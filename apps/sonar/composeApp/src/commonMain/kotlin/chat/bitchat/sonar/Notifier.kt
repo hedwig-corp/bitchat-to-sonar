@@ -5,6 +5,11 @@ enum class SonarNotificationSound {
     Ble,
 }
 
+internal fun accountNotificationsAllowed(
+    suspended: Boolean,
+    panicWipePending: Boolean,
+): Boolean = !suspended && !panicWipePending
+
 /**
  * Local notifications for incoming messages — the Android twin of the iOS
  * local-notification path (no push server; fires while the process is alive,
@@ -19,6 +24,12 @@ expect object Notifier {
         body: String,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
     )
+    /** Synchronous panic boundary: serialize with notification publication and
+     * cancel every platform notification owned by this app/account. */
+    fun suspendAndCancelAll()
+    /** Open a fresh account notification generation after replacement commits.
+     * Returns false while the durable panic-wipe marker still fences account UI. */
+    fun reactivateAccountNotifications(): Boolean
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()

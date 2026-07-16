@@ -26,39 +26,72 @@ object MeshIdentity {
     private fun unhex(s: String): ByteArray =
         ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
 
-    /** Noise static keypair (X25519), persisted or generated + saved once. */
-    private val keypair: NoiseKeypairHex by lazy {
-        val priv = DesktopEnv.getString("mesh.noise.priv")
-        val pub = DesktopEnv.getString("mesh.noise.pub")
-        if (priv != null && pub != null) {
-            NoiseKeypairHex(priv, pub)
+    private data class AccountIdentity(
+        val generation: Long,
+        val keypair: NoiseKeypairHex,
+        val seedHex: String,
+        val peerIdHex: String,
+    )
+
+    private const val BUNDLE_KEY = "mesh.identity.bundle.v1"
+    private var generation = 0L
+    private var current: AccountIdentity? = null
+
+    /** Atomically load/provision one account generation. A panic reset clears
+     * [current], so old secret objects cannot survive in a Kotlin `lazy`. */
+    @Synchronized
+    private fun identity(): AccountIdentity {
+        current?.let { return it }
+        check(!PanicWipeIntent.isPending()) { "mesh identity fenced by pending panic wipe" }
+        val stored = DesktopSecrets.get(BUNDLE_KEY)?.split(':')?.takeIf { it.size == 3 }
+        val keypair: NoiseKeypairHex
+        val seed: String
+        if (stored != null) {
+            keypair = NoiseKeypairHex(stored[0], stored[1])
+            seed = stored[2]
         } else {
-            noiseGenerateKeypair().also {
-                DesktopEnv.putString("mesh.noise.priv", it.privateHex)
-                DesktopEnv.putString("mesh.noise.pub", it.publicHex)
+            val legacyPriv = DesktopEnv.getString("mesh.noise.priv")
+            val legacyPub = DesktopEnv.getString("mesh.noise.pub")
+            keypair = if (legacyPriv != null && legacyPub != null) {
+                NoiseKeypairHex(legacyPriv, legacyPub)
+            } else {
+                noiseGenerateKeypair()
+            }
+            seed = DesktopEnv.getString("mesh.ed25519.seed")
+                ?: hex(ByteArray(32).also { SecureRandom().nextBytes(it) })
+            check(DesktopSecrets.putDurable(BUNDLE_KEY, "${keypair.privateHex}:${keypair.publicHex}:$seed")) {
+                "failed to durably provision desktop mesh identity"
+            }
+            check(DesktopEnv.removeDurable("mesh.noise.priv", "mesh.noise.pub", "mesh.ed25519.seed")) {
+                "failed to remove legacy desktop mesh identity fragments"
             }
         }
+        return AccountIdentity(
+            generation = generation,
+            keypair = keypair,
+            seedHex = seed,
+            peerIdHex = hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)),
+        ).also { current = it }
     }
 
-    /** Ed25519 announce-signing seed (32 bytes hex), persisted or made once. */
-    private val seedHex: String by lazy {
-        DesktopEnv.getString("mesh.ed25519.seed")
-            ?: hex(ByteArray(32).also { SecureRandom().nextBytes(it) })
-                .also { DesktopEnv.putString("mesh.ed25519.seed", it) }
+    @Synchronized
+    fun resetAccountState() {
+        generation += 1
+        current = null
     }
 
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
-    val peerIdHex: String by lazy { hex(Sha256.hash(unhex(keypair.publicHex)).copyOf(8)) }
+    val peerIdHex: String get() = identity().peerIdHex
 
     /** Our Noise static private key (for the responder handshake). */
-    fun noisePrivHex(): String = keypair.privateHex
+    fun noisePrivHex(): String = identity().keypair.privateHex
 
     /** The signed bitchat ANNOUNCE (type 0x01) for [nickname], current timestamp. */
     fun announce(nickname: String): ByteArray = meshBuildAnnounce(
-        seedHex,
+        identity().seedHex,
         peerIdHex,
         nickname.ifBlank { "sonar" },
-        keypair.publicHex,
+        identity().keypair.publicHex,
         DEFAULT_TTL,
         System.currentTimeMillis().toULong(),
     )
@@ -74,7 +107,7 @@ object MeshIdentity {
      *  is what lets a Sonar peer continue our BLE chat over White Noise (internet)
      *  when we go out of Bluetooth range. */
     fun buildSonarPacket(payload: ByteArray): ByteArray =
-        meshBuildSignedPacket(seedHex, TYPE_SONAR, peerIdHex, "", DEFAULT_TTL, System.currentTimeMillis().toULong(), payload)
+        meshBuildSignedPacket(identity().seedHex, TYPE_SONAR, peerIdHex, "", DEFAULT_TTL, System.currentTimeMillis().toULong(), payload)
 
     /** Stable peer fingerprint = SHA256(noise static pubkey), full hex. */
     fun fingerprintOf(noisePublicKeyHex: String): String =

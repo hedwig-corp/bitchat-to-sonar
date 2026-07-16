@@ -42,6 +42,8 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local send state projected from core delivery metadata.
     val state: String? = null,
+    /// Durable receive row whose unread/notification effects still need replay.
+    val receiveEffectsPending: Boolean = false,
     /// Sticker reference if this message is a sticker send.
     val stickerRef: SonarStickerRef? = null,
 )
@@ -147,6 +149,12 @@ data class SonarMedia(
     val isGif: Boolean get() =
         mimeType.equals("image/gif", ignoreCase = true) ||
             filename.endsWith(".gif", ignoreCase = true)
+}
+
+/** Platform bridge contract used by tombstone retirement: a missing node or
+ * native delete failure must escape to the retry loop, never look successful. */
+internal suspend fun deleteCoreGroupOrThrow(deleteGroup: suspend () -> Unit) {
+    deleteGroup()
 }
 
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity
@@ -446,6 +454,9 @@ expect object SonarCore {
 
     /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>
+    /** Strict inventory for destructive verification; unlike UI [chats], a
+     * missing native node is an error and must keep deletion tombstones alive. */
+    suspend fun deletionInventory(): List<SonarChat>
 
     /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
     suspend fun startChat(peer: String): String
@@ -709,6 +720,8 @@ expect object SonarCore {
     /** Generic persisted key/value blobs (⚡PAY ledger, BIP-353 address, …). */
     fun loadBlob(key: String): String
     fun saveBlob(key: String, value: String)
+    /** Commit a control-plane mutation before acknowledging it to a peer. */
+    suspend fun saveBlobDurable(key: String, value: String)
 
     /** Wipe all on-device data (identity, chats, prefs). */
     suspend fun wipe()

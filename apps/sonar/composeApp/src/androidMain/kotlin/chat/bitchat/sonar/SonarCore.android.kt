@@ -51,6 +51,7 @@ actual object SonarCore {
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
 
     actual suspend fun start(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "core identity fenced by pending panic wipe" }
         lock.withLock {
             if (node == null) {
                 val identity = loadOrCreateIdentity()
@@ -72,6 +73,7 @@ actual object SonarCore {
     }
 
     actual suspend fun connectRelays(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "core identity fenced by pending panic wipe" }
         lock.withLock {
             if (relayConnected) return@withLock npub
             val identity = loadOrCreateIdentity()
@@ -99,7 +101,7 @@ actual object SonarCore {
 
     actual fun isRelayConnected(): Boolean = relayConnected
 
-    actual fun myNpub(): String = npub
+    actual fun myNpub(): String = if (PanicWipeIntent.isPending()) "" else npub
 
     actual fun classifyNotificationContent(content: String): SonarNotificationKind =
         uniffi.sonar_ffi.sonarNotificationClassifyContent(content).toCommon()
@@ -110,6 +112,10 @@ actual object SonarCore {
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+    }
+
+    actual suspend fun deletionInventory(): List<SonarChat> = withContext(Dispatchers.IO) {
+        requireNode().groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
     }
 
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
@@ -577,7 +583,8 @@ actual object SonarCore {
     }
 
     actual fun joinedChannels(): List<String> =
-        prefs().getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+        if (PanicWipeIntent.isPending()) emptyList()
+        else prefs().getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
 
     actual fun joinChannel(geohash: String) {
         val g = geohash.trim().lowercase()
@@ -672,13 +679,15 @@ actual object SonarCore {
         n.acknowledgeDirectDms(eventIds)
     }
 
-    actual fun nickname(): String = prefs().getString("nickname", "") ?: ""
+    actual fun nickname(): String =
+        if (PanicWipeIntent.isPending()) "" else prefs().getString("nickname", "") ?: ""
 
     actual fun setNickname(value: String) {
         prefs().edit().putString("nickname", value.trim()).apply()
     }
 
     actual fun fingerprint(): String {
+        if (PanicWipeIntent.isPending()) return ""
         var hex = pubkeyHex
         if (hex.isEmpty()) {
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)
@@ -689,9 +698,12 @@ actual object SonarCore {
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = AndroidSecrets.getMigrating("nsec", durable = true) ?: ""
+    actual fun identityNsec(): String =
+        if (PanicWipeIntent.isPending()) "" else AndroidSecrets.getMigrating("nsec", durable = true) ?: ""
 
     actual fun hasIdentity(): Boolean =
+        if (PanicWipeIntent.isPending()) false
+        else
         runCatching {
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)?.trim()
                 ?: return@runCatching false
@@ -701,6 +713,7 @@ actual object SonarCore {
             .getOrDefault(false)
 
     actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "identity provisioning fenced by pending panic wipe" }
         lock.withLock {
             if (npub.isNotBlank()) return@withLock npub
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)
@@ -716,6 +729,7 @@ actual object SonarCore {
     }
 
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "identity import fenced by pending panic wipe" }
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
             stickerOperationLock.write {
@@ -748,7 +762,8 @@ actual object SonarCore {
         }
     }
 
-    actual fun onboardingComplete(): Boolean = prefs().getBoolean("onboarding.complete", false)
+    actual fun onboardingComplete(): Boolean =
+        !PanicWipeIntent.isPending() && prefs().getBoolean("onboarding.complete", false)
 
     actual fun setOnboardingComplete(value: Boolean) {
         prefs().edit().putBoolean("onboarding.complete", value).apply()
@@ -760,32 +775,41 @@ actual object SonarCore {
         prefs().edit().putBoolean("appearance.dark", value).apply()
     }
 
-    actual fun loadBlob(key: String): String = prefs().getString("blob.$key", "") ?: ""
+    actual fun loadBlob(key: String): String =
+        if (PanicWipeIntent.isPending()) "" else prefs().getString("blob.$key", "") ?: ""
 
     actual fun saveBlob(key: String, value: String) {
         prefs().edit().putString("blob.$key", value).apply()
+    }
+
+    actual suspend fun saveBlobDurable(key: String, value: String): Unit = withContext(Dispatchers.IO) {
+        check(prefs().edit().putString("blob.$key", value).commit()) {
+            "durable preference commit failed"
+        }
     }
 
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
                 closeNode()
-                npub = ""; pubkeyHex = ""
-                // Drop the encrypted Marmot DB + all prefs. The diagnostics logs
-                // live under sonar-marmot/ (logs/), so this also removes them — at
-                // verbose level they can contain peer npubs and must not survive a
-                // wipe (Account Key Durability / privacy rule).
+                // Atomically detach the encrypted DB/log tree before deleting
+                // account keys. A failure before this rename leaves the current
+                // account intact; a failure after it remains fail-closed and is
+                // retried from the uniquely named tombstone on the next wipe.
                 val marmotDir = File(ctx.filesDir, "sonar-marmot")
-                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
+                quarantineMarmotStorage(marmotDir)
+                check(AndroidSecrets.clearDurable()) { "failed to durably clear Android account secrets" }
+                check(prefs().edit().clear().commit()) { "failed to durably clear Android account preferences" }
+                npub = ""; pubkeyHex = ""
                 // Exported diagnostics bundles are staged in the FileProvider cache
                 // dir (not under sonar-marmot); drop them too — at verbose level
                 // they can contain peer npubs.
-                File(ctx.cacheDir, "media-share")
-                    .listFiles { f -> f.name.startsWith("sonar-diagnostics") }
-                    ?.forEach { it.delete() }
-                AndroidSecrets.clear()
-                prefs().edit().clear().apply()
-                wipeFailure?.let { throw it }
+                check(
+                    durablyDeleteAndroidFiles(File(ctx.cacheDir, "media-share")) { file ->
+                        file.name.startsWith("sonar-diagnostics")
+                    },
+                ) { "failed to durably remove exported diagnostics" }
+                cleanupMarmotTombstones(ctx.filesDir)
                 Unit
             }
         }
@@ -811,8 +835,7 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        deleteCoreGroupOrThrow { requireNode().deleteGroup(chatId) }
     }
 
     // ── Push token registration (MIP-05) ──
@@ -910,7 +933,20 @@ actual object SonarCore {
         check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
     }
 
+    private fun quarantineMarmotStorage(marmotDir: File) {
+        check(quarantineAndroidDirectory(marmotDir, ".sonar-marmot-wipe-")) {
+            "failed to durably quarantine Marmot storage"
+        }
+    }
+
+    private fun cleanupMarmotTombstones(parent: File) {
+        check(cleanupAndroidDirectoryTombstones(parent, ".sonar-marmot-wipe-")) {
+            "failed to durably remove Marmot wipe tombstones"
+        }
+    }
+
     private fun loadOrCreateIdentity(): SonarIdentity {
+        check(!PanicWipeIntent.isPending()) { "identity migration fenced by pending panic wipe" }
         val saved = AndroidSecrets.getMigrating("nsec", durable = true)
         if (saved != null) {
             return SonarIdentity.import(saved)
@@ -924,6 +960,7 @@ actual object SonarCore {
     }
 
     private fun loadOrCreateDbKey(): String {
+        check(!PanicWipeIntent.isPending()) { "database key migration fenced by pending panic wipe" }
         AndroidSecrets.getMigrating("dbKeyHex", durable = true)?.let { return it }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }

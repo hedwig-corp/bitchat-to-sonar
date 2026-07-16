@@ -45,11 +45,12 @@ struct NostrEOSECompletionTrackerTests {
 
         let first = tracker.recordEOSE(from: "wss://relay-a.test")
         let duplicate = tracker.recordEOSE(from: "wss://relay-a.test")
-        let second = tracker.recordEOSE(from: "wss://relay-b.test")
 
         #expect(!first)
         #expect(!duplicate)
         #expect(tracker.completedRelayCount == 1)
+
+        let second = tracker.recordEOSE(from: "wss://relay-b.test")
         #expect(second)
     }
 

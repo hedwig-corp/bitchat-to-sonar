@@ -73,14 +73,18 @@ object MeshGatt {
     private const val TYPE_NOISE_HANDSHAKE: UByte = 0x10u
     private const val TYPE_NOISE_ENCRYPTED: UByte = 0x11u
     private const val TYPE_FRAGMENT: UByte = 0x20u
+    private const val TYPE_REQUEST_SYNC: UByte = 0x21u
     private const val TYPE_FILE_TRANSFER: UByte = 0x22u
     private const val TYPE_SONAR_0X53: UByte = 0x53u
+    private const val NOISE_PRIVATE_MESSAGE = 0x01
+    private const val NOISE_DELIVERED = 0x03
     private const val DEFAULT_TTL: UByte = 7u
     private const val MAX_SINGLE_GATT_PACKET_BYTES = 480
     private const val FRAGMENT_CHUNK_SIZE: UInt = 350u
     private const val MAX_FILE_TRANSFER_BYTES = 1024 * 1024
     private const val MAX_V1_FILE_PAYLOAD_BYTES = 0xFFFF
     private const val MAX_PENDING_SONAR_PROFILES = 128
+    private const val DELIVERY_ACK_TIMEOUT_MS = 10_000L
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -90,27 +94,75 @@ object MeshGatt {
     // so the mesh peerID is stable without leaving private material in plaintext
     // prefs. Deriving these from the Nostr identity is tracked separately.
 
-    /** Noise static keypair (X25519), loaded from secure storage or generated + saved once. */
-    private val keypair by lazy {
-        val priv = AndroidSecrets.getMigrating("mesh.noise.priv")
-        val pub = AndroidSecrets.getMigrating("mesh.noise.pub")
-        if (priv != null && pub != null) {
-            NoiseKeypairHex(priv, pub)
-        } else {
-            noiseGenerateKeypair().also {
-                AndroidSecrets.put("mesh.noise.priv", it.privateHex)
-                AndroidSecrets.put("mesh.noise.pub", it.publicHex)
+    private data class AccountIdentity(
+        val generation: Long,
+        val keypair: NoiseKeypairHex,
+        val ed25519SeedHex: String,
+        val peerIdHex: String,
+    )
+
+    /**
+     * Replaceable account-generation holder. Unlike Kotlin `lazy`, reset drops
+     * every reference to the old private material immediately. Provisioning is
+     * fail-closed while the durable panic journal exists, and the three secrets
+     * are committed as one encrypted bundle so a crash cannot mix generations.
+     */
+    private object AccountIdentityHolder {
+        private const val BUNDLE_KEY = "mesh.identity.bundle.v1"
+        private var generation = 0L
+        private var current: AccountIdentity? = null
+
+        @Synchronized
+        fun require(): AccountIdentity {
+            current?.let { return it }
+            check(!PanicWipeIntent.isPending()) { "mesh identity fenced by pending panic wipe" }
+            val stored = AndroidSecrets.getMigrating(BUNDLE_KEY, durable = true)
+                ?.split(':')
+                ?.takeIf { it.size == 3 }
+            val keypair: NoiseKeypairHex
+            val seed: String
+            if (stored != null) {
+                keypair = NoiseKeypairHex(stored[0], stored[1])
+                seed = stored[2]
+            } else {
+                val legacyPriv = AndroidSecrets.getMigrating("mesh.noise.priv", durable = true)
+                val legacyPub = AndroidSecrets.getMigrating("mesh.noise.pub", durable = true)
+                val legacySeed = AndroidSecrets.getMigrating("mesh.ed25519.seed", durable = true)
+                keypair = if (legacyPriv != null && legacyPub != null) {
+                    NoiseKeypairHex(legacyPriv, legacyPub)
+                } else {
+                    noiseGenerateKeypair()
+                }
+                seed = legacySeed ?: ByteArray(32).also { SecureRandom().nextBytes(it) }.toHex()
+                AndroidSecrets.put(
+                    BUNDLE_KEY,
+                    "${keypair.privateHex}:${keypair.publicHex}:$seed",
+                    durable = true,
+                )
+                check(AndroidSecrets.removeDurable("mesh.noise.priv", "mesh.noise.pub", "mesh.ed25519.seed")) {
+                    "failed to remove legacy mesh identity fragments"
+                }
             }
+            val identity = AccountIdentity(
+                generation = generation,
+                keypair = keypair,
+                ed25519SeedHex = seed,
+                peerIdHex = Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex(),
+            )
+            current = identity
+            return identity
+        }
+
+        @Synchronized
+        fun drop() {
+            generation += 1
+            current = null
         }
     }
-    /** Ed25519 announce-signing seed (32 bytes, hex), loaded securely or made once. */
-    private val ed25519SeedHex by lazy {
-        AndroidSecrets.getMigrating("mesh.ed25519.seed") ?: ByteArray(32)
-            .also { SecureRandom().nextBytes(it) }.toHex()
-            .also { AndroidSecrets.put("mesh.ed25519.seed", it) }
-    }
-    /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
-    private val myPeerIdHex by lazy { Sha256.hash(keypair.publicHex.hexToBytes()).copyOf(8).toHex() }
+
+    private val keypair: NoiseKeypairHex get() = AccountIdentityHolder.require().keypair
+    private val ed25519SeedHex: String get() = AccountIdentityHolder.require().ed25519SeedHex
+    private val myPeerIdHex: String get() = AccountIdentityHolder.require().peerIdHex
     /** Display nickname carried in our announce (set by the host). */
     @Volatile private var nickname: String = ""
     /** Our latest Sonar Discovery (0x53) payload, broadcast alongside the announce. */
@@ -119,12 +171,42 @@ object MeshGatt {
     private var server: BluetoothGattServer? = null
     private var characteristic: BluetoothGattCharacteristic? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+    @Volatile private var active = false
+    @Volatile private var lifecycleGeneration = 0L
+
+    private data class GattIo(
+        val packet: ByteArray,
+        val onComplete: ((Boolean) -> Unit)? = null,
+    )
+
+    /** Complete a fragmented logical write only after every fragment succeeds;
+     * any single failed fragment fails it exactly once. Access stays serialized
+     * by the MeshGatt monitor. */
+    private class FragmentCompletion(private val complete: (Boolean) -> Unit) {
+        private var finished = false
+
+        fun callback(finalFragment: Boolean): (Boolean) -> Unit = { success ->
+            if (!finished && (!success || finalFragment)) {
+                finished = true
+                complete(success)
+            }
+        }
+    }
+
+    /** Logical DMs outlive an Activity stop; raw GATT work and Noise links do not. */
+    private val pendingDeliveries = PendingMeshDeliveryTracker()
 
     /** Per-link Noise state (DMs only), keyed by remote BLE address. [startedMs]
      *  is when the current handshake attempt began, so a half-open handshake (m1
      *  sent but m2/m3 lost to an intermittent BLE link) can be retried instead of
      *  blocking forever. */
-    private class Link(val noise: SonarNoise, var established: Boolean = false, var startedMs: Long = 0L)
+    private val nextLinkGeneration = java.util.concurrent.atomic.AtomicLong()
+    private class Link(
+        val noise: SonarNoise,
+        var established: Boolean = false,
+        var startedMs: Long = 0L,
+        val generation: Long,
+    )
     private val serverLinks = ConcurrentHashMap<String, Link>()
     private val serverDevices = ConcurrentHashMap<String, BluetoothDevice>()
     private val clientLinks = ConcurrentHashMap<String, Link>()
@@ -136,6 +218,9 @@ object MeshGatt {
      *  stays one identity across peerID + MAC rotation (issue #12). */
     private val fingerprintByAddr = ConcurrentHashMap<String, String>()
     private val fingerprintByPeerId = ConcurrentHashMap<String, String>()
+    /** Noise static key from the verified DIRECT 0x01 announce for this raw link.
+     * A relayed announce must never populate address-scoped authentication state. */
+    private val announcedNoiseKeyByAddr = ConcurrentHashMap<String, String>()
     /** Ed25519 keys learned from verified 0x01 announces, keyed by sender ID.
      *  A 0x53 is accepted only after it verifies against this exact key. */
     private val signingKeyByPeerId = ConcurrentHashMap<String, String>()
@@ -144,7 +229,7 @@ object MeshGatt {
      *  Store the FULL signed packet so it can be authenticated once the announce
      *  supplies the signing key. Access is synchronized to preserve FIFO eviction. */
     private val pendingSonarByPeerId = LinkedHashMap<String, ByteArray>()
-    private val reassembler = MeshReassembler()
+    private var reassembler = MeshReassembler()
     @Volatile private var knownOnlyPeerAllowlist: Set<String>? = null
 
     // Listeners (fired from BLE callback threads → concurrent lists). The String
@@ -156,6 +241,7 @@ object MeshGatt {
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
+    private val onDeliveryAck = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Boolean>()
     /** Dedup public broadcasts by message id (we receive from multiple links). */
     private val seenBroadcastIds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** Dedup file transfers by packet sender + packet timestamp. */
@@ -167,6 +253,9 @@ object MeshGatt {
      *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
+    fun addDeliveryAckListener(cb: (fingerprint: String, messageId: String) -> Boolean) {
+        onDeliveryAck.add(cb)
+    }
 
     /** Stable fingerprint for a peer = SHA256(noise static pubkey), full hex. */
     private fun fingerprintOf(noisePublicKeyHex: String): String =
@@ -277,21 +366,38 @@ object MeshGatt {
     }
 
     private fun broadcastDiscoveryNow(reason: String) {
+        val generation = lifecycleGeneration
         handler.post {
-            val ann = announceBytes()
-            val sonar = sonarBytes()
-            android.util.Log.i(
-                TAG,
-                "refresh discovery ($reason) announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
-            )
-            clientGatt.forEach { (_, gatt) ->
-                val ch = clientChar[gatt.device.address] ?: return@forEach
-                ann?.let { writePacket(gatt, ch, it) }
-                sonar?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
-            }
-            serverDevices.forEach { (_, device) ->
-                ann?.let { notify(device, it) }
-                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+            synchronized(MeshGatt) {
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation)) return@synchronized
+                val ann = announceBytes()
+                val sonar = sonarBytes()
+                android.util.Log.i(
+                    TAG,
+                    "refresh discovery ($reason) announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
+                )
+                clientGatt.forEach { (_, gatt) ->
+                    val ch = clientChar[gatt.device.address] ?: return@forEach
+                    ann?.let { writePacket(gatt, ch, it) }
+                    sonar?.let { p ->
+                        handler.postDelayed({
+                            synchronized(MeshGatt) {
+                                if (expectedClientCallback(generation, gatt)) writePacket(gatt, ch, p)
+                            }
+                        }, 150)
+                    }
+                }
+                serverDevices.forEach { (_, device) ->
+                    ann?.let { notify(device, it) }
+                    sonar?.let { p ->
+                        handler.postDelayed({
+                            synchronized(MeshGatt) {
+                                val expected = serverDevices[device.address] === device
+                                if (acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expected)) notify(device, p)
+                            }
+                        }, 150)
+                    }
+                }
             }
         }
     }
@@ -318,11 +424,15 @@ object MeshGatt {
 
     // ── GATT server (peripheral) ──
 
+    @Synchronized
     fun startServer() {
-        if (server != null) return
+        if (active && server != null) return
+        lifecycleGeneration += 1
+        val generation = lifecycleGeneration
+        active = true
         android.util.Log.i(TAG, "MY node id = $myPeerIdHex  nickname='$nickname'")
         val mgr = manager() ?: return
-        val s = try { mgr.openGattServer(ctx, serverCallback) } catch (_: Throwable) { return } ?: return
+        val s = try { mgr.openGattServer(ctx, serverCallback(generation)) } catch (_: Throwable) { return } ?: return
         val service = BluetoothGattService(SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
         val ch = BluetoothGattCharacteristic(
             CHAR,
@@ -340,16 +450,41 @@ object MeshGatt {
         characteristic = ch
     }
 
+    @Synchronized
     fun stop() {
+        lifecycleGeneration += 1
+        active = false
+        // Cancel pending dials, discovery bursts, and writes before closing the
+        // Binder-backed GATT objects. Otherwise delayed work can recreate traffic
+        // after the Activity has entered the cached/frozen state.
+        handler.removeCallbacksAndMessages(null)
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
-        clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
+        clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear(); clientAttempts.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
+        announcedNoiseKeyByAddr.clear()
         fingerprintByPeerId.clear(); signingKeyByPeerId.clear(); recentDials.clear()
         clearPendingSonar()
-        pendingSends.clear()
+        // Partial packets belong to the closed raw link generation and must not
+        // be completed by fragments arriving after a foreground restart.
+        reassembler = MeshReassembler()
+        pendingDeliveries.cancelInFlight()
+        clientWriteQueue.clear(); clientWriteInFlight.clear()
+        serverNotifyQueue.clear(); serverNotifyInFlight.clear()
         seenFileIds.clear()
+    }
+
+    /** Lifecycle stop retains logical sends; account teardown explicitly does not. */
+    @Synchronized
+    fun resetAccountState() {
+        stop()
+        AccountIdentityHolder.drop()
+        pendingDeliveries.clear()
+        nickname = ""
+        sonarPayload = null
+        knownOnlyPeerAllowlist = null
+        seenBroadcastIds.clear()
     }
 
     private fun peerAllowedByPolicy(fingerprint: String): Boolean {
@@ -385,49 +520,84 @@ object MeshGatt {
         cleanupClient(addr)
     }
 
-    private fun cleanupServer(addr: String) {
-        val device = serverDevices.remove(addr)
-        if (device != null) runCatching { server?.cancelConnection(device) }
-        serverLinks.remove(addr)
-        peerIdByAddr.remove(addr)
-        fingerprintByAddr.remove(addr)
-        serverNotifyQueue.remove(addr)
-        serverNotifying.remove(addr)
+    private fun clientRouteId(addr: String, generation: Long) = "client:$addr:$generation"
+    private fun serverRouteId(addr: String, generation: Long) = "server:$addr:$generation"
+
+    private fun disconnectRoute(routeId: String, addr: String) {
+        if (routeId.startsWith("client:")) cleanupClient(addr) else cleanupServer(addr)
     }
 
-    private val serverCallback = object : BluetoothGattServerCallback() {
+    private fun releaseAddrIdentityIfUnused(addr: String) {
+        if (clientGatt.containsKey(addr) || clientLinks.containsKey(addr) ||
+            serverDevices.containsKey(addr) || serverLinks.containsKey(addr)
+        ) return
+        peerIdByAddr.remove(addr)
+        fingerprintByAddr.remove(addr)
+        announcedNoiseKeyByAddr.remove(addr)
+    }
+
+    private fun cleanupServer(addr: String) {
+        val fp = fingerprintByAddr[addr]
+        val device = serverDevices.remove(addr)
+        if (device != null) runCatching { server?.cancelConnection(device) }
+        val removedLink = serverLinks.remove(addr)
+        releaseAddrIdentityIfUnused(addr)
+        val queued = serverNotifyQueue.remove(addr)
+        val failed = serverNotifyInFlight.remove(addr)?.onComplete
+            ?: queued?.firstOrNull { it.onComplete != null }?.onComplete
+        if (active) failed?.invoke(false)
+        val routeId = removedLink?.let { serverRouteId(addr, it.generation) }
+        if (active && fp != null && routeId != null && pendingDeliveries.cancelInFlightForRoute(fp, routeId)) {
+            flushPending(fp)
+        }
+    }
+
+    private fun serverCallback(generation: Long) = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                serverDevices[device.address] = device
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                cleanupServer(device.address)
+            synchronized(MeshGatt) {
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation)) return
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    serverDevices[device.address] = device
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    cleanupServer(device.address)
+                }
             }
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
-            // Slot free → drain the next queued notify (one outstanding at a time).
-            serverNotifying.remove(device.address)
-            pumpServerNotify(device.address)
+            synchronized(MeshGatt) {
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation)) return
+                // Slot free → drain the next queued notify (one outstanding at a time).
+                val completed = serverNotifyInFlight.remove(device.address)
+                completed?.onComplete?.invoke(status == BluetoothGatt.GATT_SUCCESS)
+                pumpServerNotify(device.address)
+            }
         }
 
         override fun onDescriptorWriteRequest(
             device: BluetoothDevice, requestId: Int, descriptor: BluetoothGattDescriptor,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
-            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
-            // The central just subscribed → send a short discovery burst. iOS only
-            // accepts 0x53 after it has verified the base 0x01 announce, and the
-            // first GATT notification pair is easy to lose during role setup.
-            android.util.Log.i(TAG, "server ${device.address}: central subscribed → notify discovery burst")
-            notifyDiscoveryBurst(device)
+            synchronized(MeshGatt) {
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation)) return
+                if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                // The central just subscribed → send a short discovery burst. iOS only
+                // accepts 0x53 after it has verified the base 0x01 announce, and the
+                // first GATT notification pair is easy to lose during role setup.
+                android.util.Log.i(TAG, "server ${device.address}: central subscribed → notify discovery burst")
+                notifyDiscoveryBurst(device, generation)
+            }
         }
 
         override fun onCharacteristicWriteRequest(
             device: BluetoothDevice, requestId: Int, ch: BluetoothGattCharacteristic,
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
-            if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
-            handlePacket(device.address, value, fromServer = true, device = device)
+            synchronized(MeshGatt) {
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation)) return
+                if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+                handlePacket(device.address, value, fromServer = true, device = device)
+            }
         }
     }
 
@@ -437,6 +607,9 @@ object MeshGatt {
     private val clientChar = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
     /** Dials that haven't produced an announce yet (still "probing"). */
     private val clientPending = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** Per-address attempt identity prevents an old timeout from closing a newer
+     * dial to the same rotating/reused BLE address in the same lifecycle. */
+    private val clientAttempts = ConcurrentHashMap<String, Any>()
     /** Last dial time per address, to avoid re-dialing the same one in a storm. */
     private val recentDials = ConcurrentHashMap<String, Long>()
 
@@ -464,7 +637,10 @@ object MeshGatt {
 
     /** Connect to a discovered peer to exchange announces (and enable DMs).
      *  Bounded + timed-out so a rotating-MAC advertiser can't churn the radio. */
+    @Synchronized
     fun connect(device: BluetoothDevice) {
+        if (!active) return
+        val generation = lifecycleGeneration
         val addr = device.address
         if (clientGatt.containsKey(addr) || clientPending.contains(addr)) return
         val now = System.currentTimeMillis()
@@ -473,122 +649,210 @@ object MeshGatt {
         recentDials[addr] = now
         if (recentDials.size > 256) recentDials.entries.removeAll { now - it.value > REDIAL_BACKOFF_MS }
         clientPending.add(addr) // reserve the slot before the async connect
+        val attempt = Any()
+        clientAttempts[addr] = attempt
         // connectGatt MUST run on the main thread — calling it from the scan
         // callback's binder thread is a classic cause of status 133 (every dial
         // failing immediately). Hop to the main looper.
         handler.post {
-            if (!clientPending.contains(addr)) return@post
-            android.util.Log.i(TAG, "dialing $addr (TRANSPORT_LE) [${clientGatt.size}/$MAX_CLIENTS]")
-            val gatt = runCatching {
-                device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
-            }.getOrNull()
-            if (gatt == null) { cleanupClient(addr); return@post }
-            clientGatt[addr] = gatt
+            synchronized(MeshGatt) {
+                val expectedAttempt = clientAttempts[addr] === attempt
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expectedAttempt) ||
+                    !clientPending.contains(addr)
+                ) {
+                    return@synchronized
+                }
+                android.util.Log.i(TAG, "dialing $addr (TRANSPORT_LE) [${clientGatt.size}/$MAX_CLIENTS]")
+                val gatt = runCatching {
+                    device.connectGatt(ctx, false, clientCallback(generation), BluetoothDevice.TRANSPORT_LE)
+                }.getOrNull()
+                if (gatt == null) {
+                    cleanupClient(addr)
+                    return@synchronized
+                }
+                if (!acceptsMeshLifecycleCallback(
+                        active,
+                        lifecycleGeneration,
+                        generation,
+                        expectedConnection = clientAttempts[addr] === attempt,
+                    )
+                ) {
+                    runCatching { gatt.close() }
+                    return@synchronized
+                }
+                clientGatt[addr] = gatt
+            }
         }
         // Fail fast if the connection never ESTABLISHES (rotated-away RPA hangs
         // with no callback) — frees the slot to dial the peer's live address.
         handler.postDelayed({
-            if (clientPending.contains(addr) && !clientConnected.contains(addr)) {
-                android.util.Log.i(TAG, "dial $addr not established in ${CONNECT_ESTABLISH_MS}ms — closing")
-                cleanupClient(addr)
+            synchronized(MeshGatt) {
+                val expectedAttempt = clientAttempts[addr] === attempt
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expectedAttempt)) return@synchronized
+                if (clientPending.contains(addr) && !clientConnected.contains(addr)) {
+                    android.util.Log.i(TAG, "dial $addr not established in ${CONNECT_ESTABLISH_MS}ms — closing")
+                    cleanupClient(addr)
+                }
             }
         }, CONNECT_ESTABLISH_MS)
         // For a connection that DID establish, drop it if no announce arrives.
         handler.postDelayed({
-            if (clientPending.contains(addr)) {
-                android.util.Log.i(TAG, "dial $addr timed out (no announce) — closing")
-                cleanupClient(addr)
+            synchronized(MeshGatt) {
+                val expectedAttempt = clientAttempts[addr] === attempt
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expectedAttempt)) return@synchronized
+                if (clientPending.contains(addr)) {
+                    android.util.Log.i(TAG, "dial $addr timed out (no announce) — closing")
+                    cleanupClient(addr)
+                }
             }
         }, CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS)
     }
 
-    private val clientCallback = object : BluetoothGattCallback() {
+    private fun clientCallback(generation: Long) = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            val addr = gatt.device.address
-            android.util.Log.i(TAG, "client $addr: state=$newState status=$status")
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                clientGatt[addr] = gatt
-                clientConnected.add(addr) // earns the longer announce window
-                gatt.requestMtu(517)
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                if (status != 0) gatt.close()
-                cleanupClient(addr)
-                // Any failed connect (133 transient, 19 peer-terminate from a
-                // dial race, …) is frequently retryable — clear the backoff so the
-                // next scan hit (or the soft-election fallback) can re-dial right
-                // away rather than waiting out REDIAL_BACKOFF_MS.
-                if (status != 0) recentDials.remove(addr)
+            synchronized(MeshGatt) {
+                val addr = gatt.device.address
+                val expected = clientGatt[addr] === gatt
+                if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expected)) {
+                    runCatching { gatt.close() }
+                    return
+                }
+                android.util.Log.i(TAG, "client $addr: state=$newState status=$status")
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    clientConnected.add(addr) // earns the longer announce window
+                    gatt.requestMtu(517)
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    cleanupClient(addr, expectedGatt = gatt)
+                    // Any failed connect (133 transient, 19 peer-terminate from a
+                    // dial race, …) is frequently retryable — clear the backoff so the
+                    // next scan hit (or the soft-election fallback) can re-dial right
+                    // away rather than waiting out REDIAL_BACKOFF_MS.
+                    if (status != 0) recentDials.remove(addr)
+                }
             }
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            android.util.Log.i(TAG, "client ${gatt.device.address}: mtu=$mtu status=$status → discoverServices")
-            gatt.discoverServices()
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                android.util.Log.i(TAG, "client ${gatt.device.address}: mtu=$mtu status=$status → discoverServices")
+                gatt.discoverServices()
+            }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val svc = gatt.getService(SERVICE)
-            val ch = svc?.getCharacteristic(CHAR)
-            android.util.Log.i(TAG, "client ${gatt.device.address}: servicesDiscovered status=$status svc=${svc != null} char=${ch != null}")
-            if (ch == null) return
-            val addr = gatt.device.address
-            clientChar[addr] = ch
-            // Subscribe on the MAIN thread (like connectGatt) — GATT ops issued
-            // from the discovery callback thread can silently fail to queue.
-            handler.post {
-                gatt.setCharacteristicNotification(ch, true)
-                val d = ch.getDescriptor(CCC)
-                if (d == null) {
-                    // No CCC on the peer — can't receive notifies, but we can still
-                    // WRITE our announce to its server. Send it directly.
-                    android.util.Log.i(TAG, "client $addr: no CCC descriptor → write announce only")
-                    announceBytes()?.let { writePacket(gatt, ch, it) }
-                    return@post
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                val svc = gatt.getService(SERVICE)
+                val ch = svc?.getCharacteristic(CHAR)
+                android.util.Log.i(TAG, "client ${gatt.device.address}: servicesDiscovered status=$status svc=${svc != null} char=${ch != null}")
+                if (ch == null) return
+                val addr = gatt.device.address
+                clientChar[addr] = ch
+                // Subscribe on the MAIN thread (like connectGatt) — GATT ops issued
+                // from the discovery callback thread can silently fail to queue.
+                handler.post {
+                    synchronized(MeshGatt) {
+                        if (!expectedClientCallback(generation, gatt)) return@synchronized
+                        gatt.setCharacteristicNotification(ch, true)
+                        val d = ch.getDescriptor(CCC)
+                        if (d == null) {
+                            // No CCC on the peer — can't receive notifies, but we can still
+                            // WRITE our announce to its server. Send it directly.
+                            android.util.Log.i(TAG, "client $addr: no CCC descriptor → write announce only")
+                            announceBytes()?.let { writePacket(gatt, ch, it) }
+                            return@synchronized
+                        }
+                        val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                        val rc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                            gatt.writeDescriptor(d, enable)
+                        } else {
+                            @Suppress("DEPRECATION") run { d.value = enable; if (gatt.writeDescriptor(d)) 0 else -1 }
+                        }
+                        android.util.Log.i(TAG, "client $addr: writeDescriptor(subscribe) rc=$rc")
+                    }
                 }
-                val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                val rc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(d, enable)
-                } else {
-                    @Suppress("DEPRECATION") run { d.value = enable; if (gatt.writeDescriptor(d)) 0 else -1 }
-                }
-                android.util.Log.i(TAG, "client $addr: writeDescriptor(subscribe) rc=$rc")
             }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            // Notifications enabled → send our announce, then (deferred, so the
-            // back-to-back GATT writes don't collide) our 0x53.
-            val ch = clientChar[gatt.device.address] ?: return
-            val ann = announceBytes()
-            android.util.Log.i(TAG, "client ${gatt.device.address}: notify enabled (status=$status) → send announce (${ann?.size}B)")
-            ann?.let { writePacket(gatt, ch, it) }
-            sonarBytes()?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                // Notifications enabled → send our announce, then (deferred, so the
+                // back-to-back GATT writes don't collide) our 0x53.
+                val ch = clientChar[gatt.device.address] ?: return
+                val ann = announceBytes()
+                android.util.Log.i(TAG, "client ${gatt.device.address}: notify enabled (status=$status) → send announce (${ann?.size}B)")
+                ann?.let { writePacket(gatt, ch, it) }
+                sonarBytes()?.let { p ->
+                    handler.postDelayed({
+                        synchronized(MeshGatt) {
+                            if (expectedClientCallback(generation, gatt)) writePacket(gatt, ch, p)
+                        }
+                    }, 150)
+                }
+            }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
-            // status 0 = GATT_SUCCESS. Either way the slot is now free → drain the
-            // next queued write (one outstanding write at a time is the hard limit
-            // that was dropping our handshake m1).
-            val addr = gatt.device.address
-            clientWriting.remove(addr)
-            pumpClientWrites(addr)
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                // status 0 = GATT_SUCCESS. Either way the slot is now free → drain the
+                // next queued write (one outstanding write at a time is the hard limit
+                // that was dropping our handshake m1).
+                val addr = gatt.device.address
+                val completed = clientWriteInFlight.remove(addr)
+                completed?.onComplete?.invoke(status == BluetoothGatt.GATT_SUCCESS)
+                pumpClientWrites(addr)
+            }
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-            handlePacket(gatt.device.address, value, fromServer = false, gatt = gatt)
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                handlePacket(gatt.device.address, value, fromServer = false, gatt = gatt)
+            }
         }
 
         @Deprecated("compat")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION") handlePacket(gatt.device.address, ch.value ?: return, fromServer = false, gatt = gatt)
+            synchronized(MeshGatt) {
+                if (!expectedClientCallback(generation, gatt)) return
+                @Suppress("DEPRECATION") handlePacket(gatt.device.address, ch.value ?: return, fromServer = false, gatt = gatt)
+            }
         }
     }
 
-    private fun cleanupClient(addr: String) {
-        clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
+    private fun expectedClientCallback(generation: Long, gatt: BluetoothGatt): Boolean =
+        acceptsMeshLifecycleCallback(
+            active = active,
+            currentGeneration = lifecycleGeneration,
+            callbackGeneration = generation,
+            expectedConnection = clientGatt[gatt.device.address] === gatt,
+        )
+
+    @Synchronized
+    private fun cleanupClient(addr: String, expectedGatt: BluetoothGatt? = null) {
+        val currentGatt = clientGatt[addr]
+        if (expectedGatt != null && currentGatt !== expectedGatt) {
+            runCatching { expectedGatt.close() }
+            return
+        }
+        val fp = fingerprintByAddr[addr]
+        val removedLink = clientLinks.remove(addr)
+        clientChar.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
-        clientWriteQueue.remove(addr); clientWriting.remove(addr)
+        clientAttempts.remove(addr)
+        val queued = clientWriteQueue.remove(addr)
+        val failed = clientWriteInFlight.remove(addr)?.onComplete
+            ?: queued?.firstOrNull { it.onComplete != null }?.onComplete
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
+        releaseAddrIdentityIfUnused(addr)
+        if (active) failed?.invoke(false)
+        val routeId = removedLink?.let { clientRouteId(addr, it.generation) }
+        if (active && fp != null && routeId != null && pendingDeliveries.cancelInFlightForRoute(fp, routeId)) {
+            flushPending(fp)
+        }
     }
 
     // ── Receive: route every characteristic value (one padded packet) by type ──
@@ -633,6 +897,7 @@ object MeshGatt {
                     // state. A relayed announce still belongs in the radar, but
                     // must never replace the neighbour used for Noise routing.
                     peerIdByAddr[addr] = ann.senderIdHex
+                    announcedNoiseKeyByAddr[addr] = ann.noisePublicKeyHex
                     if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
                     clientPending.remove(addr) // a real peer answered — keep this link
                 }
@@ -687,6 +952,13 @@ object MeshGatt {
             TYPE_NOISE_HANDSHAKE -> handleHandshake(addr, info.payload, fromServer, device, gatt)
             TYPE_NOISE_ENCRYPTED -> handleEncrypted(addr, info.payload, fromServer)
             TYPE_FRAGMENT -> handleFragment(addr, info.senderIdHex, info.payload, fromServer, device, gatt)
+            // Safe tracked gap: do not fabricate a lossy sync response until the
+            // Bounded GCS index + RSR flags are tracked in parity issue #284:
+            // https://github.com/hedwig-corp/bitchat-to-sonar/issues/284
+            TYPE_REQUEST_SYNC -> android.util.Log.w(
+                TAG,
+                "requestSync requires a bounded local GCS packet index and RSR flag support; refusing an incomplete response",
+            )
             TYPE_FILE_TRANSFER -> handleFileTransfer(addr, value, info)
             TYPE_SONAR_0X53 -> {
                 // Tag the 0x53 with the peer's STABLE fingerprint (from its 0x01
@@ -735,7 +1007,11 @@ object MeshGatt {
         val ch = clientChar[addr] ?: run {
             android.util.Log.w(TAG, "startHandshake $addr: no clientChar"); return
         }
-        val link = Link(SonarNoise.initiator(keypair.privateHex), startedMs = System.currentTimeMillis())
+        val link = Link(
+            SonarNoise.initiator(keypair.privateHex),
+            startedMs = System.currentTimeMillis(),
+            generation = nextLinkGeneration.incrementAndGet(),
+        )
         clientLinks[addr] = link
         runCatching {
             val m1 = link.noise.writeMessage()
@@ -750,10 +1026,16 @@ object MeshGatt {
     ) {
         try {
             if (fromServer) {
-                val link = serverLinks.getOrPut(addr) { Link(SonarNoise.responder(keypair.privateHex)) }
+                val link = serverLinks.getOrPut(addr) {
+                    Link(
+                        SonarNoise.responder(keypair.privateHex),
+                        generation = nextLinkGeneration.incrementAndGet(),
+                    )
+                }
                 if (link.established) return
                 link.noise.readMessage(noiseMsg) // m1 (then m3)
                 if (link.noise.isFinished()) {
+                    check(bindAuthenticatedNoiseIdentity(addr, link)) { "Noise static key does not match direct announce" }
                     link.noise.intoSession(); link.established = true; linkEstablished(addr)
                 } else {
                     device?.let { notify(it, handshakePacket(peerIdByAddr[addr] ?: "", link.noise.writeMessage())) } // m2
@@ -767,12 +1049,31 @@ object MeshGatt {
                     gatt?.let { writePacket(it, ch, handshakePacket(peerIdByAddr[addr] ?: "", link.noise.writeMessage())) } // m3
                 }
                 if (link.noise.isFinished()) {
+                    check(bindAuthenticatedNoiseIdentity(addr, link)) { "Noise static key does not match direct announce" }
                     link.noise.intoSession(); link.established = true; linkEstablished(addr)
                 }
             }
         } catch (_: Throwable) {
             if (fromServer) serverLinks.remove(addr) else cleanupClient(addr)
         }
+    }
+
+    /** Bind the cryptographically authenticated XX remote static to the signed
+     * direct announce before any queued DM can use this route. */
+    private fun bindAuthenticatedNoiseIdentity(addr: String, link: Link): Boolean {
+        val announced = announcedNoiseKeyByAddr[addr]
+        val authenticated = link.noise.remoteStaticHex()
+        if (!meshNoiseStaticMatches(announced, authenticated)) {
+            android.util.Log.w(TAG, "Noise identity mismatch on $addr; rejecting route")
+            return false
+        }
+        val fingerprint = authenticated?.let(::fingerprintOf).orEmpty()
+        if (fingerprint.isEmpty()) return false
+        val peerId = peerIdByAddr[addr]?.lowercase()
+        val announcedFingerprint = peerId?.let(fingerprintByPeerId::get)
+        if (announcedFingerprint != null && announcedFingerprint != fingerprint) return false
+        fingerprintByAddr[addr] = fingerprint
+        return true
     }
 
     /** The established Noise session for a peer identity, across connections.
@@ -804,42 +1105,43 @@ object MeshGatt {
             ?: fp?.let { establishedLinkForFp(it) }
             ?: return
         runCatching {
-            val plain = link.noise.decrypt(ciphertext)
-            // inner NoisePayloadType: 0x01 privateMessage, 0x02 readReceipt,
-            // 0x03 delivered ack. We currently surface only 0x01; the others are
-            // logged (a 0x03 confirms the peer received + stored our DM).
-            android.util.Log.i(TAG, "rx 0x11 inner type=0x${(plain.firstOrNull()?.toInt()?.and(0xFF) ?: -1).toString(16)} (${plain.size}B) from $addr")
+            // The Snow session owns a single nonce stream. Serialize decrypts
+            // with the synchronized send/ACK paths so callback threads cannot
+            // advance it concurrently.
+            val plain = synchronized(MeshGatt) { link.noise.decrypt(ciphertext) }
+            val innerType = plain.firstOrNull()?.toInt()?.and(0xFF) ?: return@runCatching
+            android.util.Log.i(TAG, "rx 0x11 inner type=0x${innerType.toString(16)} (${plain.size}B) from $addr")
             // Surface the STABLE fingerprint so the app keys the conversation by
             // peer identity across peerID + BLE-address rotation (issue #12).
             val idFp = fp ?: peerIdByAddr[addr] ?: addr
-            meshDecodePrivateMessage(plain)?.let { pm -> onText.forEach { it(idFp, pm.messageId, pm.content) } }
+            when (innerType) {
+                NOISE_PRIVATE_MESSAGE -> meshDecodePrivateMessage(plain)?.let { pm ->
+                    // The host persists/dedupes this before calling
+                    // acknowledgeText; receiving bytes alone is not delivery.
+                    onText.forEach { it(idFp, pm.messageId, pm.content) }
+                }
+                NOISE_DELIVERED -> {
+                    val messageId = meshDeliveryAckMessageId(plain) ?: return@runCatching
+                    synchronized(MeshGatt) {
+                        if (pendingDeliveries.acknowledgeIf(idFp, messageId) {
+                                onDeliveryAck.isNotEmpty() && onDeliveryAck.all { it(idFp, messageId) }
+                            }
+                        ) {
+                            android.util.Log.i(TAG, "peer delivery ACK ${messageId.take(12)}… from ${idFp.take(8)}…")
+                            flushPending(idFp)
+                        } else if (pendingDeliveries.awaitingAck(idFp, messageId)) {
+                            android.util.Log.w(TAG, "retaining delivery ACK ${messageId.take(12)}…: host queue is full")
+                        }
+                    }
+                }
+            }
         }
     }
 
-    private fun handleFileTransfer(addr: String, packetBytes: ByteArray, info: MeshPacketInfo) {
-        val recipient = info.recipientIdHex.lowercase()
-        if (recipient != myPeerIdHex) return
-
-        val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: return
-        val tsMs = packetTimestampMs(packetBytes) ?: System.currentTimeMillis()
-        val payloadHash = Sha256.hash(info.payload).copyOf(8).toHex()
-        val transferKey = "${info.senderIdHex}-$tsMs-$payloadHash"
-        if (!seenFileIds.add(transferKey)) return
-        if (seenFileIds.size > 1024) seenFileIds.clear()
-
-        val file = runCatching { meshDecodeFilePacket(info.payload) }.getOrNull() ?: return
-        val bytes = file.content
-        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) {
-            android.util.Log.w(TAG, "dropping file transfer size=${bytes.size} from $addr")
-            return
-        }
-        val mime = normalizedMime(file.mimeType, bytes) ?: run {
-            android.util.Log.w(TAG, "dropping file transfer mime=${file.mimeType} size=${bytes.size} from $addr")
-            return
-        }
-        val filename = safeFileName(file.fileName, mime, tsMs)
-        val messageId = "$transferKey-file"
-        onFile.forEach { it(fp, messageId, filename, mime, bytes) }
+    private fun handleFileTransfer(addr: String, _packetBytes: ByteArray, _info: MeshPacketInfo) {
+        // Directed type-0x22 payloads are signed plaintext, not Noise-encrypted.
+        // Refuse them until cross-platform encrypted chunks + durable ACK exist.
+        android.util.Log.w(TAG, "dropping legacy plaintext private file transfer from $addr")
     }
 
     private fun handshakePacket(peerIdHex: String, noiseMsg: ByteArray): ByteArray =
@@ -858,12 +1160,21 @@ object MeshGatt {
         flushPending(fp)
     }
 
-    private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray {
-        val plain = meshEncodePrivateMessage(messageId, text)
+    private fun encryptedNoisePacket(peerAddress: String, link: Link, plain: ByteArray): ByteArray {
         val ciphertext = link.noise.encrypt(plain)
         val peerId = peerIdByAddr[peerAddress] ?: ""
         return meshBuildPacket(TYPE_NOISE_ENCRYPTED, myPeerIdHex, peerId, DEFAULT_TTL, System.currentTimeMillis().toULong(), ciphertext)
     }
+
+    private fun encryptedPrivatePacket(peerAddress: String, link: Link, messageId: String, text: String): ByteArray =
+        encryptedNoisePacket(peerAddress, link, meshEncodePrivateMessage(messageId, text))
+
+    private fun encryptedDeliveryAckPacket(peerAddress: String, link: Link, messageId: String): ByteArray =
+        encryptedNoisePacket(
+            peerAddress,
+            link,
+            meshDeliveryAckPayload(messageId),
+        )
 
     private fun fileTransferPacket(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): ByteArray? {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return null
@@ -899,17 +1210,18 @@ object MeshGatt {
         peerAddress: String,
         packet: ByteArray,
         originalType: UByte = TYPE_NOISE_ENCRYPTED,
-        write: (ByteArray) -> Unit,
+        onComplete: ((Boolean) -> Unit)? = null,
+        write: (ByteArray, ((Boolean) -> Unit)?) -> Boolean,
     ): Boolean = runCatching {
         if (packet.size <= MAX_SINGLE_GATT_PACKET_BYTES) {
-            write(packet)
-            return@runCatching true
+            return@runCatching write(packet, onComplete)
         }
 
         val peerId = peerIdByAddr[peerAddress] ?: ""
         val fragments = meshFragment(packet, randomFragmentIdHex(), originalType, FRAGMENT_CHUNK_SIZE)
+        val fragmentCompletion = onComplete?.let(::FragmentCompletion)
         android.util.Log.i(TAG, "fragmenting 0x${originalType.toString(16)} packet ${packet.size}B into ${fragments.size} chunk(s) → $peerAddress")
-        fragments.forEach { payload ->
+        fragments.forEachIndexed { index, payload ->
             val fragmentPacket = meshBuildPacket(
                 TYPE_FRAGMENT,
                 myPeerIdHex,
@@ -918,7 +1230,8 @@ object MeshGatt {
                 System.currentTimeMillis().toULong(),
                 payload,
             )
-            write(fragmentPacket)
+            val completion = fragmentCompletion?.callback(finalFragment = index == fragments.lastIndex)
+            if (!write(fragmentPacket, completion)) return@runCatching false
         }
         true
     }.getOrElse {
@@ -927,7 +1240,13 @@ object MeshGatt {
     }
 
     /** Send an encrypted DM to an established, writable peer route. */
-    fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
+    private fun sendText(
+        peerAddress: String,
+        messageId: String,
+        text: String,
+        onComplete: ((Boolean) -> Unit)? = null,
+    ): Boolean = runCatching {
+        if (!active) return@runCatching false
         val client = clientLinks[peerAddress]?.takeIf { it.established }
         val gatt = clientGatt[peerAddress]
         val ch = clientChar[peerAddress]
@@ -935,7 +1254,8 @@ object MeshGatt {
             return@runCatching writePacketMaybeFragmented(
                 peerAddress,
                 encryptedPrivatePacket(peerAddress, client, messageId, text),
-            ) { writePacket(gatt, ch, it) }
+                onComplete = onComplete,
+            ) { packet, completion -> writePacket(gatt, ch, packet, completion) }
         }
         val server = serverLinks[peerAddress]?.takeIf { it.established }
         val device = serverDevices[peerAddress]
@@ -943,7 +1263,8 @@ object MeshGatt {
             return@runCatching writePacketMaybeFragmented(
                 peerAddress,
                 encryptedPrivatePacket(peerAddress, server, messageId, text),
-            ) { notify(device, it) }
+                onComplete = onComplete,
+            ) { packet, completion -> notify(device, packet, completion) }
         }
         false
     }.getOrElse {
@@ -951,11 +1272,45 @@ object MeshGatt {
         false
     }
 
-    /** DMs queued for a peer that has no live link yet, flushed when one forms.
-     *  Mesh links are intermittent (BLE MAC rotation + scanner stalls), so a peer
-     *  can be visible on the radar without a live encrypted link this instant —
-     *  queue the message instead of failing, and deliver it on (re)connect. */
-    private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
+    /** ACK only after the host has durably accepted the inbound stable id. */
+    @Synchronized
+    fun acknowledgeText(fingerprint: String, messageId: String): Boolean = runCatching {
+        if (!active || messageId.isBlank()) return@runCatching false
+        val addr = sendableAddrFor(fingerprint) ?: return@runCatching false
+        val client = clientLinks[addr]?.takeIf { it.established }
+        val gatt = clientGatt[addr]
+        val ch = clientChar[addr]
+        val completion: (Boolean) -> Unit = { success ->
+            if (!success) synchronized(MeshGatt) { disconnectAddr(addr) }
+        }
+        val sent = if (client != null && gatt != null && ch != null) {
+            writePacketMaybeFragmented(
+                addr,
+                encryptedDeliveryAckPacket(addr, client, messageId),
+                onComplete = completion,
+            ) { packet, completion -> writePacket(gatt, ch, packet, completion) }
+        } else {
+            val serverLink = serverLinks[addr]?.takeIf { it.established }
+            val device = serverDevices[addr]
+            if (serverLink != null && device != null) {
+                writePacketMaybeFragmented(
+                    addr,
+                    encryptedDeliveryAckPacket(addr, serverLink, messageId),
+                    onComplete = completion,
+                ) { packet, completion -> notify(device, packet, completion) }
+            } else {
+                false
+            }
+        }
+        // Encryption advances the Noise sending nonce before Binder accepts the
+        // packet. A rejected write therefore requires a fresh handshake; keeping
+        // this session would make the peer unable to decrypt our next ACK.
+        if (!sent) disconnectAddr(addr)
+        sent
+    }.getOrElse {
+        android.util.Log.w(TAG, "delivery ACK failed for ${fingerprint.take(8)}…: ${it.message}")
+        false
+    }
 
     private fun canSendOnAddr(addr: String): Boolean =
         (clientLinks[addr]?.established == true && clientGatt[addr] != null && clientChar[addr] != null) ||
@@ -977,15 +1332,51 @@ object MeshGatt {
      *  link (re)establishes. Returns true for policy-allowed peers because the
      *  UI echoes optimistically; policy-rejected peers fail instead of creating
      *  pending work. */
+    @Synchronized
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
-        if (!peerAllowedByPolicy(fingerprint)) return false
-        val addr = sendableAddrFor(fingerprint)
-        if (addr != null && sendText(addr, messageId, text)) return true
-        pendingSends.getOrPut(fingerprint) { java.util.concurrent.ConcurrentLinkedQueue() }.add(messageId to text)
+        if (!active || !peerAllowedByPolicy(fingerprint)) return false
+        if (!pendingDeliveries.enqueue(fingerprint, messageId, text)) return false
+        flushPending(fingerprint)
         return true
     }
 
+    /** Rehydrate process-independent logical sends without requiring a current
+     * Activity/BLE lifecycle. A later link establishment calls flushPending. */
+    @Synchronized
+    fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>) {
+        records.sortedWith(compareBy<MeshPendingDeliveryRecord> { it.peerId }.thenBy { it.sequence }).forEach { record ->
+            pendingDeliveries.enqueue(record.peerId, record.messageId, record.text)
+        }
+        if (active) records.mapTo(linkedSetOf()) { it.peerId }.forEach(::flushPending)
+    }
+
+    @Synchronized
+    fun discardPendingDeliveries(peerIds: Set<String>) {
+        peerIds.forEach(pendingDeliveries::clear)
+    }
+
+    @Synchronized
+    fun discardPendingDelivery(peerId: String, messageId: String) {
+        if (pendingDeliveries.discard(peerId, messageId) && active) flushPending(peerId)
+    }
+
+    @Synchronized
+    fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean =
+        pendingDeliveries.claimExpiry(peerId, messageId)
+
+    @Synchronized
+    fun releasePendingDeliveryExpiry(peerId: String, messageId: String) {
+        pendingDeliveries.releaseExpiry(peerId, messageId)
+        if (active) flushPending(peerId)
+    }
+
+    @Synchronized
+    fun finishDeliveryAck(peerId: String, messageId: String) {
+        pendingDeliveries.finishAcknowledgement(peerId, messageId)
+    }
+
     /** Immediate send for real-time controls. Never queues. */
+    @Synchronized
     fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
         val addr = sendableAddrFor(fingerprint) ?: return false
         sendDiscoveryToAddr(addr, "pre-control")
@@ -995,6 +1386,7 @@ object MeshGatt {
     /** Send a private file transfer to a live peer route. Binary media is not
      * queued: large stale transfers after a BLE reconnect are worse than an
      * immediate route failure, and Marmot remains the out-of-range fallback. */
+    @Synchronized
     fun sendFileToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean {
         val addr = sendableAddrFor(fingerprint) ?: return false
         sendDiscoveryToAddr(addr, "pre-file")
@@ -1006,11 +1398,15 @@ object MeshGatt {
         val gatt = clientGatt[peerAddress]
         val ch = clientChar[peerAddress]
         if (gatt != null && ch != null) {
-            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { writePacket(gatt, ch, it) }
+            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { value, _ ->
+                writePacket(gatt, ch, value)
+            }
         }
         val device = serverDevices[peerAddress]
         if (device != null) {
-            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { notify(device, it) }
+            return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { value, _ ->
+                notify(device, value)
+            }
         }
         false
     }.getOrElse {
@@ -1019,13 +1415,66 @@ object MeshGatt {
     }
 
     /** Flush any queued DMs to [fingerprint] now that an encrypted link is up. */
+    @Synchronized
     private fun flushPending(fingerprint: String) {
-        val q = pendingSends[fingerprint] ?: return
-        while (true) {
-            val (mid, txt) = q.poll() ?: break
-            if (!sendTextToPeerNow(fingerprint, mid, txt)) {
-                q.add(mid to txt)
-                break
+        if (!active) return
+        val addr = sendableAddrFor(fingerprint) ?: return
+        val clientLink = clientLinks[addr]?.takeIf {
+            it.established && clientGatt[addr] != null && clientChar[addr] != null
+        }
+        val serverLink = serverLinks[addr]?.takeIf {
+            it.established && serverDevices[addr] != null
+        }
+        val routeId = when {
+            clientLink != null -> clientRouteId(addr, clientLink.generation)
+            serverLink != null -> serverRouteId(addr, serverLink.generation)
+            else -> return
+        }
+        val delivery = pendingDeliveries.beginNext(fingerprint, routeId) ?: return
+        val accepted = sendText(addr, delivery.messageId, delivery.text) { transportAccepted ->
+            synchronized(MeshGatt) {
+                pendingDeliveries.finishTransport(
+                    fingerprint,
+                    delivery.messageId,
+                    transportAccepted,
+                    routeId,
+                )
+                if (!transportAccepted && active) {
+                    // A failed reliable operation invalidates this Noise route;
+                    // retain the logical message and retry only after re-handshake.
+                    disconnectRoute(routeId, addr)
+                    flushPending(fingerprint)
+                }
+            }
+        }
+        if (accepted) {
+            // Start at queue admission, not at the controller callback: some
+            // Android stacks never invoke onCharacteristicWrite/onNotificationSent
+            // after accepting a Binder operation. One watchdog therefore covers
+            // both a missing local callback and a missing peer ACK.
+            handler.postDelayed({
+                synchronized(MeshGatt) {
+                    if (!active || !pendingDeliveries.retryIfAwaiting(fingerprint, delivery.messageId, routeId)) {
+                        return@synchronized
+                    }
+                    android.util.Log.w(
+                        TAG,
+                        "peer delivery ACK timed out ${delivery.messageId.take(12)}…; retrying after re-handshake",
+                    )
+                    disconnectRoute(routeId, addr)
+                    flushPending(fingerprint)
+                }
+            }, DELIVERY_ACK_TIMEOUT_MS)
+        } else {
+            pendingDeliveries.finishTransport(
+                fingerprint,
+                delivery.messageId,
+                accepted = false,
+                routeId = routeId,
+            )
+            if (active) {
+                disconnectRoute(routeId, addr)
+                flushPending(fingerprint)
             }
         }
     }
@@ -1107,29 +1556,47 @@ object MeshGatt {
     // onCharacteristicWrite — so issuing announce + Noise m1 + 0x53 back-to-back
     // silently DROPPED the middle write (the handshake m1), and the Noise DM never
     // established. Serialize: enqueue, issue one at a time, drain on completion.
-    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
-    private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<GattIo>>()
+    private val clientWriteInFlight = ConcurrentHashMap<String, GattIo>()
 
-    private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
-        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
-        pumpClientWrites(gatt.device.address)
+    @Synchronized
+    private fun writePacket(
+        gatt: BluetoothGatt,
+        ch: BluetoothGattCharacteristic,
+        packet: ByteArray,
+        onComplete: ((Boolean) -> Unit)? = null,
+    ): Boolean {
+        val addr = gatt.device.address
+        if (!active || clientGatt[addr] !== gatt || clientChar[addr] !== ch) return false
+        clientWriteQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }.add(GattIo(packet, onComplete))
+        pumpClientWrites(addr)
+        return true
     }
 
     /** Issue the next queued write for [addr] iff none is in flight. */
     @Synchronized
     private fun pumpClientWrites(addr: String) {
-        if (clientWriting.contains(addr)) return
+        if (!active) return
+        if (clientWriteInFlight.containsKey(addr)) return
         val q = clientWriteQueue[addr] ?: return
-        val next = q.poll() ?: return
         val gatt = clientGatt[addr] ?: return
         val ch = clientChar[addr] ?: return
-        clientWriting.add(addr)
-        if (!issueWrite(gatt, ch, next)) {
+        val next = q.poll() ?: return
+        clientWriteInFlight[addr] = next
+        // stop(), enqueue, and both pumps share this object's monitor. Keep this
+        // final lifecycle check next to the Binder call so once stop() returns no
+        // queued write can reach a closed GATT object.
+        if (!active) {
+            clientWriteInFlight.remove(addr)
+            return
+        }
+        if (!issueWrite(gatt, ch, next.packet)) {
             // The write wasn't accepted ⇒ onCharacteristicWrite won't fire; don't
             // stall the queue — drop it and move on.
             android.util.Log.w(TAG, "write not accepted for $addr — skipping")
-            clientWriting.remove(addr)
-            pumpClientWrites(addr)
+            clientWriteInFlight.remove(addr)
+            next.onComplete?.invoke(false)
+            if (active && clientGatt[addr] === gatt) pumpClientWrites(addr)
         }
     }
 
@@ -1148,41 +1615,68 @@ object MeshGatt {
     // Server notify queue — same one-outstanding-at-a-time rule as client writes
     // (the next notify must wait for onNotificationSent), so the announce + 0x53 +
     // handshake m2 a server emits back-to-back must be serialized or they drop.
-    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
-    private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<GattIo>>()
+    private val serverNotifyInFlight = ConcurrentHashMap<String, GattIo>()
 
-    private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
-        pumpServerNotify(device.address)
+    @Synchronized
+    private fun notify(
+        device: BluetoothDevice,
+        packet: ByteArray,
+        onComplete: ((Boolean) -> Unit)? = null,
+    ): Boolean {
+        val addr = device.address
+        if (!active || serverDevices[addr] !== device) return false
+        serverNotifyQueue.getOrPut(addr) { java.util.concurrent.ConcurrentLinkedQueue() }.add(GattIo(packet, onComplete))
+        pumpServerNotify(addr)
+        return true
     }
 
-    private fun notifyDiscoveryBurst(device: BluetoothDevice) {
+    private fun notifyDiscoveryBurst(device: BluetoothDevice, generation: Long) {
         listOf(0L, 350L, 1_200L).forEach { delayMs ->
             handler.postDelayed({
-                val ann = announceBytes()
-                val sonar = sonarBytes()
-                android.util.Log.i(
-                    TAG,
-                    "server ${device.address}: discovery notify announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B delay=${delayMs}ms",
-                )
-                ann?.let { notify(device, it) }
-                sonar?.let { p -> handler.postDelayed({ notify(device, p) }, 150) }
+                synchronized(MeshGatt) {
+                    val expected = serverDevices[device.address] === device
+                    if (!acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, expected)) return@synchronized
+                    val ann = announceBytes()
+                    val sonar = sonarBytes()
+                    android.util.Log.i(
+                        TAG,
+                        "server ${device.address}: discovery notify announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B delay=${delayMs}ms",
+                    )
+                    ann?.let { notify(device, it) }
+                    sonar?.let { p ->
+                        handler.postDelayed({
+                            synchronized(MeshGatt) {
+                                val stillExpected = serverDevices[device.address] === device
+                                if (acceptsMeshLifecycleCallback(active, lifecycleGeneration, generation, stillExpected)) notify(device, p)
+                            }
+                        }, 150)
+                    }
+                }
             }, delayMs)
         }
     }
 
     @Synchronized
     private fun pumpServerNotify(addr: String) {
-        if (serverNotifying.contains(addr)) return
+        if (!active) return
+        if (serverNotifyInFlight.containsKey(addr)) return
         val q = serverNotifyQueue[addr] ?: return
-        val next = q.poll() ?: return
         val s = server ?: return
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return
-        serverNotifying.add(addr)
-        if (!issueNotify(s, device, ch, next)) {
-            serverNotifying.remove(addr)
-            pumpServerNotify(addr)
+        val next = q.poll() ?: return
+        serverNotifyInFlight[addr] = next
+        // See pumpClientWrites(): this check and the platform notify are atomic
+        // with respect to stop() under the shared object monitor.
+        if (!active) {
+            serverNotifyInFlight.remove(addr)
+            return
+        }
+        if (!issueNotify(s, device, ch, next.packet)) {
+            serverNotifyInFlight.remove(addr)
+            next.onComplete?.invoke(false)
+            if (active && serverDevices[addr] === device) pumpServerNotify(addr)
         }
     }
 

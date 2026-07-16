@@ -18,12 +18,16 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
     let idBridge = NostrIdentityBridge(keychain: keychainHelper)
     let identityManager = MockIdentityManager(keychain)
     let transport = MockTransport()
+    let messageStore = MessageStore(
+        directoryName: "ChatViewModelTorTests-\(UUID().uuidString)"
+    )
 
     let viewModel = ChatViewModel(
         keychain: keychain,
         idBridge: idBridge,
         identityManager: identityManager,
-        transport: transport
+        transport: transport,
+        messageStore: messageStore
     )
 
     return (viewModel, transport)
@@ -36,10 +40,12 @@ struct ChatViewModelTorTests {
     // MARK: - handleTorWillStart Tests
 
     @Test @MainActor
-    func handleTorWillStart_whenEnforced_setsAnnouncedFlag() async {
+    func handleTorWillStart_whenDisabled_doesNotSetAnnouncedFlag() async {
         let (viewModel, _) = makeTestableViewModel()
 
-        // Precondition: flag should start false
+        // Tor is intentionally disabled in Sonar. Reset the initialization
+        // announcement so this test only observes the notification handler.
+        viewModel.torStatusAnnounced = false
         #expect(!viewModel.torStatusAnnounced)
 
         // Action: simulate Tor starting notification
@@ -48,8 +54,7 @@ struct ChatViewModelTorTests {
         // Wait for Task to complete
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        // Assert: flag should be set (torEnforced is true in tests)
-        #expect(viewModel.torStatusAnnounced)
+        #expect(!viewModel.torStatusAnnounced)
     }
 
     @Test @MainActor
@@ -120,7 +125,7 @@ struct ChatViewModelTorTests {
     }
 
     @Test @MainActor
-    func handleTorDidBecomeReady_initialStart_setsAnnouncedFlag() async {
+    func handleTorDidBecomeReady_whenDisabled_doesNotSetAnnouncedFlag() async {
         let (viewModel, _) = makeTestableViewModel()
 
         // Setup: not restarting, but initial ready not announced yet
@@ -131,8 +136,7 @@ struct ChatViewModelTorTests {
         viewModel.handleTorDidBecomeReady()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        // Assert: should set flag (torEnforced is true in tests)
-        #expect(viewModel.torInitialReadyAnnounced)
+        #expect(!viewModel.torInitialReadyAnnounced)
     }
 
     @Test @MainActor

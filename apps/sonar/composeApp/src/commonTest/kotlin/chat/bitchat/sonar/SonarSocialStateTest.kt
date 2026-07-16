@@ -85,4 +85,15 @@ class SonarSocialStateTest {
         assertEquals("d".repeat(64), normalizeSocialNostrKey("0x" + "d".repeat(64)))
         assertEquals(null, normalizeSocialNostrKey("d".repeat(62)))
     }
+
+    @Test
+    fun favoriteRelationAndRouteRoundTripAtomically() {
+        val state = SonarSocialState().withRemoteFavoritePeer("peer-a", true)
+        val links = mapOf("peer-a" to "a".repeat(64), "peer-b" to "b".repeat(64))
+
+        val decoded = decodeFavoriteRouteState(encodeFavoriteRouteState(state, links))
+
+        assertEquals(state, decoded?.first)
+        assertEquals(links, decoded?.second)
+    }
 }

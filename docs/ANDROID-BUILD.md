@@ -64,6 +64,14 @@ adb devices
 adb install -r composeApp/build/outputs/apk/debug/composeApp-debug.apk
 ```
 
+### Android BLE mesh lifecycle
+
+The scanner, advertiser, watchdog, and GATT links run only while `MainActivity`
+is started/visible. `onStop` closes them before Android can cache and freeze the
+process; internet relay sync and durable outbox delivery remain available in the
+background. Background BLE mesh is intentionally unsupported unless it is later
+moved into a user-visible `connectedDevice` foreground service.
+
 ### Manual Rust core rebuild
 
 Usually unnecessary — Gradle depends on `buildAndroidRustCore`. Force a core

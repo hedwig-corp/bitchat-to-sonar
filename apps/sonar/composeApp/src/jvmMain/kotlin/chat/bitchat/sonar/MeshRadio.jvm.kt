@@ -38,6 +38,7 @@ actual object MeshRadio {
     }
 
     actual fun start() {
+        if (PanicWipeIntent.isPending()) return
         if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
         BleBridge.start()            // central: filtered scan
         refreshAnnounce()
@@ -49,6 +50,18 @@ actual object MeshRadio {
         MeshLink.stop()
         BleBridge.stop()
         BleBridge.stopAdvertising()
+    }
+
+    actual fun resetAccountState() {
+        stop()
+        // Discard packets already handed off by the native BLE callback before
+        // clearing protocol/account state so they cannot enter the next account.
+        BleBridge.drainRx()
+        MeshLink.wipe()
+        MeshIdentity.resetAccountState()
+        nick = "sonar"
+        discoveryMode = BleDiscoveryMode.Normal
+        knownPeerIds.clear()
     }
 
     private fun refreshAnnounce() {
@@ -96,6 +109,25 @@ actual object MeshRadio {
     actual fun localPeerIdHex(): String = MeshIdentity.peerIdHex
     actual fun drainMeshDm(): List<MeshDmIn> =
         MeshLink.drainDms().filter { isKnownPeer(it.peerId) }
+    actual fun restorePendingDeliveries(records: List<MeshPendingDeliveryRecord>) =
+        MeshLink.restorePendingDeliveries(records)
+    actual fun discardPendingDeliveries(peerIds: Set<String>) =
+        MeshLink.discardPendingDeliveries(peerIds)
+    actual fun discardPendingDelivery(peerId: String, messageId: String) =
+        MeshLink.discardPendingDelivery(peerId, messageId)
+
+    actual fun claimPendingDeliveryExpiry(peerId: String, messageId: String): Boolean =
+        MeshLink.claimPendingDeliveryExpiry(peerId, messageId)
+
+    actual fun releasePendingDeliveryExpiry(peerId: String, messageId: String) =
+        MeshLink.releasePendingDeliveryExpiry(peerId, messageId)
+
+    actual fun finishMeshDeliveryAck(peerId: String, messageId: String) =
+        MeshLink.finishDeliveryAck(peerId, messageId)
+    actual fun drainMeshDeliveryAcks(): List<MeshDeliveryAck> =
+        MeshLink.drainDeliveryAcks()
+    actual fun acknowledgeMeshDm(peerId: String, messageId: String): Boolean =
+        MeshLink.acknowledgeDm(peerId, messageId)
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = false
     actual fun drainMeshMedia(): List<MeshMediaIn> = emptyList()
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000

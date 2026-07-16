@@ -4,8 +4,14 @@ import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
 import chat.bitchat.sonar.SonarStickerRef
+import chat.bitchat.sonar.MeshPendingDeliveryRecord
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -26,6 +32,17 @@ class MessageCodecTest {
             SonarMsg("a", "npub1xx", "hi 👋", mine = true, tsSecs = 1),
             SonarMsg("b", "npub1yy", "multi\nline\tmsg", mine = false, tsSecs = 2),
         )
+        assertEquals(msgs, MessageCodec.decodeDm(MessageCodec.encodeDm(msgs)))
+    }
+
+    @Test fun dmRoundTripPreservesDurableDeliveryState() {
+        val msgs = listOf(
+            SonarMsg("sending", "me", "one", mine = true, tsSecs = 1, state = "Sending"),
+            SonarMsg("delivered", "me", "two", mine = true, tsSecs = 2, state = "Delivered"),
+            SonarMsg("failed", "me", "three", mine = true, tsSecs = 3, state = "Couldn't send"),
+            SonarMsg("incoming", "peer", "four", mine = false, tsSecs = 4, receiveEffectsPending = true),
+        )
+
         assertEquals(msgs, MessageCodec.decodeDm(MessageCodec.encodeDm(msgs)))
     }
 
@@ -57,6 +74,367 @@ class MessageCodecTest {
 
     @Test fun meshEnvelopeRejectsGarbage() {
         assertEquals(null, MessageCodec.decodeMeshEnvelope(""))
+    }
+
+    @Test fun meshSummaryIndexRoundTripsUnsafeContentInNewestFirstOrder() {
+        val summaries = listOf(
+            MeshDmSummary(
+                "peer\told\n|⚡",
+                SonarMsg("old", "", "old\npreview", mine = false, tsSecs = 10),
+            ),
+            MeshDmSummary(
+                "peer-new",
+                SonarMsg("new", "", "new\tpreview|⚡", mine = true, tsSecs = 20, state = "Sending"),
+            ),
+        )
+
+        assertEquals(
+            summaries.reversed(),
+            MessageCodec.decodeMeshSummaryIndex(MessageCodec.encodeMeshSummaryIndex(summaries)),
+        )
+        assertNull(MessageCodec.decodeMeshSummaryIndex("not-a-summary-index"))
+    }
+
+    @Test fun meshSummaryPageIsStrictlyBoundedAndDeterministic() {
+        val summaries = (0 until MESH_DM_SUMMARY_LIMIT + 50).map { index ->
+            MeshDmSummary(
+                peerKey = "peer-${index.toString().padStart(3, '0')}",
+                latest = SonarMsg("id-$index", "", "preview", mine = false, tsSecs = index.toLong()),
+            )
+        }
+
+        val bounded = boundedMeshDmSummaries(summaries.shuffled())
+
+        assertEquals(MESH_DM_SUMMARY_LIMIT, bounded.size)
+        assertEquals((50 until 250).reversed().map { "peer-${it.toString().padStart(3, '0')}" }, bounded.map { it.peerKey })
+    }
+
+    @Test fun authoritativeSummaryCatalogPagesKeepEveryPeerBeyondFirstPaint() {
+        val summaries = (0 until 451).associate { index ->
+            val peer = "peer-${index.toString().padStart(3, '0')}"
+            peer to MeshDmSummary(peer, SonarMsg("id-$index", "", "preview", false, index.toLong()))
+        }
+        val peerPages = summaries.keys.chunked(MESH_SUMMARY_CATALOG_PAGE_SIZE)
+        var tailReads = 0
+        var pageReads = 0
+        var summaryReads = 0
+        val discovered = mutableListOf<MeshDmSummary>()
+        var cursor: String? = null
+        do {
+            val page = readBoundedMeshSummaryCatalogPage(
+                afterCursor = cursor,
+                limit = MESH_DM_SUMMARY_LIMIT,
+                lastPage = { tailReads += 1; peerPages.lastIndex },
+                readPeerPage = { pageNumber -> pageReads += 1; peerPages[pageNumber] },
+                readSummary = { peer -> summaryReads += 1; summaries[peer] },
+            )
+            assertTrue(page.summaries.size <= MESH_DM_SUMMARY_LIMIT)
+            discovered += page.summaries
+            cursor = page.nextCursor
+        } while (cursor != null)
+
+        assertEquals(summaries.keys.toList(), discovered.map { it.peerKey })
+        assertEquals(451, discovered.distinctBy { it.peerKey }.size)
+        assertEquals(3, tailReads)
+        assertEquals(3, pageReads)
+        assertEquals(451, summaryReads)
+    }
+
+    @Test fun arbitraryCatalogCursorTouchesOneBoundedPageOnly() {
+        val peerPages = (0 until 50).associateWith { page ->
+            (0 until MESH_SUMMARY_CATALOG_PAGE_SIZE).map { "peer-$page-$it" }
+        }
+        var tailReads = 0
+        var pageReads = 0
+        var summaryReads = 0
+
+        val page = readBoundedMeshSummaryCatalogPage(
+            afterCursor = "25:0",
+            limit = MESH_SUMMARY_CATALOG_PAGE_SIZE,
+            lastPage = { tailReads += 1; 49 },
+            readPeerPage = { pageNumber -> pageReads += 1; peerPages[pageNumber] },
+            readSummary = { peer ->
+                summaryReads += 1
+                MeshDmSummary(peer, SonarMsg(peer, "", "preview", false, 1))
+            },
+        )
+
+        assertEquals(MESH_SUMMARY_CATALOG_PAGE_SIZE, page.summaries.size)
+        assertEquals("26:0", page.nextCursor)
+        assertEquals(1, tailReads)
+        assertEquals(1, pageReads)
+        assertEquals(MESH_SUMMARY_CATALOG_PAGE_SIZE, summaryReads)
+    }
+
+    @Test fun catalogCursorOffsetsRemainStableAcrossEarlierDeletion() {
+        var slots: List<String?> = (0 until MESH_SUMMARY_CATALOG_PAGE_SIZE).map { "peer-$it" }
+        val first = readBoundedMeshSummaryCatalogPage(
+            afterCursor = null,
+            limit = 100,
+            lastPage = { 0 },
+            readPeerPage = { slots },
+            readSummary = { peer -> MeshDmSummary(peer, SonarMsg(peer, "", "", false, 1)) },
+        )
+        assertEquals("0:100", first.nextCursor)
+
+        // Durable deletion keeps the original slot as a tombstone instead of
+        // compacting every later offset under an in-flight cursor.
+        slots = slots.mapIndexed { index, peer -> if (index == 10) null else peer }
+        val second = readBoundedMeshSummaryCatalogPage(
+            afterCursor = first.nextCursor,
+            limit = 100,
+            lastPage = { 0 },
+            readPeerPage = { slots },
+            readSummary = { peer -> MeshDmSummary(peer, SonarMsg(peer, "", "", false, 1)) },
+        )
+
+        assertEquals("peer-100", second.summaries.first().peerKey)
+        assertEquals("peer-199", second.summaries.last().peerKey)
+    }
+
+    @Test fun catalogPageAndAssignmentCodecsAreStrictAndDelimiterSafe() {
+        val peers = listOf("peer\none", "peer\ttwo⚡")
+        assertEquals(peers, MessageCodec.decodeMeshSummaryPeerPage(MessageCodec.encodeMeshSummaryPeerPage(peers)))
+        assertEquals(42, MessageCodec.decodeMeshSummaryAssignment(MessageCodec.encodeMeshSummaryAssignment(42)))
+        assertNull(MessageCodec.decodeMeshSummaryAssignment("broken"))
+    }
+
+    @Test fun missingAssignmentRetryKeepsExactlyOnePeerSlot() {
+        val firstPageCommit = meshSummaryPageWithSinglePeer(emptyList(), "peer-retry")!!
+
+        // Simulate a crash/failure after the page commit but before the separate
+        // assignment marker commit. The next attempt sees the durable page.
+        val retryPageCommit = meshSummaryPageWithSinglePeer(firstPageCommit, "peer-retry")!!
+
+        assertEquals(firstPageCommit, retryPageCommit)
+        assertEquals(1, retryPageCommit.count { it == "peer-retry" })
+    }
+
+    @Test fun visibleAssignmentAfterParentFsyncFailureIsRecommittedOnRetry() {
+        var markerVisible = false
+        var markerCommitAttempts = 0
+        var pageCommitAttempts = 0
+        fun commitMarker(parentFsyncSucceeds: Boolean): Boolean {
+            markerVisible = true // rename succeeded before the injected failure
+            markerCommitAttempts += 1
+            return parentFsyncSucceeds
+        }
+
+        val first = commitMeshSummaryAssignment(
+            pageContainsPeer = true,
+            commitPageIfRequired = { pageCommitAttempts += 1; true },
+            commitAssignment = { commitMarker(parentFsyncSucceeds = false) },
+        )
+        assertFalse(first)
+        assertTrue(markerVisible)
+
+        val retry = commitMeshSummaryAssignment(
+            pageContainsPeer = true,
+            commitPageIfRequired = { pageCommitAttempts += 1; true },
+            commitAssignment = { commitMarker(parentFsyncSucceeds = true) },
+        )
+
+        assertTrue(retry)
+        assertEquals(2, markerCommitAttempts)
+        assertEquals(0, pageCommitAttempts)
+    }
+
+    @Test fun duplicatePeerSlotsDecodeAsStableTombstonesAndCanonicalize() {
+        val duplicatePage = MessageCodec.encodeMeshSummaryPeerPage(
+            listOf("peer-retry", "other", "peer-retry"),
+        )
+        val decoded = MessageCodec.decodeMeshSummaryPeerPage(duplicatePage)!!
+
+        assertEquals(listOf("peer-retry", "other", null), decoded)
+        assertEquals(decoded, meshSummaryPageWithSinglePeer(decoded, "peer-retry"))
+    }
+
+    @Test fun blockedRepairEnumerationDoesNotBlockImmediateChatOpen() = runTest {
+        val locks = MessageStoreMutationLocks()
+        val enumerationStarted = CompletableDeferred<Unit>()
+        val finishEnumeration = CompletableDeferred<Unit>()
+        val repair = launch {
+            snapshotMeshRepairCandidates(
+                locks = locks,
+                repairPending = {},
+                enumerate = {
+                    enumerationStarted.complete(Unit)
+                    finishEnumeration.await()
+                },
+            )
+        }
+        enumerationStarted.await()
+
+        val opened = withTimeout(1_000) {
+            locks.withTranscript { "bounded local transcript" }
+        }
+
+        assertEquals("bounded local transcript", opened)
+        finishEnumeration.complete(Unit)
+        repair.join()
+    }
+
+    @Test fun authoritativeSummaryRowRoundTripsUnsafePeerAndPreview() {
+        val summary = MeshDmSummary(
+            "peer\tunsafe\n⚡",
+            SonarMsg("id", "sender", "preview\nwith\ttabs", mine = false, tsSecs = 42),
+        )
+        assertEquals(summary, MessageCodec.decodeMeshSummary(MessageCodec.encodeMeshSummary(summary)))
+    }
+
+    @Test fun transcriptSummaryTransactionReportsEveryDurabilityPhase() {
+        val failures = listOf(
+            MeshSummaryTransactionOutcome.RepairIntentWriteFailed,
+            MeshSummaryTransactionOutcome.TranscriptMutationFailed,
+            MeshSummaryTransactionOutcome.CatalogCommitFailed,
+            MeshSummaryTransactionOutcome.RepairIntentClearFailed,
+        )
+
+        failures.forEachIndexed { failedStage, expected ->
+            val events = mutableListOf<Int>()
+            val outcome = meshSummaryTransactionOutcome(
+                writeRepairIntent = { events += 0; failedStage != 0 },
+                mutateTranscript = { events += 1; failedStage != 1 },
+                commitCatalog = { events += 2; failedStage != 2 },
+                clearRepairIntent = { events += 3; failedStage != 3 },
+            )
+
+            assertEquals(expected, outcome)
+            assertEquals((0..failedStage).toList(), events)
+        }
+
+        assertEquals(
+            MeshSummaryTransactionOutcome.Committed,
+            meshSummaryTransactionOutcome({ true }, { true }, { true }, { true }),
+        )
+    }
+
+    @Test fun booleanSummaryTransactionOnlyCommitsAfterRepairIntentIsCleared() {
+        assertFalse(commitMeshSummaryTransaction({ true }, { true }, { true }, { false }))
+        assertTrue(commitMeshSummaryTransaction({ true }, { true }, { true }, { true }))
+    }
+
+    @Test fun quarantineAdvancesEpochBeforeCleanupFailureFencingQueuedOldWrite() {
+        var epoch = 7L
+        val queuedWriteEpoch = epoch
+        val result = commitMessageStoreRetirement(
+            detachNamespace = { true },
+            advanceEpoch = { epoch = 8L },
+            proveDetachedDurable = { true },
+            rollbackNamespace = { error("rollback must not run") },
+            cleanup = { false },
+        )
+
+        assertTrue(result.oldNamespaceDetached)
+        assertTrue(result.quarantined)
+        assertFalse(result.cleanupComplete)
+        assertFalse(result.rollbackAmbiguous)
+        assertFalse(queuedWriteEpoch == epoch)
+    }
+
+    @Test fun parentBarrierFailureDurablyRollsBackButKeepsOldEpochFenced() {
+        var epoch = 7L
+        val events = mutableListOf<String>()
+        val result = commitMessageStoreRetirement(
+            detachNamespace = { events += "detach"; true },
+            advanceEpoch = { events += "epoch"; epoch = 8L },
+            proveDetachedDurable = { events += "parent-fsync"; false },
+            rollbackNamespace = { events += "rollback+fsync"; MessageStoreRollbackOutcome.Restored },
+            cleanup = { events += "cleanup"; true },
+        )
+
+        assertEquals(listOf("detach", "epoch", "parent-fsync", "rollback+fsync"), events)
+        assertEquals(8L, epoch)
+        assertFalse(result.oldNamespaceDetached)
+        assertFalse(result.quarantined)
+        assertFalse(result.cleanupComplete)
+        assertFalse(result.rollbackAmbiguous)
+    }
+
+    @Test fun parentBarrierAndRollbackAmbiguityKeepPanicBoundaryUncommitted() {
+        var epoch = 7L
+        val result = commitMessageStoreRetirement(
+            detachNamespace = { true },
+            advanceEpoch = { epoch = 8L },
+            proveDetachedDurable = { false },
+            rollbackNamespace = { MessageStoreRollbackOutcome.Ambiguous },
+            cleanup = { error("cleanup must not run") },
+        )
+
+        assertEquals(8L, epoch)
+        assertFalse(result.oldNamespaceDetached)
+        assertFalse(result.quarantined)
+        assertFalse(result.cleanupComplete)
+        assertTrue(result.rollbackAmbiguous)
+    }
+
+    @Test fun staleCatalogRepairPreservesConcurrentlyCommittedRowsAndNewerPreview() {
+        val stale = MeshDmSummary("existing", SonarMsg("old", "", "old", false, 1))
+        val concurrentNew = MeshDmSummary("new-peer", SonarMsg("new", "", "new", false, 3))
+        val concurrentUpdate = MeshDmSummary("existing", SonarMsg("updated", "", "updated", false, 4))
+
+        val merged = mergeRecentMeshSummaryRepair(
+            scannedRecent = listOf(stale),
+            concurrentlyCommittedRecent = listOf(concurrentNew, concurrentUpdate),
+            isLive = { true },
+        )
+
+        assertEquals(listOf("existing", "new-peer"), merged.map { it.peerKey })
+        assertEquals("updated", merged.first { it.peerKey == "existing" }.latest.id)
+        assertFalse(staleRepairMayRemoveCatalogPeer("new-peer", setOf("existing"), transcriptStillExists = true))
+        assertTrue(staleRepairMayRemoveCatalogPeer("deleted", setOf("existing"), transcriptStillExists = false))
+    }
+
+    @Test fun largeOutboxMigrationLockDoesNotBlockTranscriptFirstPaint() = runTest {
+        val locks = MessageStoreMutationLocks()
+        val migrationStarted = CompletableDeferred<Unit>()
+        val finishMigration = CompletableDeferred<Unit>()
+        val migration = backgroundScope.launch {
+            locks.withOutbox {
+                migrationStarted.complete(Unit)
+                finishMigration.await()
+            }
+        }
+        migrationStarted.await()
+
+        val painted = withTimeout(1_000) {
+            locks.withTranscript { "bounded transcript page" }
+        }
+        assertEquals("bounded transcript page", painted)
+
+        finishMigration.complete(Unit)
+        migration.join()
+    }
+
+    @Test fun durableMeshPendingRoundTripPreservesCrashRecoveryFields() {
+        val record = MeshPendingDeliveryRecord(
+            peerId = "stable-peer",
+            messageId = "stable-message-id",
+            text = "line one\nline two\t⚡",
+            timestampSecs = 1_753_011_234L,
+            surfaceInTranscript = false,
+            sequence = 7L,
+        )
+        assertEquals(record, MessageCodec.decodeMeshPending(MessageCodec.encodeMeshPending(record)))
+        assertNull(MessageCodec.decodeMeshPending("not-a-valid-record"))
+    }
+
+    @Test fun durableRoutePendingRoundTripPreservesStableIdentityAndOrder() {
+        val record = chat.bitchat.sonar.QueuedMessage(
+            content = "queued\nmessage",
+            peerId = "stable-peer",
+            messageId = "stable-id",
+            timestampSecs = 1_753_011_234L,
+            sequence = 9L,
+        )
+        assertEquals(record, MessageCodec.decodeRoutePending(MessageCodec.encodeRoutePending(record)))
+        assertNull(MessageCodec.decodeRoutePending("not-a-valid-record"))
+    }
+
+    @Test fun newerMeshTranscriptRevisionFencesLateDetachedWriter() {
+        assertTrue(acceptsMeshStoreRevision(candidate = 8, committed = 7))
+        assertTrue(acceptsMeshStoreRevision(candidate = 8, committed = 8))
+        assertEquals(false, acceptsMeshStoreRevision(candidate = 7, committed = 8))
     }
 
     @Test fun dmRoundTripWithStickerRef() {
@@ -144,8 +522,8 @@ class MessageCodecTest {
         val media = SonarMedia("mesh-media:p:m:photo.jpg", "image/jpeg", "photo.jpg", 640, 480, null)
         val msg = SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, media = listOf(media), viaInternet = true)
         val encoded = MessageCodec.encodeDm(listOf(msg))
-        // Strip the trailing (16th) caption field to simulate the old format.
-        val old = encoded.split("\t").dropLast(1).joinToString("\t")
+        // Strip caption + newer delivery/effect fields to simulate the old format.
+        val old = encoded.split("\t").dropLast(3).joinToString("\t")
         val decoded = MessageCodec.decodeDm(old).single()
         assertEquals(media, decoded.media.single())
         assertNull(decoded.media.single().caption)

@@ -56,6 +56,7 @@ actual object SonarCore {
     private fun marmotDir(): File = DesktopEnv.file("sonar-marmot").apply { mkdirs() }
 
     actual suspend fun start(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "core identity fenced by pending panic wipe" }
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
             if (node == null) {
@@ -77,6 +78,7 @@ actual object SonarCore {
     }
 
     actual suspend fun connectRelays(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "core identity fenced by pending panic wipe" }
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
             if (relayConnected) return@withLock npub
@@ -102,7 +104,7 @@ actual object SonarCore {
 
     actual fun isRelayConnected(): Boolean = relayConnected
 
-    actual fun myNpub(): String = npub
+    actual fun myNpub(): String = if (PanicWipeIntent.isPending()) "" else npub
 
     actual fun classifyNotificationContent(content: String): SonarNotificationKind {
         SonarNativeLoader.ensureLoaded()
@@ -117,6 +119,10 @@ actual object SonarCore {
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+    }
+
+    actual suspend fun deletionInventory(): List<SonarChat> = withContext(Dispatchers.IO) {
+        requireNode().groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
     }
 
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
@@ -572,7 +578,8 @@ actual object SonarCore {
     }
 
     actual fun joinedChannels(): List<String> =
-        DesktopEnv.getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
+        if (PanicWipeIntent.isPending()) emptyList()
+        else DesktopEnv.getString("channels", "")?.split(",")?.filter { it.isNotBlank() } ?: emptyList()
 
     actual fun joinChannel(geohash: String) {
         val g = geohash.trim().lowercase()
@@ -667,25 +674,30 @@ actual object SonarCore {
         n.acknowledgeDirectDms(eventIds)
     }
 
-    actual fun nickname(): String = DesktopEnv.getString("nickname", "") ?: ""
+    actual fun nickname(): String =
+        if (PanicWipeIntent.isPending()) "" else DesktopEnv.getString("nickname", "") ?: ""
 
     actual fun setNickname(value: String) {
         DesktopEnv.putString("nickname", value.trim())
     }
 
     actual fun fingerprint(): String {
+        if (PanicWipeIntent.isPending()) return ""
         var hex = pubkeyHex
         if (hex.isEmpty()) {
-            val saved = DesktopEnv.getString("nsec")
+            val saved = DesktopSecrets.get("nsec")
             if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
         }
         if (hex.isEmpty()) return ""
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
     }
 
-    actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
+    actual fun identityNsec(): String =
+        if (PanicWipeIntent.isPending()) "" else DesktopSecrets.get("nsec") ?: ""
 
     actual fun hasIdentity(): Boolean =
+        if (PanicWipeIntent.isPending()) false
+        else
         runCatching {
             SonarNativeLoader.ensureLoaded()
             val saved = DesktopSecrets.get("nsec")?.trim() ?: return@runCatching false
@@ -695,6 +707,7 @@ actual object SonarCore {
             .getOrDefault(false)
 
     actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "identity provisioning fenced by pending panic wipe" }
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
             if (npub.isNotBlank()) return@withLock npub
@@ -712,6 +725,7 @@ actual object SonarCore {
     }
 
     actual suspend fun importIdentity(nsec: String): String = withContext(Dispatchers.IO) {
+        check(!PanicWipeIntent.isPending()) { "identity import fenced by pending panic wipe" }
         SonarNativeLoader.ensureLoaded()
         val identity = SonarIdentity.import(nsec.trim())
         lock.withLock {
@@ -745,7 +759,8 @@ actual object SonarCore {
         }
     }
 
-    actual fun onboardingComplete(): Boolean = DesktopEnv.getBoolean("onboarding.complete", false)
+    actual fun onboardingComplete(): Boolean =
+        !PanicWipeIntent.isPending() && DesktopEnv.getBoolean("onboarding.complete", false)
 
     actual fun setOnboardingComplete(value: Boolean) {
         DesktopEnv.putBoolean("onboarding.complete", value)
@@ -757,27 +772,41 @@ actual object SonarCore {
         DesktopEnv.putBoolean("appearance.dark", value)
     }
 
-    actual fun loadBlob(key: String): String = DesktopEnv.getString("blob.$key", "") ?: ""
+    actual fun loadBlob(key: String): String =
+        if (PanicWipeIntent.isPending()) "" else DesktopEnv.getString("blob.$key", "") ?: ""
 
     actual fun saveBlob(key: String, value: String) {
         DesktopEnv.putString("blob.$key", value)
+    }
+
+    actual suspend fun saveBlobDurable(key: String, value: String): Unit = withContext(Dispatchers.IO) {
+        DesktopEnv.putStringDurable("blob.$key", value)
     }
 
     actual suspend fun wipe() = withContext(Dispatchers.IO) {
         lock.withLock {
             stickerOperationLock.write {
                 closeNode()
-                npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
                 // too — at verbose level they can contain peer npubs and must not
                 // survive a wipe (Account Key Durability / privacy rule).
                 val marmotDir = marmotDir()
-                val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
-                DesktopEnv.file("diagnostics").deleteRecursively()
-                DesktopSecrets.clear("nsec", "dbKeyHex")
-                DesktopEnv.clear()
-                wipeFailure?.let { throw it }
+                quarantineMarmotStorage(marmotDir)
+                check(DesktopSecrets.clear("nsec", "dbKeyHex", "mesh.identity.bundle.v1")) {
+                    "failed to clear desktop account secrets"
+                }
+                check(DesktopEnv.clearDurable()) {
+                    "failed to durably clear desktop account preferences"
+                }
+                npub = ""; pubkeyHex = ""
+                check(
+                    durablyRetireJvmDirectory(
+                        DesktopEnv.file("diagnostics"),
+                        ".diagnostics-wipe-",
+                    ),
+                ) { "failed to durably remove exported diagnostics" }
+                cleanupMarmotTombstones(DesktopEnv.dataDir)
                 Unit
             }
         }
@@ -801,8 +830,7 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        deleteCoreGroupOrThrow { requireNode().deleteGroup(chatId) }
     }
 
     private fun requireNode(): SonarNode =
@@ -834,7 +862,20 @@ actual object SonarCore {
         check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
     }
 
+    private fun quarantineMarmotStorage(marmotDir: File) {
+        check(quarantineJvmDirectory(marmotDir, ".sonar-marmot-wipe-")) {
+            "failed to durably quarantine Marmot storage"
+        }
+    }
+
+    private fun cleanupMarmotTombstones(parent: File) {
+        check(cleanupJvmDirectoryTombstones(parent, ".sonar-marmot-wipe-")) {
+            "failed to durably remove Marmot wipe tombstones"
+        }
+    }
+
     private fun loadOrCreateIdentity(): SonarIdentity {
+        check(!PanicWipeIntent.isPending()) { "identity migration fenced by pending panic wipe" }
         // Stored in the OS keystore (macOS Keychain), NOT plaintext prefs — the nsec
         // also derives the wallet seed. [DesktopSecrets.get] migrates a legacy
         // plaintext nsec in transparently.
@@ -851,6 +892,7 @@ actual object SonarCore {
     }
 
     private fun loadOrCreateDbKey(): String {
+        check(!PanicWipeIntent.isPending()) { "database key migration fenced by pending panic wipe" }
         DesktopSecrets.get("dbKeyHex")?.let { return it }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }

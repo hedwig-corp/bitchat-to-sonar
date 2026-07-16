@@ -413,7 +413,10 @@ struct ContentView: View {
                                     isAtBottom.wrappedValue = true
                                 }
                                 if message.id == windowedMessages.first?.id,
-                                   messages.count > windowedMessages.count {
+                                   messages.count > windowedMessages.count ||
+                                    (privatePeer.map {
+                                        viewModel.canLoadOlderPrivateMessages(for: $0)
+                                    } ?? false) {
                                     expandWindow(
                                         ifNeededFor: message,
                                         allMessages: messages,
@@ -1221,7 +1224,7 @@ struct ContentView: View {
                 .foregroundColor(textColor)
                 .onTapGesture(count: 3) {
                     // PANIC: Triple-tap to clear all data
-                    viewModel.panicClearAllData()
+                    viewModel.requestPanicClearAllData()
                 }
                 .onTapGesture(count: 1) {
                     // Single tap for app info
@@ -1697,9 +1700,19 @@ private extension ContentView {
         if let peer = privatePeer {
             let current = windowCountPrivate[peer] ?? TransportConfig.uiWindowInitialCountPrivate
             let newCount = min(allMessages.count, current + step)
-            guard newCount != current else { return }
-            windowCountPrivate[peer] = newCount
-            DispatchQueue.main.async {
+            if newCount > min(current, allMessages.count) {
+                windowCountPrivate[peer] = newCount
+                DispatchQueue.main.async {
+                    proxy.scrollTo(preserveID, anchor: .top)
+                }
+                return
+            }
+            guard viewModel.canLoadOlderPrivateMessages(for: peer) else { return }
+            Task { @MainActor in
+                guard await viewModel.loadOlderPrivateMessages(for: peer) else { return }
+                let loadedCount = viewModel.getPrivateChatMessages(for: peer).count
+                windowCountPrivate[peer] = min(loadedCount, max(current, allMessages.count) + step)
+                await Task.yield()
                 proxy.scrollTo(preserveID, anchor: .top)
             }
         } else {

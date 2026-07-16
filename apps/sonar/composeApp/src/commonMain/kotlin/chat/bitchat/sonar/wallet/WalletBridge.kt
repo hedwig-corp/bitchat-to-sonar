@@ -39,6 +39,35 @@ data class WalletPaymentEvent(
     val preimage: String? = null,
 )
 
+/** A native wallet callback may mutate account state only while it still owns
+ * the exact SDK/account generation and no crash-durable panic fence is active. */
+internal fun acceptsWalletCallback(
+    listenerEpoch: Int,
+    currentEpoch: Int,
+    ownsSdkNode: Boolean,
+    panicWipePending: Boolean,
+): Boolean = listenerEpoch == currentEpoch && ownsSdkNode && !panicWipePending
+
+/** Retains the exact native node whose disconnect failed. Callers serialize
+ * access with their wallet operation gate; a retained node always wins over a
+ * newer active snapshot and must be released before storage can be retired. */
+internal class WalletTeardownSlot<T : Any> {
+    private var retainedNode: T? = null
+
+    fun nodeForDisconnect(activeNode: T?): T? = retainedNode ?: activeNode
+
+    fun recordDisconnect(node: T?, succeeded: Boolean) {
+        if (node == null) return
+        if (!succeeded) {
+            retainedNode = node
+        } else if (retainedNode === node) {
+            retainedNode = null
+        }
+    }
+
+    fun hasPendingNode(): Boolean = retainedNode != null
+}
+
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
  * twin of iOS `WalletBridgeService`. Seed is derived deterministically from the
@@ -122,4 +151,9 @@ expect object WalletBridge {
      * success while retaining a previous identity's database.
      */
     suspend fun wipeLocalStorage()
+
+    /** Panic barrier twin of [wipeLocalStorage]: disconnect, durably retire all
+     * account-derived SDK state, and return false while any setup/native handle
+     * prevents the complete wallet root from becoming absent. */
+    suspend fun wipeLocalData(): Boolean
 }

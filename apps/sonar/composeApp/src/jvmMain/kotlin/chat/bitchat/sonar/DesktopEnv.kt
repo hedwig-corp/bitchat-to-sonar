@@ -1,9 +1,41 @@
 package chat.bitchat.sonar
 
 import java.io.File
+import java.io.FileOutputStream
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.util.Properties
+
+/** Atomic preference replacement with a strict parent-directory commit. */
+internal fun persistDesktopPropertiesFile(
+    prefsFile: File,
+    properties: Properties,
+    durable: Boolean,
+    syncDirectory: (File?) -> Boolean = ::syncJvmDirectoryStrict,
+): Boolean = runCatching {
+    val parent = prefsFile.parentFile ?: error("missing preference parent")
+    check(parent.isDirectory || parent.mkdirs())
+    val tmp = File(prefsFile.absolutePath + ".tmp")
+    FileOutputStream(tmp, false).use { output ->
+        properties.store(output, "Sonar desktop preferences")
+        output.flush()
+        if (durable) output.fd.sync()
+    }
+    try {
+        Files.move(
+            tmp.toPath(), prefsFile.toPath(),
+            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
+        )
+    } catch (_: Throwable) {
+        // Some filesystems don't support ATOMIC_MOVE; the same-directory replace
+        // is committed by the strict parent barrier below.
+        Files.move(tmp.toPath(), prefsFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
+    }
+    if (durable) check(syncDirectory(parent)) { "durable preference directory sync failed" }
+    true
+}.getOrDefault(false)
 
 /**
  * Desktop (JVM) environment: the per-user data directory and a simple persisted
@@ -46,7 +78,13 @@ object DesktopEnv {
     @Synchronized
     fun putString(key: String, value: String) {
         props.setProperty(key, value)
-        persist()
+        persist(durable = false)
+    }
+
+    @Synchronized
+    fun putStringDurable(key: String, value: String) {
+        props.setProperty(key, value)
+        check(persist(durable = true)) { "durable desktop preference commit failed" }
     }
 
     @Synchronized
@@ -56,41 +94,38 @@ object DesktopEnv {
     @Synchronized
     fun putBoolean(key: String, value: Boolean) {
         props.setProperty(key, value.toString())
-        persist()
+        persist(durable = false)
     }
 
     @Synchronized
     fun remove(key: String) {
         props.remove(key)
-        persist()
+        persist(durable = false)
+    }
+
+    @Synchronized
+    fun removeDurable(vararg keys: String): Boolean {
+        keys.forEach(props::remove)
+        return persist(durable = true)
     }
 
     @Synchronized
     fun clear() {
+        clearDurable()
+    }
+
+    @Synchronized
+    fun clearDurable(): Boolean {
         props.clear()
-        persist()
+        return persist(durable = true)
     }
 
     // Atomic write: serialize to a sibling temp file, then move it into place.
     // A plain truncating write would, on a crash mid-store(), leave prefs.properties
     // empty — losing the nsec identity AND the SQLCipher DB key (an undecryptable
     // chat DB). Android's SharedPreferences writes atomically; match that.
-    private fun persist() {
-        runCatching {
-            val tmp = File(prefsFile.absolutePath + ".tmp")
-            tmp.outputStream().use { props.store(it, "Sonar desktop preferences") }
-            try {
-                Files.move(
-                    tmp.toPath(), prefsFile.toPath(),
-                    StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING,
-                )
-            } catch (_: Throwable) {
-                // Some filesystems don't support ATOMIC_MOVE; fall back to a plain
-                // replace (still far better than a truncating in-place write).
-                Files.move(tmp.toPath(), prefsFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
-            }
-        }
-    }
+    private fun persist(durable: Boolean): Boolean =
+        persistDesktopPropertiesFile(prefsFile, props, durable)
 }
 
 /**

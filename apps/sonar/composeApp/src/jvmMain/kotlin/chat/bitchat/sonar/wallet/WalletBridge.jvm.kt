@@ -17,15 +17,17 @@ import breez_sdk_liquid.SendPaymentRequest
 import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.DesktopEnv
+import chat.bitchat.sonar.PanicWipeIntent
 import chat.bitchat.sonar.crypto.Bech32
 import java.io.File
+import chat.bitchat.sonar.durablyRetireJvmDirectory
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -55,6 +57,10 @@ actual object WalletBridge {
     private const val CLEANUP_MARKER_NAME = "wallet-cleanup.pending"
 
     private val lock = Mutex()
+    private val operationGate = Mutex()
+    private val setupGate = Mutex()
+    private val cleanupGate = Mutex()
+    private val teardownSlot = WalletTeardownSlot<BindingLiquidSdk>()
     @Volatile private var sdk: BindingLiquidSdk? = null
     @Volatile private var current: WalletState = WalletState.NotConfigured
     @Volatile private var rates: Map<String, ExchangeRate> = emptyMap()
@@ -72,9 +78,32 @@ actual object WalletBridge {
      *  if the epoch moved while `getInfo()` ran, so a listener-triggered
      *  refresh can never resurrect a torn-down wallet's balance. */
     @Volatile private var walletEpoch = 0
-    /** One refresh in flight, at most one trailing — conflates event bursts. */
+    /** Listener-driven native refreshes are serialized off the SDK callback. */
     private val refreshGate = Mutex()
-    @Volatile private var refreshPending = false
+    private data class RefreshRequest(val node: BindingLiquidSdk, val epoch: Int)
+    private val refreshRequests = Channel<RefreshRequest>(Channel.CONFLATED)
+    private data class SetupResult(val node: BindingLiquidSdk, val balanceSats: Long)
+    private class SetupAttempt(
+        val epoch: Int,
+        val work: Deferred<SetupResult>,
+    ) {
+        val quiesced = CompletableDeferred<Unit>()
+    }
+    @Volatile private var setupAttempt: SetupAttempt? = null
+
+    init {
+        walletScope.launch {
+            for (request in refreshRequests) {
+                operationGate.withLock {
+                    refreshGate.withLock {
+                        if (walletGenerationActive(request.node, request.epoch)) {
+                            refreshBalanceFor(request.node, request.epoch)
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     private val apiKey: String by lazy {
         runCatching {
@@ -87,70 +116,144 @@ actual object WalletBridge {
     actual fun state(): WalletState = current
 
     actual suspend fun setupIfNeeded(nsec: String): Unit = withContext(Dispatchers.IO) {
-        lock.withLock {
-            recoverPendingCleanupLocked()
-            if (sdk != null) return@withContext
-            val key = apiKey
-            if (key.isEmpty()) { current = WalletState.NotConfigured; return@withContext }
-            val secretHex = Bech32.nsecToSecretHex(nsec)
-            if (secretHex == null) { current = WalletState.Failed("no identity"); return@withContext }
-            current = WalletState.SettingUp
-            // Breez connect()/getInfo() are blocking native calls — a plain
-            // withTimeoutOrNull can't preempt them (cancellation is cooperative).
-            // Run them in a child coroutine and bound the await: on timeout the UI
-            // gets Failed instead of hanging on SettingUp forever (the abandoned
-            // call finishes on its IO thread but its result is discarded).
-            val outcome = coroutineScope {
-                val work = async(Dispatchers.IO) {
-                    val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
-                    val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
-                        val dir = DesktopEnv.file("sonar-wallet/mainnet").apply { mkdirs() }
-                        workingDir = dir.absolutePath
-                    }
-                    var node: BindingLiquidSdk? = null
-                    var handedOff = false
-                    try {
-                        val connected = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
-                        node = connected
-                        currentCoroutineContext().ensureActive()
-                        val balanceSats = connected.getInfo().walletInfo.balanceSat.toLong()
-                        currentCoroutineContext().ensureActive()
-                        handedOff = true
-                        connected to balanceSats
-                    } finally {
-                        if (!handedOff) runCatching { node?.disconnect() }
-                    }
-                }
-                runCatching { withTimeoutOrNull(20_000) { work.await() } }
-                    .also { if (it.getOrNull() == null) work.cancel() }
+        setupGate.withLock {
+            if (cleanupPending()) {
+                check(wipeLocalData()) { "pending wallet cleanup could not be completed" }
             }
-            current = when {
-                outcome.isFailure -> WalletState.Failed(outcome.exceptionOrNull()?.message ?: "wallet setup failed")
-                outcome.getOrNull() == null -> WalletState.Failed("wallet setup timed out")
-                else -> outcome.getOrThrow()!!.let { (node, bal) ->
-                    sdk = node
-                    balance.value = bal
-                    startObservingBalance(node)
-                    WalletState.Ready(bal)
+            val key = apiKey
+            val secretHex = Bech32.nsecToSecretHex(nsec)
+            val attempt = operationGate.withLock {
+                lock.withLock {
+                    if (PanicWipeIntent.isPending() || cleanupPending()) {
+                        current = WalletState.NotConfigured
+                        return@withLock null
+                    }
+                    if (sdk != null || setupAttempt != null || teardownSlot.hasPendingNode()) {
+                        return@withLock null
+                    }
+                    if (key.isEmpty()) {
+                        current = WalletState.NotConfigured
+                        return@withLock null
+                    }
+                    if (secretHex == null) {
+                        current = WalletState.Failed("no identity")
+                        return@withLock null
+                    }
+                    current = WalletState.SettingUp
+                    val epoch = walletEpoch
+                    val work = walletScope.async(Dispatchers.IO) {
+                        val seed = WalletSeed.breezSeed(WalletSeed.hexToBytes(secretHex))
+                        val config = defaultConfig(LiquidNetwork.MAINNET, key).apply {
+                            val dir = DesktopEnv.file("sonar-wallet/mainnet").apply { mkdirs() }
+                            workingDir = dir.absolutePath
+                        }
+                        val node = connect(ConnectRequest(config, null, null, seed.map { it.toUByte() }))
+                        SetupResult(node, node.getInfo().walletInfo.balanceSat.toLong())
+                    }
+                    SetupAttempt(epoch, work).also { setupAttempt = it }
                 }
+            } ?: return@withLock
+
+            val outcome = runCatching {
+                withTimeoutOrNull(20_000) { runCatching { attempt.work.await() } }
+            }.getOrNull()
+            if (outcome == null) {
+                lock.withLock {
+                    if (setupAttempt === attempt && walletEpoch == attempt.epoch) {
+                        current = WalletState.Failed("wallet setup timed out")
+                    }
+                }
+                walletScope.launch { finishTimedOutSetup(attempt) }
+                return@withLock
+            }
+
+            val result = outcome.getOrNull()
+            operationGate.withLock {
+                var disconnect: BindingLiquidSdk? = null
+                lock.withLock {
+                    if (setupAttempt === attempt) setupAttempt = null
+                    when {
+                        result == null -> current = WalletState.Failed(
+                            outcome.exceptionOrNull()?.message ?: "wallet setup failed",
+                        )
+                        walletEpoch != attempt.epoch || PanicWipeIntent.isPending() || cleanupPending() ||
+                            sdk != null || teardownSlot.hasPendingNode() -> {
+                            disconnect = result.node
+                            if (sdk == null) current = WalletState.NotConfigured
+                        }
+                        else -> {
+                            sdk = result.node
+                            balance.value = result.balanceSats
+                            startObservingBalance(result.node)
+                            current = WalletState.Ready(result.balanceSats)
+                        }
+                    }
+                }
+                disconnect?.let { node ->
+                    if (disconnectOrRetain(node) != null) {
+                        current = WalletState.Failed("wallet node did not disconnect cleanly")
+                    }
+                }
+                attempt.quiesced.complete(Unit)
             }
         }
     }
 
+    private suspend fun finishTimedOutSetup(attempt: SetupAttempt) {
+        val result = runCatching { attempt.work.await() }.getOrNull()
+        operationGate.withLock {
+            result?.node?.let { node ->
+                if (disconnectOrRetain(node) != null) {
+                    current = WalletState.Failed("wallet node did not disconnect cleanly")
+                }
+            }
+            lock.withLock { if (setupAttempt === attempt) setupAttempt = null }
+            attempt.quiesced.complete(Unit)
+        }
+    }
+
+    /** Must be called while [operationGate] is held. */
+    private fun disconnectOrRetain(node: BindingLiquidSdk?): Throwable? {
+        val failure = runCatching { node?.disconnect() }.exceptionOrNull()
+        teardownSlot.recordDisconnect(node, succeeded = failure == null)
+        return failure
+    }
+
     actual suspend fun refreshBalance(): Long = withContext(Dispatchers.IO) {
-        val node = sdk ?: return@withContext 0L
-        val epoch = walletEpoch
+        operationGate.withLock {
+            val node = sdk ?: return@withLock 0L
+            refreshBalanceFor(node, walletEpoch)
+        }
+    }
+
+    private fun refreshBalanceFor(node: BindingLiquidSdk, epoch: Int): Long {
+        if (!walletGenerationActive(node, epoch)) return 0L
         try {
             val bal = node.getInfo().walletInfo.balanceSat.toLong()
             // Drop the writes if shutdown/re-setup won the race while the
             // blocking getInfo() ran — never resurrect a torn-down wallet.
-            if (epoch == walletEpoch && sdk === node) {
+            if (walletGenerationActive(node, epoch)) {
                 current = WalletState.Ready(bal)
                 balance.value = bal
+                return bal
             }
-            bal
-        } catch (t: Throwable) { (current as? WalletState.Ready)?.balanceSats ?: 0L }
+            return 0L
+        } catch (_: Throwable) {
+            return if (walletGenerationActive(node, epoch)) {
+                (current as? WalletState.Ready)?.balanceSats ?: 0L
+            } else {
+                0L
+            }
+        }
     }
+
+    private fun walletGenerationActive(node: BindingLiquidSdk, epoch: Int): Boolean =
+        acceptsWalletCallback(
+            listenerEpoch = epoch,
+            currentEpoch = walletEpoch,
+            ownsSdkNode = sdk === node,
+            panicWipePending = PanicWipeIntent.isPending() || cleanupPending(),
+        )
 
     /**
      * iOS parity (`WalletBridgeService.startObservingBalance()`): the Breez
@@ -159,21 +262,29 @@ actual object WalletBridge {
      * callback arrives on an SDK thread — never block it; hop to [walletScope].
      */
     private fun startObservingBalance(node: BindingLiquidSdk) {
+        val listenerEpoch = walletEpoch
         balanceListenerId = runCatching {
             node.addEventListener(object : EventListener {
                 override fun onEvent(e: SdkEvent) {
-                    when (e) {
-                        is SdkEvent.PaymentSucceeded -> {
-                            emitPaymentEvent(e.details)
-                            requestBalanceRefresh()
+                    walletScope.launch {
+                        var shouldRefresh = false
+                        lock.withLock {
+                            if (!walletGenerationActive(node, listenerEpoch)) return@withLock
+                            when (e) {
+                                is SdkEvent.PaymentSucceeded -> {
+                                    emitPaymentEvent(e.details)
+                                    shouldRefresh = true
+                                }
+                                is SdkEvent.Synced,
+                                is SdkEvent.DataSynced,
+                                is SdkEvent.PaymentWaitingConfirmation,
+                                is SdkEvent.PaymentPending,
+                                is SdkEvent.PaymentRefunded,
+                                is SdkEvent.PaymentFailed -> shouldRefresh = true
+                                else -> Unit
+                            }
                         }
-                        is SdkEvent.Synced,
-                        is SdkEvent.DataSynced,
-                        is SdkEvent.PaymentWaitingConfirmation,
-                        is SdkEvent.PaymentPending,
-                        is SdkEvent.PaymentRefunded,
-                        is SdkEvent.PaymentFailed -> requestBalanceRefresh()
-                        else -> Unit
+                        if (shouldRefresh) requestBalanceRefresh(node, listenerEpoch)
                     }
                 }
             })
@@ -200,24 +311,17 @@ actual object WalletBridge {
         payments.tryEmit(ev)
     }
 
-    /** Conflates SDK event bursts (initial sync, payment storms) into at most
-     *  one in-flight `getInfo()` plus one trailing refresh, instead of one
-     *  concurrent refresh per event. */
-    private fun requestBalanceRefresh() {
-        walletScope.launch {
-            if (!refreshGate.tryLock()) { refreshPending = true; return@launch }
-            try {
-                do {
-                    refreshPending = false
-                    refreshBalance()
-                } while (refreshPending)
-            } finally { refreshGate.unlock() }
-        }
+    /** A single conflated worker serializes native `getInfo()` calls. Every
+     * request revalidates its SDK node/account generation before execution. */
+    private fun requestBalanceRefresh(node: BindingLiquidSdk, epoch: Int) {
+        refreshRequests.trySend(RefreshRequest(node, epoch))
     }
 
     actual suspend fun createOffer(): String = withContext(Dispatchers.IO) {
-        receiveOffer ?: lock.withLock {
-            receiveOffer ?: run {
+        operationGate.withLock {
+            receiveOffer ?: lock.withLock {
+                if (PanicWipeIntent.isPending() || cleanupPending()) error("wallet wipe pending")
+                receiveOffer ?: run {
                 val node = sdk ?: error("wallet not ready")
                 // Amountless reusable BOLT12 offer. Keep it stable across descriptor
                 // refreshes so peers do not race a rotated receive path.
@@ -227,39 +331,46 @@ actual object WalletBridge {
                 node.receivePayment(ReceivePaymentRequest(prepared, "Sonar", null, null))
                     .destination
                     .also { receiveOffer = it }
+                }
             }
         }
     }
 
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {
-            val node = sdk ?: return@withContext SendResult(false)
-            if (amountSats < 0) return@withContext SendResult(false)
-            try {
-                val amount: PayAmount? =
-                    if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
-                val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
-                val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
-                val payment = resp.payment
-                val lightning = payment.details as? PaymentDetails.Lightning
-                refreshBalance()
-                SendResult(
-                    ok = true,
-                    preimage = lightning?.preimage,
-                    paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
-                    feesSats = payment.feesSat.toLong(),
-                    settledAtSecs = payment.timestamp.toLong(),
-                )
-            } catch (t: Throwable) { SendResult(false) }
+            operationGate.withLock {
+                val node = sdk ?: return@withLock SendResult(false)
+                val epoch = walletEpoch
+                if (amountSats < 0 || !walletGenerationActive(node, epoch)) return@withLock SendResult(false)
+                try {
+                    val amount: PayAmount? =
+                        if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
+                    val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                    if (!walletGenerationActive(node, epoch)) return@withLock SendResult(false)
+                    val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                    val payment = resp.payment
+                    val lightning = payment.details as? PaymentDetails.Lightning
+                    refreshBalanceFor(node, epoch)
+                    SendResult(
+                        ok = true,
+                        preimage = lightning?.preimage,
+                        paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
+                        feesSats = payment.feesSat.toLong(),
+                        settledAtSecs = payment.timestamp.toLong(),
+                    )
+                } catch (_: Throwable) { SendResult(false) }
+            }
         }
 
     actual suspend fun fetchRates(): List<ExchangeRate> = withContext(Dispatchers.IO) {
-        val node = sdk ?: return@withContext emptyList()
-        try {
-            val list = node.fetchFiatRates().map { ExchangeRate(it.coin.uppercase(), it.value) }
-            rates = list.associateBy { it.currency }
-            list
-        } catch (t: Throwable) { rates.values.toList() }
+        operationGate.withLock {
+            val node = sdk ?: return@withLock emptyList()
+            try {
+                val list = node.fetchFiatRates().map { ExchangeRate(it.coin.uppercase(), it.value) }
+                rates = list.associateBy { it.currency }
+                list
+            } catch (_: Throwable) { rates.values.toList() }
+        }
     }
 
     actual fun cachedRate(currency: FiatCurrency): ExchangeRate? = rates[currency.code]
@@ -273,37 +384,76 @@ actual object WalletBridge {
     actual fun setCurrency(value: FiatCurrency) { DesktopEnv.putString("wallet.currency", value.code) }
 
     actual suspend fun registerWebhook(url: String): Unit = withContext(Dispatchers.IO) {
-        sdk?.registerWebhook(url)
-    }
-
-    actual suspend fun unregisterWebhook(): Unit = withContext(Dispatchers.IO) {
-        sdk?.unregisterWebhook()
-    }
-
-    actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
-        lock.withLock {
-            disconnectLocked()
+        operationGate.withLock {
+            sdk?.takeIf { !PanicWipeIntent.isPending() && !cleanupPending() }?.registerWebhook(url)
         }
     }
 
-    actual suspend fun wipeLocalStorage(): Unit = withContext(Dispatchers.IO) {
-        lock.withLock {
-            markCleanupPendingLocked()
-            disconnectLocked()
-            deleteStorageLocked()
-            completeCleanupLocked()
+    actual suspend fun unregisterWebhook(): Unit = withContext(Dispatchers.IO) {
+        operationGate.withLock { sdk?.unregisterWebhook() }
+    }
+
+    actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
+        operationGate.withLock {
+            val (activeNode, listener) = lock.withLock {
+                walletEpoch += 1
+                val detached = sdk
+                val listener = balanceListenerId
+                balanceListenerId = null
+                sdk = null
+                current = WalletState.NotConfigured
+                balance.value = 0L
+                rates = emptyMap()
+                receiveOffer = null
+                detached to listener
+            }
+            val node = teardownSlot.nodeForDisconnect(activeNode)
+            listener?.let { id -> runCatching { node?.removeEventListener(id) } }
+            val disconnectFailure = disconnectOrRetain(node)
+            if (disconnectFailure != null) {
+                current = WalletState.Failed("wallet node did not disconnect cleanly")
+                throw IllegalStateException("wallet node did not disconnect cleanly", disconnectFailure)
+            }
+        }
+    }
+
+    actual suspend fun wipeLocalStorage() {
+        check(wipeLocalData()) { "wallet storage could not be removed" }
+    }
+
+    actual suspend fun wipeLocalData(): Boolean = cleanupGate.withLock {
+        val markerCommitted = withContext(Dispatchers.IO) {
+            operationGate.withLock {
+                runCatching { markCleanupPendingLocked(); true }.getOrDefault(false)
+            }
+        }
+        if (!markerCommitted) return@withLock false
+        if (runCatching { shutdown() }.isFailure) return@withLock false
+        val attempt = setupAttempt
+        if (attempt != null && withTimeoutOrNull(5_000) {
+                attempt.quiesced.await(); true
+            } != true
+        ) return@withLock false
+        val retired = withContext(Dispatchers.IO) {
+            operationGate.withLock {
+                if (setupAttempt != null || teardownSlot.hasPendingNode()) return@withLock false
+                durablyRetireJvmDirectory(
+                    DesktopEnv.file("sonar-wallet"),
+                    ".sonar-wallet-wipe-",
+                )
+            }
+        }
+        if (!retired) return@withLock false
+        withContext(Dispatchers.IO) {
+            operationGate.withLock {
+                runCatching { completeCleanupLocked(); true }.getOrDefault(false)
+            }
         }
     }
 
     private fun cleanupMarker(): File = DesktopEnv.file(CLEANUP_MARKER_NAME)
 
-    /** Complete an interrupted destructive wipe before any seed can be opened. */
-    private fun recoverPendingCleanupLocked() {
-        if (!cleanupMarker().exists()) return
-        disconnectLocked()
-        deleteStorageLocked()
-        completeCleanupLocked()
-    }
+    private fun cleanupPending(): Boolean = cleanupMarker().exists()
 
     private fun markCleanupPendingLocked() {
         val marker = cleanupMarker()
@@ -317,30 +467,6 @@ actual object WalletBridge {
         val marker = cleanupMarker()
         check(!marker.exists() || marker.delete()) {
             "wallet cleanup marker could not be cleared"
-        }
-    }
-
-    private fun disconnectLocked() {
-        walletEpoch += 1
-        val node = sdk
-        balanceListenerId?.let { id -> runCatching { node?.removeEventListener(id) } }
-        balanceListenerId = null
-        val disconnectFailure = runCatching { node?.disconnect() }.exceptionOrNull()
-        if (disconnectFailure != null) {
-            current = WalletState.Failed("wallet node did not disconnect cleanly")
-            throw IllegalStateException("wallet node did not disconnect cleanly", disconnectFailure)
-        }
-        sdk = null
-        current = WalletState.NotConfigured
-        balance.value = 0L
-        rates = emptyMap()
-        receiveOffer = null
-    }
-
-    private fun deleteStorageLocked() {
-        val root = DesktopEnv.file("sonar-wallet")
-        if (root.exists() && (!root.deleteRecursively() || root.exists())) {
-            throw IllegalStateException("wallet storage could not be removed")
         }
     }
 }

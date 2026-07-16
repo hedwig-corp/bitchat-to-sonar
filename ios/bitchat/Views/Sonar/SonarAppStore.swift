@@ -566,6 +566,23 @@ enum SonarAccountRestoreError: LocalizedError {
     }
 }
 
+enum SonarAccountStartupGate {
+    static func initialWalletState(
+        recoveringPanicWipe: Bool,
+        read: () -> SonarWalletState
+    ) -> SonarWalletState {
+        recoveringPanicWipe ? .notConfigured : read()
+    }
+
+    static func performIfActive(
+        recoveringPanicWipe: Bool,
+        _ work: () -> Void
+    ) {
+        guard !recoveringPanicWipe else { return }
+        work()
+    }
+}
+
 @MainActor
 final class SonarAppStore: ObservableObject {
     private enum Keys {
@@ -1106,6 +1123,8 @@ final class SonarAppStore: ObservableObject {
     private var needsPaymentMetadataPublish = false
     private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
+    private var accountStartupFenced = false
+    private var walletBindingsInstalled = false
 
     convenience init() {
         let keychain = KeychainManager()
@@ -1164,6 +1183,9 @@ final class SonarAppStore: ObservableObject {
         unify: UnifyNearbyService = UnifyNearbyService(),
         unifyReceiver: UnifyReceiverService = UnifyReceiverService()
     ) {
+        // This must be the first account-related read in the designated init.
+        // In particular, `wallet.state` may reflect an old Breez node.
+        let recoveringPanicWipe = PanicWipeIntent.isPending
         self.chatViewModel = chatViewModel
         self.marmot = marmot
         self.keychain = keychain
@@ -1173,7 +1195,11 @@ final class SonarAppStore: ObservableObject {
         self.paymentActivityLedger = paymentActivityLedger
         self.unify = unify
         self.unifyReceiver = unifyReceiver
-        walletState = wallet.state
+        walletState = SonarAccountStartupGate.initialWalletState(
+            recoveringPanicWipe: recoveringPanicWipe,
+            read: { wallet.state }
+        )
+        accountStartupFenced = recoveringPanicWipe
 
         // Unify receiver (mirror role): serve an AMOUNTLESS BOLT12 offer behind
         // the user's nickname so a Unify user can pay us. The offer is fetched
@@ -1185,7 +1211,7 @@ final class SonarAppStore: ObservableObject {
             let nick = chatRef?.nickname.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return nick.isEmpty ? nil : nick
         }
-        onboarded = Self.recoverOnboardingState(
+        onboarded = recoveringPanicWipe ? false : Self.recoverOnboardingState(
             storedOnboarded: defaults.bool(forKey: Keys.onboarded),
             keychain: keychain,
             defaults: defaults
@@ -1201,11 +1227,13 @@ final class SonarAppStore: ObservableObject {
         #else
         batterySavingEnabled = false
         #endif
-        marmotVerified = (UserDefaults.standard.dictionary(forKey: Keys.marmotVerified) as? [String: Bool]) ?? [:]
-        bip353 = UserDefaults.standard.string(forKey: Keys.bip353) ?? ""
+        marmotVerified = recoveringPanicWipe
+            ? [:]
+            : (UserDefaults.standard.dictionary(forKey: Keys.marmotVerified) as? [String: Bool]) ?? [:]
+        bip353 = recoveringPanicWipe ? "" : UserDefaults.standard.string(forKey: Keys.bip353) ?? ""
         // Drop the old prototype demo blob if it is still around.
         defaults.removeObject(forKey: Keys.legacyDemoState)
-        callLogs = Self.loadCallLogs(from: defaults)
+        callLogs = recoveringPanicWipe ? [:] : Self.loadCallLogs(from: defaults)
         syncNotificationPrefsToAppGroup()
 
         // The screens read computed properties off this store; republish
@@ -1220,7 +1248,8 @@ final class SonarAppStore: ObservableObject {
         republish(unify.objectWillChange)
         // Money display: re-render every amount when the mode/currency/rate
         // changes (fiat<->bitcoin toggle, currency picker, live-rate arrival).
-        republish(wallet.moneyDisplayChanged)
+        // Wallet publishers are account-bound and are installed only after the
+        // panic marker is absent (see `activateWalletBindings`).
 
         // Sonar discovery: collect verified peer profiles announced over the
         // mesh, and start announcing ours once the Marmot npub is known.
@@ -1238,33 +1267,41 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] _ in self?.refreshBatterySavingState() }
             .store(in: &cancellables)
         #endif
-        wireBLEDiscoveryPolicy()
-        refreshBleKnownContactSnapshot()
-        applyBLEDiscoveryPolicy()
+        if !recoveringPanicWipe {
+            wireBLEDiscoveryPolicy()
+            refreshBleKnownContactSnapshot()
+            applyBLEDiscoveryPolicy()
+        }
         // Let Marmot republish our kind-0 profile on every relay connect (next to
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
         marmot.$groups
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.resolvePendingSecureChats() }
+            .sink { [weak self] _ in
+                guard let self, !self.accountStartupFenced else { return }
+                self.resolvePendingSecureChats()
+            }
             .store(in: &cancellables)
         marmot.$npub
             .receive(on: DispatchQueue.main)
             .sink { [weak self] npub in
-                guard let self else { return }
+                guard let self, !self.accountStartupFenced else { return }
                 self.wireSonarProfileProvider(npub)
                 self.runPostLocalMarmotStartupIfReady()
             }
             .store(in: &cancellables)
         marmot.$initialLocalHomeReady
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.runPostLocalMarmotStartupIfReady() }
+            .sink { [weak self] _ in
+                guard let self, !self.accountStartupFenced else { return }
+                self.runPostLocalMarmotStartupIfReady()
+            }
             .store(in: &cancellables)
         marmot.$relayConnected
             .receive(on: DispatchQueue.main)
             .sink { [weak self] connected in
-                guard let self, connected else { return }
+                guard let self, connected, !self.accountStartupFenced else { return }
                 // Relay-dependent work starts only after the delayed background
                 // attach, never as a side effect of publishing the local Home.
                 self.marmot.publishProfile(name: self.chatViewModel.nickname)
@@ -1281,7 +1318,7 @@ final class SonarAppStore: ObservableObject {
         marmot.$groups
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                guard let self else { return }
+                guard let self, !self.accountStartupFenced else { return }
                 self.refreshBleKnownContactSnapshot()
                 self.applyBLEDiscoveryPolicy()
                 self.objectWillChange.send()
@@ -1295,40 +1332,18 @@ final class SonarAppStore: ObservableObject {
         // stores for incoming ⚡PAY receipt control lines.
         republish(payLedger.objectWillChange)
         republish(paymentActivityLedger.objectWillChange)
-        wallet.statePublisher
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] state in
-                guard let self else { return }
-                self.walletState = state
-                // Gate the advertised ⚡PAY capability on a receive-capable wallet.
-                let configured: Bool
-                if case .ready = state { configured = true } else { configured = false }
-                UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
-                // Start/stop the Unify receiver as the wallet becomes (un)ready.
-                self.updateReceiverAdvertising()
-                self.publishPaymentMetadataIfNeeded()
-                self.updateWalletPaymentObservation()
-                #if os(iOS)
-                if configured, let bridged = self.wallet as? BridgedWallet {
-                    SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
-                }
-                #endif
-            }
-            .store(in: &cancellables)
-        // Seed the flag from the current state so the first announce is correct.
-        if case .ready = wallet.state {
-            UserDefaults.standard.set(true, forKey: Keys.walletConfigured)
-        } else {
+        if recoveringPanicWipe {
             UserDefaults.standard.set(false, forKey: Keys.walletConfigured)
         }
-        // Seed receiver advertising from the current state (foreground at launch).
-        updateReceiverAdvertising()
-        publishPaymentMetadataIfNeeded()
-        updateWalletPaymentObservation()
+        SonarAccountStartupGate.performIfActive(
+            recoveringPanicWipe: recoveringPanicWipe
+        ) {
+            activateWalletBindings()
+        }
         chatViewModel.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                guard let self else { return }
+                guard let self, !self.accountStartupFenced else { return }
                 DispatchQueue.main.async { [weak self] in
                     self?.refreshBleKnownContactSnapshot()
                     self?.applyBLEDiscoveryPolicy()
@@ -1340,7 +1355,7 @@ final class SonarAppStore: ObservableObject {
         marmot.$messagesByGroup
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                guard let self else { return }
+                guard let self, !self.accountStartupFenced else { return }
                 self.cachePublishedUploadMedia()
                 self.processIncomingMarmotNotifications()
                 self.processIncomingPayLines()
@@ -1351,10 +1366,12 @@ final class SonarAppStore: ObservableObject {
 
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
         // stay folded into one conversation across restarts (before dmRows runs).
-        hydrateSonarProfiles()
-        hydrateMarmotConversationGroups()
-        refreshBleKnownContactSnapshot()
-        applyBLEDiscoveryPolicy()
+        if !recoveringPanicWipe {
+            hydrateSonarProfiles()
+            hydrateMarmotConversationGroups()
+            refreshBleKnownContactSnapshot()
+            applyBLEDiscoveryPolicy()
+        }
 
         if onboarded {
             marmot.connectIfNeeded()
@@ -1428,12 +1445,19 @@ final class SonarAppStore: ObservableObject {
         Task.detached(priority: .utility) {
             Self.sweepStaleMediaTempFiles()
         }
+
+        if recoveringPanicWipe {
+            // All bootstrap paths above were kept closed. Resume the idempotent
+            // barrier chain only after initialization has installed observers.
+            DispatchQueue.main.async { [weak self] in self?.wipe() }
+        }
     }
 
     /// Identity publication happens before the encrypted DB opens so BLE can
     /// advertise our npub early. Wallet setup is local-only, but still waits for
     /// the coherent Home boundary so it cannot contend with first-paint reads.
     private func runPostLocalMarmotStartupIfReady() {
+        guard !accountStartupFenced else { return }
         guard marmot.initialLocalHomeReady, marmot.npub != nil else { return }
         // The wallet derives from the same identity; retry its deferred setup.
         #if os(iOS) || os(macOS)
@@ -1703,6 +1727,18 @@ final class SonarAppStore: ObservableObject {
         // current identity, chats, wallet, and push registrations untouched.
         _ = try SonarIdentity.import(nsec: key)
 
+        // Establish the account notification boundary before deleting any
+        // prior-account state. The service advances its generation while
+        // cancelling delivered/pending notifications, so an already-admitted
+        // callback cannot publish old content into the replacement account.
+        NotificationService.shared.suspendAccountNotifications()
+        defer {
+            // On success this opens the replacement generation; on failure it
+            // restores notifications for the still-authoritative prior
+            // identity. A concurrent panic marker keeps the fence closed.
+            _ = NotificationService.shared.reactivateAccountNotifications()
+        }
+
         #if os(iOS) || os(macOS)
         let bridged = wallet as? BridgedWallet
         #if os(iOS)
@@ -1812,6 +1848,40 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Unify receiver (mirror role: a Unify user can pay us)
 
+    private func activateWalletBindings() {
+        guard !accountStartupFenced else { return }
+        walletState = wallet.state
+        if !walletBindingsInstalled {
+            walletBindingsInstalled = true
+            republish(wallet.moneyDisplayChanged)
+            wallet.statePublisher
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] state in
+                    guard let self, !self.accountStartupFenced else { return }
+                    self.walletState = state
+                    let configured: Bool
+                    if case .ready = state { configured = true } else { configured = false }
+                    UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
+                    self.updateReceiverAdvertising()
+                    self.publishPaymentMetadataIfNeeded()
+                    self.updateWalletPaymentObservation()
+                    #if os(iOS)
+                    if configured, let bridged = self.wallet as? BridgedWallet {
+                        SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
+                    }
+                    #endif
+                }
+                .store(in: &cancellables)
+        }
+
+        let configured: Bool
+        if case .ready = walletState { configured = true } else { configured = false }
+        UserDefaults.standard.set(configured, forKey: Keys.walletConfigured)
+        updateReceiverAdvertising()
+        publishPaymentMetadataIfNeeded()
+        updateWalletPaymentObservation()
+    }
+
     /// Foreground/background transitions from BitchatApp's scenePhase. iOS
     /// strips the BLE local name and restricts service-UUID advertising in the
     /// background, so we advertise the receiver only while foreground.
@@ -1830,7 +1900,8 @@ final class SonarAppStore: ObservableObject {
         // at its `true` default, so the first real foreground would otherwise skip
         // the resume and the node (deferred at launch) would never come up.
         // suspend/resume are idempotent (guarded on node state / `suspendedForBackground`).
-        if let walletService = (wallet as? BridgedWallet)?.walletService {
+        if !accountStartupFenced,
+           let walletService = (wallet as? BridgedWallet)?.walletService {
             if foreground {
                 walletService.resumeFromBackground()
             } else {
@@ -1854,6 +1925,10 @@ final class SonarAppStore: ObservableObject {
     /// app is foreground; stop otherwise. Idempotent — the receiver itself
     /// coalesces repeat starts and only advertises once an offer is fetched.
     private func updateReceiverAdvertising() {
+        guard !accountStartupFenced else {
+            unifyReceiver.stop()
+            return
+        }
         let ready: Bool
         if case .ready = walletState { ready = true } else { ready = false }
         if ready && isForeground && !isBLEDiscoveryRestricted {
@@ -2741,6 +2816,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func publishPaymentMetadataIfNeeded(force: Bool = false) {
+        guard !accountStartupFenced else { return }
         guard !publishingPaymentMetadata else {
             needsPaymentMetadataPublish = true
             return
@@ -2798,6 +2874,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func updateWalletPaymentObservation() {
+        guard !accountStartupFenced else {
+            incomingWalletTask?.cancel()
+            incomingWalletTask = nil
+            return
+        }
         guard case .ready = walletState else {
             incomingWalletTask?.cancel()
             incomingWalletTask = nil
@@ -5815,11 +5896,16 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Erase the on-disk media cache. Called by both wipe paths.
-    private func clearMediaDiskCache() {
+    @discardableResult
+    private func clearMediaDiskCache() -> Bool {
         guard let base = try? FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
-        else { return }
-        try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
+        else { return false }
+        let cache = base.appendingPathComponent("media-cache", isDirectory: true)
+        if FileManager.default.fileExists(atPath: cache.path) {
+            do { try FileManager.default.removeItem(at: cache) } catch { return false }
+        }
+        return !FileManager.default.fileExists(atPath: cache.path)
     }
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
@@ -7063,41 +7149,59 @@ final class SonarAppStore: ObservableObject {
     // MARK: Emergency wipe (the real panic path)
 
     func wipe() {
+        let recovering = PanicWipeIntent.isPending
+        guard beginPanicWipeBeforeRedaction(
+            alreadyPending: recovering,
+            commitIntent: PanicWipeIntent.begin,
+            redact: { [self] in
+                // The marker is now durable. Establish the synchronous
+                // render/transport fence before scheduling fallible cleanup.
+                accountStartupFenced = true
+                incomingWalletTask?.cancel()
+                incomingWalletTask = nil
+                unify.stop()
+                unifyReceiver.stop()
+                path = []
+                chatViewModel.beginPanicRedactionAndFence()
+                marmot.stopPolling()
+                marmot.groups = []
+                marmot.messagesByGroup = [:]
+                sonarProfiles = [:]
+                sonarProfilesByFingerprint = [:]
+                mediaImageCache = [:]
+                pendingUploadMediaCache = [:]
+                onboarded = false
+                objectWillChange.send()
+            }
+        ) else {
+            showToast("Emergency wipe could not be started safely; no account data was changed. Try again.")
+            return
+        }
         Task { @MainActor [weak self] in
-            await self?.performWipe()
+            await self?.performEmergencyWipe()
         }
     }
 
-    private func performWipe() async {
-        path = []
-        // The Breez node must release its SQLite store before wallet files are
-        // deleted. Await this before revealing onboarding so a fast re-onboard
-        // cannot race a still-running destructive wallet task.
-        var walletWipeComplete = true
-        #if os(iOS) || os(macOS)
-        if let bridged = wallet as? BridgedWallet {
-            walletWipeComplete = await bridged.wipeForEmergency()
-        } else {
-            do {
-                try BridgedWallet.beginWalletStorageMutation()
-                try BridgedWallet.wipeWalletStorage()
-            } catch {
-                walletWipeComplete = false
-            }
-        }
-        #endif
+    private func performEmergencyWipe() async {
         marmot.stopPolling()
+        // The encrypted core must cross its deletion barrier before the shared
+        // keychain is cleared or any replacement identity can be generated.
+        do {
+            try await marmot.wipeDatabaseAndWait()
+        } catch {
+            SecureLogger.error(error, context: "Emergency Marmot wipe failed", category: .session)
+            showToast("Emergency wipe is incomplete. Sonar remains disconnected; try again.")
+            return
+        }
         // Wipes Noise/Nostr keys, all keychain data (incl. marmot-nsec),
         // messages, favorites, verified fingerprints and the nickname.
-        // panicClearAllData() also erases the on-disk MessageStore; call it
-        // here too so the local mesh-DM / channel transcripts are gone even if
-        // that ordering ever changes.
-        chatViewModel.panicClearAllData()
-        MessageStore.shared.wipeAll()
-        _ = keychain.deleteIdentityKey(forKey: Keys.marmotNsecKeychainKey)
-        // Erase the encrypted Marmot (White Noise) SQLCipher database + its
-        // Keychain DB key; also resets in-memory Marmot state.
-        marmot.wipeDatabase()
+        // panicClearAllData() fences and erases the MessageStore/outbox before
+        // rotating identity. Reactivation is explicitly deferred until every
+        // higher-level cache below is cleared.
+        guard await chatViewModel.panicClearAllData() else {
+            showToast("Emergency wipe is incomplete. Sonar remains disconnected; try again.")
+            return
+        }
         // Drop diagnostics logs too: at verbose level they can contain peer
         // npubs, so a panic wipe must not leave them on disk.
         SonarDiagnostics.clearLogs()
@@ -7147,14 +7251,28 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSends = [:]
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
-        // Wallet seed and Breez state were shut down and removed at the start
-        // of this async wipe, before any new onboarding can begin.
+        // Forget every ⚡PAY coin and the Lightning wallet seed (separate
+        // keychain service owned by SonarWalletKit). The durable cleanup marker
+        // prevents a replacement identity from opening stale Breez storage.
+        var walletWipeComplete = true
+        #if os(iOS) || os(macOS)
+        if let bridged = wallet as? BridgedWallet {
+            walletWipeComplete = await bridged.wipeForEmergency()
+        } else {
+            do {
+                try BridgedWallet.beginWalletStorageMutation()
+                try BridgedWallet.wipeWalletStorage()
+            } catch {
+                walletWipeComplete = false
+            }
+        }
+        #endif
         payLedger.wipe()
         paymentActivityLedger.wipe()
         cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
-        clearMediaDiskCache()
+        let mediaWiped = clearMediaDiskCache()
         scannedPayMessageIDs = []
         pendingPayPeer = nil
         clearCallLogs()
@@ -7163,9 +7281,18 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.bip353)
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
-        if !walletWipeComplete {
-            toast = "Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account."
+        guard walletWipeComplete, mediaWiped, PanicWipeIntent.clear() else {
+            showToast("Emergency wipe is incomplete. Sonar remains disconnected; try again.")
+            return
         }
+        // Last step only: old-account DB/transcript/media/keychain paths are no
+        // longer live, so the replacement identity cannot race old cleanup.
+        chatViewModel.reactivateIdentityAfterPanicClear()
+        accountStartupFenced = false
+        wireBLEDiscoveryPolicy()
+        refreshBleKnownContactSnapshot()
+        applyBLEDiscoveryPolicy()
+        activateWalletBindings()
     }
 
     // MARK: Time formatting

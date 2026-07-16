@@ -286,12 +286,16 @@ struct ChatViewModelPresenceHandlingTests {
         let idBridge = NostrIdentityBridge(keychain: keychainHelper)
         let identityManager = MockIdentityManager(keychain)
         let transport = MockTransport()
+        let messageStore = MessageStore(
+            directoryName: "GeohashPresenceTests-\(UUID().uuidString)"
+        )
 
         let viewModel = ChatViewModel(
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            transport: transport
+            transport: transport,
+            messageStore: messageStore
         )
 
         return (viewModel, transport)

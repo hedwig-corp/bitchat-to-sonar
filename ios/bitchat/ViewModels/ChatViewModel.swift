@@ -89,6 +89,33 @@ import UIKit
 #endif
 import UniformTypeIdentifiers
 
+/// Serializes the complete private receive transaction across actor hops.
+/// MainActor tasks can interleave while awaiting disk I/O; without this gate,
+/// two staged transcript snapshots could overwrite each other before their
+/// corresponding UI write-throughs were queued.
+actor MeshInboundCommitGate {
+    private var isHeld = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func enter() async {
+        if !isHeld {
+            isHeld = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func leave() {
+        if waiters.isEmpty {
+            isHeld = false
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 /// Manages the application state and business logic for BitChat.
 /// Acts as the primary coordinator between UI components and backend services,
 /// implementing the BitchatDelegate protocol to handle network events.
@@ -100,9 +127,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
 
     @MainActor
     var canSendMediaInCurrentContext: Bool {
-        if let peer = selectedPrivateChatPeer {
-            return !(peer.isGeoDM || peer.isGeoChat)
-        }
+        // Legacy directed file packets are signed but not Noise encrypted.
+        // Never offer them from an end-to-end encrypted private conversation.
+        if selectedPrivateChatPeer != nil { return false }
         switch activeChannel {
         case .mesh: return true
         case .location: return false
@@ -162,6 +189,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     let messageRouter: MessageRouter
     let privateChatManager: PrivateChatManager
     let unifiedPeerService: UnifiedPeerService
+    let favoritesPersistenceService: FavoritesPersistenceService
+    let messageStore: MessageStore
+    let meshInboundCommitGate = MeshInboundCommitGate()
     let autocompleteService: AutocompleteService
     let deduplicationService: MessageDeduplicationService  // internal for test access
     
@@ -410,12 +440,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         identityManager: SecureIdentityStateManagerProtocol,
-        transport: Transport
+        transport: Transport,
+        messageStore: MessageStore = .shared,
+        favoritesPersistenceService: FavoritesPersistenceService = .shared
     ) {
         self.keychain = keychain
         self.idBridge = idBridge
         self.identityManager = identityManager
         self.meshService = transport
+        self.favoritesPersistenceService = favoritesPersistenceService
+        self.messageStore = messageStore
         self.publicMessagePipeline = PublicMessagePipeline()
         
         // Load persisted read receipts
@@ -429,7 +463,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         // Initialize services
         self.commandProcessor = CommandProcessor(identityManager: identityManager)
-        self.privateChatManager = PrivateChatManager(meshService: meshService)
+        self.privateChatManager = PrivateChatManager(meshService: meshService, store: messageStore)
         self.unifiedPeerService = UnifiedPeerService(meshService: meshService, idBridge: idBridge, identityManager: identityManager)
         let nostrTransport = NostrTransport(keychain: keychain, idBridge: idBridge)
         nostrTransport.senderPeerID = meshService.myPeerID
@@ -468,18 +502,20 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         // Log startup info
         
-        // Log fingerprint after a delay to ensure encryption service is ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + TransportConfig.uiStartupInitialDelaySeconds) { [weak self] in
-            if let self = self {
-                _ = self.getMyFingerprint()
+        if !PanicWipeIntent.isPending {
+            // Log fingerprint after a delay to ensure encryption service is ready
+            DispatchQueue.main.asyncAfter(deadline: .now() + TransportConfig.uiStartupInitialDelaySeconds) { [weak self] in
+                if let self = self, !PanicWipeIntent.isPending {
+                    _ = self.getMyFingerprint()
+                }
+            }
+            meshService.setNickname(nickname)
+            meshService.startServices()
+            Task { @MainActor [weak self] in
+                await self?.replayPendingPrivateReceiveEffectsAtStartup()
+                await self?.privateChatManager.hydrateRemainingChatPages()
             }
         }
-        
-        // Set nickname before starting services
-        meshService.setNickname(nickname)
-        
-        // Start mesh service immediately
-        meshService.startServices()
 
         publicMessagePipeline.delegate = self
         publicMessagePipeline.updateActiveChannel(activeChannel)
@@ -1879,6 +1915,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Return chronologically sorted, de-duplicated list
         return bestByID.values.sorted { $0.timestamp < $1.timestamp }
     }
+
+    @MainActor
+    func canLoadOlderPrivateMessages(for peerID: PeerID) -> Bool {
+        privateChatManager.canLoadOlderMessages(for: peerID)
+    }
+
+    @MainActor
+    func loadOlderPrivateMessages(for peerID: PeerID) async -> Bool {
+        await privateChatManager.loadOlderMessages(for: peerID)
+    }
     
     @MainActor
     func getPeerIDForNickname(_ nickname: String) -> PeerID? {
@@ -1919,15 +1965,23 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// message history is gone. (Contrast with panicClearAllData(), which also
     /// destroys the identity.)
     @MainActor
-    func clearAllConversations() {
+    @discardableResult
+    func clearAllConversations() -> Bool {
+        // Erase the on-disk message store: persisted mesh DMs and channel
+        // transcripts are local-only on-device, so they must go too.
+        meshService.invalidateDurablePrivateOutbox()
+        let result = messageStore.wipeAll()
+        guard result.quarantined else {
+            SecureLogger.error("Conversation wipe failed before storage quarantine", category: .session)
+            return false
+        }
         messages.removeAll()
         timelineStore.clearAll()
         privateChatManager.privateChats.removeAll()
         privateChatManager.unreadMessages.removeAll()
-        // Erase the on-disk message store: persisted mesh DMs and channel
-        // transcripts are local-only on-device, so they must go too.
-        MessageStore.shared.wipeAll()
+        meshService.reactivateDurablePrivateOutbox()
         objectWillChange.send()
+        return true
     }
 
     /// Delete ONE mesh/bitchat private conversation locally. The same contact
@@ -1935,41 +1989,110 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// stable Noise-key hex) — fold them by fingerprint and drop every one,
     /// clearing unread flags and the on-disk transcript. Local-only; the peer is
     /// not notified (like deleting a conversation in Signal/iMessage).
-    func deleteConversation(with peerID: PeerID) {
+    @discardableResult
+    func deleteConversation(with peerID: PeerID) -> Bool {
         let targetFP = getFingerprint(for: peerID)
         let matches = privateChatManager.privateChats.keys.filter { key in
             if let targetFP, let fp = getFingerprint(for: key) { return fp == targetFP }
             return key == peerID
         }
         let toRemove = matches.isEmpty ? [peerID] : Array(matches)
+        guard meshService.pruneDurablePrivateOutbox(for: toRemove) else {
+            SecureLogger.error("Conversation delete could not prune durable outbox", category: .session)
+            return false
+        }
+        let deletion = messageStore.deletePrivateDurably(peerIDs: toRemove)
+        guard deletion.fenced else {
+            SecureLogger.error("Conversation delete could not commit its durable fence", category: .session)
+            return false
+        }
         for key in toRemove {
             privateChatManager.privateChats.removeValue(forKey: key)
             privateChatManager.unreadMessages.remove(key)
-            MessageStore.shared.deletePrivate(peerID: key)
         }
         if let sel = selectedPrivateChatPeer, toRemove.contains(sel) {
             endPrivateChat()
         }
         objectWillChange.send()
+        if !deletion.complete {
+            SecureLogger.error(
+                "Conversation delete is fenced but requires crash-safe cleanup retry",
+                category: .session
+            )
+        }
+        return deletion.complete
     }
 
     // PANIC: Emergency data clearing for activist safety
     @MainActor
-    func panicClearAllData() {
-        // Messages are processed immediately - nothing to flush
-        
-        // Clear all messages
+    func beginPanicRedactionAndFence() {
+        // The durable marker already exists. Stop every account-bound transport
+        // and invalidate writers synchronously before scheduling cleanup.
+        NotificationService.shared.suspendAccountNotifications()
+        meshService.emergencyDisconnectAll()
+        meshService.invalidateDurablePrivateOutbox()
+        nostrRelayManager?.disconnect()
+        nostrRelayManager = nil
+
+        // Redact immediately for activist safety, even if durable cleanup later
+        // reports an error. Failure remains fail-closed: no identity/radio is
+        // recreated until every old-account live path is quarantined.
         messages.removeAll()
-        timelineStore.clear(channel: .mesh)
+        timelineStore.clearAll()
         privateChatManager.privateChats.removeAll()
         privateChatManager.unreadMessages.removeAll()
+        objectWillChange.send()
+    }
 
-        // Erase the on-disk message store: persisted mesh DMs and channel
-        // transcripts MUST be wiped on panic (they are local-only on-device).
-        MessageStore.shared.wipeAll()
+    @MainActor
+    func requestPanicClearAllData() {
+        let recovering = PanicWipeIntent.isPending
+        guard beginPanicWipeBeforeRedaction(
+            alreadyPending: recovering,
+            commitIntent: PanicWipeIntent.begin,
+            redact: beginPanicRedactionAndFence
+        ) else {
+            SecureLogger.error("Panic wipe journal could not be committed; live account remains unchanged", category: .security)
+            return
+        }
+        Task { @MainActor [weak self] in
+            _ = await self?.panicClearAllData()
+        }
+    }
 
-        // Delete all keychain data (including Noise and Nostr keys)
-        _ = keychain.deleteAllKeychainData()
+    @MainActor
+    @discardableResult
+    func panicClearAllData() async -> Bool {
+        // The initiating coordinator owns marker creation. Consumers must never
+        // reopen a pre-marker redaction window or silently start an unjournaled
+        // destructive transaction.
+        guard PanicWipeIntent.isPending else {
+            SecureLogger.error("Panic wipe requested without a committed journal", category: .security)
+            return false
+        }
+        beginPanicRedactionAndFence()
+
+        let transcriptResult = messageStore.wipeAll()
+        let mediaResult = await Task.detached(priority: .utility) {
+            PanicMediaStore.quarantineAndRecreate()
+        }.value
+        guard transcriptResult.quarantined,
+              transcriptResult.cleanupComplete,
+              mediaResult.quarantined,
+              mediaResult.cleanupComplete else {
+            SecureLogger.error("Panic wipe storage durability is incomplete; identity remains fenced", category: .session)
+            objectWillChange.send()
+            return false
+        }
+
+        // Keychain deletion cannot be quarantined. Treat any Security.framework
+        // error as a hard barrier; never generate a replacement account on top
+        // of a key that may still belong to the old one.
+        guard keychain.deleteAllKeychainData() else {
+            SecureLogger.error("Panic keychain deletion failed; identity remains fenced", category: .security)
+            objectWillChange.send()
+            return false
+        }
         
         // Clear UserDefaults identity data
         userDefaults.removeObject(forKey: "bitchat.noiseIdentityKey")
@@ -1989,7 +2112,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         peerIDToPublicKeyFingerprint.removeAll()
         
         // Clear persistent favorites from keychain
-        FavoritesPersistenceService.shared.clearAllFavorites()
+        guard favoritesPersistenceService.clearAllFavorites() else {
+            SecureLogger.error("Panic favorite deletion failed; identity remains fenced", category: .security)
+            objectWillChange.send()
+            return false
+        }
         
         // Identity manager has cleared persisted identity data above
         
@@ -2018,61 +2145,40 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Clear Nostr identity associations
         idBridge.clearAllAssociations()
         
-        // Disconnect from all peers and clear persistent identity
-        // This will force creation of a new identity (new fingerprint) on next launch
-        meshService.emergencyDisconnectAll()
-        if let bleService = meshService as? BLEService {
-            bleService.resetIdentityForPanic(currentNickname: nickname)
-        }
-        
-        // No need to force UserDefaults synchronization
-        
-        // Reinitialize Nostr with new identity
-        // This will generate new Nostr keys derived from new Noise keys
-        Task { @MainActor in
-            // Small delay to ensure cleanup completes
-            try? await Task.sleep(nanoseconds: TransportConfig.uiAsyncShortSleepNs) // 0.1 seconds
-            
-            // Reinitialize Nostr relay manager with new identity
-            nostrRelayManager = NostrRelayManager()
-            setupNostrMessageHandling()
-            nostrRelayManager?.connect()
-        }
-        
-        // Delete ALL media files (incoming and outgoing) in background
+        // BCH-01-013: snapshots contain no live-account target and can be
+        // cleaned only after the durable account barrier has committed.
         Task.detached(priority: .utility) {
-            do {
-                let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-                let filesDir = base.appendingPathComponent("files", isDirectory: true)
-
-                // Delete the entire files directory and recreate it
-                if FileManager.default.fileExists(atPath: filesDir.path) {
-                    try FileManager.default.removeItem(at: filesDir)
-                    SecureLogger.info("🗑️ Deleted all media files during panic clear", category: .session)
-                }
-
-                // Recreate empty directory structure
-                try FileManager.default.createDirectory(at: filesDir, withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("voicenotes/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("voicenotes/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("images/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("images/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("files/incoming", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-                try FileManager.default.createDirectory(at: filesDir.appendingPathComponent("files/outgoing", isDirectory: true), withIntermediateDirectories: true, attributes: nil)
-            } catch {
-                SecureLogger.error("Failed to clear media files during panic: \(error)", category: .session)
-            }
-
-            // BCH-01-013: Clear iOS app switcher snapshots
-            // These are stored in Library/Caches/Snapshots/<bundle_id>/
             #if os(iOS)
             Self.clearAppSwitcherSnapshots()
             #endif
         }
 
         // Force immediate UI update for panic mode
-        // UI updates immediately - no flushing needed
+        objectWillChange.send()
+        return true
+    }
 
+    /// Called only after every higher-level account store (Marmot, wallet,
+    /// media caches) has crossed its own wipe barrier.
+    @MainActor
+    func reactivateIdentityAfterPanicClear() {
+        guard !PanicWipeIntent.isPending else {
+            SecureLogger.error("Refusing to reactivate identity while panic wipe is pending", category: .security)
+            return
+        }
+        guard NotificationService.shared.reactivateAccountNotifications() else {
+            SecureLogger.error("Refusing to reactivate notifications before panic marker clear", category: .security)
+            return
+        }
+        if let bleService = meshService as? BLEService {
+            bleService.resetIdentityForPanic(currentNickname: nickname)
+        }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: TransportConfig.uiAsyncShortSleepNs)
+            nostrRelayManager = NostrRelayManager()
+            setupNostrMessageHandling()
+            nostrRelayManager?.connect()
+        }
     }
 
     /// BCH-01-013: Clear iOS app switcher snapshots during panic mode
@@ -2662,7 +2768,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         messages = timelineStore.messages(for: target)
         // Write-through: persist the visible channel transcript so public /
         // geohash history survives an app restart. Local-only on-device store.
-        MessageStore.shared.saveChannel(target.storeID, messages: messages)
+        messageStore.saveChannel(target.storeID, messages: messages)
     }
 
     /// Merge a channel's persisted transcript (from MessageStore) back into the
@@ -2670,7 +2776,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// Existing messages are deduped by id inside the timeline store.
     @MainActor
     func hydrateChannelFromStore(_ channel: ChannelID) {
-        let stored = MessageStore.shared.loadChannel(channel.storeID)
+        let stored = messageStore.loadChannel(channel.storeID)
         guard !stored.isEmpty else { return }
         switch channel {
         case .mesh:
@@ -3084,12 +3190,31 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     func didReceiveMessage(_ message: BitchatMessage) {
         Task { @MainActor in
             // Early validation
-            guard !isMessageBlocked(message) else { return }
+            guard !isMessageBlocked(message) else {
+                // Private media is persisted before BLE publishes its marker.
+                // A blocked message must not leave that unreferenced file behind.
+                if message.isPrivate { cleanupStagedIncomingMediaFile(forMessage: message) }
+                return
+            }
             guard !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || message.isPrivate else { return }
             
             // Route to appropriate handler
             if message.isPrivate {
-                handlePrivateMessage(message)
+                let disposition = await handlePrivateMessageDurably(message)
+                guard disposition != .failed else {
+                    // The file and transcript form one user-visible acceptance:
+                    // if the transcript cannot commit, roll back the staged file
+                    // and emit no notification, unread/read-receipt, pay, or call
+                    // side effect. A sender retry can safely recreate it.
+                    cleanupStagedIncomingMediaFile(forMessage: message)
+                    return
+                }
+                guard disposition == .admitted else {
+                    // Replayed media may have staged another uniquely-named file,
+                    // but the durable transcript already references the original.
+                    cleanupStagedIncomingMediaFile(forMessage: message)
+                    return
+                }
             } else {
                 handlePublicMessage(message)
             }
@@ -3100,36 +3225,48 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
 
-    /// Find message index trying both short (16-hex) and long (64-hex) peer ID formats.
-    /// Returns the peer ID where the message was found and its index, or nil if not found.
-    private func findMessageIndex(messageID: String, peerID: PeerID) -> (peerID: PeerID, index: Int)? {
-        // Try direct lookup first
-        if let messages = privateChats[peerID],
-           let idx = messages.firstIndex(where: { $0.id == messageID }) {
-            return (peerID, idx)
-        }
-
-        // Try with full noise key if peerID is short (16 hex chars)
+    /// Candidate persisted conversation keys for a receipt sender. Noise chats
+    /// may have migrated between their short transport ID and full static key.
+    @MainActor
+    func deliveryReceiptPeerCandidates(for peerID: PeerID) -> [PeerID] {
+        var candidates = [peerID]
         if peerID.bare.count == 16,
            let peer = unifiedPeerService.getPeer(by: peerID),
            !peer.noisePublicKey.isEmpty {
-            let longID = PeerID(hexData: peer.noisePublicKey)
-            if let messages = privateChats[longID],
-               let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                return (longID, idx)
-            }
+            candidates.append(PeerID(hexData: peer.noisePublicKey))
         }
-
-        // Try with short form if peerID is long (64 hex = noise key)
         if peerID.bare.count == 64 {
-            let shortID = peerID.toShort()
-            if let messages = privateChats[shortID],
-               let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                return (shortID, idx)
+            candidates.append(peerID.toShort())
+        }
+        return candidates
+    }
+
+    @MainActor
+    @discardableResult
+    func applyPrivateDeliveryStatus(
+        messageID: String,
+        status: DeliveryStatus,
+        preferredPeerIDs: [PeerID]
+    ) async -> PrivateDeliveryStatusMutationResult {
+        let generation = privateChatManager.currentStorageGeneration()
+        var candidates: [PeerID] = []
+        var seen = Set<PeerID>()
+        for peerID in preferredPeerIDs {
+            for candidate in deliveryReceiptPeerCandidates(for: peerID)
+            where seen.insert(candidate).inserted {
+                candidates.append(candidate)
             }
         }
-
-        return nil
+        let result = await privateChatManager.commitDeliveryStatus(
+            messageID: messageID,
+            status: status,
+            preferredPeerIDs: candidates,
+            expectedGeneration: generation
+        )
+        if result.disposition == .updated {
+            objectWillChange.send()
+        }
+        return result
     }
 
     // Low-level BLE events
@@ -3142,6 +3279,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 // BCH-01-012: Check blocking before processing private message to prevent notification bypass
                 if isPeerBlocked(peerID) {
                     SecureLogger.debug("🚫 Ignoring Noise payload from blocked peer: \(peerID)", category: .security)
+                    // Dropping a blocked message is a terminal local decision.
+                    // ACK it so the sender does not retry forever or surface a
+                    // misleading delivery failure for intentionally discarded data.
+                    meshService.sendDeliveryAck(for: pm.messageID, to: peerID)
                     return
                 }
 
@@ -3159,33 +3300,33 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                     senderPeerID: peerID,
                     mentions: pmMentions.isEmpty ? nil : pmMentions
                 )
-                handlePrivateMessage(msg)
-                // Send delivery ACK back over BLE
+                guard await handlePrivateMessageDurably(msg) != .failed else {
+                    SecureLogger.warning(
+                        "⚠️ Withholding delivery ACK until private message persistence succeeds: \(pm.messageID)",
+                        category: .session
+                    )
+                    return
+                }
+                // The transcript/control receipt is now atomically durable.
                 meshService.sendDeliveryAck(for: pm.messageID, to: peerID)
 
             case .delivered:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
-                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
-
-                // Don't downgrade from .read to .delivered
-                if case .read = privateChats[foundPeerID]?[idx].deliveryStatus { return }
-
-                privateChats[foundPeerID]?[idx].deliveryStatus = .delivered(to: name, at: Date())
-                objectWillChange.send()
+                let name = unifiedPeerService.getPeer(by: peerID)?.nickname ?? resolveNickname(for: peerID)
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: .delivered(to: name, at: Date()),
+                    preferredPeerIDs: deliveryReceiptPeerCandidates(for: peerID)
+                )
 
             case .readReceipt:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
-                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
-
-                // Explicitly unwrap and re-assign to ensure the @Published setter is called
-                if let messages = privateChats[foundPeerID], idx < messages.count {
-                    messages[idx].deliveryStatus = .read(by: name, at: Date())
-                    privateChats[foundPeerID] = messages
-                    privateChatManager.objectWillChange.send()
-                    objectWillChange.send()
-                }
+                let name = unifiedPeerService.getPeer(by: peerID)?.nickname ?? resolveNickname(for: peerID)
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: .read(by: name, at: Date()),
+                    preferredPeerIDs: deliveryReceiptPeerCandidates(for: peerID)
+                )
             case .verifyChallenge:
                 // Parse and respond
                 guard let tlv = VerificationService.shared.parseVerifyChallenge(payload) else { return }
@@ -3653,24 +3794,33 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     func didReceiveReadReceipt(_ receipt: ReadReceipt) {
         // Find the message and update its read status
-        updateMessageDeliveryStatus(receipt.originalMessageID, status: .read(by: receipt.readerNickname, at: receipt.timestamp))
+        updateMessageDeliveryStatus(
+            receipt.originalMessageID,
+            status: .read(by: receipt.readerNickname, at: receipt.timestamp),
+            preferredPeerIDs: [receipt.readerID]
+        )
     }
     
     func didUpdateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus) {
         updateMessageDeliveryStatus(messageID, status: status)
     }
     
-    func updateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus) {
+    func updateMessageDeliveryStatus(
+        _ messageID: String,
+        status: DeliveryStatus,
+        preferredPeerIDs: [PeerID] = []
+    ) {
         
         // Helper function to check if we should skip this update
         func shouldSkipUpdate(currentStatus: DeliveryStatus?, newStatus: DeliveryStatus) -> Bool {
             guard let current = currentStatus else { return false }
             
-            // Don't downgrade from read to delivered
             switch (current, newStatus) {
-            case (.read, .delivered):
+            case (.read, _):
                 return true
-            case (.read, .sent):
+            case (.delivered, .read):
+                return false
+            case (.delivered, _):
                 return true
             default:
                 return false
@@ -3686,14 +3836,38 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
         
         // Update in private chats
-        for (peerID, chatMessages) in privateChats {
+        var matchedPrivatePeerIDs: [PeerID] = []
+        for peerID in Array(privateChats.keys) {
+            guard let chatMessages = privateChats[peerID] else { continue }
             guard let index = chatMessages.firstIndex(where: { $0.id == messageID }) else { continue }
+            matchedPrivatePeerIDs.append(peerID)
             
             let currentStatus = chatMessages[index].deliveryStatus
             guard !shouldSkipUpdate(currentStatus: currentStatus, newStatus: status) else { continue }
             
-            // Update delivery status directly (BitchatMessage is a class/reference type)
-            privateChats[peerID]?[index].deliveryStatus = status
+            chatMessages[index].deliveryStatus = status
+            // Reassign for publication; explicit write-through handles the
+            // reference-sharing blind spot in equality-based didSet detection.
+            privateChats[peerID] = chatMessages
+            privateChatManager.persistCurrentTranscript(for: peerID)
+        }
+
+        // The chat list keeps only the latest row of a closed conversation.
+        // Receipt statuses therefore also mutate the full store by stable ID;
+        // the manager projects them back only when that row is actually in the
+        // current summary/window.
+        switch status {
+        case .delivered, .read:
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: status,
+                    preferredPeerIDs: preferredPeerIDs + matchedPrivatePeerIDs
+                )
+            }
+        case .failed, .partiallyDelivered, .sending, .sent:
+            break
         }
         
         // Trigger UI update for delivery status change

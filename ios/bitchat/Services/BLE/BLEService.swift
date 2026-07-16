@@ -164,7 +164,9 @@ final class BLEService: NSObject {
     private let identityManager: SecureIdentityStateManagerProtocol
     private let keychain: KeychainManagerProtocol
     private let idBridge: NostrIdentityBridge
+    private let messageStore: MessageStore
     private var myPeerIDData: Data = Data()
+    private var meshOutboxOwnerID = ""
 
     // MARK: - Advertising Privacy
     // No Local Name by default for maximum privacy. No rotating alias.
@@ -176,9 +178,10 @@ final class BLEService: NSObject {
     private let messageQueueKey = DispatchSpecificKey<Void>()
     private let bleQueue = DispatchQueue(label: "mesh.bluetooth", qos: .userInitiated)
     private let bleQueueKey = DispatchSpecificKey<Void>()
+    private let outboundQueue = DispatchQueue(label: "mesh.outbound.durable", qos: .utility)
+    private var meshOutboxFence = UUID().uuidString
+    private let meshRetryInterval: TimeInterval = 5
     
-    // Queue for messages pending handshake completion
-    private var pendingMessagesAfterHandshake: [PeerID: [(content: String, messageID: String)]] = [:]
     // Noise typed payloads (ACKs, read receipts, etc.) pending handshake
     private var pendingNoisePayloadsAfterHandshake: [PeerID: [Data]] = [:]
     // Queue for notifications that failed due to full queue
@@ -298,16 +301,27 @@ final class BLEService: NSObject {
     init(
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
-        identityManager: SecureIdentityStateManagerProtocol
+        identityManager: SecureIdentityStateManagerProtocol,
+        messageStore: MessageStore = .shared
     ) {
         self.keychain = keychain
         self.idBridge = idBridge
-        noiseService = NoiseEncryptionService(keychain: keychain)
+        self.messageStore = messageStore
+        let wipePending = PanicWipeIntent.isPending
+        // Keep the object graph constructible for UI redaction/recovery, but do
+        // not read, generate, or persist an account identity while recovery is pending.
+        noiseService = NoiseEncryptionService(
+            keychain: keychain,
+            allowPersistentIdentity: !wipePending
+        )
         self.identityManager = identityManager
         super.init()
         
         configureNoiseServiceCallbacks(for: noiseService)
-        refreshPeerIdentity()
+        if !wipePending {
+            refreshPeerIdentity()
+            messageStore.activateMeshOutbox(ownerID: meshOutboxOwnerID, fence: meshOutboxFence)
+        }
         
         // Set queue key for identification
         messageQueue.setSpecific(key: messageQueueKey, value: ())
@@ -524,8 +538,11 @@ final class BLEService: NSObject {
     }
 
     func resetIdentityForPanic(currentNickname: String) {
+        guard !PanicWipeIntent.isPending else {
+            SecureLogger.error("Refusing to provision BLE identity while panic wipe is pending", category: .security)
+            return
+        }
         messageQueue.sync(flags: .barrier) {
-            pendingMessagesAfterHandshake.removeAll()
             pendingNoisePayloadsAfterHandshake.removeAll()
         }
 
@@ -554,6 +571,7 @@ final class BLEService: NSObject {
         noiseService = newNoise
         configureNoiseServiceCallbacks(for: newNoise)
         refreshPeerIdentity()
+        reactivateDurablePrivateOutbox()
         restartGossipManager()
 
         setNickname(currentNickname)
@@ -582,7 +600,12 @@ final class BLEService: NSObject {
         }
         
         if let recipientID {
-            sendPrivateMessage(content, to: recipientID, messageID: messageID ?? UUID().uuidString)
+            sendPrivateMessage(
+                content,
+                to: recipientID,
+                recipientNickname: peerNickname(peerID: recipientID) ?? recipientID.id,
+                messageID: messageID ?? UUID().uuidString
+            )
             return
         }
         
@@ -653,6 +676,7 @@ final class BLEService: NSObject {
     
     var myPeerID = PeerID(str: "")
     var myNickname: String = "anon"
+    var usesAcknowledgedPrivateDelivery: Bool { true }
     
     func setNickname(_ nickname: String) {
         self.myNickname = nickname
@@ -663,7 +687,9 @@ final class BLEService: NSObject {
     // MARK: Lifecycle
     
     func startServices() {
+        guard !PanicWipeIntent.isPending else { return }
         guard allowsBLERadio else { return }
+        drainDurableMeshOutbox()
         // Start BLE services if not already running
         if centralManager?.state == .poweredOn {
             startScanning()
@@ -748,8 +774,8 @@ final class BLEService: NSObject {
             incomingFragments.removeAll()
             fragmentMetadata.removeAll()
             activeTransfers.removeAll()
-            // Also clear pending message queues to avoid stale state across sessions
-            pendingMessagesAfterHandshake.removeAll()
+            // Protocol ACK/read payloads are session-bound; user messages live
+            // in the durable outbox and intentionally survive reconnects.
             pendingNoisePayloadsAfterHandshake.removeAll()
             pendingDirectedRelays.removeAll()
             pendingSonarAnnounces.removeAll()
@@ -773,6 +799,56 @@ final class BLEService: NSObject {
             centralSubscriptionRateLimits.removeAll()
         }
         meshTopology.reset()
+    }
+
+    func invalidateDurablePrivateOutbox() {
+        outboundQueue.sync {
+            messageStore.invalidateMeshOutbox(ownerID: meshOutboxOwnerID, fence: meshOutboxFence)
+            meshOutboxFence = UUID().uuidString
+        }
+    }
+
+    func reactivateDurablePrivateOutbox() {
+        outboundQueue.sync {
+            messageStore.activateMeshOutbox(ownerID: meshOutboxOwnerID, fence: meshOutboxFence)
+        }
+    }
+
+    func pruneDurablePrivateOutbox(for peerIDs: [PeerID]) -> Bool {
+        let routingIDs = Set(peerIDs.compactMap { routingPeerID(for: $0) } + peerIDs)
+        guard !routingIDs.isEmpty else { return false }
+
+        return outboundQueue.sync {
+            guard messageStore.pruneMeshObligations(
+                ownerID: meshOutboxOwnerID,
+                fence: meshOutboxFence,
+                peerIDs: routingIDs
+            ) else { return false }
+
+            // Prevent already-encoded attempts from draining after deletion.
+            // Unrelated durable messages remain in MessageStore and will retry.
+            if DispatchQueue.getSpecific(key: bleQueueKey) == nil {
+                // Drain submissions captured before the durable prune. A write
+                // already handed to CoreBluetooth cannot be recalled, but no
+                // queued callback may repopulate the buffers after our clear.
+                bleQueue.sync {}
+            }
+            collectionsQueue.sync(flags: .barrier) {
+                for peerID in routingIDs {
+                    pendingNoisePayloadsAfterHandshake.removeValue(forKey: peerID)
+                    pendingDirectedRelays.removeValue(forKey: peerID)
+                }
+                pendingNotifications.removeAll()
+                pendingPeripheralWrites.removeAll()
+                pendingFragmentTransfers.removeAll { context in
+                    guard let directedPeer = context.directedPeer else { return false }
+                    return routingIDs.contains(directedPeer)
+                }
+                scheduledRelays.values.forEach { $0.cancel() }
+                scheduledRelays.removeAll()
+            }
+            return true
+        }
     }
     
     // MARK: Connectivity and peers
@@ -911,29 +987,101 @@ final class BLEService: NSObject {
             SecureLogger.debug("Private BLE send has no routing peer for \(peerID.id.prefix(16))", category: .session)
             return
         }
-        sendPrivateMessage(content, to: target, messageID: messageID)
+        enqueueDurablePrivateMessage(
+            content,
+            to: target,
+            recipientNickname: recipientNickname,
+            messageID: messageID,
+            kind: MeshOutboundKind.classify(content)
+        )
     }
 
-    /// Immediate BLE-only private send for real-time controls such as ☎CALL.
-    /// Unlike normal chat sends, this never queues or falls back to Nostr.
+    /// BLE-only submission for session-bound real-time controls such as ☎CALL.
+    /// Unlike ordinary private messages this path never persists, floods, spools,
+    /// fragments asynchronously, or waits for a future CoreBluetooth callback.
+    /// `true` means the complete encrypted frame was handed to a direct link now.
     func sendPrivateMessageNow(_ content: String, to peerID: PeerID, messageID: String) -> Bool {
         guard let target = routingPeerID(for: peerID) else {
             SecureLogger.debug("SonarCall: immediate BLE send has no routing peer for \(peerID.id.prefix(16))", category: .session)
             return false
         }
-        let direct = linkState(for: target)
-        let hasNoise = noiseService.hasEstablishedSession(with: target)
-        guard (direct.hasPeripheral || direct.hasCentral), hasNoise else {
+        let submit = { () -> Bool in
+            guard self.noiseService.hasEstablishedSession(with: target) else {
+                return false
+            }
+
+            let peripheralState: PeripheralState? = self.peerToPeripheralUUID[target]
+                .flatMap { self.peripherals[$0] }
+                .flatMap { $0.isConnected && $0.characteristic != nil ? $0 : nil }
+            let directCentrals: [CBCentral] = self.subscribedCentrals.filter {
+                self.centralToPeerID[$0.identifier.uuidString] == target
+            }
+            guard peripheralState != nil || !directCentrals.isEmpty else {
+                return false
+            }
+
+            do {
+                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
+                guard let tlvData = privateMessage.encode() else { return false }
+                var typedPayload = Data([NoisePayloadType.privateMessage.rawValue])
+                typedPayload.append(tlvData)
+                let encrypted = try self.noiseService.encrypt(typedPayload, for: target)
+                let packet = BitchatPacket(
+                    type: MessageType.noiseEncrypted.rawValue,
+                    senderID: self.myPeerIDData,
+                    recipientID: Data(hexString: target.id),
+                    timestamp: UInt64(Date().timeIntervalSince1970 * 1_000),
+                    payload: encrypted,
+                    signature: nil,
+                    ttl: self.messageTTL
+                )
+                let pad = self.padPolicy(for: packet.type)
+                guard let data = packet.toBinaryData(padding: pad) else { return false }
+
+                if let state = peripheralState,
+                   let characteristic = state.characteristic,
+                   data.count <= state.peripheral.maximumWriteValueLength(for: .withoutResponse),
+                   state.peripheral.canSendWriteWithoutResponse {
+                    state.peripheral.writeValue(data, for: characteristic, type: .withoutResponse)
+                    return true
+                }
+
+                if let characteristic = self.characteristic {
+                    for central in directCentrals where data.count <= central.maximumUpdateValueLength {
+                        if self.peripheralManager?.updateValue(
+                            data,
+                            for: characteristic,
+                            onSubscribedCentrals: [central]
+                        ) == true {
+                            return true
+                        }
+                    }
+                }
+
+                // Encryption advanced the Noise transport nonce but no platform
+                // queue accepted the bytes. Retire the session so a later normal
+                // message starts a fresh handshake instead of nonce-desyncing.
+                self.noiseService.clearSession(for: target)
+                return false
+            } catch {
+                SecureLogger.error("SonarCall: immediate BLE encryption failed: \(error)", category: .session)
+                return false
+            }
+        }
+
+        let accepted: Bool
+        if DispatchQueue.getSpecific(key: bleQueueKey) != nil {
+            accepted = submit()
+        } else {
+            accepted = bleQueue.sync(execute: submit)
+        }
+        if !accepted {
             SecureLogger.debug(
-                "SonarCall: immediate BLE send unavailable requested=\(peerID.id.prefix(16)) target=\(target.id) peripheral=\(direct.hasPeripheral) central=\(direct.hasCentral) noise=\(hasNoise)",
+                "SonarCall: direct link could not accept complete control bytes for \(target.id.prefix(16))",
                 category: .session
             )
-            return false
         }
-        messageQueue.async { [weak self] in
-            self?.sendPrivateMessageNowOnQueue(content, to: target, messageID: messageID)
-        }
-        return true
+        return accepted
     }
 
     func sendFileBroadcast(_ filePacket: BitchatFilePacket, transferId: String) {
@@ -966,39 +1114,13 @@ final class BLEService: NSObject {
     }
 
     func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: PeerID, transferId: String) {
-        messageQueue.async { [weak self] in
-            guard let self = self else { return }
-            guard let payload = filePacket.encode() else {
-                SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
-                return
-            }
-            guard let targetID = self.routingPeerID(for: peerID) else {
-                SecureLogger.error("❌ No routing peer for private file transfer: \(peerID)", category: .session)
-                return
-            }
-            guard let recipientData = Data(hexString: targetID.id) else {
-                SecureLogger.error("❌ Invalid recipient peer ID for file transfer: \(peerID)", category: .session)
-                return
-            }
-
-            var packet = BitchatPacket(
-                type: MessageType.fileTransfer.rawValue,
-                senderID: self.myPeerIDData,
-                recipientID: recipientData,
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                payload: payload,
-                signature: nil,
-                ttl: self.messageTTL,
-                version: 2
-            )
-
-            if let signed = self.noiseService.signPacket(packet) {
-                packet = signed
-            }
-
-            SecureLogger.debug("📁 Sending private file transfer to \(targetID.id.prefix(8))… requested=\(peerID.id.prefix(8))… bytes=\(payload.count)", category: .session)
-            self.broadcastPacket(packet, transferId: transferId)
-        }
+        // Type-0x22 exposes metadata and content outside Noise. Keep the API for
+        // transport compatibility, but fail closed until encrypted chunking +
+        // stable post-persistence ACK are implemented cross-platform.
+        SecureLogger.warning(
+            "🚫 Blocked legacy plaintext private file transfer \(transferId.prefix(8))… to \(peerID.id.prefix(8))…",
+            category: .security
+        )
     }
 
     
@@ -1343,6 +1465,15 @@ final class BLEService: NSObject {
     private func handleFileTransfer(_ packet: BitchatPacket, from peerID: PeerID) {
         if peerID == myPeerID && packet.ttl != 0 { return }
 
+        if let recipient = packet.recipientID,
+           !recipient.allSatisfy({ $0 == 0xFF }) {
+            SecureLogger.warning(
+                "🚫 Dropped directed legacy file packet outside Noise from \(peerID.id.prefix(8))…",
+                category: .security
+            )
+            return
+        }
+
         var accepted = false
         var senderNickname = ""
 
@@ -1464,7 +1595,13 @@ final class BLEService: NSObject {
         }
 
         let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
+        // File TLVs do not yet carry the sender's transcript message ID. Use a
+        // deterministic receive-side ID so a replay/restart cannot publish the
+        // same media as a second chat message. Including the payload digest
+        // also total-orders distinct files emitted in the same millisecond.
+        let messageID = "mesh-media-\(packet.senderID.hexEncodedString())-\(packet.timestamp)-\(packet.payload.sha256Hex())"
         let message = BitchatMessage(
+            id: messageID,
             sender: senderNickname,
             content: marker,
             timestamp: ts,
@@ -1495,7 +1632,13 @@ final class BLEService: NSObject {
         }
         
         SecureLogger.debug("📤 Sending favorite notification to \(peerID): \(content)", category: .session)
-        sendPrivateMessage(content, to: peerID, messageID: UUID().uuidString)
+        enqueueDurablePrivateMessage(
+            content,
+            to: routingPeerID(for: peerID) ?? peerID,
+            recipientNickname: peerNickname(peerID: peerID) ?? peerID.id,
+            messageID: UUID().uuidString,
+            kind: .favorite
+        )
     }
     
     func sendBroadcastAnnounce() {
@@ -1653,6 +1796,19 @@ final class BLEService: NSObject {
             let sanitized = sanitizeFileName(preferredName, defaultName: defaultName, fallbackExtension: fallbackExtension)
             let destination = uniqueFileURL(in: base, fileName: sanitized)
             try data.write(to: destination, options: .atomic)
+            do {
+                let handle = try FileHandle(forWritingTo: destination)
+                do {
+                    try handle.synchronize()
+                    try handle.close()
+                } catch {
+                    try? handle.close()
+                    throw error
+                }
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                throw error
+            }
             return destination
         } catch {
             SecureLogger.error("❌ Failed to persist incoming media: \(error)", category: .session)
@@ -3163,8 +3319,8 @@ extension BLEService {
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID), fingerprint: \(fingerprint.prefix(16))...")
+            self?.drainDurableMeshOutbox(for: peerID)
             self?.messageQueue.async { [weak self] in
-                self?.sendPendingMessagesAfterHandshake(for: peerID)
                 self?.sendPendingNoisePayloadsAfterHandshake(for: peerID)
             }
             self?.messageQueue.async { [weak self] in
@@ -3175,6 +3331,7 @@ extension BLEService {
 
     private func refreshPeerIdentity() {
         let fingerprint = noiseService.getIdentityFingerprint()
+        meshOutboxOwnerID = fingerprint
         myPeerID = PeerID(str: fingerprint.prefix(16))
         myPeerIDData = Data(hexString: myPeerID.id) ?? Data()
         meshTopology.reset()
@@ -3438,130 +3595,148 @@ extension BLEService {
     
     // MARK: Private Message Handling
     
-    private func sendPrivateMessage(_ content: String, to recipientID: PeerID, messageID: String) {
-        SecureLogger.debug("📨 Sending PM to \(recipientID): \(content.prefix(30))...", category: .session)
-        
-        // Check if we have an established Noise session
-        if noiseService.hasEstablishedSession(with: recipientID) {
-            // Encrypt and send
-            do {
-                // Create TLV-encoded private message
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
-                guard let tlvData = privateMessage.encode() else {
-                    SecureLogger.error("Failed to encode private message with TLV")
-                    return
+    private func enqueueDurablePrivateMessage(
+        _ content: String,
+        to recipientID: PeerID,
+        recipientNickname: String,
+        messageID: String,
+        kind: MeshOutboundKind
+    ) {
+        let createdAt = Date()
+        // Capture the lifecycle token at submission time. If a panic/account
+        // reset races this queued block, MessageStore rejects the stale token
+        // instead of letting pre-wipe work recreate the erased journal.
+        let outboxContext = outboundQueue.sync {
+            (ownerID: meshOutboxOwnerID, fence: meshOutboxFence)
+        }
+        outboundQueue.async { [weak self] in
+            guard let self else { return }
+            guard let result = self.messageStore.enqueueMeshObligation(
+                ownerID: outboxContext.ownerID,
+                fence: outboxContext.fence,
+                messageID: messageID,
+                peerID: recipientID,
+                recipientNickname: recipientNickname,
+                content: content,
+                kind: kind,
+                createdAt: createdAt
+            ) else {
+                self.notifyUI { [weak self] in
+                    self?.delegate?.didUpdateMessageDeliveryStatus(
+                        messageID,
+                        status: .failed(reason: "Could not persist outgoing message")
+                    )
                 }
-                
-                // Create message payload with TLV: [type byte] + [TLV data]
-                var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
-                messagePayload.append(tlvData)
-                
-                let encrypted = try noiseService.encrypt(messagePayload, for: recipientID)
-                
-                // Convert recipientID to Data (assuming it's a hex string)
-                var recipientData = Data()
-                var tempID = recipientID.id
-                while tempID.count >= 2 {
-                    let hexByte = String(tempID.prefix(2))
-                    if let byte = UInt8(hexByte, radix: 16) {
-                        recipientData.append(byte)
-                    }
-                    tempID = String(tempID.dropFirst(2))
-                }
-                if tempID.count == 1 {
-                    if let byte = UInt8(tempID, radix: 16) {
-                        recipientData.append(byte)
-                    }
-                }
-
-                let packet = BitchatPacket(
-                    type: MessageType.noiseEncrypted.rawValue,
-                    senderID: myPeerIDData,
-                    recipientID: recipientData,
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                    payload: encrypted,
-                    signature: nil,
-                    ttl: messageTTL
-                )
-                
-                broadcastPacket(packet)
-                
-                // Notify delegate that message was sent
-                notifyUI { [weak self] in
-                    self?.delegate?.didUpdateMessageDeliveryStatus(messageID, status: .sent)
-                }
-            } catch {
-                SecureLogger.error("Failed to encrypt message: \(error)")
+                return
             }
-        } else {
-            // Queue message for sending after handshake completes
-            SecureLogger.debug("🤝 No session with \(recipientID), initiating handshake and queueing message", category: .session)
-            
-            // Queue the message (especially important for favorite notifications)
-            collectionsQueue.sync(flags: .barrier) {
-                if pendingMessagesAfterHandshake[recipientID] == nil {
-                    pendingMessagesAfterHandshake[recipientID] = []
+            for evictedID in result.evictedMessageIDs {
+                self.notifyUI { [weak self] in
+                    self?.delegate?.didUpdateMessageDeliveryStatus(
+                        evictedID,
+                        status: .failed(reason: "Outgoing queue limit reached")
+                    )
                 }
-                pendingMessagesAfterHandshake[recipientID]?.append((content, messageID))
             }
-            
-            initiateNoiseHandshake(with: recipientID)
-            
-            // Notify delegate that message is pending
-            notifyUI { [weak self] in
-                self?.delegate?.didUpdateMessageDeliveryStatus(messageID, status: .sending)
-            }
+            self.drainDurableMeshOutboxOnQueue(for: recipientID)
         }
     }
 
-    private func sendPrivateMessageNowOnQueue(_ content: String, to recipientID: PeerID, messageID: String) {
-        guard noiseService.hasEstablishedSession(with: recipientID) else { return }
+    private func drainDurableMeshOutbox(for peerID: PeerID? = nil) {
+        outboundQueue.async { [weak self] in
+            self?.drainDurableMeshOutboxOnQueue(for: peerID)
+        }
+    }
+
+    private func drainDurableMeshOutboxOnQueue(for peerID: PeerID? = nil) {
+        dispatchPrecondition(condition: .onQueue(outboundQueue))
+        let now = Date()
+        guard let loaded = messageStore.loadMeshObligations(
+            ownerID: meshOutboxOwnerID,
+            fence: meshOutboxFence,
+            now: now
+        ) else { return }
+
+        for expiredID in loaded.expiredMessageIDs {
+            notifyUI { [weak self] in
+                self?.delegate?.didUpdateMessageDeliveryStatus(
+                    expiredID,
+                    status: .failed(reason: "Outgoing message expired")
+                )
+            }
+        }
+
+        for obligation in loaded.obligations where peerID == nil || obligation.peerID == peerID {
+            if let lastAttemptAt = obligation.lastAttemptAt,
+               now.timeIntervalSince(lastAttemptAt) < meshRetryInterval {
+                continue
+            }
+            guard noiseService.hasEstablishedSession(with: obligation.peerID) else {
+                initiateNoiseHandshake(with: obligation.peerID)
+                continue
+            }
+            guard let marked = messageStore.markMeshObligationAttempt(
+                ownerID: meshOutboxOwnerID,
+                fence: meshOutboxFence,
+                messageID: obligation.messageID,
+                at: now
+            ) else { continue }
+            transmitDurableMeshObligation(marked)
+        }
+    }
+
+    private func transmitDurableMeshObligation(_ obligation: MeshOutboundObligation) {
         do {
-            let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
+            let privateMessage = PrivateMessagePacket(
+                messageID: obligation.messageID,
+                content: obligation.content
+            )
             guard let tlvData = privateMessage.encode() else {
-                SecureLogger.error("Failed to encode immediate private message with TLV")
+                SecureLogger.error("Failed to encode durable private message TLV", category: .session)
                 return
             }
-
             var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
             messagePayload.append(tlvData)
-
-            let encrypted = try noiseService.encrypt(messagePayload, for: recipientID)
+            let encrypted = try noiseService.encrypt(messagePayload, for: obligation.peerID)
             let packet = BitchatPacket(
                 type: MessageType.noiseEncrypted.rawValue,
                 senderID: myPeerIDData,
-                recipientID: Data(hexString: recipientID.id),
-                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                recipientID: Data(hexString: obligation.peerID.id),
+                timestamp: obligation.wireTimestampMillis,
                 payload: encrypted,
                 signature: nil,
                 ttl: messageTTL
             )
 
-            let pad = padPolicy(for: packet.type)
-            guard let data = packet.toBinaryData(padding: pad) else { return }
-            if data.count > TransportConfig.bleCallControlFragmentSize {
-                SecureLogger.debug(
-                    "SonarCall: immediate BLE control fragmenting target=\(recipientID.id) bytes=\(data.count)",
-                    category: .session
-                )
-                sendFragmentedPacket(
-                    packet,
-                    pad: pad,
-                    maxChunk: TransportConfig.bleCallControlFragmentSize,
-                    directedOnlyPeer: recipientID,
-                    spacingMs: TransportConfig.bleCallControlFragmentSpacingMs,
-                    repeatCount: TransportConfig.bleCallControlFragmentRepeatCount,
-                    repeatGapMs: TransportConfig.bleCallControlFragmentRoundSpacingMs
-                )
+            if obligation.kind == .callControl {
+                let pad = padPolicy(for: packet.type)
+                guard let data = packet.toBinaryData(padding: pad) else { return }
+                if data.count > TransportConfig.bleCallControlFragmentSize {
+                    sendFragmentedPacket(
+                        packet,
+                        pad: pad,
+                        maxChunk: TransportConfig.bleCallControlFragmentSize,
+                        directedOnlyPeer: obligation.peerID,
+                        spacingMs: TransportConfig.bleCallControlFragmentSpacingMs,
+                        repeatCount: TransportConfig.bleCallControlFragmentRepeatCount,
+                        repeatGapMs: TransportConfig.bleCallControlFragmentRoundSpacingMs
+                    )
+                } else {
+                    sendOnAllLinks(
+                        packet: packet,
+                        data: data,
+                        pad: pad,
+                        directedOnlyPeer: obligation.peerID
+                    )
+                }
             } else {
-                SecureLogger.debug(
-                    "SonarCall: immediate BLE control sending target=\(recipientID.id) bytes=\(data.count)",
-                    category: .session
-                )
-                sendOnAllLinks(packet: packet, data: data, pad: pad, directedOnlyPeer: recipientID)
+                broadcastPacket(packet)
             }
+            SecureLogger.debug(
+                "📤 Durable mesh attempt #\(obligation.attemptCount) id=\(obligation.messageID.prefix(8))… seq=\(obligation.sequence)",
+                category: .session
+            )
         } catch {
-            SecureLogger.error("Failed to encrypt immediate private message: \(error)")
+            SecureLogger.error("Failed durable private message attempt: \(error)", category: .session)
         }
     }
     
@@ -3585,81 +3760,6 @@ extension BLEService {
             broadcastPacket(packet)
         } catch {
             SecureLogger.error("Failed to initiate handshake: \(error)")
-        }
-    }
-    
-    private func sendPendingMessagesAfterHandshake(for peerID: PeerID) {
-        // Atomically take all pending messages to process (prevents concurrent modification)
-        let pendingMessages = collectionsQueue.sync(flags: .barrier) { () -> [(content: String, messageID: String)]? in
-            let messages = pendingMessagesAfterHandshake[peerID]
-            pendingMessagesAfterHandshake.removeValue(forKey: peerID)
-            return messages
-        }
-
-        guard let messages = pendingMessages, !messages.isEmpty else { return }
-
-        SecureLogger.debug("📤 Sending \(messages.count) pending messages after handshake to \(peerID)", category: .session)
-
-        // Track failed messages for re-queuing
-        var failedMessages: [(content: String, messageID: String)] = []
-
-        // Send each pending message directly (we know session is established)
-        for (content, messageID) in messages {
-            do {
-                // Use the same TLV format as normal sends to keep receiver decoding consistent
-                let privateMessage = PrivateMessagePacket(messageID: messageID, content: content)
-                guard let tlvData = privateMessage.encode() else {
-                    SecureLogger.error("Failed to encode pending private message TLV")
-                    failedMessages.append((content, messageID))
-                    continue
-                }
-
-                var messagePayload = Data([NoisePayloadType.privateMessage.rawValue])
-                messagePayload.append(tlvData)
-
-                let encrypted = try noiseService.encrypt(messagePayload, for: peerID)
-
-                let packet = BitchatPacket(
-                    type: MessageType.noiseEncrypted.rawValue,
-                    senderID: myPeerIDData,
-                    recipientID: Data(hexString: peerID.id),
-                    timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
-                    payload: encrypted,
-                    signature: nil,
-                    ttl: messageTTL
-                )
-
-                // We're already on messageQueue from the callback
-                broadcastPacket(packet)
-
-                // Notify delegate that message was sent
-                notifyUI { [weak self] in
-                    self?.delegate?.didUpdateMessageDeliveryStatus(messageID, status: .sent)
-                }
-
-                SecureLogger.debug("✅ Sent pending message \(messageID) to \(peerID) after handshake", category: .session)
-            } catch {
-                SecureLogger.error("Failed to send pending message after handshake: \(error)")
-                failedMessages.append((content, messageID))
-
-                // Notify delegate of failure
-                notifyUI { [weak self] in
-                    self?.delegate?.didUpdateMessageDeliveryStatus(messageID, status: .failed(reason: "Encryption failed"))
-                }
-            }
-        }
-
-        // Re-queue any failed messages for retry on next handshake
-        if !failedMessages.isEmpty {
-            collectionsQueue.async(flags: .barrier) { [weak self] in
-                guard let self = self else { return }
-                if self.pendingMessagesAfterHandshake[peerID] == nil {
-                    self.pendingMessagesAfterHandshake[peerID] = []
-                }
-                // Prepend failed messages to maintain order
-                self.pendingMessagesAfterHandshake[peerID]?.insert(contentsOf: failedMessages, at: 0)
-                SecureLogger.warning("⚠️ Re-queued \(failedMessages.count) failed messages for \(peerID)", category: .session)
-            }
         }
     }
     
@@ -4659,9 +4759,7 @@ extension BLEService {
                 }
             case .delivered:
                 let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
-                notifyUI { [weak self] in
-                    self?.delegate?.didReceiveNoisePayload(from: peerID, type: .delivered, payload: Data(payloadData), timestamp: ts)
-                }
+                handleDurableDeliveryAck(Data(payloadData), from: peerID, timestamp: ts)
             case .readReceipt:
                 let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
                 notifyUI { [weak self] in
@@ -4693,6 +4791,34 @@ extension BLEService {
             SecureLogger.error("❌ Failed to decrypt message from \(peerID): \(error) - clearing session and re-initiating handshake")
             noiseService.clearSession(for: peerID)
             initiateNoiseHandshake(with: peerID)
+        }
+    }
+
+    private func handleDurableDeliveryAck(_ payload: Data, from peerID: PeerID, timestamp: Date) {
+        guard let messageID = String(data: payload, encoding: .utf8) else { return }
+        outboundQueue.async { [weak self] in
+            guard let self else { return }
+            let result = self.messageStore.acknowledgeMeshObligation(
+                ownerID: self.meshOutboxOwnerID,
+                fence: self.meshOutboxFence,
+                messageID: messageID,
+                from: peerID
+            )
+            guard result != .failed, result != .peerMismatch else {
+                SecureLogger.error(
+                    "Withholding delivered state because outbox ACK validation/removal failed id=\(messageID.prefix(8))…",
+                    category: .session
+                )
+                return
+            }
+            self.notifyUI { [weak self] in
+                self?.delegate?.didReceiveNoisePayload(
+                    from: peerID,
+                    type: .delivered,
+                    payload: payload,
+                    timestamp: timestamp
+                )
+            }
         }
     }
 
@@ -4783,6 +4909,7 @@ extension BLEService {
     
     private func performMaintenance() {
         maintenanceCounter += 1
+        drainDurableMeshOutbox()
         
         // Adaptive announce: reduce frequency when we have connected peers
         let now = Date()

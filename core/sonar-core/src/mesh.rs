@@ -863,6 +863,7 @@ pub mod fragment {
     }
 
     use std::collections::HashMap;
+    use std::time::{Duration, Instant};
 
     /// Upper bound on a message's fragment count. The fragments arrive from
     /// UNTRUSTED BLE peers, so a malicious `total` (up to 65535) would otherwise
@@ -871,19 +872,33 @@ pub mod fragment {
     pub const MAX_FRAGMENTS: u16 = 8192;
     /// Max concurrent in-flight reassembly streams. Bounds memory against an
     /// attacker opening many never-completed streams with distinct fragment ids.
-    pub const MAX_BUCKETS: usize = 256;
+    pub const MAX_BUCKETS: usize = 32;
+    /// A logical mesh packet is bounded independently from its fragment count.
+    pub const MAX_REASSEMBLED_BYTES: usize = 1_200_000;
+    /// Global cap across incomplete adversarial streams.
+    pub const MAX_BUFFERED_BYTES: usize = 4 * 1024 * 1024;
+    /// Incomplete BLE streams must not occupy a bucket forever.
+    pub const REASSEMBLY_TTL: Duration = Duration::from_secs(60);
+
+    struct Bucket {
+        slots: Vec<Option<Vec<u8>>>,
+        last_seen: Instant,
+        buffered_bytes: usize,
+    }
 
     /// Reassembles fragments keyed by (sender, fragmentID). `add` returns the
     /// concatenated original bytes once every index 0..total has arrived.
     #[derive(Default)]
     pub struct Reassembler {
-        buckets: HashMap<([u8; 8], [u8; 8]), Vec<Option<Vec<u8>>>>,
+        buckets: HashMap<([u8; 8], [u8; 8]), Bucket>,
+        buffered_bytes: usize,
     }
 
     impl Reassembler {
         pub fn new() -> Self {
             Reassembler {
                 buckets: HashMap::new(),
+                buffered_bytes: 0,
             }
         }
 
@@ -896,27 +911,71 @@ pub mod fragment {
             if frag.total == 0 || frag.index >= frag.total || frag.total > MAX_FRAGMENTS {
                 return None;
             }
+            let now = Instant::now();
+            let expired: Vec<_> = self
+                .buckets
+                .iter()
+                .filter_map(|(key, bucket)| {
+                    (now.duration_since(bucket.last_seen) > REASSEMBLY_TTL).then_some(*key)
+                })
+                .collect();
+            for key in expired {
+                if let Some(bucket) = self.buckets.remove(&key) {
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(bucket.buffered_bytes);
+                }
+            }
             let key = (sender, frag.fragment_id);
             if !self.buckets.contains_key(&key) && self.buckets.len() >= MAX_BUCKETS {
                 return None; // at capacity: drop fragments for new streams
             }
-            let slots = self
-                .buckets
-                .entry(key)
-                .or_insert_with(|| vec![None; frag.total as usize]);
-            if slots.len() != frag.total as usize {
+            let bucket = self.buckets.entry(key).or_insert_with(|| Bucket {
+                slots: vec![None; frag.total as usize],
+                last_seen: now,
+                buffered_bytes: 0,
+            });
+            if bucket.slots.len() != frag.total as usize {
                 return None; // inconsistent total for this id
             }
-            slots[frag.index as usize] = Some(frag.chunk.clone());
-            if slots.iter().all(|s| s.is_some()) {
+            let previous_len = bucket.slots[frag.index as usize]
+                .as_ref()
+                .map_or(0, Vec::len);
+            let next_bucket_bytes = bucket
+                .buffered_bytes
+                .saturating_sub(previous_len)
+                .saturating_add(frag.chunk.len());
+            let next_global_bytes = self
+                .buffered_bytes
+                .saturating_sub(previous_len)
+                .saturating_add(frag.chunk.len());
+            if next_bucket_bytes > MAX_REASSEMBLED_BYTES || next_global_bytes > MAX_BUFFERED_BYTES {
+                let buffered = bucket.buffered_bytes;
+                self.buckets.remove(&key);
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(buffered);
+                return None;
+            }
+            bucket.last_seen = now;
+            bucket.slots[frag.index as usize] = Some(frag.chunk.clone());
+            bucket.buffered_bytes = next_bucket_bytes;
+            self.buffered_bytes = next_global_bytes;
+            if bucket.slots.iter().all(|s| s.is_some()) {
                 let mut out = Vec::new();
-                for s in slots.iter() {
+                for s in bucket.slots.iter() {
                     out.extend_from_slice(s.as_ref().unwrap());
                 }
-                self.buckets.remove(&key);
+                if let Some(bucket) = self.buckets.remove(&key) {
+                    self.buffered_bytes = self.buffered_bytes.saturating_sub(bucket.buffered_bytes);
+                }
                 Some(out)
             } else {
                 None
+            }
+        }
+
+        #[cfg(test)]
+        pub(crate) fn age_all(&mut self, age: Duration) {
+            let aged = Instant::now() - age;
+            for bucket in self.buckets.values_mut() {
+                bucket.last_seen = aged;
             }
         }
     }
@@ -1393,5 +1452,73 @@ mod tests {
         assert!(r.add(sender, &frags[0]).is_none());
         let done = r.add(sender, &frags[1]).unwrap();
         assert_eq!(done, original);
+    }
+
+    #[test]
+    fn phone_sized_fragmentation_roundtrips_packet_above_gatt_mtu() {
+        let original = vec![0xA5; 2_000];
+        let payloads = file_packet::fragment(&original, [0x44; 8], msg_type::NOISE_ENCRYPTED, 350)
+            .expect("bounded packet fragments");
+        assert!(payloads.len() > 1);
+        let sender = [0x22; 8];
+        let mut reassembler = fragment::Reassembler::new();
+        let mut completed = None;
+        for fragment in payloads {
+            completed = reassembler.add(sender, &fragment).or(completed);
+        }
+        assert_eq!(completed, Some(original));
+    }
+
+    #[test]
+    fn fragment_reassembly_bounds_hostile_streams_and_expires_stale_buckets() {
+        let sender = [7u8; 8];
+        let mut r = fragment::Reassembler::new();
+        let oversized = fragment::Fragment {
+            fragment_id: [1; 8],
+            index: 0,
+            total: 1,
+            original_type: msg_type::MESSAGE,
+            chunk: vec![0; fragment::MAX_REASSEMBLED_BYTES + 1],
+        };
+        assert!(r.add(sender, &oversized).is_none());
+
+        for index in 0..fragment::MAX_BUCKETS {
+            let pending = fragment::Fragment {
+                fragment_id: [index as u8; 8],
+                index: 0,
+                total: 2,
+                original_type: msg_type::MESSAGE,
+                chunk: vec![index as u8],
+            };
+            assert!(r.add(sender, &pending).is_none());
+        }
+        let overflow_id = [0xFE; 8];
+        assert!(r
+            .add(
+                sender,
+                &fragment::Fragment {
+                    fragment_id: overflow_id,
+                    index: 0,
+                    total: 2,
+                    original_type: msg_type::MESSAGE,
+                    chunk: vec![1],
+                },
+            )
+            .is_none());
+        r.age_all(fragment::REASSEMBLY_TTL + std::time::Duration::from_secs(1));
+        // Pruning the stale buckets admits and completes a fresh stream.
+        assert_eq!(
+            r.add(
+                sender,
+                &fragment::Fragment {
+                    fragment_id: overflow_id,
+                    index: 0,
+                    total: 1,
+                    original_type: msg_type::MESSAGE,
+                    chunk: b"fresh".to_vec(),
+                },
+            ),
+            Some(b"fresh".to_vec()),
+        );
     }
 }

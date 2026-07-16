@@ -47,12 +47,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import chat.bitchat.sonar.CallScreen
 import chat.bitchat.sonar.HomeMessageRow
+import chat.bitchat.sonar.LocalStateLaunchSurface
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
 import chat.bitchat.sonar.mergeHomeMessageRows
+import chat.bitchat.sonar.runAccountColdStart
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SNDot
@@ -75,17 +77,25 @@ fun DesktopApp() {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope).also { it.callOverlay = true } }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
-    LaunchedEffect(state.onboarded) {
-        if (state.onboarded) state.boot()
+    LaunchedEffect(state.onboarded, state.panicWipeRecoveryPending) {
+        runAccountColdStart(
+            panicWipePending = state.panicWipeRecoveryPending,
+            onboarded = state.onboarded,
+            recoverPendingWipe = state::recoverPendingPanicWipeOnLaunch,
+            activateAccount = state::boot,
+        )
     }
-    // Start the BLE radio (desktop: native CoreBluetooth/BlueZ scan via the
-    // sonar-ble bridge). No-op where BLE is unavailable. The poll loop then
-    // refreshes meshPeers, so the radar lights up with nearby mesh devices.
-    LaunchedEffect(Unit) { state.startMesh() }
+    // Start BLE only after the local account boot has succeeded. In particular,
+    // never race identity/radio startup with crash-recovery wipe barriers.
+    LaunchedEffect(state.started, state.panicWipeRecoveryPending) {
+        if (state.started && !state.panicWipeRecoveryPending) state.startMesh()
+    }
     SonarTheme(dark = state.dark) {
         val s = sonar
         Surface(Modifier.fillMaxSize(), color = s.bg) {
-            if (!state.onboarded) {
+            if (state.panicWipeRecoveryPending) {
+                LocalStateLaunchSurface()
+            } else if (!state.onboarded) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     Box(Modifier.width(420.dp)) { SonarOnboardingScreen(state) }
                 }

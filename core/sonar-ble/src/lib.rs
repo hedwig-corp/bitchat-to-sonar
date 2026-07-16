@@ -18,17 +18,17 @@
 //!   sonar_ble_free(ptr)        -> free a string returned above
 //!   sonar_ble_stop()           -> stop scanning + clear state
 
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
-use btleplug::platform::Manager;
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
 use bluster::gatt::event::{Event, Response};
 use bluster::gatt::service::Service;
 use bluster::Peripheral;
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::Manager;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, CString};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -44,16 +44,18 @@ const BITCHAT_SERVICE: Uuid = Uuid::from_u128(BITCHAT_SERVICE_U128);
 /// what makes a phone show this desktop as a named mesh peer.
 static ANNOUNCE: Lazy<Mutex<Option<Vec<u8>>>> = Lazy::new(|| Mutex::new(None));
 static ADVERTISING: AtomicBool = AtomicBool::new(false);
+static ADVERTISING_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ADVERTISING_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Packets centrals wrote to our GATT characteristic (their announce / handshake).
 /// Drained by the JVM, which decodes the announce to name + dedupe a peer — this
 /// is how the desktop learns a phone that connected to it (the phone suppresses
 /// its own advertising while connected, so scanning alone can't see it).
-static RX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static RX_PACKETS: Lazy<Mutex<Vec<(u64, Vec<u8>)>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// Packets the JVM mesh engine wants pushed to subscribed centrals (Noise
 /// handshake replies, encrypted DMs). The advertise loop drains + notifies them.
-static TX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static TX_PACKETS: Lazy<Mutex<Vec<(u64, Vec<u8>)>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -108,7 +110,10 @@ pub extern "C" fn sonar_ble_start() {
     std::thread::Builder::new()
         .name("sonar-ble-scan".into())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
                     RUNNING.store(false, Ordering::SeqCst);
@@ -160,9 +165,15 @@ pub extern "C" fn sonar_ble_peers_json() -> *mut c_char {
 /// decodes these to learn + name the peer. Free with [`sonar_ble_free`].
 #[no_mangle]
 pub extern "C" fn sonar_ble_drain_rx_json() -> *mut c_char {
+    let generation = ADVERTISING_GENERATION.load(Ordering::SeqCst);
     let items: Vec<serde_json::Value> = RX_PACKETS
         .lock()
-        .map(|mut q| q.drain(..).map(|b| serde_json::Value::String(hex_encode(&b))).collect())
+        .map(|mut q| {
+            q.drain(..)
+                .filter(|(packet_generation, _)| *packet_generation == generation)
+                .map(|(_, bytes)| serde_json::Value::String(hex_encode(&bytes)))
+                .collect()
+        })
         .unwrap_or_default();
     let json = serde_json::Value::Array(items).to_string();
     CString::new(json).unwrap_or_default().into_raw()
@@ -198,7 +209,9 @@ async fn scan_loop() {
     // Scan FILTERED to the bitchat service (like the Android app) — far more
     // reliable than scanning everything and checking the parsed service UUID,
     // which CoreBluetooth often reports empty (especially while also advertising).
-    let filter = ScanFilter { services: vec![BITCHAT_SERVICE] };
+    let filter = ScanFilter {
+        services: vec![BITCHAT_SERVICE],
+    };
     match central.start_scan(filter.clone()).await {
         Ok(_) => dbg_log("scan_loop: scan started (bitchat filter)"),
         Err(e) => dbg_log(&format!("scan_loop: start_scan ERR {e}")),
@@ -220,7 +233,9 @@ async fn scan_loop() {
             let total = DEVICES.lock().map(|d| d.len()).unwrap_or(0);
             dbg_log(&format!(
                 "scan: rescan stop={:?} start={:?} (total devices seen={})",
-                stop.is_ok(), start.is_ok(), total
+                stop.is_ok(),
+                start.is_ok(),
+                total
             ));
             last_rescan = Instant::now();
         }
@@ -242,7 +257,9 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
         | CentralEvent::DeviceDisconnected(id) => id.clone(),
         _ => return,
     };
-    let Ok(p) = central.peripheral(&id).await else { return };
+    let Ok(p) = central.peripheral(&id).await else {
+        return;
+    };
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
@@ -254,7 +271,12 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
             id.to_string(),
-            Seen { name, rssi, bitchat, at: Instant::now() },
+            Seen {
+                name,
+                rssi,
+                bitchat,
+                at: Instant::now(),
+            },
         );
     }
 }
@@ -273,7 +295,10 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
     } else {
         Some(std::slice::from_raw_parts(ptr, len).to_vec())
     };
-    dbg_log(&format!("set_announce: {} bytes", next.as_ref().map(|v| v.len()).unwrap_or(0)));
+    dbg_log(&format!(
+        "set_announce: {} bytes",
+        next.as_ref().map(|v| v.len()).unwrap_or(0)
+    ));
     if let Ok(mut a) = ANNOUNCE.lock() {
         *a = next;
     }
@@ -283,32 +308,70 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
 /// this desktop and, on subscribe, receive the announce. Idempotent.
 #[no_mangle]
 pub extern "C" fn sonar_ble_start_advertising() {
-    if ADVERTISING.swap(true, Ordering::SeqCst) {
+    if ADVERTISING.load(Ordering::SeqCst)
+        || ADVERTISING_LOOP_ACTIVE
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
         return;
     }
-    std::thread::Builder::new()
+    let generation = ADVERTISING_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    ADVERTISING.store(true, Ordering::SeqCst);
+    if let Ok(mut q) = RX_PACKETS.lock() {
+        q.clear();
+    }
+    if let Ok(mut q) = TX_PACKETS.lock() {
+        q.clear();
+    }
+    let spawned = std::thread::Builder::new()
         .name("sonar-ble-adv".into())
-        .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
-                    ADVERTISING.store(false, Ordering::SeqCst);
+                    if ADVERTISING_GENERATION.load(Ordering::SeqCst) == generation {
+                        ADVERTISING.store(false, Ordering::SeqCst);
+                    }
+                    ADVERTISING_LOOP_ACTIVE.store(false, Ordering::SeqCst);
                     return;
                 }
             };
             rt.block_on(async {
-                if let Err(e) = run_peripheral().await {
+                if let Err(e) = run_peripheral(generation).await {
                     dbg_log(&format!("advertise: ERR {e}"));
                 }
-                ADVERTISING.store(false, Ordering::SeqCst);
+                if ADVERTISING_GENERATION.load(Ordering::SeqCst) == generation {
+                    ADVERTISING.store(false, Ordering::SeqCst);
+                }
+                ADVERTISING_LOOP_ACTIVE.store(false, Ordering::SeqCst);
             });
-        })
-        .ok();
+        });
+    if spawned.is_err() {
+        ADVERTISING.store(false, Ordering::SeqCst);
+        ADVERTISING_LOOP_ACTIVE.store(false, Ordering::SeqCst);
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn sonar_ble_stop_advertising() {
     ADVERTISING.store(false, Ordering::SeqCst);
+    ADVERTISING_GENERATION.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut q) = RX_PACKETS.lock() {
+        q.clear();
+    }
+    if let Ok(mut q) = TX_PACKETS.lock() {
+        q.clear();
+    }
+}
+
+/// True while the native peripheral manager still owns its GATT generation.
+/// A restart waits for this to become false before constructing another manager.
+#[no_mangle]
+pub extern "C" fn sonar_ble_advertising_loop_active() -> i32 {
+    i32::from(ADVERTISING_LOOP_ACTIVE.load(Ordering::SeqCst))
 }
 
 /// Queue a raw packet to notify to subscribed centrals (the JVM mesh engine sends
@@ -317,23 +380,37 @@ pub extern "C" fn sonar_ble_stop_advertising() {
 /// # Safety
 /// `ptr` must point to `len` readable bytes, or be null.
 #[no_mangle]
-pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
+pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null()
+        || len == 0
+        || !ADVERTISING.load(Ordering::SeqCst)
+        || !ADVERTISING_LOOP_ACTIVE.load(Ordering::SeqCst)
+    {
+        return 0;
     }
+    let generation = ADVERTISING_GENERATION.load(Ordering::SeqCst);
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     if let Ok(mut q) = TX_PACKETS.lock() {
         if q.len() < 256 {
-            q.push(bytes);
+            q.push((generation, bytes));
+            return 1;
         }
     }
+    0
 }
 
-async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
+async fn run_peripheral(generation: u64) -> Result<(), Box<dyn std::error::Error>> {
+    let generation_active = || {
+        ADVERTISING.load(Ordering::SeqCst)
+            && ADVERTISING_GENERATION.load(Ordering::SeqCst) == generation
+    };
     let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
 
     let peripheral = Peripheral::new().await?;
+    if !generation_active() {
+        return Ok(());
+    }
 
     // CoreBluetooth silently ignores addService:/startAdvertising: until the
     // CBPeripheralManager is powered on — so WAIT for power-on BEFORE registering
@@ -341,7 +418,13 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     // no service: the Android client logs `servicesDiscovered svc=false`.)
     let mut tries = 0;
     while !peripheral.is_powered().await? {
+        if !generation_active() {
+            return Ok(());
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
+        if !generation_active() {
+            return Ok(());
+        }
         tries += 1;
         if tries > 50 {
             return Err("peripheral never powered on".into());
@@ -362,23 +445,42 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut chars = HashSet::new();
     chars.insert(characteristic);
+    if !generation_active() {
+        return Ok(());
+    }
     peripheral.add_service(&Service::new(svc, true, chars))?;
     peripheral.register_gatt().await?;
+    if !generation_active() {
+        return Ok(());
+    }
     // Let CoreBluetooth commit the service (didAddService) before advertising, so
     // the GATT DB is populated by the time a central connects + discovers.
     tokio::time::sleep(Duration::from_millis(400)).await;
+    if !generation_active() {
+        return Ok(());
+    }
 
     peripheral.start_advertising("Sonar", &[svc]).await?;
+    if !generation_active() {
+        let _ = peripheral.stop_advertising().await;
+        return Ok(());
+    }
     dbg_log("advertise: started (bitchat service)");
 
     fn announce() -> Vec<u8> {
-        ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
+        ANNOUNCE
+            .lock()
+            .ok()
+            .and_then(|a| a.clone())
+            .unwrap_or_default()
     }
 
     let mut last_notify = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
-    while ADVERTISING.load(Ordering::SeqCst) {
+    while ADVERTISING.load(Ordering::SeqCst)
+        && ADVERTISING_GENERATION.load(Ordering::SeqCst) == generation
+    {
         // Push our announce to any subscribed central every ~2s. bluster's
         // CoreBluetooth backend has no didSubscribe callback, so instead of
         // sending on-subscribe we just keep notifying; updateValue only reaches
@@ -388,12 +490,25 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
             let ann = announce();
             if !ann.is_empty() {
                 let sent = peripheral.notify(&ann);
-                dbg_log(&format!("advertise: notify announce ({} bytes) sent={}", ann.len(), sent));
+                dbg_log(&format!(
+                    "advertise: notify announce ({} bytes) sent={}",
+                    ann.len(),
+                    sent
+                ));
             }
             last_notify = Instant::now();
         }
         // Flush packets the JVM mesh engine queued (handshake replies, DMs).
-        let tx: Vec<Vec<u8>> = TX_PACKETS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+        let tx: Vec<Vec<u8>> = TX_PACKETS
+            .lock()
+            .map(|mut q| {
+                std::mem::take(&mut *q)
+                    .into_iter()
+                    .filter(|(packet_generation, _)| *packet_generation == generation)
+                    .map(|(_, bytes)| bytes)
+                    .collect()
+            })
+            .unwrap_or_default();
         for pkt in tx {
             peripheral.notify(&pkt);
         }
@@ -401,11 +516,18 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
         // on macOS; we patched it to queue writes — take them here).
         let writes = peripheral.take_writes();
         if !writes.is_empty() {
-            dbg_log(&format!("advertise: rx {} write packet(s) from central", writes.len()));
-            if let Ok(mut q) = RX_PACKETS.lock() {
-                for w in writes {
-                    if q.len() < 256 {
-                        q.push(w);
+            dbg_log(&format!(
+                "advertise: rx {} write packet(s) from central",
+                writes.len()
+            ));
+            if ADVERTISING.load(Ordering::SeqCst)
+                && ADVERTISING_GENERATION.load(Ordering::SeqCst) == generation
+            {
+                if let Ok(mut q) = RX_PACKETS.lock() {
+                    for w in writes {
+                        if q.len() < 256 {
+                            q.push((generation, w));
+                        }
                     }
                 }
             }
@@ -422,7 +544,10 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 Event::WriteRequest(req) => {
                     // The central's packets (its announce / handshake). Discovery
                     // doesn't consume them yet; ack so it isn't left hanging.
-                    dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
+                    dbg_log(&format!(
+                        "advertise: rx write {} bytes from central",
+                        req.data.len()
+                    ));
                     let _ = req.response.send(Response::Success(vec![]));
                 }
                 Event::NotifyUnsubscribe => {}

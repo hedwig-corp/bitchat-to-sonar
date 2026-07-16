@@ -5,6 +5,7 @@ import uniffi.sonar_ffi.SonarNoise
 import uniffi.sonar_ffi.noiseGenerateKeypair
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -42,5 +43,22 @@ class DesktopFfiSmokeTest {
         ini.intoSession(); res.intoSession()
         val ct = ini.encrypt("mesh hello".encodeToByteArray())
         assertEquals("mesh hello", res.decrypt(ct).decodeToString())
+    }
+
+    @Test
+    fun replayedVictimAnnounceCannotBindAnAttackerNoiseSession() {
+        SonarNativeLoader.ensureLoaded()
+        val local = noiseGenerateKeypair()
+        val attacker = noiseGenerateKeypair()
+        val victim = noiseGenerateKeypair()
+        val initiator = SonarNoise.initiator(attacker.privateHex)
+        val responder = SonarNoise.responder(local.privateHex)
+
+        responder.readMessage(initiator.writeMessage())
+        initiator.readMessage(responder.writeMessage())
+        responder.readMessage(initiator.writeMessage())
+
+        assertEquals(attacker.publicHex, responder.remoteStaticHex())
+        assertFalse(meshNoiseStaticMatches(victim.publicHex, responder.remoteStaticHex()))
     }
 }

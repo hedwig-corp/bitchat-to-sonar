@@ -96,9 +96,16 @@ extension ChatViewModel {
         
         // Send via appropriate transport (BLE if connected/reachable, else Nostr when possible)
         if isConnected || isReachable || (isMutualFavorite && hasNostrKey) {
-            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
-            // Optimistically mark as sent for both transports; delivery/read will update subsequently
-            if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+            let disposition = messageRouter.sendPrivate(
+                content,
+                to: peerID,
+                recipientNickname: recipientNickname,
+                messageID: messageID
+            )
+            // BLE stays `.sending` until the peer's encrypted 0x03 ACK removes
+            // the durable obligation. Nostr retains its hand-off `.sent` state.
+            if case .sent = disposition,
+               let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
                 privateChats[peerID]?[idx].deliveryStatus = .sent
             }
         } else {
@@ -200,33 +207,37 @@ extension ChatViewModel {
 
     // MARK: - Private Chat Handling (Geohash/Ephemeral)
 
+    @MainActor
     func handlePrivateMessage(
         _ payload: NoisePayload,
         senderPubkey: String,
         convKey: PeerID,
         id: NostrIdentity,
         messageTimestamp: Date
-    ) {
+    ) async {
         guard let pm = PrivateMessagePacket.decode(from: payload.data) else { return }
         let messageId = pm.messageID
-        
+
         SecureLogger.info("GeoDM: recv PM <- sender=\(senderPubkey.prefix(8))… mid=\(messageId.prefix(8))…", category: .session)
 
-        sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
+        await meshInboundCommitGate.enter()
+        let gate = meshInboundCommitGate
+        defer { Task { await gate.leave() } }
+        let storageGeneration = privateChatManager.currentStorageGeneration()
 
         // Respect geohash blocks
         if identityManager.isNostrBlocked(pubkeyHexLowercased: senderPubkey) {
+            // Policy-handled messages do not enter the transcript, but their
+            // terminal ACK still follows a durable stable-ID receipt.
+            guard await privateChatManager.commitIncomingControl(
+                messageId,
+                from: convKey,
+                expectedGeneration: storageGeneration
+            ), privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+            sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
             return
         }
 
-        // Duplicate check
-        if privateChats[convKey]?.contains(where: { $0.id == messageId }) == true { return }
-        for (_, arr) in privateChats {
-            if arr.contains(where: { $0.id == messageId }) {
-                return
-            }
-        }
-        
         let senderName = displayNameForNostrPubkey(senderPubkey)
         let msg = BitchatMessage(
             id: messageId,
@@ -240,60 +251,113 @@ extension ChatViewModel {
             receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
-        
-        if privateChats[convKey] == nil {
-            privateChats[convKey] = []
+
+        let admission = await privateChatManager.commitIncomingMessageAtomically(
+            msg,
+            preferredPeerID: convKey,
+            expectedGeneration: storageGeneration
+        )
+        guard admission.disposition != .failed,
+              privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+
+        switch admission.disposition {
+        case .admitted, .pendingEffects:
+            guard let durableMessage = admission.message,
+                  await handleInternetPrivateMessageReceiveSideEffects(
+                    durableMessage,
+                    peerID: convKey,
+                    senderPubkey: senderPubkey,
+                    identity: id
+                  ),
+                  await privateChatManager.commitReceiveEffectsProcessed(
+                    durableMessage.id,
+                    preferredPeerID: convKey,
+                    expectedGeneration: storageGeneration
+                  ),
+                  privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+        case .duplicate:
+            break
+        case .failed:
+            return
         }
-        privateChats[convKey]?.append(msg)
-        
-        let isViewing = selectedPrivateChatPeer == convKey
-        let wasReadBefore = sentReadReceipts.contains(messageId)
-        let isRecentMessage = Date().timeIntervalSince(messageTimestamp) < 30
-        let shouldMarkUnread = !wasReadBefore && !isViewing && isRecentMessage
-        if shouldMarkUnread {
-            unreadPrivateMessages.insert(convKey)
-        }
-        
-        // Send READ if viewing this conversation
-        if isViewing {
-            sendReadReceiptIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
-        }
-        
-        // Notify for truly unread and recent messages when not viewing
-        if !isViewing,
-           shouldMarkUnread,
-           Self.shouldSendGenericPrivateMessageNotification(for: pm.content) {
-            NotificationService.shared.sendPrivateMessageNotification(
-                from: senderName,
-                message: pm.content,
-                peerID: convKey
-            )
-        }
-        
+
+        // Delivery means transcript + receive effects are both durably retired.
+        sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
         objectWillChange.send()
+    }
+
+    @MainActor
+    private func handleInternetPrivateMessageReceiveSideEffects(
+        _ message: BitchatMessage,
+        peerID: PeerID,
+        senderPubkey: String,
+        identity: NostrIdentity
+    ) async -> Bool {
+        if sentReadReceipts.contains(message.id) { return true }
+        let isViewing = selectedPrivateChatPeer == peerID
+        if isViewing {
+            unreadPrivateMessages.remove(peerID)
+            sendReadReceiptIfNeeded(
+                to: message.id,
+                senderPubKey: senderPubkey,
+                from: identity
+            )
+            return true
+        }
+
+        let isRecent = Date().timeIntervalSince(message.timestamp) < 30
+        guard isRecent else { return true }
+        unreadPrivateMessages.insert(peerID)
+        guard Self.shouldSendGenericPrivateMessageNotification(for: message.content) else {
+            return true
+        }
+        let outcome = await NotificationService.shared.sendPrivateMessageNotification(
+            from: message.sender,
+            message: message.content,
+            peerID: peerID,
+            messageID: message.id,
+            sound: .standard
+        )
+        return outcome != .retryableFailure
     }
     
     func handleDelivered(_ payload: NoisePayload, senderPubkey: String, convKey: PeerID) {
         guard let messageID = String(data: payload.data, encoding: .utf8) else { return }
-        
-        if let idx = privateChats[convKey]?.firstIndex(where: { $0.id == messageID }) {
-            privateChats[convKey]?[idx].deliveryStatus = .delivered(to: displayNameForNostrPubkey(senderPubkey), at: Date())
-            objectWillChange.send()
-            SecureLogger.info("GeoDM: recv DELIVERED for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
-        } else {
-            SecureLogger.warning("GeoDM: delivered ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await applyPrivateDeliveryStatus(
+                messageID: messageID,
+                status: .delivered(to: displayNameForNostrPubkey(senderPubkey), at: Date()),
+                preferredPeerIDs: deliveryReceiptPeerCandidates(for: convKey)
+            )
+            if result.disposition == .notFound {
+                SecureLogger.warning("GeoDM: delivered ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+            } else if result.disposition == .failed {
+                SecureLogger.error("GeoDM: failed to persist DELIVERED for mid=\(messageID.prefix(8))…", category: .session)
+            } else {
+                SecureLogger.info("GeoDM: recv DELIVERED for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
+            }
         }
     }
     
     func handleReadReceipt(_ payload: NoisePayload, senderPubkey: String, convKey: PeerID) {
         guard let messageID = String(data: payload.data, encoding: .utf8) else { return }
-        
-        if let idx = privateChats[convKey]?.firstIndex(where: { $0.id == messageID }) {
-            privateChats[convKey]?[idx].deliveryStatus = .read(by: displayNameForNostrPubkey(senderPubkey), at: Date())
-            objectWillChange.send()
-            SecureLogger.info("GeoDM: recv READ for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
-        } else {
-            SecureLogger.warning("GeoDM: read ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await applyPrivateDeliveryStatus(
+                messageID: messageID,
+                status: .read(by: displayNameForNostrPubkey(senderPubkey), at: Date()),
+                preferredPeerIDs: deliveryReceiptPeerCandidates(for: convKey)
+            )
+            if result.disposition == .notFound {
+                SecureLogger.warning("GeoDM: read ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+            } else if result.disposition == .failed {
+                SecureLogger.error("GeoDM: failed to persist READ for mid=\(messageID.prefix(8))…", category: .session)
+            } else {
+                SecureLogger.info("GeoDM: recv READ for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
+            }
         }
     }
 
@@ -326,7 +390,7 @@ extension ChatViewModel {
         guard canSendMediaInCurrentContext else {
             SecureLogger.info("Voice note blocked outside mesh/private context", category: .session)
             try? FileManager.default.removeItem(at: url)
-            addSystemMessage("Voice notes are only available in mesh chats.")
+            addSystemMessage("Private Bluetooth media is unavailable until end-to-end encryption is established.")
             return
         }
 
@@ -391,7 +455,7 @@ extension ChatViewModel {
         guard canSendMediaInCurrentContext else {
             SecureLogger.info("Image send blocked outside mesh/private context", category: .session)
             cleanup?()
-            addSystemMessage("Images are only available in mesh chats.")
+            addSystemMessage("Private Bluetooth media is unavailable until end-to-end encryption is established.")
             return
         }
 
@@ -446,7 +510,7 @@ extension ChatViewModel {
     func sendFile(data: Data, filename: String, mime: String) {
         guard canSendMediaInCurrentContext else {
             SecureLogger.info("File send blocked outside mesh/private context", category: .session)
-            addSystemMessage("Files are only available in mesh chats.")
+            addSystemMessage("Private Bluetooth media is unavailable until end-to-end encryption is established.")
             return
         }
 
@@ -692,6 +756,28 @@ extension ChatViewModel {
         }
     }
 
+    /// Roll back only the exact incoming media file staged by BLE. The broader
+    /// user-delete cleanup intentionally scans outgoing and incoming folders;
+    /// receive rollback must not delete an unrelated outgoing file that happens
+    /// to share the same last path component.
+    func cleanupStagedIncomingMediaFile(forMessage message: BitchatMessage) {
+        let mapping: [(prefix: String, subdirectory: String)] = [
+            ("[voice] ", "voicenotes/incoming"),
+            ("[image] ", "images/incoming"),
+            ("[file] ", "files/incoming")
+        ]
+        guard let match = mapping.first(where: { message.content.hasPrefix($0.prefix) }) else { return }
+        let rawName = String(message.content.dropFirst(match.prefix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeName = (rawName as NSString).lastPathComponent
+        guard !safeName.isEmpty, safeName != ".", safeName != "..",
+              let base = try? applicationFilesDirectory() else { return }
+        let target = base
+            .appendingPathComponent(match.subdirectory, isDirectory: true)
+            .appendingPathComponent(safeName)
+        try? FileManager.default.removeItem(at: target)
+    }
+
     func applicationFilesDirectory() throws -> URL {
         let base = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
         let filesDir = base.appendingPathComponent("files", isDirectory: true)
@@ -806,7 +892,8 @@ extension ChatViewModel {
                 key: actualSenderNoiseKey,
                 isRecentMessage: isRecentMessage,
                 senderNickname: senderNickname,
-                messageContent: messageContent
+                messageContent: messageContent,
+                messageID: message.id
             )
         }
 
@@ -814,6 +901,121 @@ extension ChatViewModel {
     }
     
     /// Handle incoming private message (Mesh)
+    ///
+    /// Atomically admits the stable ID (or non-transcript control receipt), then
+    /// publishes receive-side effects from the authoritative stored payload.
+    /// Callers must only emit a delivery ACK for a non-failed disposition.
+    @MainActor
+    func handlePrivateMessageDurably(_ message: BitchatMessage) async -> PrivateReceiveDisposition {
+        await meshInboundCommitGate.enter()
+        let gate = meshInboundCommitGate
+        defer { Task { await gate.leave() } }
+
+        guard let peerID = message.senderPeerID ?? getPeerIDForNickname(message.sender) else {
+            SecureLogger.warning("⚠️ Could not resolve durable sender for \(message.id)", category: .session)
+            return .failed
+        }
+        preparePrivateChatRoute(for: peerID, senderNickname: message.sender)
+        let storageGeneration = privateChatManager.currentStorageGeneration()
+
+        if message.content.hasPrefix("[FAVORITED]") || message.content.hasPrefix("[UNFAVORITED]") {
+            // The receipt is the MessageStore transaction for a control that
+            // intentionally never enters the transcript. Apply Keychain/UI
+            // state only after that transaction succeeds.
+            guard await privateChatManager.commitIncomingControl(
+                message.id,
+                from: peerID,
+                expectedGeneration: storageGeneration
+            ), privateChatManager.currentStorageGeneration() == storageGeneration else {
+                return .failed
+            }
+            return handleFavoriteNotificationFromMesh(
+                message.content,
+                from: peerID,
+                senderNickname: message.sender
+            ) ? .admitted : .failed
+        }
+
+        let admission = await privateChatManager.commitIncomingMessageAtomically(
+            message,
+            preferredPeerID: peerID,
+            expectedGeneration: storageGeneration
+        )
+        guard admission.disposition != .failed,
+              privateChatManager.currentStorageGeneration() == storageGeneration else {
+            return .failed
+        }
+
+        switch admission.disposition {
+        case .admitted, .pendingEffects:
+            guard let durableMessage = admission.message else { return .failed }
+            let noiseKey = peerID.noiseKey ?? unifiedPeerService.getPeer(by: peerID)?.noisePublicKey
+            mirrorToEphemeralIfNeeded(durableMessage, targetPeerID: peerID, key: noiseKey)
+            guard await handlePrivateMessageReceiveSideEffects(durableMessage, peerID: peerID),
+                  await privateChatManager.commitReceiveEffectsProcessed(
+                    durableMessage.id,
+                    preferredPeerID: peerID,
+                    expectedGeneration: storageGeneration
+                  ),
+                  privateChatManager.currentStorageGeneration() == storageGeneration else {
+                return .failed
+            }
+            objectWillChange.send()
+        case .duplicate:
+            break
+        case .failed:
+            return .failed
+        }
+        return admission.disposition
+    }
+
+    @MainActor
+    func replayPendingPrivateReceiveEffectsAtStartup() async {
+        let storageGeneration = privateChatManager.currentStorageGeneration()
+        for pending in await privateChatManager.pendingReceiveEffectsForStartupReplay() {
+            guard privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+            guard await handlePrivateMessageReceiveSideEffects(pending.message, peerID: pending.peerID) else {
+                continue
+            }
+            guard await privateChatManager.commitReceiveEffectsProcessed(
+                pending.message.id,
+                preferredPeerID: pending.peerID,
+                expectedGeneration: storageGeneration
+            ), privateChatManager.currentStorageGeneration() == storageGeneration else {
+                // Leave the in-memory + durable obligation for a stable-id retry.
+                continue
+            }
+        }
+        objectWillChange.send()
+    }
+
+    @MainActor
+    private func preparePrivateChatRoute(for peerID: PeerID, senderNickname: String) {
+        migratePrivateChatsIfNeeded(for: peerID, senderNickname: senderNickname)
+
+        // A BLE short ID and its stable Noise-key/Nostr route are one logical
+        // conversation. Fold the existing stable transcript before the durable
+        // receive snapshot is built, so the commit and ACK target one key.
+        guard peerID.id.count == 16,
+              let peer = unifiedPeerService.getPeer(by: peerID) else { return }
+        let stableKey = PeerID(hexData: peer.noisePublicKey)
+        guard stableKey != peerID,
+              let stableMessages = privateChats[stableKey],
+              !stableMessages.isEmpty else { return }
+
+        var canonical = privateChats[peerID] ?? []
+        let existingIDs = Set(canonical.map(\.id))
+        canonical.append(contentsOf: stableMessages.filter { !existingIDs.contains($0.id) })
+        canonical.sort { $0.timestamp < $1.timestamp }
+        privateChats[peerID] = canonical
+        privateChats.removeValue(forKey: stableKey)
+        privateChatManager.sanitizeChat(for: peerID)
+        SecureLogger.info(
+            "📥 Consolidated \(stableMessages.count) stable-route messages into \(peerID)",
+            category: .session
+        )
+    }
+
     @MainActor
     func handlePrivateMessage(_ message: BitchatMessage) {
         SecureLogger.debug("📥 handlePrivateMessage called for message from \(message.sender)", category: .session)
@@ -821,7 +1023,7 @@ extension ChatViewModel {
         
         guard let peerID = senderPeerID else { 
             SecureLogger.warning("⚠️ Could not get peer ID for sender \(message.sender)", category: .session)
-            return 
+            return
         }
         
         // Check if this is a favorite/unfavorite notification
@@ -830,40 +1032,7 @@ extension ChatViewModel {
             return  // Don't store as a regular message
         }
         
-        // Migrate chats if needed
-        migratePrivateChatsIfNeeded(for: peerID, senderNickname: message.sender)
-        
-        // IMPORTANT: Also consolidate messages from stable Noise key if this is an ephemeral peer
-        // This ensures Nostr messages appear in BLE chats
-        if peerID.id.count == 16 {  // This is an ephemeral peer ID (8 bytes = 16 hex chars)
-            if let peer = unifiedPeerService.getPeer(by: peerID) {
-                let stableKeyHex = PeerID(hexData: peer.noisePublicKey)
-                
-                // If we have messages stored under the stable key, merge them
-                if stableKeyHex != peerID, let nostrMessages = privateChats[stableKeyHex], !nostrMessages.isEmpty {
-                    // Merge messages from stable key into ephemeral peer ID storage
-                    if privateChats[peerID] == nil {
-                        privateChats[peerID] = []
-                    }
-                    
-                    // Add any messages that aren't already in the ephemeral storage
-                    let existingMessageIds = Set(privateChats[peerID]?.map { $0.id } ?? [])
-                    for nostrMessage in nostrMessages {
-                        if !existingMessageIds.contains(nostrMessage.id) {
-                            privateChats[peerID]?.append(nostrMessage)
-                        }
-                    }
-                    
-                    // Sort by timestamp
-                    privateChats[peerID]?.sort { $0.timestamp < $1.timestamp }
-                    
-                    // Clean up the stable key storage to avoid duplication
-                    privateChats.removeValue(forKey: stableKeyHex)
-                    
-                    SecureLogger.info("📥 Consolidated \(nostrMessages.count) Nostr messages from stable key to ephemeral peer \(peerID)", category: .session)
-                }
-            }
-        }
+        preparePrivateChatRoute(for: peerID, senderNickname: message.sender)
         
         // Avoid duplicates
         if isDuplicateMessage(message.id, targetPeerID: peerID) {
@@ -881,7 +1050,21 @@ extension ChatViewModel {
         let noiseKey = peerID.noiseKey ?? unifiedPeerService.getPeer(by: peerID)?.noisePublicKey
         mirrorToEphemeralIfNeeded(message, targetPeerID: peerID, key: noiseKey)
 
-        // Notifications and Read Receipts
+        Task { @MainActor [weak self] in
+            _ = await self?.handlePrivateMessageReceiveSideEffects(message, peerID: peerID)
+        }
+
+        objectWillChange.send()
+    }
+
+    @MainActor
+    private func handlePrivateMessageReceiveSideEffects(_ message: BitchatMessage, peerID: PeerID) async -> Bool {
+        // Notifications and read receipts must follow the durable commit on
+        // the BLE receive path. Other local-first callers use this immediately.
+        // A viewed-message receipt is persisted by stable ID. If we crashed
+        // before clearing the effect obligation, boot replay must not convert
+        // that already-read message into an unread notification.
+        if sentReadReceipts.contains(message.id) { return true }
         let isViewing = selectedPrivateChatPeer == peerID
         
         if isViewing {
@@ -892,6 +1075,7 @@ extension ChatViewModel {
             let receipt = ReadReceipt(originalMessageID: message.id, readerID: meshService.myPeerID, readerNickname: nickname)
             meshService.sendReadReceipt(receipt, to: peerID)
             sentReadReceipts.insert(message.id)
+            return true
         } else {
             // Notify — skip ☎CALL / ⚡PAY control lines; SonarAppStore owns those
             // specialized alerts so we don't double-fire BLE sounds.
@@ -899,16 +1083,17 @@ extension ChatViewModel {
             if Self.shouldSendGenericPrivateMessageNotification(for: message.content) {
                 let notifBody = meshParseStickerContent(content: message.content) != nil
                     ? "Sticker" : message.content
-                NotificationService.shared.sendPrivateMessageNotification(
+                let outcome = await NotificationService.shared.sendPrivateMessageNotification(
                     from: message.sender,
                     message: notifBody,
                     peerID: peerID,
+                    messageID: message.id,
                     sound: .ble
                 )
+                return outcome != .retryableFailure
             }
+            return true
         }
-        
-        objectWillChange.send()
     }
 
     func isDuplicateMessage(_ messageId: String, targetPeerID: PeerID) -> Bool {
@@ -984,7 +1169,8 @@ extension ChatViewModel {
         key: Data?,
         isRecentMessage: Bool,
         senderNickname: String,
-        messageContent: String
+        messageContent: String,
+        messageID: String
     ) {
         guard shouldMarkAsUnread else { return }
         
@@ -996,16 +1182,20 @@ extension ChatViewModel {
         }
         if isRecentMessage,
            Self.shouldSendGenericPrivateMessageNotification(for: messageContent) {
-            NotificationService.shared.sendPrivateMessageNotification(
-                from: senderNickname,
-                message: messageContent,
-                peerID: targetPeerID
-            )
+            Task {
+                _ = await NotificationService.shared.sendPrivateMessageNotification(
+                    from: senderNickname,
+                    message: messageContent,
+                    peerID: targetPeerID,
+                    messageID: messageID
+                )
+            }
         }
     }
     
     @MainActor
-    func handleFavoriteNotificationFromMesh(_ content: String, from peerID: PeerID, senderNickname: String) {
+    @discardableResult
+    func handleFavoriteNotificationFromMesh(_ content: String, from peerID: PeerID, senderNickname: String) -> Bool {
         // Parse the message format: "[FAVORITED]:npub..." or "[UNFAVORITED]:npub..."
         let isFavorite = content.hasPrefix("[FAVORITED]")
         let parts = content.split(separator: ":")
@@ -1022,18 +1212,20 @@ extension ChatViewModel {
         
         guard let finalNoiseKey = noiseKey else {
             SecureLogger.warning("⚠️ Cannot get Noise key for peer \(peerID)", category: .session)
-            return
+            return false
         }
         // Determine prior state to avoid duplicate system messages on repeated notifications
-        let prior = FavoritesPersistenceService.shared.getFavoriteStatus(for: finalNoiseKey)?.theyFavoritedUs ?? false
+        let prior = favoritesPersistenceService.getFavoriteStatus(for: finalNoiseKey)?.theyFavoritedUs ?? false
 
         // Update the favorite relationship (idempotent storage)
-        FavoritesPersistenceService.shared.updatePeerFavoritedUs(
+        guard favoritesPersistenceService.updatePeerFavoritedUs(
             peerNoisePublicKey: finalNoiseKey,
             favorited: isFavorite,
             peerNickname: senderNickname,
             peerNostrPublicKey: nostrPubkey
-        )
+        ) else {
+            return false
+        }
 
         // If they favorited us and provided their Nostr key, ensure it's stored (log only)
         if isFavorite && nostrPubkey != nil {
@@ -1045,6 +1237,7 @@ extension ChatViewModel {
             let action = isFavorite ? "favorited" : "unfavorited"
             addMeshOnlySystemMessage("\(senderNickname) \(action) you")
         }
+        return true
     }
     
     /// Process action messages (hugs, slaps) into system messages

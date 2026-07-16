@@ -5,6 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class WalletSeedTest {
@@ -37,6 +38,40 @@ class WalletSeedTest {
     @Test fun notRawSecret() {
         // Entropy must be domain-separated, not the raw nsec bytes.
         assertNotEquals(secret, WalletSeed.entropyHex(WalletSeed.hexToBytes(secret)))
+    }
+}
+
+class WalletCallbackFenceTest {
+    @Test
+    fun staleOrPanicFencedCallbacksCannotMutateTheNewAccount() {
+        assertTrue(acceptsWalletCallback(4, 4, ownsSdkNode = true, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(3, 4, ownsSdkNode = true, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(4, 4, ownsSdkNode = false, panicWipePending = false))
+        assertFalse(acceptsWalletCallback(4, 4, ownsSdkNode = true, panicWipePending = true))
+    }
+}
+
+class WalletTeardownSlotTest {
+    @Test
+    fun failedDisconnectRetainsExactNodeUntilSuccessfulRetry() {
+        val slot = WalletTeardownSlot<Any>()
+        val failedNode = Any()
+        val laterActiveNode = Any()
+
+        assertSame(failedNode, slot.nodeForDisconnect(failedNode))
+        slot.recordDisconnect(failedNode, succeeded = false)
+        assertTrue(slot.hasPendingNode())
+        assertSame(failedNode, slot.nodeForDisconnect(laterActiveNode))
+
+        // A different successful disconnect must never release the retained
+        // database handle that actually failed teardown.
+        slot.recordDisconnect(laterActiveNode, succeeded = true)
+        assertTrue(slot.hasPendingNode())
+        assertSame(failedNode, slot.nodeForDisconnect(null))
+
+        slot.recordDisconnect(failedNode, succeeded = true)
+        assertFalse(slot.hasPendingNode())
+        assertSame(laterActiveNode, slot.nodeForDisconnect(laterActiveNode))
     }
 }
 
