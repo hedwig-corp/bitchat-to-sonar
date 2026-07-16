@@ -102,14 +102,22 @@ cargo run -p "$CRATE" --features cli --bin uniffi-bindgen -- generate \
 #     ABI, loaded by JNA) and drop its dynamic library next to the core's. It's a
 #     SEPARATE cargo workspace (its BLE deps stay out of sonar-ffi / CI). ---------
 BLE_LIB="$(echo "$LIB" | sed 's/sonar_ffi/sonar_ble/')"  # libsonar_ble.<ext>
-echo "Building sonar-ble (BLE radio bridge)..."
-( cd "$SCRIPT_DIR/sonar-ble" && cargo build --release --lib )
-BLE_BUILT="$SCRIPT_DIR/sonar-ble/target/release/$BLE_LIB"
-if [[ -f "$BLE_BUILT" ]]; then
-  cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX/$BLE_LIB"
-  [[ -n "$JNA_PREFIX_ALT" ]] && cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX_ALT/$BLE_LIB"
+# SONAR_SKIP_BLE=1 skips the bridge build; BLE is optional at runtime (the app
+# runs internet-only without the dylib). CI uses this: the Linux peripheral dep
+# (bluster) does not compile on current stable Rust, and CI only needs the core
+# bindings + tests, not a radio.
+if [[ "${SONAR_SKIP_BLE:-0}" == "1" ]]; then
+  echo "Skipping sonar-ble (SONAR_SKIP_BLE=1) — desktop BLE will be unavailable."
 else
-  echo "warning: $BLE_BUILT not found — desktop BLE will be unavailable" >&2
+  echo "Building sonar-ble (BLE radio bridge)..."
+  ( cd "$SCRIPT_DIR/sonar-ble" && cargo build --release --lib )
+  BLE_BUILT="$SCRIPT_DIR/sonar-ble/target/release/$BLE_LIB"
+  if [[ -f "$BLE_BUILT" ]]; then
+    cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX/$BLE_LIB"
+    [[ -n "$JNA_PREFIX_ALT" ]] && cp "$BLE_BUILT" "$RES_DIR/$JNA_PREFIX_ALT/$BLE_LIB"
+  else
+    echo "warning: $BLE_BUILT not found — desktop BLE will be unavailable" >&2
+  fi
 fi
 
 # --- Fetch the Breez SDK Liquid native lib (on-device ⚡PAY wallet) -------------

@@ -31,18 +31,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Install Linux build deps (BlueZ D-Bus headers for sonar-ble)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
-
       - name: Update Rust toolchain
         run: rustup update stable && rustup default stable
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            core
-            core/sonar-ble
+          workspaces: core
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -54,5 +49,10 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
 
       - name: Run JVM unit tests (builds desktop Rust core + UniFFI bindings)
+        # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
+        # compile on current stable Rust; BLE is optional at runtime and the
+        # tests don't need a radio.
         run: ./gradlew :composeApp:jvmTest --console=plain
         working-directory: apps/sonar
+        env:
+          SONAR_SKIP_BLE: '1'
