@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s सक्रिय</string>
+    <string name="active">%1$s सक्रिय</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">बंद करें</string>
     <string name="app_info_done">समाप्त</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">नोस्ट्र पर उपलब्ध</string>
     <string name="content_accessibility_back_to_main_chat">मुख्य चैट पर वापस</string>
     <string name="content_accessibility_connected_mesh">मेश से जुड़ा</string>
-    <string name="content_accessibility_encryption_status">एन्क्रिप्शन स्थिति: %s</string>
+    <string name="content_accessibility_encryption_status">एन्क्रिप्शन स्थिति: %1$s</string>
     <string name="content_accessibility_location_channels">लोकेशन चैनल</string>
     <string name="content_accessibility_location_notes">इस स्थान के लोकेशन नोट</string>
     <string name="content_accessibility_open_unread">अपठित निजी चैट खोलें</string>
-    <string name="content_accessibility_private_chat">%s के साथ निजी चैट</string>
+    <string name="content_accessibility_private_chat">%1$s के साथ निजी चैट</string>
     <string name="content_accessibility_reachable_mesh">मेश के माध्यम से पहुंच योग्य</string>
     <string name="content_accessibility_remove_favorite">पसंदीदा से हटाएँ</string>
     <string name="content_accessibility_send_hint_empty">संदेश भेजने के लिए संदेश लिखें</string>
     <string name="content_accessibility_send_hint_ready">भेजने के लिए डबल टैप करें</string>
     <string name="content_accessibility_send_message">संदेश भेजें</string>
-    <string name="content_accessibility_toggle_bookmark">#%s के लिए बुकमार्क टॉगल करें</string>
+    <string name="content_accessibility_toggle_bookmark">#%1$s के लिए बुकमार्क टॉगल करें</string>
     <string name="content_accessibility_toggle_favorite">पसंदीदा स्थिति बदलने के लिए डबल टैप करें</string>
     <string name="content_accessibility_view_fingerprint">एन्क्रिप्शन फिंगरप्रिंट देखने के लिए टैप करें</string>
     <string name="content_actions_block">ब्लॉक करें</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">पसंदीदा से हटाएँ</string>
     <string name="content_commands_who">कौन ऑनलाइन है देखें</string>
     <string name="content_delivery_delivered_members">%2$d सदस्यों में से %1$d को पहुँचाया</string>
-    <string name="content_delivery_delivered_to">%s को पहुँचाया</string>
-    <string name="content_delivery_failed">विफल: %s</string>
-    <string name="content_delivery_read_by">%s ने पढ़ा</string>
+    <string name="content_delivery_delivered_to">%1$s को पहुँचाया</string>
+    <string name="content_delivery_failed">विफल: %1$s</string>
+    <string name="content_delivery_read_by">%1$s ने पढ़ा</string>
     <string name="content_delivery_reason_blocked">उपयोगकर्ता ब्लॉक है</string>
     <string name="content_delivery_reason_self">खुद को संदेश नहीं भेज सकते</string>
     <string name="content_delivery_reason_send_error">भेजने में त्रुटि</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ सत्यापित</string>
     <string name="fingerprint_handshake_pending">उपलब्ध नहीं - हैंडशेक जारी है</string>
     <string name="fingerprint_message_verified">आपने इस व्यक्ति की पहचान सत्यापित की है।</string>
-    <string name="fingerprint_message_verify_hint">इन फिंगरप्रिंट्स की तुलना %s से सुरक्षित चैनल पर करें।</string>
+    <string name="fingerprint_message_verify_hint">इन फिंगरप्रिंट्स की तुलना %1$s से सुरक्षित चैनल पर करें।</string>
     <string name="fingerprint_their_label">उनका फिंगरप्रिंट:</string>
     <string name="fingerprint_title">सुरक्षा सत्यापन</string>
     <string name="fingerprint_your_label">आपका फिंगरप्रिंट:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">अनब्लॉक करें</string>
     <string name="geohash_people_none_nearby">आसपास कोई नहीं...</string>
     <string name="geohash_people_tooltip_blocked">जियोहैश में ब्लॉक</string>
-    <string name="geohash_people_you_suffix">" (आप)"</string>
+    <string name="geohash_people_you_suffix"> (आप)</string>
     <string name="images_are_only_available_in_mesh_chats">चित्र केवल मेश चैट में ही उपलब्ध हैं।</string>
     <string name="location_channels_action_open_settings">सेटिंग्स खोलें</string>
     <string name="location_channels_action_remove_access">लोकेशन एक्सेस हटाएँ</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">इस स्थान के लिए अन्य आगंतुकों को मिलने वाले छोटे स्थायी नोट जोड़ें।</string>
     <string name="location_notes_empty_subtitle">इस जगह के लिए पहला नोट आप जोड़ें।</string>
     <string name="location_notes_empty_title">अभी कोई नोट नहीं</string>
-    <string name="location_notes_error_failed_to_send">नोट भेजने में विफल। %s</string>
+    <string name="location_notes_error_failed_to_send">नोट भेजने में विफल। %1$s</string>
     <string name="location_notes_error_no_relays">इस स्थान के पास कोई जियो रिले उपलब्ध नहीं। कुछ देर बाद फिर प्रयास करें।</string>
     <string name="location_notes_loading_notes">नोट लोड हो रहे हैं…</string>
     <string name="location_notes_loading_recent">हाल के नोट लोड हो रहे हैं…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">जियो रिले अनुपलब्ध; नोट रुके हैं</string>
     <string name="location_notes_relays_retry_hint">नोट जियो रिले पर निर्भर हैं। कनेक्शन जांचें और फिर प्रयास करें।</string>
     <string name="mesh_peers_tooltip_new_messages">नए संदेश</string>
-    <string name="recording">रिकॉर्डिंग %s</string>
+    <string name="recording">रिकॉर्डिंग %1$s</string>
     <string name="save_2">सहेजें</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">%s के साथ चैट शुरू नहीं कर सकते: व्यक्ति ब्लॉक है।</string>
-    <string name="system_chat_requires_favorite">%s के साथ चैट शुरू नहीं कर सकते: ऑफ़लाइन मैसेजिंग के लिए आपसी पसंदीदा आवश्यक है।</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">%1$s के साथ चैट शुरू नहीं कर सकते: व्यक्ति ब्लॉक है।</string>
+    <string name="system_chat_requires_favorite">%1$s के साथ चैट शुरू नहीं कर सकते: ऑफ़लाइन मैसेजिंग के लिए आपसी पसंदीदा आवश्यक है।</string>
     <string name="system_common_user">उपयोगकर्ता</string>
     <string name="system_dm_blocked_generic">संदेश नहीं भेज सकते: व्यक्ति ब्लॉक है।</string>
-    <string name="system_dm_blocked_recipient">%s को संदेश नहीं भेज सकते: व्यक्ति ब्लॉक है।</string>
-    <string name="system_dm_unreachable">%s को संदेश नहीं भेज सकते - पीयर मेश या नोस्ट्र पर पहुँच योग्य नहीं।</string>
-    <string name="system_geohash_blocked">जियोहैश चैट में %s ब्लॉक किया गया</string>
-    <string name="system_geohash_unblocked">जियोहैश चैट में %s अनब्लॉक किया गया</string>
+    <string name="system_dm_blocked_recipient">%1$s को संदेश नहीं भेज सकते: व्यक्ति ब्लॉक है।</string>
+    <string name="system_dm_unreachable">%1$s को संदेश नहीं भेज सकते - पीयर मेश या नोस्ट्र पर पहुँच योग्य नहीं।</string>
+    <string name="system_geohash_blocked">जियोहैश चैट में %1$s ब्लॉक किया गया</string>
+    <string name="system_geohash_unblocked">जियोहैश चैट में %1$s अनब्लॉक किया गया</string>
     <string name="system_location_not_in_channel">भेज नहीं सकते: लोकेशन चैनल में नहीं हैं</string>
     <string name="system_location_send_failed">लोकेशन चैनल पर भेजना विफल</string>
     <string name="system_tor_dev_bypass">डेवलपमेंट बिल्ड: Tor बायपास सक्षम।</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">मित्र का QR स्कैन करें</string>
     <string name="verification_scan_status_invalid">अमान्य या समाप्त हुआ QR पेलोड</string>
     <string name="verification_scan_status_no_peer">मिलता-जुलता पीयर नहीं मिला</string>
-    <string name="verification_scan_status_requested">%s के लिए सत्यापन अनुरोध किया गया</string>
+    <string name="verification_scan_status_requested">%1$s के लिए सत्यापन अनुरोध किया गया</string>
     <string name="verification_scan_validate">सत्यापित करें</string>
     <string name="verification_sheet_title">सत्यापन</string>
     <string name="voice_notes_are_only_available_in_mesh">वॉइस नोट्स केवल मेश चैट में ही उपलब्ध हैं।</string>

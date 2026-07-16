@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s активных</string>
+    <string name="active">%1$s активных</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">закрыть</string>
     <string name="app_info_done">ГОТОВО</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">доступно через nostr</string>
     <string name="content_accessibility_back_to_main_chat">назад в основной чат</string>
     <string name="content_accessibility_connected_mesh">подключено через mesh</string>
-    <string name="content_accessibility_encryption_status">статус шифрования: %s</string>
+    <string name="content_accessibility_encryption_status">статус шифрования: %1$s</string>
     <string name="content_accessibility_location_channels">каналы локации</string>
     <string name="content_accessibility_location_notes">заметки для этого места</string>
     <string name="content_accessibility_open_unread">открыть непрочитанный приватный чат</string>
-    <string name="content_accessibility_private_chat">приватный чат с %s</string>
+    <string name="content_accessibility_private_chat">приватный чат с %1$s</string>
     <string name="content_accessibility_reachable_mesh">достижим через mesh</string>
     <string name="content_accessibility_remove_favorite">убрать из избранного</string>
     <string name="content_accessibility_send_hint_empty">введи сообщение для отправки</string>
     <string name="content_accessibility_send_hint_ready">дважды тапни, чтобы отправить</string>
     <string name="content_accessibility_send_message">отправить сообщение</string>
-    <string name="content_accessibility_toggle_bookmark">переключить закладку для #%s</string>
+    <string name="content_accessibility_toggle_bookmark">переключить закладку для #%1$s</string>
     <string name="content_accessibility_toggle_favorite">дважды тапни, чтобы переключить статус избранного</string>
     <string name="content_accessibility_view_fingerprint">нажми, чтобы увидеть криптографический отпечаток</string>
     <string name="content_actions_block">заблокировать</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">убрать из избранного</string>
     <string name="content_commands_who">посмотреть, кто онлайн</string>
     <string name="content_delivery_delivered_members">доставлено %1$d из %2$d участников</string>
-    <string name="content_delivery_delivered_to">доставлено %s</string>
-    <string name="content_delivery_failed">ошибка: %s</string>
-    <string name="content_delivery_read_by">прочитано %s</string>
+    <string name="content_delivery_delivered_to">доставлено %1$s</string>
+    <string name="content_delivery_failed">ошибка: %1$s</string>
+    <string name="content_delivery_read_by">прочитано %1$s</string>
     <string name="content_delivery_reason_blocked">пользователь заблокирован</string>
     <string name="content_delivery_reason_self">нельзя отправить себе</string>
     <string name="content_delivery_reason_send_error">ошибка отправки</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ ПРОВЕРЕНО</string>
     <string name="fingerprint_handshake_pending">недоступно — handshake выполняется</string>
     <string name="fingerprint_message_verified">ты подтвердил личность этого человека.</string>
-    <string name="fingerprint_message_verify_hint">сравни эти отпечатки с %s по безопасному каналу.</string>
+    <string name="fingerprint_message_verify_hint">сравни эти отпечатки с %1$s по безопасному каналу.</string>
     <string name="fingerprint_their_label">их отпечаток:</string>
     <string name="fingerprint_title">проверка безопасности</string>
     <string name="fingerprint_your_label">твой отпечаток:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">разблокировать</string>
     <string name="geohash_people_none_nearby">никого рядом...</string>
     <string name="geohash_people_tooltip_blocked">заблокирован в geohash</string>
-    <string name="geohash_people_you_suffix">" (ты)"</string>
+    <string name="geohash_people_you_suffix"> (ты)</string>
     <string name="images_are_only_available_in_mesh_chats">Изображения доступны только в mesh-чатах.</string>
     <string name="location_channels_action_open_settings">открыть настройки</string>
     <string name="location_channels_action_remove_access">отключить доступ к локации</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">поиск каналов рядом…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">доступ к локации запрещён. включи разрешение в настройках, чтобы использовать каналы.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#каналы локации</string>
     <string name="location_channels_tor_subtitle">скрывает твой ip для каналов локации. рекомендуем включить.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">добавь короткие постоянные заметки об этом месте для других.</string>
     <string name="location_notes_empty_subtitle">стань первым, кто добавит здесь заметку.</string>
     <string name="location_notes_empty_title">заметок пока нет</string>
-    <string name="location_notes_error_failed_to_send">не удалось отправить заметку. %s</string>
+    <string name="location_notes_error_failed_to_send">не удалось отправить заметку. %1$s</string>
     <string name="location_notes_error_no_relays">рядом нет георелеев. попробуй позже.</string>
     <string name="location_notes_loading_notes">загрузка заметок…</string>
     <string name="location_notes_loading_recent">загрузка свежих заметок…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">геореле недоступны; заметки приостановлены</string>
     <string name="location_notes_relays_retry_hint">заметки зависят от георелеев. проверь подключение и попробуй снова.</string>
     <string name="mesh_peers_tooltip_new_messages">новые сообщения</string>
-    <string name="recording">идет запись %s</string>
+    <string name="recording">идет запись %1$s</string>
     <string name="save_2">сохранить</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">нельзя начать чат с %s: пользователь заблокирован.</string>
-    <string name="system_chat_requires_favorite">нельзя начать чат с %s: нужны взаимные избранные для офлайна.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">нельзя начать чат с %1$s: пользователь заблокирован.</string>
+    <string name="system_chat_requires_favorite">нельзя начать чат с %1$s: нужны взаимные избранные для офлайна.</string>
     <string name="system_common_user">пользователь</string>
     <string name="system_dm_blocked_generic">отправка невозможна: пользователь заблокирован.</string>
-    <string name="system_dm_blocked_recipient">нельзя отправить %s: пользователь заблокирован.</string>
-    <string name="system_dm_unreachable">нельзя отправить %s: адресат недоступен через mesh или nostr.</string>
-    <string name="system_geohash_blocked">%s заблокирован в geohash-чатах</string>
-    <string name="system_geohash_unblocked">%s разблокирован в geohash-чатах</string>
+    <string name="system_dm_blocked_recipient">нельзя отправить %1$s: пользователь заблокирован.</string>
+    <string name="system_dm_unreachable">нельзя отправить %1$s: адресат недоступен через mesh или nostr.</string>
+    <string name="system_geohash_blocked">%1$s заблокирован в geohash-чатах</string>
+    <string name="system_geohash_unblocked">%1$s разблокирован в geohash-чатах</string>
     <string name="system_location_not_in_channel">отправка невозможна: ты не в канале локации</string>
     <string name="system_location_send_failed">не удалось отправить в канал локации</string>
     <string name="system_tor_dev_bypass">dev-сборка: обход tor включён.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">отсканируй qr друга</string>
     <string name="verification_scan_status_invalid">qr недействителен или просрочен</string>
     <string name="verification_scan_status_no_peer">соответствующий пир не найден</string>
-    <string name="verification_scan_status_requested">проверка запрошена для %s</string>
+    <string name="verification_scan_status_requested">проверка запрошена для %1$s</string>
     <string name="verification_scan_validate">проверить</string>
     <string name="verification_sheet_title">ПРОВЕРИТЬ</string>
     <string name="voice_notes_are_only_available_in_mesh">Голосовые сообщения доступны только в mesh-чатах.</string>

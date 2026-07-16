@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s aktif</string>
+    <string name="active">%1$s aktif</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">tutup</string>
     <string name="app_info_done">SELESAI</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">tersedia melalui nostr</string>
     <string name="content_accessibility_back_to_main_chat">kembali ke chat utama</string>
     <string name="content_accessibility_connected_mesh">terhubung lewat mesh</string>
-    <string name="content_accessibility_encryption_status">status enkripsi: %s</string>
+    <string name="content_accessibility_encryption_status">status enkripsi: %1$s</string>
     <string name="content_accessibility_location_channels">kanal lokasi</string>
     <string name="content_accessibility_location_notes">catatan lokasi untuk tempat ini</string>
     <string name="content_accessibility_open_unread">buka chat pribadi belum dibaca</string>
-    <string name="content_accessibility_private_chat">chat pribadi dengan %s</string>
+    <string name="content_accessibility_private_chat">chat pribadi dengan %1$s</string>
     <string name="content_accessibility_reachable_mesh">dapat dijangkau lewat mesh</string>
     <string name="content_accessibility_remove_favorite">hapus dari favorit</string>
     <string name="content_accessibility_send_hint_empty">masukkan pesan untuk dihantar</string>
     <string name="content_accessibility_send_hint_ready">ketuk dua kali untuk menghantar</string>
     <string name="content_accessibility_send_message">hantar pesan</string>
-    <string name="content_accessibility_toggle_bookmark">ubah penanda untuk #%s</string>
+    <string name="content_accessibility_toggle_bookmark">ubah penanda untuk #%1$s</string>
     <string name="content_accessibility_toggle_favorite">ketuk dua kali untuk mengubah status favorit</string>
     <string name="content_accessibility_view_fingerprint">ketuk untuk melihat sidik enkripsi</string>
     <string name="content_actions_block">blokir</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">hapus dari favorit</string>
     <string name="content_commands_who">lihat siapa yang online</string>
     <string name="content_delivery_delivered_members">terhantar ke %1$d dari %2$d anggota</string>
-    <string name="content_delivery_delivered_to">terhantar ke %s</string>
-    <string name="content_delivery_failed">gagal: %s</string>
-    <string name="content_delivery_read_by">dibaca oleh %s</string>
+    <string name="content_delivery_delivered_to">terhantar ke %1$s</string>
+    <string name="content_delivery_failed">gagal: %1$s</string>
+    <string name="content_delivery_read_by">dibaca oleh %1$s</string>
     <string name="content_delivery_reason_blocked">pengguna diblokir</string>
     <string name="content_delivery_reason_self">tidak bisa hantar ke diri sendiri</string>
     <string name="content_delivery_reason_send_error">kesalahan penghantaran</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ TERVERIFIKASI</string>
     <string name="fingerprint_handshake_pending">tidak tersedia - handshake sedang berlangsung</string>
     <string name="fingerprint_message_verified">kamu sudah memverifikasi identitas orang ini.</string>
-    <string name="fingerprint_message_verify_hint">bandingkan sidik ini dengan %s lewat kanal aman.</string>
+    <string name="fingerprint_message_verify_hint">bandingkan sidik ini dengan %1$s lewat kanal aman.</string>
     <string name="fingerprint_their_label">sidik mereka:</string>
     <string name="fingerprint_title">verifikasi keamanan</string>
     <string name="fingerprint_your_label">sidikmu:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">buka blokir</string>
     <string name="geohash_people_none_nearby">tidak ada siapa pun...</string>
     <string name="geohash_people_tooltip_blocked">diblokir di geohash</string>
-    <string name="geohash_people_you_suffix">" (kamu)"</string>
+    <string name="geohash_people_you_suffix"> (kamu)</string>
     <string name="images_are_only_available_in_mesh_chats">Imej hanya tersedia dalam sembang mesh.</string>
     <string name="location_channels_action_open_settings">buka Tetapan</string>
     <string name="location_channels_action_remove_access">cabut capaian lokasi</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">mencari kanal sekitar…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">kebenaran lokasi ditolak. aktifkan dalam Tetapan untuk menggunakan kanal lokasi.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#kanal lokasi</string>
     <string name="location_channels_tor_subtitle">menyembunyikan ip-mu untuk kanal lokasi. disarankan: aktif.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">tambahkan catatan permanen singkat di tempat ini agar orang lain menemukannya.</string>
     <string name="location_notes_empty_subtitle">jadilah orang pertama yang menambahkannya di sini.</string>
     <string name="location_notes_empty_title">belum ada catatan</string>
-    <string name="location_notes_error_failed_to_send">tidak bisa menghantar catatan. %s</string>
+    <string name="location_notes_error_failed_to_send">tidak bisa menghantar catatan. %1$s</string>
     <string name="location_notes_error_no_relays">tidak ada relay geo tersedia dekat sini. coba lagi nanti.</string>
     <string name="location_notes_loading_notes">memuat catatan…</string>
     <string name="location_notes_loading_recent">memuat catatan terbaru…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">relay geo tidak tersedia; catatan dijeda</string>
     <string name="location_notes_relays_retry_hint">catatan bergantung pada relay geo. cek koneksi lalu coba lagi.</string>
     <string name="mesh_peers_tooltip_new_messages">pesan baru</string>
-    <string name="recording">merakam %s</string>
+    <string name="recording">merakam %1$s</string>
     <string name="save_2">simpan</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">tidak bisa mulai chat dengan %s: pengguna diblokir.</string>
-    <string name="system_chat_requires_favorite">tidak bisa mulai chat dengan %s: butuh favorit bersama untuk offline.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">tidak bisa mulai chat dengan %1$s: pengguna diblokir.</string>
+    <string name="system_chat_requires_favorite">tidak bisa mulai chat dengan %1$s: butuh favorit bersama untuk offline.</string>
     <string name="system_common_user">pengguna</string>
     <string name="system_dm_blocked_generic">tidak bisa menghantar: pengguna diblokir.</string>
-    <string name="system_dm_blocked_recipient">tidak bisa menghantar ke %s: pengguna diblokir.</string>
-    <string name="system_dm_unreachable">tidak bisa menghantar ke %s: penerima tidak dapat dijangkau lewat mesh atau nostr.</string>
-    <string name="system_geohash_blocked">%s diblokir di chat geohash</string>
-    <string name="system_geohash_unblocked">%s dibuka blokirnya di chat geohash</string>
+    <string name="system_dm_blocked_recipient">tidak bisa menghantar ke %1$s: pengguna diblokir.</string>
+    <string name="system_dm_unreachable">tidak bisa menghantar ke %1$s: penerima tidak dapat dijangkau lewat mesh atau nostr.</string>
+    <string name="system_geohash_blocked">%1$s diblokir di chat geohash</string>
+    <string name="system_geohash_unblocked">%1$s dibuka blokirnya di chat geohash</string>
     <string name="system_location_not_in_channel">gagal menghantar: kamu tidak berada di kanal lokasi</string>
     <string name="system_location_send_failed">gagal menghantar ke kanal lokasi</string>
     <string name="system_tor_dev_bypass">build pengembangan: bypass tor aktif.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">pindai qr teman</string>
     <string name="verification_scan_status_invalid">qr tidak valid atau kedaluwarsa</string>
     <string name="verification_scan_status_no_peer">tidak ada peer yang cocok</string>
-    <string name="verification_scan_status_requested">verifikasi diminta untuk %s</string>
+    <string name="verification_scan_status_requested">verifikasi diminta untuk %1$s</string>
     <string name="verification_scan_validate">validasi</string>
     <string name="verification_sheet_title">VERIFIKASI</string>
     <string name="voice_notes_are_only_available_in_mesh">Nota suara hanya tersedia dalam sembang mesh.</string>

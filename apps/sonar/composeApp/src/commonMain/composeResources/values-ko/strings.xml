@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">활성 사용자 %s명</string>
+    <string name="active">활성 사용자 %1$s명</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">닫기</string>
     <string name="app_info_done">확인</string>
@@ -13,7 +13,7 @@
     <string name="app_info_features_favorites_title">즐겨찾기</string>
     <string name="app_info_features_geohash_description">분산형 익명 릴레이를 통해 geohash 채널에서 주변 지역의 사람들과 대화할 수 있습니다</string>
     <string name="app_info_features_geohash_title">지역 채널</string>
-    <string name="app_info_features_mentions_description">\@닉네임을 사용하여 특정 사람에게 알림을 보낼 수 있습니다</string>
+    <string name="app_info_features_mentions_description">@닉네임을 사용하여 특정 사람에게 알림을 보낼 수 있습니다</string>
     <string name="app_info_features_mentions_title">멘션</string>
     <string name="app_info_features_offline_description">저전력 bluetooth를 사용하여 인터넷 없이 작동합니다</string>
     <string name="app_info_features_offline_title">오프라인 통신</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">Nostr를 통해 사용 가능</string>
     <string name="content_accessibility_back_to_main_chat">메인 대화로 돌아가기</string>
     <string name="content_accessibility_connected_mesh">메시를 통해 연결됨</string>
-    <string name="content_accessibility_encryption_status">암호화 상태: %s</string>
+    <string name="content_accessibility_encryption_status">암호화 상태: %1$s</string>
     <string name="content_accessibility_location_channels">위치 채널</string>
     <string name="content_accessibility_location_notes">이 장소의 위치 노트</string>
     <string name="content_accessibility_open_unread">읽지 않은 비공개 대화 열기</string>
-    <string name="content_accessibility_private_chat">%s과(와) 비공개 대화</string>
+    <string name="content_accessibility_private_chat">%1$s과(와) 비공개 대화</string>
     <string name="content_accessibility_reachable_mesh">메시를 통해 연결 가능</string>
     <string name="content_accessibility_remove_favorite">즐겨찾기에서 제거</string>
     <string name="content_accessibility_send_hint_empty">전송할 메시지를 입력하세요</string>
     <string name="content_accessibility_send_hint_ready">전송하려면 두 번 탭하세요</string>
     <string name="content_accessibility_send_message">메시지 보내기</string>
-    <string name="content_accessibility_toggle_bookmark">#%s 북마크 토글</string>
+    <string name="content_accessibility_toggle_bookmark">#%1$s 북마크 토글</string>
     <string name="content_accessibility_toggle_favorite">두 번 탭하여 즐겨찾기 상태 토글</string>
     <string name="content_accessibility_view_fingerprint">탭하여 암호화 지문 보기</string>
     <string name="content_actions_block">차단하기</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">즐겨찾기에서 제거하기</string>
     <string name="content_commands_who">온라인인 사람 확인하기</string>
     <string name="content_delivery_delivered_members">%2$d명 중 %1$d명에게 전달되었습니다</string>
-    <string name="content_delivery_delivered_to">%s에게 전달되었습니다</string>
-    <string name="content_delivery_failed">실패: %s</string>
-    <string name="content_delivery_read_by">%s가 읽음</string>
+    <string name="content_delivery_delivered_to">%1$s에게 전달되었습니다</string>
+    <string name="content_delivery_failed">실패: %1$s</string>
+    <string name="content_delivery_read_by">%1$s가 읽음</string>
     <string name="content_delivery_reason_blocked">차단된 사용자입니다</string>
     <string name="content_delivery_reason_self">자신에게 메시지를 보낼 수 없습니다</string>
     <string name="content_delivery_reason_send_error">전송 오류</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ 인증됨</string>
     <string name="fingerprint_handshake_pending">사용 불가 - 핸드셰이크 진행 중</string>
     <string name="fingerprint_message_verified">이 사람의 신원을 인증했습니다.</string>
-    <string name="fingerprint_message_verify_hint">보안 채널을 통해 이 지문을 %s와 비교하세요.</string>
+    <string name="fingerprint_message_verify_hint">보안 채널을 통해 이 지문을 %1$s와 비교하세요.</string>
     <string name="fingerprint_their_label">상대방의 지문:</string>
     <string name="fingerprint_title">보안 인증</string>
     <string name="fingerprint_your_label">나의 지문:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">차단 해제하기</string>
     <string name="geohash_people_none_nearby">주변에 아무도 없습니다...</string>
     <string name="geohash_people_tooltip_blocked">geohash에서 차단됨</string>
-    <string name="geohash_people_you_suffix">" (나)"</string>
+    <string name="geohash_people_you_suffix"> (나)</string>
     <string name="images_are_only_available_in_mesh_chats">이미지는 메쉬 채팅에서만 사용할 수 있습니다.</string>
     <string name="location_channels_action_open_settings">설정 열기</string>
     <string name="location_channels_action_remove_access">위치 접근 권한 제거</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">주변 채널 찾는 중…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">위치 권한이 거부되었습니다. 위치 채널을 사용하려면 설정에서 활성화하세요.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#위치 채널</string>
     <string name="location_channels_tor_subtitle">위치 채널에서 IP를 숨깁니다. 권장: 켜기.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">다른 방문자가 볼 수 있도록 이 위치에 짧은 영구적 노트를 추가하세요.</string>
     <string name="location_notes_empty_subtitle">이 장소에 첫 번째 노트를 남겨보세요.</string>
     <string name="location_notes_empty_title">아직 노트가 없습니다</string>
-    <string name="location_notes_error_failed_to_send">노트 전송 실패. %s</string>
+    <string name="location_notes_error_failed_to_send">노트 전송 실패. %1$s</string>
     <string name="location_notes_error_no_relays">이 위치 근처에 사용 가능한 geo 릴레이가 없습니다. 잠시 후 다시 시도하세요.</string>
     <string name="location_notes_loading_notes">노트 로딩 중…</string>
     <string name="location_notes_loading_recent">최근 노트 로딩 중…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">geo 릴레이를 사용할 수 없습니다; 노트가 일시 중지됩니다</string>
     <string name="location_notes_relays_retry_hint">노트는 geo 릴레이를 사용합니다. 연결을 확인하고 다시 시도하세요.</string>
     <string name="mesh_peers_tooltip_new_messages">새 메시지</string>
-    <string name="recording">녹음 중 %s</string>
+    <string name="recording">녹음 중 %1$s</string>
     <string name="save_2">저장</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">%s와 채팅을 시작할 수 없습니다: 차단된 사용자입니다.</string>
-    <string name="system_chat_requires_favorite">%s와 채팅을 시작할 수 없습니다: 오프라인 메시지를 보내려면 서로 즐겨찾기에 추가해야 합니다.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">%1$s와 채팅을 시작할 수 없습니다: 차단된 사용자입니다.</string>
+    <string name="system_chat_requires_favorite">%1$s와 채팅을 시작할 수 없습니다: 오프라인 메시지를 보내려면 서로 즐겨찾기에 추가해야 합니다.</string>
     <string name="system_common_user">사용자</string>
     <string name="system_dm_blocked_generic">메시지를 보낼 수 없습니다: 차단된 사용자입니다.</string>
-    <string name="system_dm_blocked_recipient">%s에게 메시지를 보낼 수 없습니다: 차단된 사용자입니다.</string>
-    <string name="system_dm_unreachable">%s에게 메시지를 보낼 수 없습니다 - mesh 또는 nostr를 통해 피어에 연결할 수 없습니다.</string>
-    <string name="system_geohash_blocked">geohash 채팅에서 %s을(를) 차단했습니다</string>
-    <string name="system_geohash_unblocked">geohash 채팅에서 %s의 차단을 해제했습니다</string>
+    <string name="system_dm_blocked_recipient">%1$s에게 메시지를 보낼 수 없습니다: 차단된 사용자입니다.</string>
+    <string name="system_dm_unreachable">%1$s에게 메시지를 보낼 수 없습니다 - mesh 또는 nostr를 통해 피어에 연결할 수 없습니다.</string>
+    <string name="system_geohash_blocked">geohash 채팅에서 %1$s을(를) 차단했습니다</string>
+    <string name="system_geohash_unblocked">geohash 채팅에서 %1$s의 차단을 해제했습니다</string>
     <string name="system_location_not_in_channel">전송할 수 없음: 위치 채널에 있지 않습니다</string>
     <string name="system_location_send_failed">위치 채널로 전송에 실패했습니다</string>
     <string name="system_tor_dev_bypass">개발 빌드: Tor 우회가 활성화되었습니다.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">친구의 QR 스캔하기</string>
     <string name="verification_scan_status_invalid">QR 페이로드가 잘못되었거나 만료되었습니다</string>
     <string name="verification_scan_status_no_peer">일치하는 피어를 찾을 수 없습니다</string>
-    <string name="verification_scan_status_requested">%s에 대한 인증이 요청되었습니다</string>
+    <string name="verification_scan_status_requested">%1$s에 대한 인증이 요청되었습니다</string>
     <string name="verification_scan_validate">인증하기</string>
     <string name="verification_sheet_title">인증</string>
     <string name="voice_notes_are_only_available_in_mesh">음성 메모는 메쉬 채팅에서만 사용할 수 있습니다.</string>

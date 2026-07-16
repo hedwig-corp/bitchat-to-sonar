@@ -35,6 +35,14 @@ user-facing string is left hardcoded.
 - No RTL layout rework beyond what the frameworks give for free (ar/he/ur exist in the
   catalog — verify but don't redesign screens here).
 
+**Tracked Compose 1.7.3 locale gap:**
+- Compose resources accept language and region qualifiers but reject BCP-47 script
+  qualifiers. The generator therefore emits Simplified Chinese for `zh`, CN, and SG,
+  and Traditional Chinese for TW, HK, and MO. A regionless `zh-Hant` locale cannot be
+  distinguished from `zh-Hans` by this Compose version and falls back to the
+  language-only Simplified resource. Re-evaluate script-qualified directories when
+  upgrading Compose Multiplatform; the JVM locale tests cover every supported alias.
+
 **Success criteria:**
 - Every user-facing Compose string goes through a resource id; grep for `Text("` /
   literal user strings in `commonMain` UI returns only non-localizable cases.

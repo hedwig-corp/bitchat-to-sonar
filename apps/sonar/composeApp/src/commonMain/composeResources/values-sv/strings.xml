@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s aktiva</string>
+    <string name="active">%1$s aktiva</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">stäng</string>
     <string name="app_info_done">KLART</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">tillgänglig via Nostr</string>
     <string name="content_accessibility_back_to_main_chat">tillbaka till huvudchatten</string>
     <string name="content_accessibility_connected_mesh">ansluten via mesh</string>
-    <string name="content_accessibility_encryption_status">krypteringsstatus: %s</string>
+    <string name="content_accessibility_encryption_status">krypteringsstatus: %1$s</string>
     <string name="content_accessibility_location_channels">platskanaler</string>
     <string name="content_accessibility_location_notes">platsanteckningar för den här platsen</string>
     <string name="content_accessibility_open_unread">öppna oläst privat chatt</string>
-    <string name="content_accessibility_private_chat">privat chatt med %s</string>
+    <string name="content_accessibility_private_chat">privat chatt med %1$s</string>
     <string name="content_accessibility_reachable_mesh">nåbar via mesh</string>
     <string name="content_accessibility_remove_favorite">ta bort från favoriter</string>
     <string name="content_accessibility_send_hint_empty">skriv ett meddelande för att skicka</string>
     <string name="content_accessibility_send_hint_ready">dubbeltryck för att skicka</string>
     <string name="content_accessibility_send_message">skicka meddelande</string>
-    <string name="content_accessibility_toggle_bookmark">växla bokmärke för #%s</string>
+    <string name="content_accessibility_toggle_bookmark">växla bokmärke för #%1$s</string>
     <string name="content_accessibility_toggle_favorite">dubbeltryck för att växla favoritstatus</string>
     <string name="content_accessibility_view_fingerprint">tryck för att visa krypteringsfingeravtryck</string>
     <string name="content_actions_block">blockera</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">ta bort från favoriter</string>
     <string name="content_commands_who">se vem som är online</string>
     <string name="content_delivery_delivered_members">levererat till %1$d av %2$d medlemmar</string>
-    <string name="content_delivery_delivered_to">levererat till %s</string>
-    <string name="content_delivery_failed">misslyckades: %s</string>
-    <string name="content_delivery_read_by">läst av %s</string>
+    <string name="content_delivery_delivered_to">levererat till %1$s</string>
+    <string name="content_delivery_failed">misslyckades: %1$s</string>
+    <string name="content_delivery_read_by">läst av %1$s</string>
     <string name="content_delivery_reason_blocked">användaren är blockerad</string>
     <string name="content_delivery_reason_self">kan inte skicka till dig själv</string>
     <string name="content_delivery_reason_send_error">sändningsfel</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ VERIFIERAD</string>
     <string name="fingerprint_handshake_pending">inte tillgänglig – handskakning pågår</string>
     <string name="fingerprint_message_verified">du har verifierat den här personens identitet.</string>
-    <string name="fingerprint_message_verify_hint">jämför dessa fingeravtryck med %s via en säker kanal.</string>
+    <string name="fingerprint_message_verify_hint">jämför dessa fingeravtryck med %1$s via en säker kanal.</string>
     <string name="fingerprint_their_label">deras fingeravtryck:</string>
     <string name="fingerprint_title">säkerhetsverifiering</string>
     <string name="fingerprint_your_label">ditt fingeravtryck:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">avblockera</string>
     <string name="geohash_people_none_nearby">ingen i närheten...</string>
     <string name="geohash_people_tooltip_blocked">blockerad i geohash</string>
-    <string name="geohash_people_you_suffix">" (du)"</string>
+    <string name="geohash_people_you_suffix"> (du)</string>
     <string name="images_are_only_available_in_mesh_chats">Bilder är bara tillgängliga i mesh-chattar.</string>
     <string name="location_channels_action_open_settings">öppna inställningar</string>
     <string name="location_channels_action_remove_access">ta bort platsåtkomst</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">lägg till korta beständiga anteckningar för denna plats så att andra hittar dem</string>
     <string name="location_notes_empty_subtitle">var först med en anteckning här</string>
     <string name="location_notes_empty_title">inga anteckningar än</string>
-    <string name="location_notes_error_failed_to_send">kunde inte skicka anteckning. %s</string>
+    <string name="location_notes_error_failed_to_send">kunde inte skicka anteckning. %1$s</string>
     <string name="location_notes_error_no_relays">inga geo-reläer nära denna plats. försök igen senare.</string>
     <string name="location_notes_loading_notes">laddar anteckningar…</string>
     <string name="location_notes_loading_recent">laddar senaste anteckningar…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">geo-reläer otillgängliga; anteckningar pausade</string>
     <string name="location_notes_relays_retry_hint">anteckningar är beroende av geo-reläer. kontrollera uppkopplingen och försök igen.</string>
     <string name="mesh_peers_tooltip_new_messages">nya meddelanden</string>
-    <string name="recording">spelar in %s</string>
+    <string name="recording">spelar in %1$s</string>
     <string name="save_2">spara</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">kan inte starta chatt med %s: personen är blockerad.</string>
-    <string name="system_chat_requires_favorite">kan inte starta chatt med %s: ömsesidig favorit krävs för offline-meddelanden.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">kan inte starta chatt med %1$s: personen är blockerad.</string>
+    <string name="system_chat_requires_favorite">kan inte starta chatt med %1$s: ömsesidig favorit krävs för offline-meddelanden.</string>
     <string name="system_common_user">användare</string>
     <string name="system_dm_blocked_generic">kan inte skicka meddelande: personen är blockerad.</string>
-    <string name="system_dm_blocked_recipient">kan inte skicka till %s: personen är blockerad.</string>
-    <string name="system_dm_unreachable">kan inte skicka till %s – peer nås inte via mesh eller nostr.</string>
-    <string name="system_geohash_blocked">blockerade %s i geohash-chattar</string>
-    <string name="system_geohash_unblocked">avblockerade %s i geohash-chattar</string>
+    <string name="system_dm_blocked_recipient">kan inte skicka till %1$s: personen är blockerad.</string>
+    <string name="system_dm_unreachable">kan inte skicka till %1$s – peer nås inte via mesh eller nostr.</string>
+    <string name="system_geohash_blocked">blockerade %1$s i geohash-chattar</string>
+    <string name="system_geohash_unblocked">avblockerade %1$s i geohash-chattar</string>
     <string name="system_location_not_in_channel">kan inte skicka: du är inte i ett platskanal</string>
     <string name="system_location_send_failed">kunde inte skicka till platskanalen</string>
     <string name="system_tor_dev_bypass">utvecklarbuild: Tor-bypass aktiverad.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">skanna en väns QR</string>
     <string name="verification_scan_status_invalid">ogiltig eller utgången QR-payload</string>
     <string name="verification_scan_status_no_peer">hittade ingen matchande peer</string>
-    <string name="verification_scan_status_requested">verifiering begärd för %s</string>
+    <string name="verification_scan_status_requested">verifiering begärd för %1$s</string>
     <string name="verification_scan_validate">verifiera</string>
     <string name="verification_sheet_title">VERIFIERA</string>
     <string name="voice_notes_are_only_available_in_mesh">Röstanteckningar är bara tillgängliga i mesh-chattar.</string>

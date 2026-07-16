@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s פעילים</string>
+    <string name="active">%1$s פעילים</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">סגור</string>
     <string name="app_info_done">בוצע</string>
@@ -19,7 +19,7 @@
     <string name="app_info_features_offline_title">תקשורת לא מקוונת</string>
     <string name="app_info_features_title">יכולות</string>
     <string name="app_info_how_to_use_change_channels">• הקש על #mesh כדי להחליף ערוץ</string>
-    <string name="app_info_how_to_use_clear_chat">• הקש שלוש פעמים על הצ\'אט כדי לנקות</string>
+    <string name="app_info_how_to_use_clear_chat">• הקש שלוש פעמים על הצ'אט כדי לנקות</string>
     <string name="app_info_how_to_use_commands">• הקלד / כדי לראות פקודות</string>
     <string name="app_info_how_to_use_open_sidebar">• הקש על אייקון האנשים כדי לפתוח סרגל צד</string>
     <string name="app_info_how_to_use_set_nickname">• הקש על הכינוי שלך כדי לעדכן</string>
@@ -46,19 +46,19 @@
     <string name="common_unknown">לא ידוע</string>
     <string name="content_accessibility_add_favorite">הוסף למועדפים</string>
     <string name="content_accessibility_available_nostr">זמין דרך nostr</string>
-    <string name="content_accessibility_back_to_main_chat">חזרה לצ\'אט הראשי</string>
+    <string name="content_accessibility_back_to_main_chat">חזרה לצ'אט הראשי</string>
     <string name="content_accessibility_connected_mesh">מחובר דרך mesh</string>
-    <string name="content_accessibility_encryption_status">מצב הצפנה: %s</string>
+    <string name="content_accessibility_encryption_status">מצב הצפנה: %1$s</string>
     <string name="content_accessibility_location_channels">ערוצי מיקום</string>
     <string name="content_accessibility_location_notes">הערות מיקום למקום הזה</string>
-    <string name="content_accessibility_open_unread">פתח צ\'אט פרטי שלא נקרא</string>
-    <string name="content_accessibility_private_chat">צ\'אט פרטי עם %s</string>
+    <string name="content_accessibility_open_unread">פתח צ'אט פרטי שלא נקרא</string>
+    <string name="content_accessibility_private_chat">צ'אט פרטי עם %1$s</string>
     <string name="content_accessibility_reachable_mesh">זמין דרך mesh</string>
     <string name="content_accessibility_remove_favorite">הסר מהמועדפים</string>
     <string name="content_accessibility_send_hint_empty">הזן הודעה לשליחה</string>
     <string name="content_accessibility_send_hint_ready">הקש פעמיים לשליחה</string>
     <string name="content_accessibility_send_message">שלח הודעה</string>
-    <string name="content_accessibility_toggle_bookmark">החלף סימנייה עבור #%s</string>
+    <string name="content_accessibility_toggle_bookmark">החלף סימנייה עבור #%1$s</string>
     <string name="content_accessibility_toggle_favorite">הקש פעמיים כדי להחליף מצב מועדפים</string>
     <string name="content_accessibility_view_fingerprint">הקש להצגת טביעת ההצפנה</string>
     <string name="content_actions_block">חסום</string>
@@ -75,7 +75,7 @@
     <string name="content_alert_screenshot_message">צילומי מסך של ערוצי מיקום יחשפו את מיקומך. חשב לפני שיתוף פומבי.</string>
     <string name="content_alert_screenshot_title">שים לב</string>
     <string name="content_commands_block">חסום או הצג עמיתים חסומים</string>
-    <string name="content_commands_clear">נקה הודעות צ\'אט</string>
+    <string name="content_commands_clear">נקה הודעות צ'אט</string>
     <string name="content_commands_favorite">הוסף למועדפים</string>
     <string name="content_commands_hug">שלח חיבוק חם</string>
     <string name="content_commands_message">שלח הודעה פרטית</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">הסר מהמועדפים</string>
     <string name="content_commands_who">ראה מי מחובר</string>
     <string name="content_delivery_delivered_members">נמסר ל-%1$d מתוך %2$d חברים</string>
-    <string name="content_delivery_delivered_to">נמסר ל-%s</string>
-    <string name="content_delivery_failed">נכשל: %s</string>
-    <string name="content_delivery_read_by">נקרא על ידי %s</string>
+    <string name="content_delivery_delivered_to">נמסר ל-%1$s</string>
+    <string name="content_delivery_failed">נכשל: %1$s</string>
+    <string name="content_delivery_read_by">נקרא על ידי %1$s</string>
     <string name="content_delivery_reason_blocked">המשתמש חסום</string>
     <string name="content_delivery_reason_self">אי אפשר לשלוח לעצמך</string>
     <string name="content_delivery_reason_send_error">שגיאת שליחה</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ מאומת</string>
     <string name="fingerprint_handshake_pending">לא זמין - handshake מתבצע</string>
     <string name="fingerprint_message_verified">אישרת את זהותו של האדם הזה.</string>
-    <string name="fingerprint_message_verify_hint">השווה את הטביעות עם %s בערוץ מאובטח.</string>
+    <string name="fingerprint_message_verify_hint">השווה את הטביעות עם %1$s בערוץ מאובטח.</string>
     <string name="fingerprint_their_label">הטבעת שלהם:</string>
     <string name="fingerprint_title">אימות אבטחה</string>
     <string name="fingerprint_your_label">הטבעת שלך:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">בטל חסימה</string>
     <string name="geohash_people_none_nearby">אין אף אחד בסביבה...</string>
     <string name="geohash_people_tooltip_blocked">חסום ב-geohash</string>
-    <string name="geohash_people_you_suffix">" (אתה)"</string>
+    <string name="geohash_people_you_suffix"> (אתה)</string>
     <string name="images_are_only_available_in_mesh_chats">תמונות זמינות רק בצ׳אט של mesh.</string>
     <string name="location_channels_action_open_settings">פתח הגדרות</string>
     <string name="location_channels_action_remove_access">הסר גישת מיקום</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">מחפש ערוצים קרובים…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">הרשאת מיקום נדחתה. אפשר בהגדרות כדי להשתמש בערוצי מיקום.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#ערוצי מיקום</string>
     <string name="location_channels_tor_subtitle">מסתיר את ה-ip שלך לערוצי מיקום. מומלץ: פעיל.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">הוסף הערות קצרות וקבועות למקום הזה כדי שאחרים ימצאו.</string>
     <string name="location_notes_empty_subtitle">היה הראשון להוסיף כאן.</string>
     <string name="location_notes_empty_title">אין הערות עדיין</string>
-    <string name="location_notes_error_failed_to_send">לא ניתן לשלוח את ההערה. %s</string>
+    <string name="location_notes_error_failed_to_send">לא ניתן לשלוח את ההערה. %1$s</string>
     <string name="location_notes_error_no_relays">אין ממסרי geo זמינים בקרבת מקום. נסה שוב מאוחר יותר.</string>
     <string name="location_notes_loading_notes">טוען הערות…</string>
     <string name="location_notes_loading_recent">טוען הערות אחרונות…</string>
@@ -165,23 +165,23 @@
     <string name="location_notes_relays_paused">ממסרי geo אינם זמינים; הערות הושהו</string>
     <string name="location_notes_relays_retry_hint">הערות תלויות בממסרי geo. בדוק את החיבור ונסה שוב.</string>
     <string name="mesh_peers_tooltip_new_messages">הודעות חדשות</string>
-    <string name="recording">הקלטה %s</string>
+    <string name="recording">הקלטה %1$s</string>
     <string name="save_2">שמור</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">לא ניתן להתחיל צ\'אט עם %s: המשתמש חסום.</string>
-    <string name="system_chat_requires_favorite">לא ניתן להתחיל צ\'אט עם %s: נדרשים מועדפים הדדיים לאופליין.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">לא ניתן להתחיל צ'אט עם %1$s: המשתמש חסום.</string>
+    <string name="system_chat_requires_favorite">לא ניתן להתחיל צ'אט עם %1$s: נדרשים מועדפים הדדיים לאופליין.</string>
     <string name="system_common_user">משתמש</string>
     <string name="system_dm_blocked_generic">אי אפשר לשלוח: המשתמש חסום.</string>
-    <string name="system_dm_blocked_recipient">אי אפשר לשלוח ל-%s: המשתמש חסום.</string>
-    <string name="system_dm_unreachable">אי אפשר לשלוח ל-%s: הנמען אינו נגיש דרך mesh או nostr.</string>
-    <string name="system_geohash_blocked">%s נחסם בצ\'אטי geohash</string>
-    <string name="system_geohash_unblocked">%s הוסר מהחסימה בצ\'אטי geohash</string>
+    <string name="system_dm_blocked_recipient">אי אפשר לשלוח ל-%1$s: המשתמש חסום.</string>
+    <string name="system_dm_unreachable">אי אפשר לשלוח ל-%1$s: הנמען אינו נגיש דרך mesh או nostr.</string>
+    <string name="system_geohash_blocked">%1$s נחסם בצ'אטי geohash</string>
+    <string name="system_geohash_unblocked">%1$s הוסר מהחסימה בצ'אטי geohash</string>
     <string name="system_location_not_in_channel">אי אפשר לשלוח: אינך בערוץ מיקום</string>
     <string name="system_location_send_failed">השליחה לערוץ המיקום נכשלה</string>
     <string name="system_tor_dev_bypass">בנייה לפיתוח: עקיפת tor פעילה.</string>
     <string name="system_tor_restarted">tor הופעל מחדש. הניתוב שוחזר.</string>
     <string name="system_tor_restarting">tor מופעל מחדש להשבת החיבור...</string>
-    <string name="system_tor_started">tor פעיל. כל הצ\'אט עובר דרך tor לפרטיות.</string>
+    <string name="system_tor_started">tor פעיל. כל הצ'אט עובר דרך tor לפרטיות.</string>
     <string name="system_tor_starting">tor מופעל...</string>
     <string name="verification_my_qr_accessibility_label">קוד qr לאימות</string>
     <string name="verification_my_qr_title">סרוק כדי לאמת</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">סרוק qr של חבר</string>
     <string name="verification_scan_status_invalid">qr לא תקף או שפג תוקפו</string>
     <string name="verification_scan_status_no_peer">לא נמצא עמית תואם</string>
-    <string name="verification_scan_status_requested">התבקש אימות עבור %s</string>
+    <string name="verification_scan_status_requested">התבקש אימות עבור %1$s</string>
     <string name="verification_scan_validate">אשר</string>
     <string name="verification_sheet_title">אימות</string>
     <string name="voice_notes_are_only_available_in_mesh">הערות קוליות זמינות רק בצ׳אט של mesh.</string>

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s सक्रिय</string>
+    <string name="active">%1$s सक्रिय</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">बन्द</string>
     <string name="app_info_done">सम्पन्न</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">nostr मार्फत उपलब्ध</string>
     <string name="content_accessibility_back_to_main_chat">मुख्य च्याटमा फर्क</string>
     <string name="content_accessibility_connected_mesh">mesh मार्फत जडान</string>
-    <string name="content_accessibility_encryption_status">सङ्केतको अवस्था: %s</string>
+    <string name="content_accessibility_encryption_status">सङ्केतको अवस्था: %1$s</string>
     <string name="content_accessibility_location_channels">स्थान च्यानल</string>
     <string name="content_accessibility_location_notes">यस ठाउँका स्थान नोटहरू</string>
     <string name="content_accessibility_open_unread">नपढिएको निजी च्याट खोल</string>
-    <string name="content_accessibility_private_chat">%s सँग निजी च्याट</string>
+    <string name="content_accessibility_private_chat">%1$s सँग निजी च्याट</string>
     <string name="content_accessibility_reachable_mesh">mesh मार्फत पहुँचयोग्य</string>
     <string name="content_accessibility_remove_favorite">मनपर्नेबाट हटाउ</string>
     <string name="content_accessibility_send_hint_empty">पठाउन सन्देश लेख</string>
     <string name="content_accessibility_send_hint_ready">पठाउन दोहोरो ट्याप गर</string>
     <string name="content_accessibility_send_message">सन्देश पठाउ</string>
-    <string name="content_accessibility_toggle_bookmark">#%s का लागि बुकमार्क बदल</string>
+    <string name="content_accessibility_toggle_bookmark">#%1$s का लागि बुकमार्क बदल</string>
     <string name="content_accessibility_toggle_favorite">मनपर्ने स्थिति बदल्न दोहोरो ट्याप गर</string>
     <string name="content_accessibility_view_fingerprint">सङ्केत फिङ्गरप्रिन्ट हेर्न ट्याप गर</string>
     <string name="content_actions_block">ब्लक</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">मनपर्नेबाट हटाउ</string>
     <string name="content_commands_who">अनलाइन को-को छन् हेर्नु</string>
     <string name="content_delivery_delivered_members">%2$d सदस्यमध्ये %1$d जनालाई पुर्याइयो</string>
-    <string name="content_delivery_delivered_to">%s लाई पुर्याइयो</string>
-    <string name="content_delivery_failed">असफल: %s</string>
-    <string name="content_delivery_read_by">%s ले पढ्यो</string>
+    <string name="content_delivery_delivered_to">%1$s लाई पुर्याइयो</string>
+    <string name="content_delivery_failed">असफल: %1$s</string>
+    <string name="content_delivery_read_by">%1$s ले पढ्यो</string>
     <string name="content_delivery_reason_blocked">प्रयोगकर्ता ब्लक गरिएको</string>
     <string name="content_delivery_reason_self">आफूलाई पठाउन मिल्दैन</string>
     <string name="content_delivery_reason_send_error">पठाउने त्रुटि</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ प्रमाणित</string>
     <string name="fingerprint_handshake_pending">उपलब्ध छैन - handshake हुँदै</string>
     <string name="fingerprint_message_verified">तिमीले यस व्यक्तिको पहिचान प्रमाणित गरेको छौ.</string>
-    <string name="fingerprint_message_verify_hint">यी फिङ्गरप्रिन्टहरू %s सँग सुरक्षित च्यानलमा तुलना गर।</string>
+    <string name="fingerprint_message_verify_hint">यी फिङ्गरप्रिन्टहरू %1$s सँग सुरक्षित च्यानलमा तुलना गर।</string>
     <string name="fingerprint_their_label">उनको फिङ्गरप्रिन्ट:</string>
     <string name="fingerprint_title">सुरक्षा प्रमाणीकरण</string>
     <string name="fingerprint_your_label">तिम्रो फिङ्गरप्रिन्ट:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">अनब्लक</string>
     <string name="geohash_people_none_nearby">वरिपरि कोही छैन...</string>
     <string name="geohash_people_tooltip_blocked">geohash मा ब्लक</string>
-    <string name="geohash_people_you_suffix">" (तिमी)"</string>
+    <string name="geohash_people_you_suffix"> (तिमी)</string>
     <string name="images_are_only_available_in_mesh_chats">तस्बिरहरू केवल मेष च्याटमा मात्र उपलब्ध छन्।</string>
     <string name="location_channels_action_open_settings">सेटिङ खोल</string>
     <string name="location_channels_action_remove_access">स्थान पहुँच हटाउ</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">नजिकका च्यानल खोज्दै…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">स्थान अनुमति अस्वीकार। स्थान च्यानल प्रयोग गर्न सेटिङमा सक्षम गर।</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#स्थान च्यानल</string>
     <string name="location_channels_tor_subtitle">स्थान च्यानलका लागि तिम्रो ip लुकाउँछ। सिफारिस: अन।</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">अन्यले भेटून् भनी यस स्थानमा छोटो स्थायी नोट थप।</string>
     <string name="location_notes_empty_subtitle">यस ठाउँमा नोट थप्ने पहिलो व्यक्ती बन।</string>
     <string name="location_notes_empty_title">अहिले नोट छैन</string>
-    <string name="location_notes_error_failed_to_send">नोट पठाउन सकेन। %s</string>
+    <string name="location_notes_error_failed_to_send">नोट पठाउन सकेन। %1$s</string>
     <string name="location_notes_error_no_relays">यस स्थान नजिक georelay उपलब्ध छैन। केही बेरपछि प्रयास गर।</string>
     <string name="location_notes_loading_notes">नोट लोड हुँदै…</string>
     <string name="location_notes_loading_recent">हालैका नोट लोड गर्दै…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">georelay उपलब्ध छैन; नोट रोकिएको</string>
     <string name="location_notes_relays_retry_hint">नोट georelay मा निर्भर छन्। जडान जाँच गरेर फेरि प्रयास गर.</string>
     <string name="mesh_peers_tooltip_new_messages">नयाँ सन्देश</string>
-    <string name="recording">रेकर्डिङ %s</string>
+    <string name="recording">रेकर्डिङ %1$s</string>
     <string name="save_2">सेभ</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">%s सँग च्याट सुरु गर्न मिलेन: प्रयोगकर्ता ब्लक गरिएको</string>
-    <string name="system_chat_requires_favorite">%s सँग च्याट सुरु गर्न मिलेन: अफलाइनका लागि दुवै मनपर्ने हुनुपर्छ</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">%1$s सँग च्याट सुरु गर्न मिलेन: प्रयोगकर्ता ब्लक गरिएको</string>
+    <string name="system_chat_requires_favorite">%1$s सँग च्याट सुरु गर्न मिलेन: अफलाइनका लागि दुवै मनपर्ने हुनुपर्छ</string>
     <string name="system_common_user">प्रयोगकर्ता</string>
     <string name="system_dm_blocked_generic">पठाउन मिलेन: प्रयोगकर्ता ब्लक</string>
-    <string name="system_dm_blocked_recipient">%s लाई पठाउन मिलेन: प्रयोगकर्ता ब्लक</string>
-    <string name="system_dm_unreachable">%s लाई पठाउन मिलेन: प्राप्तकर्ता mesh वा nostr बाट उपलब्ध छैन</string>
-    <string name="system_geohash_blocked">%s लाई geohash च्याटमा ब्लक गरियो</string>
-    <string name="system_geohash_unblocked">%s लाई geohash च्याटमा अनब्लक गरियो</string>
+    <string name="system_dm_blocked_recipient">%1$s लाई पठाउन मिलेन: प्रयोगकर्ता ब्लक</string>
+    <string name="system_dm_unreachable">%1$s लाई पठाउन मिलेन: प्राप्तकर्ता mesh वा nostr बाट उपलब्ध छैन</string>
+    <string name="system_geohash_blocked">%1$s लाई geohash च्याटमा ब्लक गरियो</string>
+    <string name="system_geohash_unblocked">%1$s लाई geohash च्याटमा अनब्लक गरियो</string>
     <string name="system_location_not_in_channel">पठाउन मिलेन: तिमी स्थान च्यानलमा छैनौ</string>
     <string name="system_location_send_failed">स्थान च्यानलमा पठाउन सकेन</string>
     <string name="system_tor_dev_bypass">डेभ बिल्ड: tor बाइपास सक्षम।</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">साथीको qr स्क्यान गर</string>
     <string name="verification_scan_status_invalid">qr अवैध या म्याद सकिएको</string>
     <string name="verification_scan_status_no_peer">मिल्ने peer फेला परेन</string>
-    <string name="verification_scan_status_requested">%s को लागि प्रमाणीकरण अनुरोध भयो</string>
+    <string name="verification_scan_status_requested">%1$s को लागि प्रमाणीकरण अनुरोध भयो</string>
     <string name="verification_scan_validate">प्रमाणित गर</string>
     <string name="verification_sheet_title">प्रमाणित</string>
     <string name="voice_notes_are_only_available_in_mesh">भ्वाइस नोटहरू केवल मेष च्याटमा मात्र उपलब्ध छन्।</string>

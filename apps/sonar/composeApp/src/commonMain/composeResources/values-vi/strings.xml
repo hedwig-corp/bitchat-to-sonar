@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s đang hoạt động</string>
+    <string name="active">%1$s đang hoạt động</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">đóng</string>
     <string name="app_info_done">XONG</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">có sẵn qua Nostr</string>
     <string name="content_accessibility_back_to_main_chat">quay lại phòng chat chính</string>
     <string name="content_accessibility_connected_mesh">đang kết nối qua mesh</string>
-    <string name="content_accessibility_encryption_status">trạng thái mã hóa: %s</string>
+    <string name="content_accessibility_encryption_status">trạng thái mã hóa: %1$s</string>
     <string name="content_accessibility_location_channels">kênh theo vị trí</string>
     <string name="content_accessibility_location_notes">ghi chú vị trí cho nơi này</string>
     <string name="content_accessibility_open_unread">mở chat riêng chưa đọc</string>
-    <string name="content_accessibility_private_chat">chat riêng với %s</string>
+    <string name="content_accessibility_private_chat">chat riêng với %1$s</string>
     <string name="content_accessibility_reachable_mesh">liên hệ được qua mesh</string>
     <string name="content_accessibility_remove_favorite">xóa khỏi yêu thích</string>
     <string name="content_accessibility_send_hint_empty">nhập tin nhắn để gửi</string>
     <string name="content_accessibility_send_hint_ready">chạm hai lần để gửi</string>
     <string name="content_accessibility_send_message">gửi tin nhắn</string>
-    <string name="content_accessibility_toggle_bookmark">chuyển đánh dấu cho #%s</string>
+    <string name="content_accessibility_toggle_bookmark">chuyển đánh dấu cho #%1$s</string>
     <string name="content_accessibility_toggle_favorite">chạm hai lần để chuyển trạng thái yêu thích</string>
     <string name="content_accessibility_view_fingerprint">chạm để xem vân tay mã hóa</string>
     <string name="content_actions_block">chặn</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">xóa khỏi yêu thích</string>
     <string name="content_commands_who">xem ai đang online</string>
     <string name="content_delivery_delivered_members">đã gửi tới %1$d trong %2$d thành viên</string>
-    <string name="content_delivery_delivered_to">gửi tới %s</string>
-    <string name="content_delivery_failed">thất bại: %s</string>
-    <string name="content_delivery_read_by">đã đọc bởi %s</string>
+    <string name="content_delivery_delivered_to">gửi tới %1$s</string>
+    <string name="content_delivery_failed">thất bại: %1$s</string>
+    <string name="content_delivery_read_by">đã đọc bởi %1$s</string>
     <string name="content_delivery_reason_blocked">người dùng bị chặn</string>
     <string name="content_delivery_reason_self">không thể tự gửi cho chính mình</string>
     <string name="content_delivery_reason_send_error">lỗi gửi</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ ĐÃ XÁC THỰC</string>
     <string name="fingerprint_handshake_pending">chưa sẵn sàng - đang bắt tay</string>
     <string name="fingerprint_message_verified">bạn đã xác thực danh tính người này.</string>
-    <string name="fingerprint_message_verify_hint">so sánh các vân tay này với %s qua kênh an toàn.</string>
+    <string name="fingerprint_message_verify_hint">so sánh các vân tay này với %1$s qua kênh an toàn.</string>
     <string name="fingerprint_their_label">vân tay của họ:</string>
     <string name="fingerprint_title">xác minh bảo mật</string>
     <string name="fingerprint_your_label">vân tay của bạn:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">bỏ chặn</string>
     <string name="geohash_people_none_nearby">không có ai gần...</string>
     <string name="geohash_people_tooltip_blocked">đã chặn trong geohash</string>
-    <string name="geohash_people_you_suffix">" (bạn)"</string>
+    <string name="geohash_people_you_suffix"> (bạn)</string>
     <string name="images_are_only_available_in_mesh_chats">Hình ảnh chỉ khả dụng trong các cuộc trò chuyện mesh.</string>
     <string name="location_channels_action_open_settings">mở cài đặt</string>
     <string name="location_channels_action_remove_access">gỡ quyền truy cập vị trí</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">thêm ghi chú ngắn cố định cho nơi này để người khác tìm thấy</string>
     <string name="location_notes_empty_subtitle">hãy là người đầu tiên thêm ghi chú tại đây</string>
     <string name="location_notes_empty_title">chưa có ghi chú</string>
-    <string name="location_notes_error_failed_to_send">gửi ghi chú thất bại. %s</string>
+    <string name="location_notes_error_failed_to_send">gửi ghi chú thất bại. %1$s</string>
     <string name="location_notes_error_no_relays">không có relay địa lý gần khu vực này. thử lại sau.</string>
     <string name="location_notes_loading_notes">đang tải ghi chú…</string>
     <string name="location_notes_loading_recent">đang tải ghi chú gần đây…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">relay địa lý không sẵn có; ghi chú bị tạm dừng</string>
     <string name="location_notes_relays_retry_hint">ghi chú phụ thuộc vào relay địa lý. kiểm tra kết nối rồi thử lại.</string>
     <string name="mesh_peers_tooltip_new_messages">tin nhắn mới</string>
-    <string name="recording">đang ghi %s</string>
+    <string name="recording">đang ghi %1$s</string>
     <string name="save_2">lưu</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">không thể bắt đầu chat với %s: người này bị chặn.</string>
-    <string name="system_chat_requires_favorite">không thể bắt đầu chat với %s: cần yêu thích lẫn nhau để nhắn ngoại tuyến.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">không thể bắt đầu chat với %1$s: người này bị chặn.</string>
+    <string name="system_chat_requires_favorite">không thể bắt đầu chat với %1$s: cần yêu thích lẫn nhau để nhắn ngoại tuyến.</string>
     <string name="system_common_user">người dùng</string>
     <string name="system_dm_blocked_generic">không thể gửi tin: người này bị chặn.</string>
-    <string name="system_dm_blocked_recipient">không thể gửi tin cho %s: người này bị chặn.</string>
-    <string name="system_dm_unreachable">không thể gửi tin cho %s - nút không thể liên lạc qua mesh hoặc nostr.</string>
-    <string name="system_geohash_blocked">đã chặn %s trong chat geohash</string>
-    <string name="system_geohash_unblocked">đã bỏ chặn %s trong chat geohash</string>
+    <string name="system_dm_blocked_recipient">không thể gửi tin cho %1$s: người này bị chặn.</string>
+    <string name="system_dm_unreachable">không thể gửi tin cho %1$s - nút không thể liên lạc qua mesh hoặc nostr.</string>
+    <string name="system_geohash_blocked">đã chặn %1$s trong chat geohash</string>
+    <string name="system_geohash_unblocked">đã bỏ chặn %1$s trong chat geohash</string>
     <string name="system_location_not_in_channel">không gửi được: bạn không ở trong kênh vị trí</string>
     <string name="system_location_send_failed">gửi tới kênh vị trí thất bại</string>
     <string name="system_tor_dev_bypass">bản dành cho dev: đang bật bỏ qua Tor.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">quét QR của bạn</string>
     <string name="verification_scan_status_invalid">payload QR không hợp lệ hoặc đã hết hạn</string>
     <string name="verification_scan_status_no_peer">không tìm thấy nút phù hợp</string>
-    <string name="verification_scan_status_requested">đã yêu cầu xác minh cho %s</string>
+    <string name="verification_scan_status_requested">đã yêu cầu xác minh cho %1$s</string>
     <string name="verification_scan_validate">xác minh</string>
     <string name="verification_sheet_title">XÁC MINH</string>
     <string name="voice_notes_are_only_available_in_mesh">Ghi chú giọng nói chỉ khả dụng trong các cuộc trò chuyện mesh.</string>

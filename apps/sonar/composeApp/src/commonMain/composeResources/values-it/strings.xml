@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s attivi</string>
+    <string name="active">%1$s attivi</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">chiudi</string>
     <string name="app_info_done">FATTO</string>
@@ -21,7 +21,7 @@
     <string name="app_info_how_to_use_change_channels">• tocca #mesh per cambiare canale</string>
     <string name="app_info_how_to_use_clear_chat">• tocca tre volte la chat per svuotarla</string>
     <string name="app_info_how_to_use_commands">• digita / per vedere i comandi</string>
-    <string name="app_info_how_to_use_open_sidebar">• tocca l\'icona persone per aprire la barra laterale</string>
+    <string name="app_info_how_to_use_open_sidebar">• tocca l'icona persone per aprire la barra laterale</string>
     <string name="app_info_how_to_use_set_nickname">• imposta il tuo nickname toccandolo</string>
     <string name="app_info_how_to_use_start_dm">• tocca il nome di un peer per avviare un dm</string>
     <string name="app_info_how_to_use_title">COME SI USA</string>
@@ -48,26 +48,26 @@
     <string name="content_accessibility_available_nostr">disponibile via nostr</string>
     <string name="content_accessibility_back_to_main_chat">torna alla chat principale</string>
     <string name="content_accessibility_connected_mesh">connesso tramite mesh</string>
-    <string name="content_accessibility_encryption_status">stato crittografia: %s</string>
+    <string name="content_accessibility_encryption_status">stato crittografia: %1$s</string>
     <string name="content_accessibility_location_channels">canali posizione</string>
     <string name="content_accessibility_location_notes">note di posizione per questo posto</string>
     <string name="content_accessibility_open_unread">apri chat privata non letta</string>
-    <string name="content_accessibility_private_chat">chat privata con %s</string>
+    <string name="content_accessibility_private_chat">chat privata con %1$s</string>
     <string name="content_accessibility_reachable_mesh">raggiungibile via mesh</string>
     <string name="content_accessibility_remove_favorite">rimuovi dai preferiti</string>
     <string name="content_accessibility_send_hint_empty">inserisci un messaggio da inviare</string>
     <string name="content_accessibility_send_hint_ready">tocca due volte per inviare</string>
     <string name="content_accessibility_send_message">invia messaggio</string>
-    <string name="content_accessibility_toggle_bookmark">cambia segnalibro per #%s</string>
+    <string name="content_accessibility_toggle_bookmark">cambia segnalibro per #%1$s</string>
     <string name="content_accessibility_toggle_favorite">tocca due volte per cambiare stato preferito</string>
-    <string name="content_accessibility_view_fingerprint">tocca per vedere l\'impronta di cifratura</string>
+    <string name="content_accessibility_view_fingerprint">tocca per vedere l'impronta di cifratura</string>
     <string name="content_actions_block">blocca</string>
     <string name="content_actions_direct_message">messaggio diretto</string>
     <string name="content_actions_hug">abbraccia</string>
     <string name="content_actions_mention">menziona</string>
     <string name="content_actions_slap">schiaffo</string>
     <string name="content_actions_title">azioni</string>
-    <string name="content_alert_bluetooth_required">bitchat richiede l\'autorizzazione bluetooth per collegarsi ai dispositivi vicini. abilita l\'accesso nelle impostazioni.</string>
+    <string name="content_alert_bluetooth_required">bitchat richiede l'autorizzazione bluetooth per collegarsi ai dispositivi vicini. abilita l'accesso nelle impostazioni.</string>
     <string name="content_alert_bluetooth_required_2">impostazioni</string>
     <string name="content_alert_bluetooth_required_3">questo dispositivo non supporta bluetooth. bitchat richiede bluetooth per funzionare.</string>
     <string name="content_alert_bluetooth_required_off">bluetooth è disattivato. attiva bluetooth nelle impostazioni per usare bitchat.</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">rimuovi dai preferiti</string>
     <string name="content_commands_who">vedi chi è online</string>
     <string name="content_delivery_delivered_members">consegnato a %1$d di %2$d membri</string>
-    <string name="content_delivery_delivered_to">consegnato a %s</string>
-    <string name="content_delivery_failed">non riuscito: %s</string>
-    <string name="content_delivery_read_by">letto da %s</string>
+    <string name="content_delivery_delivered_to">consegnato a %1$s</string>
+    <string name="content_delivery_failed">non riuscito: %1$s</string>
+    <string name="content_delivery_read_by">letto da %1$s</string>
     <string name="content_delivery_reason_blocked">utente bloccato</string>
     <string name="content_delivery_reason_self">impossibile inviarti il messaggio</string>
     <string name="content_delivery_reason_send_error">errore di invio</string>
@@ -119,8 +119,8 @@
     <string name="fingerprint_badge_not_verified">⚠️ NON VERIFICATO</string>
     <string name="fingerprint_badge_verified">✓ VERIFICATO</string>
     <string name="fingerprint_handshake_pending">non disponibile - handshake in corso</string>
-    <string name="fingerprint_message_verified">hai verificato l\'identità di questa persona.</string>
-    <string name="fingerprint_message_verify_hint">confronta queste impronte con %s tramite un canale sicuro.</string>
+    <string name="fingerprint_message_verified">hai verificato l'identità di questa persona.</string>
+    <string name="fingerprint_message_verify_hint">confronta queste impronte con %1$s tramite un canale sicuro.</string>
     <string name="fingerprint_their_label">impronta loro:</string>
     <string name="fingerprint_title">verifica di sicurezza</string>
     <string name="fingerprint_your_label">tua impronta:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">sblocca</string>
     <string name="geohash_people_none_nearby">nessuno nei dintorni...</string>
     <string name="geohash_people_tooltip_blocked">bloccato su geohash</string>
-    <string name="geohash_people_you_suffix">" (tu)"</string>
+    <string name="geohash_people_you_suffix"> (tu)</string>
     <string name="images_are_only_available_in_mesh_chats">Le immagini sono disponibili solo nelle chat mesh.</string>
     <string name="location_channels_action_open_settings">apri impostazioni</string>
     <string name="location_channels_action_remove_access">revoca accesso alla posizione</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">ricerca canali vicini…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">autorizzazione posizione negata. abilitala nelle impostazioni per usare i canali.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#canali posizione</string>
     <string name="location_channels_tor_subtitle">nasconde il tuo ip per i canali posizione. consigliato: attivo.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">aggiungi brevi note permanenti su questo luogo per chi verrà.</string>
     <string name="location_notes_empty_subtitle">fai tu la prima nota qui.</string>
     <string name="location_notes_empty_title">ancora nessuna nota</string>
-    <string name="location_notes_error_failed_to_send">impossibile inviare la nota. %s</string>
+    <string name="location_notes_error_failed_to_send">impossibile inviare la nota. %1$s</string>
     <string name="location_notes_error_no_relays">nessun relay geo disponibile qui vicino. riprova presto.</string>
     <string name="location_notes_loading_notes">caricamento note…</string>
     <string name="location_notes_loading_recent">caricamento note recenti…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">relay geo non disponibili; note in pausa</string>
     <string name="location_notes_relays_retry_hint">le note dipendono dai relay geo. controlla la connessione e riprova.</string>
     <string name="mesh_peers_tooltip_new_messages">nuovi messaggi</string>
-    <string name="recording">registrazione %s</string>
+    <string name="recording">registrazione %1$s</string>
     <string name="save_2">salva</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">impossibile avviare una chat con %s: utente bloccato.</string>
-    <string name="system_chat_requires_favorite">impossibile avviare una chat con %s: servono preferiti reciproci per l\'offline.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">impossibile avviare una chat con %1$s: utente bloccato.</string>
+    <string name="system_chat_requires_favorite">impossibile avviare una chat con %1$s: servono preferiti reciproci per l'offline.</string>
     <string name="system_common_user">utente</string>
     <string name="system_dm_blocked_generic">invio non riuscito: utente bloccato.</string>
-    <string name="system_dm_blocked_recipient">impossibile inviare a %s: utente bloccato.</string>
-    <string name="system_dm_unreachable">impossibile inviare a %s: destinatario irraggiungibile via mesh o nostr.</string>
-    <string name="system_geohash_blocked">%s è stato bloccato nei chat geohash</string>
-    <string name="system_geohash_unblocked">%s è stato sbloccato nei chat geohash</string>
+    <string name="system_dm_blocked_recipient">impossibile inviare a %1$s: utente bloccato.</string>
+    <string name="system_dm_unreachable">impossibile inviare a %1$s: destinatario irraggiungibile via mesh o nostr.</string>
+    <string name="system_geohash_blocked">%1$s è stato bloccato nei chat geohash</string>
+    <string name="system_geohash_unblocked">%1$s è stato sbloccato nei chat geohash</string>
     <string name="system_location_not_in_channel">invio fallito: non sei in un canale posizione</string>
     <string name="system_location_send_failed">impossibile inviare al canale posizione</string>
     <string name="system_tor_dev_bypass">build di sviluppo: bypass tor attivo.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">scansiona il qr di un amico</string>
     <string name="verification_scan_status_invalid">qr non valido o scaduto</string>
     <string name="verification_scan_status_no_peer">nessun peer corrispondente trovato</string>
-    <string name="verification_scan_status_requested">verifica richiesta per %s</string>
+    <string name="verification_scan_status_requested">verifica richiesta per %1$s</string>
     <string name="verification_scan_validate">convalida</string>
     <string name="verification_sheet_title">VERIFICA</string>
     <string name="voice_notes_are_only_available_in_mesh">Le note vocali sono disponibili solo nelle chat mesh.</string>

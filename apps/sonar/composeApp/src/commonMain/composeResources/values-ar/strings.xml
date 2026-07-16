@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s نشطين</string>
+    <string name="active">%1$s نشطين</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">إغلاق</string>
     <string name="app_info_done">تم</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">متاح عبر nostr</string>
     <string name="content_accessibility_back_to_main_chat">عودة إلى الدردشة الرئيسية</string>
     <string name="content_accessibility_connected_mesh">متصل عبر mesh</string>
-    <string name="content_accessibility_encryption_status">حالة التشفير: %s</string>
+    <string name="content_accessibility_encryption_status">حالة التشفير: %1$s</string>
     <string name="content_accessibility_location_channels">قنوات الموقع</string>
     <string name="content_accessibility_location_notes">ملاحظات الموقع لهذا المكان</string>
     <string name="content_accessibility_open_unread">فتح دردشة خاصة غير مقروءة</string>
-    <string name="content_accessibility_private_chat">دردشة خاصة مع %s</string>
+    <string name="content_accessibility_private_chat">دردشة خاصة مع %1$s</string>
     <string name="content_accessibility_reachable_mesh">قابل للوصول عبر mesh</string>
     <string name="content_accessibility_remove_favorite">إزالة من المفضلة</string>
     <string name="content_accessibility_send_hint_empty">أدخل رسالة للإرسال</string>
     <string name="content_accessibility_send_hint_ready">اضغط مرتين للإرسال</string>
     <string name="content_accessibility_send_message">إرسال رسالة</string>
-    <string name="content_accessibility_toggle_bookmark">تبديل الإشارة لـ #%s</string>
+    <string name="content_accessibility_toggle_bookmark">تبديل الإشارة لـ #%1$s</string>
     <string name="content_accessibility_toggle_favorite">اضغط مرتين لتبديل حالة المفضلة</string>
     <string name="content_accessibility_view_fingerprint">اضغط لمشاهدة بصمة التشفير</string>
     <string name="content_actions_block">حظر</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">إزالة من المفضلة</string>
     <string name="content_commands_who">عرض من هو متصل</string>
     <string name="content_delivery_delivered_members">تم التسليم إلى %1$d من %2$d عضو</string>
-    <string name="content_delivery_delivered_to">سُلّم إلى %s</string>
-    <string name="content_delivery_failed">فشل: %s</string>
-    <string name="content_delivery_read_by">قُرِئ بواسطة %s</string>
+    <string name="content_delivery_delivered_to">سُلّم إلى %1$s</string>
+    <string name="content_delivery_failed">فشل: %1$s</string>
+    <string name="content_delivery_read_by">قُرِئ بواسطة %1$s</string>
     <string name="content_delivery_reason_blocked">المستخدم محظور</string>
     <string name="content_delivery_reason_self">لا يمكن الإرسال لنفسك</string>
     <string name="content_delivery_reason_send_error">خطأ في الإرسال</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ مُتحقق</string>
     <string name="fingerprint_handshake_pending">غير متاح - جار تنفيذ handshake</string>
     <string name="fingerprint_message_verified">لقد تحققت من هوية هذا الشخص.</string>
-    <string name="fingerprint_message_verify_hint">قارن هذه البصمات مع %s عبر قناة آمنة.</string>
+    <string name="fingerprint_message_verify_hint">قارن هذه البصمات مع %1$s عبر قناة آمنة.</string>
     <string name="fingerprint_their_label">بصمتهم:</string>
     <string name="fingerprint_title">تحقق الأمان</string>
     <string name="fingerprint_your_label">بصمتك:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">إلغاء الحظر</string>
     <string name="geohash_people_none_nearby">لا أحد قريب...</string>
     <string name="geohash_people_tooltip_blocked">محظور في geohash</string>
-    <string name="geohash_people_you_suffix">" (أنت)"</string>
+    <string name="geohash_people_you_suffix"> (أنت)</string>
     <string name="images_are_only_available_in_mesh_chats">الصور متاحة فقط في محادثات الميش.</string>
     <string name="location_channels_action_open_settings">فتح الإعدادات</string>
     <string name="location_channels_action_remove_access">إزالة صلاحية الموقع</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">جار البحث عن قنوات قريبة…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">تم رفض إذن الموقع. فعّله في الإعدادات لاستخدام قنوات الموقع.</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#قنوات الموقع</string>
     <string name="location_channels_tor_subtitle">يخفي ip لقنوات الموقع. الموصى به: تشغيل.</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">أضف ملاحظات قصيرة دائمة لهذا المكان ليجدها الآخرون.</string>
     <string name="location_notes_empty_subtitle">كن أول من يضيف هنا.</string>
     <string name="location_notes_empty_title">لا توجد ملاحظات بعد</string>
-    <string name="location_notes_error_failed_to_send">تعذر إرسال الملاحظة. %s</string>
+    <string name="location_notes_error_failed_to_send">تعذر إرسال الملاحظة. %1$s</string>
     <string name="location_notes_error_no_relays">لا توجد مرحلات جغرافية قريبة من هذا المكان. حاول لاحقاً.</string>
     <string name="location_notes_loading_notes">جار تحميل الملاحظات…</string>
     <string name="location_notes_loading_recent">جار تحميل الملاحظات الحديثة…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">المرحلات الجغرافية غير متاحة؛ الملاحظات متوقفة</string>
     <string name="location_notes_relays_retry_hint">الملاحظات تعتمد على المرحلات الجغرافية. تحقق من الاتصال ثم أعد المحاولة.</string>
     <string name="mesh_peers_tooltip_new_messages">رسائل جديدة</string>
-    <string name="recording">جارٍ التسجيل %s</string>
+    <string name="recording">جارٍ التسجيل %1$s</string>
     <string name="save_2">حفظ</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">لا يمكن بدء دردشة مع %s: المستخدم محظور.</string>
-    <string name="system_chat_requires_favorite">لا يمكن بدء دردشة مع %s: يجب أن تكونا مفضلين متبادلين للتشغيل بدون اتصال.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">لا يمكن بدء دردشة مع %1$s: المستخدم محظور.</string>
+    <string name="system_chat_requires_favorite">لا يمكن بدء دردشة مع %1$s: يجب أن تكونا مفضلين متبادلين للتشغيل بدون اتصال.</string>
     <string name="system_common_user">مستخدم</string>
     <string name="system_dm_blocked_generic">تعذر الإرسال: المستخدم محظور.</string>
-    <string name="system_dm_blocked_recipient">لا يمكن الإرسال إلى %s: المستخدم محظور.</string>
-    <string name="system_dm_unreachable">لا يمكن الإرسال إلى %s: المستلم غير متاح عبر mesh أو nostr.</string>
-    <string name="system_geohash_blocked">تم حظر %s في محادثات geohash</string>
-    <string name="system_geohash_unblocked">تم إلغاء حظر %s في محادثات geohash</string>
+    <string name="system_dm_blocked_recipient">لا يمكن الإرسال إلى %1$s: المستخدم محظور.</string>
+    <string name="system_dm_unreachable">لا يمكن الإرسال إلى %1$s: المستلم غير متاح عبر mesh أو nostr.</string>
+    <string name="system_geohash_blocked">تم حظر %1$s في محادثات geohash</string>
+    <string name="system_geohash_unblocked">تم إلغاء حظر %1$s في محادثات geohash</string>
     <string name="system_location_not_in_channel">تعذر الإرسال: لست داخل قناة موقع</string>
     <string name="system_location_send_failed">تعذر الإرسال إلى قناة الموقع</string>
     <string name="system_tor_dev_bypass">بناء تطوير: تجاوز tor مفعل.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">امسح qr لصديق</string>
     <string name="verification_scan_status_invalid">qr غير صالح أو منتهٍ</string>
     <string name="verification_scan_status_no_peer">لم يتم العثور على قرين مطابق</string>
-    <string name="verification_scan_status_requested">تم طلب التحقق لـ %s</string>
+    <string name="verification_scan_status_requested">تم طلب التحقق لـ %1$s</string>
     <string name="verification_scan_validate">تحقق</string>
     <string name="verification_sheet_title">تحقق</string>
     <string name="voice_notes_are_only_available_in_mesh">الملاحظات الصوتية متاحة فقط في محادثات الميش.</string>

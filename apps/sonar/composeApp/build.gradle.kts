@@ -38,27 +38,40 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
 
 val repoRootDir = rootProject.projectDir.parentFile.parentFile
 val notificationResourcesDir = repoRootDir.resolve("assets/notifications")
+val configuredPython =
+    providers.gradleProperty("pythonExecutable").orNull
+        ?: providers.environmentVariable("PYTHON").orNull
+val pythonCommand = when {
+    !configuredPython.isNullOrBlank() -> listOf(configuredPython)
+    System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true) ->
+        listOf("py", "-3")
+    else -> listOf("python3")
+}
 
 // Verifies the committed Compose string resources are in sync with the iOS
 // localization catalog (ios/bitchat/Localizable.xcstrings), the single source
 // of truth. Run scripts/i18n/xcstrings_to_compose.py to regenerate after
-// editing the catalog. Best-effort: skips silently if python3 is unavailable so
-// it never blocks contributors without a Python toolchain.
+// editing the catalog. Python 3 is required; override executable discovery with
+// `-PpythonExecutable=/path/to/python` or the `PYTHON` environment variable.
 val checkI18nStringsInSync = tasks.register<Exec>("checkI18nStringsInSync") {
     description = "Checks generated Compose string resources match the iOS xcstrings catalog."
     group = "verification"
 
     val generator = repoRootDir.resolve("scripts/i18n/xcstrings_to_compose.py")
+    val idMap = repoRootDir.resolve("scripts/i18n/string_id_map.json")
     val stamp = layout.buildDirectory.file("i18n/strings-in-sync.stamp")
     inputs.file(repoRootDir.resolve("ios/bitchat/Localizable.xcstrings"))
     inputs.file(generator)
+    inputs.file(idMap)
     inputs.dir(layout.projectDirectory.dir("src/commonMain/composeResources"))
     // Output stamp lets Gradle mark the task UP-TO-DATE when nothing changed.
     outputs.file(stamp)
 
     workingDir(repoRootDir)
     isIgnoreExitValue = true
-    commandLine("python3", generator.absolutePath, "--check")
+    executable(pythonCommand.first())
+    args(pythonCommand.drop(1))
+    args(generator.absolutePath, "--check")
 
     doLast {
         val result = executionResult.get()

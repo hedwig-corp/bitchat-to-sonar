@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s 人がアクティブ</string>
+    <string name="active">%1$s 人がアクティブ</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">閉じる</string>
     <string name="app_info_done">完了</string>
@@ -13,7 +13,7 @@
     <string name="app_info_features_favorites_title">お気に入り</string>
     <string name="app_info_features_geohash_description">geohashチャンネルで近くの人と匿名分散リレー越しにチャット</string>
     <string name="app_info_features_geohash_title">ローカルチャンネル</string>
-    <string name="app_info_features_mentions_description">\@nicknameで特定の人に通知</string>
+    <string name="app_info_features_mentions_description">@nicknameで特定の人に通知</string>
     <string name="app_info_features_mentions_title">メンション</string>
     <string name="app_info_features_offline_description">bluetooth low energyでインターネットなしでも動作</string>
     <string name="app_info_features_offline_title">オフライン通信</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">nostrで利用可能</string>
     <string name="content_accessibility_back_to_main_chat">メインチャットに戻る</string>
     <string name="content_accessibility_connected_mesh">mesh経由で接続</string>
-    <string name="content_accessibility_encryption_status">暗号状態: %s</string>
+    <string name="content_accessibility_encryption_status">暗号状態: %1$s</string>
     <string name="content_accessibility_location_channels">ロケーションチャンネル</string>
     <string name="content_accessibility_location_notes">この場所のロケーションノート</string>
     <string name="content_accessibility_open_unread">未読のプライベートチャットを開く</string>
-    <string name="content_accessibility_private_chat">%sとのプライベートチャット</string>
+    <string name="content_accessibility_private_chat">%1$sとのプライベートチャット</string>
     <string name="content_accessibility_reachable_mesh">meshで到達可能</string>
     <string name="content_accessibility_remove_favorite">お気に入りから削除</string>
     <string name="content_accessibility_send_hint_empty">送信するメッセージを入力</string>
     <string name="content_accessibility_send_hint_ready">ダブルタップで送信</string>
     <string name="content_accessibility_send_message">メッセージ送信</string>
-    <string name="content_accessibility_toggle_bookmark">#%sのブックマークを切り替え</string>
+    <string name="content_accessibility_toggle_bookmark">#%1$sのブックマークを切り替え</string>
     <string name="content_accessibility_toggle_favorite">ダブルタップでお気に入り状態を切り替え</string>
     <string name="content_accessibility_view_fingerprint">暗号フィンガープリントを見る</string>
     <string name="content_actions_block">ブロック</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">お気に入りから外す</string>
     <string name="content_commands_who">オンラインの人を見る</string>
     <string name="content_delivery_delivered_members">%2$d人中%1$d人に配信</string>
-    <string name="content_delivery_delivered_to">%sに配信</string>
-    <string name="content_delivery_failed">失敗: %s</string>
-    <string name="content_delivery_read_by">%sが既読</string>
+    <string name="content_delivery_delivered_to">%1$sに配信</string>
+    <string name="content_delivery_failed">失敗: %1$s</string>
+    <string name="content_delivery_read_by">%1$sが既読</string>
     <string name="content_delivery_reason_blocked">ユーザーをブロック中</string>
     <string name="content_delivery_reason_self">自分には送れません</string>
     <string name="content_delivery_reason_send_error">送信エラー</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ 検証済み</string>
     <string name="fingerprint_handshake_pending">利用不可 - handshake進行中</string>
     <string name="fingerprint_message_verified">この人の身元を確認しました。</string>
-    <string name="fingerprint_message_verify_hint">これらのフィンガープリントを%sと安全なチャネルで比較</string>
+    <string name="fingerprint_message_verify_hint">これらのフィンガープリントを%1$sと安全なチャネルで比較</string>
     <string name="fingerprint_their_label">相手のフィンガープリント:</string>
     <string name="fingerprint_title">セキュリティ検証</string>
     <string name="fingerprint_your_label">あなたのフィンガープリント:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">ブロック解除</string>
     <string name="geohash_people_none_nearby">近くに誰もいません...</string>
     <string name="geohash_people_tooltip_blocked">geohashでブロック中</string>
-    <string name="geohash_people_you_suffix">" (あなた)"</string>
+    <string name="geohash_people_you_suffix"> (あなた)</string>
     <string name="images_are_only_available_in_mesh_chats">画像はメッシュチャットでのみ利用できます。</string>
     <string name="location_channels_action_open_settings">設定を開く</string>
     <string name="location_channels_action_remove_access">位置アクセスを解除</string>
@@ -140,7 +140,7 @@
     <string name="location_channels_loading_nearby">近くのチャンネルを検索中…</string>
     <string name="location_channels_mesh_label">mesh</string>
     <string name="location_channels_permission_denied">位置情報の許可が拒否されました。チャンネルを使うには設定で許可してください。</string>
-    <string name="location_channels_subtitle_prefix">#%s • %s</string>
+    <string name="location_channels_subtitle_prefix">#%1$s • %2$s</string>
     <string name="location_channels_subtitle_with_name">%1$s • %2$s</string>
     <string name="location_channels_title">#ロケーションチャンネル</string>
     <string name="location_channels_tor_subtitle">ロケーションチャンネル用にipを隠します。推奨: オン</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">他の人が見つけられるようこの場所に短いノートを追加</string>
     <string name="location_notes_empty_subtitle">ここで最初のノートを残そう。</string>
     <string name="location_notes_empty_title">ノートはまだありません</string>
-    <string name="location_notes_error_failed_to_send">ノートを送信できませんでした。%s</string>
+    <string name="location_notes_error_failed_to_send">ノートを送信できませんでした。%1$s</string>
     <string name="location_notes_error_no_relays">近くに利用できるジオリレーがありません。後で再試行してください。</string>
     <string name="location_notes_loading_notes">ノートを読み込み中…</string>
     <string name="location_notes_loading_recent">最新ノートを読み込み中…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">ジオリレーが利用不可: ノート一時停止</string>
     <string name="location_notes_relays_retry_hint">ノートはジオリレーに依存します。接続を確認して再試行してください。</string>
     <string name="mesh_peers_tooltip_new_messages">新しいメッセージ</string>
-    <string name="recording">録音中 %s</string>
+    <string name="recording">録音中 %1$s</string>
     <string name="save_2">保存</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">%sとはチャットできません: ユーザーをブロック中。</string>
-    <string name="system_chat_requires_favorite">%sとはチャットできません: オフラインには相互のお気に入りが必要です。</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">%1$sとはチャットできません: ユーザーをブロック中。</string>
+    <string name="system_chat_requires_favorite">%1$sとはチャットできません: オフラインには相互のお気に入りが必要です。</string>
     <string name="system_common_user">ユーザー</string>
     <string name="system_dm_blocked_generic">送信できません: ユーザーをブロック中。</string>
-    <string name="system_dm_blocked_recipient">%sに送れません: ユーザーをブロック中。</string>
-    <string name="system_dm_unreachable">%sに送れません: 受信者はmeshやnostrで到達できません。</string>
-    <string name="system_geohash_blocked">%sをgeohashチャットでブロックしました</string>
-    <string name="system_geohash_unblocked">%sのgeohashチャットでのブロックを解除しました</string>
+    <string name="system_dm_blocked_recipient">%1$sに送れません: ユーザーをブロック中。</string>
+    <string name="system_dm_unreachable">%1$sに送れません: 受信者はmeshやnostrで到達できません。</string>
+    <string name="system_geohash_blocked">%1$sをgeohashチャットでブロックしました</string>
+    <string name="system_geohash_unblocked">%1$sのgeohashチャットでのブロックを解除しました</string>
     <string name="system_location_not_in_channel">送信失敗: ロケーションチャンネルに参加していません</string>
     <string name="system_location_send_failed">ロケーションチャンネルに送信できませんでした</string>
     <string name="system_tor_dev_bypass">開発ビルド: torバイパスが有効です。</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">友達のqrをスキャン</string>
     <string name="verification_scan_status_invalid">qrが無効または期限切れ</string>
     <string name="verification_scan_status_no_peer">該当するピアが見つかりません</string>
-    <string name="verification_scan_status_requested">%sの検証をリクエストしました</string>
+    <string name="verification_scan_status_requested">%1$sの検証をリクエストしました</string>
     <string name="verification_scan_validate">確認</string>
     <string name="verification_sheet_title">確認</string>
     <string name="voice_notes_are_only_available_in_mesh">ボイスメモはメッシュチャットでのみ利用できます。</string>

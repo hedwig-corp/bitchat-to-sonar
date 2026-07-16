@@ -33,40 +33,45 @@ OUT_ROOT = (
 )
 ID_MAP_PATH = Path(__file__).resolve().parent / "string_id_map.json"
 
-# xcstrings lang code -> Android/Compose values-dir qualifier (None = default `values`)
-LOCALE_QUALIFIER: dict[str, str | None] = {
-    "en": None,
-    "ar": "ar",
-    "bn": "bn",
-    "de": "de",
-    "es": "es",
-    "fil": "fil",
-    "fr": "fr",
-    "he": "he",
-    "hi": "hi",
-    "id": "id",
-    "it": "it",
-    "ja": "ja",
-    "ko": "ko",
-    "ms": "ms",
-    "ne": "ne",
-    "nl": "nl",
-    "pl": "pl",
-    "pt": "pt",
-    "ru": "ru",
-    "sv": "sv",
-    "ta": "ta",
-    "th": "th",
-    "tr": "tr",
-    "uk": "uk",
-    "ur": "ur",
-    "vi": "vi",
-    "pt-BR": "pt-rBR",
+# xcstrings lang code -> one or more Compose values-dir qualifiers
+# (None = default `values`). Most catalog locales map one-to-one. Chinese needs
+# aliases because Compose Multiplatform 1.7.3 understands language + region but
+# not BCP-47 script qualifiers.
+LOCALE_QUALIFIERS: dict[str, tuple[str | None, ...]] = {
+    "en": (None,),
+    "ar": ("ar",),
+    "bn": ("bn",),
+    "de": ("de",),
+    "es": ("es",),
+    "fil": ("fil",),
+    "fr": ("fr",),
+    "he": ("he",),
+    "hi": ("hi",),
+    "id": ("id",),
+    "it": ("it",),
+    "ja": ("ja",),
+    "ko": ("ko",),
+    "ms": ("ms",),
+    "ne": ("ne",),
+    "nl": ("nl",),
+    "pl": ("pl",),
+    "pt": ("pt",),
+    "ru": ("ru",),
+    "sv": ("sv",),
+    "ta": ("ta",),
+    "th": ("th",),
+    "tr": ("tr",),
+    "uk": ("uk",),
+    "ur": ("ur",),
+    "vi": ("vi",),
+    "pt-BR": ("pt-rBR",),
     # Compose Multiplatform 1.7.3 does NOT support the BCP-47 "b+lang+Script"
-    # qualifier form (it rejects it with "unknown qualifier"). Use the Android
-    # language+region form instead: Simplified Chinese -> CN, Traditional -> TW.
-    "zh-Hans": "zh-rCN",
-    "zh-Hant": "zh-rTW",
+    # qualifier form (it rejects it with "unknown qualifier"). A language-only
+    # Simplified fallback covers generic Chinese and SG; explicit region copies
+    # keep CN/SG Simplified and TW/HK/MO Traditional. Regionless `zh-Hant`
+    # remains indistinguishable from `zh-Hans` until Compose exposes scripts.
+    "zh-Hans": ("zh", "zh-rCN", "zh-rSG"),
+    "zh-Hant": ("zh-rTW", "zh-rHK", "zh-rMO"),
 }
 
 AUTO_HEADER = (
@@ -84,7 +89,7 @@ _KOTLIN_HARD_KEYWORDS = frozenset({
     "super", "this", "throw", "true", "try", "typealias", "typeof", "val",
     "var", "when", "while",
 })
-_FORMAT_POSITIONAL = re.compile(r"%(\d+)\$@")
+_APPLE_OBJECT_FORMAT = re.compile(r"(?<!%)%(?:(\d+)\$)?@")
 _VALID_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Apple stringsdict plural/variable reference, e.g. %#@people@ or %2$#@count@.
@@ -175,31 +180,42 @@ def assign_ids(keys: list[str], existing: dict[str, str]) -> dict[str, str]:
 
 
 def convert_format_specifiers(value: str) -> str:
-    """Map Apple %@ / %n$@ to Android %s / %n$s before XML escaping."""
-    value = _FORMAT_POSITIONAL.sub(r"%\1$s", value)
-    value = value.replace("%@", "%s")
-    return value
+    """Map Apple object placeholders to numbered Compose string templates."""
+    matches = list(_APPLE_OBJECT_FORMAT.finditer(value))
+    explicit_positions = {
+        int(match.group(1)) for match in matches if match.group(1) is not None
+    }
+    next_position = 1
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal next_position
+        explicit = match.group(1)
+        if explicit is not None:
+            return f"%{explicit}$s"
+        while next_position in explicit_positions:
+            next_position += 1
+        position = next_position
+        next_position += 1
+        return f"%{position}$s"
+
+    return _APPLE_OBJECT_FORMAT.sub(replace, value)
 
 
-def escape_android_value(value: str) -> str:
-    """Escape a string for Android strings.xml text content."""
+def escape_compose_value(value: str) -> str:
+    """Escape XML plus the backslash sequences Compose resources interpret."""
     value = convert_format_specifiers(value)
+    # Compose's XML converter interprets \n, \t, \uXXXX, and doubled
+    # backslashes. Protect source backslashes before encoding real newlines/tabs.
     value = (
-        value.replace("&", "&amp;")
+        value.replace("\\", "\\\\")
+        .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
-        .replace("'", r"\'")
-        .replace('"', r"\"")
         .replace("\r\n", r"\n")
         .replace("\n", r"\n")
         .replace("\r", r"\n")
+        .replace("\t", r"\t")
     )
-    # A leading @ or ? makes Android read the value as a resource / theme-attr
-    # reference; escape it so the literal character survives.
-    if value[:1] in ("@", "?"):
-        value = "\\" + value
-    if value[:1].isspace() or value[-1:].isspace():
-        value = f'"{value}"'
     return value
 
 
@@ -238,7 +254,7 @@ def emit_strings_xml(items: list[tuple[str, str]]) -> str:
         "<resources>",
     ]
     for rid, value in items:
-        lines.append(f'    <string name="{rid}">{escape_android_value(value)}</string>')
+        lines.append(f'    <string name="{rid}">{escape_compose_value(value)}</string>')
     lines.append("</resources>")
     lines.append("")
     return "\n".join(lines)
@@ -260,13 +276,13 @@ def collect_by_locale(
         for lang, loc in locs.items():
             if lang == "en":
                 continue
-            if lang not in LOCALE_QUALIFIER:
+            if lang not in LOCALE_QUALIFIERS:
                 raise SystemExit(f"unknown language code in xcstrings: {lang!r}")
             unit = (loc or {}).get("stringUnit") or {}
             if "value" not in unit:
                 continue
-            qual = LOCALE_QUALIFIER[lang]
-            by_qual.setdefault(qual, []).append((rid, unit["value"]))
+            for qual in LOCALE_QUALIFIERS[lang]:
+                by_qual.setdefault(qual, []).append((rid, unit["value"]))
 
     for qual in by_qual:
         by_qual[qual].sort(key=lambda pair: pair[0])

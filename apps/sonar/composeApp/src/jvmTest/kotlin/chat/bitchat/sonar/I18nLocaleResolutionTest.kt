@@ -1,7 +1,11 @@
 package chat.bitchat.sonar
 
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.active
 import chat.bitchat.sonar.resources.app_info_close
+import chat.bitchat.sonar.resources.app_info_how_to_use_start_dm
+import chat.bitchat.sonar.resources.geohash_people_you_suffix
+import chat.bitchat.sonar.resources.paste_the
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.compose.resources.getString
 import java.util.Locale
@@ -44,8 +48,24 @@ class I18nLocaleResolutionTest {
         assertEquals("关闭", closeLabelIn("zh-Hans-CN"))
 
     @Test
+    fun resolvesSimplifiedChineseInSingapore() =
+        assertEquals("关闭", closeLabelIn("zh-Hans-SG"))
+
+    @Test
+    fun resolvesLanguageOnlyChineseFallback() =
+        assertEquals("关闭", closeLabelIn("zh"))
+
+    @Test
     fun resolvesTraditionalChineseFromScriptLocale() =
         assertEquals("關閉", closeLabelIn("zh-Hant-TW"))
+
+    @Test
+    fun resolvesTraditionalChineseInHongKong() =
+        assertEquals("關閉", closeLabelIn("zh-Hant-HK"))
+
+    @Test
+    fun resolvesTraditionalChineseInMacau() =
+        assertEquals("關閉", closeLabelIn("zh-Hant-MO"))
 
     /** Legacy-code check: modern `he` dir vs the JDK's historical `iw` mapping. */
     @Test
@@ -54,4 +74,20 @@ class I18nLocaleResolutionTest {
     /** Legacy-code check: modern `id` dir vs the JDK's historical `in` mapping. */
     @Test
     fun resolvesIndonesian() = assertEquals("tutup", closeLabelIn("id-ID"))
+
+    @Test
+    fun preservesComposeEscapingAndBoundaryWhitespace() {
+        Locale.setDefault(Locale.forLanguageTag("en-US"))
+        runBlocking {
+            assertEquals("• tap a peer's name to start a DM", getString(Res.string.app_info_how_to_use_start_dm))
+            assertEquals(" (you)", getString(Res.string.geohash_people_you_suffix))
+            assertEquals("Paste the ", getString(Res.string.paste_the))
+        }
+    }
+
+    @Test
+    fun formatsNumberedAppleObjectPlaceholder() {
+        Locale.setDefault(Locale.forLanguageTag("en-US"))
+        assertEquals("3 active", runBlocking { getString(Res.string.active, 3) })
+    }
 }

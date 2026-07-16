@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s actief</string>
+    <string name="active">%1$s actief</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">sluiten</string>
     <string name="app_info_done">KLAAR</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">beschikbaar via Nostr</string>
     <string name="content_accessibility_back_to_main_chat">terug naar hoofdchat</string>
     <string name="content_accessibility_connected_mesh">verbonden via mesh</string>
-    <string name="content_accessibility_encryption_status">versleutelingsstatus: %s</string>
+    <string name="content_accessibility_encryption_status">versleutelingsstatus: %1$s</string>
     <string name="content_accessibility_location_channels">locatiekanalen</string>
     <string name="content_accessibility_location_notes">locatienotities voor deze plek</string>
     <string name="content_accessibility_open_unread">ongelezen privéchat openen</string>
-    <string name="content_accessibility_private_chat">privéchat met %s</string>
+    <string name="content_accessibility_private_chat">privéchat met %1$s</string>
     <string name="content_accessibility_reachable_mesh">bereikbaar via mesh</string>
     <string name="content_accessibility_remove_favorite">uit favorieten verwijderen</string>
     <string name="content_accessibility_send_hint_empty">voer een bericht in om te sturen</string>
     <string name="content_accessibility_send_hint_ready">dubbelklikken om te versturen</string>
     <string name="content_accessibility_send_message">bericht sturen</string>
-    <string name="content_accessibility_toggle_bookmark">bladwijzer voor #%s schakelen</string>
+    <string name="content_accessibility_toggle_bookmark">bladwijzer voor #%1$s schakelen</string>
     <string name="content_accessibility_toggle_favorite">dubbelklikken om favoriet te schakelen</string>
     <string name="content_accessibility_view_fingerprint">tik om de versleutelingsfingerprint te bekijken</string>
     <string name="content_actions_block">blokkeren</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">uit favorieten verwijderen</string>
     <string name="content_commands_who">bekijk wie online is</string>
     <string name="content_delivery_delivered_members">bezorgd bij %1$d van %2$d leden</string>
-    <string name="content_delivery_delivered_to">bezorgd bij %s</string>
-    <string name="content_delivery_failed">mislukt: %s</string>
-    <string name="content_delivery_read_by">gelezen door %s</string>
+    <string name="content_delivery_delivered_to">bezorgd bij %1$s</string>
+    <string name="content_delivery_failed">mislukt: %1$s</string>
+    <string name="content_delivery_read_by">gelezen door %1$s</string>
     <string name="content_delivery_reason_blocked">gebruiker is geblokkeerd</string>
     <string name="content_delivery_reason_self">je kunt jezelf geen bericht sturen</string>
     <string name="content_delivery_reason_send_error">verzendfout</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ GEVERIFICEERD</string>
     <string name="fingerprint_handshake_pending">niet beschikbaar - handshake bezig</string>
     <string name="fingerprint_message_verified">je hebt de identiteit van deze persoon geverifieerd.</string>
-    <string name="fingerprint_message_verify_hint">vergelijk deze fingerprints met %s via een veilig kanaal.</string>
+    <string name="fingerprint_message_verify_hint">vergelijk deze fingerprints met %1$s via een veilig kanaal.</string>
     <string name="fingerprint_their_label">hun fingerprint:</string>
     <string name="fingerprint_title">beveiligingsverificatie</string>
     <string name="fingerprint_your_label">jouw fingerprint:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">deblokkeren</string>
     <string name="geohash_people_none_nearby">niemand in de buurt...</string>
     <string name="geohash_people_tooltip_blocked">geblokkeerd in geohash</string>
-    <string name="geohash_people_you_suffix">" (jij)"</string>
+    <string name="geohash_people_you_suffix"> (jij)</string>
     <string name="images_are_only_available_in_mesh_chats">Afbeeldingen zijn alleen beschikbaar in mesh-chats.</string>
     <string name="location_channels_action_open_settings">open instellingen</string>
     <string name="location_channels_action_remove_access">toegang tot locatie verwijderen</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">voeg korte, blijvende notities toe aan deze locatie zodat anderen ze kunnen vinden</string>
     <string name="location_notes_empty_subtitle">wees de eerste die er hier een toevoegt</string>
     <string name="location_notes_empty_title">nog geen notities</string>
-    <string name="location_notes_error_failed_to_send">versturen van notitie mislukt. %s</string>
+    <string name="location_notes_error_failed_to_send">versturen van notitie mislukt. %1$s</string>
     <string name="location_notes_error_no_relays">geen geo-relays in de buurt van deze locatie. probeer het later opnieuw.</string>
     <string name="location_notes_loading_notes">notities laden…</string>
     <string name="location_notes_loading_recent">recentste notities laden…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">geo-relays niet beschikbaar; notities gepauzeerd</string>
     <string name="location_notes_relays_retry_hint">notities zijn afhankelijk van geo-relays. controleer de verbinding en probeer opnieuw.</string>
     <string name="mesh_peers_tooltip_new_messages">nieuwe berichten</string>
-    <string name="recording">opname %s</string>
+    <string name="recording">opname %1$s</string>
     <string name="save_2">opslaan</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">kan chat met %s niet starten: persoon is geblokkeerd.</string>
-    <string name="system_chat_requires_favorite">kan chat met %s niet starten: wederzijds favoriet vereist voor offline berichten.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">kan chat met %1$s niet starten: persoon is geblokkeerd.</string>
+    <string name="system_chat_requires_favorite">kan chat met %1$s niet starten: wederzijds favoriet vereist voor offline berichten.</string>
     <string name="system_common_user">gebruiker</string>
     <string name="system_dm_blocked_generic">kan bericht niet sturen: persoon is geblokkeerd.</string>
-    <string name="system_dm_blocked_recipient">kan geen bericht sturen naar %s: persoon is geblokkeerd.</string>
-    <string name="system_dm_unreachable">kan geen bericht sturen naar %s – peer niet bereikbaar via mesh of nostr.</string>
-    <string name="system_geohash_blocked">%s geblokkeerd in geohash-chats</string>
-    <string name="system_geohash_unblocked">%s gedeblokkeerd in geohash-chats</string>
+    <string name="system_dm_blocked_recipient">kan geen bericht sturen naar %1$s: persoon is geblokkeerd.</string>
+    <string name="system_dm_unreachable">kan geen bericht sturen naar %1$s – peer niet bereikbaar via mesh of nostr.</string>
+    <string name="system_geohash_blocked">%1$s geblokkeerd in geohash-chats</string>
+    <string name="system_geohash_unblocked">%1$s gedeblokkeerd in geohash-chats</string>
     <string name="system_location_not_in_channel">kan niet versturen: je zit niet in een locatiekanaal</string>
     <string name="system_location_send_failed">versturen naar locatiekanaal mislukt</string>
     <string name="system_tor_dev_bypass">ontwikkelaarsbuild: Tor-bypass ingeschakeld.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">scan de QR van een vriend</string>
     <string name="verification_scan_status_invalid">ongeldige of verlopen QR-payload</string>
     <string name="verification_scan_status_no_peer">geen overeenkomende peer gevonden</string>
-    <string name="verification_scan_status_requested">verificatie aangevraagd voor %s</string>
+    <string name="verification_scan_status_requested">verificatie aangevraagd voor %1$s</string>
     <string name="verification_scan_validate">verifiëren</string>
     <string name="verification_sheet_title">VERIFICATIE</string>
     <string name="voice_notes_are_only_available_in_mesh">Spraaknotities zijn alleen beschikbaar in mesh-chats.</string>

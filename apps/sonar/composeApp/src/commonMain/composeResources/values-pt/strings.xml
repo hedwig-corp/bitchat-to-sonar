@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s ativos</string>
+    <string name="active">%1$s ativos</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">fechar</string>
     <string name="app_info_done">CONCLUÍDO</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">disponível através do Nostr</string>
     <string name="content_accessibility_back_to_main_chat">voltar ao chat principal</string>
     <string name="content_accessibility_connected_mesh">ligado por mesh</string>
-    <string name="content_accessibility_encryption_status">estado da encriptação: %s</string>
+    <string name="content_accessibility_encryption_status">estado da encriptação: %1$s</string>
     <string name="content_accessibility_location_channels">canais de localização</string>
     <string name="content_accessibility_location_notes">notas de localização deste lugar</string>
     <string name="content_accessibility_open_unread">abrir chat privado não lido</string>
-    <string name="content_accessibility_private_chat">chat privado com %s</string>
+    <string name="content_accessibility_private_chat">chat privado com %1$s</string>
     <string name="content_accessibility_reachable_mesh">acessível por mesh</string>
     <string name="content_accessibility_remove_favorite">remover dos favoritos</string>
     <string name="content_accessibility_send_hint_empty">escreve uma mensagem para enviar</string>
     <string name="content_accessibility_send_hint_ready">toca duas vezes para enviar</string>
     <string name="content_accessibility_send_message">enviar mensagem</string>
-    <string name="content_accessibility_toggle_bookmark">alternar o marcador de #%s</string>
+    <string name="content_accessibility_toggle_bookmark">alternar o marcador de #%1$s</string>
     <string name="content_accessibility_toggle_favorite">toca duas vezes para alternar o estado de favorito</string>
     <string name="content_accessibility_view_fingerprint">toca para ver a impressão de encriptação</string>
     <string name="content_actions_block">bloquear</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">remover dos favoritos</string>
     <string name="content_commands_who">ver quem está online</string>
     <string name="content_delivery_delivered_members">entregue a %1$d de %2$d membros</string>
-    <string name="content_delivery_delivered_to">entregue a %s</string>
-    <string name="content_delivery_failed">falhou: %s</string>
-    <string name="content_delivery_read_by">lido por %s</string>
+    <string name="content_delivery_delivered_to">entregue a %1$s</string>
+    <string name="content_delivery_failed">falhou: %1$s</string>
+    <string name="content_delivery_read_by">lido por %1$s</string>
     <string name="content_delivery_reason_blocked">utilizador bloqueado</string>
     <string name="content_delivery_reason_self">não é possível enviar mensagem a ti próprio</string>
     <string name="content_delivery_reason_send_error">erro ao enviar</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ VERIFICADO</string>
     <string name="fingerprint_handshake_pending">indisponível - aperto de mão em curso</string>
     <string name="fingerprint_message_verified">confirmaste a identidade desta pessoa.</string>
-    <string name="fingerprint_message_verify_hint">compara estas impressões com %s num canal seguro.</string>
+    <string name="fingerprint_message_verify_hint">compara estas impressões com %1$s num canal seguro.</string>
     <string name="fingerprint_their_label">impressão digital desta pessoa:</string>
     <string name="fingerprint_title">verificação de segurança</string>
     <string name="fingerprint_your_label">a tua impressão digital:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">desbloquear</string>
     <string name="geohash_people_none_nearby">ninguém por perto...</string>
     <string name="geohash_people_tooltip_blocked">bloqueado em geohash</string>
-    <string name="geohash_people_you_suffix">" (tu)"</string>
+    <string name="geohash_people_you_suffix"> (tu)</string>
     <string name="images_are_only_available_in_mesh_chats">As imagens só estão disponíveis nos chats mesh.</string>
     <string name="location_channels_action_open_settings">abrir definições</string>
     <string name="location_channels_action_remove_access">remover acesso à localização</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">adiciona pequenas notas permanentes a este local para outros visitantes encontrarem.</string>
     <string name="location_notes_empty_subtitle">sê o primeiro a adicionar uma nota para este sítio.</string>
     <string name="location_notes_empty_title">ainda sem notas</string>
-    <string name="location_notes_error_failed_to_send">falha ao enviar a nota. %s</string>
+    <string name="location_notes_error_failed_to_send">falha ao enviar a nota. %1$s</string>
     <string name="location_notes_error_no_relays">sem relés geográficos disponíveis perto deste local. tenta novamente em breve.</string>
     <string name="location_notes_loading_notes">a carregar notas…</string>
     <string name="location_notes_loading_recent">a carregar notas recentes…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">relés geográficos indisponíveis; notas em pausa</string>
     <string name="location_notes_relays_retry_hint">as notas dependem de relés geográficos. verifica a ligação e tenta de novo.</string>
     <string name="mesh_peers_tooltip_new_messages">novas mensagens</string>
-    <string name="recording">a gravar %s</string>
+    <string name="recording">a gravar %1$s</string>
     <string name="save_2">guardar</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">não é possível iniciar o chat com %s: a pessoa está bloqueada.</string>
-    <string name="system_chat_requires_favorite">não é possível iniciar o chat com %s: precisam de ser favoritos mútuos para mensagens offline.</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">não é possível iniciar o chat com %1$s: a pessoa está bloqueada.</string>
+    <string name="system_chat_requires_favorite">não é possível iniciar o chat com %1$s: precisam de ser favoritos mútuos para mensagens offline.</string>
     <string name="system_common_user">utilizador</string>
     <string name="system_dm_blocked_generic">não é possível enviar mensagem: a pessoa está bloqueada.</string>
-    <string name="system_dm_blocked_recipient">não é possível enviar mensagem a %s: a pessoa está bloqueada.</string>
-    <string name="system_dm_unreachable">não é possível enviar mensagem a %s - o par não está acessível por mesh ou Nostr.</string>
-    <string name="system_geohash_blocked">%s bloqueado nos chats geohash</string>
-    <string name="system_geohash_unblocked">%s desbloqueado nos chats geohash</string>
+    <string name="system_dm_blocked_recipient">não é possível enviar mensagem a %1$s: a pessoa está bloqueada.</string>
+    <string name="system_dm_unreachable">não é possível enviar mensagem a %1$s - o par não está acessível por mesh ou Nostr.</string>
+    <string name="system_geohash_blocked">%1$s bloqueado nos chats geohash</string>
+    <string name="system_geohash_unblocked">%1$s desbloqueado nos chats geohash</string>
     <string name="system_location_not_in_channel">não foi possível enviar: não estás num canal de localização</string>
     <string name="system_location_send_failed">falha ao enviar para o canal de localização</string>
     <string name="system_tor_dev_bypass">compilação de desenvolvimento: bypass do Tor ativo.</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">Digitaliza o QR de um amigo</string>
     <string name="verification_scan_status_invalid">payload de QR inválido ou expirado</string>
     <string name="verification_scan_status_no_peer">não foi possível encontrar o par correspondente</string>
-    <string name="verification_scan_status_requested">verificação solicitada para %s</string>
+    <string name="verification_scan_status_requested">verificação solicitada para %1$s</string>
     <string name="verification_scan_validate">validar</string>
     <string name="verification_sheet_title">VERIFICAR</string>
     <string name="voice_notes_are_only_available_in_mesh">As notas de voz só estão disponíveis nos chats mesh.</string>

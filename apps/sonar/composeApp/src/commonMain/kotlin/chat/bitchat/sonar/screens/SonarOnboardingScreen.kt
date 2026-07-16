@@ -50,6 +50,7 @@ import chat.bitchat.sonar.resources.continue_
 import chat.bitchat.sonar.resources.create_a_new_identity
 import chat.bitchat.sonar.resources.direct_messages_are_end_to_end
 import chat.bitchat.sonar.resources.friends_can_verify_this_fingerprint_in
+import chat.bitchat.sonar.resources.generating
 import chat.bitchat.sonar.resources.get_started
 import chat.bitchat.sonar.resources.it_s_just_what_people_see_change_it
 import chat.bitchat.sonar.resources.messages_travel_encrypted_over_the_open
@@ -59,6 +60,7 @@ import chat.bitchat.sonar.resources.no_signup_your_identity_is_a_private
 import chat.bitchat.sonar.resources.nsec1
 import chat.bitchat.sonar.resources.out_of_range_still_reachable
 import chat.bitchat.sonar.resources.paste_key
+import chat.bitchat.sonar.resources.paste_your_nsec_private_key_to_bring
 import chat.bitchat.sonar.resources.pick_a_nickname
 import chat.bitchat.sonar.resources.private_by_design
 import chat.bitchat.sonar.resources.restore_account
@@ -67,6 +69,7 @@ import chat.bitchat.sonar.resources.sense_who_s_nearby_before_you_see_them
 import chat.bitchat.sonar.resources.sonar_connects_phones_directly_no_phone
 import chat.bitchat.sonar.resources.start_chatting
 import chat.bitchat.sonar.resources.surprise_me
+import chat.bitchat.sonar.resources.that_key_couldn_t_be_imported_check_you
 import chat.bitchat.sonar.resources.works_without_internet
 import chat.bitchat.sonar.resources.you_re_in
 import chat.bitchat.sonar.resources.your_key_fingerprint_2
@@ -97,6 +100,8 @@ fun SonarOnboardingScreen(state: SonarAppState) {
     val can = trimmed.length >= 2
     val nsecOk = nsec.trim().matches(Regex("^nsec1[0-9a-z]{20,}$"))
     val clipboard = LocalClipboardManager.current
+    val restoreFailureFallback =
+        stringResource(Res.string.that_key_couldn_t_be_imported_check_you)
 
     Column(
         Modifier.fillMaxSize().background(s.bg)
@@ -159,7 +164,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                         restoreInFlight = false
                         result.exceptionOrNull()?.let { failure ->
                             restoreError = (failure as? SonarAccountRestoreException)?.message
-                                ?: "Account restore failed. Restart Sonar and try again."
+                                ?: restoreFailureFallback
                         }
                     }
                 }
@@ -304,7 +309,7 @@ private fun StepRestore(
         Text(stringResource(Res.string.restore_account), color = s.text, fontSize = 30.sp, fontWeight = FontWeight.Black)
         Spacer(Modifier.height(10.dp))
         Text(
-            "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history on this device starts fresh until backup ships.",
+            stringResource(Res.string.paste_your_nsec_private_key_to_bring),
             color = s.text2, fontSize = 16.sp, lineHeight = 21.sp,
         )
         Spacer(Modifier.height(22.dp))
@@ -343,6 +348,7 @@ private fun StepRestore(
 @Composable
 private fun StepDone(nick: String, fingerprint: String) {
     val s = sonar
+    val generatingLabel = stringResource(Res.string.generating)
     Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.Center) {
         SonarAvatar(nick.ifEmpty { "?" }, 92.dp)
         Spacer(Modifier.height(22.dp))
@@ -350,7 +356,10 @@ private fun StepDone(nick: String, fingerprint: String) {
         Spacer(Modifier.height(10.dp))
         Text(stringResource(Res.string.no_account_was_created_anywhere_your), color = s.text2, fontSize = 16.sp, lineHeight = 21.sp)
         Spacer(Modifier.height(24.dp))
-        SNFingerprintCard(stringResource(Res.string.your_key_fingerprint_2), fingerprint.ifEmpty { "generating…" })
+        SNFingerprintCard(
+            stringResource(Res.string.your_key_fingerprint_2),
+            fingerprint.ifEmpty { generatingLabel },
+        )
         Spacer(Modifier.height(18.dp))
         Text(stringResource(Res.string.friends_can_verify_this_fingerprint_in), color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
     }

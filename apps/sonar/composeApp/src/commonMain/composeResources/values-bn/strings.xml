@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
-    <string name="active">%s সক্রিয়</string>
+    <string name="active">%1$s সক্রিয়</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">বন্ধ করুন</string>
     <string name="app_info_done">সম্পন্ন</string>
@@ -48,17 +48,17 @@
     <string name="content_accessibility_available_nostr">নোস্টরে উপলব্ধ</string>
     <string name="content_accessibility_back_to_main_chat">মুখ্য চ্যাটে ফিরুন</string>
     <string name="content_accessibility_connected_mesh">মেশের মাধ্যমে সংযুক্ত</string>
-    <string name="content_accessibility_encryption_status">এনক্রিপশনের অবস্থা: %s</string>
+    <string name="content_accessibility_encryption_status">এনক্রিপশনের অবস্থা: %1$s</string>
     <string name="content_accessibility_location_channels">অবস্থান চ্যানেল</string>
     <string name="content_accessibility_location_notes">এই স্থানের লোকেশন নোট</string>
     <string name="content_accessibility_open_unread">না পড়া ব্যক্তিগত চ্যাট খুলুন</string>
-    <string name="content_accessibility_private_chat">%s-এর সঙ্গে ব্যক্তিগত চ্যাট</string>
+    <string name="content_accessibility_private_chat">%1$s-এর সঙ্গে ব্যক্তিগত চ্যাট</string>
     <string name="content_accessibility_reachable_mesh">মেশের মাধ্যমে পৌঁছানো সম্ভব</string>
     <string name="content_accessibility_remove_favorite">প্রিয় থেকে সরান</string>
     <string name="content_accessibility_send_hint_empty">বার্তা পাঠাতে একটি বার্তা লিখুন</string>
     <string name="content_accessibility_send_hint_ready">পাঠাতে দুইবার ট্যাপ করুন</string>
     <string name="content_accessibility_send_message">বার্তা পাঠান</string>
-    <string name="content_accessibility_toggle_bookmark">#%s-এর জন্য বুকমার্ক টগল করুন</string>
+    <string name="content_accessibility_toggle_bookmark">#%1$s-এর জন্য বুকমার্ক টগল করুন</string>
     <string name="content_accessibility_toggle_favorite">প্রিয় অবস্থা বদলাতে দুইবার ট্যাপ করুন</string>
     <string name="content_accessibility_view_fingerprint">এনক্রিপশন ফিঙ্গারপ্রিন্ট দেখতে ট্যাপ করুন</string>
     <string name="content_actions_block">ব্লক করুন</string>
@@ -84,9 +84,9 @@
     <string name="content_commands_unfavorite">প্রিয় থেকে সরিয়ে দিন</string>
     <string name="content_commands_who">কে অনলাইনে আছে দেখুন</string>
     <string name="content_delivery_delivered_members">%2$d জন সদস্যের মধ্যে %1$d জনের কাছে পৌঁছেছে</string>
-    <string name="content_delivery_delivered_to">%s-এর কাছে পৌঁছেছে</string>
-    <string name="content_delivery_failed">ব্যর্থ: %s</string>
-    <string name="content_delivery_read_by">%s পড়েছে</string>
+    <string name="content_delivery_delivered_to">%1$s-এর কাছে পৌঁছেছে</string>
+    <string name="content_delivery_failed">ব্যর্থ: %1$s</string>
+    <string name="content_delivery_read_by">%1$s পড়েছে</string>
     <string name="content_delivery_reason_blocked">ব্যবহারকারী ব্লক করা</string>
     <string name="content_delivery_reason_self">নিজেকে বার্তা পাঠানো যায় না</string>
     <string name="content_delivery_reason_send_error">পাঠাতে ত্রুটি</string>
@@ -120,7 +120,7 @@
     <string name="fingerprint_badge_verified">✓ যাচাইকৃত</string>
     <string name="fingerprint_handshake_pending">উপলব্ধ নয় - হ্যান্ডশেক চলছে</string>
     <string name="fingerprint_message_verified">আপনি এই ব্যক্তির পরিচয় যাচাই করেছেন।</string>
-    <string name="fingerprint_message_verify_hint">নিরাপদ চ্যানেলে %s-এর সঙ্গে এই ফিঙ্গারপ্রিন্ট মিলিয়ে দেখুন।</string>
+    <string name="fingerprint_message_verify_hint">নিরাপদ চ্যানেলে %1$s-এর সঙ্গে এই ফিঙ্গারপ্রিন্ট মিলিয়ে দেখুন।</string>
     <string name="fingerprint_their_label">তাদের ফিঙ্গারপ্রিন্ট:</string>
     <string name="fingerprint_title">নিরাপত্তা যাচাই</string>
     <string name="fingerprint_your_label">আপনার ফিঙ্গারপ্রিন্ট:</string>
@@ -128,7 +128,7 @@
     <string name="geohash_people_action_unblock">আনব্লক করুন</string>
     <string name="geohash_people_none_nearby">কাছে কেউ নেই...</string>
     <string name="geohash_people_tooltip_blocked">জিওহ্যাশে ব্লক করা</string>
-    <string name="geohash_people_you_suffix">" (আপনি)"</string>
+    <string name="geohash_people_you_suffix"> (আপনি)</string>
     <string name="images_are_only_available_in_mesh_chats">ছবি শুধু মেশ চ্যাটে উপলব্ধ।</string>
     <string name="location_channels_action_open_settings">সেটিংস খুলুন</string>
     <string name="location_channels_action_remove_access">লোকেশন অ্যাক্সেস সরান</string>
@@ -156,7 +156,7 @@
     <string name="location_notes_description">এই স্থানে অন্যরা খুঁজে পেতে পারে এমন ছোট স্থায়ী নোট যোগ করুন।</string>
     <string name="location_notes_empty_subtitle">এই জায়গার জন্য প্রথম নোট যোগ করুন।</string>
     <string name="location_notes_empty_title">এখনও কোনো নোট নেই</string>
-    <string name="location_notes_error_failed_to_send">নোট পাঠাতে ব্যর্থ। %s</string>
+    <string name="location_notes_error_failed_to_send">নোট পাঠাতে ব্যর্থ। %1$s</string>
     <string name="location_notes_error_no_relays">এই স্থানের কাছে কোনো জিও রিলে নেই। কিছুক্ষণ পরে আবার চেষ্টা করুন।</string>
     <string name="location_notes_loading_notes">নোট লোড হচ্ছে…</string>
     <string name="location_notes_loading_recent">সাম্প্রতিক নোট লোড হচ্ছে…</string>
@@ -165,17 +165,17 @@
     <string name="location_notes_relays_paused">জিও রিলে অনুপলব্ধ; নোট স্থগিত</string>
     <string name="location_notes_relays_retry_hint">নোট জিও রিলের উপর নির্ভরশীল। সংযোগ পরীক্ষা করে আবার চেষ্টা করুন।</string>
     <string name="mesh_peers_tooltip_new_messages">নতুন বার্তা</string>
-    <string name="recording">রেকর্ডিং %s</string>
+    <string name="recording">রেকর্ডিং %1$s</string>
     <string name="save_2">সংরক্ষণ</string>
-    <string name="str_1">%s</string>
-    <string name="system_chat_blocked">%s-এর সঙ্গে চ্যাট শুরু করা যায় না: ব্যক্তি ব্লক করা আছে।</string>
-    <string name="system_chat_requires_favorite">%s-এর সঙ্গে চ্যাট শুরু করা যায় না: অফলাইন মেসেজিংয়ের জন্য পারস্পরিক প্রিয় দরকার।</string>
+    <string name="str_1">%1$s</string>
+    <string name="system_chat_blocked">%1$s-এর সঙ্গে চ্যাট শুরু করা যায় না: ব্যক্তি ব্লক করা আছে।</string>
+    <string name="system_chat_requires_favorite">%1$s-এর সঙ্গে চ্যাট শুরু করা যায় না: অফলাইন মেসেজিংয়ের জন্য পারস্পরিক প্রিয় দরকার।</string>
     <string name="system_common_user">ব্যবহারকারী</string>
     <string name="system_dm_blocked_generic">বার্তা পাঠানো যায় না: ব্যক্তি ব্লক করা আছে।</string>
-    <string name="system_dm_blocked_recipient">%s-কে বার্তা পাঠানো যায় না: ব্যক্তি ব্লক করা আছে।</string>
-    <string name="system_dm_unreachable">%s-কে বার্তা পাঠানো যায় না - পিয়ার মেশ বা নোস্টরে পৌঁছানো যাচ্ছে না।</string>
-    <string name="system_geohash_blocked">জিওহ্যাশ চ্যাটে %s ব্লক করা হয়েছে</string>
-    <string name="system_geohash_unblocked">জিওহ্যাশ চ্যাটে %s আনব্লক করা হয়েছে</string>
+    <string name="system_dm_blocked_recipient">%1$s-কে বার্তা পাঠানো যায় না: ব্যক্তি ব্লক করা আছে।</string>
+    <string name="system_dm_unreachable">%1$s-কে বার্তা পাঠানো যায় না - পিয়ার মেশ বা নোস্টরে পৌঁছানো যাচ্ছে না।</string>
+    <string name="system_geohash_blocked">জিওহ্যাশ চ্যাটে %1$s ব্লক করা হয়েছে</string>
+    <string name="system_geohash_unblocked">জিওহ্যাশ চ্যাটে %1$s আনব্লক করা হয়েছে</string>
     <string name="system_location_not_in_channel">পাঠানো যায় না: লোকেশন চ্যানেলে নেই</string>
     <string name="system_location_send_failed">লোকেশন চ্যানেলে পাঠাতে ব্যর্থ</string>
     <string name="system_tor_dev_bypass">ডেভেলপমেন্ট বিল্ড: Tor বাইপাস সক্রিয়।</string>
@@ -190,7 +190,7 @@
     <string name="verification_scan_prompt_friend">বন্ধুর QR স্ক্যান করুন</string>
     <string name="verification_scan_status_invalid">অবৈধ বা মেয়াদোত্তীর্ণ QR পেলোড</string>
     <string name="verification_scan_status_no_peer">মিলে যাওয়া পিয়ার খুঁজে পাওয়া যায়নি</string>
-    <string name="verification_scan_status_requested">%s-এর জন্য যাচাই অনুরোধ করা হয়েছে</string>
+    <string name="verification_scan_status_requested">%1$s-এর জন্য যাচাই অনুরোধ করা হয়েছে</string>
     <string name="verification_scan_validate">যাচাই করুন</string>
     <string name="verification_sheet_title">যাচাই</string>
     <string name="voice_notes_are_only_available_in_mesh">ভয়েস নোট শুধু মেশ চ্যাটে উপলব্ধ।</string>
