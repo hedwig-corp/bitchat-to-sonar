@@ -80,6 +80,7 @@ pub struct MediaUpload {
 const MAX_MEDIA_PLAINTEXT_BYTES: usize = 25 * 1024 * 1024;
 const MIP04_AEAD_TAG_BYTES: usize = 16;
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = MAX_MEDIA_PLAINTEXT_BYTES + MIP04_AEAD_TAG_BYTES;
+const BLOSSOM_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -3248,6 +3249,16 @@ impl SonarClient {
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
     /// Nostr key, returning the URL where it can be fetched.
     async fn blossom_upload(&self, server_url: &str, data: Vec<u8>) -> Result<String> {
+        self.blossom_upload_with_timeout(server_url, data, BLOSSOM_UPLOAD_TIMEOUT)
+            .await
+    }
+
+    async fn blossom_upload_with_timeout(
+        &self,
+        server_url: &str,
+        data: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<String> {
         let server = if server_url.is_empty() {
             DEFAULT_BLOSSOM_SERVER
         } else {
@@ -3255,15 +3266,24 @@ impl SonarClient {
         };
         let base = Url::parse(server)
             .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
-        let descriptor = BlossomClient::new(base)
-            .upload_blob(
+        let client = BlossomClient::new(base);
+        let descriptor = tokio::time::timeout(
+            timeout,
+            client.upload_blob(
                 data,
                 Some(ENCRYPTED_BLOB_MIME_TYPE.to_string()),
                 None,
                 Some(self.identity().keys()),
-            )
-            .await
-            .map_err(|e| Error::Blossom(e.to_string()))?;
+            ),
+        )
+        .await
+        .map_err(|_| {
+            Error::Blossom(format!(
+                "upload to {server} timed out after {} seconds",
+                timeout.as_secs()
+            ))
+        })?
+        .map_err(|e| Error::Blossom(e.to_string()))?;
         Ok(descriptor.url.to_string())
     }
 
@@ -5346,6 +5366,37 @@ mod tests {
                     && value.trim().eq_ignore_ascii_case(ENCRYPTED_BLOB_MIME_TYPE)
             }),
             "encrypted uploads must use {ENCRYPTED_BLOB_MIME_TYPE}, got:\n{headers}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_times_out_when_server_never_responds() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept upload");
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let error = client
+            .blossom_upload_with_timeout(
+                &base,
+                b"encrypted image ciphertext".to_vec(),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("a stalled Blossom server must time out");
+
+        server.join().expect("mock Blossom exits");
+        assert!(
+            matches!(&error, Error::Blossom(message) if message.contains("timed out")),
+            "unexpected upload error: {error}"
         );
     }
 
