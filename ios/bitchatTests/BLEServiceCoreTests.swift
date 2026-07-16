@@ -59,6 +59,29 @@ struct BLEServiceCoreTests {
         #expect(delegate.publicMessagesSnapshot().isEmpty)
     }
 
+    // Turning Bluetooth off must retire the mesh links right away. CoreBluetooth
+    // delivers no disconnect callback for links the radio drops, so without this
+    // the peer stays "connected" until the inactivity sweep notices ~8-13s later
+    // and DM routing keeps handing sends to a radio that is off.
+    @Test
+    func bluetoothPoweredOff_stopsRoutingOverMesh() {
+        let ble = makeService()
+        let sender = PeerID(str: "1122334455667788")
+        let packet = makePublicPacket(
+            content: "Hello",
+            sender: sender,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
+        )
+
+        ble._test_handlePacket(packet, fromPeerID: sender)
+        #expect(ble.isPeerConnected(sender))
+
+        ble.handleCentralState(.poweredOff, central: nil)
+
+        #expect(!ble.isPeerConnected(sender))
+        #expect(!ble.isPeerReachable(sender))
+    }
+
     @Test
     func announceSenderMismatch_isRejected() async throws {
         let ble = makeService()

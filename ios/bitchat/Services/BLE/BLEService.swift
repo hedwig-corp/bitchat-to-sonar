@@ -1919,12 +1919,18 @@ extension BLEService: CBCentralManagerDelegate {
     #endif
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        handleCentralState(central.state, central: central)
+    }
+
+    /// State handling split out of the delegate callback so the radio-off path is
+    /// reachable without a live `CBCentralManager` (its `state` cannot be forced).
+    func handleCentralState(_ state: CBManagerState, central: CBCentralManager?) {
         // Notify delegate about state change on main thread
         Task { @MainActor in
-            self.delegate?.didUpdateBluetoothState(central.state)
+            self.delegate?.didUpdateBluetoothState(state)
         }
 
-        switch central.state {
+        switch state {
         case .poweredOn:
             // Start scanning - use allow duplicates for faster discovery when active
             startScanning()
@@ -1932,27 +1938,22 @@ extension BLEService: CBCentralManagerDelegate {
         case .poweredOff:
             // Bluetooth was turned off - stop scanning and clean up connection state
             SecureLogger.info("📴 Bluetooth powered off - cleaning up central state", category: .session)
-            central.stopScan()
+            central?.stopScan()
             // Mark all peripheral connections as disconnected (they are now invalid)
-            let peerIDs: [PeerID] = peripherals.compactMap { $0.value.peerID }
-            for state in peripherals.values {
-                central.cancelPeripheralConnection(state.peripheral)
+            for peripheralState in peripherals.values {
+                central?.cancelPeripheralConnection(peripheralState.peripheral)
             }
             peripherals.removeAll()
             peerToPeripheralUUID.removeAll()
-            // Notify UI of disconnections
-            for peerID in peerIDs {
-                notifyUI { [weak self] in
-                    self?.notifyPeerDisconnectedDebounced(peerID)
-                }
-            }
+            invalidateMeshLinks(reason: "Bluetooth powered off")
 
         case .unauthorized:
             // User denied Bluetooth permission
             SecureLogger.warning("🚫 Bluetooth unauthorized - user denied permission", category: .session)
-            central.stopScan()
+            central?.stopScan()
             peripherals.removeAll()
             peerToPeripheralUUID.removeAll()
+            invalidateMeshLinks(reason: "Bluetooth unauthorized")
 
         case .unsupported:
             // Device doesn't support BLE
@@ -1967,7 +1968,7 @@ extension BLEService: CBCentralManagerDelegate {
             SecureLogger.debug("❓ Bluetooth state unknown (initializing)", category: .session)
 
         @unknown default:
-            SecureLogger.warning("⚠️ Unknown Bluetooth state: \(central.state.rawValue)", category: .session)
+            SecureLogger.warning("⚠️ Unknown Bluetooth state: \(state.rawValue)", category: .session)
         }
     }
     
@@ -2605,17 +2606,11 @@ extension BLEService: CBPeripheralManagerDelegate {
             SecureLogger.info("📴 Bluetooth powered off - cleaning up peripheral state", category: .session)
             peripheral.stopAdvertising()
             // Clear subscribed centrals (they are now invalid)
-            let centralPeerIDs = centralToPeerID.values.map { $0 }
             subscribedCentrals.removeAll()
             centralToPeerID.removeAll()
             centralSubscriptionRateLimits.removeAll()
             characteristic = nil
-            // Notify UI of disconnections
-            for peerID in centralPeerIDs {
-                notifyUI { [weak self] in
-                    self?.notifyPeerDisconnectedDebounced(peerID)
-                }
-            }
+            invalidateMeshLinks(reason: "Bluetooth powered off")
 
         case .unauthorized:
             // User denied Bluetooth permission
@@ -2625,6 +2620,7 @@ extension BLEService: CBPeripheralManagerDelegate {
             centralToPeerID.removeAll()
             centralSubscriptionRateLimits.removeAll()
             characteristic = nil
+            invalidateMeshLinks(reason: "Bluetooth unauthorized")
 
         case .unsupported:
             // Device doesn't support BLE peripheral role
@@ -4747,6 +4743,42 @@ extension BLEService {
         }
     }
     
+    /// Drop every direct mesh link because the radio itself became unusable
+    /// (powered off, or permission revoked).
+    ///
+    /// CoreBluetooth delivers no `didDisconnectPeripheral` / `didUnsubscribeFrom`
+    /// for links torn down this way, so the two paths that normally clear
+    /// `isConnected` never run. Without this, `peers` keeps reporting the peer as
+    /// connected until `checkPeerConnectivity` times it out ~8-13s later, and DM
+    /// routing (`isPeerConnected` / `isPeerReachable`) hands sends to a radio that
+    /// is off instead of falling back to White Noise.
+    func invalidateMeshLinks(reason: String) {
+        let disconnected: [PeerID] = collectionsQueue.sync(flags: .barrier) {
+            var changed: [PeerID] = []
+            for (peerID, peer) in peers where peer.isConnected {
+                var updated = peer
+                updated.isConnected = false
+                peers[peerID] = updated
+                changed.append(peerID)
+            }
+            return changed
+        }
+        guard !disconnected.isEmpty else { return }
+
+        SecureLogger.info("📴 \(reason): dropped \(disconnected.count) mesh link(s)", category: .session)
+        refreshLocalTopology()
+        notifyUI { [weak self] in
+            guard let self else { return }
+            let currentPeerIDs = self.collectionsQueue.sync { self.currentPeerIDs }
+            for peerID in disconnected {
+                self.notifyPeerDisconnectedDebounced(peerID)
+            }
+            // Publish snapshots so UnifiedPeerService drops the connection icons
+            self.requestPeerDataPublish()
+            self.delegate?.didUpdatePeerList(currentPeerIDs)
+        }
+    }
+
     // NEW: Publish peer snapshots to subscribers and notify Transport delegates
     private func publishFullPeerData() {
         let transportPeers: [TransportPeerSnapshot] = collectionsQueue.sync {
