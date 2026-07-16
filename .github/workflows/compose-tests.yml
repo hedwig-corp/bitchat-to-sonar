@@ -1,0 +1,58 @@
+name: Compose tests
+
+# Compose Multiplatform unit tests. Runs commonTest via the JVM target, which
+# needs the UniFFI bindings + host dylib that core/build-desktop.sh generates
+# (Gradle wires it as :composeApp:buildDesktopRustCore). This is the cheapest
+# target that compiles commonMain and executes the shared unit tests: no NDK,
+# no per-ABI Android builds, and it doubles as a desktop-target compile check.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/sonar/**'
+      - 'core/**'
+      - '.github/workflows/compose-tests.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'apps/sonar/**'
+      - 'core/**'
+      - '.github/workflows/compose-tests.yml'
+
+jobs:
+  test:
+    name: Compose unit tests (JVM)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Linux build deps (BlueZ D-Bus headers for sonar-ble)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - name: Update Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            core
+            core/sonar-ble
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run JVM unit tests (builds desktop Rust core + UniFFI bindings)
+        run: ./gradlew :composeApp:jvmTest --console=plain
+        working-directory: apps/sonar

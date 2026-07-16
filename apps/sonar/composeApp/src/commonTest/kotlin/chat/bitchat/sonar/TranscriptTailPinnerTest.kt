@@ -80,4 +80,31 @@ class TranscriptTailPinnerTest {
         assertEquals(TranscriptTailPin.None, pinner.onFrame(frame(itemCount = 0, tailFullyVisible = false)))
         assertEquals(TranscriptTailPin.None, pinner.onFrame(frame(itemCount = 0, tailFullyVisible = false, viewportHeight = 1300)))
     }
+
+    @Test
+    fun tail_row_taller_than_viewport_reports_hidden_bottom() {
+        // Keyboard-shrunk viewport 808px, media row 900px: scrollToItem
+        // top-aligns the row (offset 0), leaving 92px + padding hidden below.
+        assertEquals(
+            122,
+            transcriptTailOverflowPx(lastOffset = 0, lastSize = 900, viewportEndOffset = 808, afterContentPadding = 30),
+        )
+    }
+
+    @Test
+    fun fully_scrolled_tail_has_no_overflow() {
+        // At max scroll the row bottom rests exactly at end - afterContentPadding.
+        assertEquals(
+            0,
+            transcriptTailOverflowPx(lastOffset = 1370, lastSize = 800, viewportEndOffset = 2200, afterContentPadding = 30),
+        )
+    }
+
+    @Test
+    fun short_tail_row_never_reports_negative_overflow() {
+        assertEquals(
+            0,
+            transcriptTailOverflowPx(lastOffset = 1900, lastSize = 100, viewportEndOffset = 2200, afterContentPadding = 30),
+        )
+    }
 }

@@ -40,7 +40,9 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -851,6 +853,68 @@ internal class TranscriptTailPinner {
     }
 }
 
+/** Pixels the tail row still hangs below the viewport's content area after a
+ *  scroll-to-tail (0 when its bottom edge is visible). Non-zero only when the
+ *  row is taller than the viewport — e.g. a large media bubble over an open
+ *  keyboard — because scrollToItem top-aligns the row. */
+internal fun transcriptTailOverflowPx(
+    lastOffset: Int,
+    lastSize: Int,
+    viewportEndOffset: Int,
+    afterContentPadding: Int,
+): Int = (lastOffset + lastSize - (viewportEndOffset - afterContentPadding)).coerceAtLeast(0)
+
+/** Anchor the newest transcript row bottom-aligned, Signal-style. scrollToItem
+ *  alone top-aligns the row; when the row is taller than the (keyboard-shrunk)
+ *  viewport that leaves the newest content hidden below the fold, so any
+ *  remaining overflow is corrected with a follow-up scroll. */
+private suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boolean) {
+    if (index < 0) return
+    if (animate) animateScrollToItem(index) else scrollToItem(index)
+    val info = layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull() ?: return
+    if (last.index != index) return
+    val overflow = transcriptTailOverflowPx(
+        lastOffset = last.offset,
+        lastSize = last.size,
+        viewportEndOffset = info.viewportEndOffset,
+        afterContentPadding = info.afterContentPadding,
+    )
+    if (overflow > 0) scrollBy(overflow.toFloat())
+}
+
+/** Wire [TranscriptTailPinner] to a transcript list: re-anchor the newest row
+ *  whenever layout (IME shrink, media growth) — not the user's scroll and not
+ *  a history prepend — steals a fully visible tail. */
+@Composable
+private fun TranscriptTailPinning(
+    listState: LazyListState,
+    key: Any? = null,
+    isPrepending: () -> Boolean = { false },
+) {
+    LaunchedEffect(key, listState) {
+        val pinner = TranscriptTailPinner()
+        snapshotFlow {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            TranscriptTailFrame(
+                itemCount = info.totalItemsCount,
+                viewportHeight = info.viewportSize.height,
+                tailFullyVisible = last != null && last.index == info.totalItemsCount - 1 &&
+                    last.offset + last.size <= info.viewportEndOffset,
+                scrolling = listState.isScrollInProgress,
+                prepending = isPrepending(),
+            )
+        }.distinctUntilChanged().collect { frame ->
+            when (pinner.onFrame(frame)) {
+                TranscriptTailPin.Snap -> listState.anchorTranscriptTail(frame.itemCount - 1, animate = false)
+                TranscriptTailPin.Animate -> listState.anchorTranscriptTail(frame.itemCount - 1, animate = true)
+                TranscriptTailPin.None -> Unit
+            }
+        }
+    }
+}
+
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
@@ -930,10 +994,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     LaunchedEffect(screen.id, newestFeedKey) {
         if (feed.isEmpty()) return@LaunchedEffect
         if (!didInitialScroll) {
-            listState.scrollToItem(feed.lastIndex)
+            listState.anchorTranscriptTail(feed.lastIndex, animate = false)
             didInitialScroll = true
         } else if (isNearBottom && !isPrepending) {
-            listState.animateScrollToItem(feed.lastIndex)
+            listState.anchorTranscriptTail(feed.lastIndex, animate = true)
         }
     }
 
@@ -979,7 +1043,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             isPrepending = true
             if (state.loadNewestMessages(screen.id)) {
                 withFrameNanos { }
-                if (currentFeed.isNotEmpty()) listState.scrollToItem(currentFeed.lastIndex)
+                if (currentFeed.isNotEmpty()) {
+                    listState.anchorTranscriptTail(currentFeed.lastIndex, animate = false)
+                }
                 didLeaveTail = false
             }
             isPrepending = false
@@ -990,27 +1056,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // transcript viewport and decoded media grows tail rows after first paint;
     // both would otherwise hide the newest messages behind the keyboard or
     // below the fold. Re-anchor whenever layout — not the user — steals the tail.
-    LaunchedEffect(screen.id, listState) {
-        val pinner = TranscriptTailPinner()
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()
-            TranscriptTailFrame(
-                itemCount = info.totalItemsCount,
-                viewportHeight = info.viewportSize.height,
-                tailFullyVisible = last != null && last.index == info.totalItemsCount - 1 &&
-                    last.offset + last.size <= info.viewportEndOffset,
-                scrolling = listState.isScrollInProgress,
-                prepending = isPrepending,
-            )
-        }.distinctUntilChanged().collect { frame ->
-            when (pinner.onFrame(frame)) {
-                TranscriptTailPin.Snap -> listState.scrollToItem(frame.itemCount - 1)
-                TranscriptTailPin.Animate -> listState.animateScrollToItem(frame.itemCount - 1)
-                TranscriptTailPin.None -> Unit
-            }
-        }
-    }
+    TranscriptTailPinning(listState, key = screen.id, isPrepending = { isPrepending })
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
@@ -1722,8 +1768,13 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val blocked = state.isGeoDmBlocked(screen.peerHex)
     val listState = rememberLazyListState()
     LaunchedEffect(state.messages.size) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.size - 1)
+        if (state.messages.isNotEmpty()) {
+            listState.anchorTranscriptTail(state.messages.size - 1, animate = true)
+        }
     }
+    // Same tail pinning as the main transcript: the IME opening must not hide
+    // the newest rows behind the keyboard.
+    TranscriptTailPinning(listState, key = screen.peerHex)
     Column(Modifier.fillMaxSize()) {
         Row(
             Modifier.fillMaxWidth().padding(start = 6.dp, end = 16.dp, top = 12.dp, bottom = 8.dp),
