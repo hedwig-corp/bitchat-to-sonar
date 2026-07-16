@@ -77,10 +77,21 @@ pub struct MediaUpload {
 /// SENDER (untrusted), so this bounds memory use against a malicious/huge blob.
 /// Hosts accept 25 MiB of plaintext; MIP-04 ChaCha20-Poly1305 appends its
 /// 16-byte authentication tag to the uploaded ciphertext.
-const MAX_MEDIA_PLAINTEXT_BYTES: usize = 25 * 1024 * 1024;
+pub const MAX_MEDIA_PLAINTEXT_BYTES: usize = 25 * 1024 * 1024;
+/// Aggregate plaintext ceiling for ONE album send. Every item is resident in
+/// memory at once on both sides of the FFI (plus the ciphertext of the item
+/// being uploaded), so a full 10 x 25 MiB selection could exhaust a low-RAM
+/// phone. Interim backstop until the file-backed/streaming send API lands.
+pub const MAX_MEDIA_TOTAL_PLAINTEXT_BYTES: usize = 100 * 1024 * 1024;
 const MIP04_AEAD_TAG_BYTES: usize = 16;
 const MAX_MEDIA_DOWNLOAD_BYTES: usize = MAX_MEDIA_PLAINTEXT_BYTES + MIP04_AEAD_TAG_BYTES;
 const BLOSSOM_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+/// Ceiling for the size-scaled upload deadline: even a max-size blob on a slow
+/// uplink must eventually fail into the retryable state instead of hanging.
+const BLOSSOM_UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+/// Worst-case sustained uplink assumed when scaling the upload deadline
+/// (slow cellular). 25 MiB at this rate needs ~256s, still under the ceiling.
+const BLOSSOM_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 100 * 1024;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -3153,6 +3164,26 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
+        // over-limit upload would publish a message NO client can ever fetch.
+        // Reject before any encrypt/upload work. The aggregate cap bounds the
+        // whole album's resident plaintext (every item is in memory at once).
+        let mut total_bytes: u64 = 0;
+        for item in &items {
+            if item.data.len() > MAX_MEDIA_PLAINTEXT_BYTES {
+                return Err(Error::MediaTooLarge {
+                    bytes: item.data.len() as u64,
+                    max: MAX_MEDIA_PLAINTEXT_BYTES as u64,
+                });
+            }
+            total_bytes += item.data.len() as u64;
+        }
+        if total_bytes > MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64 {
+            return Err(Error::MediaTooLarge {
+                bytes: total_bytes,
+                max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
+            });
+        }
         // Encrypt + upload every attachment first; only then build + publish the
         // single message. Any failure aborts the whole album with nothing sent.
         let mut uploads = Vec::with_capacity(items.len());
@@ -3249,7 +3280,8 @@ impl SonarClient {
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
     /// Nostr key, returning the URL where it can be fetched.
     async fn blossom_upload(&self, server_url: &str, data: Vec<u8>) -> Result<String> {
-        self.blossom_upload_with_timeout(server_url, data, BLOSSOM_UPLOAD_TIMEOUT)
+        let timeout = blossom_upload_timeout(data.len());
+        self.blossom_upload_with_timeout(server_url, data, timeout)
             .await
     }
 
@@ -5147,6 +5179,15 @@ fn is_terminal_marmot_processing_error(err: &Error) -> bool {
     )
 }
 
+/// Deadline for one Blossom upload, scaled to the payload so a large video on
+/// a slow uplink is not killed while still progressing (the fixed 60s cap
+/// predates video attachments). Floor keeps small blobs snappy to fail; the
+/// ceiling guarantees a stalled transfer still lands in the retryable state.
+fn blossom_upload_timeout(len: usize) -> Duration {
+    let transfer = Duration::from_secs(len as u64 / BLOSSOM_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC);
+    (BLOSSOM_UPLOAD_TIMEOUT + transfer).min(BLOSSOM_UPLOAD_TIMEOUT_MAX)
+}
+
 /// Chat-list preview text stored in the conversation index for `message`.
 /// The caption/text wins when present; a caption-less media message previews
 /// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
@@ -5159,9 +5200,14 @@ fn index_preview(message: &ChatMessage) -> String {
     if media.len() > 1 && media.iter().all(|m| m.mime_type.starts_with("image/")) {
         return format!("{} photos", media.len());
     }
+    if media.len() > 1 && media.iter().all(|m| m.mime_type.starts_with("video/")) {
+        return format!("{} videos", media.len());
+    }
     let first = &media[0];
     if first.mime_type.starts_with("image/") {
         "Photo".to_owned()
+    } else if first.mime_type.starts_with("video/") {
+        "Video".to_owned()
     } else if first.mime_type.starts_with("audio/") {
         "Voice note".to_owned()
     } else if first.filename.is_empty() {
@@ -5477,6 +5523,31 @@ mod tests {
             "3 photos"
         );
         assert_eq!(
+            index_preview(&msg("", vec![media_ref("video/mp4", "clip.mp4")])),
+            "Video"
+        );
+        assert_eq!(
+            index_preview(&msg(
+                "",
+                vec![
+                    media_ref("video/mp4", "a.mp4"),
+                    media_ref("video/quicktime", "b.mov"),
+                ]
+            )),
+            "2 videos"
+        );
+        // Mixed photo+video album falls through to the first attachment's kind.
+        assert_eq!(
+            index_preview(&msg(
+                "",
+                vec![
+                    media_ref("image/jpeg", "a.jpg"),
+                    media_ref("video/mp4", "b.mp4"),
+                ]
+            )),
+            "Photo"
+        );
+        assert_eq!(
             index_preview(&msg("", vec![media_ref("audio/mp4", "voice.m4a")])),
             "Voice note"
         );
@@ -5567,6 +5638,73 @@ mod tests {
         assert!(!retryable_media_http_error(&Error::Http(
             "media exceeds size cap".into()
         )));
+    }
+
+    #[test]
+    fn blossom_upload_timeout_scales_with_payload() {
+        // Small blobs keep the original 60s deadline.
+        assert_eq!(blossom_upload_timeout(0), Duration::from_secs(60));
+        assert_eq!(
+            blossom_upload_timeout(1024 * 1024),
+            Duration::from_secs(60 + 10)
+        );
+        // A max-size video gets time to transfer on a slow uplink...
+        assert_eq!(
+            blossom_upload_timeout(MAX_MEDIA_PLAINTEXT_BYTES),
+            Duration::from_secs(300)
+        );
+        // ...but never beyond the ceiling, so stalls still fail retryable.
+        assert_eq!(blossom_upload_timeout(usize::MAX), Duration::from_secs(300));
+    }
+
+    #[tokio::test]
+    async fn send_media_rejects_attachments_over_receiver_download_cap() {
+        // Receivers cannot fetch blobs over MAX_MEDIA_PLAINTEXT_BYTES, so the
+        // send side must refuse to publish an unfetchable message.
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let oversized = vec![0u8; MAX_MEDIA_PLAINTEXT_BYTES + 1];
+        let err = client
+            .send_media(&group_id, oversized, "big.mp4", "video/mp4", "", "")
+            .await
+            .expect_err("over-cap media must be rejected");
+        assert!(
+            matches!(err, Error::MediaTooLarge { bytes, max }
+                if bytes == (MAX_MEDIA_PLAINTEXT_BYTES + 1) as u64
+                    && max == MAX_MEDIA_PLAINTEXT_BYTES as u64),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_media_multi_rejects_album_over_aggregate_cap() {
+        // Every item fits individually, but the album total would hold more
+        // resident plaintext than a low-RAM phone can afford.
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let per_item = MAX_MEDIA_PLAINTEXT_BYTES;
+        let count = MAX_MEDIA_TOTAL_PLAINTEXT_BYTES / per_item + 1;
+        let items: Vec<_> = (0..count)
+            .map(|i| MediaUpload {
+                data: vec![0u8; per_item],
+                filename: format!("clip-{i}.mp4"),
+                mime: "video/mp4".to_string(),
+            })
+            .collect();
+        let err = client
+            .send_media_multi(&group_id, items, "", "")
+            .await
+            .expect_err("over-aggregate album must be rejected");
+        assert!(
+            matches!(err, Error::MediaTooLarge { bytes, max }
+                if bytes == (count * per_item) as u64
+                    && max == MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

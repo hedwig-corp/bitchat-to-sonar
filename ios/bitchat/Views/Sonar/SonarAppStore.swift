@@ -690,6 +690,14 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Bytes source for one staged attachment. Photos arrive as in-memory
+    /// `Data`; videos arrive as picker-owned temp FILES and are moved into the
+    /// preview directory without ever buffering the payload through memory.
+    enum PendingMediaPayload: Sendable {
+        case data(Data)
+        case file(URL)
+    }
+
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
@@ -719,6 +727,28 @@ final class SonarAppStore: ObservableObject {
         return try? Data(contentsOf: url)
     }
 
+    /// Move an already-on-disk picked file into the preview directory (same
+    /// volume ⇒ a rename, no byte copy). Falls back to copy across volumes.
+    private nonisolated static func moveTempMediaFile(_ source: URL, suffix: String) -> URL? {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sonar-preview")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let url = dir.appendingPathComponent(UUID().uuidString + suffix)
+        do {
+            try FileManager.default.moveItem(at: source, to: url)
+            return url
+        } catch {
+            // Consume the source either way — a file we can't stage is a file
+            // we must not strand in the picker temp dir.
+            defer { try? FileManager.default.removeItem(at: source) }
+            do {
+                try FileManager.default.copyItem(at: source, to: url)
+                return url
+            } catch {
+                return nil
+            }
+        }
+    }
+
     private nonisolated static func deleteTempMediaFile(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
     }
@@ -737,6 +767,95 @@ final class SonarAppStore: ObservableObject {
         #endif
     }
 
+    /// Receivers hard-cap media downloads at this plaintext size (core
+    /// `MAX_MEDIA_PLAINTEXT_BYTES`, read through the FFI so the sender can
+    /// never drift from receiver enforcement) — anything larger publishes a
+    /// message no client can fetch.
+    private nonisolated static let maxMediaPlaintextBytes = Int(SonarCore.maxMediaPlaintextBytes())
+
+    /// Aggregate plaintext ceiling for one album send (core
+    /// `MAX_MEDIA_TOTAL_PLAINTEXT_BYTES`): every attachment is memory-resident
+    /// at once during `send_media_multi`.
+    private nonisolated static let maxMediaTotalPlaintextBytes = Int(SonarCore.maxMediaTotalPlaintextBytes())
+
+    private nonisolated static func fileSize(_ url: URL) -> Int? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int
+    }
+
+    /// Delete picker/preview temp files older than a day. Normal flows clean
+    /// up via `defer`s; this sweep catches files stranded by a crash or kill.
+    private nonisolated static func sweepStaleMediaTempFiles() {
+        let fm = FileManager.default
+        let cutoff = Date().addingTimeInterval(-24 * 60 * 60)
+        for name in ["sonar-preview", "sonar-picked"] {
+            let dir = fm.temporaryDirectory.appendingPathComponent(name)
+            guard let files = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.contentModificationDateKey]
+            ) else { continue }
+            for file in files {
+                let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                if modified < cutoff {
+                    try? fm.removeItem(at: file)
+                }
+            }
+        }
+    }
+
+    /// Outcome of finalizing a staged video: distinguishes "cannot fit under
+    /// the cap" from an I/O or export failure so the toast never lies.
+    private enum VideoFinalizeResult: Sendable {
+        case ready(data: Data, filename: String, mime: String)
+        case tooLarge
+        case failed
+    }
+
+    /// Finalize a staged video on send confirmation (Signal-style lazy
+    /// finalization): pass the original bytes through when they already fit
+    /// under the receiver download cap, otherwise re-encode to a smaller
+    /// H.264/AAC MP4 with `AVAssetExportSession` and send that if it fits.
+    /// Consumes (deletes) the staged temp file.
+    private nonisolated static func finalizeVideoForSend(
+        _ url: URL,
+        filename: String,
+        mime: String
+    ) async -> VideoFinalizeResult {
+        defer { deleteTempMediaFile(url) }
+        if let size = fileSize(url), size <= maxMediaPlaintextBytes {
+            guard let data = readTempMediaFile(url) else { return .failed }
+            return .ready(data: data, filename: filename, mime: mime)
+        }
+        let asset = AVURLAsset(url: url)
+        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPreset960x540) else {
+            return .failed
+        }
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("sonar-preview")
+            .appendingPathComponent(UUID().uuidString + ".mp4")
+        defer { deleteTempMediaFile(outURL) }
+        export.shouldOptimizeForNetworkUse = true
+        if #available(iOS 18.0, macOS 15.0, *) {
+            do {
+                try await export.export(to: outURL, as: .mp4)
+            } catch {
+                return .failed
+            }
+        } else {
+            export.outputURL = outURL
+            export.outputFileType = .mp4
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                export.exportAsynchronously { continuation.resume() }
+            }
+            guard export.status == .completed else { return .failed }
+        }
+        guard let outSize = fileSize(outURL) else { return .failed }
+        guard outSize <= maxMediaPlaintextBytes else { return .tooLarge }
+        guard let data = readTempMediaFile(outURL) else { return .failed }
+        let stem = (filename as NSString).deletingPathExtension
+        return .ready(data: data, filename: (stem.isEmpty ? "video" : stem) + ".mp4", mime: "video/mp4")
+    }
+
     private func deletePreviewTempFilesAsync(_ previews: [PendingMediaPreview]) {
         guard !previews.isEmpty else { return }
         Task.detached(priority: .utility) {
@@ -752,17 +871,28 @@ final class SonarAppStore: ObservableObject {
     }
 
     func stageMediaPreview(_ peerId: String, data: Data, filename: String, mime: String) {
-        stageMediaPreviews(peerId, items: [(data: data, filename: filename, mime: mime)])
+        stageMediaPreviews(peerId, items: [(payload: .data(data), filename: filename, mime: mime)])
     }
 
-    /// Stage one or more picked photos for the pre-send preview. All items are
-    /// written to temp files off-main (Signal-style: full-quality until send
-    /// confirmation); the batch replaces any previously staged previews.
+    /// Stage one or more picked photos/videos for the pre-send preview. All
+    /// items land as temp files off-main (Signal-style: full-quality until send
+    /// confirmation); the batch replaces any previously staged previews. Video
+    /// temp files keep their container extension — `AVAsset` needs it to open
+    /// the file for the poster frame and the lazy send-time re-encode.
     func stageMediaPreviews(
         _ peerId: String,
-        items: [(data: Data, filename: String, mime: String)]
+        items: [(payload: PendingMediaPayload, filename: String, mime: String)]
     ) {
-        guard currentDMId == peerId, !items.isEmpty else { return }
+        guard currentDMId == peerId, !items.isEmpty else {
+            // Never staged — drop any picker-owned temp files so a video
+            // picked right before navigating away doesn't orphan on disk.
+            Task.detached(priority: .utility) {
+                for item in items {
+                    if case .file(let url) = item.payload { Self.deleteTempMediaFile(url) }
+                }
+            }
+            return
+        }
         let generation = nextMediaPreviewGeneration()
         let previous = pendingMediaPreviews
         pendingMediaPreviews = []
@@ -770,16 +900,30 @@ final class SonarAppStore: ObservableObject {
         Task { @MainActor in
             let written = await Task.detached(priority: .userInitiated, operation: { () -> [(URL, String, String)] in
                 items.compactMap { item in
-                    let suffix = item.mime == "image/gif" ? ".gif" : ".img"
-                    guard let url = Self.writeTempMediaFile(item.data, suffix: suffix) else { return nil }
-                    return (url, item.filename, item.mime)
+                    let suffix: String
+                    if item.mime == "image/gif" {
+                        suffix = ".gif"
+                    } else if item.mime.hasPrefix("video/") {
+                        let ext = (item.filename as NSString).pathExtension
+                        suffix = "." + (ext.isEmpty ? "mp4" : ext)
+                    } else {
+                        suffix = ".img"
+                    }
+                    switch item.payload {
+                    case .data(let data):
+                        guard let url = Self.writeTempMediaFile(data, suffix: suffix) else { return nil }
+                        return (url, item.filename, item.mime)
+                    case .file(let source):
+                        guard let url = Self.moveTempMediaFile(source, suffix: suffix) else { return nil }
+                        return (url, item.filename, item.mime)
+                    }
                 }
             }).value
             guard written.count == items.count else {
                 Task.detached(priority: .utility) {
                     for (url, _, _) in written { Self.deleteTempMediaFile(url) }
                 }
-                showToast("Couldn't prepare image.")
+                showToast("Couldn't prepare media.")
                 return
             }
             guard mediaPreviewGeneration == generation, currentDMId == peerId else {
@@ -805,10 +949,41 @@ final class SonarAppStore: ObservableObject {
         }
         Task { @MainActor in
             // Finalize every staged item off-main IN ORDER (lazy jpeg re-encode
-            // happens here, on send confirmation — Signal-style).
+            // and lazy video re-encode happen here, on send confirmation —
+            // Signal-style lazy finalization).
             var prepared: [(peerId: String, data: Data, filename: String, mime: String)] = []
             var encodeFailed = false
+            var videoTooLarge = false
+            var videoFailed = false
+            // Every album item is memory-resident at once through the send —
+            // bound the batch's video total like the core aggregate cap does.
+            var remainingVideoBudget = Self.maxMediaTotalPlaintextBytes
             for preview in items {
+                if preview.mime.hasPrefix("video/") {
+                    // Pass through when under the receiver download cap; else
+                    // re-encode with AVAssetExportSession to try to fit.
+                    let finalized = await Task.detached(priority: .userInitiated, operation: {
+                        await Self.finalizeVideoForSend(
+                            preview.tempURL,
+                            filename: preview.filename,
+                            mime: preview.mime
+                        )
+                    }).value
+                    switch finalized {
+                    case .ready(let data, let filename, let mime):
+                        if data.count > remainingVideoBudget {
+                            videoTooLarge = true
+                        } else {
+                            remainingVideoBudget -= data.count
+                            prepared.append((preview.peerId, data, filename, mime))
+                        }
+                    case .tooLarge:
+                        videoTooLarge = true
+                    case .failed:
+                        videoFailed = true
+                    }
+                    continue
+                }
                 guard let raw = await Task.detached(priority: .userInitiated, operation: { () -> Data? in
                     defer { Self.deleteTempMediaFile(preview.tempURL) }
                     return Self.readTempMediaFile(preview.tempURL)
@@ -824,6 +999,8 @@ final class SonarAppStore: ObservableObject {
                 }
             }
             if encodeFailed { showToast("Couldn't encode image.") }
+            if videoTooLarge { showToast("Video is too large to send (max 25 MB).") }
+            if videoFailed { showToast("Couldn't prepare video.") }
             // Group per peer: 2+ items to one peer send as ONE album message;
             // a single item keeps the exact pre-album behavior.
             let peersInOrder = prepared.map(\.peerId).reduce(into: [String]()) {
@@ -841,8 +1018,16 @@ final class SonarAppStore: ObservableObject {
                     }
                     sendImageAlbum(peer, items: numbered)
                 } else if let only = list.first {
-                    if only.mime == "image/gif" {
-                        _ = sendAttachment(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
+                    if only.mime == "image/gif" || only.mime.hasPrefix("video/") {
+                        // The attachment path preserves the source MIME (GIF
+                        // animation, video container) instead of forcing JPEG.
+                        // A false return means NO route took the payload —
+                        // never dismiss the preview into silence.
+                        if !sendAttachment(only.peerId, data: only.data, filename: only.filename, mime: only.mime) {
+                            showToast(only.mime.hasPrefix("video/")
+                                ? "Couldn't send video — start the secure chat first."
+                                : "Couldn't send attachment — start the secure chat first.")
+                        }
                     } else {
                         sendImage(only.peerId, data: only.data, filename: only.filename, mime: only.mime)
                     }
@@ -1236,6 +1421,13 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
+
+        // A crash or kill mid pick/preview/export bypasses every `defer`, so
+        // stale picker/preview temp files (multi-MB for videos) are swept by
+        // age on launch.
+        Task.detached(priority: .utility) {
+            Self.sweepStaleMediaTempFiles()
+        }
     }
 
     /// Identity publication happens before the encrypted DB opens so BLE can
@@ -5141,12 +5333,20 @@ final class SonarAppStore: ObservableObject {
             // Per-item over mesh (no album packet), preserving each MIME:
             // sendImageOverMesh forces JPEG, so route GIFs through the file
             // path to keep the animation instead of flattening it.
+            var failed = 0
             for item in items {
-                if item.mime == "image/gif" {
-                    _ = sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime)
+                if item.mime == "image/gif" || item.mime.hasPrefix("video/") {
+                    if !sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime) {
+                        failed += 1
+                    }
                 } else {
                     sendImageOverMesh(PeerID(str: id), data: item.data)
                 }
+            }
+            if failed > 0 {
+                showToast(failed == 1
+                    ? "1 attachment couldn't be sent — start the secure chat first."
+                    : "\(failed) attachments couldn't be sent — start the secure chat first.")
             }
             return
         }
@@ -5218,11 +5418,15 @@ final class SonarAppStore: ObservableObject {
         let safeName = snEncryptedAttachmentFilename(filename)
         let safeMime = snEncryptedAttachmentMime(mime)
         if meshReachable(id) {
-            guard FileTransferLimits.isValidPayload(data.count) else { return false }
-            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
-            let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
-            chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
-            return true
+            if FileTransferLimits.isValidPayload(data.count) {
+                chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+                let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
+                chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
+                return true
+            }
+            // Payload exceeds the mesh file-packet limit (videos usually do) —
+            // fall through to the White Noise route below instead of silently
+            // refusing while a perfectly good encrypted route exists.
         }
 
         let groupId: String?

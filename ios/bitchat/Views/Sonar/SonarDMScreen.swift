@@ -11,12 +11,46 @@
 // For more information, see <https://unlicense.org>
 //
 
+import AVFoundation
 import SwiftUI
 import PhotosUI
 import UniformTypeIdentifiers
 #if os(iOS)
 import ImageIO
 #endif
+
+/// Movie payload from the Photos picker delivered as a FILE: the transfer
+/// lands on disk and is copied into our own temp dir (the picker deletes its
+/// copy when the import closure returns), so a large video never buffers
+/// through memory on the pick path.
+private struct PickedVideoFile: Transferable {
+    let url: URL
+
+    var suggestedFilename: String {
+        let ext = url.pathExtension.lowercased()
+        return "video." + (ext.isEmpty ? "mp4" : ext)
+    }
+
+    var mime: String {
+        switch url.pathExtension.lowercased() {
+        case "mov": return "video/quicktime"
+        case "webm": return "video/webm"
+        case "mkv": return "video/x-matroska"
+        default: return "video/mp4"
+        }
+    }
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .movie) { received in
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("sonar-picked")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let ext = received.file.pathExtension.isEmpty ? "mp4" : received.file.pathExtension
+            let dest = dir.appendingPathComponent(UUID().uuidString + "." + ext)
+            try FileManager.default.copyItem(at: received.file, to: dest)
+            return Self(url: dest)
+        }
+    }
+}
 
 /// Thin wrapper that resolves the per-conversation render state from the
 /// store: `@ObservedObject` needs the object at init, and the environment
@@ -232,7 +266,7 @@ struct SonarDMScreenContent: View {
                     }
                 }
                 if store.canSendMedia(peerId) {
-                    SNActionRow(icon: .lock, label: "Send photo or GIF", desc: "Encrypted end-to-end over White Noise") {
+                    SNActionRow(icon: .lock, label: "Send photo or video", desc: "Encrypted end-to-end over White Noise") {
                         sheet = false
                         pickPhoto = true
                     }
@@ -265,24 +299,53 @@ struct SonarDMScreenContent: View {
             isPresented: $pickPhoto,
             selection: $photoItems,
             maxSelectionCount: 10,
-            matching: .images,
+            matching: .any(of: [.images, .videos]),
             preferredItemEncoding: .current
         )
         .onChange(of: photoItems) { items in
             guard !items.isEmpty else { return }
             Task {
                 // Load every pick in selection order; 2+ stage as one album.
-                var staged: [(data: Data, filename: String, mime: String)] = []
+                // Videos land as picker-owned temp FILES (never buffered
+                // through memory here); photos load as Data like before.
+                var staged: [(payload: SonarAppStore.PendingMediaPayload, filename: String, mime: String)] = []
+                // An iCloud download/export can fail per item — count it so a
+                // partially imported album never sends in silence.
+                var failedImports = 0
                 for item in items {
-                    guard let data = try? await item.loadTransferable(type: Data.self) else { continue }
+                    let isVideo = item.supportedContentTypes.contains {
+                        $0.conforms(to: .movie) || $0.conforms(to: .audiovisualContent)
+                    }
+                    if isVideo {
+                        guard let picked = try? await item.loadTransferable(type: PickedVideoFile.self) else {
+                            failedImports += 1
+                            continue
+                        }
+                        staged.append((
+                            payload: .file(picked.url),
+                            filename: picked.suggestedFilename,
+                            mime: picked.mime
+                        ))
+                        continue
+                    }
+                    guard let data = try? await item.loadTransferable(type: Data.self) else {
+                        failedImports += 1
+                        continue
+                    }
                     if data.snIsGif {
-                        staged.append((data: data, filename: "animation.gif", mime: "image/gif"))
+                        staged.append((payload: .data(data), filename: "animation.gif", mime: "image/gif"))
                     } else {
-                        staged.append((data: data, filename: "photo.jpg", mime: "image/jpeg"))
+                        staged.append((payload: .data(data), filename: "photo.jpg", mime: "image/jpeg"))
                     }
                 }
                 let toStage = staged
+                let failed = failedImports
                 await MainActor.run {
+                    if failed > 0 {
+                        showToast(failed == 1
+                            ? "Couldn't load 1 item from your library."
+                            : "Couldn't load \(failed) items from your library.")
+                    }
                     if !toStage.isEmpty {
                         store.stageMediaPreviews(peerId, items: toStage)
                     }
@@ -747,9 +810,18 @@ struct SonarDMScreenContent: View {
     }
 }
 
+/// One staged attachment in the pre-send preview pager. Images/GIFs carry
+/// their bytes; videos carry only a poster frame (never the full payload).
+private struct SendPreviewItem {
+    let data: Data?
+    let isGif: Bool
+    let isVideo: Bool
+    let poster: CGImage?
+    let filename: String
+}
+
 private struct MediaSendPreviewView: View {
-    /// (bytes, isGif) per staged item, in pick order.
-    let items: [(data: Data, isGif: Bool)]
+    let items: [SendPreviewItem]
     let onSend: () -> Void
     let onCancel: () -> Void
 
@@ -824,13 +896,34 @@ private struct MediaSendPreviewView: View {
     }
 
     @ViewBuilder
-    private func singleImage(_ item: (data: Data, isGif: Bool)) -> some View {
+    private func singleImage(_ item: SendPreviewItem) -> some View {
         #if os(iOS)
-        if item.isGif {
-            GifImageView(data: item.data)
+        if item.isVideo {
+            ZStack {
+                if let poster = item.poster {
+                    Image(decorative: poster, scale: 1)
+                        .resizable()
+                        .scaledToFit()
+                        .ignoresSafeArea()
+                        .padding(.bottom, 80)
+                }
+                VStack(spacing: 8) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 44))
+                        .foregroundColor(.white)
+                    if item.poster == nil {
+                        Text(item.filename)
+                            .font(SonarTheme.uiFont(size: 14))
+                            .foregroundColor(.white.opacity(0.75))
+                            .lineLimit(1)
+                    }
+                }
+            }
+        } else if item.isGif, let data = item.data {
+            GifImageView(data: data)
                 .ignoresSafeArea()
                 .padding(.bottom, 80)
-        } else if let uiImage = UIImage(data: item.data) {
+        } else if let data = item.data, let uiImage = UIImage(data: data) {
             Image(uiImage: uiImage)
                 .resizable()
                 .scaledToFit()
@@ -851,7 +944,7 @@ private struct MediaSendPreviewLoaderView: View {
     let onSend: () -> Void
     let onCancel: () -> Void
 
-    @State private var items: [(data: Data, isGif: Bool)]?
+    @State private var items: [SendPreviewItem]?
 
     private var loadKey: String {
         previews.map(\.tempURL.absoluteString).joined(separator: "|")
@@ -876,11 +969,42 @@ private struct MediaSendPreviewLoaderView: View {
         .task(id: loadKey) {
             let toLoad = previews
             items = await Task.detached(priority: .userInitiated) {
-                toLoad.compactMap { preview in
-                    guard let data = try? Data(contentsOf: preview.tempURL) else { return nil }
-                    return (data: data, isGif: preview.mime == "image/gif")
+                var loaded: [SendPreviewItem] = []
+                for preview in toLoad {
+                    if preview.mime.hasPrefix("video/") {
+                        // Poster frame only — never buffer the full video.
+                        let poster = await Self.videoPoster(preview.tempURL)
+                        loaded.append(SendPreviewItem(
+                            data: nil,
+                            isGif: false,
+                            isVideo: true,
+                            poster: poster,
+                            filename: preview.filename
+                        ))
+                        continue
+                    }
+                    guard let data = try? Data(contentsOf: preview.tempURL) else { continue }
+                    loaded.append(SendPreviewItem(
+                        data: data,
+                        isGif: preview.mime == "image/gif",
+                        isVideo: false,
+                        poster: nil,
+                        filename: preview.filename
+                    ))
                 }
+                return loaded
             }.value
+        }
+    }
+
+    private static func videoPoster(_ url: URL) async -> CGImage? {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+        generator.appliesPreferredTrackTransform = true
+        let time = CMTime(seconds: 0.03, preferredTimescale: 600)
+        if #available(iOS 16.0, macOS 13.0, *) {
+            return try? await generator.image(at: time).image
+        } else {
+            return try? generator.copyCGImage(at: time, actualTime: nil)
         }
     }
 }

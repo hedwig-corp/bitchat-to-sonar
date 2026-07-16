@@ -43,7 +43,7 @@ private const val MEDIA_SHARE_CACHE_MAX_AGE_MS = 24L * 60L * 60L * 1000L
 
 @Composable
 actual fun rememberPhotoPicker(
-    onPicked: (items: List<PickedPhoto>) -> Unit
+    onPicked: (items: List<PickedPhoto>, rejectedTooLarge: Int) -> Unit
 ): () -> Unit {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -53,30 +53,92 @@ actual fun rememberPhotoPicker(
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
         scope.launch(Dispatchers.IO) {
             // Load every pick in selection order; 2+ stage as one album.
+            var rejectedTooLarge = 0
+            // Every album item is memory-resident at once through the send, so
+            // the videos in one pick share an aggregate budget on top of the
+            // per-item receiver download cap.
+            var remainingVideoBudget = MAX_ALBUM_TOTAL_VIDEO_BYTES
             val items = uris.mapNotNull { uri ->
-                val raw = ctx.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                    ?: return@mapNotNull null
-                val sourceMime = ctx.contentResolver.getType(uri).orEmpty()
-                val sourceName = ctx.displayNameForUri(uri) ?: "photo"
-                if (sourceMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
-                    val filename = sourceName.takeIf { it.endsWith(".gif", ignoreCase = true) }
+                val declaredMime = ctx.contentResolver.getType(uri).orEmpty()
+                val sourceName = ctx.displayNameForUri(uri)
+                val videoMime = pickedVideoMime(declaredMime, sourceName.orEmpty())
+                if (videoMime != null) {
+                    // Videos can far exceed the receiver download cap — check
+                    // the provider-reported size BEFORE buffering anything.
+                    val read = ctx.readBounded(uri, minOf(MAX_INTERNET_ATTACHMENT_BYTES, remainingVideoBudget))
+                    if (read.tooLarge) {
+                        rejectedTooLarge += 1
+                        return@mapNotNull null
+                    }
+                    val raw = read.bytes ?: return@mapNotNull null
+                    remainingVideoBudget -= raw.size.toLong()
+                    return@mapNotNull PickedPhoto(raw, sourceName ?: "video.mp4", videoMime)
+                }
+                // Images stay bounded too: a provider that misreports the MIME
+                // of a huge file must never trigger an unbounded readBytes().
+                val read = ctx.readBounded(uri, IMAGE_READ_SANITY_BYTES)
+                if (read.tooLarge) {
+                    rejectedTooLarge += 1
+                    return@mapNotNull null
+                }
+                val raw = read.bytes ?: return@mapNotNull null
+                val name = sourceName ?: "photo"
+                if (declaredMime.equals("image/gif", ignoreCase = true) || raw.isGifBytes()) {
+                    val filename = name.takeIf { it.endsWith(".gif", ignoreCase = true) }
                         ?: "animation.gif"
                     PickedPhoto(raw, filename, "image/gif")
                 } else {
                     // Raw bytes — JPEG re-encoding happens lazily on send confirmation.
-                    PickedPhoto(raw, sourceName.ifBlank { "photo" }, sourceMime.ifBlank { "image/jpeg" })
+                    PickedPhoto(raw, name.ifBlank { "photo" }, declaredMime.ifBlank { "image/jpeg" })
                 }
             }
-            if (items.isNotEmpty()) {
-                withContext(Dispatchers.Main) { onPicked(items) }
+            if (items.isNotEmpty() || rejectedTooLarge > 0) {
+                withContext(Dispatchers.Main) { onPicked(items, rejectedTooLarge) }
             }
         }
     }
     return {
         launcher.launch(
-            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
         )
     }
+}
+
+/** Sanity ceiling for a picked image read. Real photos re-encode to JPEG on
+ *  send, so this only guards the pathological case: a provider misreporting a
+ *  multi-GB file as an image and OOMing the unbounded read. */
+private const val IMAGE_READ_SANITY_BYTES = 128L * 1024L * 1024L
+
+private class BoundedVideoRead(val bytes: ByteArray?, val tooLarge: Boolean)
+
+/** Read a picked item fully, refusing to buffer anything over [maxBytes].
+ *  Provider-reported size rejects cheaply; an unreported size is enforced
+ *  while streaming so an over-cap file never materializes in memory. */
+private fun Context.readBounded(uri: Uri, maxBytes: Long): BoundedVideoRead {
+    val metadata = pickedFileMetadata(uri)
+    if (metadata.size != null && metadata.size > maxBytes) {
+        return BoundedVideoRead(null, tooLarge = true)
+    }
+    var tooLarge = false
+    val bytes = runCatching {
+        contentResolver.openInputStream(uri)?.use { input ->
+            val output = ByteArrayOutputStream(minOf(metadata.size ?: DEFAULT_BUFFER_SIZE.toLong(), maxBytes).toInt())
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var total = 0L
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > maxBytes) {
+                    tooLarge = true
+                    return@use null
+                }
+                output.write(buffer, 0, read)
+            }
+            output.toByteArray()
+        }
+    }.getOrNull()
+    return BoundedVideoRead(bytes, tooLarge)
 }
 
 @Composable
@@ -240,6 +302,17 @@ actual fun MediaImage(
 
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+
+actual fun decodeVideoPosterFrame(path: String): ImageBitmap? =
+    runCatching {
+        val retriever = android.media.MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(path)
+            retriever.frameAtTime?.asImageBitmap()
+        } finally {
+            retriever.release()
+        }
+    }.getOrNull()
 
 @Composable
 actual fun rememberMediaActions(): MediaActions {

@@ -124,6 +124,12 @@ xcodebuild -create-xcframework "${ARGS[@]}" -output "$XCFRAMEWORK"
 # --- install generated Swift into the package ---------------------------------
 mkdir -p "$PKG_DIR/Sources"
 cp "$GEN_DIR/sonar_ffi.swift" "$PKG_DIR/Sources/SonarFFI.swift"
+# Normalize generator churn so the checked-in file passes `git diff --check`:
+# strip trailing whitespace and guarantee a final newline.
+sed -i '' -e 's/[[:space:]]*$//' "$PKG_DIR/Sources/SonarFFI.swift"
+if [ -n "$(tail -c1 "$PKG_DIR/Sources/SonarFFI.swift")" ]; then
+    printf '\n' >> "$PKG_DIR/Sources/SonarFFI.swift"
+fi
 
 log "Done."
 log "  $XCFRAMEWORK ($(du -sh "$XCFRAMEWORK" | cut -f1))"
