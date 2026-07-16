@@ -202,6 +202,10 @@ object MeshGatt {
             transact { engine.onTick(now) }
             if (tickArmed) handler.postDelayed(this, TICK_MS)
         }
+
+        /** Re-read the clock so rx that landed since the decision spares the link. */
+        private fun stillStale(lastRx: Long?): Boolean =
+            lastRx != null && nowMonotonic() - lastRx >= LINK_STALE_MS
     }
 
     fun startServer() {
