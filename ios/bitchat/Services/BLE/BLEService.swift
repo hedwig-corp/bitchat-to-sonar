@@ -87,6 +87,18 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
+    /// False while the radio is unusable (`.poweredOff` / `.unauthorized` / `.resetting`).
+    ///
+    /// Announces are processed on `messageQueue`, so one received a few ms before
+    /// the radio died can land *after* `invalidateMeshLinks` ran and re-mark the
+    /// peer connected off its full TTL alone — resurrecting a dead route. The
+    /// announce handler gates `isConnected` on this flag to prevent that.
+    ///
+    /// MUST be accessed only under `collectionsQueue` (same discipline as `peers`):
+    /// reads inside `collectionsQueue.sync`, writes inside
+    /// `collectionsQueue.sync(flags: .barrier)`. That keeps the demote and the
+    /// flag flip atomic with respect to announce processing.
+    private var meshRadioAvailable = true
     private var currentPeerIDs: [PeerID] {
         Array(peers.keys)
     }
@@ -1924,14 +1936,16 @@ extension BLEService: CBCentralManagerDelegate {
 
     /// State handling split out of the delegate callback so the radio-off path is
     /// reachable without a live `CBCentralManager` (its `state` cannot be forced).
-    func handleCentralState(_ state: CBManagerState, central: CBCentralManager?) {
-        // Serialize against real CoreBluetooth delegate callbacks: this method
-        // mutates bleQueue-confined state (peripherals / peerToPeripheralUUID),
-        // but is also reachable from the test thread. Hop onto bleQueue when we
-        // are not already on it.
-        if DispatchQueue.getSpecific(key: bleQueueKey) == nil {
-            return bleQueue.sync { handleCentralState(state, central: central) }
-        }
+    ///
+    /// Runs on `bleQueue`: it mutates bleQueue-confined state (`peripherals` /
+    /// `peerToPeripheralUUID`) and reaches `captureBluetoothStatus`, which does a
+    /// `DispatchQueue.main.sync`. Calling this from the main thread would deadlock
+    /// (main waits on bleQueue, bleQueue waits on main), so callers must already
+    /// be on bleQueue — the CB delegate callbacks are, and tests use
+    /// `_test_handleCentralState`.
+    private func handleCentralState(_ state: CBManagerState, central: CBCentralManager?) {
+        assert(DispatchQueue.getSpecific(key: bleQueueKey) != nil, "handleCentralState must run on bleQueue")
+
         // Notify delegate about state change on main thread
         Task { @MainActor in
             self.delegate?.didUpdateBluetoothState(state)
@@ -1939,6 +1953,9 @@ extension BLEService: CBCentralManagerDelegate {
 
         switch state {
         case .poweredOn:
+            // Radio usable again: reopen the announce gate closed by a previous
+            // .poweredOff / .unauthorized / .resetting before rebuilding links.
+            markMeshRadioAvailable()
             // Start scanning - use allow duplicates for faster discovery when active
             startScanning()
 
@@ -1969,10 +1986,17 @@ extension BLEService: CBCentralManagerDelegate {
         case .resetting:
             // Bluetooth stack is resetting - will get another state update when done.
             // The OS invalidates every connection here and delivers no
-            // didDisconnectPeripheral, so demote link state now (peripherals /
-            // peerToPeripheralUUID are left intact: the OS restores the manager
-            // and .poweredOn follows).
+            // didDisconnectPeripheral, so clear the link maps as well as the peer
+            // state: a stale peripherals entry makes linkState(for:) report a live
+            // link, which both re-marks the peer connected off a relayed announce
+            // and disables the checkPeerConnectivity safety net (it only demotes
+            // when no link is recorded), and it consumes the connection budget so
+            // rediscovered peripherals get skipped. No CoreBluetooth calls here —
+            // the manager is unusable mid-reset. .poweredOn rebuilds everything via
+            // a fresh scan and the announces that follow.
             SecureLogger.info("🔄 Bluetooth stack resetting...", category: .session)
+            peripherals.removeAll()
+            peerToPeripheralUUID.removeAll()
             invalidateMeshLinks(reason: "Bluetooth resetting")
 
         case .unknown:
@@ -2334,6 +2358,15 @@ extension BLEService {
         }
         handleReceivedPacket(packet, from: fromPeerID)
     }
+
+    /// Drive the central state machine without a live `CBCentralManager` (its
+    /// `state` cannot be forced). The sync hop onto bleQueue is confined to test
+    /// code on purpose: `handleCentralState` reaches a `DispatchQueue.main.sync`
+    /// via `captureBluetoothStatus`, so a main-thread caller would deadlock.
+    /// Tests run this off the main thread's critical path, from the test thread.
+    func _test_handleCentralState(_ state: CBManagerState) {
+        bleQueue.sync { handleCentralState(state, central: nil) }
+    }
 }
 #endif
 
@@ -2594,6 +2627,10 @@ extension BLEService: CBPeripheralManagerDelegate {
 
         switch peripheral.state {
         case .poweredOn:
+            // Radio usable again: reopen the announce gate closed by a previous
+            // .poweredOff / .unauthorized / .resetting before rebuilding links.
+            markMeshRadioAvailable()
+
             // Remove all services first to ensure clean state
             peripheral.removeAllServices()
 
@@ -2640,8 +2677,18 @@ extension BLEService: CBPeripheralManagerDelegate {
 
         case .resetting:
             // Bluetooth stack is resetting - the OS invalidates every connection
-            // here without didUnsubscribeFrom callbacks, so demote link state now.
+            // here without didUnsubscribeFrom callbacks, so clear the subscription
+            // maps too: a stale centralToPeerID entry makes linkState(for:) report
+            // a live central link, which re-marks the peer connected off a relayed
+            // announce and disables the checkPeerConnectivity safety net. No
+            // CoreBluetooth calls here (no stopAdvertising) — the manager is
+            // unusable mid-reset; .poweredOn re-creates the characteristic and
+            // re-adds the service.
             SecureLogger.info("🔄 Bluetooth peripheral stack resetting...", category: .session)
+            subscribedCentrals.removeAll()
+            centralToPeerID.removeAll()
+            centralSubscriptionRateLimits.removeAll()
+            characteristic = nil
             invalidateMeshLinks(reason: "Bluetooth resetting")
 
         case .unknown:
@@ -4296,6 +4343,8 @@ extension BLEService {
         // Track if this is a new or reconnected peer
         var isNewPeer = false
         var isReconnectedPeer = false
+        var hasDirectLink = false
+        var directAnnounceAccepted = false
         let directLinkState = linkState(for: peerID)
         
         collectionsQueue.sync(flags: .barrier) {
@@ -4308,22 +4357,30 @@ extension BLEService {
             
             // Direct announces arrive with full TTL (no prior hop)
             let isDirectAnnounce = (packet.ttl == messageTTL)
-            
+
+            // A full-TTL announce alone proves nothing once the radio is off: it
+            // may have been queued on messageQueue before the radio died. Gate
+            // every direct-link claim on the radio still being usable, otherwise
+            // this resurrects the link invalidateMeshLinks just retired.
+            hasDirectLink = meshRadioAvailable
+                && (isDirectAnnounce || hasPeripheralConnection || hasCentralSubscription)
+            directAnnounceAccepted = meshRadioAvailable && isDirectAnnounce
+
             // Check if we already have this peer (might be reconnecting)
             let existingPeer = peers[peerID]
             let wasDisconnected = existingPeer?.isConnected == false
-            
+
             // Set flags for use outside the sync block
             isNewPeer = (existingPeer == nil)
             isReconnectedPeer = wasDisconnected
-            
+
             // Update or create peer info
             if let existing = existingPeer, existing.isConnected {
                 // Update lastSeen and identity info
                 peers[peerID] = PeerInfo(
                     peerID: existing.peerID,
                     nickname: announcement.nickname,
-                    isConnected: isDirectAnnounce || hasPeripheralConnection || hasCentralSubscription,
+                    isConnected: hasDirectLink,
                     noisePublicKey: announcement.noisePublicKey,
                     signingPublicKey: announcement.signingPublicKey,
                     isVerifiedNickname: true,
@@ -4334,16 +4391,17 @@ extension BLEService {
                 peers[peerID] = PeerInfo(
                     peerID: peerID,
                     nickname: announcement.nickname,
-                    isConnected: isDirectAnnounce || hasPeripheralConnection || hasCentralSubscription,
+                    isConnected: hasDirectLink,
                     noisePublicKey: announcement.noisePublicKey,
                     signingPublicKey: announcement.signingPublicKey,
                     isVerifiedNickname: true,
                     lastSeen: Date()
                 )
             }
-            
-            // Log connection status only for direct connectivity changes; debounce to reduce spam
-            if isDirectAnnounce || hasPeripheralConnection || hasCentralSubscription {
+
+            // Log connection status only for direct connectivity changes; debounce to reduce spam.
+            // Uses the gated value so a log never claims a link the gate refused.
+            if hasDirectLink {
                 let now = Date()
                 if existingPeer == nil {
                     SecureLogger.debug("🆕 New peer: \(announcement.nickname)", category: .session)
@@ -4385,8 +4443,10 @@ extension BLEService {
             // Get current peer list (after addition)
             let currentPeerIDs = self.collectionsQueue.sync { self.currentPeerIDs }
             
-            // Only notify of connection for new or reconnected peers when it is a direct announce
-            if (packet.ttl == self.messageTTL) && (isNewPeer || isReconnectedPeer) {
+            // Only notify of connection for new or reconnected peers when it is a
+            // direct announce that the radio gate accepted (see meshRadioAvailable):
+            // a full-TTL announce queued before the radio died must not report a connect.
+            if directAnnounceAccepted && (isNewPeer || isReconnectedPeer) {
                 self.delegate?.didConnectToPeer(peerID)
                 // Schedule initial unicast sync to this peer
                 self.gossipSyncManager?.scheduleInitialSyncToPeer(peerID, delaySeconds: 1.0)
@@ -4768,6 +4828,10 @@ extension BLEService {
     /// is off instead of falling back to White Noise.
     private func invalidateMeshLinks(reason: String) {
         let disconnected: [PeerID] = collectionsQueue.sync(flags: .barrier) {
+            // Demote and close the gate atomically, so an announce racing us on
+            // messageQueue either sees a live radio (before) or a dead one
+            // (after) — never a dead radio with the gate still open.
+            meshRadioAvailable = false
             var changed: [PeerID] = []
             for (peerID, peer) in peers where peer.isConnected {
                 var updated = peer
@@ -4777,6 +4841,9 @@ extension BLEService {
             }
             return changed
         }
+        // Note: the gate above is closed unconditionally — it must stay closed
+        // even when no peer was connected, so a late announce cannot open a
+        // route on a radio that is off.
         guard !disconnected.isEmpty else { return }
 
         SecureLogger.info("📴 \(reason): dropped \(disconnected.count) mesh link(s)", category: .session)
@@ -4790,6 +4857,15 @@ extension BLEService {
             // Publish snapshots so UnifiedPeerService drops the connection icons
             self.requestPeerDataPublish()
             self.delegate?.didUpdatePeerList(currentPeerIDs)
+        }
+    }
+
+    /// Reopen the announce gate closed by `invalidateMeshLinks` once the radio is
+    /// usable again. Links are not restored here: `.poweredOn` rebuilds them via a
+    /// fresh scan and the announces that follow.
+    private func markMeshRadioAvailable() {
+        collectionsQueue.sync(flags: .barrier) {
+            meshRadioAvailable = true
         }
     }
 

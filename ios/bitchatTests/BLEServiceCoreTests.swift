@@ -76,10 +76,106 @@ struct BLEServiceCoreTests {
         ble._test_handlePacket(packet, fromPeerID: sender)
         #expect(ble.isPeerConnected(sender))
 
-        ble.handleCentralState(.poweredOff, central: nil)
+        ble._test_handleCentralState(.poweredOff)
 
         #expect(!ble.isPeerConnected(sender))
         #expect(!ble.isPeerReachable(sender))
+    }
+
+    // Revoking Bluetooth permission kills the links the same way powering the
+    // radio off does, and with the same silence from CoreBluetooth.
+    @Test
+    func bluetoothUnauthorized_stopsRoutingOverMesh() {
+        let ble = makeService()
+        let sender = PeerID(str: "1122334455667788")
+        let packet = makePublicPacket(
+            content: "Hello",
+            sender: sender,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
+        )
+
+        ble._test_handlePacket(packet, fromPeerID: sender)
+        #expect(ble.isPeerConnected(sender))
+
+        ble._test_handleCentralState(.unauthorized)
+
+        #expect(!ble.isPeerConnected(sender))
+        #expect(!ble.isPeerReachable(sender))
+    }
+
+    // A stack reset invalidates every connection with no callback either. The
+    // link maps must be cleared too, otherwise linkState(for:) keeps reporting a
+    // live link — which both re-marks the peer connected off a relayed announce
+    // and disables the checkPeerConnectivity sweep that would demote it.
+    @Test
+    func bluetoothResetting_stopsRoutingOverMesh() {
+        let ble = makeService()
+        let sender = PeerID(str: "1122334455667788")
+        let packet = makePublicPacket(
+            content: "Hello",
+            sender: sender,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000)
+        )
+
+        ble._test_handlePacket(packet, fromPeerID: sender)
+        #expect(ble.isPeerConnected(sender))
+
+        ble._test_handleCentralState(.resetting)
+
+        #expect(!ble.isPeerConnected(sender))
+        #expect(!ble.isPeerReachable(sender))
+    }
+
+    // Announces are processed on messageQueue, so one received a few ms before
+    // the radio died can land after the invalidation. A full-TTL announce alone
+    // used to re-mark the peer connected with no radio check, resurrecting the
+    // dead route and putting the ~8-13s demote back on the critical path.
+    @Test
+    func announceAfterRadioOffDoesNotResurrectMeshRoute() async throws {
+        let ble = makeService()
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Late Announce",
+            noisePublicKey: signer.getStaticPublicKeyData(),
+            signingPublicKey: signer.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let peerID = PeerID(publicKey: announcement.noisePublicKey)
+        let announcePayload = try #require(announcement.encode(), "Failed to encode announcement")
+
+        func signedAnnounce(at timestamp: UInt64) throws -> BitchatPacket {
+            // ttl == messageTTL marks this a direct (full-TTL) announce — the
+            // exact shape that used to imply "connected" on its own.
+            try #require(signer.signPacket(BitchatPacket(
+                type: MessageType.announce.rawValue,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: timestamp,
+                payload: announcePayload,
+                signature: nil,
+                ttl: 7
+            )), "Failed to sign announce packet")
+        }
+
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        // preseedPeer: false throughout — the preseed path sets isConnected
+        // directly and would defeat the test.
+        ble._test_handlePacket(try signedAnnounce(at: now), fromPeerID: peerID, preseedPeer: false)
+
+        let didConnect = await TestHelpers.waitUntil({ ble.isPeerConnected(peerID) },
+                                                     timeout: TestConstants.shortTimeout)
+        #expect(didConnect)
+
+        ble._test_handleCentralState(.poweredOff)
+        #expect(!ble.isPeerConnected(peerID))
+
+        // The announce that was already in flight when the radio died.
+        ble._test_handlePacket(try signedAnnounce(at: now + 1), fromPeerID: peerID, preseedPeer: false)
+
+        let didResurrect = await TestHelpers.waitUntil({ ble.isPeerConnected(peerID) }, timeout: 0.3)
+        #expect(!didResurrect)
+        #expect(!ble.isPeerConnected(peerID))
     }
 
     @Test
