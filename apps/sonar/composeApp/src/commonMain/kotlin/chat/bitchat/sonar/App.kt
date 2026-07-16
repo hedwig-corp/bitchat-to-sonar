@@ -807,6 +807,30 @@ private fun ChannelHint() {
 private fun transcriptFeedKey(item: Any): String =
     if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
 
+/** Bounds an image bubble renders within (design: .bc-msg media). */
+internal val MAX_MEDIA_BUBBLE_WIDTH = 240.dp
+internal val MAX_MEDIA_BUBBLE_HEIGHT = 300.dp
+
+/**
+ * The box a decoded image bubble occupies: [intrinsic] scaled down to fit
+ * [maxWidth]×[maxHeight] with the aspect ratio preserved, never upscaled.
+ * This mirrors how `MediaImage` lays out (ContentScale.Fit under widthIn/heightIn
+ * maxes) — reserving it up front keeps the transcript from reflowing when the
+ * bytes arrive. Coercing each axis independently would NOT match: a 360×803dp
+ * portrait fits to 135×300, not 240×300, and the extra width would show as
+ * background bars beside the image.
+ */
+internal fun mediaBubbleFittedSize(intrinsic: DpSize, maxWidth: Dp, maxHeight: Dp): DpSize {
+    if (intrinsic.width <= 0.dp || intrinsic.height <= 0.dp) return DpSize(0.dp, 0.dp)
+    val scale = minOf(maxWidth / intrinsic.width, maxHeight / intrinsic.height, 1f)
+    // Clamp: scaling by a Float can land a hair over the bound (800dp * 240/800
+    // = 240.00002dp), and the reserved box must never exceed what Fit renders.
+    return DpSize(
+        (intrinsic.width * scale).coerceAtMost(maxWidth),
+        (intrinsic.height * scale).coerceAtMost(maxHeight),
+    )
+}
+
 /** One observed frame of transcript tail state for [TranscriptTailPinner].
  *  [viewportHeight] keeps successive IME-resize frames distinct so a
  *  `distinctUntilChanged` flow never swallows a shrink step. */
@@ -2282,23 +2306,23 @@ private fun MediaBubble(
             // Signal pre-sizes media cells from stored attachment dimensions so
             // the decoded image never reflows the transcript (Signal-Android
             // ThumbnailView measures EXACTLY from DB width/height; Signal-iOS
-            // CVMediaAlbumView measures from sourceMediaSizePixels). MediaImage
-            // lays out at intrinsic pixels coerced per-axis into the 240×300
-            // maxes, so the same coercion here reserves the final box before
-            // any bytes arrive. Dimension-less media keeps the legacy skeleton.
+            // CVMediaAlbumView measures from sourceMediaSizePixels). Reserve the
+            // box MediaImage will occupy once decoded, so it holds its place
+            // before any bytes arrive. Dimension-less media keeps the skeleton.
             val density = LocalDensity.current
             val reservedSize = remember(media.width, media.height, maxBubbleWidth, density) {
                 val w = media.width ?: 0
                 val h = media.height ?: 0
                 if (w > 0 && h > 0) with(density) {
-                    DpSize(
-                        w.toDp().coerceAtMost(minOf(240.dp, maxBubbleWidth)),
-                        h.toDp().coerceAtMost(300.dp),
+                    mediaBubbleFittedSize(
+                        intrinsic = DpSize(w.toDp(), h.toDp()),
+                        maxWidth = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth),
+                        maxHeight = MAX_MEDIA_BUBBLE_HEIGHT,
                     )
                 } else null
             }
             Box(
-                (if (reservedSize != null) Modifier.size(reservedSize) else Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)))
+                (if (reservedSize != null) Modifier.size(reservedSize) else Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth)))
                     .clip(bubbleShape).background(s.surface2)
                     .clickable {
                         when (transfer.phase) {
@@ -2315,7 +2339,8 @@ private fun MediaBubble(
                         MediaImage(
                             bytes = bytes,
                             isGif = renderAsGif,
-                            modifier = Modifier.widthIn(max = minOf(240.dp, maxBubbleWidth)).heightIn(max = 300.dp)
+                            modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
+                                .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
                         )
                         if (renderAsGif) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                         // media-chip: glass time + via pill bottom-right.
