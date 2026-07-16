@@ -62,6 +62,21 @@ const DEFAULT_RELAYS: &[&str] = &[
     "wss://nostr.relay.hedwig.sh",
 ];
 
+/// Relays the official White Noise Android client bootstraps against — kept in
+/// sync with `MarmotClient.bootstrapRelays` in marmot-protocol/whitenoise-android.
+///
+/// Sonar's own traffic does not use these, but Marmot interop with the official
+/// White Noise clients depends on them, so they are monitored as part of the
+/// relay network row: if they go down, our relay row degrades like any other.
+///
+/// Reachability only. The chat/sticker probes *publish* events, and those writes
+/// stay on `DEFAULT_RELAYS` — we monitor third-party infrastructure, we do not
+/// write to it to fill in a status page.
+const WHITENOISE_RELAYS: &[&str] = &[
+    "wss://relay.us.whitenoise.chat",
+    "wss://relay.eu.whitenoise.chat",
+];
+
 /// Where the signed status document is published (must be readable by the site).
 const DEFAULT_PUBLISH_RELAYS: &[&str] = &[
     "wss://relay.damus.io",
@@ -125,6 +140,10 @@ struct ProbeArgs {
     /// Comma-separated wss:// relays to RTT-probe (defaults to client bootstrap set).
     #[arg(long, env = "SONAR_STATUS_PROBE_RELAYS")]
     relays: Option<String>,
+    /// Comma-separated White Noise interop relays to RTT-probe (defaults to the
+    /// official whitenoise-android bootstrap set).
+    #[arg(long, env = "SONAR_STATUS_WHITENOISE_RELAYS")]
+    whitenoise_relays: Option<String>,
     /// Path to a previous status document used to merge incident history.
     #[arg(long)]
     previous: Option<PathBuf>,
@@ -171,6 +190,10 @@ struct PublishArgs {
     /// Relays to RTT-probe for the document (comma-separated).
     #[arg(long, env = "SONAR_STATUS_PROBE_RELAYS")]
     probe_relays: Option<String>,
+    /// White Noise interop relays to RTT-probe (comma-separated; defaults to the
+    /// official whitenoise-android bootstrap set).
+    #[arg(long, env = "SONAR_STATUS_WHITENOISE_RELAYS")]
+    whitenoise_relays: Option<String>,
     /// Extra HTTP health URLs.
     #[arg(long = "http", value_name = "URL")]
     http_urls: Vec<String>,
@@ -281,6 +304,7 @@ async fn run() -> Result<()> {
             };
             let payload = build_payload(
                 parse_list(args.relays.as_deref(), DEFAULT_RELAYS),
+                parse_list(args.whitenoise_relays.as_deref(), WHITENOISE_RELAYS),
                 &args.http_urls,
                 args.previous.as_ref(),
                 &opts,
@@ -291,6 +315,7 @@ async fn run() -> Result<()> {
         Command::Publish(args) => {
             let keys = load_keys(args.nsec.as_deref(), args.nsec_file.as_ref())?;
             let probe_relays = parse_list(args.probe_relays.as_deref(), DEFAULT_RELAYS);
+            let whitenoise_relays = parse_list(args.whitenoise_relays.as_deref(), WHITENOISE_RELAYS);
             let publish_relays = parse_list(args.publish_relays.as_deref(), DEFAULT_PUBLISH_RELAYS);
             let opts = ProbeOptions {
                 chat_probe: args.chat_probe
@@ -308,8 +333,14 @@ async fn run() -> Result<()> {
                 groups_result: args.groups_result,
                 payments_coming_soon: args.payments_coming_soon,
             };
-            let payload =
-                build_payload(probe_relays, &args.http_urls, args.previous.as_ref(), &opts).await?;
+            let payload = build_payload(
+                probe_relays,
+                whitenoise_relays,
+                &args.http_urls,
+                args.previous.as_ref(),
+                &opts,
+            )
+            .await?;
             if let Some(path) = &args.out {
                 std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
             }
@@ -446,20 +477,16 @@ fn parse_list(raw: Option<&str>, defaults: &[&str]) -> Vec<String> {
 
 async fn build_payload(
     relay_urls: Vec<String>,
+    whitenoise_relay_urls: Vec<String>,
     http_urls: &[String],
     previous: Option<&PathBuf>,
     opts: &ProbeOptions,
 ) -> Result<StatusPayload> {
-    let mut relay_probes = Vec::with_capacity(relay_urls.len());
-    for url in &relay_urls {
-        let region = region_for(url);
-        let ms = probe_relay_ws(url).await;
-        relay_probes.push(RelayProbe {
-            url: url.clone(),
-            region,
-            ms,
-        });
-    }
+    // Everything we monitor and display. `relay_urls` is additionally the *write*
+    // set for the chat/sticker probes below; the interop relays are never written
+    // to, so the two lists stay separate here.
+    let mut relay_probes = probe_relays(&relay_urls).await;
+    relay_probes.extend(probe_relays(&whitenoise_relay_urls).await);
 
     let mut http_probes = Vec::new();
     for url in http_urls {
@@ -569,8 +596,25 @@ async fn build_payload(
     })
 }
 
+async fn probe_relays(urls: &[String]) -> Vec<RelayProbe> {
+    let mut probes = Vec::with_capacity(urls.len());
+    for url in urls {
+        let region = region_for(url);
+        let ms = probe_relay_ws(url).await;
+        probes.push(RelayProbe {
+            url: url.clone(),
+            region,
+            ms,
+        });
+    }
+    probes
+}
+
 fn region_for(url: &str) -> String {
     match url {
+        u if u.contains("relay.us.whitenoise.chat") => "US · White Noise".into(),
+        u if u.contains("relay.eu.whitenoise.chat") => "EU · White Noise".into(),
+        u if u.contains("whitenoise.chat") => "White Noise".into(),
         u if u.contains("damus") => "Global · CDN".into(),
         u if u.contains("nos.lol") => "EU · Germany".into(),
         u if u.contains("primal") => "US · East".into(),
@@ -691,9 +735,9 @@ fn derive_services(
     // their probe ran — see docs/SONAR-STATUS.md.
     let mut services = vec![StatusService {
         id: "relays".into(),
-        name: "Nostr relay network (client defaults)".into(),
+        name: "Nostr relay network (Sonar + White Noise defaults)".into(),
         desc: format!(
-            "{reachable}/{total} Sonar bootstrap relays reachable · median {} ms",
+            "{reachable}/{total} relays reachable · median {} ms",
             median.map(|m| m.to_string()).unwrap_or_else(|| "—".into())
         ),
         uptime: (relay_uptime * 100.0).round() / 100.0,
@@ -882,6 +926,57 @@ mod tests {
         let relays_svc = services.iter().find(|s| s.id == "relays").unwrap();
         assert_eq!(relays_svc.state, Some(ServiceState::Down));
         assert!(services.iter().all(|s| s.id == "relays" || s.id.starts_with("http-")));
+    }
+
+    /// The monitored set as `build_payload` assembles it: Sonar's own relays
+    /// followed by the White Noise interop relays.
+    fn monitored_relays(sonar_ms: Option<u64>, whitenoise_ms: Option<u64>) -> Vec<RelayProbe> {
+        let mut relays: Vec<RelayProbe> = DEFAULT_RELAYS
+            .iter()
+            .map(|u| RelayProbe {
+                url: (*u).into(),
+                region: region_for(u),
+                ms: sonar_ms,
+            })
+            .collect();
+        relays.extend(WHITENOISE_RELAYS.iter().map(|u| RelayProbe {
+            url: (*u).into(),
+            region: region_for(u),
+            ms: whitenoise_ms,
+        }));
+        relays
+    }
+
+    #[test]
+    fn whitenoise_relays_are_monitored_as_part_of_the_relay_row() {
+        let relays = monitored_relays(Some(250), Some(505));
+        let services = derive_services(&relays, &[], None, None, None, None, None);
+
+        // One relay row covering both sets — no separate interop row.
+        let row = services.iter().find(|s| s.id == "relays").unwrap();
+        assert_eq!(services.iter().filter(|s| s.id.starts_with("relays")).count(), 1);
+        assert!(row.desc.contains("9/9"));
+        assert_eq!(row.state, None);
+
+        // Transatlantic RTT to two of nine relays must not drag the median into
+        // a false "degraded" — the whole set is what is being judged.
+        assert!(derive_incidents(&services, None).is_empty());
+    }
+
+    #[test]
+    fn whitenoise_outage_degrades_the_relay_row() {
+        // Treated as relays we use: if they go down, our row degrades.
+        let relays = monitored_relays(Some(250), None);
+        let services = derive_services(&relays, &[], None, None, None, None, None);
+        let row = services.iter().find(|s| s.id == "relays").unwrap();
+        assert!(row.desc.contains("7/9"));
+        assert_eq!(row.state, Some(ServiceState::Degraded));
+    }
+
+    #[test]
+    fn whitenoise_relays_are_labelled_by_region() {
+        assert_eq!(region_for("wss://relay.us.whitenoise.chat"), "US · White Noise");
+        assert_eq!(region_for("wss://relay.eu.whitenoise.chat"), "EU · White Noise");
     }
 
     #[test]

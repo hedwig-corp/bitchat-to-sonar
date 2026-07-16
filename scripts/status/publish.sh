@@ -12,7 +12,18 @@ OUT="$STATE_DIR/last.json"
 
 mkdir -p "$STATE_DIR"
 
-if [[ ! -x "$BIN" ]]; then
+# Always rebuild from the checkout, so a `git pull` on the scheduler host takes
+# effect on the next run. Building only when the binary is missing silently
+# reuses a stale one: probe changes land in git, every publish still looks
+# healthy, and the document never actually changes. Cargo is a fast no-op when
+# the tree is unchanged. Set SONAR_STATUS_BIN to opt out and manage the binary
+# yourself (e.g. a host without a Rust toolchain).
+if [[ -n "${SONAR_STATUS_BIN:-}" ]]; then
+  if [[ ! -x "$BIN" ]]; then
+    echo "error: SONAR_STATUS_BIN=$BIN is not executable" >&2
+    exit 1
+  fi
+else
   echo "building sonar-status…"
   cargo build -p sonar-status --release --manifest-path "$ROOT/core/Cargo.toml"
   BIN="$ROOT/core/target/release/sonar-status"
