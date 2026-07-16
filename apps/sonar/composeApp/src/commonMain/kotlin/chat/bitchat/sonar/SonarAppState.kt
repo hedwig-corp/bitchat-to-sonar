@@ -8220,7 +8220,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun flushOutboxNow(peerId: String) {
         val queue = outbox.snapshot(peerId)
-        if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
+        if (queue.isEmpty()) { outbox.finishFlush(peerId, emptyList(), emptyList()); return }
         if (isMeshContactBlocked(peerId)) {
             sonarLog("SonarOutbox", "paused blocked outbox peer=${peerId.take(10)}…")
             return
@@ -8292,7 +8292,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
         }
 
-        outbox.finishFlush(peerId, queue.size, remaining)
+        outbox.finishFlush(peerId, queue, remaining)
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {

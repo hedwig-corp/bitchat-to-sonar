@@ -56,8 +56,18 @@ internal class SonarOutbox(
     fun remainingAfterFailure(snapshot: List<QueuedMessage>, failedIndex: Int, nowSecs: Long): List<QueuedMessage> =
         snapshot.drop(failedIndex).filterNot { isExpired(it, nowSecs) }
 
-    fun finishFlush(peerId: String, snapshotSize: Int, remaining: List<QueuedMessage>) {
-        val appended = queues[peerId].orEmpty().drop(snapshotSize)
+    /** Reconcile the queue after a flush. [snapshot] is what the flush attempted;
+     *  [remaining] is what it could not deliver.
+     *
+     *  Identify messages appended during the flush BY ID, never by position. A
+     *  positional `drop(snapshotSize)` assumed the live queue still starts with
+     *  the whole snapshot — false at max capacity, where an in-flight enqueue
+     *  evicts the head, leaving `size == snapshotSize` with the new message at
+     *  the tail. `drop(snapshotSize)` then returned empty and silently erased
+     *  that message whether or not the flush succeeded. */
+    fun finishFlush(peerId: String, snapshot: List<QueuedMessage>, remaining: List<QueuedMessage>) {
+        val attempted = snapshot.mapTo(HashSet()) { it.messageId }
+        val appended = queues[peerId].orEmpty().filterNot { it.messageId in attempted }
         val next = (remaining + appended).toMutableList()
         if (next.isEmpty()) queues.remove(peerId) else queues[peerId] = next
     }
