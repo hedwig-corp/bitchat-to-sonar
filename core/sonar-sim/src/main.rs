@@ -170,19 +170,57 @@ fn new_agent() -> Agent {
     }
 }
 
-/// Deliver one event to one agent and classify the result.
-async fn deliver(agent: &Agent, event: &nostr::Event, expect: &str, log: &mut Vec<String>) -> Incoming {
-    match agent.engine.process_incoming(event).await {
-        Ok(incoming) => incoming,
-        Err(e) => {
-            log.push(format!("{expect}: process_incoming failed: {e}"));
-            Incoming::None
-        }
-    }
+/// Deliver one event to one agent. Returns the classified result, or the
+/// engine error as a string. The caller logs exactly once — `deliver` never
+/// pushes, so a single failed recipient can't be counted twice.
+async fn deliver(agent: &Agent, event: &nostr::Event) -> Result<Incoming, String> {
+    agent
+        .engine
+        .process_incoming(event)
+        .await
+        .map_err(|e| e.to_string())
 }
 
-/// Wrap and deliver welcomes to `targets`, have them accept, mark active.
-/// Returns the largest wrapped welcome size seen.
+/// Gift-wrap a welcome from `sender`, deliver it to `invitee`, and accept it.
+/// Marks `invitee.active` on success. Returns the wrapped welcome size, or one
+/// error string describing where the join failed. `sender` and `invitee` must be
+/// distinct agents (the borrow checker enforces this at call sites).
+async fn wrap_and_accept(
+    sender: &Agent,
+    invitee: &mut Agent,
+    member_pk: &PublicKey,
+    welcome: nostr::UnsignedEvent,
+) -> Result<usize, String> {
+    let wrapped = sender
+        .engine
+        .gift_wrap_welcome(member_pk, welcome)
+        .await
+        .map_err(|e| format!("gift_wrap_welcome({member_pk}): {e}"))?;
+    let size = wrapped.as_json().len();
+    match deliver(invitee, &wrapped).await? {
+        Incoming::GroupInvitePending(_) => {
+            let invites = invitee
+                .engine
+                .pending_group_invites()
+                .map_err(|e| format!("pending_group_invites({member_pk}): {e}"))?;
+            let invite = invites
+                .first()
+                .ok_or_else(|| format!("welcome delivered to {member_pk} but no pending invite"))?;
+            invitee
+                .engine
+                .accept_group_invite(&invite.id)
+                .map_err(|e| format!("accept_group_invite({member_pk}): {e}"))?;
+            invitee.active = true;
+        }
+        // 2-member groups auto-join on welcome (DM semantics).
+        Incoming::GroupUpdated(_) => invitee.active = true,
+        other => return Err(format!("welcome to {member_pk} produced {other:?}")),
+    }
+    Ok(size)
+}
+
+/// Wrap and deliver welcomes to their target members, have them accept, mark
+/// active. Returns the largest wrapped welcome size seen.
 async fn deliver_welcomes(
     creator: &Agent,
     agents: &mut [Agent],
@@ -191,73 +229,60 @@ async fn deliver_welcomes(
 ) -> usize {
     let mut max_welcome = 0usize;
     for (member_pk, welcome) in welcomes {
-        let wrapped = match creator
-            .engine
-            .gift_wrap_welcome(member_pk, welcome.clone())
-            .await
-        {
-            Ok(w) => w,
-            Err(e) => {
-                anomalies.push(format!("gift_wrap_welcome({member_pk}): {e}"));
-                continue;
-            }
-        };
-        max_welcome = max_welcome.max(wrapped.as_json().len());
         let Some(agent) = agents.iter_mut().find(|a| a.pk == *member_pk) else {
             anomalies.push(format!("welcome for unknown member {member_pk}"));
             continue;
         };
-        match deliver(agent, &wrapped, "welcome", anomalies).await {
-            Incoming::GroupInvitePending(_) => {
-                let invites = match agent.engine.pending_group_invites() {
-                    Ok(i) => i,
-                    Err(e) => {
-                        anomalies.push(format!("pending_group_invites({member_pk}): {e}"));
-                        continue;
-                    }
-                };
-                let Some(invite) = invites.first() else {
-                    anomalies.push(format!("welcome delivered to {member_pk} but no pending invite"));
-                    continue;
-                };
-                match agent.engine.accept_group_invite(&invite.id) {
-                    Ok(_) => agent.active = true,
-                    Err(e) => anomalies.push(format!("accept_group_invite({member_pk}): {e}")),
-                }
-            }
-            // 2-member groups auto-join on welcome (DM semantics).
-            Incoming::GroupUpdated(_) => agent.active = true,
-            other => anomalies.push(format!("welcome to {member_pk} produced {other:?}")),
+        match wrap_and_accept(creator, agent, member_pk, welcome.clone()).await {
+            Ok(size) => max_welcome = max_welcome.max(size),
+            Err(e) => anomalies.push(e),
         }
     }
     max_welcome
 }
 
-/// Fan an event out to every active agent except `skip`.
+/// Fan an event out to every active agent except `skip`. Returns the number of
+/// **distinct recipients** that did not accept it (one per broken member, never
+/// two), and appends one diagnostic per broken recipient to `errors`.
 async fn fan_out(
     agents: &mut [Agent],
     skip: PublicKey,
     event: &nostr::Event,
     expect_message: bool,
     errors: &mut Vec<String>,
-) {
+) -> usize {
+    let want = if expect_message {
+        "Message"
+    } else {
+        "GroupUpdated"
+    };
+    let mut broken = 0;
     for (i, agent) in agents.iter_mut().enumerate() {
         if !agent.active || agent.pk == skip {
             continue;
         }
-        let got = deliver(agent, event, "fan-out", errors).await;
-        match got {
-            Incoming::Message(_) if expect_message => {}
-            Incoming::GroupUpdated(_) if !expect_message => {}
-            other => errors.push(format!(
-                "agent-{i}: expected {}, got {other:?}",
-                if expect_message { "Message" } else { "GroupUpdated" }
-            )),
+        match deliver(agent, event).await {
+            Ok(Incoming::Message(_)) if expect_message => {}
+            Ok(Incoming::GroupUpdated(_)) if !expect_message => {}
+            Ok(other) => {
+                errors.push(format!("agent-{i}: expected {want}, got {other:?}"));
+                broken += 1;
+            }
+            Err(e) => {
+                errors.push(format!("agent-{i}: process_incoming failed: {e}"));
+                broken += 1;
+            }
         }
     }
+    broken
 }
 
-async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepResult, Option<(Vec<Agent>, GroupId)>) {
+async fn run_step(
+    n: usize,
+    mode: Mode,
+    batch: usize,
+    senders: usize,
+) -> (StepResult, Option<(Vec<Agent>, GroupId)>) {
     let relays = group_relays();
     let mut anomalies = Vec::new();
     let mut convergence_errors = Vec::new();
@@ -287,10 +312,11 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
         Mode::Incremental => batch.min(kps.len()),
     };
 
-    let creation = match agents[0]
-        .engine
-        .create_group(&format!("sim-scale-{n}"), kps[..first_wave].to_vec(), relays.clone())
-    {
+    let creation = match agents[0].engine.create_group(
+        &format!("sim-scale-{n}"),
+        kps[..first_wave].to_vec(),
+        relays.clone(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -317,7 +343,13 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
     }
     let creator = std::mem::replace(&mut agents[0], new_agent());
     max_welcome = max_welcome.max(
-        deliver_welcomes(&creator, &mut agents[1..], &creation.welcomes, &mut anomalies).await,
+        deliver_welcomes(
+            &creator,
+            &mut agents[1..],
+            &creation.welcomes,
+            &mut anomalies,
+        )
+        .await,
     );
     agents[0] = creator;
 
@@ -334,7 +366,14 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
         };
         max_evolution = max_evolution.max(update.evolution_event.as_json().len());
         // Relay order: commit first to existing members, then welcomes.
-        fan_out(&mut agents, creator_pk, &update.evolution_event, false, &mut delivery_errors).await;
+        let _ = fan_out(
+            &mut agents,
+            creator_pk,
+            &update.evolution_event,
+            false,
+            &mut delivery_errors,
+        )
+        .await;
         let creator = std::mem::replace(&mut agents[0], new_agent());
         max_welcome = max_welcome.max(
             deliver_welcomes(&creator, &mut agents[1..], &update.welcomes, &mut anomalies).await,
@@ -349,7 +388,11 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
     }
     let build_ms = t_build.elapsed().as_millis();
 
-    // Convergence: every active member sees all N members.
+    // Convergence: every active member must see the exact same member SET — the
+    // roster of all N agent public keys, not merely a count of N. An MDK change
+    // that leaves an agent with the right number of *different* members must fail
+    // here, so we compare pubkey sets, not lengths.
+    let expected: std::collections::BTreeSet<PublicKey> = agents.iter().map(|a| a.pk).collect();
     for (i, agent) in agents.iter().enumerate() {
         if !agent.active {
             convergence_errors.push(format!("agent-{i}: never became active"));
@@ -357,8 +400,14 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
         }
         match agent.engine.members(&group_id) {
             Ok(members) => {
-                if members.len() != n {
-                    convergence_errors.push(format!("agent-{i}: got {} members, want {n}", members.len()));
+                let got: std::collections::BTreeSet<PublicKey> = members.into_iter().collect();
+                if got != expected {
+                    let missing = expected.difference(&got).count();
+                    let extra = got.difference(&expected).count();
+                    convergence_errors.push(format!(
+                        "agent-{i}: roster mismatch ({} members: {missing} missing, {extra} unexpected, want {n})",
+                        got.len()
+                    ));
                 }
             }
             Err(e) => convergence_errors.push(format!("agent-{i}: members(): {e}")),
@@ -368,7 +417,9 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
     // Fan-out: `senders` spread across the roster each send one message.
     let t_fanout = Instant::now();
     let mut message_bytes = 0usize;
-    let sender_idxs: Vec<usize> = (0..senders.min(n)).map(|k| k * n / senders.min(n)).collect();
+    let sender_idxs: Vec<usize> = (0..senders.min(n))
+        .map(|k| k * n / senders.min(n))
+        .collect();
     for &idx in &sender_idxs {
         let text = format!("probe from agent-{idx} at n={n}");
         let event = {
@@ -376,7 +427,10 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
             if !agent.active {
                 continue;
             }
-            match agent.engine.create_and_process_text_message(&group_id, &text) {
+            match agent
+                .engine
+                .create_and_process_text_message(&group_id, &text)
+            {
                 Ok((ev, _)) => ev,
                 Err(e) => {
                     delivery_errors.push(format!("agent-{idx}: create message: {e}"));
@@ -386,7 +440,7 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
         };
         message_bytes = message_bytes.max(event.as_json().len());
         let sender_pk = agents[idx].pk;
-        fan_out(&mut agents, sender_pk, &event, true, &mut delivery_errors).await;
+        let _ = fan_out(&mut agents, sender_pk, &event, true, &mut delivery_errors).await;
     }
     let fanout_ms = t_fanout.elapsed().as_millis();
 
@@ -404,7 +458,11 @@ async fn run_step(n: usize, mode: Mode, batch: usize, senders: usize) -> (StepRe
         delivery_errors,
         anomalies,
     };
-    let swarm = if step.ok { Some((agents, group_id)) } else { None };
+    let swarm = if step.ok {
+        Some((agents, group_id))
+    } else {
+        None
+    };
     (step, swarm)
 }
 
@@ -432,8 +490,12 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
     // exactly what two admins on different phones do at the same moment. Prefer
     // two non-creator members; a 2-member group races creator vs member.
     let (committer_a, committer_b) = if agents.len() >= 3 { (1, 2) } else { (0, 1) };
-    let update_a = agents[committer_a].engine.add_members(&group_id, vec![kp_a]);
-    let update_b = agents[committer_b].engine.add_members(&group_id, vec![kp_b]);
+    let update_a = agents[committer_a]
+        .engine
+        .add_members(&group_id, vec![kp_a]);
+    let update_b = agents[committer_b]
+        .engine
+        .add_members(&group_id, vec![kp_b]);
     let (Ok(update_a), Ok(update_b)) = (update_a, update_b) else {
         return ChaosResult {
             n,
@@ -464,28 +526,66 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
             }
         }
     }
+    // Deliver each committer's welcome to ITS invitee and fold both into the
+    // swarm: fresh_a joins via the winning commit, fresh_b via the stale one.
+    // Without this, an invitee stranded on the losing branch is silently dropped
+    // and the group can report converged while a new member is isolated.
+    let mut fresh_a = fresh_a;
+    let mut fresh_b = fresh_b;
+    for (committer, update, invitee) in [
+        (committer_a, &update_a, &mut fresh_a),
+        (committer_b, &update_b, &mut fresh_b),
+    ] {
+        let invitee_pk = invitee.pk;
+        match update.welcomes.iter().find(|(pk, _)| *pk == invitee_pk) {
+            Some((pk, welcome)) => {
+                if let Err(e) =
+                    wrap_and_accept(&agents[committer], invitee, pk, welcome.clone()).await
+                {
+                    outcomes.push(format!("invitee {invitee_pk} join: {e}"));
+                }
+            }
+            None => outcomes.push(format!("no welcome staged for invitee {invitee_pk}")),
+        }
+    }
+    agents.push(fresh_a);
+    agents.push(fresh_b);
+
     // Keep chaos output readable: dedupe identical outcomes into counts.
     outcomes = summarize_outcomes(outcomes);
 
-    // Convergence: do all previously-active members agree on the member SET?
-    // Counts are not enough — two racing add-commits both grow the group by
-    // one, so a fork keeps the count identical while the rosters differ.
+    // Convergence: do ALL active members (originals + both invitees) agree on the
+    // member SET? Counts are not enough — two racing add-commits both grow the
+    // group by one, so a fork keeps the count identical while the rosters differ.
     let mut branches: std::collections::BTreeMap<Vec<String>, Vec<usize>> =
         std::collections::BTreeMap::new();
+    let mut roster_errors = Vec::new();
     for (i, agent) in agents.iter().enumerate() {
         if !agent.active {
             continue;
         }
-        let mut roster: Vec<String> = agent
-            .engine
-            .members(&group_id)
-            .map(|m| m.iter().map(|pk| pk.to_hex()[..8].to_owned()).collect())
-            .unwrap_or_default();
-        roster.sort();
-        branches.entry(roster).or_default().push(i);
+        // A members() failure must NOT collapse to an empty roster — otherwise
+        // several unreadable agents would all land in the same empty bucket and
+        // masquerade as convergence. Record it as its own non-convergence signal.
+        match agent.engine.members(&group_id) {
+            Ok(m) => {
+                let mut roster: Vec<String> =
+                    m.iter().map(|pk| pk.to_hex()[..8].to_owned()).collect();
+                roster.sort();
+                branches.entry(roster).or_default().push(i);
+            }
+            Err(e) => roster_errors.push(format!("agent-{i}: members(): {e}")),
+        }
     }
-    let converged = branches.len() == 1;
-    if !converged {
+    let converged = branches.len() == 1 && roster_errors.is_empty();
+    if !roster_errors.is_empty() {
+        let sample: Vec<_> = roster_errors.iter().take(3).cloned().collect();
+        findings.push(format!(
+            "{} agent(s) could not read group state after the race: {sample:?}",
+            roster_errors.len()
+        ));
+    }
+    if branches.len() > 1 {
         findings.push(format!(
             "group forked into {} branches after concurrent commits; populations: {:?}",
             branches.len(),
@@ -493,23 +593,32 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
         ));
     }
 
-    // Can the group still talk? Fan a message from the winning committer.
+    // Can the group still talk? Fan a message from the winning committer and
+    // count DISTINCT broken recipients (fan_out returns one per member).
     let mut post_errors = Vec::new();
     let sender_pk = agents[committer_a].pk;
-    match agents[committer_a]
+    let (broken, sender_failed) = match agents[committer_a]
         .engine
         .create_and_process_text_message(&group_id, "post-race probe")
     {
-        Ok((ev, _)) => fan_out(&mut agents, sender_pk, &ev, true, &mut post_errors).await,
-        Err(e) => post_errors.push(format!("winner cannot send after race: {e}")),
-    }
+        Ok((ev, _)) => (
+            fan_out(&mut agents, sender_pk, &ev, true, &mut post_errors).await,
+            false,
+        ),
+        Err(e) => {
+            post_errors.push(format!("winner cannot send after race: {e}"));
+            (0, true)
+        }
+    };
     let post_race_fanout_ok = post_errors.is_empty();
     if !post_race_fanout_ok {
         let sample: Vec<_> = post_errors.iter().take(3).cloned().collect();
-        findings.push(format!(
-            "{} member(s) broke after the race; first: {sample:?}",
-            post_errors.len()
-        ));
+        let label = if sender_failed {
+            "the winner could not send after the race".to_string()
+        } else {
+            format!("{broken} member(s) could not read the winner's message after the race")
+        };
+        findings.push(format!("{label}; first: {sample:?}"));
     }
 
     ChaosResult {
@@ -594,7 +703,11 @@ fn ceilings(steps: &[StepResult], limits: &[RelayLimit]) -> Vec<Ceiling> {
             let mut max_fitting_n = None;
             let mut first_overflow_n = None;
             for s in steps {
-                if s.max_welcome_bytes == 0 {
+                // Only successful steps have a trustworthy welcome size for their
+                // N. A failed step keeps the last *successful* wrap (its own
+                // welcome was never produced), so counting it would report a
+                // failed N as "fits" against a relay it never reached.
+                if !s.ok || s.max_welcome_bytes == 0 {
                     continue;
                 }
                 if (s.max_welcome_bytes as u64) <= limit {
@@ -643,12 +756,16 @@ async fn main() {
             step.build_ms,
             step.fanout_ms,
         );
+        // Anomalies first: they carry the root cause (e.g. `gift_wrap_welcome:
+        // message too long`), whereas convergence errors are usually derivative
+        // ("never became active") and would otherwise crowd the cause out of a
+        // truncated view.
         for e in step
-            .convergence_errors
+            .anomalies
             .iter()
             .chain(&step.delivery_errors)
-            .chain(&step.anomalies)
-            .take(5)
+            .chain(&step.convergence_errors)
+            .take(6)
         {
             eprintln!("   ! {e}");
         }
@@ -698,7 +815,13 @@ async fn main() {
     for s in &report.steps {
         println!(
             "{:<6} {:<11} {:<13} {:<11} {:<10} {:<11} {}",
-            s.n, s.max_welcome_bytes, s.max_evolution_bytes, s.message_bytes, s.build_ms, s.fanout_ms, s.ok
+            s.n,
+            s.max_welcome_bytes,
+            s.max_evolution_bytes,
+            s.message_bytes,
+            s.build_ms,
+            s.fanout_ms,
+            s.ok
         );
     }
     if !report.ceilings.is_empty() {
@@ -718,7 +841,10 @@ async fn main() {
             println!(
                 "  {:<38} no NIP-11 limit advertised{}",
                 l.relay,
-                l.error.as_deref().map(|e| format!(" ({e})")).unwrap_or_default()
+                l.error
+                    .as_deref()
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default()
             );
         }
     }
@@ -749,9 +875,13 @@ mod tests {
     use super::*;
 
     fn step(n: usize, welcome: usize) -> StepResult {
+        step_with(n, welcome, true)
+    }
+
+    fn step_with(n: usize, welcome: usize, ok: bool) -> StepResult {
         StepResult {
             n,
-            ok: true,
+            ok,
             max_welcome_bytes: welcome,
             max_evolution_bytes: 0,
             message_bytes: 0,
@@ -762,6 +892,22 @@ mod tests {
             delivery_errors: vec![],
             anomalies: vec![],
         }
+    }
+
+    #[test]
+    fn ceiling_ignores_failed_steps() {
+        // The 130 step FAILED (welcome could not be produced) but still carries
+        // the previous successful welcome size. It must not be reported as
+        // fitting the relay: max_fitting_n stays at the last *successful* N.
+        let steps = vec![step(100, 77_000), step_with(130, 77_000, false)];
+        let limits = vec![RelayLimit {
+            relay: "wss://r".into(),
+            max_message_length: Some(131_072),
+            error: None,
+        }];
+        let c = &ceilings(&steps, &limits)[0];
+        assert_eq!(c.max_fitting_n, Some(100));
+        assert_eq!(c.first_overflow_n, None);
     }
 
     #[test]

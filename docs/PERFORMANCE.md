@@ -490,17 +490,18 @@ the protocol itself.
 
 ```sh
 cargo run -p sonar-sim --release -- group-scale \
-  --ramp 2,5,10,25,50,100,130,150 --mode incremental --chaos --out /tmp/scale.json
+  --ramp 2,5,10,25,50,100,110,120,130 --mode incremental --batch 25 --chaos --out /tmp/scale.json
 ```
 
-Headline result (MDK rev `e8cd584`, 2026-07): the group-size ceiling is **~130
-members**, gated by the **welcome, not the relay** — `gift_wrap_welcome` fails with
-`nip44 encryption error: message too long` once the welcome plaintext crosses
-NIP-44's 65535-byte cap (the welcome carries the full ratchet tree, ~1 KB/member).
-Every relay's `max_message_length` (131 KB smallest) sits far above the ~77 KB
-wrapped welcome, so relay size never binds first. `--chaos` also surfaces a
-concurrent-commit **fork** (two same-epoch adds split the group; the losing branch
-can no longer decrypt).
+Headline result (MDK rev `e8cd584`, 2026-07, `--batch 25`): the group-size
+ceiling is **~120 members**, gated by the **welcome, not the relay** —
+`gift_wrap_welcome` fails with `nip44 encryption error: message too long` once the
+welcome plaintext crosses NIP-44's 65535-byte cap (the welcome carries the full
+ratchet tree, ~1 KB/member). Every relay's `max_message_length` (131 KB smallest)
+sits far above the ~77 KB wrapped welcome, so relay size never binds first. The
+ceiling shifts with the add pattern (smaller batches reach ~135). `--chaos` also
+surfaces a concurrent-commit **fork** (two same-epoch adds strand the losing
+invitee on an orphan branch that can no longer decrypt).
 
 **What to assert vs report:** the **structural** outputs are deterministic and make
 good regression gates — ceiling N, `converged` yes/no, fork-heals yes/no, welcome
