@@ -14,6 +14,10 @@ Step-by-step guide for wiring the iOS Sonar app to both notification servers
 - Sonar notification servers deployed and running (see `deploy/README.md`)
 - The transponder's **npub** (Nostr public key) — generated during server setup
 - APNS credentials configured on the transponder
+- Push Notifications enabled for both the iOS and macOS App IDs in the Apple
+  Developer portal. Regenerate the provisioning profiles after enabling it;
+  the native macOS profile must authorize
+  `com.apple.developer.aps-environment`.
 - Xcode project: `ios/bitchat.xcodeproj`
 
 ## 1. Enable Entitlements
@@ -25,6 +29,13 @@ Add push notification and background mode entitlements to the main app target.
 ```xml
 <key>aps-environment</key>
 <string>production</string>
+```
+
+The native macOS target uses Apple's macOS-specific entitlement name:
+
+```xml
+<key>com.apple.developer.aps-environment</key>
+<string>$(APS_ENVIRONMENT)</string>
 ```
 
 **Xcode Capabilities** (main target):

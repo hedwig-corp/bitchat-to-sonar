@@ -3354,7 +3354,10 @@ impl SonarClient {
                     continue;
                 };
                 // Fan out to every cached device (iPhone + Mac, etc.).
-                for info in devices.values() {
+                for info in devices
+                    .values()
+                    .filter(|info| crate::push::is_cached_token_active(info))
+                {
                     let rumor = EventBuilder::new(
                         Kind::Custom(crate::push::KIND_NOTIFICATION_REQUEST),
                         &info.encrypted_token_b64,
@@ -3365,19 +3368,24 @@ impl SonarClient {
                     ])
                     .build(my_pubkey);
 
-                    let seal_builder =
-                        match EventBuilder::seal(&identity_keys, &info.server_pubkey, rumor).await {
-                            Ok(b) => b,
-                            Err(e) => {
-                                tracing::debug!(
-                                    member = %member,
-                                    device_id = %info.device_id,
-                                    %e,
-                                    "push notify seal failed"
-                                );
-                                continue;
-                            }
-                        };
+                    let seal_builder = match EventBuilder::seal(
+                        &identity_keys,
+                        &info.server_pubkey,
+                        rumor,
+                    )
+                    .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            tracing::debug!(
+                                member = %member,
+                                device_id = %info.device_id,
+                                %e,
+                                "push notify seal failed"
+                            );
+                            continue;
+                        }
+                    };
                     let seal = match seal_builder.sign(&identity_keys).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -7278,13 +7286,14 @@ impl SonarClient {
         platform: &str,
         token: &[u8],
         server_npub: &str,
+        device_id: &str,
     ) -> Result<()> {
         use crate::push;
 
         let server_pubkey = PublicKey::parse(server_npub)?;
         let plat = push::platform_byte(platform)?;
         let (content, _) = push::encode_notification_request(plat, token, &server_pubkey)?;
-        let device_id = push::device_id_from_token(plat, token);
+        let device_id = push::validate_installation_device_id(device_id)?;
 
         // Store our own registration so we can share it with group members.
         let own_reg = push::OwnPushRegistration {
@@ -9642,7 +9651,12 @@ mod tests {
         let server_pubkey = Keys::generate().public_key();
 
         client
-            .register_push_token("apns", b"device-token", &server_pubkey.to_hex())
+            .register_push_token(
+                "apns",
+                b"device-token",
+                &server_pubkey.to_hex(),
+                "test-installation",
+            )
             .await
             .expect("push registration should only cache and share the token");
 
@@ -9654,6 +9668,7 @@ mod tests {
             .expect("own push registration cached");
 
         assert_eq!(own.server_pubkey, server_pubkey);
+        assert_eq!(own.device_id, "test-installation");
         assert!(!own.encrypted_token_b64.is_empty());
     }
 

@@ -321,8 +321,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
 
     private func handleFCMToken(_ fcmToken: String, source: String) {
         Self.pushLog.info("FCM token available from \(source, privacy: .public)")
-        let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
-        SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
+        Task { @MainActor [weak self] in
+            let wallet = (self?.sonarStore?.wallet as? BridgedWallet)?.walletService
+            SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
+        }
     }
 
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) {
@@ -424,8 +426,10 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate, MessagingDelegate {
 
     private func handleFCMToken(_ fcmToken: String, source: String) {
         Self.pushLog.info("FCM token available from \(source, privacy: .public)")
-        let wallet = (sonarStore?.wallet as? BridgedWallet)?.walletService
-        SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
+        Task { @MainActor [weak self] in
+            let wallet = (self?.sonarStore?.wallet as? BridgedWallet)?.walletService
+            SonarPushRegistration.shared.didReceiveFCMToken(fcmToken, wallet: wallet)
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

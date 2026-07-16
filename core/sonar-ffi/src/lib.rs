@@ -1640,16 +1640,20 @@ impl SonarNode {
     /// `platform`: `"apns"` or `"fcm"`.
     /// `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
     /// `server_npub`: the transponder's npub (bech32 or hex).
+    /// `device_id`: host-persisted installation id, stable across token rotation.
     pub fn register_push_token(
         &self,
         platform: String,
         token: Vec<u8>,
         server_npub: String,
+        device_id: String,
     ) -> FfiResult<()> {
-        self.runtime.block_on(
-            self.client
-                .register_push_token(&platform, &token, &server_npub),
-        )?;
+        self.runtime.block_on(self.client.register_push_token(
+            &platform,
+            &token,
+            &server_npub,
+            &device_id,
+        ))?;
         Ok(())
     }
 }

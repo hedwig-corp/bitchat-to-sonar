@@ -87,7 +87,8 @@ Deploy both notification servers. Full setup guide: [`deploy/README.md`](../depl
 Wire the iOS app to both servers. Full guide: [`docs/ios-push-integration.md`](ios-push-integration.md).
 
 - [x] Enable Push Notifications and Background Modes (remote-notification)
-      entitlements in the app target. Added `aps-environment` to entitlements,
+      entitlements in the app target. Added `aps-environment` on iOS,
+      `com.apple.developer.aps-environment` on native macOS, and
       `remote-notification` to UIBackgroundModes in Info.plist.
 - [x] Add a Notification Service Extension target that shares an App Group
       with the main app. It handles Transponder pushes with generic killed-app
@@ -140,7 +141,7 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
 - [x] Breez wakeup path starts wallet SDK if needed, refreshes balance,
       stays silent (no user-visible notification).
 - [x] Implement MIP-05 token encryption for transponder registration through
-      `SonarNode::register_push_token(token, server_npub)`. The Rust core
+      `SonarNode::register_push_token(token, server_npub, device_id)`. The Rust core
       caches the encrypted token and shares it with peers; sender-side wakeups
       publish `kind:446` requests only when notifying recipients.
 - [x] Push registration disable in settings: "Background push" toggle in
@@ -156,7 +157,8 @@ Wire the Compose app to both servers. Full guide: [`docs/android-push-integratio
       payment amounts, or message previews; local rendering shows names/amounts
       from decrypted/local data and keeps message previews opt-in.
 - [ ] Verify foreground suppression still works with remote pushes.
-- [ ] Verify token rotation: unregister old token, register new one.
+- [ ] Verify provider token rotation updates the existing installation entry
+      without consuming another per-member device slot.
 - [ ] Load test transponder with concurrent gift wraps.
 
 ## Transponder Details
@@ -192,6 +194,15 @@ encrypted blobs inside a `kind:446` notification request only when they need the
 transponder to wake a recipient. App startup/registration does not publish a
 `kind:446` request because the transponder is stateless and treats every valid
 request as an immediate push dispatch.
+
+Each app installation supplies a random, host-persisted `device_id` that is
+independent of the APNS/FCM token. Apple stores it in a device-only Keychain
+item; Android stores it atomically under `noBackupFilesDir`. A provider token
+rotation therefore replaces the token for one installation instead of creating
+a pseudo-device. During the v1-to-v2 rollout, a recently refreshed legacy row
+is retained for 30 days alongside installation-scoped rows so upgrading one
+device cannot silently remove notifications from another device still running
+v1. Legacy rows stop participating in fanout after the grace period.
 
 ### Deployment
 

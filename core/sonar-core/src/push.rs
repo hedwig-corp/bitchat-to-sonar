@@ -25,7 +25,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use nostr::prelude::*;
 use nostr::secp256k1;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 const HKDF_SALT: &[u8] = b"mip05-v1";
 const HKDF_INFO: &[u8] = b"mip05-token-encryption";
@@ -36,9 +36,15 @@ pub(crate) const PUSH_TOKEN_CACHE_FILE_SUFFIX: &str = ".sonar-push-tokens.json";
 /// v1 = one token per member. v2 = multiple devices per member.
 const PUSH_TOKEN_CACHE_VERSION: u32 = 2;
 const PUSH_TOKEN_CACHE_VERSION_V1: u32 = 1;
-/// Cap devices kept per member so token rotation / churn cannot grow forever.
+/// Cap installation-scoped devices per member so churn cannot grow forever.
+/// One bounded `legacy` rollout row may coexist without consuming a slot.
 pub(crate) const MAX_DEVICES_PER_MEMBER: usize = 4;
 const LEGACY_DEVICE_ID: &str = "legacy";
+const MAX_DEVICE_ID_LEN: usize = 128;
+/// v1 clients refresh their single legacy row on normal token sharing. Keep a
+/// recently refreshed row alongside v2 devices during rollout, then stop using
+/// it once no v1 client has refreshed it for this long.
+const LEGACY_DEVICE_GRACE_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const KIND_NOTIFICATION_REQUEST: u16 = 446;
 pub(crate) const KIND_PUSH_TOKEN_SHARE: u16 = 447;
 /// Maximum accepted length of an encrypted_token (base64) in a kind-447 share.
@@ -70,20 +76,22 @@ pub(crate) fn platform_byte(platform: &str) -> crate::Result<u8> {
     }
 }
 
-/// Stable-enough device key derived from the provider token bytes.
-///
-/// Token rotation yields a new id (old entry ages out via the per-member cap).
-/// Callers that want a install-stable id can pass an explicit `device_id` in the
-/// share payload instead.
-pub(crate) fn device_id_from_token(platform: u8, token: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update([platform]);
-    hasher.update(token);
-    hex_encode(&hasher.finalize()[..16])
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Validate the host-provided, install-stable device id. Provider tokens are
+/// deliberately not used as ids: APNs/FCM rotation must replace one device's
+/// token instead of consuming another slot in the per-member cache.
+pub(crate) fn validate_installation_device_id(device_id: &str) -> crate::Result<String> {
+    if device_id.is_empty()
+        || device_id.len() > MAX_DEVICE_ID_LEN
+        || device_id == LEGACY_DEVICE_ID
+        || !device_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(crate::Error::InvalidInput(
+            "device_id must be 1..=128 ASCII letters, digits, '-', '_', '.', or ':'".into(),
+        ));
+    }
+    Ok(device_id.to_owned())
 }
 
 fn now_unix_secs() -> u64 {
@@ -193,38 +201,72 @@ pub(crate) type MemberPushTokens = HashMap<String, CachedPushToken>;
 /// In-memory cache of group member push tokens. Outer key = member pubkey hex.
 pub(crate) type PushTokenCache = Arc<Mutex<HashMap<String, MemberPushTokens>>>;
 
-/// Upsert one device token for a member, dropping the legacy placeholder when a
-/// real device id arrives, and capping the number of devices kept.
+/// Upsert one device token and cap the number of installation-scoped devices.
+///
+/// A recent v1 `legacy` row is retained alongside v2 rows: it may belong to a
+/// different phone during a phased rollout. v1 clients refresh that row during
+/// normal token sharing; an upgraded/replaced client stops refreshing it and
+/// the bounded grace below eventually removes the duplicate.
 pub(crate) fn upsert_member_device_token(
     cache: &mut HashMap<String, MemberPushTokens>,
     member_pubkey_hex: &str,
     token: CachedPushToken,
 ) {
+    upsert_member_device_token_at(cache, member_pubkey_hex, token, now_unix_secs());
+}
+
+fn upsert_member_device_token_at(
+    cache: &mut HashMap<String, MemberPushTokens>,
+    member_pubkey_hex: &str,
+    token: CachedPushToken,
+    now: u64,
+) {
     let devices = cache.entry(member_pubkey_hex.to_string()).or_default();
-    if token.device_id != LEGACY_DEVICE_ID {
-        devices.remove(LEGACY_DEVICE_ID);
-    }
+    devices.retain(|_, cached| is_cached_token_active_at(cached, now));
     devices.insert(token.device_id.clone(), token);
-    if devices.len() <= MAX_DEVICES_PER_MEMBER {
-        return;
-    }
     let mut ranked: Vec<(u64, String)> = devices
         .values()
+        .filter(|token| token.device_id != LEGACY_DEVICE_ID)
         .map(|t| (t.updated_at, t.device_id.clone()))
         .collect();
+    if ranked.len() <= MAX_DEVICES_PER_MEMBER {
+        return;
+    }
     ranked.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    let drop_count = devices.len() - MAX_DEVICES_PER_MEMBER;
+    let drop_count = ranked.len() - MAX_DEVICES_PER_MEMBER;
     for (_, device_id) in ranked.into_iter().take(drop_count) {
         devices.remove(&device_id);
     }
 }
 
+pub(crate) fn is_cached_token_active(token: &CachedPushToken) -> bool {
+    is_cached_token_active_at(token, now_unix_secs())
+}
+
+fn is_cached_token_active_at(token: &CachedPushToken, now: u64) -> bool {
+    token.device_id != LEGACY_DEVICE_ID
+        || token.updated_at == 0
+        || now.saturating_sub(token.updated_at) <= LEGACY_DEVICE_GRACE_SECS
+}
+
 pub(crate) fn load_push_token_cache(path: Option<&Path>) -> PushTokenCache {
+    let mut migrated_v1 = false;
     let cache = path
         .and_then(|path| fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice::<PushTokenCacheDisk>(&bytes).ok())
-        .and_then(|disk| disk.into_cache().ok())
+        .and_then(|disk| {
+            let is_v1 = disk.version == PUSH_TOKEN_CACHE_VERSION_V1;
+            disk.into_cache().ok().map(|cache| {
+                migrated_v1 = is_v1;
+                cache
+            })
+        })
         .unwrap_or_default();
+    if migrated_v1 {
+        if let Err(error) = save_push_token_cache(path, &cache) {
+            tracing::warn!(%error, "failed to persist v1 push token cache migration");
+        }
+    }
     Arc::new(Mutex::new(cache))
 }
 
@@ -333,10 +375,12 @@ impl PushTokenCacheDisk {
     }
 
     fn into_cache(self) -> Result<HashMap<String, MemberPushTokens>, ()> {
-        match self.version {
+        let version = self.version;
+        match version {
             PUSH_TOKEN_CACHE_VERSION | PUSH_TOKEN_CACHE_VERSION_V1 => {}
             _ => return Err(()),
         }
+        let loaded_at = now_unix_secs();
         let mut cache: HashMap<String, MemberPushTokens> = HashMap::new();
         for entry in self.entries {
             let server_pubkey = PublicKey::parse(&entry.server_pubkey_hex).map_err(|_| ())?;
@@ -350,9 +394,18 @@ impl PushTokenCacheDisk {
                 device_id: device_id.clone(),
                 encrypted_token_b64: entry.encrypted_token,
                 server_pubkey,
-                updated_at: entry.updated_at,
+                // v1 rows had no timestamp. Start their rollout grace at the
+                // first v2 load instead of expiring every existing install.
+                updated_at: if entry.updated_at == 0 {
+                    loaded_at
+                } else {
+                    entry.updated_at
+                },
             };
-            upsert_member_device_token(&mut cache, &entry.member_pubkey_hex, token);
+            upsert_member_device_token_at(&mut cache, &entry.member_pubkey_hex, token, loaded_at);
+        }
+        for devices in cache.values_mut() {
+            devices.retain(|_, token| is_cached_token_active_at(token, loaded_at));
         }
         Ok(cache)
     }
@@ -369,10 +422,10 @@ struct PushTokenCacheEntry {
     updated_at: u64,
 }
 
-pub(crate) fn resolve_share_device_id(payload_device_id: Option<String>) -> String {
+pub(crate) fn resolve_share_device_id(payload_device_id: Option<String>) -> Option<String> {
     match payload_device_id {
-        Some(id) if !id.is_empty() => id,
-        _ => LEGACY_DEVICE_ID.to_string(),
+        Some(id) => validate_installation_device_id(&id).ok(),
+        None => Some(LEGACY_DEVICE_ID.to_string()),
     }
 }
 
@@ -502,33 +555,108 @@ mod tests {
     }
 
     #[test]
-    fn real_device_id_replaces_legacy_placeholder() {
+    fn real_device_id_preserves_recent_legacy_during_rollout() {
         let member = Keys::generate().public_key().to_hex();
         let server = Keys::generate().public_key();
         let mut cache = HashMap::new();
-        upsert_member_device_token(
+        upsert_member_device_token_at(
             &mut cache,
             &member,
             CachedPushToken {
                 device_id: LEGACY_DEVICE_ID.into(),
                 encrypted_token_b64: "old".into(),
                 server_pubkey: server,
-                updated_at: 1,
+                updated_at: 100,
             },
+            100,
         );
-        upsert_member_device_token(
+        upsert_member_device_token_at(
             &mut cache,
             &member,
             CachedPushToken {
                 device_id: "mac".into(),
                 encrypted_token_b64: "new".into(),
                 server_pubkey: server,
-                updated_at: 2,
+                updated_at: 101,
             },
+            101,
         );
         let devices = cache.get(&member).expect("member");
-        assert_eq!(devices.len(), 1);
+        assert_eq!(devices.len(), 2);
+        assert!(devices.contains_key(LEGACY_DEVICE_ID));
         assert!(devices.contains_key("mac"));
+    }
+
+    #[test]
+    fn stale_legacy_device_expires_after_rollout_grace() {
+        let member = Keys::generate().public_key().to_hex();
+        let server = Keys::generate().public_key();
+        let mut cache = HashMap::new();
+        upsert_member_device_token_at(
+            &mut cache,
+            &member,
+            CachedPushToken {
+                device_id: LEGACY_DEVICE_ID.into(),
+                encrypted_token_b64: "old".into(),
+                server_pubkey: server,
+                updated_at: 100,
+            },
+            100,
+        );
+        upsert_member_device_token_at(
+            &mut cache,
+            &member,
+            CachedPushToken {
+                device_id: "mac".into(),
+                encrypted_token_b64: "new".into(),
+                server_pubkey: server,
+                updated_at: 101,
+            },
+            100 + LEGACY_DEVICE_GRACE_SECS + 1,
+        );
+
+        let devices = cache.get(&member).expect("member");
+        assert_eq!(devices.len(), 1);
+        assert!(!devices.contains_key(LEGACY_DEVICE_ID));
+        assert!(devices.contains_key("mac"));
+    }
+
+    #[test]
+    fn rollout_legacy_row_does_not_consume_a_real_device_slot() {
+        let member = Keys::generate().public_key().to_hex();
+        let server = Keys::generate().public_key();
+        let mut cache = HashMap::new();
+        upsert_member_device_token_at(
+            &mut cache,
+            &member,
+            CachedPushToken {
+                device_id: LEGACY_DEVICE_ID.into(),
+                encrypted_token_b64: "legacy-token".into(),
+                server_pubkey: server,
+                updated_at: 100,
+            },
+            100,
+        );
+        for i in 0..MAX_DEVICES_PER_MEMBER {
+            upsert_member_device_token_at(
+                &mut cache,
+                &member,
+                CachedPushToken {
+                    device_id: format!("device-{i}"),
+                    encrypted_token_b64: format!("token-{i}"),
+                    server_pubkey: server,
+                    updated_at: 101 + i as u64,
+                },
+                101 + i as u64,
+            );
+        }
+
+        let devices = cache.get(&member).expect("member");
+        assert_eq!(devices.len(), MAX_DEVICES_PER_MEMBER + 1);
+        assert!(devices.contains_key(LEGACY_DEVICE_ID));
+        for i in 0..MAX_DEVICES_PER_MEMBER {
+            assert!(devices.contains_key(&format!("device-{i}")));
+        }
     }
 
     #[test]
@@ -553,10 +681,20 @@ mod tests {
         assert_eq!(devices.len(), 1);
         let entry = devices.get(LEGACY_DEVICE_ID).expect("legacy device");
         assert_eq!(entry.encrypted_token_b64, "legacy-token");
+        assert!(entry.updated_at > 0);
+        drop(loaded);
+
+        let migrated: PushTokenCacheDisk =
+            serde_json::from_slice(&fs::read(&path).expect("migrated cache file"))
+                .expect("migrated v2 cache");
+        assert_eq!(migrated.version, PUSH_TOKEN_CACHE_VERSION);
+        assert_eq!(migrated.entries.len(), 1);
+        assert_eq!(migrated.entries[0].device_id, LEGACY_DEVICE_ID);
+        assert!(migrated.entries[0].updated_at > 0);
     }
 
     #[test]
-    fn push_token_cache_replaces_existing_file() {
+    fn token_rotation_replaces_existing_installation_without_growing_cache() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("marmot.sqlite.sonar-push-tokens.json");
         let member = Keys::generate().public_key().to_hex();
@@ -585,6 +723,7 @@ mod tests {
                 updated_at: 2,
             },
         );
+        assert_eq!(cache.get(&member).expect("member").len(), 1);
         save_push_token_cache(Some(&path), &cache).expect("existing cache is replaced");
 
         let loaded = load_push_token_cache(Some(&path));
@@ -599,12 +738,15 @@ mod tests {
     }
 
     #[test]
-    fn device_id_from_token_is_stable_for_same_input() {
-        let a = device_id_from_token(PLATFORM_APNS, b"token-bytes");
-        let b = device_id_from_token(PLATFORM_APNS, b"token-bytes");
-        let c = device_id_from_token(PLATFORM_APNS, b"other-token");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.len(), 32);
+    fn installation_device_id_validation_rejects_legacy_and_log_injection() {
+        assert_eq!(
+            validate_installation_device_id("ios:550e8400-e29b-41d4-a716-446655440000")
+                .expect("valid id"),
+            "ios:550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert!(validate_installation_device_id("").is_err());
+        assert!(validate_installation_device_id(LEGACY_DEVICE_ID).is_err());
+        assert!(validate_installation_device_id("device\nforged-log").is_err());
+        assert!(validate_installation_device_id(&"x".repeat(MAX_DEVICE_ID_LEN + 1)).is_err());
     }
 }
