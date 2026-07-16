@@ -85,7 +85,7 @@ class SonarPushProcessingService : Service() {
     private suspend fun processMarmotWakeup() {
         try {
             val prefs = notificationPrefs()
-            withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
+            val synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
                 SonarCore.start()
                 SonarCore.connectRelays()
                 // Push wake: force the batched gap-recovery fetch. A routine
@@ -93,69 +93,86 @@ class SonarPushProcessingService : Service() {
                 // active even though the socket was torn down while backgrounded,
                 // leaving the pushed message unfetched.
                 SonarCore.syncForce()
-            } ?: run {
-                Log.w(TAG, "Marmot sync timed out, showing fallback")
-                notifyFallback(prefs)
-                return
-            }
+            } != null
 
             if (!prefs.enabled) {
-                Log.d(TAG, "Marmot sync complete, notifications disabled")
+                Log.d(TAG, "Marmot sync done (synced=$synced), notifications disabled")
                 return
             }
 
-            val summaries = SonarCore.conversationSummaries()
-            val unread = summaries.filter { it.unreadCount > 0 }
+            // Even when syncForce overran its budget, the partial drain has
+            // usually already written the pushed message into local storage
+            // (relays EOSE well inside the window; the tail is engine work).
+            // So always try to render real titled notifications from local
+            // state, and only degrade to the generic fallback when nothing
+            // unread actually landed AND the sync was cut short.
+            val notified = notifyUnreadConversations(prefs)
 
-            if (unread.isEmpty()) {
-                Log.d(TAG, "Marmot sync complete, no unread messages")
-                return
-            }
-
-            // The drain runs while the UI may be dead, so resolve nicknames the
-            // same way the foreground path does: persisted kind-0 cache first,
-            // then a bounded relay fetch (relays are already connected here).
-            // Never title a notification with the raw npub when a name exists.
-            // Skip the network entirely when names are hidden -- the router
-            // discards senderName in that case, so the fetches would be wasted.
-            val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
-            val fetchedProfiles =
-                if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
-                else emptyMap()
-
-            for (summary in unread) {
-                val kind = SonarNotificationRouter.classifyContent(
-                    summary.latestContent,
-                    isCallControl = { SonarCore.callParseControl(it) != null },
-                )
-                if (kind == SonarNotificationKind.Call) continue
-
-                val notif = SonarNotificationRouter.build(
-                    idKey = summary.groupIdHex,
-                    kind = kind,
-                    conversationTitle = summary.name.ifBlank { null },
-                    senderName = if (!prefs.showNames) null else summary.latestSenderNpub
-                        .takeIf { it.isNotBlank() }
-                        ?.let { npub ->
-                            // Everything is prefetched above under one budget, so
-                            // the fetch lambda is a pure map read (no network).
-                            resolvePushSenderName(npub, cachedProfiles) { missing ->
-                                fetchedProfiles[canonicalProfileKey(missing)]
-                            }
-                        },
-                    preview = summary.latestContent,
-                    unreadCount = summary.unreadCount,
-                    prefs = prefs,
-                )
-                if (notif != null) {
-                    Notifier.notify(notif.id, notif.title, notif.body)
+            when {
+                notified > 0 ->
+                    Log.d(TAG, "Marmot wakeup: notified for $notified conversation(s) (synced=$synced)")
+                synced ->
+                    Log.d(TAG, "Marmot sync complete, no unread messages")
+                else -> {
+                    Log.w(TAG, "Marmot sync timed out with nothing unread, showing fallback")
+                    notifyFallback(prefs)
                 }
             }
-            Log.d(TAG, "Marmot wakeup: notified for ${unread.size} conversation(s)")
         } catch (e: Exception) {
             Log.e(TAG, "Marmot wakeup failed, showing fallback", e)
             notifyFallback(notificationPrefs())
         }
+    }
+
+    /** Render titled notifications for every unread conversation from local
+     *  storage. Returns how many conversations were notified. */
+    private suspend fun notifyUnreadConversations(prefs: SonarNotificationPrefs): Int {
+        val summaries = SonarCore.conversationSummaries()
+        val unread = summaries.filter { it.unreadCount > 0 }
+        if (unread.isEmpty()) return 0
+
+        // The drain runs while the UI may be dead, so resolve nicknames the
+        // same way the foreground path does: persisted kind-0 cache first,
+        // then a bounded relay fetch (relays are already connected here).
+        // Never title a notification with the raw npub when a name exists.
+        // Skip the network entirely when names are hidden -- the router
+        // discards senderName in that case, so the fetches would be wasted.
+        val cachedProfiles = decodeProfileCache(SonarCore.loadBlob(PROFILE_CACHE_BLOB_KEY))
+        val fetchedProfiles =
+            if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
+            else emptyMap()
+
+        var notified = 0
+        for (summary in unread) {
+            val kind = SonarNotificationRouter.classifyContent(
+                summary.latestContent,
+                isCallControl = { SonarCore.callParseControl(it) != null },
+            )
+            if (kind == SonarNotificationKind.Call) continue
+
+            val notif = SonarNotificationRouter.build(
+                idKey = summary.groupIdHex,
+                kind = kind,
+                conversationTitle = summary.name.ifBlank { null },
+                senderName = if (!prefs.showNames) null else summary.latestSenderNpub
+                    .takeIf { it.isNotBlank() }
+                    ?.let { npub ->
+                        // Everything is prefetched above under one budget, so
+                        // the fetch lambda is a pure map read (no network).
+                        resolvePushSenderName(npub, cachedProfiles) { missing ->
+                            fetchedProfiles[canonicalProfileKey(missing)]
+                        }
+                    },
+                preview = summary.latestContent,
+                unreadCount = summary.unreadCount,
+                prefs = prefs,
+            )
+            if (notif != null) {
+                Notifier.notify(notif.id, notif.title, notif.body)
+                notified++
+            }
+        }
+        return notified
     }
 
     /**
