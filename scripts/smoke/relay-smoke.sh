@@ -247,7 +247,7 @@ latency_stats() {
     med = (n % 2) ? v[int(n / 2) + 1] : int((v[n / 2] + v[n / 2 + 1]) / 2)
     pi = int(0.95 * n); if (pi < 1) pi = 1; if (pi > n) pi = n
     printf "%d %d %d %d\n", min, med, v[pi], max
-  }
+  }'
 }
 
 # Provision N ephemeral identities on the current RELAY_ARGS.
