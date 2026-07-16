@@ -176,6 +176,24 @@ actual fun MediaImage(
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     runCatching { SkiaImage.makeFromEncoded(bytes).toComposeImageBitmap() }.getOrNull()
 
+actual fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>? = runCatching {
+    // ImageIO's reader exposes the header dimensions without decoding pixels.
+    javax.imageio.ImageIO.createImageInputStream(java.io.ByteArrayInputStream(bytes))
+        ?.use { stream ->
+            val readers = javax.imageio.ImageIO.getImageReaders(stream)
+            if (!readers.hasNext()) return@use null
+            val reader = readers.next()
+            try {
+                reader.input = stream
+                val w = reader.getWidth(0)
+                val h = reader.getHeight(0)
+                if (w > 0 && h > 0) w to h else null
+            } finally {
+                reader.dispose()
+            }
+        }
+}.getOrNull()
+
 // The stock JVM has no video decoder — the preview falls back to a generic
 // video tile (filename + play glyph) instead of a poster frame.
 actual fun decodeVideoPosterFrame(path: String): ImageBitmap? = null

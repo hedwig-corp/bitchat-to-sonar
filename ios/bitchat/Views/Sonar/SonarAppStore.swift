@@ -21,6 +21,7 @@ import AVFoundation
 import Combine
 import CryptoKit
 import Foundation
+import ImageIO
 import SonarCore
 import SwiftUI
 #if canImport(UIKit)
@@ -5558,6 +5559,31 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendImage(from: tmp) { try? FileManager.default.removeItem(at: tmp) }
     }
 
+    /// Header-only image dimensions for a local file (no pixel decode), cached
+    /// by path. Signal derives attachment dimensions at ingestion and sizes
+    /// media cells ONLY from stored values (Signal-Android attachments table
+    /// width/height → ThumbnailView; Signal-iOS TSAttachmentStream
+    /// imageSizePixels → CVMediaAlbumView). Marmot media gets this from MIP-04
+    /// metadata; BLE file transfers carry none, so derive it here where the
+    /// bytes live — otherwise the bubble reserves the fixed skeleton box and
+    /// grows on decode, shifting the transcript.
+    private static var meshImageBoundsCache: [String: (UInt32, UInt32)] = [:]
+
+    private func meshImageBounds(atPath path: String) -> (UInt32, UInt32)? {
+        if let cached = Self.meshImageBoundsCache[path] { return cached }
+        let url = URL(fileURLWithPath: path) as CFURL
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url, options),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0
+        else { return nil }
+        let bounds = (UInt32(w), UInt32(h))
+        Self.meshImageBoundsCache[path] = bounds
+        return bounds
+    }
+
     /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
     /// item with the local on-disk path, if the file exists.
     private func meshMediaItem(_ content: String) -> SNMediaItem? {
@@ -5577,7 +5603,16 @@ final class SonarAppStore: ObservableObject {
         for dir in k.dirs {
             let path = filesDir.appendingPathComponent(dir).appendingPathComponent(safe).path
             if FileManager.default.fileExists(atPath: path) {
-                return SNMediaItem(url: "", mime: k.mime, filename: safe, groupId: "", localPath: path)
+                let bounds = k.mime.hasPrefix("image/") ? meshImageBounds(atPath: path) : nil
+                return SNMediaItem(
+                    url: "",
+                    mime: k.mime,
+                    filename: safe,
+                    groupId: "",
+                    localPath: path,
+                    width: bounds?.0,
+                    height: bounds?.1
+                )
             }
         }
         return nil

@@ -303,6 +303,13 @@ actual fun MediaImage(
 actual fun decodeImageBitmap(bytes: ByteArray): ImageBitmap? =
     BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
 
+actual fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>? {
+    // inJustDecodeBounds reads the header only — no pixel buffer is allocated.
+    val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    runCatching { BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts) }
+    return if (opts.outWidth > 0 && opts.outHeight > 0) opts.outWidth to opts.outHeight else null
+}
+
 actual fun decodeVideoPosterFrame(path: String): ImageBitmap? =
     runCatching {
         val retriever = android.media.MediaMetadataRetriever()

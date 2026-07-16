@@ -3458,6 +3458,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
             // open the encrypted database without any relay dependency.
             meshChats.putAll(MessageStore.loadAllMeshDms())
+            backfillMeshMediaBounds()
             loadLinks()
             loadMeshNames()
             seedVerifiedChatIds()
@@ -3766,6 +3767,59 @@ class SonarAppState(private val scope: CoroutineScope) {
             // absorb them instantly. Only now do later feed changes mean real
             // new messages, which may animate.
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+        }
+    }
+
+    /**
+     * Build a BLE-mesh [SonarMedia], deriving image dimensions from the bytes.
+     *
+     * Marmot media carries width/height as MIP-04 metadata, so its bubbles
+     * reserve their final box before decode (Signal pre-sizing) and the
+     * transcript never reflows. Mesh media has no metadata, so without this the
+     * bubble reserves the fixed 216x150dp skeleton and visibly grows — and
+     * shifts everything below it — the moment the image decodes. The header
+     * read is cheap (no pixel buffer) and happens once, off the render path,
+     * while we still hold the bytes.
+     */
+    private fun meshMediaFor(url: String, mime: String, filename: String, bytes: ByteArray): SonarMedia {
+        val bounds = if (mime.startsWith("image/")) decodeImageBounds(bytes) else null
+        return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null)
+    }
+
+    /**
+     * One-time migration: mesh image media persisted before [meshMediaFor]
+     * derived dimensions has null width/height, so its bubbles still reserve the
+     * skeleton box and grow on decode. Recover the dimensions from the stored
+     * bytes on the IO path at startup and rewrite the affected transcripts.
+     */
+    private suspend fun backfillMeshMediaBounds() {
+        val repaired = mutableListOf<String>()
+        for ((peerId, msgs) in meshChats.entries.toList()) {
+            var changed = false
+            val patched = msgs.map { msg ->
+                if (msg.media.isEmpty()) return@map msg
+                val media = msg.media.map { m ->
+                    val needsBounds = m.mimeType.startsWith("image/") &&
+                        (m.width == null || m.height == null) &&
+                        m.url.startsWith(MESH_MEDIA_URL_PREFIX)
+                    if (!needsBounds) return@map m
+                    val bytes = mediaCache[m.url] ?: MessageStore.loadMeshMedia(m.url) ?: return@map m
+                    val bounds = decodeImageBounds(bytes) ?: return@map m
+                    changed = true
+                    m.copy(width = bounds.first, height = bounds.second)
+                }
+                if (changed) msg.copy(media = media) else msg
+            }
+            if (changed) {
+                meshChats[peerId] = patched
+                repaired += peerId
+            }
+        }
+        for (peerId in repaired) {
+            MessageStore.saveMeshDm(peerId, meshChats[peerId].orEmpty())
+        }
+        if (repaired.isNotEmpty()) {
+            sonarLog("SonarMedia", "backfilled mesh image bounds for ${repaired.size} peer transcript(s)")
         }
     }
 
@@ -6289,7 +6343,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Not connected over Bluetooth yet — stay close and try again"
             return false
         }
-        val media = SonarMedia(mediaUrl, mime, filename, null, null, null)
+        val media = meshMediaFor(mediaUrl, mime, filename, data)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
@@ -7649,7 +7703,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val id = m.messageId.ifBlank { randomMeshId() }
             if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
-            val media = SonarMedia(mediaUrl, m.mimeType, m.filename, null, null, null)
+            val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes
             scope.launch { MessageStore.saveMeshMedia(mediaUrl, m.bytes) }
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))
