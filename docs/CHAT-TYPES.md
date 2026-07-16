@@ -128,6 +128,26 @@ iOS has the same staging (`openedDM` → `loadLocalWhenConnected` →
 refresh). Open-time captures must fall back to reading
 `service.conversationSummaries()` directly.
 
+### The snapshot is not uniformly real (synthetic chat-list rows)
+
+`chatSnapshotMessagesByChat` is **not** all transcript rows. Only the newest
+`LOCAL_SUMMARY_CHAT_LIMIT` (5) chats get real message rows from
+`recentMessagePages`; every chat below that carries a **synthetic placeholder**
+minted from the core conversation index with id
+`summary:<groupIdHex>:<latestAtSecs>:<messageCount>` — enough to render a
+chat-list subtitle, and nothing more.
+
+A placeholder's id is not an event id, so it can never dedupe against the real
+row a bounded page later brings. Feeding one into a transcript renders a
+**permanent duplicate bubble**, and the feed growing by it is itself a visible
+jump. Always strip them with `withoutSyntheticSummaryRows()` before seeding
+transcript state. This is a nasty one because it is position-dependent: the same
+code path works for a chat in the top 5 and breaks for the 6th
+(`605fa1992` — Sara D worked, Vincenzo-Mac showed the same message twice).
+
+Note `refreshTranscriptGroupWindow`'s fallback also reads this snapshot when the
+cursor page read fails; the same rule applies there.
+
 ## Read-marking and capture ordering
 
 Opening a chat zeroes the core unread counter. Any feature that needs the
@@ -150,17 +170,20 @@ the read-marking uses, or the two will disagree for one of the two chat kinds.
 1. **Which id do I hold?** If it can be a `mesh:` route id, resolve through
    `transcriptGroupIds` (Compose) / `marmotGroupId` + npub bridge (iOS) before
    indexing any group-keyed map.
-2. **Sum across folded groups.** One person ⇒ possibly several group ids.
+2. **Is that snapshot row real?** `chatSnapshotMessagesByChat` mixes real rows
+   (top 5 chats) with synthetic `summary:` chat-list placeholders. Strip them
+   with `withoutSyntheticSummaryRows()` before anything but a list subtitle.
+3. **Sum across folded groups.** One person ⇒ possibly several group ids.
    Reading only one group's entry silently breaks duplicate-group peers.
-3. **Don't trust the first feed of a mesh chat.** Gate position/count logic on
+4. **Don't trust the first feed of a mesh chat.** Gate position/count logic on
    the catch-up check; assume one or more async merges will follow first paint.
-4. **Capture before the open path mutates.** Unread counts, badges, and any
+5. **Capture before the open path mutates.** Unread counts, badges, and any
    "state at open" must be read before `markConversationRead`/`openedDM` runs
    (on iOS: at navigation time, not `onAppear`).
-5. **Test with BOTH kinds.** A pure Marmot chat and a mesh-folded chat (peer
+6. **Test with BOTH kinds.** A pure Marmot chat and a mesh-folded chat (peer
    with BLE history + White Noise account). The bug that motivated this doc
    shipped green because it was only exercised against pure Marmot chats.
-6. **Both platforms.** The Compose and SwiftUI stores mirror each other
+7. **Both platforms.** The Compose and SwiftUI stores mirror each other
    (`SonarAppState.kt` ↔ `SonarAppStore.swift`); a fix landing on one side is
    the most common way conversation bugs return (see `docs/REGRESSIONS.md`).
 
