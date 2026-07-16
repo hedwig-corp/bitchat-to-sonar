@@ -2808,7 +2808,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelAllMediaDownloads(); MediaCache.wipe()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++
-                lastSeenTs.clear(); lastNotifiedTs.clear(); seededSeen = false
+                notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
                 scanWatermark.clear()
                 SonarCore.saveBlob(NPUB_BLOB_KEY, "")
                 npub = ""
