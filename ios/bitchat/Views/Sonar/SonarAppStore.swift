@@ -399,6 +399,10 @@ struct SNMediaItem: Equatable {
     /// For BLE-mesh media (bitchat file transfer): the local file path on disk.
     /// When set, the bytes are loaded locally instead of downloaded from Blossom.
     var localPath: String? = nil
+    /// Stored attachment dimensions (MIP-04 metadata). Signal pre-sizes media
+    /// cells from these so the decoded image never reflows the transcript.
+    var width: UInt32? = nil
+    var height: UInt32? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
     var isGif: Bool {
         mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
@@ -4955,7 +4959,14 @@ final class SonarAppStore: ObservableObject {
     /// Map a Marmot message's attachments into UI items carrying the group id.
     static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
         m.media.map {
-            SNMediaItem(url: $0.url, mime: $0.mimeType, filename: $0.filename, groupId: groupId)
+            SNMediaItem(
+                url: $0.url,
+                mime: $0.mimeType,
+                filename: $0.filename,
+                groupId: groupId,
+                width: $0.width,
+                height: $0.height
+            )
         }
     }
 
@@ -5826,6 +5837,38 @@ final class SonarAppStore: ObservableObject {
         try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
     }
 
+    /// Unread count per DM route captured when navigation pushed the chat.
+    /// Consumed by the transcript to anchor at the first unread row with a
+    /// divider (Signal-style); cleared when the route pops.
+    @Published var unreadCountAtOpenByDM: [String: UInt64] = [:]
+
+    /// Capture the DM's unread count at navigation time — BEFORE `openedDM`
+    /// zeroes the core counter — so the transcript can anchor at the first
+    /// unread row with a divider (Signal-style) instead of force-pinning the
+    /// tail. The published `unreadByGroup` map lags a cold launch, so a map
+    /// miss falls back to reading the core conversation index directly; that
+    /// read races openedDM's read-marking, but read-marking only runs after
+    /// the local hydrate completes, so the summaries read lands first — and a
+    /// lost race just degrades to today's open-at-tail behavior.
+    func captureUnreadAtOpen(_ id: String) {
+        unreadCountAtOpenByDM[id] = nil
+        let groupId = marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else { return }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
+        if cached > 0 {
+            unreadCountAtOpenByDM[id] = cached
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let unread = await self.marmot.unreadCount(forGroups: ids)
+            if unread > 0 { self.unreadCountAtOpenByDM[id] = unread }
+        }
+    }
+
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
@@ -6505,6 +6548,11 @@ final class SonarAppStore: ObservableObject {
         if case .dm(let id) = route, currentDMId != id {
             cleanupPreviewTempFiles()
         }
+        if case .dm(let id) = route {
+            // Capture at navigation time — the screen's own onAppear would
+            // lose the race against its child list's onAppear.
+            captureUnreadAtOpen(id)
+        }
         #if os(iOS)
         if case .call = route { return }
         #endif
@@ -6513,6 +6561,9 @@ final class SonarAppStore: ObservableObject {
 
     func pop() {
         cleanupPreviewTempFiles()
+        // The unread divider lives while its chat is on the stack; leaving the
+        // chat retires it so a later reopen (already marked read) starts clean.
+        if case .dm(let id)? = path.last { unreadCountAtOpenByDM[id] = nil }
         if !path.isEmpty { path.removeLast() }
     }
 

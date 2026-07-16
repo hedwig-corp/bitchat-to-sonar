@@ -176,7 +176,10 @@ struct SonarDMScreenContent: View {
                     onTapPack: { previewPackCoordinate = $0 },
                     onRetry: { store.retryDm(peerId, message: $0) },
                     loadOlder: { await convo.loadOlder() },
-                    loadNewest: { await convo.loadNewestIfNeeded() }
+                    loadNewest: { await convo.loadNewestIfNeeded() },
+                    // Captured by push() at navigation time, before this screen
+                    // (and openedDM's read-marking) existed.
+                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0
                 )
             }
 

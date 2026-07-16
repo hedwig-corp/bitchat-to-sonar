@@ -943,6 +943,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
 
+    /** Unread count per chat captured at open time — BEFORE opening zeroes the
+     *  core unread counter — so the transcript can anchor at the first unread
+     *  row with a divider (Signal-style) instead of force-pinning the tail.
+     *  The entry lives while the chat is on the nav stack. */
+    var openChatUnread by mutableStateOf<Map<String, Long>>(emptyMap())
+        private set
+
+    /** Frozen unread-anchor row ID per chat. Once the transcript resolves the
+     *  divider row, revisits of the same open (back from a pushed profile
+     *  screen) reuse it instead of recounting against a feed that has since
+     *  grown — new arrivals were already marked read and must not drift it. */
+    var openChatUnreadAnchor by mutableStateOf<Map<String, String>>(emptyMap())
+
+    private fun captureOpenChatUnread(chatId: String, sourceChatIds: List<String>) {
+        val unreadAtOpen = sourceChatIds.sumOf { unreadByChat[it] ?: 0L }
+        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatUnread = if (unreadAtOpen > 0L) {
+            openChatUnread + (chatId to unreadAtOpen)
+        } else {
+            openChatUnread - chatId
+        }
+    }
+
     // ── Mocked voice/video call log (in-memory only) ──
     /** Call records per chat id, merged into that DM's transcript by timestamp. */
     private val callLogs = mutableMapOf<String, MutableList<CallRecord>>()
@@ -3595,6 +3618,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val readChatIds = directMarmotChatIds(chat.id)
+        captureOpenChatUnread(chat.id, readChatIds)
         unreadByChat = unreadByChat - readChatIds.toSet()
         // Local-first paint (Signal-Comparable Performance Rule): show the
         // cached snapshot synchronously so the transcript never opens empty;
@@ -3642,6 +3666,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
+        captureOpenChatUnread(id, directMarmotChatIds(id))
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
@@ -3713,7 +3738,14 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun back() {
         cleanupPreviewTempFiles()
+        val popped = stack.lastOrNull()
         if (stack.size > 1) stack = stack.dropLast(1)
+        // The unread divider lives while its chat is on the stack; leaving the
+        // chat retires it so a later reopen (already marked read) starts clean.
+        (popped as? Screen.Chat)?.let {
+            openChatUnread = openChatUnread - it.id
+            openChatUnreadAnchor = openChatUnreadAnchor - it.id
+        }
         restoreRevealedChatOrClear()
         scope.launch { refreshChats() }
     }
@@ -3728,6 +3760,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             endTranscriptSession()
             stack = listOf(Screen.Home)
             messages = emptyList()
+            openChatUnread = emptyMap()
+            openChatUnreadAnchor = emptyMap()
         }
     }
 

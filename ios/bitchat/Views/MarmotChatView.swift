@@ -1248,6 +1248,18 @@ final class MarmotChatModel: ObservableObject {
     /// chat list fresh without scanning full transcripts on cold start, polling,
     /// or idle reconciliation. Already-loaded active transcripts are preserved
     /// and merged with the newest row.
+    /// Sum of unread counts for [groupIds] read straight from the core
+    /// conversation index. The published `unreadByGroup` map lags a cold
+    /// launch (it fills on the next summaries refresh), so open-time captures
+    /// must not depend on it.
+    func unreadCount(forGroups groupIds: [String]) async -> UInt64 {
+        let wanted = Set(groupIds)
+        let summaries = await service.conversationSummaries()
+        return summaries
+            .filter { wanted.contains($0.groupIdHex) }
+            .reduce(UInt64(0)) { $0 + $1.unreadCount }
+    }
+
     func loadLocalSummaries(resolveMembers: Bool = true) async {
         do {
             let groups = try await service.groups()

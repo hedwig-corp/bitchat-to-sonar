@@ -12,6 +12,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
@@ -115,6 +116,7 @@ import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -1010,17 +1012,60 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val feed: List<Any> = (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
     val currentFeed by rememberUpdatedState(feed)
-    // Open pinned at the newest row (Signal parity): start the list state at the
-    // tail of the locally painted feed so the first frame never shows the oldest
-    // page and then visibly jumps down. anchorTranscriptTail below still corrects
-    // the pixel offset for tail rows taller than the viewport.
+    // Signal-style unread anchoring: opening a chat with unread messages lands
+    // on the oldest unread row (with a divider) instead of force-pinning the
+    // tail; only a fully-read chat opens at the bottom. The anchor freezes by
+    // row ID at first computation so messages arriving while the chat is open
+    // (already marked read in core) cannot drift the divider down. The frozen
+    // ID persists in state so back-revealing this chat reuses it verbatim.
+    var unreadAnchorId by remember(screen.id) {
+        mutableStateOf(state.openChatUnreadAnchor[screen.id])
+    }
+    var userScrolled by remember(screen.id) { mutableStateOf(false) }
+    val unreadAnchorIndex = unreadAnchorId
+        ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
+        ?: -1
+    // Open pinned at the first unread row, or at the newest row for a read
+    // chat (Signal parity): start the list state there so the first frame
+    // never shows the wrong page and then visibly jumps.
     val listState = remember(screen.id) {
-        LazyListState(firstVisibleItemIndex = feed.lastIndex.coerceAtLeast(0))
+        val anchor = unreadAnchorId
+            ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
+            ?.takeIf { it >= 0 }
+            ?: firstUnreadTranscriptIndex(feed, state.openChatUnread[screen.id] ?: 0L)
+        LazyListState(
+            firstVisibleItemIndex = if (anchor >= 0) anchor else feed.lastIndex.coerceAtLeast(0),
+        )
     }
     var isNearBottom by remember(screen.id) { mutableStateOf(true) }
     var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
     var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
     var isPrepending by remember(screen.id) { mutableStateOf(false) }
+
+    // The divider must not resurrect or re-scroll once the reader takes over.
+    LaunchedEffect(screen.id, listState) {
+        listState.interactionSource.interactions.first { it is DragInteraction.Start }
+        userScrolled = true
+    }
+    // Freeze the unread anchor on the first feed that can resolve it, and
+    // re-resolve only if its row vanishes (a snapshot row replaced by the
+    // canonical DB page) before the user scrolls.
+    LaunchedEffect(screen.id, feed) {
+        val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
+        if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
+        val current = unreadAnchorId
+        if (current != null && feed.any { transcriptFeedKey(it) == current }) return@LaunchedEffect
+        if (current != null && userScrolled) return@LaunchedEffect
+        val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
+        if (anchor < 0) return@LaunchedEffect
+        val anchorKey = transcriptFeedKey(feed[anchor])
+        unreadAnchorId = anchorKey
+        state.openChatUnreadAnchor = state.openChatUnreadAnchor + (screen.id to anchorKey)
+        if (!userScrolled) {
+            withFrameNanos { }
+            listState.scrollToItem(anchor)
+        }
+    }
 
     // Observe the position independently of transcript publication. A newly
     // appended row follows only when the user was already reading the tail.
@@ -1037,7 +1082,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     LaunchedEffect(screen.id, newestFeedKey) {
         if (feed.isEmpty()) return@LaunchedEffect
         if (!didInitialScroll) {
-            listState.anchorTranscriptTail(feed.lastIndex, animate = false)
+            // An unread-anchored open keeps its position; the freeze effect
+            // above owns that scroll. Only a fully-read chat pins the tail.
+            if ((state.openChatUnread[screen.id] ?: 0L) <= 0L) {
+                listState.anchorTranscriptTail(feed.lastIndex, animate = false)
+            }
             didInitialScroll = true
         } else if (isNearBottom && !isPrepending) {
             listState.anchorTranscriptTail(feed.lastIndex, animate = true)
@@ -1268,6 +1317,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         // bc-datechip — "Today"/"Yesterday"/weekday/date when the local day flips.
                         val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
                         if (newDay) DateChip(dayLabel(ts))
+                        // Signal-style unread marker above the oldest unread row.
+                        if (i == unreadAnchorIndex) UnreadDivider()
                         if (item is CallRecord) {
                             CallLogRow(item)
                         } else {
@@ -2033,6 +2084,22 @@ private fun DateChip(label: String) {
     val s = sonar
     Box(Modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = Alignment.Center) {
         Text(label, color = s.text3, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Signal-style unread marker: hairlines around a centered label, attached
+ *  above the oldest unread row captured at chat-open time. */
+@Composable
+private fun UnreadDivider() {
+    val s = sonar
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Box(Modifier.weight(1f).height(1.dp).background(s.text3.copy(alpha = 0.25f)))
+        Text("Unread messages", color = s.text2, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
+        Box(Modifier.weight(1f).height(1.dp).background(s.text3.copy(alpha = 0.25f)))
     }
 }
 
