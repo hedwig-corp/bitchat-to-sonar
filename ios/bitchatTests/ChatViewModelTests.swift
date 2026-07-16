@@ -16,7 +16,9 @@ import Foundation
 @MainActor
 private func makeTestableViewModel(
     keychain: MockKeychain = MockKeychain(),
-    messageStore: MessageStore = .shared,
+    messageStore: MessageStore = MessageStore(
+        directoryName: "ChatViewModelTests-\(UUID().uuidString)"
+    ),
     favoritesPersistenceService: FavoritesPersistenceService = .shared
 ) -> (viewModel: ChatViewModel, transport: MockTransport) {
     let keychainHelper = MockKeychainHelper()

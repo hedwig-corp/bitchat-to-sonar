@@ -1727,6 +1727,18 @@ final class SonarAppStore: ObservableObject {
         // current identity, chats, wallet, and push registrations untouched.
         _ = try SonarIdentity.import(nsec: key)
 
+        // Establish the account notification boundary before deleting any
+        // prior-account state. The service advances its generation while
+        // cancelling delivered/pending notifications, so an already-admitted
+        // callback cannot publish old content into the replacement account.
+        NotificationService.shared.suspendAccountNotifications()
+        defer {
+            // On success this opens the replacement generation; on failure it
+            // restores notifications for the still-authoritative prior
+            // identity. A concurrent panic marker keeps the fence closed.
+            _ = NotificationService.shared.reactivateAccountNotifications()
+        }
+
         #if os(iOS) || os(macOS)
         let bridged = wallet as? BridgedWallet
         #if os(iOS)

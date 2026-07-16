@@ -20,12 +20,16 @@ struct ChatViewModelRefactoringTests {
         let idBridge = NostrIdentityBridge(keychain: keychainHelper)
         let identityManager = MockIdentityManager(keychain)
         let transport = MockTransport()
+        let messageStore = MessageStore(
+            directoryName: "ChatViewModelRefactoringTests-\(UUID().uuidString)"
+        )
 
         let viewModel = ChatViewModel(
             keychain: keychain,
             idBridge: idBridge,
             identityManager: identityManager,
-            transport: transport
+            transport: transport,
+            messageStore: messageStore
         )
 
         return (viewModel, transport, identityManager)

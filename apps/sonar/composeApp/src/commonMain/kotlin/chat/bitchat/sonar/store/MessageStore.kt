@@ -68,12 +68,30 @@ expect object MessageStore {
     suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray, expectedEpoch: Long = storageEpoch()): Boolean
     /** Load local bytes for a mesh media attachment referenced by `mesh-media:*`. */
     suspend fun loadMeshMedia(mediaUrl: String): ByteArray?
+    /** Durably remove one attachment that never reached a current transcript. */
+    suspend fun deleteMeshMedia(mediaUrl: String, expectedEpoch: Long = storageEpoch()): Boolean
+    /** Durably remove every local attachment referenced by a peer transcript.
+     * Must run before deleting that transcript so retries retain the URL index. */
+    suspend fun deleteMeshMediaForPeer(peerKey: String, expectedEpoch: Long = storageEpoch()): Boolean
     /** Quarantine is the privacy/account boundary; cleanup may be retried later. */
     suspend fun wipe(revision: Long): MessageStoreWipeResult
 }
 
 /** Cap kept on disk per conversation (matches the in-memory timeline). */
 const val MESSAGE_STORE_CAP = 500
+
+internal fun meshMediaUrlsForDeletion(messages: List<SonarMsg>): Set<String> = messages
+    .asSequence()
+    .flatMap { it.media.asSequence() }
+    .map { it.url }
+    .filter { it.startsWith("mesh-media:") }
+    .toSet()
+
+internal fun meshPeerKeyFromMediaUrl(mediaUrl: String): String? = mediaUrl
+    .takeIf { it.startsWith("mesh-media:") }
+    ?.removePrefix("mesh-media:")
+    ?.substringBefore(':')
+    ?.takeIf { it.isNotBlank() }
 
 /** First paint is a fixed local page, independent of total transcript count. */
 const val MESH_DM_SUMMARY_LIMIT = 200
@@ -136,20 +154,48 @@ internal enum class MessageStoreRollbackOutcome {
     Ambiguous,
 }
 
-/** Shared transaction order used by both platform stores. A failed catalog
- * commit leaves the repair intent in place and can never be reported as a
- * successful transcript mutation. */
+/** The durable phase reached by a transcript + summary-catalog transaction.
+ * Every value other than [MeshSummaryTransactionOutcome.Committed] is
+ * deliberately conservative: the caller cannot
+ * retire a retry obligation because the transcript may be absent, present, or
+ * present without a matching catalog row after a filesystem failure. */
+internal enum class MeshSummaryTransactionOutcome {
+    RepairIntentWriteFailed,
+    TranscriptMutationFailed,
+    CatalogCommitFailed,
+    RepairIntentClearFailed,
+    Committed,
+}
+
+/** Shared transaction order used by both platform stores. The detailed result
+ * keeps partial/ambiguous commits distinguishable in fault-injection tests. */
+internal inline fun meshSummaryTransactionOutcome(
+    writeRepairIntent: () -> Boolean,
+    mutateTranscript: () -> Boolean,
+    commitCatalog: () -> Boolean,
+    clearRepairIntent: () -> Boolean,
+): MeshSummaryTransactionOutcome {
+    if (!writeRepairIntent()) return MeshSummaryTransactionOutcome.RepairIntentWriteFailed
+    if (!mutateTranscript()) return MeshSummaryTransactionOutcome.TranscriptMutationFailed
+    if (!commitCatalog()) return MeshSummaryTransactionOutcome.CatalogCommitFailed
+    if (!clearRepairIntent()) return MeshSummaryTransactionOutcome.RepairIntentClearFailed
+    return MeshSummaryTransactionOutcome.Committed
+}
+
+/** Boolean compatibility surface used by platform stores. Only the fully
+ * committed phase is success; callers therefore retain pending delivery files
+ * for every partial or ambiguous transaction. */
 internal inline fun commitMeshSummaryTransaction(
     writeRepairIntent: () -> Boolean,
     mutateTranscript: () -> Boolean,
     commitCatalog: () -> Boolean,
     clearRepairIntent: () -> Boolean,
-): Boolean {
-    if (!writeRepairIntent()) return false
-    if (!mutateTranscript()) return false
-    if (!commitCatalog()) return false
-    return clearRepairIntent()
-}
+): Boolean = meshSummaryTransactionOutcome(
+    writeRepairIntent,
+    mutateTranscript,
+    commitCatalog,
+    clearRepairIntent,
+) == MeshSummaryTransactionOutcome.Committed
 
 /** Advance the active epoch immediately after the visible rename, but expose a
  * durable quarantine only after the parent directory barrier. A failed barrier

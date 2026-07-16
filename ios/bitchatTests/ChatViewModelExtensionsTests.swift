@@ -14,7 +14,9 @@ import Combine
 
 @MainActor
 private func makeTestableViewModel(
-    messageStore: MessageStore = .shared,
+    messageStore: MessageStore = MessageStore(
+        directoryName: "ChatViewModelExtensionsTests-\(UUID().uuidString)"
+    ),
     favoritesPersistenceService: FavoritesPersistenceService = .shared
 ) -> (viewModel: ChatViewModel, transport: MockTransport) {
     let keychain = MockKeychain()
@@ -59,7 +61,8 @@ struct ChatViewModelPrivateChatExtensionTests {
         _ content: String,
         messageID: String,
         from peerID: PeerID,
-        viewModel: ChatViewModel
+        viewModel: ChatViewModel,
+        timestamp: Date = Date()
     ) throws {
         let packet = PrivateMessagePacket(messageID: messageID, content: content)
         let payload = try #require(packet.encode(), "Failed to encode private message")
@@ -67,7 +70,7 @@ struct ChatViewModelPrivateChatExtensionTests {
             from: peerID,
             type: .privateMessage,
             payload: payload,
-            timestamp: Date()
+            timestamp: timestamp
         )
     }
 
@@ -248,6 +251,93 @@ struct ChatViewModelPrivateChatExtensionTests {
     }
 
     @Test @MainActor
+    func meshPrivateMessage_closedChatNonLatestReplayUsesDurableReceipt() async throws {
+        let dirName = "MeshClosedReplayTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-closed-replay")
+        let olderID = "closed-older-\(UUID().uuidString)"
+        let newerID = "closed-newer-\(UUID().uuidString)"
+        let olderTimestamp = Date().addingTimeInterval(-60)
+
+        try receiveMeshPrivateMessage(
+            "durable older",
+            messageID: olderID,
+            from: peerID,
+            viewModel: viewModel,
+            timestamp: olderTimestamp
+        )
+        await waitForDeliveryAcks(1, transport: transport)
+        try receiveMeshPrivateMessage(
+            "visible newer",
+            messageID: newerID,
+            from: peerID,
+            viewModel: viewModel
+        )
+        await waitForDeliveryAcks(2, transport: transport)
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+
+        try receiveMeshPrivateMessage(
+            "durable older",
+            messageID: olderID,
+            from: peerID,
+            viewModel: viewModel,
+            timestamp: olderTimestamp
+        )
+        await waitForDeliveryAcks(3, transport: transport)
+
+        #expect(transport.sentDeliveryAcks.map(\.messageID) == [olderID, newerID, olderID])
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+        #expect(store.load(peerID: peerID).filter { $0.id == olderID }.count == 1)
+        #expect(await store.loadPendingReceiveEffects().isEmpty)
+    }
+
+    @Test @MainActor
+    func meshPrivateMessage_closedChatNonLatestCollisionKeepsStoredPayload() async throws {
+        let dirName = "MeshClosedCollisionTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        let peerID = PeerID(str: "sender-closed-collision")
+        let olderID = "collision-older-\(UUID().uuidString)"
+        let newerID = "collision-newer-\(UUID().uuidString)"
+        let olderTimestamp = Date().addingTimeInterval(-60)
+
+        try receiveMeshPrivateMessage(
+            "stored payload",
+            messageID: olderID,
+            from: peerID,
+            viewModel: viewModel,
+            timestamp: olderTimestamp
+        )
+        await waitForDeliveryAcks(1, transport: transport)
+        try receiveMeshPrivateMessage(
+            "newest payload",
+            messageID: newerID,
+            from: peerID,
+            viewModel: viewModel
+        )
+        await waitForDeliveryAcks(2, transport: transport)
+
+        try receiveMeshPrivateMessage(
+            "replacement payload",
+            messageID: olderID,
+            from: peerID,
+            viewModel: viewModel,
+            timestamp: Date().addingTimeInterval(60)
+        )
+        await waitForDeliveryAcks(3, transport: transport)
+
+        let stored = store.load(peerID: peerID)
+        #expect(transport.sentDeliveryAcks.map(\.messageID) == [olderID, newerID, olderID])
+        #expect(stored.first(where: { $0.id == olderID })?.content == "stored payload")
+        #expect(stored.filter { $0.id == olderID }.count == 1)
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+        #expect(await store.loadPendingReceiveEffects().isEmpty)
+    }
+
+    @Test @MainActor
     func meshPrivateMessage_concurrentBurstCommitsAndAcksEveryMessage() async throws {
         let dirName = "MeshBurstAckTest-\(UUID().uuidString)"
         let store = MessageStore(directoryName: dirName)
@@ -267,7 +357,10 @@ struct ChatViewModelPrivateChatExtensionTests {
         await waitForDeliveryAcks(ids.count, transport: transport)
 
         #expect(Set(transport.sentDeliveryAcks.map(\.messageID)) == Set(ids))
-        #expect(Set(viewModel.privateChats[peerID]?.map(\.id) ?? []) == Set(ids))
+        // Closed chats retain only their newest summary in memory. The complete
+        // bounded transcript remains authoritative in MessageStore.
+        #expect(viewModel.privateChats[peerID]?.count == 1)
+        #expect(ids.contains(viewModel.privateChats[peerID]?.first?.id ?? ""))
         let reopened = MessageStore(directoryName: dirName)
         #expect(Set(reopened.load(peerID: peerID).map(\.id)) == Set(ids))
     }
@@ -503,6 +596,80 @@ struct ChatViewModelPrivateChatExtensionTests {
         let status = reopened.load(peerID: peerID).first?.deliveryStatus
         if case .delivered = status {} else {
             Issue.record("Delivery status did not survive MessageStore reopen")
+        }
+    }
+
+    @Test @MainActor
+    func meshAndNostrReceiptsPersistForClosedNonLatestMessage() async {
+        let dirName = "ClosedReceiptStatusTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let senderPubkey = String(repeating: "ab", count: 32)
+        let peerID = PeerID(nostr_: senderPubkey)
+        let olderID = "closed-receipt-older"
+        let newerID = "closed-receipt-newer"
+        let older = BitchatMessage(
+            id: olderID,
+            sender: "me",
+            content: "older",
+            timestamp: Date(timeIntervalSince1970: 1_000),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "alice",
+            deliveryStatus: .sent
+        )
+        let newer = BitchatMessage(
+            id: newerID,
+            sender: "me",
+            content: "newer",
+            timestamp: Date(timeIntervalSince1970: 2_000),
+            isRelay: false,
+            isPrivate: true,
+            recipientNickname: "alice",
+            deliveryStatus: .sent
+        )
+        #expect(await store.commitPrivate(peerID: peerID, messages: [older, newer]))
+
+        let (viewModel, transport) = makeTestableViewModel(messageStore: store)
+        transport.peerNicknames[peerID] = "alice"
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+
+        viewModel.didReceiveNoisePayload(
+            from: peerID,
+            type: .delivered,
+            payload: Data(olderID.utf8),
+            timestamp: Date()
+        )
+        let delivered = await TestHelpers.waitUntil {
+            guard let status = store.load(peerID: peerID)
+                .first(where: { $0.id == olderID })?.deliveryStatus else { return false }
+            if case .delivered = status { return true }
+            return false
+        }
+        #expect(delivered)
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+
+        viewModel.handleReadReceipt(
+            NoisePayload(type: .readReceipt, data: Data(olderID.utf8)),
+            senderPubkey: senderPubkey,
+            convKey: peerID
+        )
+        let read = await TestHelpers.waitUntil {
+            guard let status = store.load(peerID: peerID)
+                .first(where: { $0.id == olderID })?.deliveryStatus else { return false }
+            if case .read = status { return true }
+            return false
+        }
+        #expect(read)
+        #expect(viewModel.privateChats[peerID]?.map(\.id) == [newerID])
+
+        let reopenedManager = PrivateChatManager(store: MessageStore(directoryName: dirName))
+        #expect(reopenedManager.privateChats[peerID]?.map(\.id) == [newerID])
+        reopenedManager.startChat(with: peerID)
+        let reopenedStatus = reopenedManager.privateChats[peerID]?
+            .first(where: { $0.id == olderID })?.deliveryStatus
+        if case .read = reopenedStatus {} else {
+            Issue.record("Closed non-latest receipt was not durable across reopen")
         }
     }
 
@@ -948,9 +1115,16 @@ struct ChatViewModelGeohashQueueTests {
 
 struct ChatViewModelGeoDMTests {
 
+    private enum SimulatedPersistenceFailure: Error {
+        case beforeRename
+    }
+
     @Test @MainActor
     func handlePrivateMessage_geohash_dedupsAndTracksAck() async throws {
-        let (viewModel, _) = makeTestableViewModel()
+        let dirName = "GeoDMDedupeTest-\(UUID().uuidString)"
+        let store = MessageStore(directoryName: dirName)
+        defer { store.wipeAll() }
+        let (viewModel, _) = makeTestableViewModel(messageStore: store)
         let geohash = "u4pruydq"
         let senderPubkey = "0000000000000000000000000000000000000000000000000000000000000001"
         let messageID = "pm-1"
@@ -963,11 +1137,69 @@ struct ChatViewModelGeoDMTests {
         let payloadData = try #require(packet.encode(), "Failed to encode private message")
         let payload = NoisePayload(type: .privateMessage, data: payloadData)
 
-        viewModel.handlePrivateMessage(payload, senderPubkey: senderPubkey, convKey: convKey, id: identity, messageTimestamp: Date())
-        viewModel.handlePrivateMessage(payload, senderPubkey: senderPubkey, convKey: convKey, id: identity, messageTimestamp: Date())
+        await viewModel.handlePrivateMessage(payload, senderPubkey: senderPubkey, convKey: convKey, id: identity, messageTimestamp: Date())
+        await viewModel.handlePrivateMessage(payload, senderPubkey: senderPubkey, convKey: convKey, id: identity, messageTimestamp: Date())
 
         #expect(viewModel.privateChats[convKey]?.count == 1)
         #expect(viewModel.sentGeoDeliveryAcks.contains(messageID))
+        #expect(store.load(peerID: convKey).map(\.id) == [messageID])
+        let pendingAfterDuplicate = await store.loadPendingReceiveEffects()
+        #expect(!pendingAfterDuplicate.contains { $0.message.id == messageID })
+    }
+
+    @Test @MainActor
+    func handlePrivateMessage_geohashFailedCommitWithholdsAckAndEffectsUntilStableRetry() async throws {
+        let dirName = "GeoDMAckFailureTest-\(UUID().uuidString)"
+        let cleanupStore = MessageStore(directoryName: dirName)
+        defer { cleanupStore.wipeAll() }
+        let failingStore = MessageStore(
+            directoryName: dirName,
+            beforeAtomicReplace: { throw SimulatedPersistenceFailure.beforeRename }
+        )
+        let (failingViewModel, _) = makeTestableViewModel(messageStore: failingStore)
+        let geohash = "u4pruydq"
+        let senderPubkey = "0000000000000000000000000000000000000000000000000000000000000001"
+        let messageID = "pm-stable-retry"
+        failingViewModel.switchLocationChannel(
+            to: .location(GeohashChannel(level: .city, geohash: geohash))
+        )
+        let failingIdentity = try failingViewModel.idBridge.deriveIdentity(forGeohash: geohash)
+        let convKey = PeerID(nostr_: senderPubkey)
+        let packet = PrivateMessagePacket(messageID: messageID, content: "Persist before ACK")
+        let payloadData = try #require(packet.encode(), "Failed to encode private message")
+        let payload = NoisePayload(type: .privateMessage, data: payloadData)
+
+        await failingViewModel.handlePrivateMessage(
+            payload,
+            senderPubkey: senderPubkey,
+            convKey: convKey,
+            id: failingIdentity,
+            messageTimestamp: Date()
+        )
+
+        #expect(!failingViewModel.sentGeoDeliveryAcks.contains(messageID))
+        #expect(failingViewModel.privateChats[convKey] == nil)
+        #expect(!failingViewModel.unreadPrivateMessages.contains(convKey))
+        #expect(cleanupStore.load(peerID: convKey).isEmpty)
+
+        let retryStore = MessageStore(directoryName: dirName)
+        let (retryViewModel, _) = makeTestableViewModel(messageStore: retryStore)
+        retryViewModel.switchLocationChannel(
+            to: .location(GeohashChannel(level: .city, geohash: geohash))
+        )
+        let retryIdentity = try retryViewModel.idBridge.deriveIdentity(forGeohash: geohash)
+        await retryViewModel.handlePrivateMessage(
+            payload,
+            senderPubkey: senderPubkey,
+            convKey: convKey,
+            id: retryIdentity,
+            messageTimestamp: Date()
+        )
+
+        #expect(retryViewModel.sentGeoDeliveryAcks.contains(messageID))
+        #expect(retryStore.load(peerID: convKey).map(\.id) == [messageID])
+        let pendingAfterRetry = await retryStore.loadPendingReceiveEffects()
+        #expect(!pendingAfterRetry.contains { $0.message.id == messageID })
     }
 }
 

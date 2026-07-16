@@ -1,10 +1,47 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.store.MESSAGE_STORE_CAP
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
 class SonarOutboxTest {
+    @Test
+    fun directTranscriptReplayDistinguishesAlreadyPresentFromIdCollision() {
+        val candidate = SonarMsg(
+            "stable-id",
+            "sender",
+            "hello",
+            mine = true,
+            tsSecs = 1,
+            viaInternet = true,
+            state = "Sending",
+        )
+
+        assertEquals(
+            MeshTranscriptAdmission.AlreadyPresent,
+            classifyMeshTranscriptReplay(candidate.copy(state = "Couldn't send"), candidate),
+        )
+        assertEquals(
+            MeshTranscriptAdmission.CommitFailed,
+            classifyMeshTranscriptReplay(candidate.copy(content = "different"), candidate),
+        )
+        assertEquals(null, classifyMeshTranscriptReplay(null, candidate))
+    }
+
+    @Test
+    fun composePrivateTranscriptRetainsOnlyNewestLocalWindow() {
+        val messages = (0 until MESSAGE_STORE_CAP + 25).map { index ->
+            SonarMsg("id-$index", "peer", "message-$index", mine = false, tsSecs = index.toLong())
+        }.reversed()
+
+        val retained = retainedPrivateTranscript(messages)
+
+        assertEquals(MESSAGE_STORE_CAP, retained.size)
+        assertEquals("id-25", retained.first().id)
+        assertEquals("id-${MESSAGE_STORE_CAP + 24}", retained.last().id)
+    }
+
     @Test
     fun enqueueEvictsOldestMessageWhenPeerQueueIsFull() {
         val outbox = SonarOutbox(maxPerPeer = 3, ttlSecs = 100)

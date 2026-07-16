@@ -60,6 +60,7 @@ actual object WalletBridge {
     private val operationGate = Mutex()
     private val setupGate = Mutex()
     private val cleanupGate = Mutex()
+    private val teardownSlot = WalletTeardownSlot<BindingLiquidSdk>()
     @Volatile private var sdk: BindingLiquidSdk? = null
     @Volatile private var current: WalletState = WalletState.NotConfigured
     @Volatile private var rates: Map<String, ExchangeRate> = emptyMap()
@@ -127,7 +128,9 @@ actual object WalletBridge {
                         current = WalletState.NotConfigured
                         return@withLock null
                     }
-                    if (sdk != null || setupAttempt != null) return@withLock null
+                    if (sdk != null || setupAttempt != null || teardownSlot.hasPendingNode()) {
+                        return@withLock null
+                    }
                     if (key.isEmpty()) {
                         current = WalletState.NotConfigured
                         return@withLock null
@@ -173,7 +176,8 @@ actual object WalletBridge {
                         result == null -> current = WalletState.Failed(
                             outcome.exceptionOrNull()?.message ?: "wallet setup failed",
                         )
-                        walletEpoch != attempt.epoch || PanicWipeIntent.isPending() || cleanupPending() || sdk != null -> {
+                        walletEpoch != attempt.epoch || PanicWipeIntent.isPending() || cleanupPending() ||
+                            sdk != null || teardownSlot.hasPendingNode() -> {
                             disconnect = result.node
                             if (sdk == null) current = WalletState.NotConfigured
                         }
@@ -185,7 +189,11 @@ actual object WalletBridge {
                         }
                     }
                 }
-                disconnect?.let { runCatching { it.disconnect() } }
+                disconnect?.let { node ->
+                    if (disconnectOrRetain(node) != null) {
+                        current = WalletState.Failed("wallet node did not disconnect cleanly")
+                    }
+                }
                 attempt.quiesced.complete(Unit)
             }
         }
@@ -194,10 +202,21 @@ actual object WalletBridge {
     private suspend fun finishTimedOutSetup(attempt: SetupAttempt) {
         val result = runCatching { attempt.work.await() }.getOrNull()
         operationGate.withLock {
-            result?.node?.let { runCatching { it.disconnect() } }
+            result?.node?.let { node ->
+                if (disconnectOrRetain(node) != null) {
+                    current = WalletState.Failed("wallet node did not disconnect cleanly")
+                }
+            }
             lock.withLock { if (setupAttempt === attempt) setupAttempt = null }
             attempt.quiesced.complete(Unit)
         }
+    }
+
+    /** Must be called while [operationGate] is held. */
+    private fun disconnectOrRetain(node: BindingLiquidSdk?): Throwable? {
+        val failure = runCatching { node?.disconnect() }.exceptionOrNull()
+        teardownSlot.recordDisconnect(node, succeeded = failure == null)
+        return failure
     }
 
     actual suspend fun refreshBalance(): Long = withContext(Dispatchers.IO) {
@@ -376,7 +395,7 @@ actual object WalletBridge {
 
     actual suspend fun shutdown(): Unit = withContext(Dispatchers.IO) {
         operationGate.withLock {
-            val (node, listener) = lock.withLock {
+            val (activeNode, listener) = lock.withLock {
                 walletEpoch += 1
                 val detached = sdk
                 val listener = balanceListenerId
@@ -388,8 +407,9 @@ actual object WalletBridge {
                 receiveOffer = null
                 detached to listener
             }
+            val node = teardownSlot.nodeForDisconnect(activeNode)
             listener?.let { id -> runCatching { node?.removeEventListener(id) } }
-            val disconnectFailure = runCatching { node?.disconnect() }.exceptionOrNull()
+            val disconnectFailure = disconnectOrRetain(node)
             if (disconnectFailure != null) {
                 current = WalletState.Failed("wallet node did not disconnect cleanly")
                 throw IllegalStateException("wallet node did not disconnect cleanly", disconnectFailure)
@@ -416,7 +436,7 @@ actual object WalletBridge {
         ) return@withLock false
         val retired = withContext(Dispatchers.IO) {
             operationGate.withLock {
-                if (setupAttempt != null) return@withLock false
+                if (setupAttempt != null || teardownSlot.hasPendingNode()) return@withLock false
                 durablyRetireJvmDirectory(
                     DesktopEnv.file("sonar-wallet"),
                     ".sonar-wallet-wipe-",

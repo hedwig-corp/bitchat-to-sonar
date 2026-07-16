@@ -146,7 +146,7 @@ final class MessageStoreTests: XCTestCase {
 
         XCTAssertEqual(fullTranscriptReads, 0)
         XCTAssertEqual(snapshot.scannedFileCount, 1)
-        XCTAssertEqual(snapshot.chats[peer]?.count, MessageStore.privateMessageWindowSize)
+        XCTAssertEqual(snapshot.chats[peer]?.count, 1)
         XCTAssertEqual(snapshot.chats[peer]?.last?.id, huge.last?.id)
     }
 
@@ -179,8 +179,10 @@ final class MessageStoreTests: XCTestCase {
 
         var windowDirectoryListings = 0
         var completeIndexReads = 0
+        var windowReads = 0
         let reopened = MessageStore(
             directoryName: dirName,
+            privateWindowReadObserver: { windowReads += 1 },
             fullConversationIndexReadObserver: { completeIndexReads += 1 },
             directoryLister: { directory in
                 if directory.lastPathComponent == "private-windows" {
@@ -198,8 +200,10 @@ final class MessageStoreTests: XCTestCase {
 
         XCTAssertEqual(windowDirectoryListings, 0)
         XCTAssertEqual(completeIndexReads, 0)
+        XCTAssertEqual(windowReads, 0)
         XCTAssertEqual(first.scannedFileCount, PrivateChatManager.startupChatPageSize)
         XCTAssertEqual(first.chats.count, PrivateChatManager.startupChatPageSize)
+        XCTAssertTrue(first.chats.values.allSatisfy { $0.count == 1 })
         XCTAssertTrue(first.hasMore)
         XCTAssertNotNil(first.nextCursor)
     }
@@ -402,7 +406,7 @@ final class MessageStoreTests: XCTestCase {
         flush()
 
         let manager = PrivateChatManager(store: store)
-        XCTAssertEqual(manager.privateChats[peer]?.count, MessageStore.privateMessageWindowSize)
+        XCTAssertEqual(manager.privateChats[peer]?.count, 1)
         manager.privateChats[peer]?.append(
             message(id: "new-row", content: "new", senderPeerID: peer)
         )
@@ -443,6 +447,63 @@ final class MessageStoreTests: XCTestCase {
         XCTAssertEqual(manager.privateChats[target]?.first?.id, "target-50")
         XCTAssertEqual(manager.privateChats[target]?.last?.id, "target-99")
         XCTAssertEqual(fullTranscriptReads, 0)
+    }
+
+    @MainActor
+    func testOpenChatPagesOlderRowsAndCapsLiveWindow() async {
+        let peer = PeerID(str: "0000000000000001")
+        let history = (0..<TransportConfig.privateChatCap).map { index in
+            message(id: "paged-\(index)", content: "row-\(index)", senderPeerID: peer)
+        }
+        store.savePrivate(peerID: peer, messages: history)
+        flush()
+
+        let manager = PrivateChatManager(store: store)
+        XCTAssertEqual(manager.privateChats[peer]?.count, 1, "chat list retains only a summary")
+        manager.startChat(with: peer)
+        XCTAssertEqual(manager.privateChats[peer]?.count, MessageStore.privateMessageWindowSize)
+        XCTAssertEqual(manager.privateChats[peer]?.first?.id, "paged-1287")
+
+        while manager.canLoadOlderMessages(for: peer) {
+            _ = await manager.loadOlderMessages(for: peer)
+        }
+
+        XCTAssertEqual(manager.privateChats[peer]?.count, TransportConfig.privateChatCap)
+        XCTAssertEqual(manager.privateChats[peer]?.first?.id, "paged-0")
+        manager.privateChats[peer]?.append(
+            message(id: "beyond-cap", content: "new", senderPeerID: peer)
+        )
+        XCTAssertEqual(manager.privateChats[peer]?.count, TransportConfig.privateChatCap)
+        XCTAssertEqual(manager.privateChats[peer]?.last?.id, "beyond-cap")
+
+        manager.endChat()
+        XCTAssertEqual(manager.privateChats[peer]?.map(\.id), ["beyond-cap"])
+    }
+
+    @MainActor
+    func testBackgroundHydrationRetainsSummariesOnly() async {
+        for index in 0..<60 {
+            let peer = PeerID(str: String(format: "%016llx", index + 1))
+            store.savePrivate(
+                peerID: peer,
+                messages: (0..<80).map { row in
+                    message(id: "summary-\(index)-\(row)", content: "row", senderPeerID: peer)
+                }
+            )
+        }
+        flush()
+        var windowReads = 0
+        let reopened = MessageStore(
+            directoryName: dirName,
+            privateWindowReadObserver: { windowReads += 1 }
+        )
+        let manager = PrivateChatManager(store: reopened)
+
+        await manager.hydrateRemainingChatPages()
+
+        XCTAssertEqual(manager.privateChats.count, 60)
+        XCTAssertTrue(manager.privateChats.values.allSatisfy { $0.count == 1 })
+        XCTAssertEqual(windowReads, 0)
     }
 
     /// A fresh store pointed at the same directory sees the persisted data —
@@ -587,7 +648,8 @@ final class MessageStoreTests: XCTestCase {
 
         let reopened = MessageStore(directoryName: dirName)
         XCTAssertTrue(reopened.hasPendingReceiveEffects(peerID: peer, messageID: incoming.id))
-        XCTAssertEqual(reopened.loadPrivateSnapshot().pendingReceiveEffects.map { $0.message.id }, [incoming.id])
+        let reopenedPending = await reopened.loadPendingReceiveEffects()
+        XCTAssertEqual(reopenedPending.map { $0.message.id }, [incoming.id])
         let processed = await reopened.commitReceiveEffectsProcessed(
             peerID: peer,
             messageID: incoming.id,
@@ -598,7 +660,212 @@ final class MessageStoreTests: XCTestCase {
         let verified = MessageStore(directoryName: dirName)
         XCTAssertEqual(verified.load(peerID: peer).map(\.id), [incoming.id])
         XCTAssertFalse(verified.hasPendingReceiveEffects(peerID: peer, messageID: incoming.id))
-        XCTAssertTrue(verified.loadPrivateSnapshot().pendingReceiveEffects.isEmpty)
+        let verifiedPending = await verified.loadPendingReceiveEffects()
+        XCTAssertTrue(verifiedPending.isEmpty)
+    }
+
+    func testIncomingStableIDCollisionKeepsStoredPayloadAndDoesNotRearmEffects() async {
+        let peer = PeerID(str: "stable-receive-peer")
+        let original = message(id: "stable-receive-id", content: "original", senderPeerID: peer)
+        let generation = store.currentStorageGeneration()
+        let admitted = await store.commitIncomingPrivate(
+            peerID: peer,
+            message: original,
+            expectedGeneration: generation
+        )
+        XCTAssertEqual(admitted.disposition, .admitted)
+        let processed = await store.commitReceiveEffectsProcessed(
+            peerID: peer,
+            messageID: original.id,
+            expectedGeneration: generation
+        )
+        XCTAssertTrue(processed)
+
+        let collision = message(id: original.id, content: "replacement", senderPeerID: peer)
+        let duplicate = await store.commitIncomingPrivate(
+            peerID: peer,
+            message: collision,
+            expectedGeneration: generation
+        )
+
+        XCTAssertEqual(duplicate.disposition, .duplicate)
+        XCTAssertEqual(duplicate.message?.content, "original")
+        XCTAssertEqual(store.load(peerID: peer).map(\.content), ["original"])
+        let pending = await store.loadPendingReceiveEffects()
+        XCTAssertTrue(pending.isEmpty)
+    }
+
+    @MainActor
+    func testStableIDReceiptMutatesClosedNonLatestRowWithoutPromotingIt() async {
+        let peer = PeerID(str: "receipt-history-peer")
+        let older = message(
+            id: "receipt-older",
+            content: "older",
+            senderPeerID: peer,
+            status: .sent
+        )
+        let newer = message(
+            id: "receipt-newer",
+            content: "newer",
+            senderPeerID: peer,
+            status: .sent
+        )
+        let seeded = await store.commitPrivate(peerID: peer, messages: [older, newer])
+        XCTAssertTrue(seeded)
+
+        let manager = PrivateChatManager(store: store)
+        XCTAssertEqual(manager.privateChats[peer]?.map(\.id), [newer.id])
+
+        let deliveredAt = Date(timeIntervalSince1970: 2_000_000)
+        let delivered = await manager.commitDeliveryStatus(
+            messageID: older.id,
+            status: .delivered(to: "alice", at: deliveredAt),
+            preferredPeerIDs: [peer],
+            expectedGeneration: manager.currentStorageGeneration()
+        )
+        XCTAssertEqual(delivered.disposition, .updated)
+        XCTAssertFalse(delivered.isLatest)
+        XCTAssertEqual(manager.privateChats[peer]?.map(\.id), [newer.id])
+        XCTAssertEqual(manager.privateChats[peer]?.first?.deliveryStatus, .sent)
+
+        let duplicate = await store.commitPrivateDeliveryStatus(
+            peerIDs: [peer],
+            messageID: older.id,
+            status: .delivered(to: "replacement", at: deliveredAt.addingTimeInterval(30)),
+            expectedGeneration: store.currentStorageGeneration()
+        )
+        XCTAssertEqual(duplicate.disposition, .unchanged)
+        XCTAssertEqual(
+            store.load(peerID: peer).first(where: { $0.id == older.id })?.deliveryStatus,
+            .delivered(to: "alice", at: deliveredAt)
+        )
+
+        let readAt = deliveredAt.addingTimeInterval(60)
+        let read = await store.commitPrivateDeliveryStatus(
+            peerIDs: [peer],
+            messageID: older.id,
+            status: .read(by: "alice", at: readAt),
+            expectedGeneration: store.currentStorageGeneration()
+        )
+        XCTAssertEqual(read.disposition, .updated)
+        let lateDelivered = await store.commitPrivateDeliveryStatus(
+            peerIDs: [peer],
+            messageID: older.id,
+            status: .delivered(to: "alice", at: readAt.addingTimeInterval(30)),
+            expectedGeneration: store.currentStorageGeneration()
+        )
+        XCTAssertEqual(lateDelivered.disposition, .unchanged)
+
+        let latest = await manager.commitDeliveryStatus(
+            messageID: newer.id,
+            status: .delivered(to: "alice", at: deliveredAt),
+            preferredPeerIDs: [peer],
+            expectedGeneration: manager.currentStorageGeneration()
+        )
+        XCTAssertEqual(latest.disposition, .updated)
+        XCTAssertTrue(latest.isLatest)
+        XCTAssertEqual(
+            manager.privateChats[peer]?.first?.deliveryStatus,
+            .delivered(to: "alice", at: deliveredAt)
+        )
+
+        let reopened = MessageStore(directoryName: dirName)
+        let reopenedManager = PrivateChatManager(store: reopened)
+        XCTAssertEqual(reopenedManager.privateChats[peer]?.map(\.id), [newer.id])
+        reopenedManager.startChat(with: peer)
+        XCTAssertEqual(
+            reopenedManager.privateChats[peer]?.first(where: { $0.id == older.id })?.deliveryStatus,
+            .read(by: "alice", at: readAt)
+        )
+        XCTAssertEqual(
+            reopenedManager.privateChats[peer]?.first(where: { $0.id == newer.id })?.deliveryStatus,
+            .delivered(to: "alice", at: deliveredAt)
+        )
+    }
+
+    func testDuplicateReceiptRepairsWindowAfterPartialDurableCommit() async {
+        enum SimulatedFailure: Error { case beforeWindowReplace }
+        let peer = PeerID(str: "receipt-repair-peer")
+        let message = message(
+            id: "receipt-repair-id",
+            content: "repair",
+            senderPeerID: peer,
+            status: .sent
+        )
+        let seeded = await store.commitPrivate(peerID: peer, messages: [message])
+        XCTAssertTrue(seeded)
+
+        var replaceCount = 0
+        let failing = MessageStore(
+            directoryName: dirName,
+            beforeAtomicReplace: {
+                replaceCount += 1
+                if replaceCount == 2 { throw SimulatedFailure.beforeWindowReplace }
+            }
+        )
+        let deliveredAt = Date(timeIntervalSince1970: 3_000_000)
+        let partial = await failing.commitPrivateDeliveryStatus(
+            peerIDs: [peer],
+            messageID: message.id,
+            status: .delivered(to: "alice", at: deliveredAt),
+            expectedGeneration: failing.currentStorageGeneration()
+        )
+        XCTAssertEqual(partial.disposition, .failed)
+        XCTAssertEqual(
+            failing.load(peerID: peer).first?.deliveryStatus,
+            .delivered(to: "alice", at: deliveredAt),
+            "the full transcript crossed its rename before the sidecar fault"
+        )
+        XCTAssertEqual(failing.loadRecent(peerID: peer).first?.deliveryStatus, .sent)
+
+        let retrying = MessageStore(directoryName: dirName)
+        let repaired = await retrying.commitPrivateDeliveryStatus(
+            peerIDs: [peer],
+            messageID: message.id,
+            status: .delivered(to: "replacement", at: deliveredAt.addingTimeInterval(60)),
+            expectedGeneration: retrying.currentStorageGeneration()
+        )
+        XCTAssertEqual(repaired.disposition, .unchanged)
+
+        let reopened = MessageStore(directoryName: dirName)
+        XCTAssertEqual(
+            reopened.loadRecent(peerID: peer).first?.deliveryStatus,
+            .delivered(to: "alice", at: deliveredAt)
+        )
+    }
+
+    func testProcessedStableIDReceiptSurvivesTranscriptCapEviction() async {
+        let peer = PeerID(str: "stable-receipt-peer")
+        let original = message(id: "receipt-id", content: "original", senderPeerID: peer)
+        let generation = store.currentStorageGeneration()
+        let admitted = await store.commitIncomingPrivate(
+            peerID: peer,
+            message: original,
+            expectedGeneration: generation
+        )
+        XCTAssertEqual(admitted.disposition, .admitted)
+        let processed = await store.commitReceiveEffectsProcessed(
+            peerID: peer,
+            messageID: original.id,
+            expectedGeneration: generation
+        )
+        XCTAssertTrue(processed)
+        let newer = (0..<TransportConfig.privateChatCap).map { index in
+            message(id: "newer-\(index)", content: "row", senderPeerID: peer)
+        }
+        store.savePrivate(peerID: peer, messages: newer)
+        flush()
+        XCTAssertFalse(store.load(peerID: peer).contains { $0.id == original.id })
+
+        let replay = await store.commitIncomingPrivate(
+            peerID: peer,
+            message: original,
+            expectedGeneration: generation
+        )
+
+        XCTAssertEqual(replay.disposition, .duplicate)
+        XCTAssertNil(replay.message)
+        XCTAssertFalse(store.load(peerID: peer).contains { $0.id == original.id })
     }
 
     func testPendingEffectReplayReadsOnlyIndexedPeersWithoutDirectoryScan() async {
@@ -1138,6 +1405,102 @@ final class MessageStoreTests: XCTestCase {
             reopened.loadMeshObligations(ownerID: owner, fence: "verify")?.obligations.isEmpty == true
         )
         XCTAssertTrue(reopened.load(peerID: peer).isEmpty)
+    }
+
+    func testBatchConversationDeleteRemovesEveryAliasInOneCommittedResult() async {
+        let aliasA = PeerID(str: "alias-delete-a")
+        let aliasB = PeerID(str: "alias-delete-b")
+        let survivor = PeerID(str: "alias-delete-survivor")
+        let messageA = message(id: "alias-a-message", content: "delete a", senderPeerID: aliasA)
+        let messageB = message(id: "alias-b-message", content: "delete b", senderPeerID: aliasB)
+        let committedA = await store.commitPrivate(
+            peerID: aliasA,
+            messages: [messageA],
+            pendingReceiveEffectMessageID: messageA.id
+        )
+        let committedB = await store.commitPrivate(
+            peerID: aliasB,
+            messages: [messageB],
+            pendingReceiveEffectMessageID: messageB.id
+        )
+        let committedSurvivor = await store.commitPrivate(
+            peerID: survivor,
+            messages: [message(content: "keep", senderPeerID: survivor)]
+        )
+        XCTAssertTrue(committedA)
+        XCTAssertTrue(committedB)
+        XCTAssertTrue(committedSurvivor)
+
+        let result = store.deletePrivateDurably(peerIDs: [aliasB, aliasA, aliasA])
+
+        XCTAssertEqual(result, PrivateConversationDeletionResult(fenced: true, complete: true))
+        let snapshot = store.loadPrivateSnapshot(chatLimit: 24)
+        XCTAssertNil(snapshot.chats[aliasA])
+        XCTAssertNil(snapshot.chats[aliasB])
+        XCTAssertNotNil(snapshot.chats[survivor])
+        XCTAssertTrue(store.load(peerID: aliasA).isEmpty)
+        XCTAssertTrue(store.load(peerID: aliasB).isEmpty)
+        XCTAssertEqual(store.load(peerID: survivor).map(\.content), ["keep"])
+        let pendingEffects = await store.loadPendingReceiveEffects()
+        XCTAssertTrue(pendingEffects.isEmpty)
+    }
+
+    func testEveryConversationDeletionStageRecoversAfterRestart() async {
+        enum SimulatedCrash: Error { case after(PrivateDeletionStage) }
+
+        for stage in PrivateDeletionStage.allCases {
+            let name = "PrivateDeletionRecovery-\(stage)-\(UUID().uuidString)"
+            let aliasA = PeerID(str: "recovery-alias-a")
+            let aliasB = PeerID(str: "recovery-alias-b")
+            let survivor = PeerID(str: "recovery-survivor")
+            let seeded = MessageStore(directoryName: name)
+            let messageA = message(id: "recover-a", content: "delete a", senderPeerID: aliasA)
+            let messageB = message(id: "recover-b", content: "delete b", senderPeerID: aliasB)
+            let committedA = await seeded.commitPrivate(
+                peerID: aliasA,
+                messages: [messageA],
+                pendingReceiveEffectMessageID: messageA.id
+            )
+            let committedB = await seeded.commitPrivate(
+                peerID: aliasB,
+                messages: [messageB],
+                pendingReceiveEffectMessageID: messageB.id
+            )
+            let committedSurvivor = await seeded.commitPrivate(
+                peerID: survivor,
+                messages: [message(content: "keep", senderPeerID: survivor)]
+            )
+            XCTAssertTrue(committedA, "stage=\(stage)")
+            XCTAssertTrue(committedB, "stage=\(stage)")
+            XCTAssertTrue(committedSurvivor, "stage=\(stage)")
+
+            let interrupted = MessageStore(
+                directoryName: name,
+                beforePrivateDeletionStage: { reached in
+                    if reached == stage { throw SimulatedCrash.after(reached) }
+                }
+            )
+            let interruptedResult = interrupted.deletePrivateDurably(peerIDs: [aliasA, aliasB])
+            XCTAssertTrue(interruptedResult.fenced, "stage=\(stage)")
+            XCTAssertFalse(interruptedResult.complete, "stage=\(stage)")
+            // The durable intent is also a render/read fence; a failed cleanup
+            // never republishes the embedded manifest summary in this process.
+            XCTAssertNil(interrupted.loadPrivateSnapshot(chatLimit: 24).chats[aliasA], "stage=\(stage)")
+            XCTAssertNil(interrupted.loadPrivateSnapshot(chatLimit: 24).chats[aliasB], "stage=\(stage)")
+            XCTAssertTrue(interrupted.load(peerID: aliasA).isEmpty, "stage=\(stage)")
+
+            let reopened = MessageStore(directoryName: name)
+            let snapshot = reopened.loadPrivateSnapshot(chatLimit: 24)
+            XCTAssertNil(snapshot.chats[aliasA], "stage=\(stage)")
+            XCTAssertNil(snapshot.chats[aliasB], "stage=\(stage)")
+            XCTAssertNotNil(snapshot.chats[survivor], "stage=\(stage)")
+            XCTAssertTrue(reopened.load(peerID: aliasA).isEmpty, "stage=\(stage)")
+            XCTAssertTrue(reopened.load(peerID: aliasB).isEmpty, "stage=\(stage)")
+            XCTAssertEqual(reopened.load(peerID: survivor).map(\.content), ["keep"], "stage=\(stage)")
+            let pendingEffects = await reopened.loadPendingReceiveEffects()
+            XCTAssertTrue(pendingEffects.isEmpty, "stage=\(stage)")
+            _ = reopened.wipeAll()
+        }
     }
 
     func testMeshOutboxCorruptionFailsClosedWithoutOverwritingJournal() throws {

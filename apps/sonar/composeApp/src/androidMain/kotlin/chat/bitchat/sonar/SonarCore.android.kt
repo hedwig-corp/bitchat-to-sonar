@@ -114,6 +114,10 @@ actual object SonarCore {
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
     }
 
+    actual suspend fun deletionInventory(): List<SonarChat> = withContext(Dispatchers.IO) {
+        requireNode().groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }
+    }
+
     actual suspend fun startChat(peer: String): String = withContext(Dispatchers.IO) {
         val n = requireNode()
         n.startDm(peer.trim(), "")
@@ -831,8 +835,7 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        deleteCoreGroupOrThrow { requireNode().deleteGroup(chatId) }
     }
 
     // ── Push token registration (MIP-05) ──

@@ -15,6 +15,366 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 
+/** Android twin of the desktop fixed-page catalog. See the JVM implementation
+ * for the persistence protocol; keeping the exact protocol on both surfaces
+ * makes catalog cursors and crash recovery platform-equivalent. */
+internal class MeshSummaryCatalogPages(
+    private val pagesDir: File,
+    private val assignmentFile: (String) -> File,
+    private val atomicWrite: (File, String) -> Boolean,
+    private val deleteDurably: (File) -> Boolean,
+    private val readText: (File) -> String? = { target ->
+        if (!target.exists()) null else runCatching { target.readText() }.getOrNull()
+    },
+) {
+    private data class ReuseIntent(
+        val peerKey: String,
+        val pageNumber: Int,
+        val slot: Int,
+        val nextGeneration: Long,
+    )
+
+    private data class CompactionIntent(
+        val oldTail: Int,
+        val newTail: Int,
+        val nextGeneration: Long,
+    )
+
+    private data class FreeHint(val pageNumber: Int?, val scannedThrough: Int)
+    private data class FreeSlot(val pageNumber: Int, val slot: Int)
+    private data class FreeSearch(val valid: Boolean, val slot: FreeSlot?)
+
+    private companion object {
+        const val FOREGROUND_FREE_SCAN_PAGE_LIMIT = 4
+    }
+
+    private val tailFile get() = File(pagesDir, "tail")
+    private val generationFile get() = File(pagesDir, "generation-v1")
+    private val reuseIntentFile get() = File(pagesDir, "reuse-intent-v1")
+    private val compactionIntentFile get() = File(pagesDir, "compact-intent-v1")
+    private val freeHintFile get() = File(pagesDir, "free-page-v1")
+    private fun pageFile(pageNumber: Int): File =
+        File(pagesDir, "page-${pageNumber.toString().padStart(10, '0')}")
+
+    private fun readTailForMutation(): Int? = when {
+        !tailFile.exists() -> 0
+        else -> readText(tailFile)?.trim()?.toIntOrNull()?.takeIf { it >= 0 }
+    }
+
+    private fun readTailForPaging(): Int? = when {
+        !tailFile.exists() -> null
+        else -> readText(tailFile)?.trim()?.toIntOrNull()?.takeIf { it >= 0 }
+    }
+
+    private fun readPage(pageNumber: Int): List<String?>? {
+        val target = pageFile(pageNumber)
+        if (!target.exists()) return emptyList()
+        return readText(target)?.let(MessageCodec::decodeMeshSummaryPeerPage)
+    }
+
+    private fun writePage(pageNumber: Int, peers: List<String?>): Boolean =
+        atomicWrite(pageFile(pageNumber), MessageCodec.encodeMeshSummaryPeerPage(peers))
+
+    private fun readGeneration(): Long? = when {
+        !generationFile.exists() -> 0L
+        else -> readText(generationFile)?.trim()?.toLongOrNull()?.takeIf { it >= 0L }
+    }
+
+    private fun readAssignment(peerKey: String): Int? {
+        val target = assignmentFile(peerKey)
+        if (!target.exists()) return null
+        return readText(target)?.let(MessageCodec::decodeMeshSummaryAssignment)
+    }
+
+    private fun writeAssignment(peerKey: String, pageNumber: Int): Boolean =
+        atomicWrite(assignmentFile(peerKey), MessageCodec.encodeMeshSummaryAssignment(pageNumber))
+
+    private fun encodeIntent(intent: ReuseIntent): String = buildString {
+        append("sonar-mesh-summary-reuse-v1\n")
+        append(intent.peerKey.encodeToByteArray().joinToString("") {
+            ((it.toInt() and 0xff) + 0x100).toString(16).substring(1)
+        })
+        append('\n').append(intent.pageNumber)
+        append('\n').append(intent.slot)
+        append('\n').append(intent.nextGeneration)
+    }
+
+    private fun decodeHex(value: String): String? {
+        if (value.length % 2 != 0) return null
+        val bytes = ByteArray(value.length / 2)
+        for (index in bytes.indices) {
+            val high = value[index * 2].digitToIntOrNull(16) ?: return null
+            val low = value[index * 2 + 1].digitToIntOrNull(16) ?: return null
+            bytes[index] = ((high shl 4) or low).toByte()
+        }
+        return runCatching { bytes.decodeToString() }.getOrNull()
+    }
+
+    private fun readIntent(): ReuseIntent? {
+        if (!reuseIntentFile.exists()) return null
+        val lines = readText(reuseIntentFile)?.lineSequence()?.toList() ?: return null
+        if (lines.size != 5 || lines[0] != "sonar-mesh-summary-reuse-v1") return null
+        val peerKey = decodeHex(lines[1])?.takeIf { it.isNotBlank() } ?: return null
+        val pageNumber = lines[2].toIntOrNull()?.takeIf { it >= 0 } ?: return null
+        val slot = lines[3].toIntOrNull()?.takeIf { it in 0 until MESH_SUMMARY_CATALOG_PAGE_SIZE } ?: return null
+        val generation = lines[4].toLongOrNull()?.takeIf { it > 0L } ?: return null
+        return ReuseIntent(peerKey, pageNumber, slot, generation)
+    }
+
+    private fun encodeCompactionIntent(intent: CompactionIntent): String =
+        "sonar-mesh-summary-compact-v1\n${intent.oldTail}\n${intent.newTail}\n${intent.nextGeneration}"
+
+    private fun readCompactionIntent(): CompactionIntent? {
+        if (!compactionIntentFile.exists()) return null
+        val lines = readText(compactionIntentFile)?.lineSequence()?.toList() ?: return null
+        if (lines.size != 4 || lines[0] != "sonar-mesh-summary-compact-v1") return null
+        val oldTail = lines[1].toIntOrNull()?.takeIf { it > 0 } ?: return null
+        val newTail = lines[2].toIntOrNull()?.takeIf { it in 0 until oldTail } ?: return null
+        val generation = lines[3].toLongOrNull()?.takeIf { it > 0L } ?: return null
+        return CompactionIntent(oldTail, newTail, generation)
+    }
+
+    private fun encodeFreeHint(hint: FreeHint): String =
+        "sonar-mesh-summary-free-v1\n${hint.pageNumber ?: -1}\n${hint.scannedThrough}"
+
+    private fun readFreeHint(): FreeHint? {
+        if (!freeHintFile.exists()) return null
+        val lines = readText(freeHintFile)?.lineSequence()?.toList() ?: return null
+        if (lines.size != 3 || lines[0] != "sonar-mesh-summary-free-v1") return null
+        val encodedPage = lines[1].toIntOrNull() ?: return null
+        val scannedThrough = lines[2].toIntOrNull()?.takeIf { it >= -1 } ?: return null
+        if (encodedPage < -1) return null
+        return FreeHint(encodedPage.takeIf { it >= 0 }, scannedThrough)
+    }
+
+    private fun writeFreeHint(pageNumber: Int?, scannedThrough: Int): Boolean =
+        atomicWrite(freeHintFile, encodeFreeHint(FreeHint(pageNumber, scannedThrough)))
+
+    private fun findFreeSlot(tail: Int, maxPages: Int): FreeSearch {
+        val budget = maxPages.coerceAtLeast(0)
+        if (budget == 0) return FreeSearch(valid = true, slot = null)
+        val hint = readFreeHint()
+        val hintedPage = hint?.pageNumber
+        var inspected = 0
+        // Normalize legacy known-page hints whose tail-wide scan claim cannot
+        // remain valid after that one page fills.
+        var scannedThrough = when {
+            hint == null -> -1
+            hintedPage != null && hint.scannedThrough >= hintedPage -> -1
+            else -> hint.scannedThrough
+        }
+        if (hintedPage != null && hintedPage <= tail) {
+            val peers = readPage(hintedPage) ?: return FreeSearch(false, null)
+            inspected += 1
+            val slot = peers.indexOfFirst { it == null }
+            if (slot >= 0) return FreeSearch(true, FreeSlot(hintedPage, slot))
+        }
+        var pageNumber = when {
+            hint == null -> 0
+            scannedThrough >= tail -> return FreeSearch(true, null)
+            else -> scannedThrough + 1
+        }
+        while (pageNumber <= tail && inspected < budget) {
+            val peers = readPage(pageNumber)
+            if (peers == null) {
+                if (scannedThrough >= 0 && !writeFreeHint(null, scannedThrough)) {
+                    return FreeSearch(valid = false, slot = null)
+                }
+                return FreeSearch(valid = false, slot = null)
+            }
+            inspected += 1
+            scannedThrough = pageNumber
+            val slot = peers.indexOfFirst { it == null }
+            if (slot >= 0) {
+                return if (writeFreeHint(pageNumber, pageNumber - 1)) {
+                    FreeSearch(true, FreeSlot(pageNumber, slot))
+                } else {
+                    FreeSearch(false, null)
+                }
+            }
+            pageNumber += 1
+        }
+        if (scannedThrough < 0) return FreeSearch(true, null)
+        return if (writeFreeHint(null, scannedThrough)) FreeSearch(true, null) else FreeSearch(false, null)
+    }
+
+    /** Reuse completion derives the next hint from its in-memory page; no late
+     * fallible page read can strand the durable redo journal. */
+    private fun updateFreeHintAfterReuse(pageNumber: Int, peers: List<String?>): Boolean =
+        writeFreeHint(pageNumber.takeIf { peers.any { it == null } }, -1)
+
+    private fun completeReuseIntent(): Boolean {
+        if (!reuseIntentFile.exists()) return true
+        val intent = readIntent() ?: return false
+        val peers = readPage(intent.pageNumber) ?: return false
+        if (intent.slot > peers.size || (intent.slot == peers.size && peers.size >= MESH_SUMMARY_CATALOG_PAGE_SIZE)) {
+            return false
+        }
+        if (intent.slot < peers.size && peers[intent.slot] != null && peers[intent.slot] != intent.peerKey) {
+            return false
+        }
+        val committed = peers.map { if (it == intent.peerKey) null else it }.toMutableList()
+        if (intent.slot == committed.size) committed += intent.peerKey else committed[intent.slot] = intent.peerKey
+        // The journal remains durable until page, generation, assignment and
+        // free-page hint have all crossed their parent-directory barriers.
+        if (!writePage(intent.pageNumber, committed)) return false
+        val generation = readGeneration() ?: return false
+        if (generation > intent.nextGeneration) return false
+        if (!atomicWrite(generationFile, intent.nextGeneration.toString())) return false
+        if (!writeAssignment(intent.peerKey, intent.pageNumber)) return false
+        if (!updateFreeHintAfterReuse(intent.pageNumber, committed)) return false
+        return deleteDurably(reuseIntentFile)
+    }
+
+    private fun completeCompactionIntent(): Boolean {
+        if (!compactionIntentFile.exists()) return true
+        val intent = readCompactionIntent() ?: return false
+        val visibleTail = readTailForMutation() ?: return false
+        if (visibleTail > intent.oldTail || visibleTail < intent.newTail) return false
+        if (!atomicWrite(tailFile, intent.newTail.toString())) return false
+        val generation = readGeneration() ?: return false
+        if (generation > intent.nextGeneration) return false
+        if (!atomicWrite(generationFile, intent.nextGeneration.toString())) return false
+        if (!deleteDurably(freeHintFile)) return false
+        for (pageNumber in (intent.newTail + 1)..intent.oldTail) {
+            if (!deleteDurably(pageFile(pageNumber))) return false
+        }
+        return deleteDurably(compactionIntentFile)
+    }
+
+    private fun completePendingMaintenance(): Boolean =
+        completeReuseIntent() && completeCompactionIntent()
+
+    internal fun recoverPendingMaintenance(): Boolean = completePendingMaintenance()
+
+    private fun beginReuse(peerKey: String, slot: FreeSlot): Boolean {
+        if (!completePendingMaintenance()) return false
+        val generation = readGeneration() ?: return false
+        if (generation == Long.MAX_VALUE) return false
+        val intent = ReuseIntent(peerKey, slot.pageNumber, slot.slot, generation + 1L)
+        if (!atomicWrite(reuseIntentFile, encodeIntent(intent))) return false
+        return completeReuseIntent()
+    }
+
+    internal fun ensureAssignment(peerKey: String): Boolean {
+        if (!completePendingMaintenance()) return false
+        val assignment = assignmentFile(peerKey)
+        val assignedPage = readAssignment(peerKey)
+        if (assignment.exists() && assignedPage == null) return false
+        if (assignedPage != null) {
+            val peers = readPage(assignedPage) ?: return false
+            if (peerKey in peers) return writeAssignment(peerKey, assignedPage)
+            val reusable = peers.indexOfFirst { it == null }.takeIf { it >= 0 }
+                ?: peers.size.takeIf { it < MESH_SUMMARY_CATALOG_PAGE_SIZE }
+                ?: return false
+            return beginReuse(peerKey, FreeSlot(assignedPage, reusable))
+        }
+
+        var tail = readTailForMutation() ?: return false
+        var tailPeers = readPage(tail) ?: return false
+        if (peerKey in tailPeers) return writeAssignment(peerKey, tail)
+
+        val free = findFreeSlot(tail, FOREGROUND_FREE_SCAN_PAGE_LIMIT)
+        if (!free.valid) return false
+        if (free.slot != null) return beginReuse(peerKey, free.slot)
+
+        if (tailPeers.size >= MESH_SUMMARY_CATALOG_PAGE_SIZE) {
+            tail += 1
+            tailPeers = emptyList()
+        }
+        if (!atomicWrite(tailFile, tail.toString())) return false
+        val committedPeers = meshSummaryPageWithSinglePeer(tailPeers, peerKey) ?: return false
+        if (!writePage(tail, committedPeers)) return false
+        return writeAssignment(peerKey, tail)
+    }
+
+    internal fun removeAssignment(peerKey: String): Boolean {
+        if (!completePendingMaintenance()) return false
+        val assignment = assignmentFile(peerKey)
+        val pageNumber = readAssignment(peerKey)
+        if (assignment.exists() && pageNumber == null) return false
+        if (pageNumber == null) return true
+        val peers = readPage(pageNumber) ?: return false
+        if (!writePage(pageNumber, peers.map { if (it == peerKey) null else it })) return false
+        val existing = readFreeHint()?.pageNumber
+        val firstFreePage = listOfNotNull(existing, pageNumber).minOrNull() ?: pageNumber
+        if (!writeFreeHint(firstFreePage, -1)) return false
+        return deleteDurably(assignment)
+    }
+
+    /** Background repair advances a bounded legacy scan without charging send
+     * or chat-open latency. */
+    internal fun advanceFreeHintScan(maxPages: Int = 64): Boolean {
+        if (!completePendingMaintenance()) return false
+        val tail = readTailForPaging() ?: return true
+        return findFreeSlot(tail, maxPages).valid
+    }
+
+    /** Background-only bounded migration. The durable tail records progress,
+     * and page zero is always preserved. */
+    internal fun compactTrailingEmptyPages(maxPages: Int = 64): Boolean {
+        if (!completePendingMaintenance()) return false
+        val budget = maxPages.coerceAtLeast(0)
+        if (budget == 0) return true
+        val oldTail = readTailForPaging() ?: return true
+        var newTail = oldTail
+        var inspected = 0
+        while (newTail > 0 && inspected < budget) {
+            val peers = readPage(newTail) ?: return false
+            if (peers.any { it != null }) break
+            newTail -= 1
+            inspected += 1
+        }
+        if (newTail == oldTail) return true
+        val generation = readGeneration() ?: return false
+        if (generation == Long.MAX_VALUE) return false
+        val intent = CompactionIntent(oldTail, newTail, generation + 1L)
+        if (!atomicWrite(compactionIntentFile, encodeCompactionIntent(intent))) return false
+        return completeCompactionIntent()
+    }
+
+    internal fun readSummaryPage(
+        afterCursor: String?,
+        limit: Int,
+        readSummary: (String) -> MeshDmSummary?,
+    ): MeshDmSummaryPage {
+        check(completePendingMaintenance()) { "mesh summary catalog maintenance is not durably repaired" }
+        val generation = checkNotNull(readGeneration()) { "mesh summary catalog generation is corrupt" }
+        val directCursor = when {
+            afterCursor == null -> null
+            else -> {
+                val parts = afterCursor.split(':')
+                val cursorGeneration: Long
+                val page: String
+                val offset: String
+                when (parts.size) {
+                    2 -> {
+                        cursorGeneration = 0L
+                        page = parts[0]
+                        offset = parts[1]
+                    }
+                    3 -> {
+                        cursorGeneration = parts[0].toLongOrNull()
+                            ?: return MeshDmSummaryPage(emptyList(), null)
+                        page = parts[1]
+                        offset = parts[2]
+                    }
+                    else -> return MeshDmSummaryPage(emptyList(), null)
+                }
+                if (cursorGeneration == generation) "$page:$offset" else null
+            }
+        }
+        val page = readBoundedMeshSummaryCatalogPage(
+            afterCursor = directCursor,
+            limit = limit,
+            lastPage = ::readTailForPaging,
+            readPeerPage = ::readPage,
+            readSummary = readSummary,
+        )
+        return page.copy(nextCursor = page.nextCursor?.let { "$generation:$it" })
+    }
+}
+
 /**
  * Android `actual`: transcripts as files under the app's private `files/messages`
  * dir (encrypted at rest by Android File-Based Encryption). Filenames are
@@ -102,10 +462,15 @@ actual object MessageStore {
     private fun meshSummaryAssignmentFile(peerKey: String): File =
         File(meshSummaryCatalogDir(), "${hashName("mesh-summary:$peerKey")}.page-ref")
     private fun meshSummaryPagesDir(): File = File(meshSummaryCatalogDir(), "pages-v1").apply { mkdirs() }
-    private fun meshSummaryTailFile(): File = File(meshSummaryPagesDir(), "tail")
-    private fun meshSummaryPageFile(pageNumber: Int): File =
-        File(meshSummaryPagesDir(), "page-${pageNumber.toString().padStart(10, '0')}")
     private fun meshSummaryRepairIntentFile(): File = File(meshDir(), ".mesh-summary-repair-v1")
+    private val meshSummaryCatalogPages by lazy {
+        MeshSummaryCatalogPages(
+            pagesDir = meshSummaryPagesDir(),
+            assignmentFile = ::meshSummaryAssignmentFile,
+            atomicWrite = ::atomicWrite,
+            deleteDurably = ::deleteDurably,
+        )
+    }
 
     private fun meshFile(peerKey: String): File {
         val name = Sha256.hash("mesh:$peerKey".encodeToByteArray())
@@ -245,68 +610,12 @@ actual object MessageStore {
     private fun deleteDurably(target: File): Boolean =
         (!target.exists() || target.delete()) && syncDirectory(target.parentFile)
 
-    private fun readMeshSummaryTail(): Int? {
-        val target = meshSummaryTailFile()
-        if (!target.exists()) return null
-        return runCatching { target.readText().trim().toInt() }.getOrNull()?.takeIf { it >= 0 }
-    }
-
-    private fun readMeshSummaryPeerPage(pageNumber: Int): List<String?>? {
-        val target = meshSummaryPageFile(pageNumber)
-        if (!target.exists()) return emptyList()
-        return runCatching { MessageCodec.decodeMeshSummaryPeerPage(target.readText()) }.getOrNull()
-    }
-
-    private fun writeMeshSummaryPeerPage(pageNumber: Int, peers: List<String?>): Boolean =
-        atomicWrite(meshSummaryPageFile(pageNumber), MessageCodec.encodeMeshSummaryPeerPage(peers))
-
     private fun ensureMeshSummaryPageAssignment(peerKey: String): Boolean {
-        val assignment = meshSummaryAssignmentFile(peerKey)
-        val assignedPage = if (!assignment.exists()) null else runCatching {
-            MessageCodec.decodeMeshSummaryAssignment(assignment.readText())
-        }.getOrNull()
-        if (assignedPage != null) {
-            val peers = readMeshSummaryPeerPage(assignedPage) ?: return false
-            val committedPeers = meshSummaryPageWithSinglePeer(peers, peerKey)
-            if (committedPeers != null) {
-                return commitMeshSummaryAssignment(
-                    pageContainsPeer = peerKey in peers,
-                    commitPageIfRequired = { writeMeshSummaryPeerPage(assignedPage, committedPeers) },
-                    // Visibility does not prove the earlier marker rename was
-                    // committed if its parent-directory fsync failed.
-                    commitAssignment = {
-                        atomicWrite(assignment, MessageCodec.encodeMeshSummaryAssignment(assignedPage))
-                    },
-                )
-            }
-        }
-
-        var tail = readMeshSummaryTail() ?: 0
-        var peers: List<String?> = readMeshSummaryPeerPage(tail) ?: return false
-        var committedPeers = meshSummaryPageWithSinglePeer(peers, peerKey)
-        if (committedPeers == null) {
-            tail += 1
-            peers = emptyList()
-            committedPeers = meshSummaryPageWithSinglePeer(peers, peerKey) ?: return false
-        }
-        if (!atomicWrite(meshSummaryTailFile(), tail.toString())) return false
-        // Page first, assignment last. If the assignment write failed after a
-        // successful page commit, the retry recommits that one slot rather than
-        // appending a duplicate before recreating the marker.
-        if (!writeMeshSummaryPeerPage(tail, committedPeers)) return false
-        return atomicWrite(assignment, MessageCodec.encodeMeshSummaryAssignment(tail))
+        return meshSummaryCatalogPages.ensureAssignment(peerKey)
     }
 
     private fun removeMeshSummaryCatalogPeer(peerKey: String): Boolean {
-        val assignment = meshSummaryAssignmentFile(peerKey)
-        val pageNumber = if (!assignment.exists()) null else runCatching {
-            MessageCodec.decodeMeshSummaryAssignment(assignment.readText())
-        }.getOrNull() ?: if (assignment.exists()) return false else null
-        if (pageNumber != null) {
-            val peers = readMeshSummaryPeerPage(pageNumber) ?: return false
-            if (!writeMeshSummaryPeerPage(pageNumber, peers.map { if (it == peerKey) null else it })) return false
-            if (!deleteDurably(assignment)) return false
-        }
+        if (!meshSummaryCatalogPages.removeAssignment(peerKey)) return false
         return deleteDurably(meshSummaryCatalogFile(peerKey))
     }
 
@@ -342,11 +651,9 @@ actual object MessageStore {
     }
 
     private fun readMeshSummaryCatalogPage(afterCursor: String?, limit: Int): MeshDmSummaryPage {
-        return readBoundedMeshSummaryCatalogPage(
+        return meshSummaryCatalogPages.readSummaryPage(
             afterCursor = afterCursor,
             limit = limit,
-            lastPage = ::readMeshSummaryTail,
-            readPeerPage = ::readMeshSummaryPeerPage,
             readSummary = { peerKey ->
                 val target = meshSummaryCatalogFile(peerKey)
                 if (!target.exists()) null else runCatching { MessageCodec.decodeMeshSummary(target.readText()) }
@@ -477,6 +784,11 @@ actual object MessageStore {
                     .getOrNull()?.takeIf { it.first == peerKey }?.second?.lastOrNull() != null
             }
             writeMeshSummaries(merged)
+            // Never charge legacy tail compaction to first paint. This repair
+            // path trims one journaled bounded batch per background run.
+            if (meshSummaryCatalogPages.compactTrailingEmptyPages()) {
+                meshSummaryCatalogPages.advanceFreeHintScan()
+            }
         }
     }
 
@@ -566,11 +878,32 @@ actual object MessageStore {
     private fun meshMediaFile(mediaUrl: String): File =
         File(meshMediaDir(), "${hashName("mesh-media:$mediaUrl")}.bin")
 
+    private fun meshMediaIndexFile(peerKey: String): File =
+        File(meshMediaDir(), "${hashName("mesh-media-index:$peerKey")}.idx")
+
+    private fun readMeshMediaIndex(peerKey: String): Set<String>? {
+        val index = meshMediaIndexFile(peerKey)
+        if (!index.exists()) return emptySet()
+        return runCatching { index.readLines().filter(String::isNotBlank).toSet() }.getOrNull()
+    }
+
+    private fun writeMeshMediaIndex(peerKey: String, names: Set<String>): Boolean {
+        val index = meshMediaIndexFile(peerKey)
+        return if (names.isEmpty()) deleteDurably(index)
+        else atomicWrite(index, names.sorted().joinToString("\n"))
+    }
+
     actual suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray, expectedEpoch: Long): Boolean =
         withContext(Dispatchers.IO) {
             mutationLocks.withTranscript {
                 if (expectedEpoch != committedWipeRevision) return@withTranscript false
-                atomicWriteBytes(meshMediaFile(mediaUrl), bytes)
+                val target = meshMediaFile(mediaUrl)
+                if (!atomicWriteBytes(target, bytes)) return@withTranscript false
+                val peerKey = meshPeerKeyFromMediaUrl(mediaUrl) ?: return@withTranscript true
+                val indexed = readMeshMediaIndex(peerKey)
+                if (indexed != null && writeMeshMediaIndex(peerKey, indexed + target.name)) return@withTranscript true
+                deleteDurably(target)
+                false
             }
         }
 
@@ -580,6 +913,39 @@ actual object MessageStore {
             if (!f.exists()) null else runCatching { f.readBytes() }.getOrNull()
         }
     }
+
+    actual suspend fun deleteMeshMedia(mediaUrl: String, expectedEpoch: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            mutationLocks.withTranscript {
+                if (expectedEpoch != committedWipeRevision) return@withTranscript false
+                val target = meshMediaFile(mediaUrl)
+                val peerKey = meshPeerKeyFromMediaUrl(mediaUrl)
+                val deleted = deleteDurably(target)
+                if (!deleted || peerKey == null) return@withTranscript deleted
+                val indexed = readMeshMediaIndex(peerKey) ?: return@withTranscript false
+                writeMeshMediaIndex(peerKey, indexed - target.name)
+            }
+        }
+
+    actual suspend fun deleteMeshMediaForPeer(peerKey: String, expectedEpoch: Long): Boolean =
+        withContext(Dispatchers.IO) {
+            mutationLocks.withTranscript {
+                if (expectedEpoch != committedWipeRevision) return@withTranscript false
+                val transcriptFile = meshFile(peerKey)
+                val transcriptUrls = if (!transcriptFile.exists()) emptySet() else {
+                    val envelope = runCatching { MessageCodec.decodeMeshEnvelope(transcriptFile.readText()) }
+                        .getOrNull()?.takeIf { it.first == peerKey } ?: return@withTranscript false
+                    meshMediaUrlsForDeletion(envelope.second)
+                }
+                val indexed = readMeshMediaIndex(peerKey) ?: return@withTranscript false
+                val validIndexedFiles = indexed.mapNotNull { name ->
+                    name.takeIf { it.matches(Regex("[0-9a-f]{64}\\.bin")) }?.let { File(meshMediaDir(), it) }
+                }
+                if (validIndexedFiles.size != indexed.size) return@withTranscript false
+                val targets = validIndexedFiles + transcriptUrls.map(::meshMediaFile)
+                targets.all(::deleteDurably) && deleteDurably(meshMediaIndexFile(peerKey))
+            }
+        }
 
     actual suspend fun wipe(revision: Long): MessageStoreWipeResult = withContext(Dispatchers.IO) {
         mutationLocks.withWipe {

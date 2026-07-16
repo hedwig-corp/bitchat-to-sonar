@@ -94,7 +94,27 @@ enum MeshOutboxAckResult: Equatable {
     case failed
 }
 
+struct PrivateConversationDeletionResult: Equatable {
+    /// A crash-durable intent exists for every requested peer. Once true, the
+    /// named conversations must stay hidden even if physical cleanup retries.
+    let fenced: Bool
+    /// The summary manifest, receive-effect index, transcript/window files, and
+    /// deletion intent have all crossed their durability barriers.
+    let complete: Bool
+
+    static let notStarted = PrivateConversationDeletionResult(fenced: false, complete: false)
+}
+
+enum PrivateDeletionStage: CaseIterable, Equatable {
+    case intentCommitted
+    case conversationIndexCommitted
+    case pendingEffectsCommitted
+    case transcriptFilesRemoved
+}
+
 struct PrivateStoreSnapshot {
+    /// Summary-only chat rows. Each value contains at most the newest message;
+    /// transcript windows are loaded explicitly when a conversation opens.
     let chats: [PeerID: [BitchatMessage]]
     let pendingReceiveEffects: [(peerID: PeerID, message: BitchatMessage)]
     /// Number of transcript files inspected for this page. Callers advance by
@@ -106,6 +126,57 @@ struct PrivateStoreSnapshot {
     /// this remains deterministic when a conversation is promoted to the
     /// front of the index between page reads.
     let nextCursor: PrivateConversationCursor?
+}
+
+struct PrivateMessagePage {
+    let messages: [BitchatMessage]
+    let hasMore: Bool
+}
+
+enum PrivateReceiveDisposition: Equatable {
+    case admitted
+    case pendingEffects
+    case duplicate
+    case failed
+}
+
+struct PrivateReceiveCommitResult {
+    let disposition: PrivateReceiveDisposition
+    /// The authoritative stored payload. Stable-ID collisions never project the
+    /// retry's untrusted replacement content into local effects.
+    let message: BitchatMessage?
+
+    static let failed = PrivateReceiveCommitResult(disposition: .failed, message: nil)
+}
+
+enum PrivateDeliveryStatusMutationDisposition: Equatable {
+    case updated
+    case unchanged
+    case notFound
+    case failed
+}
+
+/// Result of mutating one persisted private-message row by its stable ID.
+/// `isLatest` lets callers preserve a closed chat's one-row summary instead of
+/// accidentally promoting an older receipt target into the chat list.
+struct PrivateDeliveryStatusMutationResult {
+    let disposition: PrivateDeliveryStatusMutationDisposition
+    let peerID: PeerID?
+    let message: BitchatMessage?
+    let isLatest: Bool
+
+    static let notFound = PrivateDeliveryStatusMutationResult(
+        disposition: .notFound,
+        peerID: nil,
+        message: nil,
+        isLatest: false
+    )
+    static let failed = PrivateDeliveryStatusMutationResult(
+        disposition: .failed,
+        peerID: nil,
+        message: nil,
+        isLatest: false
+    )
 }
 
 struct PrivateConversationCursor: Codable, Equatable {
@@ -338,9 +409,11 @@ final class MessageStore {
     private var legacyPrivateFileSnapshot: [URL]?
     private let beforeAtomicReplace: (() throws -> Void)?
     private let beforeWipeQuarantine: (() throws -> Void)?
+    private let beforePrivateDeletionStage: ((PrivateDeletionStage) throws -> Void)?
     private let directorySyncFault: DirectoryDurability.FaultInjector?
     private let directoryLister: DirectoryLister
     private let fullTranscriptReadObserver: (() -> Void)?
+    private let privateWindowReadObserver: (() -> Void)?
     private let fullConversationIndexReadObserver: (() -> Void)?
     private let indexNodeReadObserver: (() -> Void)?
     private let indexNodeWriteObserver: (() -> Void)?
@@ -389,6 +462,21 @@ final class MessageStore {
         let peerID: PeerID
         let latestMessageAt: Date
         let latestMessageID: String
+        /// Added compatibly to the v2 index. Older manifests decode this as nil
+        /// and lazily backfill from their bounded window sidecar.
+        let latestMessage: BitchatMessage?
+
+        init(
+            peerID: PeerID,
+            latestMessageAt: Date,
+            latestMessageID: String,
+            latestMessage: BitchatMessage? = nil
+        ) {
+            self.peerID = peerID
+            self.latestMessageAt = latestMessageAt
+            self.latestMessageID = latestMessageID
+            self.latestMessage = latestMessage
+        }
 
         var cursor: PrivateConversationCursor {
             PrivateConversationCursor(
@@ -430,6 +518,11 @@ final class MessageStore {
         var records: [PendingReceiveEffectRecord]
     }
 
+    private struct PrivateDeletionIntent: Codable {
+        let version: Int
+        let peerIDs: [PeerID]
+    }
+
     /// Atomic roots for two immutable persistent treaps: one keyed by the
     /// newest-first conversation order, one keyed by peer ID. Updating a chat
     /// path-copies O(log N) small nodes and then swaps this manifest. The first
@@ -454,6 +547,12 @@ final class MessageStore {
                 legacyRebuildCursorFilename: nil
             )
         }
+
+        static var emptyCurrent: PrivateConversationIndexManifest {
+            var manifest = emptyLegacy
+            manifest.legacyRebuildComplete = true
+            return manifest
+        }
     }
 
     // MARK: - Init
@@ -464,8 +563,10 @@ final class MessageStore {
         directoryName: String = "Messages",
         beforeAtomicReplace: (() throws -> Void)? = nil,
         beforeWipeQuarantine: (() throws -> Void)? = nil,
+        beforePrivateDeletionStage: ((PrivateDeletionStage) throws -> Void)? = nil,
         directorySyncFault: DirectoryDurability.FaultInjector? = nil,
         fullTranscriptReadObserver: (() -> Void)? = nil,
+        privateWindowReadObserver: (() -> Void)? = nil,
         fullConversationIndexReadObserver: (() -> Void)? = nil,
         indexNodeReadObserver: (() -> Void)? = nil,
         indexNodeWriteObserver: (() -> Void)? = nil,
@@ -478,9 +579,11 @@ final class MessageStore {
     ) {
         self.beforeAtomicReplace = beforeAtomicReplace
         self.beforeWipeQuarantine = beforeWipeQuarantine
+        self.beforePrivateDeletionStage = beforePrivateDeletionStage
         self.directorySyncFault = directorySyncFault
         self.directoryLister = directoryLister
         self.fullTranscriptReadObserver = fullTranscriptReadObserver
+        self.privateWindowReadObserver = privateWindowReadObserver
         self.fullConversationIndexReadObserver = fullConversationIndexReadObserver
         self.indexNodeReadObserver = indexNodeReadObserver
         self.indexNodeWriteObserver = indexNodeWriteObserver
@@ -493,9 +596,14 @@ final class MessageStore {
         privateWindowDir = baseDir.appendingPathComponent("private-windows", isDirectory: true)
         privateIndexNodeDir = baseDir.appendingPathComponent("private-index-nodes", isDirectory: true)
         channelDir = baseDir.appendingPathComponent("channels", isDirectory: true)
+        let isFreshStore = !FileManager.default.fileExists(atPath: baseDir.path)
         io.sync {
             ensureDirectories()
             _ = retryPendingWipeCleanup()
+            if isFreshStore {
+                bootstrapFreshConversationIndex()
+            }
+            _ = recoverPendingPrivateDeletion()
         }
     }
 
@@ -507,18 +615,67 @@ final class MessageStore {
         applyProtection(to: baseDir)
     }
 
+    /// A newly-created store cannot contain legacy transcripts. Seed its empty
+    /// current index without enumerating the transcript directory on startup;
+    /// existing installs retain the bounded background rebuild path.
+    private func bootstrapFreshConversationIndex() {
+        guard !FileManager.default.fileExists(atPath: privateConversationIndexURL.path) else { return }
+        guard let data = try? encoder.encode(PrivateConversationIndexManifest.emptyCurrent) else { return }
+        _ = writeDurably(data, to: privateConversationIndexURL)
+    }
+
     // MARK: - Private chats (keyed by PeerID)
 
     /// Load the stored transcript for one peer (oldest → newest). Empty when
     /// nothing was stored yet.
     func load(peerID: PeerID) -> [BitchatMessage] {
-        io.sync { readPrivate(at: privateFileURL(for: peerID))?.messages ?? [] }
+        io.sync {
+            guard !isPrivateDeletionFenced(peerID) else { return [] }
+            return readPrivate(at: privateFileURL(for: peerID))?.messages ?? []
+        }
     }
 
     /// Read the strictly bounded derived window used by first paint/open. This
     /// never parses the full transcript JSON file.
     func loadRecent(peerID: PeerID) -> [BitchatMessage] {
-        io.sync { readPrivateWindow(at: privateWindowFileURL(for: peerID))?.messages ?? [] }
+        io.sync {
+            guard !isPrivateDeletionFenced(peerID) else { return [] }
+            return readPrivateWindow(at: privateWindowFileURL(for: peerID))?.messages ?? []
+        }
+    }
+
+    /// Load one older bounded page for an already-open conversation. The full
+    /// transcript file is capped at `privateChatCap`; decoding it happens on the
+    /// store queue and never on the main actor or first-paint path.
+    func loadPrivatePage(
+        peerID: PeerID,
+        beforeMessageID: String,
+        limit: Int = MessageStore.privateMessageWindowSize
+    ) async -> PrivateMessagePage {
+        await withCheckedContinuation { continuation in
+            io.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: PrivateMessagePage(messages: [], hasMore: false))
+                    return
+                }
+                guard !self.isPrivateDeletionFenced(peerID) else {
+                    continuation.resume(returning: PrivateMessagePage(messages: [], hasMore: false))
+                    return
+                }
+                let messages = self.readPrivate(at: self.privateFileURL(for: peerID))?.messages ?? []
+                let boundedLimit = max(0, min(limit, self.cap))
+                guard boundedLimit > 0,
+                      let upperBound = messages.firstIndex(where: { $0.id == beforeMessageID }) else {
+                    continuation.resume(returning: PrivateMessagePage(messages: [], hasMore: false))
+                    return
+                }
+                let lowerBound = max(0, upperBound - boundedLimit)
+                continuation.resume(returning: PrivateMessagePage(
+                    messages: Array(messages[lowerBound..<upperBound]),
+                    hasMore: lowerBound > 0
+                ))
+            }
+        }
     }
 
     /// Replace the stored transcript for a peer (used to mirror an in-memory
@@ -549,6 +706,8 @@ final class MessageStore {
         guard source != destination else { return }
         io.async { [weak self] in
             guard let self,
+                  !self.isPrivateDeletionFenced(source),
+                  !self.isPrivateDeletionFenced(destination),
                   let sourceChat = self.readPrivate(
                     at: self.privateFileURL(for: source)
                   ) else { return }
@@ -575,7 +734,7 @@ final class MessageStore {
                   self.writePrivateWindow(window, durable: false),
                   self.updatePrivateConversationIndex(for: window, durable: true),
                   self.updatePendingReceiveEffectIndex(for: envelope, durable: true) else { return }
-            _ = self.deletePrivateOnQueue(peerID: source)
+            _ = self.deletePrivateBatchOnQueue(peerIDs: [source])
         }
     }
 
@@ -599,7 +758,8 @@ final class MessageStore {
                     continuation.resume(returning: false)
                     return
                 }
-                guard expectedGeneration == nil || expectedGeneration == self.storageGeneration else {
+                guard !self.isPrivateDeletionFenced(peerID),
+                      expectedGeneration == nil || expectedGeneration == self.storageGeneration else {
                     continuation.resume(returning: false)
                     return
                 }
@@ -625,6 +785,141 @@ final class MessageStore {
         }
     }
 
+    /// Atomically admit one inbound stable ID. Duplicate lookup and insertion
+    /// share the same serial transaction, so two concurrent relay deliveries
+    /// cannot both create effects. The stored payload always wins an ID collision.
+    func commitIncomingPrivate(
+        peerID: PeerID,
+        message: BitchatMessage,
+        expectedGeneration: String
+    ) async -> PrivateReceiveCommitResult {
+        await withCheckedContinuation { continuation in
+            io.async { [weak self] in
+                guard let self,
+                      !self.isPrivateDeletionFenced(peerID),
+                      expectedGeneration == self.storageGeneration else {
+                    continuation.resume(returning: .failed)
+                    return
+                }
+                let stored = self.readPrivate(at: self.privateFileURL(for: peerID))
+                if let existing = stored?.messages.first(where: { $0.id == message.id }) {
+                    let pending = stored?.pendingReceiveEffectIDs?.contains(message.id) == true
+                    continuation.resume(returning: PrivateReceiveCommitResult(
+                        disposition: pending ? .pendingEffects : .duplicate,
+                        message: existing
+                    ))
+                    return
+                }
+
+                // A processed stable ID can outlive the bounded transcript cap.
+                // The transcript lookup above deliberately wins while effects
+                // are pending, even if the receipt was committed just before a
+                // crash during effect-marker retirement.
+                let receipt = self.controlReceiptKey(peerID: peerID, messageID: message.id)
+                if self.readControlReceipts().contains(receipt) {
+                    continuation.resume(returning: PrivateReceiveCommitResult(
+                        disposition: .duplicate,
+                        message: nil
+                    ))
+                    return
+                }
+
+                let snapshot = self.mergedPrivateMessages(
+                    existing: stored?.messages ?? [],
+                    incoming: [message]
+                )
+                guard snapshot.contains(where: { $0.id == message.id }),
+                      self.writePrivateDurably(
+                        peerID: peerID,
+                        messages: snapshot,
+                        pendingReceiveEffectMessageID: message.id
+                      ) else {
+                    continuation.resume(returning: .failed)
+                    return
+                }
+                continuation.resume(returning: PrivateReceiveCommitResult(
+                    disposition: .admitted,
+                    message: message
+                ))
+            }
+        }
+    }
+
+    /// Durably mutate one private-message row without requiring that row to be
+    /// present in the bounded UI window. Candidate conversations are checked in
+    /// caller-preference order inside one store transaction.
+    func commitPrivateDeliveryStatus(
+        peerIDs: [PeerID],
+        messageID: String,
+        status: DeliveryStatus,
+        expectedGeneration: String
+    ) async -> PrivateDeliveryStatusMutationResult {
+        await withCheckedContinuation { continuation in
+            io.async { [weak self] in
+                guard let self, expectedGeneration == self.storageGeneration else {
+                    continuation.resume(returning: .failed)
+                    return
+                }
+
+                var seen = Set<PeerID>()
+                for peerID in peerIDs where seen.insert(peerID).inserted {
+                    guard !self.isPrivateDeletionFenced(peerID),
+                          let stored = self.readPrivate(at: self.privateFileURL(for: peerID)),
+                          let index = stored.messages.firstIndex(where: { $0.id == messageID }) else {
+                        continue
+                    }
+
+                    let message = stored.messages[index]
+                    let isLatest = stored.messages.last?.id == messageID
+                    guard self.shouldApplyPrivateDeliveryStatus(
+                        current: message.deliveryStatus,
+                        incoming: status
+                    ) else {
+                        // A previous attempt may have committed the full
+                        // transcript and then failed while replacing its
+                        // window/index projections. Recommit the authoritative
+                        // row so an idempotent retry also repairs that crash
+                        // window without changing actor/timestamp.
+                        guard self.writePrivateDurably(
+                            peerID: peerID,
+                            messages: stored.messages,
+                            pendingReceiveEffectIDs: stored.pendingReceiveEffectIDs
+                        ) else {
+                            continuation.resume(returning: .failed)
+                            return
+                        }
+                        continuation.resume(returning: PrivateDeliveryStatusMutationResult(
+                            disposition: .unchanged,
+                            peerID: peerID,
+                            message: message,
+                            isLatest: isLatest
+                        ))
+                        return
+                    }
+
+                    message.deliveryStatus = status
+                    guard self.writePrivateDurably(
+                        peerID: peerID,
+                        messages: stored.messages,
+                        pendingReceiveEffectIDs: stored.pendingReceiveEffectIDs
+                    ) else {
+                        continuation.resume(returning: .failed)
+                        return
+                    }
+                    continuation.resume(returning: PrivateDeliveryStatusMutationResult(
+                        disposition: .updated,
+                        peerID: peerID,
+                        message: message,
+                        isLatest: isLatest
+                    ))
+                    return
+                }
+
+                continuation.resume(returning: .notFound)
+            }
+        }
+    }
+
     func hasPendingReceiveEffects(peerID: PeerID, messageID: String) -> Bool {
         io.sync {
             readPrivate(at: privateFileURL(for: peerID))?
@@ -644,6 +939,16 @@ final class MessageStore {
             io.async { [weak self] in
                 guard let self, expectedGeneration == self.storageGeneration,
                       let stored = self.readPrivate(at: self.privateFileURL(for: peerID)) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                // Keep a bounded durable stable-ID receipt beyond transcript
+                // eviction. It is written before clearing the effect marker;
+                // duplicate admission still checks the transcript marker first,
+                // so a crash in between safely replays idempotent effects.
+                guard self.commitReceiptKey(
+                    self.controlReceiptKey(peerID: peerID, messageID: messageID)
+                ) else {
                     continuation.resume(returning: false)
                     return
                 }
@@ -676,20 +981,7 @@ final class MessageStore {
                     continuation.resume(returning: false)
                     return
                 }
-                var receipts = self.readControlReceipts()
-                if receipts.contains(key) {
-                    continuation.resume(returning: true)
-                    return
-                }
-                receipts.append(key)
-                if receipts.count > self.controlReceiptCap {
-                    receipts.removeFirst(receipts.count - self.controlReceiptCap)
-                }
-                guard let data = try? self.encoder.encode(StoredControlReceipts(keys: receipts)) else {
-                    continuation.resume(returning: false)
-                    return
-                }
-                continuation.resume(returning: self.writeDurably(data, to: self.controlReceiptsURL))
+                continuation.resume(returning: self.commitReceiptKey(key))
             }
         }
     }
@@ -876,16 +1168,15 @@ final class MessageStore {
         }
     }
 
-    /// All bounded private render windows, keyed by their persisted PeerID.
-    /// Retained for diagnostics/tests; app startup uses one page below.
+    /// All conversation summaries, keyed by their persisted PeerID.
+    /// Retained for diagnostics/tests; transcripts are loaded per open chat.
     func loadAllPrivate() -> [PeerID: [BitchatMessage]] {
         loadPrivateSnapshot().chats
     }
 
     /// Load at most `chatLimit` locally persisted conversations from the
-    /// durable newest-first index. Each decoded sidecar contains at most
-    /// `privateMessageWindowSize` rows; no directory listing, metadata stat,
-    /// global sort, or full transcript parse occurs on this path.
+    /// durable newest-first index. New index entries carry their latest message,
+    /// so no transcript/window file is parsed on this path.
     func loadPrivateSnapshot(
         after cursor: PrivateConversationCursor? = nil,
         chatLimit: Int = .max
@@ -922,6 +1213,19 @@ final class MessageStore {
         after cursor: PrivateConversationCursor?,
         chatLimit: Int
     ) -> PrivateStoreSnapshot {
+        let deletionFence = privateDeletionFence()
+        if case .corrupt = deletionFence {
+            return PrivateStoreSnapshot(
+                chats: [:], pendingReceiveEffects: [], scannedFileCount: 0,
+                hasMore: false, nextCursor: nil
+            )
+        }
+        let fencedPeerIDs: Set<String>
+        if case .peers(let peers) = deletionFence {
+            fencedPeerIDs = peers
+        } else {
+            fencedPeerIDs = []
+        }
         let limit = max(0, chatLimit)
         let pageEntries: [PrivateConversationIndexEntry]
         let hasMore: Bool
@@ -946,19 +1250,31 @@ final class MessageStore {
         indexLock.unlock()
 
         var out: [PeerID: [BitchatMessage]] = [:]
-        var pending: [(peerID: PeerID, message: BitchatMessage)] = []
+        var legacyBackfill: [StoredPrivateChat] = []
         for entry in pageEntries {
+            guard !fencedPeerIDs.contains(entry.peerID.id) else { continue }
+            if let latest = entry.latestMessage {
+                out[entry.peerID] = [latest]
+                continue
+            }
+            // One-time compatibility path for pre-summary v2 entries. It reads
+            // only the bounded sidecar, publishes one row, and path-copies the
+            // index entry so subsequent launches stay summary-only.
             let file = privateWindowFileURL(for: entry.peerID)
-            guard let chat = readPrivateWindow(at: file), !chat.messages.isEmpty else { continue }
-            out[chat.peerID] = chat.messages
-            let pendingIDs = Set(chat.pendingReceiveEffectIDs ?? [])
-            pending.append(contentsOf: chat.messages.compactMap { message in
-                pendingIDs.contains(message.id) ? (chat.peerID, message) : nil
-            })
+            guard let chat = readPrivateWindow(at: file), let latest = chat.messages.last else { continue }
+            out[chat.peerID] = [latest]
+            legacyBackfill.append(StoredPrivateChat(
+                peerID: chat.peerID,
+                messages: [latest],
+                pendingReceiveEffectIDs: nil
+            ))
+        }
+        if !legacyBackfill.isEmpty {
+            _ = updatePrivateConversationIndexBatch(for: legacyBackfill)
         }
         return PrivateStoreSnapshot(
             chats: out,
-            pendingReceiveEffects: pending,
+            pendingReceiveEffects: [],
             scannedFileCount: pageEntries.count,
             hasMore: hasMore,
             nextCursor: pageEntries.last?.cursor
@@ -1065,6 +1381,19 @@ final class MessageStore {
                     continuation.resume(returning: [])
                     return
                 }
+                let deletionFence = self.privateDeletionFence()
+                if case .corrupt = deletionFence {
+                    // The deletion journal is fail-closed, but unrelated
+                    // receive obligations must remain intact for later repair.
+                    continuation.resume(returning: [])
+                    return
+                }
+                let fencedPeerIDs: Set<String>
+                if case .peers(let peers) = deletionFence {
+                    fencedPeerIDs = peers
+                } else {
+                    fencedPeerIDs = []
+                }
                 // A pending add is written before its transcript, while a
                 // pending removal is written after its transcript. Validate
                 // against only the peers named by the sidecar so either crash
@@ -1072,6 +1401,10 @@ final class MessageStore {
                 var valid: [PendingReceiveEffectRecord] = []
                 var stale: [PendingReceiveEffectRecord] = []
                 for record in stored.records {
+                    if fencedPeerIDs.contains(record.peerID.id) {
+                        stale.append(record)
+                        continue
+                    }
                     let chat = self.readPrivate(
                         at: self.privateFileURL(for: record.peerID)
                     )
@@ -1200,38 +1533,132 @@ final class MessageStore {
     /// raw key never hits the FS, so we remove the hashed file for this PeerID.
     func deletePrivate(peerID: PeerID) {
         io.async { [weak self] in
-            _ = self?.deletePrivateOnQueue(peerID: peerID)
+            _ = self?.deletePrivateBatchOnQueue(peerIDs: [peerID])
         }
     }
 
     /// Awaitable deletion barrier used by per-conversation erase. Returning
-    /// true means the unlink (or already-missing state) and parent directory
-    /// entry are durable.
+    /// true means the summary, effect record, unlink (or already-missing state),
+    /// and deletion-intent retirement are all durable.
     func deletePrivateDurably(peerID: PeerID) -> Bool {
-        io.sync { deletePrivateOnQueue(peerID: peerID) }
+        deletePrivateDurably(peerIDs: [peerID]).complete
     }
 
-    private func deletePrivateOnQueue(peerID: PeerID) -> Bool {
-        let urls = [privateFileURL(for: peerID), privateWindowFileURL(for: peerID)]
-        do {
-            var removedFull = false
-            var removedWindow = false
-            for url in urls where FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.removeItem(at: url)
-                if url.deletingLastPathComponent() == privateDir { removedFull = true }
-                if url.deletingLastPathComponent() == privateWindowDir { removedWindow = true }
+    /// Delete every alias of one logical conversation under one durable intent
+    /// and one conversation-index root swap. `fenced` may be true while cleanup
+    /// is pending; callers should redact those rows but report success only when
+    /// `complete` is also true.
+    func deletePrivateDurably(peerIDs: [PeerID]) -> PrivateConversationDeletionResult {
+        io.sync { deletePrivateBatchOnQueue(peerIDs: peerIDs) }
+    }
+
+    private func deletePrivateBatchOnQueue(
+        peerIDs: [PeerID]
+    ) -> PrivateConversationDeletionResult {
+        let unique = Dictionary(grouping: peerIDs, by: \.id)
+            .compactMap { $0.value.first }
+            .sorted { $0.id < $1.id }
+        guard !unique.isEmpty else {
+            return PrivateConversationDeletionResult(fenced: true, complete: true)
+        }
+
+        if FileManager.default.fileExists(atPath: privateDeletionIntentURL.path) {
+            guard let active = readPrivateDeletionIntent() else {
+                // The journal itself is still a global fail-closed read fence.
+                return PrivateConversationDeletionResult(fenced: true, complete: false)
             }
-            if removedFull { try syncDirectory(privateDir) }
-            if removedWindow { try syncDirectory(privateWindowDir) }
-            let empty = StoredPrivateChat(
-                peerID: peerID,
-                messages: [],
-                pendingReceiveEffectIDs: []
-            )
-            guard updatePrivateConversationIndex(for: empty, durable: true) else { return false }
-            return updatePendingReceiveEffectIndex(for: empty, durable: true)
+            let activeIDs = Set(active.peerIDs.map(\.id))
+            let requestedIDs = Set(unique.map(\.id))
+            if activeIDs != requestedIDs {
+                guard completePrivateDeletion(active) else { return .notStarted }
+            } else {
+                let complete = completePrivateDeletion(active)
+                return PrivateConversationDeletionResult(fenced: true, complete: complete)
+            }
+        }
+
+        let intent = PrivateDeletionIntent(version: 1, peerIDs: unique)
+        guard let data = try? encoder.encode(intent),
+              writeDurably(data, to: privateDeletionIntentURL) else {
+            return .notStarted
+        }
+        do {
+            try beforePrivateDeletionStage?(.intentCommitted)
+        } catch {
+            return PrivateConversationDeletionResult(fenced: true, complete: false)
+        }
+        return PrivateConversationDeletionResult(
+            fenced: true,
+            complete: completePrivateDeletion(intent)
+        )
+    }
+
+    private func recoverPendingPrivateDeletion() -> Bool {
+        guard FileManager.default.fileExists(atPath: privateDeletionIntentURL.path) else { return true }
+        guard let intent = readPrivateDeletionIntent() else { return false }
+        return completePrivateDeletion(intent)
+    }
+
+    private func completePrivateDeletion(_ intent: PrivateDeletionIntent) -> Bool {
+        let peerIDs = intent.peerIDs
+        let emptyEnvelopes = peerIDs.map {
+            StoredPrivateChat(peerID: $0, messages: [], pendingReceiveEffectIDs: [])
+        }
+        guard updatePrivateConversationIndexBatch(for: emptyEnvelopes),
+              privateConversationIndexExcludes(peerIDs) else { return false }
+        do { try beforePrivateDeletionStage?(.conversationIndexCommitted) }
+        catch { return false }
+
+        guard removePendingReceiveEffects(for: peerIDs) else { return false }
+        do { try beforePrivateDeletionStage?(.pendingEffectsCommitted) }
+        catch { return false }
+
+        do {
+            for peerID in peerIDs {
+                let urls = [privateFileURL(for: peerID), privateWindowFileURL(for: peerID)]
+                for url in urls where FileManager.default.fileExists(atPath: url.path) {
+                    try FileManager.default.removeItem(at: url)
+                }
+            }
+            // Always recommit both directory entries. A previous attempt may
+            // have unlinked a file but failed before its parent barrier.
+            try syncDirectory(privateDir)
+            try syncDirectory(privateWindowDir)
+            try beforePrivateDeletionStage?(.transcriptFilesRemoved)
+            guard removePrivateDeletionIntentDurably() else { return false }
+            return true
         } catch {
             SecureLogger.error("MessageStore conversation delete failed: \(error)", category: .session)
+            return false
+        }
+    }
+
+    private func privateConversationIndexExcludes(_ peerIDs: [PeerID]) -> Bool {
+        indexLock.lock(); defer { indexLock.unlock() }
+        guard let manifest = readPrivateConversationIndexManifestUnlocked() else { return false }
+        return peerIDs.allSatisfy { peerLookup(manifest.peerRoot, peerID: $0) == nil }
+    }
+
+    private func removePendingReceiveEffects(for peerIDs: [PeerID]) -> Bool {
+        let ids = Set(peerIDs.map(\.id))
+        pendingEffectLock.lock(); defer { pendingEffectLock.unlock() }
+        guard let existing = readPendingReceiveEffectIndexUnlocked()?.records else { return false }
+        let records = existing.filter { !ids.contains($0.peerID.id) }
+        if records == existing { return true }
+        return writePendingReceiveEffectIndexUnlocked(
+            PendingReceiveEffectIndex(records: records), durable: true
+        )
+    }
+
+    private func removePrivateDeletionIntentDurably() -> Bool {
+        do {
+            if FileManager.default.fileExists(atPath: privateDeletionIntentURL.path) {
+                try FileManager.default.removeItem(at: privateDeletionIntentURL)
+            }
+            try syncDirectory(baseDir)
+            return true
+        } catch {
+            SecureLogger.error("MessageStore deletion-intent retirement failed: \(error)", category: .session)
             return false
         }
     }
@@ -1272,6 +1699,10 @@ final class MessageStore {
         baseDir.appendingPathComponent("pending-receive-effects.json")
     }
 
+    private var privateDeletionIntentURL: URL {
+        baseDir.appendingPathComponent("private-deletion-intent.json")
+    }
+
     private func orderIndexNodeURL(_ id: String) -> URL {
         privateIndexNodeDir.appendingPathComponent("o-\(id).json")
     }
@@ -1297,8 +1728,45 @@ final class MessageStore {
     }
 
     private func readPrivateWindow(at url: URL) -> StoredPrivateChat? {
+        privateWindowReadObserver?()
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(StoredPrivateChat.self, from: data)
+    }
+
+    private enum PrivateDeletionFence {
+        case none
+        case peers(Set<String>)
+        case corrupt
+    }
+
+    private func readPrivateDeletionIntent() -> PrivateDeletionIntent? {
+        guard FileManager.default.fileExists(atPath: privateDeletionIntentURL.path) else { return nil }
+        do {
+            let data = try Data(contentsOf: privateDeletionIntentURL)
+            let intent = try decoder.decode(PrivateDeletionIntent.self, from: data)
+            guard intent.version == 1, !intent.peerIDs.isEmpty,
+                  Set(intent.peerIDs.map(\.id)).count == intent.peerIDs.count else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            return intent
+        } catch {
+            SecureLogger.error("Private deletion intent is unreadable; hiding private chats", category: .session)
+            return nil
+        }
+    }
+
+    private func privateDeletionFence() -> PrivateDeletionFence {
+        guard FileManager.default.fileExists(atPath: privateDeletionIntentURL.path) else { return .none }
+        guard let intent = readPrivateDeletionIntent() else { return .corrupt }
+        return .peers(Set(intent.peerIDs.map(\.id)))
+    }
+
+    private func isPrivateDeletionFenced(_ peerID: PeerID) -> Bool {
+        switch privateDeletionFence() {
+        case .none: return false
+        case .peers(let peers): return peers.contains(peerID.id)
+        case .corrupt: return true
+        }
     }
 
     private func privateWindowEnvelope(from full: StoredPrivateChat) -> StoredPrivateChat {
@@ -1350,6 +1818,8 @@ final class MessageStore {
         for envelope: StoredPrivateChat,
         durable: Bool
     ) -> Bool {
+        if !(envelope.pendingReceiveEffectIDs ?? []).isEmpty,
+           isPrivateDeletionFenced(envelope.peerID) { return false }
         pendingEffectLock.lock(); defer { pendingEffectLock.unlock() }
         guard let existing = readPendingReceiveEffectIndexUnlocked()?.records else { return false }
         var records = existing
@@ -1379,6 +1849,8 @@ final class MessageStore {
         for envelope: StoredPrivateChat,
         durable: Bool
     ) -> Bool {
+        if !(envelope.pendingReceiveEffectIDs ?? []).isEmpty,
+           isPrivateDeletionFenced(envelope.peerID) { return false }
         pendingEffectLock.lock(); defer { pendingEffectLock.unlock() }
         guard let existing = readPendingReceiveEffectIndexUnlocked()?.records else { return false }
         var records = existing.filter {
@@ -1493,7 +1965,10 @@ final class MessageStore {
         _ lhs: PrivateConversationIndexEntry,
         _ rhs: PrivateConversationIndexEntry
     ) -> Int {
-        if lhs == rhs { return 0 }
+        // Summary payload/status changes do not change the treap key.
+        if lhs.latestMessageAt == rhs.latestMessageAt,
+           lhs.latestMessageID == rhs.latestMessageID,
+           lhs.peerID == rhs.peerID { return 0 }
         return conversationEntry(lhs, sortsBefore: rhs) ? -1 : 1
     }
 
@@ -1801,7 +2276,8 @@ final class MessageStore {
         return PrivateConversationIndexEntry(
             peerID: envelope.peerID,
             latestMessageAt: latest.timestamp,
-            latestMessageID: latest.id
+            latestMessageID: latest.id,
+            latestMessage: latest
         )
     }
 
@@ -1891,6 +2367,9 @@ final class MessageStore {
         var mutation = IndexMutation()
         var indexChanged = false
         for envelope in envelopes {
+            if !envelope.messages.isEmpty && isPrivateDeletionFenced(envelope.peerID) {
+                return false
+            }
             let old = peerLookup(manifest.peerRoot, peerID: envelope.peerID, mutation: mutation)
             let candidate = latestEntry(for: envelope)
             if old == candidate { continue }
@@ -1972,6 +2451,7 @@ final class MessageStore {
     }
 
     private func writeLegacyPrivateWindowIfAbsent(_ envelope: StoredPrivateChat) -> Bool {
+        guard !isPrivateDeletionFenced(envelope.peerID) else { return false }
         privateWindowWriteLock.lock(); defer { privateWindowWriteLock.unlock() }
         let url = privateWindowFileURL(for: envelope.peerID)
         guard !FileManager.default.fileExists(atPath: url.path) else { return true }
@@ -1986,6 +2466,7 @@ final class MessageStore {
 
     @discardableResult
     private func writePrivate(peerID: PeerID, messages: [BitchatMessage]) -> Bool {
+        guard !isPrivateDeletionFenced(peerID) else { return false }
         let pending = readPrivate(at: privateFileURL(for: peerID))?.pendingReceiveEffectIDs
         let envelope = StoredPrivateChat(peerID: peerID, messages: messages, pendingReceiveEffectIDs: pending)
         guard let data = try? encoder.encode(envelope) else { return false }
@@ -2002,6 +2483,7 @@ final class MessageStore {
         pendingReceiveEffectMessageID: String? = nil,
         pendingReceiveEffectIDs: [String]? = nil
     ) -> Bool {
+        guard !isPrivateDeletionFenced(peerID) else { return false }
         var pending = pendingReceiveEffectIDs ??
             readPrivate(at: privateFileURL(for: peerID))?.pendingReceiveEffectIDs ?? []
         if let pendingReceiveEffectMessageID, !pending.contains(pendingReceiveEffectMessageID) {
@@ -2034,11 +2516,47 @@ final class MessageStore {
         return trimmed(Array(byID.values), cap: cap)
     }
 
+    /// Delivery and read receipts are terminal, monotonic acknowledgements.
+    /// Replays must not replace their original actor/timestamp, and late send
+    /// callbacks must never move a delivered/read row backwards.
+    private func shouldApplyPrivateDeliveryStatus(
+        current: DeliveryStatus?,
+        incoming: DeliveryStatus
+    ) -> Bool {
+        guard let current else { return true }
+        switch (current, incoming) {
+        case (.read, _):
+            return false
+        case (.delivered, .read):
+            return true
+        case (.delivered, _):
+            return false
+        case (_, .delivered), (_, .read):
+            return true
+        default:
+            return current != incoming
+        }
+    }
+
     private func readControlReceipts() -> [String] {
         guard let data = try? Data(contentsOf: controlReceiptsURL),
               let stored = try? decoder.decode(StoredControlReceipts.self, from: data)
         else { return [] }
         return stored.keys
+    }
+
+    /// Called only from the serial store queue.
+    private func commitReceiptKey(_ key: String) -> Bool {
+        var receipts = readControlReceipts()
+        if receipts.contains(key) { return true }
+        receipts.append(key)
+        if receipts.count > controlReceiptCap {
+            receipts.removeFirst(receipts.count - controlReceiptCap)
+        }
+        guard let data = try? encoder.encode(StoredControlReceipts(keys: receipts)) else {
+            return false
+        }
+        return writeDurably(data, to: controlReceiptsURL)
     }
 
     private func controlReceiptKey(peerID: PeerID, messageID: String) -> String {

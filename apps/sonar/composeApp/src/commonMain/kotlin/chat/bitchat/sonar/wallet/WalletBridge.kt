@@ -48,6 +48,26 @@ internal fun acceptsWalletCallback(
     panicWipePending: Boolean,
 ): Boolean = listenerEpoch == currentEpoch && ownsSdkNode && !panicWipePending
 
+/** Retains the exact native node whose disconnect failed. Callers serialize
+ * access with their wallet operation gate; a retained node always wins over a
+ * newer active snapshot and must be released before storage can be retired. */
+internal class WalletTeardownSlot<T : Any> {
+    private var retainedNode: T? = null
+
+    fun nodeForDisconnect(activeNode: T?): T? = retainedNode ?: activeNode
+
+    fun recordDisconnect(node: T?, succeeded: Boolean) {
+        if (node == null) return
+        if (!succeeded) {
+            retainedNode = node
+        } else if (retainedNode === node) {
+            retainedNode = null
+        }
+    }
+
+    fun hasPendingNode(): Boolean = retainedNode != null
+}
+
 /**
  * Thin Kotlin façade over the on-device Breez SDK Liquid wallet, the Android
  * twin of iOS `WalletBridgeService`. Seed is derived deterministically from the

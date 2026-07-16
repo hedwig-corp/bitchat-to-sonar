@@ -207,33 +207,37 @@ extension ChatViewModel {
 
     // MARK: - Private Chat Handling (Geohash/Ephemeral)
 
+    @MainActor
     func handlePrivateMessage(
         _ payload: NoisePayload,
         senderPubkey: String,
         convKey: PeerID,
         id: NostrIdentity,
         messageTimestamp: Date
-    ) {
+    ) async {
         guard let pm = PrivateMessagePacket.decode(from: payload.data) else { return }
         let messageId = pm.messageID
-        
+
         SecureLogger.info("GeoDM: recv PM <- sender=\(senderPubkey.prefix(8))… mid=\(messageId.prefix(8))…", category: .session)
 
-        sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
+        await meshInboundCommitGate.enter()
+        let gate = meshInboundCommitGate
+        defer { Task { await gate.leave() } }
+        let storageGeneration = privateChatManager.currentStorageGeneration()
 
         // Respect geohash blocks
         if identityManager.isNostrBlocked(pubkeyHexLowercased: senderPubkey) {
+            // Policy-handled messages do not enter the transcript, but their
+            // terminal ACK still follows a durable stable-ID receipt.
+            guard await privateChatManager.commitIncomingControl(
+                messageId,
+                from: convKey,
+                expectedGeneration: storageGeneration
+            ), privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+            sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
             return
         }
 
-        // Duplicate check
-        if privateChats[convKey]?.contains(where: { $0.id == messageId }) == true { return }
-        for (_, arr) in privateChats {
-            if arr.contains(where: { $0.id == messageId }) {
-                return
-            }
-        }
-        
         let senderName = displayNameForNostrPubkey(senderPubkey)
         let msg = BitchatMessage(
             id: messageId,
@@ -247,63 +251,113 @@ extension ChatViewModel {
             receivedViaInternet: true,
             deliveryStatus: .delivered(to: nickname, at: Date())
         )
-        
-        if privateChats[convKey] == nil {
-            privateChats[convKey] = []
-        }
-        privateChats[convKey]?.append(msg)
-        
-        let isViewing = selectedPrivateChatPeer == convKey
-        let wasReadBefore = sentReadReceipts.contains(messageId)
-        let isRecentMessage = Date().timeIntervalSince(messageTimestamp) < 30
-        let shouldMarkUnread = !wasReadBefore && !isViewing && isRecentMessage
-        if shouldMarkUnread {
-            unreadPrivateMessages.insert(convKey)
-        }
-        
-        // Send READ if viewing this conversation
-        if isViewing {
-            sendReadReceiptIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
-        }
-        
-        // Notify for truly unread and recent messages when not viewing
-        if !isViewing,
-           shouldMarkUnread,
-           Self.shouldSendGenericPrivateMessageNotification(for: pm.content) {
-            Task {
-                _ = await NotificationService.shared.sendPrivateMessageNotification(
-                    from: senderName,
-                    message: pm.content,
+
+        let admission = await privateChatManager.commitIncomingMessageAtomically(
+            msg,
+            preferredPeerID: convKey,
+            expectedGeneration: storageGeneration
+        )
+        guard admission.disposition != .failed,
+              privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+
+        switch admission.disposition {
+        case .admitted, .pendingEffects:
+            guard let durableMessage = admission.message,
+                  await handleInternetPrivateMessageReceiveSideEffects(
+                    durableMessage,
                     peerID: convKey,
-                    messageID: messageId
-                )
-            }
+                    senderPubkey: senderPubkey,
+                    identity: id
+                  ),
+                  await privateChatManager.commitReceiveEffectsProcessed(
+                    durableMessage.id,
+                    preferredPeerID: convKey,
+                    expectedGeneration: storageGeneration
+                  ),
+                  privateChatManager.currentStorageGeneration() == storageGeneration else { return }
+        case .duplicate:
+            break
+        case .failed:
+            return
         }
-        
+
+        // Delivery means transcript + receive effects are both durably retired.
+        sendDeliveryAckIfNeeded(to: messageId, senderPubKey: senderPubkey, from: id)
         objectWillChange.send()
+    }
+
+    @MainActor
+    private func handleInternetPrivateMessageReceiveSideEffects(
+        _ message: BitchatMessage,
+        peerID: PeerID,
+        senderPubkey: String,
+        identity: NostrIdentity
+    ) async -> Bool {
+        if sentReadReceipts.contains(message.id) { return true }
+        let isViewing = selectedPrivateChatPeer == peerID
+        if isViewing {
+            unreadPrivateMessages.remove(peerID)
+            sendReadReceiptIfNeeded(
+                to: message.id,
+                senderPubKey: senderPubkey,
+                from: identity
+            )
+            return true
+        }
+
+        let isRecent = Date().timeIntervalSince(message.timestamp) < 30
+        guard isRecent else { return true }
+        unreadPrivateMessages.insert(peerID)
+        guard Self.shouldSendGenericPrivateMessageNotification(for: message.content) else {
+            return true
+        }
+        let outcome = await NotificationService.shared.sendPrivateMessageNotification(
+            from: message.sender,
+            message: message.content,
+            peerID: peerID,
+            messageID: message.id,
+            sound: .standard
+        )
+        return outcome != .retryableFailure
     }
     
     func handleDelivered(_ payload: NoisePayload, senderPubkey: String, convKey: PeerID) {
         guard let messageID = String(data: payload.data, encoding: .utf8) else { return }
-        
-        if let idx = privateChats[convKey]?.firstIndex(where: { $0.id == messageID }) {
-            privateChats[convKey]?[idx].deliveryStatus = .delivered(to: displayNameForNostrPubkey(senderPubkey), at: Date())
-            objectWillChange.send()
-            SecureLogger.info("GeoDM: recv DELIVERED for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
-        } else {
-            SecureLogger.warning("GeoDM: delivered ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await applyPrivateDeliveryStatus(
+                messageID: messageID,
+                status: .delivered(to: displayNameForNostrPubkey(senderPubkey), at: Date()),
+                preferredPeerIDs: deliveryReceiptPeerCandidates(for: convKey)
+            )
+            if result.disposition == .notFound {
+                SecureLogger.warning("GeoDM: delivered ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+            } else if result.disposition == .failed {
+                SecureLogger.error("GeoDM: failed to persist DELIVERED for mid=\(messageID.prefix(8))…", category: .session)
+            } else {
+                SecureLogger.info("GeoDM: recv DELIVERED for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
+            }
         }
     }
     
     func handleReadReceipt(_ payload: NoisePayload, senderPubkey: String, convKey: PeerID) {
         guard let messageID = String(data: payload.data, encoding: .utf8) else { return }
-        
-        if let idx = privateChats[convKey]?.firstIndex(where: { $0.id == messageID }) {
-            privateChats[convKey]?[idx].deliveryStatus = .read(by: displayNameForNostrPubkey(senderPubkey), at: Date())
-            objectWillChange.send()
-            SecureLogger.info("GeoDM: recv READ for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
-        } else {
-            SecureLogger.warning("GeoDM: read ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await applyPrivateDeliveryStatus(
+                messageID: messageID,
+                status: .read(by: displayNameForNostrPubkey(senderPubkey), at: Date()),
+                preferredPeerIDs: deliveryReceiptPeerCandidates(for: convKey)
+            )
+            if result.disposition == .notFound {
+                SecureLogger.warning("GeoDM: read ack for unknown mid=\(messageID.prefix(8))… conv=\(convKey)", category: .session)
+            } else if result.disposition == .failed {
+                SecureLogger.error("GeoDM: failed to persist READ for mid=\(messageID.prefix(8))…", category: .session)
+            } else {
+                SecureLogger.info("GeoDM: recv READ for mid=\(messageID.prefix(8))… from=\(senderPubkey.prefix(8))…", category: .session)
+            }
         }
     }
 
@@ -848,19 +902,18 @@ extension ChatViewModel {
     
     /// Handle incoming private message (Mesh)
     ///
-    /// Stages the accepted message (or non-transcript control receipt), then
-    /// suspends off-main until it is atomically durable. UI and receive-side
-    /// effects are published only after that barrier succeeds. Callers must
-    /// only emit a delivery ACK when this returns true.
+    /// Atomically admits the stable ID (or non-transcript control receipt), then
+    /// publishes receive-side effects from the authoritative stored payload.
+    /// Callers must only emit a delivery ACK for a non-failed disposition.
     @MainActor
-    func handlePrivateMessageDurably(_ message: BitchatMessage) async -> Bool {
+    func handlePrivateMessageDurably(_ message: BitchatMessage) async -> PrivateReceiveDisposition {
         await meshInboundCommitGate.enter()
         let gate = meshInboundCommitGate
         defer { Task { await gate.leave() } }
 
         guard let peerID = message.senderPeerID ?? getPeerIDForNickname(message.sender) else {
             SecureLogger.warning("⚠️ Could not resolve durable sender for \(message.id)", category: .session)
-            return false
+            return .failed
         }
         preparePrivateChatRoute(for: peerID, senderNickname: message.sender)
         let storageGeneration = privateChatManager.currentStorageGeneration()
@@ -874,59 +927,46 @@ extension ChatViewModel {
                 from: peerID,
                 expectedGeneration: storageGeneration
             ), privateChatManager.currentStorageGeneration() == storageGeneration else {
-                return false
+                return .failed
             }
             return handleFavoriteNotificationFromMesh(
                 message.content,
                 from: peerID,
                 senderNickname: message.sender
-            )
+            ) ? .admitted : .failed
         }
 
-        if isDuplicateMessage(message.id, targetPeerID: peerID) {
-            guard await privateChatManager.commitIncomingMessage(
-                message.id,
-                preferredPeerID: peerID,
-                expectedGeneration: storageGeneration
-            ), privateChatManager.currentStorageGeneration() == storageGeneration else {
-                return false
-            }
-            if privateChatManager.hasPendingReceiveEffects(message.id, preferredPeerID: peerID) {
-                guard await handlePrivateMessageReceiveSideEffects(message, peerID: peerID) else {
-                    return false
-                }
-                guard await privateChatManager.commitReceiveEffectsProcessed(
-                    message.id,
-                    preferredPeerID: peerID,
-                    expectedGeneration: storageGeneration
-                ), privateChatManager.currentStorageGeneration() == storageGeneration else {
-                    return false
-                }
-            }
-            return true
-        }
-
-        guard await privateChatManager.commitStagedIncomingMessage(
+        let admission = await privateChatManager.commitIncomingMessageAtomically(
             message,
             preferredPeerID: peerID,
             expectedGeneration: storageGeneration
-        ), privateChatManager.currentStorageGeneration() == storageGeneration else {
-            return false
+        )
+        guard admission.disposition != .failed,
+              privateChatManager.currentStorageGeneration() == storageGeneration else {
+            return .failed
         }
-        let noiseKey = peerID.noiseKey ?? unifiedPeerService.getPeer(by: peerID)?.noisePublicKey
-        mirrorToEphemeralIfNeeded(message, targetPeerID: peerID, key: noiseKey)
-        guard await handlePrivateMessageReceiveSideEffects(message, peerID: peerID) else {
-            return false
+
+        switch admission.disposition {
+        case .admitted, .pendingEffects:
+            guard let durableMessage = admission.message else { return .failed }
+            let noiseKey = peerID.noiseKey ?? unifiedPeerService.getPeer(by: peerID)?.noisePublicKey
+            mirrorToEphemeralIfNeeded(durableMessage, targetPeerID: peerID, key: noiseKey)
+            guard await handlePrivateMessageReceiveSideEffects(durableMessage, peerID: peerID),
+                  await privateChatManager.commitReceiveEffectsProcessed(
+                    durableMessage.id,
+                    preferredPeerID: peerID,
+                    expectedGeneration: storageGeneration
+                  ),
+                  privateChatManager.currentStorageGeneration() == storageGeneration else {
+                return .failed
+            }
+            objectWillChange.send()
+        case .duplicate:
+            break
+        case .failed:
+            return .failed
         }
-        guard await privateChatManager.commitReceiveEffectsProcessed(
-            message.id,
-            preferredPeerID: peerID,
-            expectedGeneration: storageGeneration
-        ), privateChatManager.currentStorageGeneration() == storageGeneration else {
-            return false
-        }
-        objectWillChange.send()
-        return true
+        return admission.disposition
     }
 
     @MainActor

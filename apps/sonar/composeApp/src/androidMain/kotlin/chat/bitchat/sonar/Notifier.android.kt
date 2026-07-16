@@ -32,6 +32,7 @@ actual object Notifier {
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun manager() = ctx.getSystemService(NotificationManager::class.java)
+    @Volatile private var accountNotificationsSuspended = false
 
     /** Stable type/name URI so a persisted channel survives resource-ID renumbering. */
     private fun soundUri(resourceId: Int): Uri {
@@ -92,7 +93,7 @@ actual object Notifier {
 
     @Synchronized
     actual fun canNotify(): Boolean {
-        if (PanicWipeIntent.isPending()) return false
+        if (!accountNotificationsAllowed(accountNotificationsSuspended, PanicWipeIntent.isPending())) return false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             return ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
                 PackageManager.PERMISSION_GRANTED
@@ -122,7 +123,7 @@ actual object Notifier {
 
     @Synchronized
     actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
-        if (PanicWipeIntent.isPending()) return
+        if (!accountNotificationsAllowed(accountNotificationsSuspended, PanicWipeIntent.isPending())) return
         if (!canNotify()) return
         val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
             ?.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
@@ -150,6 +151,15 @@ actual object Notifier {
 
     @Synchronized
     actual fun suspendAndCancelAll() {
+        accountNotificationsSuspended = true
         runCatching { manager().cancelAll() }
+    }
+
+    @Synchronized
+    actual fun reactivateAccountNotifications(): Boolean {
+        if (PanicWipeIntent.isPending()) return false
+        accountNotificationsSuspended = false
+        ensureChannel()
+        return true
     }
 }

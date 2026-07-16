@@ -1915,6 +1915,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Return chronologically sorted, de-duplicated list
         return bestByID.values.sorted { $0.timestamp < $1.timestamp }
     }
+
+    @MainActor
+    func canLoadOlderPrivateMessages(for peerID: PeerID) -> Bool {
+        privateChatManager.canLoadOlderMessages(for: peerID)
+    }
+
+    @MainActor
+    func loadOlderPrivateMessages(for peerID: PeerID) async -> Bool {
+        await privateChatManager.loadOlderMessages(for: peerID)
+    }
     
     @MainActor
     func getPeerIDForNickname(_ nickname: String) -> PeerID? {
@@ -1991,11 +2001,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             SecureLogger.error("Conversation delete could not prune durable outbox", category: .session)
             return false
         }
-        for key in toRemove {
-            guard messageStore.deletePrivateDurably(peerID: key) else {
-                SecureLogger.error("Conversation delete could not commit transcript removal", category: .session)
-                return false
-            }
+        let deletion = messageStore.deletePrivateDurably(peerIDs: toRemove)
+        guard deletion.fenced else {
+            SecureLogger.error("Conversation delete could not commit its durable fence", category: .session)
+            return false
         }
         for key in toRemove {
             privateChatManager.privateChats.removeValue(forKey: key)
@@ -2005,7 +2014,13 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             endPrivateChat()
         }
         objectWillChange.send()
-        return true
+        if !deletion.complete {
+            SecureLogger.error(
+                "Conversation delete is fenced but requires crash-safe cleanup retry",
+                category: .session
+            )
+        }
+        return deletion.complete
     }
 
     // PANIC: Emergency data clearing for activist safety
@@ -2753,7 +2768,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         messages = timelineStore.messages(for: target)
         // Write-through: persist the visible channel transcript so public /
         // geohash history survives an app restart. Local-only on-device store.
-        MessageStore.shared.saveChannel(target.storeID, messages: messages)
+        messageStore.saveChannel(target.storeID, messages: messages)
     }
 
     /// Merge a channel's persisted transcript (from MessageStore) back into the
@@ -2761,7 +2776,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     /// Existing messages are deduped by id inside the timeline store.
     @MainActor
     func hydrateChannelFromStore(_ channel: ChannelID) {
-        let stored = MessageStore.shared.loadChannel(channel.storeID)
+        let stored = messageStore.loadChannel(channel.storeID)
         guard !stored.isEmpty else { return }
         switch channel {
         case .mesh:
@@ -3185,11 +3200,8 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             
             // Route to appropriate handler
             if message.isPrivate {
-                let peerID = message.senderPeerID ?? getPeerIDForNickname(message.sender)
-                let wasAlreadyCommitted = peerID.map {
-                    isDuplicateMessage(message.id, targetPeerID: $0)
-                } ?? false
-                guard await handlePrivateMessageDurably(message) else {
+                let disposition = await handlePrivateMessageDurably(message)
+                guard disposition != .failed else {
                     // The file and transcript form one user-visible acceptance:
                     // if the transcript cannot commit, roll back the staged file
                     // and emit no notification, unread/read-receipt, pay, or call
@@ -3197,7 +3209,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                     cleanupStagedIncomingMediaFile(forMessage: message)
                     return
                 }
-                if wasAlreadyCommitted {
+                guard disposition == .admitted else {
                     // Replayed media may have staged another uniquely-named file,
                     // but the durable transcript already references the original.
                     cleanupStagedIncomingMediaFile(forMessage: message)
@@ -3213,36 +3225,48 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
 
-    /// Find message index trying both short (16-hex) and long (64-hex) peer ID formats.
-    /// Returns the peer ID where the message was found and its index, or nil if not found.
-    private func findMessageIndex(messageID: String, peerID: PeerID) -> (peerID: PeerID, index: Int)? {
-        // Try direct lookup first
-        if let messages = privateChats[peerID],
-           let idx = messages.firstIndex(where: { $0.id == messageID }) {
-            return (peerID, idx)
-        }
-
-        // Try with full noise key if peerID is short (16 hex chars)
+    /// Candidate persisted conversation keys for a receipt sender. Noise chats
+    /// may have migrated between their short transport ID and full static key.
+    @MainActor
+    func deliveryReceiptPeerCandidates(for peerID: PeerID) -> [PeerID] {
+        var candidates = [peerID]
         if peerID.bare.count == 16,
            let peer = unifiedPeerService.getPeer(by: peerID),
            !peer.noisePublicKey.isEmpty {
-            let longID = PeerID(hexData: peer.noisePublicKey)
-            if let messages = privateChats[longID],
-               let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                return (longID, idx)
-            }
+            candidates.append(PeerID(hexData: peer.noisePublicKey))
         }
-
-        // Try with short form if peerID is long (64 hex = noise key)
         if peerID.bare.count == 64 {
-            let shortID = peerID.toShort()
-            if let messages = privateChats[shortID],
-               let idx = messages.firstIndex(where: { $0.id == messageID }) {
-                return (shortID, idx)
+            candidates.append(peerID.toShort())
+        }
+        return candidates
+    }
+
+    @MainActor
+    @discardableResult
+    func applyPrivateDeliveryStatus(
+        messageID: String,
+        status: DeliveryStatus,
+        preferredPeerIDs: [PeerID]
+    ) async -> PrivateDeliveryStatusMutationResult {
+        let generation = privateChatManager.currentStorageGeneration()
+        var candidates: [PeerID] = []
+        var seen = Set<PeerID>()
+        for peerID in preferredPeerIDs {
+            for candidate in deliveryReceiptPeerCandidates(for: peerID)
+            where seen.insert(candidate).inserted {
+                candidates.append(candidate)
             }
         }
-
-        return nil
+        let result = await privateChatManager.commitDeliveryStatus(
+            messageID: messageID,
+            status: status,
+            preferredPeerIDs: candidates,
+            expectedGeneration: generation
+        )
+        if result.disposition == .updated {
+            objectWillChange.send()
+        }
+        return result
     }
 
     // Low-level BLE events
@@ -3276,7 +3300,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                     senderPeerID: peerID,
                     mentions: pmMentions.isEmpty ? nil : pmMentions
                 )
-                guard await handlePrivateMessageDurably(msg) else {
+                guard await handlePrivateMessageDurably(msg) != .failed else {
                     SecureLogger.warning(
                         "⚠️ Withholding delivery ACK until private message persistence succeeds: \(pm.messageID)",
                         category: .session
@@ -3288,35 +3312,21 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
 
             case .delivered:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
-                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
-
-                // Don't downgrade from .read to .delivered
-                if case .read = privateChats[foundPeerID]?[idx].deliveryStatus { return }
-
-                if let messages = privateChats[foundPeerID], idx < messages.count {
-                    messages[idx].deliveryStatus = .delivered(to: name, at: Date())
-                    // Reassign for publication, then explicitly persist because
-                    // BitchatMessage is a reference type shared with oldValue.
-                    privateChats[foundPeerID] = messages
-                    privateChatManager.persistCurrentTranscript(for: foundPeerID)
-                    privateChatManager.objectWillChange.send()
-                    objectWillChange.send()
-                }
+                let name = unifiedPeerService.getPeer(by: peerID)?.nickname ?? resolveNickname(for: peerID)
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: .delivered(to: name, at: Date()),
+                    preferredPeerIDs: deliveryReceiptPeerCandidates(for: peerID)
+                )
 
             case .readReceipt:
                 guard let messageID = String(data: payload, encoding: .utf8) else { return }
-                guard let name = unifiedPeerService.getPeer(by: peerID)?.nickname,
-                      let (foundPeerID, idx) = findMessageIndex(messageID: messageID, peerID: peerID) else { return }
-
-                // Explicitly unwrap and re-assign to ensure the @Published setter is called
-                if let messages = privateChats[foundPeerID], idx < messages.count {
-                    messages[idx].deliveryStatus = .read(by: name, at: Date())
-                    privateChats[foundPeerID] = messages
-                    privateChatManager.persistCurrentTranscript(for: foundPeerID)
-                    privateChatManager.objectWillChange.send()
-                    objectWillChange.send()
-                }
+                let name = unifiedPeerService.getPeer(by: peerID)?.nickname ?? resolveNickname(for: peerID)
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: .read(by: name, at: Date()),
+                    preferredPeerIDs: deliveryReceiptPeerCandidates(for: peerID)
+                )
             case .verifyChallenge:
                 // Parse and respond
                 guard let tlv = VerificationService.shared.parseVerifyChallenge(payload) else { return }
@@ -3784,24 +3794,33 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     func didReceiveReadReceipt(_ receipt: ReadReceipt) {
         // Find the message and update its read status
-        updateMessageDeliveryStatus(receipt.originalMessageID, status: .read(by: receipt.readerNickname, at: receipt.timestamp))
+        updateMessageDeliveryStatus(
+            receipt.originalMessageID,
+            status: .read(by: receipt.readerNickname, at: receipt.timestamp),
+            preferredPeerIDs: [receipt.readerID]
+        )
     }
     
     func didUpdateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus) {
         updateMessageDeliveryStatus(messageID, status: status)
     }
     
-    func updateMessageDeliveryStatus(_ messageID: String, status: DeliveryStatus) {
+    func updateMessageDeliveryStatus(
+        _ messageID: String,
+        status: DeliveryStatus,
+        preferredPeerIDs: [PeerID] = []
+    ) {
         
         // Helper function to check if we should skip this update
         func shouldSkipUpdate(currentStatus: DeliveryStatus?, newStatus: DeliveryStatus) -> Bool {
             guard let current = currentStatus else { return false }
             
-            // Don't downgrade from read to delivered
             switch (current, newStatus) {
-            case (.read, .delivered):
+            case (.read, _):
                 return true
-            case (.read, .sent):
+            case (.delivered, .read):
+                return false
+            case (.delivered, _):
                 return true
             default:
                 return false
@@ -3817,9 +3836,11 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
         
         // Update in private chats
+        var matchedPrivatePeerIDs: [PeerID] = []
         for peerID in Array(privateChats.keys) {
             guard let chatMessages = privateChats[peerID] else { continue }
             guard let index = chatMessages.firstIndex(where: { $0.id == messageID }) else { continue }
+            matchedPrivatePeerIDs.append(peerID)
             
             let currentStatus = chatMessages[index].deliveryStatus
             guard !shouldSkipUpdate(currentStatus: currentStatus, newStatus: status) else { continue }
@@ -3829,6 +3850,24 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             // reference-sharing blind spot in equality-based didSet detection.
             privateChats[peerID] = chatMessages
             privateChatManager.persistCurrentTranscript(for: peerID)
+        }
+
+        // The chat list keeps only the latest row of a closed conversation.
+        // Receipt statuses therefore also mutate the full store by stable ID;
+        // the manager projects them back only when that row is actually in the
+        // current summary/window.
+        switch status {
+        case .delivered, .read:
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await applyPrivateDeliveryStatus(
+                    messageID: messageID,
+                    status: status,
+                    preferredPeerIDs: preferredPeerIDs + matchedPrivatePeerIDs
+                )
+            }
+        case .failed, .partiallyDelivered, .sending, .sent:
+            break
         }
         
         // Trigger UI update for delivery status change

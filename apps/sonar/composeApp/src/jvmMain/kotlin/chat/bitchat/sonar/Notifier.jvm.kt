@@ -16,6 +16,7 @@ import javax.sound.sampled.AudioSystem
  */
 actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
+    @Volatile private var accountNotificationsSuspended = false
     private val soundGeneration = AtomicLong()
     private val soundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "sonar-notification-sound").apply { isDaemon = true }
@@ -43,7 +44,9 @@ actual object Notifier {
         }
     }
 
-    actual fun canNotify(): Boolean = !PanicWipeIntent.isPending() && SystemTray.isSupported()
+    actual fun canNotify(): Boolean =
+        accountNotificationsAllowed(accountNotificationsSuspended, PanicWipeIntent.isPending()) &&
+            SystemTray.isSupported()
 
     actual fun onWalletReady() { /* no push webhooks on desktop */ }
 
@@ -55,7 +58,7 @@ actual object Notifier {
 
     @Synchronized
     actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
-        if (PanicWipeIntent.isPending()) return
+        if (!accountNotificationsAllowed(accountNotificationsSuspended, PanicWipeIntent.isPending())) return
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
             .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
@@ -105,10 +108,19 @@ actual object Notifier {
 
     @Synchronized
     actual fun suspendAndCancelAll() {
+        accountNotificationsSuspended = true
         // Invalidate queued and currently playing account-bound sounds at the
         // same serialized boundary as tray notification removal.
         soundGeneration.incrementAndGet()
         trayIcon?.let { icon -> runCatching { SystemTray.getSystemTray().remove(icon) } }
         trayIcon = null
+    }
+
+    @Synchronized
+    actual fun reactivateAccountNotifications(): Boolean {
+        if (PanicWipeIntent.isPending()) return false
+        accountNotificationsSuspended = false
+        ensureChannel()
+        return true
     }
 }

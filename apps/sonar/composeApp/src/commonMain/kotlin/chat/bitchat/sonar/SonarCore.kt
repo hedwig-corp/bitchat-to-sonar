@@ -151,6 +151,12 @@ data class SonarMedia(
             filename.endsWith(".gif", ignoreCase = true)
 }
 
+/** Platform bridge contract used by tombstone retirement: a missing node or
+ * native delete failure must escape to the retry loop, never look successful. */
+internal suspend fun deleteCoreGroupOrThrow(deleteGroup: suspend () -> Unit) {
+    deleteGroup()
+}
+
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity
  *  is a Nostr pubkey, so this resolves their human name + avatar (vs a raw npub). */
 data class SonarProfile(
@@ -448,6 +454,9 @@ expect object SonarCore {
 
     /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>
+    /** Strict inventory for destructive verification; unlike UI [chats], a
+     * missing native node is an error and must keep deletion tombstones alive. */
+    suspend fun deletionInventory(): List<SonarChat>
 
     /** Start (or fetch) a 1:1 chat with a peer (npub or hex). Returns chat id. */
     suspend fun startChat(peer: String): String

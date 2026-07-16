@@ -282,17 +282,36 @@ class MessageCodecTest {
         assertEquals(summary, MessageCodec.decodeMeshSummary(MessageCodec.encodeMeshSummary(summary)))
     }
 
-    @Test fun transcriptMutationCannotSucceedWhenSummaryCatalogCommitFails() {
-        val events = mutableListOf<String>()
-        val committed = commitMeshSummaryTransaction(
-            writeRepairIntent = { events += "intent"; true },
-            mutateTranscript = { events += "transcript"; true },
-            commitCatalog = { events += "summary"; false },
-            clearRepairIntent = { events += "clear"; true },
+    @Test fun transcriptSummaryTransactionReportsEveryDurabilityPhase() {
+        val failures = listOf(
+            MeshSummaryTransactionOutcome.RepairIntentWriteFailed,
+            MeshSummaryTransactionOutcome.TranscriptMutationFailed,
+            MeshSummaryTransactionOutcome.CatalogCommitFailed,
+            MeshSummaryTransactionOutcome.RepairIntentClearFailed,
         )
 
-        assertFalse(committed)
-        assertEquals(listOf("intent", "transcript", "summary"), events)
+        failures.forEachIndexed { failedStage, expected ->
+            val events = mutableListOf<Int>()
+            val outcome = meshSummaryTransactionOutcome(
+                writeRepairIntent = { events += 0; failedStage != 0 },
+                mutateTranscript = { events += 1; failedStage != 1 },
+                commitCatalog = { events += 2; failedStage != 2 },
+                clearRepairIntent = { events += 3; failedStage != 3 },
+            )
+
+            assertEquals(expected, outcome)
+            assertEquals((0..failedStage).toList(), events)
+        }
+
+        assertEquals(
+            MeshSummaryTransactionOutcome.Committed,
+            meshSummaryTransactionOutcome({ true }, { true }, { true }, { true }),
+        )
+    }
+
+    @Test fun booleanSummaryTransactionOnlyCommitsAfterRepairIntentIsCleared() {
+        assertFalse(commitMeshSummaryTransaction({ true }, { true }, { true }, { false }))
+        assertTrue(commitMeshSummaryTransaction({ true }, { true }, { true }, { true }))
     }
 
     @Test fun quarantineAdvancesEpochBeforeCleanupFailureFencingQueuedOldWrite() {
