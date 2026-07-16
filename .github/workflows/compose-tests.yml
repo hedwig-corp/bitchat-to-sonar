@@ -31,6 +31,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Compose resource loading (getString) initializes AWT, which throws
+      # HeadlessException on a bare Linux runner — so I18nLocaleResolutionTest
+      # needs a display even though it asserts on plain strings. xvfb gives the
+      # job a virtual one. (The Compose UI tests themselves render via skiko in
+      # software and pass headless; this is only for the AWT dependency.)
+      - name: Install xvfb (virtual display for AWT)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+
       - name: Update Rust toolchain
         run: rustup update stable && rustup default stable
 
@@ -52,7 +60,7 @@ jobs:
         # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
         # compile on current stable Rust; BLE is optional at runtime and the
         # tests don't need a radio.
-        run: ./gradlew :composeApp:jvmTest --console=plain
+        run: xvfb-run -a ./gradlew :composeApp:jvmTest --console=plain
         working-directory: apps/sonar
         env:
           SONAR_SKIP_BLE: '1'
