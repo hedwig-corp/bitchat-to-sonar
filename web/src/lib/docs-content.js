@@ -12,6 +12,7 @@ export const SONAR_DOCS = {
     { name: 'Money', items: ['SONAR-PAYMENTS', 'bip353-registration'] },
     { name: 'Content', items: ['SONAR-STICKERS'] },
     { name: 'Integrations', items: ['HERMES-AGENT'] },
+    { name: 'Engineering', items: ['BENCHMARKS'] },
   ],
   docs: {
     index: {
@@ -669,6 +670,43 @@ A–C do not require it.
 - Hermes gateway plugin README: \`hermes-agent/plugins/platforms/sonar/README.md\`
 - Hermes docs: https://hermes-agent.nousresearch.com/docs
 - Agent skill (terminal contract): \`core/sonar-cli/hermes/SKILL.md\``,
+    },
+
+    BENCHMARKS: {
+      title: 'Benchmarks',
+      status: 'two harnesses',
+      gh: 'https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/PERFORMANCE.md',
+      blurb: 'group-size limits and cold-start / relay-sync performance',
+      md: `# Benchmarks
+
+Sonar measures performance on two independent axes. Each has its own harness, and they answer different questions.
+
+| Track | Question | Depends on |
+| --- | --- | --- |
+| **Device latency** | How fast does the app start, sync, and send? | Your phone and network |
+| **Protocol scale** | How large can one group get before it breaks? | The MLS/Marmot protocol only |
+
+## Protocol scale — how large a group can get
+
+With the current protocol, a single group holds **about 120 members** before it stops accepting new ones.
+
+The limit is not the relays and not the app — it is the encrypted **welcome** every new member must receive to join. A welcome carries the group's full cryptographic member tree, so it grows by roughly 1 KB per existing member. Around 120 members it crosses the 65535-byte ceiling of the NIP-44 encryption Sonar seals it with, and past that point the welcome can no longer be produced, so no further members can be added.
+
+This sits far below every relay's message-size limit (the smallest across Sonar's relays is 131 KB, comfortably above the ~77 KB a full welcome reaches), so relays are never the bottleneck. The exact number shifts a little with how members were added — adding them in smaller batches reshapes the tree and reaches ~135 — so treat ~120 as the safe ceiling, not a hard constant.
+
+A second finding: if two admins add someone at the exact same moment (a concurrent-commit race), the group can **fork** — one new member lands on an orphaned branch and can no longer read the conversation. The underlying protocol does not self-heal from this on its own; recovery is handled a layer up. This is a known area with a tracked follow-up.
+
+The measurement is deterministic and runs on any machine (it does not need a phone), which makes it a regression check to re-run whenever the cryptographic protocol version is updated.
+
+- Method, reproduce steps, and the full baseline table: [GROUP-SCALE-SIM.md on GitHub](https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/GROUP-SCALE-SIM.md)
+
+## Device latency — how fast the app starts and syncs
+
+A cold-start harness measures how long the app takes to become usable and to finish its first relay sync, broken down by phase, on the real device. It exists to keep chat opening, sending, and scrolling paint-from-local-storage fast — Signal-comparable — with network sync in the background rather than on the critical path.
+
+- Full method, markers, and baseline numbers: [PERFORMANCE.md on GitHub](https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/PERFORMANCE.md)
+
+> Both harnesses live in the repository. Use **View on GitHub** above for the runnable commands and the current baseline numbers.`,
     },
   },
 };
