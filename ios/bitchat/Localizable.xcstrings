@@ -1,6 +1,66 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Restoring..." : {
+
+    },
+    "Restore account" : {
+
+    },
+    "Create a new identity" : {
+
+    },
+    "Get started" : {
+
+    },
+    "Generating…" : {
+
+    },
+    "I already have a key" : {
+
+    },
+    "Continue" : {
+
+    },
+    "Start chatting" : {
+
+    },
+    "Works without internet" : {
+
+    },
+    "Bluetooth finds people around you, even offline." : {
+
+    },
+    "Out of range? Still reachable" : {
+
+    },
+    "Messages travel encrypted over the open internet instead." : {
+
+    },
+    "Private by design" : {
+
+    },
+    "Direct messages are end-to-end encrypted. Always." : {
+
+    },
+    "Paste your nsec private key to bring this Sonar identity and wallet onto this device." : {
+
+    },
+    "nsec1..." : {
+
+    },
+    "Paste key" : {
+
+    },
+    "Anyone with this key controls your account and wallet. Only restore from your own backup." : {
+
+    },
+    "Your key fingerprint" : {
+
+    },
+    "That key couldn't be imported. Check you pasted the full nsec1... key." : {
+
+    },
     " · %@ nearby on mesh" : {
 
     },

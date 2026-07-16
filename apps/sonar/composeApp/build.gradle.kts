@@ -38,6 +38,56 @@ val generateBreezKeyResource = tasks.register("generateBreezKeyResource") {
 
 val repoRootDir = rootProject.projectDir.parentFile.parentFile
 val notificationResourcesDir = repoRootDir.resolve("assets/notifications")
+val configuredPython =
+    providers.gradleProperty("pythonExecutable").orNull
+        ?: providers.environmentVariable("PYTHON").orNull
+val pythonCommand = when {
+    !configuredPython.isNullOrBlank() -> listOf(configuredPython)
+    System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true) ->
+        listOf("py", "-3")
+    else -> listOf("python3")
+}
+
+// Verifies the committed Compose string resources are in sync with the iOS
+// localization catalog (ios/bitchat/Localizable.xcstrings), the single source
+// of truth. Run scripts/i18n/xcstrings_to_compose.py to regenerate after
+// editing the catalog. Python 3 is required; override executable discovery with
+// `-PpythonExecutable=/path/to/python` or the `PYTHON` environment variable.
+val checkI18nStringsInSync = tasks.register<Exec>("checkI18nStringsInSync") {
+    description = "Checks generated Compose string resources match the iOS xcstrings catalog."
+    group = "verification"
+
+    val generator = repoRootDir.resolve("scripts/i18n/xcstrings_to_compose.py")
+    val idMap = repoRootDir.resolve("scripts/i18n/string_id_map.json")
+    val stamp = layout.buildDirectory.file("i18n/strings-in-sync.stamp")
+    inputs.file(repoRootDir.resolve("ios/bitchat/Localizable.xcstrings"))
+    inputs.file(generator)
+    inputs.file(idMap)
+    inputs.dir(layout.projectDirectory.dir("src/commonMain/composeResources"))
+    // Output stamp lets Gradle mark the task UP-TO-DATE when nothing changed.
+    outputs.file(stamp)
+
+    workingDir(repoRootDir)
+    isIgnoreExitValue = true
+    executable(pythonCommand.first())
+    args(pythonCommand.drop(1))
+    args(generator.absolutePath, "--check")
+
+    doLast {
+        val result = executionResult.get()
+        if (result.exitValue != 0) {
+            throw GradleException(
+                "Compose string resources are out of sync with " +
+                    "ios/bitchat/Localizable.xcstrings. " +
+                    "Run: python3 scripts/i18n/xcstrings_to_compose.py",
+            )
+        }
+        val stampFile = stamp.get().asFile
+        stampFile.parentFile.mkdirs()
+        stampFile.writeText("in-sync")
+    }
+}
+
 val androidMainDir = layout.projectDirectory.dir("src/androidMain")
 val androidBindingsFile = androidMainDir.file("kotlin/uniffi/sonar_ffi/sonar_ffi.kt")
 val androidJniLibsDir = androidMainDir.dir("jniLibs")
@@ -198,6 +248,7 @@ tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }
 tasks.named("compileKotlinJvm") { dependsOn(buildDesktopRustCore) }
 tasks.named("jvmProcessResources") { dependsOn(buildDesktopRustCore) }
 tasks.named("preBuild") { dependsOn(buildAndroidRustCore) }
+tasks.matching { it.name == "check" }.configureEach { dependsOn(checkI18nStringsInSync) }
 
 android {
     namespace = "chat.bitchat.sonar"
