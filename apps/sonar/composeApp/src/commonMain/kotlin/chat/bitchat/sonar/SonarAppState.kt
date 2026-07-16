@@ -956,8 +956,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  grown — new arrivals were already marked read and must not drift it. */
     var openChatUnreadAnchor by mutableStateOf<Map<String, String>>(emptyMap())
 
-    private fun captureOpenChatUnread(chatId: String, sourceChatIds: List<String>) {
-        val unreadAtOpen = sourceChatIds.sumOf { unreadByChat[it] ?: 0L }
+    /**
+     * Capture the chat's unread count before opening clears it.
+     *
+     * [unreadByChat] is keyed by Marmot group id hex, so the sources MUST be
+     * resolved through [transcriptGroupIds] — a mesh route's chat id
+     * ("mesh:<peerId>") is not a group id, and looking it up directly always
+     * read 0, leaving radar/BLE-folded conversations with no divider while
+     * plain Marmot chats got one. That resolver is also what the read-marking
+     * paths use, so capture and clear always cover the same groups.
+     */
+    private fun captureOpenChatUnread(chatId: String) {
+        val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
         openChatUnread = if (unreadAtOpen > 0L) {
             openChatUnread + (chatId to unreadAtOpen)
@@ -3618,7 +3628,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val readChatIds = directMarmotChatIds(chat.id)
-        captureOpenChatUnread(chat.id, readChatIds)
+        captureOpenChatUnread(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
         // Local-first paint (Signal-Comparable Performance Rule): show the
         // cached snapshot synchronously so the transcript never opens empty;
@@ -3666,7 +3676,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
-        captureOpenChatUnread(id, directMarmotChatIds(id))
+        captureOpenChatUnread(id)
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
