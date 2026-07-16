@@ -133,6 +133,108 @@ cli() {
   done
 }
 
+# ---- enhanced diagnostics helpers ----
+
+# topology: list of directed edges (sender_idx, receiver_idx, sender_npub, receiver_npub)
+topology_tsv() {
+  local label="$1"
+  local graph="$WORK/graph.tsv"
+  local out="$WORK/topology-$label.tsv"
+  : > "$out"
+  [[ -f "$graph" ]] || return 0
+  while IFS=$'\t' read -r a b; do
+    printf '%s\t%s\t%s\t%s\n' "$a" "$b" "${NPUBS[$a]:-unknown}" "${NPUBS[$b]:-unknown}" >> "$out"
+  done < "$graph"
+  printf '%s' "$out"
+}
+
+# per-pair delivery matrix: sender_idx receiver_idx sent received
+pair_delivery_matrix() {
+  local label="$1"
+  local sent_tsv="$WORK/sent-$label.tsv"
+  local recv_all="$WORK/recv-all-$label.tsv"
+  local matrix="$WORK/matrix-$label.tsv"
+  : > "$matrix"
+  [[ -f "$sent_tsv" ]] || { printf '%s' "$matrix"; return 0; }
+  awk -F'\t' '
+  NR==FNR { sent[$1"\t"$2]++; next }
+  {
+    payload=$1
+    # payload format: RUN_ID:b<receiver>:a<sender>:s<seq>
+    if (match(payload, ":b([0-9]+):a([0-9]+):s", m)) {
+      recv[m[2]"\t"m[1]]++
+    }
+  }
+  END {
+    for (pair in sent) {
+      printf "%s\t%s\n", pair, (recv[pair] ? recv[pair] : 0)
+    }
+  }
+  ' "$sent_tsv" "$recv_all" 2>/dev/null >> "$matrix" || true
+  printf '%s' "$matrix"
+}
+
+# infer a root cause from send/listener/recv artifacts
+infer_root_cause() {
+  local label="$1"
+  local sent_tsv="$WORK/sent-$label.tsv"
+  local recv_all="$WORK/recv-all-$label.tsv"
+  local errlog="$WORK/errors-$label.txt"
+  local send_err="$WORK/send-$label.err"
+  local raw_count=0 sent_count=0 recv_count=0 err_count=0 send_err_lines=0
+  raw_count=$(find "$WORK" -maxdepth 1 -name "raw-$label-b*.jsonl" -print0 2>/dev/null | xargs -0 -r wc -l | awk '{s+=$1} END {print s+0}')
+  sent_count=$(wc -l < "$sent_tsv" 2>/dev/null | tr -d ' ' || echo 0)
+  recv_count=$(wc -l < "$recv_all" 2>/dev/null | tr -d ' ' || echo 0)
+  err_count=$(wc -l < "$errlog" 2>/dev/null | tr -d ' ' || echo 0)
+  send_err_lines=$(wc -l < "$send_err" 2>/dev/null | tr -d ' ' || echo 0)
+
+  if (( err_count > 0 || send_err_lines > 0 )) && (( sent_count == 0 )); then
+    printf 'send_failed: sonar-cli send or provision failed before any message was accepted'
+    return 0
+  fi
+  if (( sent_count == 0 )); then
+    printf 'no_send_attempts: graph produced zero send attempts (check identities/fanout)'
+    return 0
+  fi
+  if (( raw_count == 0 )); then
+    printf 'listener_zero_events: send succeeded (%d messages) but listeners received zero raw events; likely relay did not store/propagate NIP-17 gift-wraps' "$sent_count"
+    return 0
+  fi
+  if (( recv_count == 0 )); then
+    printf 'decrypt_failure: listeners saw %d raw events but none decrypted to expected payload; KeyPackage may be missing or MLS group setup failed' "$raw_count"
+    return 0
+  fi
+  if (( recv_count < sent_count )); then
+    printf 'partial_delivery: listeners decrypted %d/%d messages; relay dropped some events or listener timing missed them' "$recv_count" "$sent_count"
+    return 0
+  fi
+  printf 'healthy'
+}
+
+# collect listener stderr snippets (last N non-empty lines) per receiver
+listener_error_digest() {
+  local label="$1" limit="${2:-20}"
+  local combined=""
+  local f
+  for f in "$WORK"/recv-$label-b*.err; do
+    [[ -f "$f" && -s "$f" ]] || continue
+    local b
+    b=$(basename "$f" | sed -E "s/recv-$label-b([0-9]+)\.err/\1/")
+    local lines
+    lines=$(grep -v '^[[:space:]]*$' "$f" 2>/dev/null | tail -n "$limit" | sed 's/$/\n/' | tr '\n' ';' | sed 's/;$/\n/')
+    [[ -n "$lines" ]] && combined="${combined}receiver_$b: $lines; "
+  done
+  printf '%s' "$combined" | sed 's/; $//'
+}
+
+# collect send stderr digest (first N lines)
+send_error_digest() {
+  local label="$1" limit="${2:-20}"
+  local f="$WORK/send-$label.err"
+  [[ -f "$f" && -s "$f" ]] || return 0
+  grep -v '^[[:space:]]*$' "$f" 2>/dev/null | head -n "$limit" | tr '\n' ';' | sed 's/;$/\n/'
+}
+
 # latency stats: read ms-per-line on stdin, print "min median p95 max" (ms)
 latency_stats() {
   awk '{ a[NR]=$1 }
@@ -145,7 +247,7 @@ latency_stats() {
     med = (n % 2) ? v[int(n / 2) + 1] : int((v[n / 2] + v[n / 2 + 1]) / 2)
     pi = int(0.95 * n); if (pi < 1) pi = 1; if (pi > n) pi = n
     printf "%d %d %d %d\n", min, med, v[pi], max
-  }'
+  }
 }
 
 # Provision N ephemeral identities on the current RELAY_ARGS.
@@ -276,8 +378,29 @@ run_exchange() {
   local lat_min lat_med lat_p95 lat_max
   read -r lat_min lat_med lat_p95 lat_max <<< "$(latency_stats < "$latfile")"
 
+  local topology_tsv_file matrix_tsv_file root_cause send_err listener_err
+  topology_tsv_file="$(topology_tsv "$LABEL")"
+  matrix_tsv_file="$(pair_delivery_matrix "$LABEL")"
+  root_cause="$(infer_root_cause "$LABEL")"
+  send_err="$(send_error_digest "$LABEL")"
+  listener_err="$(listener_error_digest "$LABEL")"
+
+  # pair delivery matrix as JSON array of {sender,receiver,sent,received}
+  local pair_json
+  pair_json=$(awk -F'\t' '
+    { printf "%s{\"sender\":%s,\"receiver\":%s,\"sent\":%s,\"received\":%s}", (NR>1?",":""), $1, $2, $3, $4 }
+    END { if (NR==0) print ""; else print "" }
+  ' "$matrix_tsv_file")
+
+  # topology as JSON array of {sender,receiver,sender_npub,receiver_npub}
+  local topo_json
+  topo_json=$(awk -F'\t' '
+    { printf "%s{\"sender\":%s,\"receiver\":%s,\"sender_npub\":\"%s\",\"receiver_npub\":\"%s\"}", (NR>1?",":""), $1, $2, $3, $4 }
+    END { if (NR==0) print ""; else print "" }
+  ' "$topology_tsv_file")
+
   local _filter
-  _filter='{"name":$name,"sent":$sent,"received":$received,"lost":$lost,"loss_pct":$loss_pct,"latency_ms":{"min":$lat_min,"median":$lat_med,"p95":$lat_p95,"max":$lat_max},"errors":$errors}'
+  _filter='{"name":$name,"sent":$sent,"received":$received,"lost":$lost,"loss_pct":$loss_pct,"latency_ms":{"min":$lat_min,"median":$lat_med,"p95":$lat_p95,"max":$lat_max},"errors":$errors,"root_cause":$root_cause,"diagnostics":{"send_errors":$send_err,"listener_errors":$listener_err},"topology":[$topo_json],"pair_delivery":[$pair_json]}'
   jq -n \
     --arg name "$LABEL" \
     --argjson sent "$sent" --argjson received "$received" --argjson lost "$lost" \
@@ -285,6 +408,11 @@ run_exchange() {
     --argjson lat_min "$lat_min" --argjson lat_med "$lat_med" \
     --argjson lat_p95 "$lat_p95" --argjson lat_max "$lat_max" \
     --argjson errors "$errors" \
+    --arg root_cause "$root_cause" \
+    --arg send_err "$send_err" \
+    --arg listener_err "$listener_err" \
+    --arg topo_json "$topo_json" \
+    --arg pair_json "$pair_json" \
     "$_filter"
 }
 
@@ -338,7 +466,9 @@ main() {
   fi
 
   # classify
-  local overall
+  local overall root_cause_target root_cause_control
+  root_cause_target=$(printf '%s' "$target_metrics" | jq -r '.root_cause // "unknown"')
+  root_cause_control=$(printf '%s' "$control_metrics" | jq -r '.root_cause // "unknown"')
   if [[ "$target_status" == "pass" ]]; then
     overall="pass"
   elif [[ "$control_status" == "pass" ]]; then
@@ -362,6 +492,8 @@ main() {
     --argjson max_errors "$MAX_ERRORS" --argjson max_lost "$MAX_LOST" \
     --arg target_status "$target_status" --arg control_status "$control_status" \
     --arg overall "$overall" --arg report_npub "$REPORT_NPUB" \
+    --arg root_cause_target "$root_cause_target" \
+    --arg root_cause_control "$root_cause_control" \
     --argjson target "$target_metrics" --argjson control "$control_metrics" \
     '{run_id:$run_id, seed:$seed, started_at:$started_at, ended_at:$ended_at,
       config:{target_relay:$target_relay, control_relays:($control_relays|split(" ")),
@@ -369,6 +501,7 @@ main() {
               receive_timeout_secs:$receive_timeout_secs},
       thresholds:{max_loss_pct:($max_loss_pct|tonumber), max_p95_latency_ms:($max_p95_latency_ms|tonumber), max_errors:$max_errors, max_lost:$max_lost},
       target_status:$target_status, control_status:$control_status, overall:$overall,
+      root_causes:{target:$root_cause_target, control:$root_cause_control},
       target:$target, control:$control, report_npub:$report_npub}' \
     > "$METRICS_JSON"
 
@@ -398,11 +531,19 @@ report_if_needed() {
   fi
   cli "$SONAR_CLI" --home "$rhome" "${RELAY_ARGS[@]}" publish >/dev/null || true
   local summary
-  summary=$(printf '%s' "$METRICS_JSON" | jq -r '"[relay-smoke] " + .overall +
-    " | target " + .target.name + " loss=" + (.target.loss_pct|tostring) + "%" +
+  summary=$(printf '%s' "$METRICS_JSON" | jq -r '
+    "[relay-smoke] " + .overall +
+    " | target " + .target.name + " " + .target_status +
+    " loss=" + (.target.loss_pct|tostring) + "%" +
     " (" + (.target.lost|tostring) + "/" + (.target.sent|tostring) + ")" +
-    " | control loss=" + (.control.loss_pct|tostring) + "%" +
-    " | seed=" + (.seed|tostring)' "$METRICS_JSON")
+    " p95=" + (.target.latency_ms.p95|tostring) + "ms errors=" + (.target.errors|tostring) +
+    " cause=" + (.root_causes.target // "unknown") +
+    " | control " + .control_status +
+    " loss=" + (.control.loss_pct|tostring) + "%" +
+    " cause=" + (.root_causes.control // "unknown") +
+    " | seed=" + (.seed|tostring) +
+    " | topology=" + (.config.identities|tostring) + "x" + (.config.fanout|tostring) + "x" + (.config.messages_per_pair|tostring)'
+    "$METRICS_JSON")
   if cli "$SONAR_CLI" --home "$rhome" "${RELAY_ARGS[@]}" send --to "$REPORT_NPUB" --text "$summary" >/dev/null; then
     log "report DM sent to $REPORT_NPUB"
   else
@@ -424,17 +565,27 @@ issue_if_needed() {
   body=$(jq -r --arg relay "$TARGET_RELAY" --arg ctrl "$CONTROL_RELAYS" --arg ts "$(date -u +'%F %H:%M UTC')" '
     "**Update " + $ts + "**.\n\n" +
     "Daily relay smoke test classified this run as **" + .overall + "**.\n\n" +
-    "- target `" + $relay + "`: " + .target_status + " (loss=" + (.target.loss_pct|tostring) +
-      "%, lost " + (.target.lost|tostring) + "/" + (.target.sent|tostring) +
-      ", p95=" + (.target.latency_ms.p95|tostring) + "ms, errors=" + (.target.errors|tostring) + ")\n" +
-    "- control `" + $ctrl + "`: " + .control_status + " (loss=" + (.control.loss_pct|tostring) +
-      "%, p95=" + (.control.latency_ms.p95|tostring) + "ms)\n\n" +
-    "Classification:\n" +
+    "**Target relay** `" + $relay + "` — status: " + .target_status + "\n" +
+    "- loss: " + (.target.loss_pct|tostring) + "% (lost " + (.target.lost|tostring) + "/" + (.target.sent|tostring) + ")\n" +
+    "- latency p95: " + (.target.latency_ms.p95|tostring) + "ms\n" +
+    "- CLI errors: " + (.target.errors|tostring) + "\n" +
+    "- root cause: " + (.root_causes.target // "unknown") + "\n" +
+    "- send stderr: `" + ((.target.diagnostics.send_errors // "none")|tostring) + "`\n" +
+    "- listener stderr: `" + ((.target.diagnostics.listener_errors // "none")|tostring) + "`\n\n" +
+    "**Control relay set** `" + $ctrl + "` — status: " + .control_status + "\n" +
+    "- loss: " + (.control.loss_pct|tostring) + "% (lost " + (.control.lost|tostring) + "/" + (.control.sent|tostring) + ")\n" +
+    "- latency p95: " + (.control.latency_ms.p95|tostring) + "ms\n" +
+    "- root cause: " + (.root_causes.control // "unknown") + "\n\n" +
+    "**Topology**\n" +
+    "- identities: " + (.config.identities|tostring) + ", fanout: " + (.config.fanout|tostring) + ", messages per pair: " + (.config.messages_per_pair|tostring) + "\n" +
+    "- expected edges: identities × fanout × messages = " + ((.config.identities * .config.fanout * .config.messages_per_pair)|tostring) + "\n" +
+    "- receive timeout: " + (.config.receive_timeout_secs|tostring) + "s\n\n" +
+    "**Classification**\n" +
     "- `relay_issue` = target fails, control passes (problem is the target relay)\n" +
     "- `regression` = target and control both fail (Sonar/Marmot regression)\n" +
     "- `target_fail` = target fails, control was skipped\n\n" +
-    "Reproduce locally:\n" +
-    "```\nSEED=" + (.seed|tostring) + " scripts/smoke/relay-smoke.sh\n```\n\n" +
+    "**Reproduce locally**\n" +
+    "```\nSEED=" + (.seed|tostring) + " SKIP_REPORT=1 RELAY_SMOKE_DEBUG=1 scripts/smoke/relay-smoke.sh\n```\n\n" +
     "Full metrics JSON:\n```json\n" + (.|tostring) + "\n```"' "$METRICS_JSON")
 
   local repo_args=()
