@@ -1030,14 +1030,18 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
-    // The feed is only trustworthy once the open's async local hydrate has
-    // published: a mesh open paints the BLE window first and merges the White
-    // Noise leg a beat later, which can add OLDER rows — shifting every index
-    // and moving the tail. A timestamp comparison cannot detect this (a nearby
-    // peer's BLE rows are newer than anything in the White-Noise-only index),
-    // so ask the store whether hydration actually finished.
+    // A MESH feed is only trustworthy once the open's async local hydrate has
+    // published: it paints the BLE window first and merges the White Noise leg
+    // a beat later, which can add OLDER rows — shifting every index and moving
+    // the tail. A timestamp comparison cannot detect this (a nearby peer's BLE
+    // rows are newer than anything in the White-Noise-only index), so ask the
+    // store whether hydration actually finished. A pure Marmot open needs no
+    // gate: its first paint is the complete snapshot, and waiting for the
+    // async page would turn the instant unread anchor into a visible
+    // tail-then-divider snap.
     fun feedCaughtUp(rows: List<Any>): Boolean =
-        rows.isNotEmpty() && state.isTranscriptHydrated(screen.id)
+        rows.isNotEmpty() &&
+            (!screen.id.startsWith("mesh:") || state.isTranscriptHydrated(screen.id))
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
@@ -1073,7 +1077,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         if (current != null && userScrolled) return@LaunchedEffect
         if (!feedCaughtUp(feed)) return@LaunchedEffect
         val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
-        if (anchor < 0) return@LaunchedEffect
+        if (anchor < 0) {
+            // The caught-up feed cannot place a divider (e.g. every unread
+            // event is a filtered ☎CALL/⚡PAY control line). Retire the pending
+            // unread state, or unreadAnchorPending() would suppress tail
+            // following for the rest of this open.
+            state.retireOpenChatUnread(screen.id)
+            return@LaunchedEffect
+        }
         val anchorKey = transcriptFeedKey(feed[anchor])
         unreadAnchorId = anchorKey
         state.openChatUnreadAnchor = state.openChatUnreadAnchor + (screen.id to anchorKey)

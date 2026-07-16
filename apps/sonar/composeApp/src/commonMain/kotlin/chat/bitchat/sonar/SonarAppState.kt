@@ -757,7 +757,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             stack = listOf(Screen.Home)
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
-            cancelAllMediaDownloads(); MediaCache.wipe()
+            cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
             onboarded = false; nick = ""; npub = ""; started = false
@@ -816,7 +816,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
-            cancelAllMediaDownloads(); MediaCache.wipe()
+            cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
             notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
@@ -976,13 +976,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Newest message timestamp across the chat's folded sources, from the
-     *  core-owned conversation index. Covers the White Noise groups only — a
-     *  mesh chat's BLE rows are not in that index and can be newer, so this is
-     *  a lower bound on "newest known", never proof the feed is complete. Use
-     *  [isTranscriptHydrated] for that. */
-    fun latestKnownMessageSecs(chatId: String): Long =
-        transcriptGroupIds(chatId).maxOfOrNull { chatSnapshotLatestByChat[it] ?: 0L } ?: 0L
+    /** Give up on a pending unread divider for this open: the transcript is
+     *  fully hydrated but no anchor row is placeable (e.g. every unread event
+     *  is a filtered control line). Clears the pending state so tail
+     *  following resumes. */
+    fun retireOpenChatUnread(chatId: String) {
+        openChatUnread = openChatUnread - chatId
+        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+    }
+
+    /** Account wipe/erase: per-open transcript state must not outlive the
+     *  chats it is keyed by. */
+    private fun clearOpenChatTransientState() {
+        openChatUnread = emptyMap()
+        openChatUnreadAnchor = emptyMap()
+        hydratedTranscripts = emptySet()
+    }
 
     /**
      * Chats whose async local hydrate has published for the CURRENT open.
@@ -2903,7 +2912,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
-                cancelAllMediaDownloads(); MediaCache.wipe()
+                cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++
                 notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
@@ -3458,7 +3467,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
             // open the encrypted database without any relay dependency.
             meshChats.putAll(MessageStore.loadAllMeshDms())
-            backfillMeshMediaBounds()
+            // Legacy-media repair reads image files back from disk; that must
+            // not sit between disk hydrate and core start on the local-first
+            // paint path (Signal-Comparable Performance Rule). Run it beside
+            // the startup sequence, not inside it.
+            scope.launch { backfillMeshMediaBounds() }
             loadLinks()
             loadMeshNames()
             seedVerifiedChatIds()

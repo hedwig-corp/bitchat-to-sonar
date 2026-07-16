@@ -1748,6 +1748,7 @@ final class SonarAppStore: ObservableObject {
 
     private func clearAccountBoundLocalStateForRestore() {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         chatViewModel.clearAllConversations()
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -7117,6 +7118,7 @@ final class SonarAppStore: ObservableObject {
     /// onboarding. Contrast with `wipe()`, which destroys everything.
     func eraseAllChats() {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
         // White Noise / Marmot groups: wipe the encrypted DB then reconnect
@@ -7174,6 +7176,7 @@ final class SonarAppStore: ObservableObject {
 
     private func performWipe() async {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         // The Breez node must release its SQLite store before wallet files are
         // deleted. Await this before revealing onboarding so a fast re-onboard
         // cannot race a still-running destructive wallet task.

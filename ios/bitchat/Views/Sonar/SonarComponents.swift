@@ -740,6 +740,10 @@ struct SNMsgList: View {
     /// Frozen ID of the oldest unread row: live incoming messages (already
     /// marked read on open) must not drift the divider down the transcript.
     @State private var unreadAnchorId: String?
+    /// True when a caught-up feed could not place a divider (e.g. every unread
+    /// event is a call/pay control row). Ends the pending-anchor state so tail
+    /// following is not suppressed for the rest of the open.
+    @State private var unreadAnchorAbandoned = false
 
     /// True once the visible rows have caught up with the newest message the
     /// core index knows across the chat's folded sources. A mesh chat paints
@@ -774,6 +778,7 @@ struct SNMsgList: View {
             if remaining == 0 { break }
         }
         unreadAnchorId = anchor
+        if anchor == nil { unreadAnchorAbandoned = true }
     }
 
     var body: some View {
@@ -926,8 +931,9 @@ struct SNMsgList: View {
                         return
                     }
                     // While the divider is still pending, don't follow merged
-                    // rows to the bottom — the anchor scroll would lose the race.
-                    if unreadCountAtOpen > 0, unreadAnchorId == nil { return }
+                    // rows to the bottom — the anchor scroll would lose the
+                    // race. An abandoned anchor is no longer pending.
+                    if unreadCountAtOpen > 0, unreadAnchorId == nil, !unreadAnchorAbandoned { return }
                     guard isNearBottom else { return }
                     // A mesh chat paints the BLE window before the White Noise
                     // leg merges async; following that merge with an ANIMATED
