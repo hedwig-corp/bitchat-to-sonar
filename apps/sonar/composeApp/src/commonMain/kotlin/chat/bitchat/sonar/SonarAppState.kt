@@ -977,13 +977,37 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /** Newest message timestamp across the chat's folded sources, from the
-     *  core-owned conversation index. The transcript may only resolve the
-     *  unread divider once its feed has caught up to this: a mesh open paints
-     *  the BLE window before the White Noise leg merges async, and the rows
-     *  still missing are exactly the unread ones — counting against the
-     *  incomplete feed would freeze the divider on the wrong row. */
+     *  core-owned conversation index. Covers the White Noise groups only — a
+     *  mesh chat's BLE rows are not in that index and can be newer, so this is
+     *  a lower bound on "newest known", never proof the feed is complete. Use
+     *  [isTranscriptHydrated] for that. */
     fun latestKnownMessageSecs(chatId: String): Long =
         transcriptGroupIds(chatId).maxOfOrNull { chatSnapshotLatestByChat[it] ?: 0L } ?: 0L
+
+    /**
+     * Chats whose async local hydrate has published for the CURRENT open.
+     *
+     * Opening paints synchronously from partial local state (a mesh chat shows
+     * only its BLE window; the White Noise leg merges a beat later), so until
+     * this flips the visible feed can still gain rows — including OLDER ones,
+     * which shift every index and move the tail. Position changes in that
+     * window are hydration, not new messages: they must be applied instantly,
+     * never animated, or the transcript visibly scrolls on every open.
+     */
+    var hydratedTranscripts by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
+
+    private fun markTranscriptHydrated(chatId: String) {
+        if (chatId in hydratedTranscripts) return
+        hydratedTranscripts = hydratedTranscripts + chatId
+    }
+
+    private fun clearTranscriptHydrated(chatId: String) {
+        if (chatId !in hydratedTranscripts) return
+        hydratedTranscripts = hydratedTranscripts - chatId
+    }
 
     /**
      * Cached White Noise rows to seed a mesh chat's synchronous first paint,
@@ -3655,6 +3679,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id)
+        clearTranscriptHydrated(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
         // Local-first paint (Signal-Comparable Performance Rule): show the
         // cached snapshot synchronously so the transcript never opens empty;
@@ -3690,6 +3715,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 messages = visibleFresh
                 processPayLines(chat.id, visibleFresh)
             }
+            // Both publishes above replace the snapshot first paint: hydration,
+            // not new messages. Later feed changes may animate.
+            if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
         }
     }
 
@@ -3703,6 +3731,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
         captureOpenChatUnread(id)
+        clearTranscriptHydrated(id)
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
@@ -3732,6 +3761,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Reconcile the open transcript after chat-list refresh may discover
             // the peer's Marmot group mapping.
             refreshOpenDm(canonicalPeerId)
+            // Every publish above is hydration of a partial first paint (the BLE
+            // window merging with the White Noise leg), so the transcript must
+            // absorb them instantly. Only now do later feed changes mean real
+            // new messages, which may animate.
+            if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
         }
     }
 
@@ -3742,6 +3776,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Recreate bounded transcript state when Back reveals an earlier chat in the stack. */
     private fun restoreTranscriptSession(chat: Screen.Chat) {
         val generation = beginTranscriptSession(chat.id)
+        clearTranscriptHydrated(chat.id)
         if (isMeshChat(chat.id)) {
             val peerId = meshPeerId(chat.id)
             // Seed the White Noise leg from the cached snapshot so the restored
@@ -3756,7 +3791,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                     generation,
                 ),
             )
-            scope.launch { refreshOpenDm(peerId) }
+            scope.launch {
+                refreshOpenDm(peerId)
+                if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
+            }
             return
         }
         if (pendingMarmotNpub(chat.id) != null || isPendingMarmotGroup(chat.id)) {
@@ -3781,6 +3819,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
             if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
             setCurrentVisibleMessages(chat.id, local, processCalls = true)
+            markTranscriptHydrated(chat.id)
         }
     }
 

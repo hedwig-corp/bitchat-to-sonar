@@ -1025,16 +1025,14 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
-    // The anchor may only be counted against a feed that has caught up with
-    // the newest known message across the chat's folded sources: a mesh open
-    // publishes the BLE window before the White Noise leg merges async, and
-    // the rows still missing are exactly the unread ones.
-    fun feedCaughtUp(rows: List<Any>): Boolean {
-        val newest = rows.maxOfOrNull {
-            if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs
-        } ?: return false
-        return newest >= state.latestKnownMessageSecs(screen.id)
-    }
+    // The feed is only trustworthy once the open's async local hydrate has
+    // published: a mesh open paints the BLE window first and merges the White
+    // Noise leg a beat later, which can add OLDER rows — shifting every index
+    // and moving the tail. A timestamp comparison cannot detect this (a nearby
+    // peer's BLE rows are newer than anything in the White-Noise-only index),
+    // so ask the store whether hydration actually finished.
+    fun feedCaughtUp(rows: List<Any>): Boolean =
+        rows.isNotEmpty() && state.isTranscriptHydrated(screen.id)
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
@@ -1097,8 +1095,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // not race it to the bottom when the White Noise leg merges in.
     fun unreadAnchorPending(): Boolean =
         (state.openChatUnread[screen.id] ?: 0L) > 0L && unreadAnchorId == null && !userScrolled
-    LaunchedEffect(screen.id, newestFeedKey) {
+    // Keyed on the feed SIZE as well as its newest row: hydration merges the
+    // White Noise leg in, which can insert only OLDER rows. That leaves the
+    // newest key untouched while shifting every index — the tail moves and the
+    // viewport is left showing older content until something re-anchors it.
+    LaunchedEffect(screen.id, newestFeedKey, feed.size) {
         if (feed.isEmpty()) return@LaunchedEffect
+        val hydrated = feedCaughtUp(feed)
         if (!didInitialScroll) {
             // An unread-anchored open keeps its position; the freeze effect
             // above owns that scroll. Only a fully-read chat pins the tail.
@@ -1106,14 +1109,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 listState.anchorTranscriptTail(feed.lastIndex, animate = false)
             }
             didInitialScroll = true
-        } else if (isNearBottom && !isPrepending && !unreadAnchorPending()) {
-            // A mesh open paints the BLE window before the White Noise leg
-            // merges async. Following that merge with an ANIMATED scroll is the
-            // visible jump users see on open — a pure Marmot chat never does it,
-            // because its snapshot already holds the newest rows. Re-pin
-            // instantly (invisibly) until the feed catches up with the newest
-            // known message; animate only genuinely new post-settle messages.
-            listState.anchorTranscriptTail(feed.lastIndex, animate = feedCaughtUp(feed))
+        } else if (!isPrepending && !unreadAnchorPending() &&
+            // Follow the tail when the reader is already there. Until hydration
+            // completes, also follow unconditionally (unless they scrolled
+            // away): the index shift above can push the tail out of the
+            // near-bottom window before this runs.
+            (isNearBottom || (!hydrated && !userScrolled))
+        ) {
+            // Hydration is not a new message: absorb it instantly so the open
+            // shows no motion. Animate only genuinely new post-settle rows.
+            listState.anchorTranscriptTail(feed.lastIndex, animate = hydrated)
         }
     }
 
