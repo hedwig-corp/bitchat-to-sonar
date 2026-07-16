@@ -706,9 +706,17 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     var callOverlay = false
 
+    // Debug-only SONAR_BENCH clock: armed when a chat screen is pushed, read
+    // (and disarmed) by ChatScreen's first composed frame. Always null in
+    // Release (sonarBenchMarkersEnabled gates the write and the read).
+    var chatOpenBenchMark: kotlin.time.TimeSource.Monotonic.ValueTimeMark? = null
+
     fun push(s: Screen) {
         if (s is Screen.Chat && (screen as? Screen.Chat)?.id != s.id) {
             cleanupPreviewTempFiles()
+            if (sonarBenchMarkersEnabled) {
+                chatOpenBenchMark = kotlin.time.TimeSource.Monotonic.markNow()
+            }
         }
         if (callOverlay && s is Screen.Call) return
         stack = stack + s

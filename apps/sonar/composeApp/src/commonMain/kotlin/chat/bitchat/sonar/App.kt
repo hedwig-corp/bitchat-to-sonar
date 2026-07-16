@@ -1017,6 +1017,22 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
     val currentFeed by rememberUpdatedState(feed)
+    // Debug-only SONAR_BENCH marker (issue #305): time from the chat-open push
+    // to the end of the transcript's first composed frame. Parsed by
+    // scripts/bench/android-chat-open-bench.sh; see docs/PERFORMANCE.md.
+    if (sonarBenchMarkersEnabled) {
+        LaunchedEffect(screen.id) {
+            val mark = state.chatOpenBenchMark ?: return@LaunchedEffect
+            state.chatOpenBenchMark = null
+            val rows = currentFeed.size
+            withFrameNanos { }
+            val ms = mark.elapsedNow().inWholeMicroseconds / 1000.0
+            sonarLog(
+                "SonarCore",
+                "SONAR_BENCH chat_open_first_frame chat=${screen.id.take(12)} rows=$rows ms=$ms",
+            )
+        }
+    }
     // Signal-style unread anchoring: opening a chat with unread messages lands
     // on the oldest unread row (with a divider) instead of force-pinning the
     // tail; only a fully-read chat opens at the bottom. The anchor freezes by

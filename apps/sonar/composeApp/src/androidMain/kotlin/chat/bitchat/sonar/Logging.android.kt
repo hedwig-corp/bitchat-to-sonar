@@ -6,3 +6,7 @@ internal actual fun sonarLog(tag: String, message: String) {
     // devices we can't attach to (async, never blocks the caller).
     SonarFileLog.append(tag, message)
 }
+
+// Never emit bench markers from a Release build (same rule as iOS, where
+// SecureLogger renders them <private> in Release).
+internal actual val sonarBenchMarkersEnabled: Boolean = BuildConfig.DEBUG

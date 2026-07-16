@@ -464,6 +464,57 @@ faithful benchmark and compare `launch→t4`/`t0→t4`, `t2→t4`, `t3→t3a`, a
 `t3b→t4` against this baseline; a regression there means sync moved onto the
 critical path.
 
+## Android chat-open first-frame benchmark (issue #305)
+
+Opening a chat in the Compose app pays a **first-composition** cost: the
+transcript's header + banner + composer + N bubbles compose in one frame.
+On a Pixel 10 Pro **debug** build this measured 117–200 ms (the "small lag on
+chat open"); the same journey on the same device class in a **release** build
+is ~3.5× cheaper, because a debug build runs Compose with its debug checks and
+no AOT compilation. Two tools track this cost:
+
+**1. The `chat_open_first_frame` marker** (Compose apps, Debug builds only —
+gated on `sonarBenchMarkersEnabled`, i.e. `BuildConfig.DEBUG` on Android, the
+`sonar.bench.markers=1` system property on desktop; Release never emits it):
+
+```
+SONAR_BENCH chat_open_first_frame chat=<id prefix> rows=<feed rows> ms=<open→first frame>
+```
+
+It times `SonarAppState.push(Screen.Chat)` → end of `ChatScreen`'s first
+composed frame — the exact frame profiled in issue #305. Drive it repeatably
+with:
+
+```bash
+scripts/bench/android-chat-open-bench.sh --serial <adb serial> \
+  --chat "<chat row title>" --runs 10
+```
+
+(The device needs a Debug build, onboarded, with the chat visible in the
+list; seed a test conversation with `sonar-cli send` per the provisioning
+notes above.) iOS has no equivalent marker yet — the tracked follow-up is a
+matching `chat_open_first_frame` in `MarmotChatView`/`SNMsgList`.
+
+**2. Baseline Profiles** (`apps/sonar/baselineprofile/`): a macrobenchmark
+module that generates `composeApp/src/androidRelease/generated/baselineProfiles/`,
+baked into every release APK so cold start and the first transcript
+composition run AOT-compiled instead of interpreted/JIT. Regenerate after
+large UI changes:
+
+```bash
+cd apps/sonar
+ANDROID_SERIAL=<api 33+ device/emulator> ./gradlew :composeApp:generateBaselineProfile \
+  -Pandroid.testInstrumentationRunnerArguments.sonarBenchNsec=nsec1...
+```
+
+The optional `sonarBenchNsec` argument onboards a bench account whose relays
+already hold a seeded "Sonar agent DM" conversation (text + images), so the
+profile also covers the chat-open/scroll journey; without it only cold start +
+onboarding are profiled. Verify the profile ships: the release APK must
+contain `assets/dexopt/baseline.prof` (tens of KB, not the 7 KB library-only
+default), and after installing it `adb shell dumpsys package dexopt | grep -A2
+chat.bitchat.sonar` must show `speed-profile`.
+
 ## Relay smoke test (delivery / loss)
 
 Separate from the cold-start benchmark above: `scripts/smoke/relay-smoke.sh`

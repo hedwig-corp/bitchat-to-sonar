@@ -90,3 +90,4 @@ scripts/blog/.env
 # Android Rust core build outputs (regenerate with core/build-android.sh)
 core/android-out/
 ios/bitchat/GoogleService-Info.plist
+.kotlin/
