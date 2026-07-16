@@ -976,6 +976,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Newest message timestamp across the chat's folded sources, from the
+     *  core-owned conversation index. The transcript may only resolve the
+     *  unread divider once its feed has caught up to this: a mesh open paints
+     *  the BLE window before the White Noise leg merges async, and the rows
+     *  still missing are exactly the unread ones — counting against the
+     *  incomplete feed would freeze the divider on the wrong row. */
+    fun latestKnownMessageSecs(chatId: String): Long =
+        transcriptGroupIds(chatId).maxOfOrNull { chatSnapshotLatestByChat[it] ?: 0L } ?: 0L
+
     // ── Mocked voice/video call log (in-memory only) ──
     /** Call records per chat id, merged into that DM's transcript by timestamp. */
     private val callLogs = mutableMapOf<String, MutableList<CallRecord>>()

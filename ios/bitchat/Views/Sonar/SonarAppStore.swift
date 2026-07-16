@@ -5869,6 +5869,20 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Newest known message date across the DM's folded groups, from the
+    /// core conversation index. The transcript must not freeze its unread
+    /// divider before the visible rows have caught up to this — hydration can
+    /// publish one leg before the folded White Noise groups merge in, and the
+    /// rows still missing are exactly the unread ones.
+    func expectedNewestMessageDate(_ id: String) -> Date? {
+        let groupId = marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else { return nil }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
+    }
+
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
         if let knownMarmotGroupId {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)

@@ -1025,6 +1025,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
+    // The anchor may only be counted against a feed that has caught up with
+    // the newest known message across the chat's folded sources: a mesh open
+    // publishes the BLE window before the White Noise leg merges async, and
+    // the rows still missing are exactly the unread ones.
+    fun feedCaughtUp(rows: List<Any>): Boolean {
+        val newest = rows.maxOfOrNull {
+            if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs
+        } ?: return false
+        return newest >= state.latestKnownMessageSecs(screen.id)
+    }
     // Open pinned at the first unread row, or at the newest row for a read
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
@@ -1033,6 +1043,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
             ?.takeIf { it >= 0 }
             ?: firstUnreadTranscriptIndex(feed, state.openChatUnread[screen.id] ?: 0L)
+                .takeIf { feedCaughtUp(feed) }
+            ?: -1
         LazyListState(
             firstVisibleItemIndex = if (anchor >= 0) anchor else feed.lastIndex.coerceAtLeast(0),
         )
@@ -1047,15 +1059,16 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         listState.interactionSource.interactions.first { it is DragInteraction.Start }
         userScrolled = true
     }
-    // Freeze the unread anchor on the first feed that can resolve it, and
-    // re-resolve only if its row vanishes (a snapshot row replaced by the
-    // canonical DB page) before the user scrolls.
+    // Freeze the unread anchor on the first CAUGHT-UP feed that can resolve
+    // it, and re-resolve only if its row vanishes (a snapshot row replaced by
+    // the canonical DB page) before the user scrolls.
     LaunchedEffect(screen.id, feed) {
         val unreadAtOpen = state.openChatUnread[screen.id] ?: 0L
         if (unreadAtOpen <= 0L || feed.isEmpty()) return@LaunchedEffect
         val current = unreadAnchorId
         if (current != null && feed.any { transcriptFeedKey(it) == current }) return@LaunchedEffect
         if (current != null && userScrolled) return@LaunchedEffect
+        if (!feedCaughtUp(feed)) return@LaunchedEffect
         val anchor = firstUnreadTranscriptIndex(feed, unreadAtOpen)
         if (anchor < 0) return@LaunchedEffect
         val anchorKey = transcriptFeedKey(feed[anchor])
@@ -1079,6 +1092,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             if (didInitialScroll && !it) didLeaveTail = true
         }
     }
+    // True while an unread open is still waiting for its divider row: the
+    // pending anchor owns the next programmatic scroll, so tail-following must
+    // not race it to the bottom when the White Noise leg merges in.
+    fun unreadAnchorPending(): Boolean =
+        (state.openChatUnread[screen.id] ?: 0L) > 0L && unreadAnchorId == null && !userScrolled
     LaunchedEffect(screen.id, newestFeedKey) {
         if (feed.isEmpty()) return@LaunchedEffect
         if (!didInitialScroll) {
@@ -1088,7 +1106,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 listState.anchorTranscriptTail(feed.lastIndex, animate = false)
             }
             didInitialScroll = true
-        } else if (isNearBottom && !isPrepending) {
+        } else if (isNearBottom && !isPrepending && !unreadAnchorPending()) {
             listState.anchorTranscriptTail(feed.lastIndex, animate = true)
         }
     }
@@ -1148,7 +1166,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // transcript viewport and decoded media grows tail rows after first paint;
     // both would otherwise hide the newest messages behind the keyboard or
     // below the fold. Re-anchor whenever layout — not the user — steals the tail.
-    TranscriptTailPinning(listState, key = screen.id, isPrepending = { isPrepending })
+    // A pending unread anchor also suppresses the layout pinner: the White
+    // Noise merge growing the item count must jump to the divider, not the tail.
+    TranscriptTailPinning(
+        listState,
+        key = screen.id,
+        isPrepending = { isPrepending || unreadAnchorPending() },
+    )
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)

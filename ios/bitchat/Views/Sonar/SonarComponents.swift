@@ -723,6 +723,11 @@ struct SNMsgList: View {
     /// counter). Non-zero opens the transcript anchored at the first unread
     /// row with a divider, Signal-style, instead of pinning the tail.
     var unreadCountAtOpen: UInt64 = 0
+    /// Newest known message date across the chat's folded sources. The unread
+    /// anchor may only be resolved once the visible rows have caught up to
+    /// this — hydration can publish one transport leg before the folded White
+    /// Noise groups merge in, and the missing rows are exactly the unread ones.
+    var expectedNewestDate: Date? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -743,6 +748,14 @@ struct SNMsgList: View {
     private func resolveUnreadAnchor() {
         guard unreadCountAtOpen > 0 else { return }
         if let current = unreadAnchorId, msgs.contains(where: { $0.id == current }) { return }
+        // Wait for the rows to catch up with the newest known message before
+        // counting from the tail; freezing against a partially merged feed
+        // would anchor the divider on the wrong row.
+        if let expected = expectedNewestDate,
+           let newest = msgs.compactMap(\.sortDate).max(),
+           newest < expected {
+            return
+        }
         var remaining = unreadCountAtOpen
         var anchor: String? = nil
         for m in msgs.reversed() where !m.mine && m.call == nil {
@@ -891,7 +904,20 @@ struct SNMsgList: View {
                     }
                 }
                 .onChange(of: msgs.count) { _ in
+                    let hadAnchor = unreadAnchorId != nil
                     resolveUnreadAnchor()
+                    if !hadAnchor, unreadAnchorId != nil {
+                        // A late-merged transport leg just made the divider
+                        // resolvable: it owns this scroll, not the tail.
+                        isNearBottom = false
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("sn-unread", anchor: .top)
+                        }
+                        return
+                    }
+                    // While the divider is still pending, don't follow merged
+                    // rows to the bottom — the anchor scroll would lose the race.
+                    if unreadCountAtOpen > 0, unreadAnchorId == nil { return }
                     guard isNearBottom else { return }
                     if reduceMotion {
                         proxy.scrollTo("sn-bottom", anchor: .bottom)

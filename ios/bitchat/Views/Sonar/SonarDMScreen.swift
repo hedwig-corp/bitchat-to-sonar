@@ -179,7 +179,8 @@ struct SonarDMScreenContent: View {
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     // Captured by push() at navigation time, before this screen
                     // (and openedDM's read-marking) existed.
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0
+                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0,
+                    expectedNewestDate: store.expectedNewestMessageDate(peerId)
                 )
             }
 
