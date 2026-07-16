@@ -12,6 +12,7 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
+import android.os.SystemClock
 import chat.bitchat.sonar.crypto.Sha256
 import java.security.SecureRandom
 import java.util.UUID
@@ -318,13 +319,30 @@ object MeshGatt {
 
     // ── Link liveness ──
 
-    /** Last packet receive time per BLE address, either role. Fed by
-     *  [handlePacket] and seeded on connect so a fresh link gets a full
-     *  [LINK_STALE_MS] window before the sweep may judge it. */
-    private val lastRxMs = ConcurrentHashMap<String, Long>()
+    // Receive times are tracked PER ROLE, not per address: one address can hold a
+    // client link and a server link at the same time, and a single per-address
+    // entry lets a healthy server role mask a dead client GATT — which would keep
+    // burning a MAX_CLIENTS slot and stay eligible as a (broken) send route.
+    // Per-role keys also make cleanup exact: each cleanup drops only its own key,
+    // so no cross-map guard can leak an entry.
+    /** Last rx per address on the CLIENT role (we are central; peer notifies us). */
+    private val lastClientRxMs = ConcurrentHashMap<String, Long>()
+    /** Last rx per address on the SERVER role (we are peripheral; peer writes us). */
+    private val lastServerRxMs = ConcurrentHashMap<String, Long>()
     /** A healthy link carries rx at least every ~30s (our heartbeat below plus
      *  iOS's 15–38s connected announce cadence), so 90s of silence means the
-     *  link is dead even though no disconnect callback ever fired. */
+     *  link is dead even though no disconnect callback ever fired.
+     *
+     *  KNOWN LIMIT: silence is only evidence of death for a peer that owes us
+     *  traffic. iOS qualifies (periodic announce + an activity-driven announce
+     *  that answers our heartbeat within ~10s), as does any Sonar-Android from
+     *  this build onward. A peer running a PRE-heartbeat Sonar-Android build
+     *  announces once at setup and then goes quiet forever, so its link is culled
+     *  every 90s and immediately re-dialed: ~1-2s of churn per cycle, self-healing
+     *  (queued DMs flush on re-link, and the 300s radar grace hides the gap).
+     *  That is the accepted cost of not leaving the peer undetectable forever.
+     *  The real fix is a negotiated packet-level ping/ack — only a round trip
+     *  proves the receive path — which needs a protocol bump; tracked, not here. */
     private const val LINK_STALE_MS = 90_000L
     private const val LIVENESS_TICK_MS = 15_000L
     /** Android has no periodic announce of its own (iOS announces every
@@ -332,38 +350,67 @@ object MeshGatt {
      *  links carrying traffic — which is exactly what the stale check
      *  measures — and to keep peers' radar entries fresh. */
     private const val HEARTBEAT_MS = 30_000L
+    /** Monotonic: wall-clock would let an NTP/user clock jump forward cull every
+     *  healthy link at once, and a backward jump suppress the cull that is the
+     *  whole point of this sweep. Matches `bleScanRestartReason`'s clock. */
+    private fun nowMonotonic(): Long = SystemClock.elapsedRealtime()
     @Volatile private var lastHeartbeatMs = 0L
     @Volatile private var livenessArmed = false
 
     /** Cull zombie links the stack never reported as disconnected (seen on
      *  Pixel 10: rx stops mid-conversation with no callback; the stale map
      *  entry then blocks every re-dial via [isLinkedAddr], so a static-address
-     *  peer like a Mac stays undetectable forever). */
+     *  peer like a Mac stays undetectable forever).
+     *
+     *  Runs on the main looper, but rx lands on BLE binder threads, so a link can
+     *  revive between the stale decision and the disconnect — every cull re-checks
+     *  under a fresh clock read before acting. */
     private val linkLivenessSweep = object : Runnable {
         override fun run() {
             if (!livenessArmed) return
-            val now = System.currentTimeMillis()
-            val linked = HashSet<String>()
-            linked.addAll(clientGatt.keys)
-            linked.addAll(serverDevices.keys)
-            if (linked.isNotEmpty() && now - lastHeartbeatMs >= HEARTBEAT_MS) {
+            val now = nowMonotonic()
+            val clients = clientGatt.keys.toSet()
+            val servers = serverDevices.keys.toSet()
+            if ((clients.isNotEmpty() || servers.isNotEmpty()) && now - lastHeartbeatMs >= HEARTBEAT_MS) {
                 lastHeartbeatMs = now
                 broadcastDiscoveryNow("heartbeat")
             }
-            linked.forEach { lastRxMs.putIfAbsent(it, now) }
-            for (addr in meshStaleLinkAddrs(now, linked, lastRxMs, LINK_STALE_MS)) {
-                android.util.Log.i(TAG, "link $addr zombie (no rx in ${LINK_STALE_MS}ms) — closing so scan can re-dial")
+            // Seed first so a link that just formed gets a full LINK_STALE_MS window.
+            clients.forEach { lastClientRxMs.putIfAbsent(it, now) }
+            servers.forEach { lastServerRxMs.putIfAbsent(it, now) }
+            // Drop entries a late callback re-added after cleanup, so neither map
+            // grows without bound across a long session of rotating addresses.
+            lastClientRxMs.keys.removeAll { it !in clients && it !in clientPending }
+            lastServerRxMs.keys.removeAll { it !in servers }
+            for (addr in meshStaleLinkAddrs(now, clients, lastClientRxMs, LINK_STALE_MS)) {
+                if (!stillStale(lastClientRxMs[addr])) continue
+                android.util.Log.i(TAG, "client link $addr zombie (no rx in ${LINK_STALE_MS}ms) — closing so scan can re-dial")
                 recentDials.remove(addr) // allow an immediate re-dial
-                disconnectAddr(addr)
+                cleanupClient(addr)
             }
-            handler.postDelayed(this, LIVENESS_TICK_MS)
+            for (addr in meshStaleLinkAddrs(now, servers, lastServerRxMs, LINK_STALE_MS)) {
+                if (!stillStale(lastServerRxMs[addr])) continue
+                android.util.Log.i(TAG, "server link $addr zombie (no rx in ${LINK_STALE_MS}ms) — closing so scan can re-dial")
+                recentDials.remove(addr) // let us dial the peer back
+                cleanupServer(addr)
+            }
+            if (livenessArmed) handler.postDelayed(this, LIVENESS_TICK_MS)
         }
+
+        /** Re-read the clock so rx that landed since the decision spares the link. */
+        private fun stillStale(lastRx: Long?): Boolean =
+            lastRx != null && nowMonotonic() - lastRx >= LINK_STALE_MS
     }
 
     // ── GATT server (peripheral) ──
 
     fun startServer() {
-        if (!livenessArmed) {
+        // Arm on the handler thread: start()/stop() are called off the main looper,
+        // so doing it here would race a sweep that is mid-run and could leave two
+        // sweeps rescheduling each other forever. All (dis)arming is serialized on
+        // the same looper the sweep runs on.
+        handler.post {
+            if (livenessArmed) return@post
             livenessArmed = true
             handler.postDelayed(linkLivenessSweep, LIVENESS_TICK_MS)
         }
@@ -389,9 +436,12 @@ object MeshGatt {
     }
 
     fun stop() {
+        // Disarm before removeCallbacks so a sweep already running on the looper
+        // sees the flag and declines to reschedule itself.
         livenessArmed = false
         handler.removeCallbacks(linkLivenessSweep)
-        lastRxMs.clear()
+        lastClientRxMs.clear()
+        lastServerRxMs.clear()
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
@@ -439,7 +489,7 @@ object MeshGatt {
     private fun cleanupServer(addr: String) {
         val device = serverDevices.remove(addr)
         if (device != null) runCatching { server?.cancelConnection(device) }
-        if (!clientGatt.containsKey(addr)) lastRxMs.remove(addr)
+        lastServerRxMs.remove(addr)
         serverLinks.remove(addr)
         peerIdByAddr.remove(addr)
         fingerprintByAddr.remove(addr)
@@ -451,7 +501,7 @@ object MeshGatt {
         override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverDevices[device.address] = device
-                lastRxMs[device.address] = System.currentTimeMillis()
+                lastServerRxMs[device.address] = nowMonotonic()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 cleanupServer(device.address)
             }
@@ -562,7 +612,7 @@ object MeshGatt {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 clientGatt[addr] = gatt
                 clientConnected.add(addr) // earns the longer announce window
-                lastRxMs[addr] = System.currentTimeMillis()
+                lastClientRxMs[addr] = nowMonotonic()
                 gatt.requestMtu(517)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (status != 0) gatt.close()
@@ -639,7 +689,7 @@ object MeshGatt {
     }
 
     private fun cleanupClient(addr: String) {
-        if (!serverDevices.containsKey(addr)) lastRxMs.remove(addr)
+        lastClientRxMs.remove(addr)
         clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
         clientPending.remove(addr); clientConnected.remove(addr)
         clientWriteQueue.remove(addr); clientWriting.remove(addr)
@@ -652,7 +702,7 @@ object MeshGatt {
         addr: String, value: ByteArray, fromServer: Boolean,
         device: BluetoothDevice? = null, gatt: BluetoothGatt? = null,
     ) {
-        lastRxMs[addr] = System.currentTimeMillis()
+        if (fromServer) lastServerRxMs[addr] = nowMonotonic() else lastClientRxMs[addr] = nowMonotonic()
         val info = runCatching { meshDecodePacket(value) }.getOrNull()
         if (info == null) {
             android.util.Log.i(TAG, "rx undecodable value (${value.size}B) from $addr")

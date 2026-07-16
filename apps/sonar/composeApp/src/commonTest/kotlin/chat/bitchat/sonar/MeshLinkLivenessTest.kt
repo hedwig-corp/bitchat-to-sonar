@@ -63,6 +63,32 @@ class MeshLinkLivenessTest {
     }
 
     @Test
+    fun healthyRoleDoesNotMaskADeadRoleOnTheSameAddress() {
+        // Same address, both roles live: the server role is carrying traffic while
+        // the client GATT is dead. Called per role, the dead client is still culled
+        // (it would otherwise hold a MAX_CLIENTS slot and stay a broken send route).
+        val addr = "84:2F:57:4B:C7:95"
+        assertEquals(
+            listOf(addr),
+            meshStaleLinkAddrs(
+                nowMs = 200_000L,
+                linkedAddrs = setOf(addr),
+                lastRxMsByAddr = mapOf(addr to 10_000L), // client role: silent
+                staleMs = staleMs,
+            ),
+        )
+        assertEquals(
+            emptyList(),
+            meshStaleLinkAddrs(
+                nowMs = 200_000L,
+                linkedAddrs = setOf(addr),
+                lastRxMsByAddr = mapOf(addr to 190_000L), // server role: healthy
+                staleMs = staleMs,
+            ),
+        )
+    }
+
+    @Test
     fun cullsOnlyTheSilentLinkAmongMany() {
         assertEquals(
             listOf("11:11:11:11:11:11"),

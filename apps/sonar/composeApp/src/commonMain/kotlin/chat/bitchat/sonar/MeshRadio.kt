@@ -103,6 +103,11 @@ internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: Str
  * scanner still reports it. Culling such zombies lets the next scan result
  * re-dial and recover the link. Addresses with no recorded receive time are
  * left alone — the caller seeds them first so a fresh link gets a full window.
+ *
+ * Called once per GATT role with that role's own linked set and rx times: one
+ * address can hold a client and a server link at once, and a shared per-address
+ * entry would let a healthy role mask a dead one. Timestamps must come from a
+ * MONOTONIC clock — a wall-clock jump would otherwise cull every live link.
  */
 internal fun meshStaleLinkAddrs(
     nowMs: Long,
