@@ -8157,6 +8157,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
+            val queued = texts.toList()
+            // Claim the queue so a concurrent flush can't double-send…
             pendingMarmotSends.remove(npubHex)
             scope.launch {
                 for (send in sends) {
