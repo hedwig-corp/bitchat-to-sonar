@@ -1925,6 +1925,13 @@ extension BLEService: CBCentralManagerDelegate {
     /// State handling split out of the delegate callback so the radio-off path is
     /// reachable without a live `CBCentralManager` (its `state` cannot be forced).
     func handleCentralState(_ state: CBManagerState, central: CBCentralManager?) {
+        // Serialize against real CoreBluetooth delegate callbacks: this method
+        // mutates bleQueue-confined state (peripherals / peerToPeripheralUUID),
+        // but is also reachable from the test thread. Hop onto bleQueue when we
+        // are not already on it.
+        if DispatchQueue.getSpecific(key: bleQueueKey) == nil {
+            return bleQueue.sync { handleCentralState(state, central: central) }
+        }
         // Notify delegate about state change on main thread
         Task { @MainActor in
             self.delegate?.didUpdateBluetoothState(state)
@@ -1960,8 +1967,13 @@ extension BLEService: CBCentralManagerDelegate {
             SecureLogger.error("❌ Bluetooth LE not supported on this device", category: .session)
 
         case .resetting:
-            // Bluetooth stack is resetting - will get another state update when done
+            // Bluetooth stack is resetting - will get another state update when done.
+            // The OS invalidates every connection here and delivers no
+            // didDisconnectPeripheral, so demote link state now (peripherals /
+            // peerToPeripheralUUID are left intact: the OS restores the manager
+            // and .poweredOn follows).
             SecureLogger.info("🔄 Bluetooth stack resetting...", category: .session)
+            invalidateMeshLinks(reason: "Bluetooth resetting")
 
         case .unknown:
             // Initial state before we know the actual state
@@ -2627,8 +2639,10 @@ extension BLEService: CBPeripheralManagerDelegate {
             SecureLogger.error("❌ Bluetooth LE peripheral role not supported", category: .session)
 
         case .resetting:
-            // Bluetooth stack is resetting
+            // Bluetooth stack is resetting - the OS invalidates every connection
+            // here without didUnsubscribeFrom callbacks, so demote link state now.
             SecureLogger.info("🔄 Bluetooth peripheral stack resetting...", category: .session)
+            invalidateMeshLinks(reason: "Bluetooth resetting")
 
         case .unknown:
             SecureLogger.debug("❓ Peripheral Bluetooth state unknown (initializing)", category: .session)
@@ -4752,7 +4766,7 @@ extension BLEService {
     /// connected until `checkPeerConnectivity` times it out ~8-13s later, and DM
     /// routing (`isPeerConnected` / `isPeerReachable`) hands sends to a radio that
     /// is off instead of falling back to White Noise.
-    func invalidateMeshLinks(reason: String) {
+    private func invalidateMeshLinks(reason: String) {
         let disconnected: [PeerID] = collectionsQueue.sync(flags: .barrier) {
             var changed: [PeerID] = []
             for (peerID, peer) in peers where peer.isConnected {

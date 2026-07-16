@@ -172,6 +172,26 @@ roughly halves it. The ranking is stable across all three.)
 
 ---
 
+## R-006 — Radio power-off retires mesh links immediately
+
+**Invariant:** When the Bluetooth radio becomes unusable (`.poweredOff`, `.unauthorized`, `.resetting`), every `peers[*].isConnected` must be demoted immediately; DM routing must never rely on the ~8-13s `checkPeerConnectivity` sweep to notice a dead radio.
+
+**Breaks as:** A DM composed right after turning Bluetooth off is handed to the dead radio ("via mesh" in the composer) instead of falling back to White Noise; the send silently dies.
+
+**Why:** CoreBluetooth delivers no `didDisconnectPeripheral` / `didUnsubscribeFrom` for links the radio drops, so the normal disconnect paths never clear `isConnected`.
+
+**Call sites:** iOS `BLEService.swift::invalidateMeshLinks(reason:)` (called from both CB state handlers); Compose: not yet implemented — no adapter-off receiver exists and Android links may self-clear via `MeshGatt.onConnectionStateChange`; unproven, see Unguarded.
+
+**Guarded by:** `BLEServiceCoreTests.bluetoothPoweredOff_stopsRoutingOverMesh`
+
+**History:** #302.
+
+**Rejected:**
+- *A `bluetoothState` check inside `SonarAppStore.meshReachable`.* The view-model copy is updated asynchronously and starts at `.unknown` — a second, staler source of truth; and `peers[*].isConnected` has six other consumers (presence, topology, images, calls) that would keep lying.
+- *Shortening `blePeerInactivityTimeoutSeconds`.* Keeps the bug class and causes disconnect flapping on healthy links.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -183,5 +203,5 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
-- **Compose has no Bluetooth-adapter-off handler.** iOS invalidates its mesh links the moment CoreBluetooth reports `.poweredOff`, so DM routing falls back to White Noise immediately (`BLEService.invalidateMeshLinks`, guarded by `BLEServiceCoreTests.bluetoothPoweredOff_stopsRoutingOverMesh`). Compose has no `ACTION_STATE_CHANGED` receiver at all — nothing pushes adapter-off into `MeshRadio`, whose `stop()` already contains the right teardown but only runs on discovery-policy changes. Android's links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, which iOS has no equivalent of, so it is unproven whether Compose has the same bug. Needs a Pixel with a peer in range to confirm; `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
+- **Compose side of R-006 (Bluetooth-adapter-off).** Compose has no `ACTION_STATE_CHANGED` receiver — nothing pushes adapter-off into `MeshRadio`, whose `stop()` has the right teardown but only runs on discovery-policy changes. Android links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, so whether R-006 applies there is unproven; needs a Pixel with a peer in range to confirm. `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
 - **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
