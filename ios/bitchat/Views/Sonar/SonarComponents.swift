@@ -1923,6 +1923,29 @@ struct SNMsgList: View {
             }
         }
     }
+
+    /// Scroll to the newest row only AFTER the pending layout pass commits.
+    ///
+    /// Mirror of the Compose tail-pinner fix (#283): a `scrollTo` issued inside
+    /// the same transaction that inserted rows (send echo, incoming batch,
+    /// first appearance) targets estimated, uncommitted `LazyVStack` layout.
+    /// On macOS — and occasionally iOS — the viewport then lands past the real
+    /// content and paints a completely blank transcript until a manual scroll
+    /// forces re-layout ("my chat is blank until I scroll"). Deferring one
+    /// main-runloop tick lets layout commit first, so the target is exact.
+    ///
+    /// The unread-divider (#303) and keyboard-pin paths already defer for the
+    /// same reason; this is the tail equivalent. Keep every programmatic
+    /// scroll-to-bottom routed through here.
+    private func scrollToBottomAfterLayout(_ proxy: ScrollViewProxy, animated: Bool) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
+            } else {
+                proxy.scrollTo("sn-bottom", anchor: .bottom)
+            }
+        }
+    }
 }
 
 /// Signal-style unread marker: hairlines around a centered label, anchored
