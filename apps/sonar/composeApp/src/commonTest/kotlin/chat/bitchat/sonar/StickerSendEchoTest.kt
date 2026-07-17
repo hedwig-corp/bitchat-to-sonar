@@ -28,6 +28,36 @@ class StickerSendEchoTest {
         )
     }
 
+    // NOTE: these two pin helpers the test feeds itself. The behaviour that
+    // actually broke — evict+refetch of a stale pack, and not re-driving it for
+    // a disowned ref — lives in SonarAppState.stickerImage(ref), which needs a
+    // real SonarCore to exercise. See the `Unguarded` note in the PR: the Rust
+    // side pins its real call sites (claim_sticker_refs_for_prefetch,
+    // cancel_on_wiped_session); the hosts do not yet have an injectable core.
+    @Test fun stickerRefMemoryKeyNormalizesAuthorCaseAndHashCase() {
+        val key = stickerRefMemoryKey(
+            packCoordinate = "30031:ABCDEF1234:MyPack",
+            shortcode = "wave",
+            plaintextSha256 = "AA".repeat(32),
+        )
+        assertEquals("30031:abcdef1234:MyPack|wave|${"aa".repeat(32)}", key)
+        // Identifier and shortcode stay case-sensitive: they are distinct
+        // stickers per the pack model, so they must not collapse to one key.
+        assertFalse(
+            key == stickerRefMemoryKey("30031:abcdef1234:mypack", "wave", "aa".repeat(32)),
+        )
+        assertFalse(
+            key == stickerRefMemoryKey("30031:abcdef1234:MyPack", "Wave", "aa".repeat(32)),
+        )
+    }
+
+    @Test fun stickerLoadRetryScheduleIsShortAndBounded() {
+        assertEquals(2_000L, stickerLoadRetryDelayMs(0))
+        assertEquals(8_000L, stickerLoadRetryDelayMs(1))
+        assertEquals(null, stickerLoadRetryDelayMs(2))
+        assertEquals(null, stickerLoadRetryDelayMs(100))
+    }
+
     @Test fun failedInstalledRefreshPreservesCachedPacks() {
         assertTrue(shouldPreserveCachedStickerPacks(hadCachedPacks = true, installedCoordinates = null))
         assertFalse(shouldPreserveCachedStickerPacks(hadCachedPacks = false, installedCoordinates = null))

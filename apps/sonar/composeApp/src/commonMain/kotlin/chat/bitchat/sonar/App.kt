@@ -114,6 +114,7 @@ import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -2223,14 +2224,27 @@ private fun StickerBubble(
     val ref = m.stickerRef ?: return
     var imageBytes by remember(ref) { mutableStateOf<ByteArray?>(null) }
     var failed by remember(ref) { mutableStateOf(false) }
-    LaunchedEffect(ref) {
+    var retryToken by remember(ref) { mutableStateOf(0) }
+    LaunchedEffect(ref, retryToken) {
         failed = false
-        imageBytes = state.stickerImage(ref)
-        failed = imageBytes == null
+        // The failed placeholder shows after the first miss, but keep retrying
+        // on a short bounded schedule: cold opens race the relay connection and
+        // the core's receive-time prefetch may land moments later.
+        var attempt = 0
+        while (true) {
+            // retryToken > 0 means the user tapped the failed placeholder: that
+            // overrides a cached "unresolvable" verdict, which may have been
+            // recorded off stale pack metadata.
+            imageBytes = state.stickerImage(ref, userInitiated = retryToken > 0)
+            if (imageBytes != null) {
+                failed = false
+                return@LaunchedEffect
+            }
+            failed = true
+            delay(stickerLoadRetryDelayMs(attempt) ?: return@LaunchedEffect)
+            attempt++
+        }
     }
-    val tapModifier = if (onTap != null) {
-        Modifier.clickable { onTap(ref.packCoordinate) }
-    } else Modifier
     Column(
         Modifier.fillMaxWidth().padding(top = 9.dp),
         horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start
@@ -2248,6 +2262,9 @@ private fun StickerBubble(
         }
         val displayFailed = failed || (imageBytes != null && image == null)
         if (image != null) {
+            val tapModifier = if (onTap != null) {
+                Modifier.clickable { onTap(ref.packCoordinate) }
+            } else Modifier
             androidx.compose.foundation.Image(
                 bitmap = image,
                 contentDescription = ref.shortcode,
@@ -2255,7 +2272,8 @@ private fun StickerBubble(
             )
         } else if (displayFailed) {
             Box(
-                tapModifier.size(120.dp).padding(4.dp).clip(RoundedCornerShape(12.dp)).background(sonar.surface2),
+                Modifier.clickable { retryToken++ }
+                    .size(120.dp).padding(4.dp).clip(RoundedCornerShape(12.dp)).background(sonar.surface2),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(ref.shortcode, color = sonar.text3, fontSize = 12.sp)

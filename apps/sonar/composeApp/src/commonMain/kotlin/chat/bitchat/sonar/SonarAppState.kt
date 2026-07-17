@@ -517,6 +517,33 @@ internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
 private const val STICKER_IMAGE_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024
 private const val STICKER_IMAGE_MEMORY_ENTRY_LIMIT = 100
 
+/** Bounded wait for the relay before a sticker pack lookup. Mirrors the iOS
+ *  `ensureRelayConnected(timeoutSeconds: 10)` guard: chats open local-first, so
+ *  the first sticker render often races the relay connection on cold start. */
+private const val STICKER_PACK_RELAY_WAIT_MS = 10_000L
+
+/** Cap on remembered unresolvable refs. A peer can mint refs freely, so the
+ *  negative cache that protects the relay must itself be bounded. */
+private const val STICKER_UNRESOLVABLE_REF_LIMIT = 256
+
+/** Stable identity of a sticker reference. Only the hash is case-normalized:
+ *  identifier and shortcode are case-sensitive per the pack model. */
+internal fun stickerRefMemoryKey(
+    packCoordinate: String,
+    shortcode: String,
+    plaintextSha256: String,
+): String =
+    "${normalizeStickerPackCoordinate(packCoordinate)}|$shortcode|${plaintextSha256.lowercase()}"
+
+/** Delay before retry [attempt] (0-based) of a failed transcript sticker load,
+ *  or null when attempts are exhausted. Bubbles keep the failed placeholder
+ *  visible while these run, so the schedule stays short and bounded. */
+internal fun stickerLoadRetryDelayMs(attempt: Int): Long? = when (attempt) {
+    0 -> 2_000L
+    1 -> 8_000L
+    else -> null
+}
+
 internal fun stickerCacheLookupState(
     hasBytes: Boolean,
     startedGeneration: Long,
@@ -5215,6 +5242,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
+    /** Refs the latest relay-refreshed pack does not contain. Bounded; entries
+     *  stop a removed/bogus ref from re-driving eviction + relay refetch on
+     *  every bubble mount, retry tick, and tap. */
+    private val unresolvableStickerRefKeys = linkedSetOf<String>()
     private var stickerImageMemoryBytes = 0
     private var stickerBenchmarkRecording = false
     /** Last locally-authoritative installed set. Generic pack metadata also
@@ -5812,6 +5843,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val cacheKey = "30031:${authorPubkeyHex.lowercase()}:$identifier"
         stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
+            // Cold-start race: chats paint before the relay connects, so give
+            // the connection a bounded head start instead of failing the
+            // kind-30031 lookup instantly (mirrors iOS ensureRelayConnected).
+            if (!SonarCore.isRelayConnected()) {
+                withTimeoutOrNull(STICKER_PACK_RELAY_WAIT_MS) { awaitRelayConnection() }
+            }
+            if (stickerCacheGeneration != generation) return null
             val pack = SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls)
             if (stickerCacheGeneration != generation) return null
             if (stickerPackCache.size >= 20) stickerPackCache.remove(stickerPackCache.keys.first())
@@ -5854,21 +5892,66 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
+    /** Resolve a received sticker. Never gated on the pack being installed:
+     *  the picker's installed list decides what you can SEND, while anything a
+     *  peer sends must render from the reference alone (pack metadata off the
+     *  relay, bytes off Blossom, both hash-verified).
+     *
+     *  [userInitiated] marks an explicit tap on the failed placeholder, which
+     *  always retries even a ref previously judged unresolvable. */
+    suspend fun stickerImage(ref: SonarStickerRef, userInitiated: Boolean = false): ByteArray? {
         val generation = stickerCacheGeneration
+        val refKey = stickerRefMemoryKey(ref.packCoordinate, ref.shortcode, ref.plaintextSha256)
+        // The core is the sole authority on whether the LATEST validated pack
+        // still authorizes this exact ref, so every ref lookup asks it. There is
+        // deliberately no host-side memory shortcut here: the byte LRU is keyed
+        // by sha alone and cannot answer "does the current pack still contain
+        // this sticker", which is what the core's validated read enforces.
         when (val cached = cachedStickerImage(ref, generation)) {
             is CachedStickerImageResult.Hit -> return cached.bytes
             CachedStickerImageResult.Invalidated -> return null
             CachedStickerImageResult.Miss -> Unit
         }
         if (stickerCacheGeneration != generation) return null
+        // A ref the latest pack has already disowned must not re-drive relay
+        // work on every bubble mount and retry tick — but a human tap is
+        // bounded by the human, so it always gets a fresh attempt.
+        if (userInitiated) {
+            unresolvableStickerRefKeys.remove(refKey)
+        } else if (refKey in unresolvableStickerRefKeys) {
+            return null
+        }
         val (author, identifier) = ref.packAddressParts() ?: return null
         val pack = stickerPack(
             authorPubkeyHex = author,
             identifier = identifier,
             expectedGeneration = generation,
         ) ?: return null
-        val sticker = pack.stickerMatching(ref) ?: return null
+        // Session pack metadata can be stale: a sticker published to the pack
+        // after this session cached its metadata — or a copy served by the
+        // offline validated-local fallback — is missing from the cached copy
+        // while every older sticker still renders. Evict and refetch once so
+        // one early failed relay fetch cannot pin a stale pack for the session.
+        val sticker = pack.stickerMatching(ref) ?: run {
+            if (stickerCacheGeneration != generation) return null
+            stickerPackCache.remove("30031:${author.lowercase()}:$identifier")
+            val refreshed = stickerPack(
+                authorPubkeyHex = author,
+                identifier = identifier,
+                expectedGeneration = generation,
+            ) ?: return null
+            refreshed.stickerMatching(ref) ?: run {
+                // Only trust "not in pack" when we actually reached a relay.
+                // The core falls back to stale validated-local metadata when the
+                // fetch fails, so negative-caching an offline answer would keep
+                // a perfectly good sticker black for the rest of the session —
+                // exactly the stale-metadata failure this PR exists to fix.
+                if (stickerCacheGeneration == generation && SonarCore.isRelayConnected()) {
+                    rememberUnresolvableStickerRef(refKey)
+                }
+                return null
+            }
+        }
         return stickerImage(
             url = sticker.url,
             expectedSha256 = ref.plaintextSha256,
@@ -6040,9 +6123,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         stickerImageMemoryBytes = 0
     }
 
+    private fun rememberUnresolvableStickerRef(refKey: String) {
+        while (unresolvableStickerRefKeys.size >= STICKER_UNRESOLVABLE_REF_LIMIT) {
+            val oldest = unresolvableStickerRefKeys.firstOrNull() ?: break
+            unresolvableStickerRefKeys.remove(oldest)
+        }
+        unresolvableStickerRefKeys += refKey
+    }
+
     private fun clearStickerCaches() {
         stickerCacheGeneration++
         stickerPackCache.clear()
+        unresolvableStickerRefKeys.clear()
         clearStickerImageMemoryCache()
         installedPackCoordinates.clear()
     }

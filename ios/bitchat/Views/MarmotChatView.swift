@@ -215,6 +215,9 @@ final class MarmotChatModel: ObservableObject {
     /// pressure without improving transcript paint.
     private static let stickerImageMemoryBudgetBytes = 25 * 1024 * 1024
     private static let stickerImageMemoryEntryLimit = 100
+    /// Cap on remembered unresolvable refs. A peer can mint refs freely, so the
+    /// negative cache that protects the relay must itself be bounded.
+    private static let unresolvableStickerRefLimit = 256
     private static let sonarDescriptorRefreshInterval: TimeInterval = 15 * 60
     private static let sonarDescriptorMissRetryInterval: TimeInterval = 60
     /// Re-fetch kind-0 profiles older than this so alias/name updates are
@@ -306,6 +309,11 @@ final class MarmotChatModel: ObservableObject {
     private var stickerPackLRU: [String] = []
     private var stickerImagesBySHA256: [String: Data] = [:]
     private var stickerImageLRU: [String] = []
+    /// Refs the latest relay-refreshed pack does not contain. Bounded; entries
+    /// stop a removed/bogus ref from re-driving eviction + relay refetch on
+    /// every bubble mount, retry tick, and tap.
+    private var unresolvableStickerRefKeys: [String] = []
+    private var unresolvableStickerRefKeySet: Set<String> = []
     private var stickerImageMemoryBytes = 0
     private var stickerCacheGeneration: UInt64 = 0
     /// Last desired payment offer metadata for our public descriptor. Reused
@@ -362,6 +370,27 @@ final class MarmotChatModel: ObservableObject {
     ) -> StickerCacheLookupState {
         guard startedGeneration == currentGeneration else { return .invalidated }
         return hasData ? .hit : .miss
+    }
+
+    /// Session key under which a sticker reference was authorized against the
+    /// validated pack. Memory-first lookups are gated on this so the sha-keyed
+    /// byte LRU never serves a ref that was not verified this session.
+    static func stickerRefMemoryKey(
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) -> String {
+        "\(snNormalizeStickerPackCoordinate(packCoordinate))|\(shortcode)|\(plaintextSha256.lowercased())"
+    }
+
+    /// Delay before retry `attempt` (0-based) of a failed transcript sticker
+    /// load, or nil when attempts are exhausted. Mirrors the Compose schedule.
+    static func stickerLoadRetryDelaySeconds(attempt: Int) -> Double? {
+        switch attempt {
+        case 0: return 2
+        case 1: return 8
+        default: return nil
+        }
     }
 
     private enum CachedStickerImageResult {
@@ -2254,8 +2283,28 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+    /// Resolve a received sticker. Never gated on the pack being installed: the
+    /// picker's installed list decides what you can SEND, while anything a peer
+    /// sends must render from the reference alone (pack metadata off the relay,
+    /// bytes off Blossom, both hash-verified).
+    ///
+    /// `userInitiated` marks an explicit tap on the failed placeholder, which
+    /// always retries even a ref previously judged unresolvable.
+    func stickerData(
+        for ref: MarmotService.MarmotStickerRef,
+        userInitiated: Bool = false
+    ) async -> Data? {
         let generation = stickerCacheGeneration
+        let refKey = Self.stickerRefMemoryKey(
+            packCoordinate: ref.packCoordinate,
+            shortcode: ref.shortcode,
+            plaintextSha256: ref.plaintextSha256
+        )
+        // The core is the sole authority on whether the LATEST validated pack
+        // still authorizes this exact ref, so every ref lookup asks it. There is
+        // deliberately no host-side memory shortcut here: the byte LRU is keyed
+        // by sha alone and cannot answer "does the current pack still contain
+        // this sticker", which is what the core's validated read enforces.
         switch await cachedStickerImage(for: ref, generation: generation) {
         case .hit(let data):
             return data
@@ -2265,18 +2314,58 @@ final class MarmotChatModel: ObservableObject {
             break
         }
         guard stickerCacheGeneration == generation else { return nil }
+        // A ref the latest pack has already disowned must not re-drive relay
+        // work on every bubble mount and retry tick — but a human tap is
+        // bounded by the human, so it always gets a fresh attempt.
+        if userInitiated {
+            forgetUnresolvableStickerRef(refKey)
+        } else if unresolvableStickerRefKeySet.contains(refKey) {
+            return nil
+        }
         guard let parts = Self.stickerPackParts(ref.packCoordinate),
               let pack = await fetchStickerPack(
                   authorPubkeyHex: parts.author,
                   identifier: parts.identifier,
                   relayUrls: [],
                   expectedGeneration: generation
-              ),
-              let sticker = pack.stickers.first(where: {
-                  $0.shortcode == ref.shortcode &&
-                      $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
-              })
+              )
         else { return nil }
+        func matching(_ pack: StickerPackInfo) -> StickerInfo? {
+            pack.stickers.first(where: {
+                $0.shortcode == ref.shortcode &&
+                    $0.sha256.caseInsensitiveCompare(ref.plaintextSha256) == .orderedSame
+            })
+        }
+        var sticker = matching(pack)
+        if sticker == nil {
+            // Session pack metadata can be stale: a sticker published to the
+            // pack after this session cached its metadata — or a copy served
+            // by the offline validated-local fallback — is missing from the
+            // cached copy while every older sticker still renders. Evict and
+            // refetch once so one early failed relay fetch cannot pin a stale
+            // pack for the session.
+            guard stickerCacheGeneration == generation else { return nil }
+            evictStickerPack(coordinate: ref.packCoordinate)
+            guard let refreshed = await fetchStickerPack(
+                authorPubkeyHex: parts.author,
+                identifier: parts.identifier,
+                relayUrls: [],
+                expectedGeneration: generation
+            ) else { return nil }
+            sticker = matching(refreshed)
+            if sticker == nil {
+                // Only trust "not in pack" when we actually reached a relay.
+                // The core falls back to stale validated-local metadata when the
+                // fetch fails, so negative-caching an offline answer would keep
+                // a perfectly good sticker black for the rest of the session —
+                // exactly the stale-metadata failure this PR exists to fix.
+                if stickerCacheGeneration == generation, service.isRelayConnected() {
+                    rememberUnresolvableStickerRef(refKey)
+                }
+                return nil
+            }
+        }
+        guard let sticker else { return nil }
         return await fetchStickerImage(
             url: sticker.url,
             expectedSha256: ref.plaintextSha256,
@@ -2356,6 +2445,8 @@ final class MarmotChatModel: ObservableObject {
         stickerCacheGeneration = stickerCacheGeneration &+ 1
         stickerPacksByCoordinate = [:]
         stickerPackLRU = []
+        unresolvableStickerRefKeys = []
+        unresolvableStickerRefKeySet = []
         clearStickerImageMemoryCache()
         installedPackCoordinates = []
     }
@@ -2377,6 +2468,29 @@ final class MarmotChatModel: ObservableObject {
     private func touchStickerPack(_ cacheKey: String) {
         stickerPackLRU.removeAll { $0 == cacheKey }
         stickerPackLRU.append(cacheKey)
+    }
+
+    /// Drop one pack's session metadata so the next fetch consults the relay
+    /// again. Used when a transcript ref is missing from the cached copy.
+    private func evictStickerPack(coordinate: String) {
+        let normalized = snNormalizeStickerPackCoordinate(coordinate)
+        stickerPacksByCoordinate.removeValue(forKey: normalized)
+        stickerPackLRU.removeAll { $0 == normalized }
+    }
+
+    private func forgetUnresolvableStickerRef(_ refKey: String) {
+        guard unresolvableStickerRefKeySet.remove(refKey) != nil else { return }
+        unresolvableStickerRefKeys.removeAll { $0 == refKey }
+    }
+
+    private func rememberUnresolvableStickerRef(_ refKey: String) {
+        guard !unresolvableStickerRefKeySet.contains(refKey) else { return }
+        while unresolvableStickerRefKeys.count >= Self.unresolvableStickerRefLimit {
+            let oldest = unresolvableStickerRefKeys.removeFirst()
+            unresolvableStickerRefKeySet.remove(oldest)
+        }
+        unresolvableStickerRefKeys.append(refKey)
+        unresolvableStickerRefKeySet.insert(refKey)
     }
 
     func replaceInstalledPackCoordinates(_ coordinates: [String]) {

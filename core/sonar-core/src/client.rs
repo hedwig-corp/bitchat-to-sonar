@@ -98,6 +98,14 @@ const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
+/// Upper bound on receive-time sticker prefetch work per processed event batch.
+const STICKER_REF_PREFETCH_BATCH_LIMIT: usize = 16;
+/// Concurrent receive-time prefetch batches. Peers control how many batches
+/// arrive, so this — not the per-batch limit — is what bounds total in-flight
+/// relay/HTTP work on this path.
+const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
+/// How often a receive-prefetch await re-checks for an identity wipe.
+const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
@@ -410,6 +418,8 @@ impl StickerPrefetchCancellation {
 }
 
 type StickerPrefetchRegistry = Arc<Mutex<HashMap<String, Arc<StickerPrefetchCancellation>>>>;
+/// Sticker refs currently claimed by an in-flight receive-time prefetch batch.
+type StickerRefPrefetchInflight = Arc<Mutex<HashSet<String>>>;
 
 struct StickerPrefetchRegistration {
     coordinate: String,
@@ -586,6 +596,85 @@ fn log_sticker_prefetch_result(outcome: Option<StickerPrefetchJoinResult>) -> (u
         }
         Some(Ok((_, Ok(_)))) => (1, 0),
         None => (0, 0),
+    }
+}
+
+/// Stable identity of a sticker reference: coordinate + shortcode + plaintext
+/// hash, with only the hash case-normalized (identifier and shortcode are
+/// case-sensitive per the pack model).
+fn sticker_ref_prefetch_key(sticker_ref: &StickerRef) -> String {
+    format!(
+        "{}|{}|{}",
+        sticker_ref.pack.coordinate(),
+        sticker_ref.shortcode,
+        sticker_ref.plaintext_sha256.to_ascii_lowercase()
+    )
+}
+
+/// Dedup receive-time sticker refs by full reference preserving first-seen
+/// order, capped at `limit` so one large drain cannot schedule unbounded
+/// downloads. Cross-batch dedup and the global concurrency bound live in
+/// [`SonarClient::spawn_sticker_refs_prefetch`].
+fn sticker_prefetch_batch(refs: Vec<StickerRef>, limit: usize) -> Vec<StickerRef> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut batch = Vec::new();
+    for sticker_ref in refs {
+        if batch.len() >= limit {
+            break;
+        }
+        if seen.insert(sticker_ref_prefetch_key(&sticker_ref)) {
+            batch.push(sticker_ref);
+        }
+    }
+    batch
+}
+
+/// Releases this batch's cross-batch in-flight claims on every exit path,
+/// including an early return when the session is wiped mid-batch.
+struct StickerRefPrefetchClaim {
+    registry: StickerRefPrefetchInflight,
+    keys: Vec<String>,
+}
+
+impl StickerRefPrefetchClaim {
+    fn new(registry: StickerRefPrefetchInflight, refs: &[StickerRef]) -> Self {
+        Self {
+            registry,
+            keys: refs.iter().map(sticker_ref_prefetch_key).collect(),
+        }
+    }
+}
+
+impl Drop for StickerRefPrefetchClaim {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.registry.lock() {
+            for key in &self.keys {
+                inflight.remove(key);
+            }
+        }
+    }
+}
+
+/// Await `future`, giving up as soon as the sticker cache generation moves.
+///
+/// `StickerCache` already rejects writes from a wiped session, but a bare await
+/// on an HTTP fetch can still run to completion (three attempts x 60s) after an
+/// identity wipe. Returns `None` when the session was invalidated. Mirrors the
+/// polling cadence used by the install-prefetch loop.
+async fn cancel_on_wiped_session<F, T>(cache: &StickerCache, future: F) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    loop {
+        tokio::select! {
+            output = &mut future => return Some(output),
+            _ = tokio::time::sleep(STICKER_PREFETCH_CANCEL_POLL) => {
+                if !matches!(cache.session_is_current(), Ok(true)) {
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -1285,6 +1374,13 @@ pub struct SonarClient {
     /// matching task immediately; the cache generation separately cancels all
     /// old-session tasks during identity wipe.
     sticker_prefetch_registry: StickerPrefetchRegistry,
+    /// Caps concurrent receive-time prefetch batches. Remote peers decide how
+    /// many sticker messages arrive, so the bound has to live on the client
+    /// rather than inside one batch.
+    sticker_ref_prefetch_permits: Arc<tokio::sync::Semaphore>,
+    /// Refs claimed by an in-flight receive-time prefetch batch, so a later
+    /// batch carrying the same sticker does not schedule the work twice.
+    sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
     /// Incoming-message notifications produced by the forced-sync gap-recovery
@@ -1737,6 +1833,10 @@ impl SonarClient {
             sticker_pack_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_image_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
+            sticker_ref_prefetch_permits: Arc::new(tokio::sync::Semaphore::new(
+                STICKER_REF_PREFETCH_CONCURRENCY,
+            )),
+            sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
         };
@@ -2851,6 +2951,148 @@ impl SonarClient {
                 total_us = prefetch_started.elapsed().as_micros() as u64,
                 "SONAR_BENCH sticker_pack_prefetch_finished"
             );
+        });
+    }
+
+    /// Warm the disk cache for sticker references carried by freshly received
+    /// messages.
+    ///
+    /// Peers control both the number of refs and the pack coordinates they point
+    /// at, so this path is bounded on every axis that a remote sender can grow:
+    ///
+    /// * a global semaphore caps how much receive-time prefetch can be in flight
+    ///   at once, no matter how many event batches arrive;
+    /// * refs already scheduled by an earlier batch are skipped, so repeated
+    ///   sends of the same sticker cannot stack duplicate work;
+    /// * pack metadata is fetched at most once per coordinate per batch;
+    /// * every await is raced against the cache generation, so an identity wipe
+    ///   stops in-flight downloads instead of running them to completion.
+    fn spawn_sticker_refs_prefetch(&self, refs: Vec<StickerRef>) {
+        if refs.is_empty() {
+            return;
+        }
+        let claimed = self.claim_sticker_refs_for_prefetch(refs);
+        if claimed.is_empty() {
+            return;
+        }
+        self.run_sticker_refs_prefetch(claimed);
+    }
+
+    /// Claim refs no other in-flight batch is already warming. Returns the refs
+    /// this batch owns; the returned claims are released by
+    /// [`StickerRefPrefetchClaim`] when the batch finishes.
+    fn claim_sticker_refs_for_prefetch(&self, refs: Vec<StickerRef>) -> Vec<StickerRef> {
+        let mut inflight = match self.sticker_ref_prefetch_inflight.lock() {
+            Ok(inflight) => inflight,
+            Err(_) => {
+                tracing::debug!("sticker ref prefetch: inflight lock poisoned");
+                return Vec::new();
+            }
+        };
+        refs.into_iter()
+            .filter(|sticker_ref| inflight.insert(sticker_ref_prefetch_key(sticker_ref)))
+            .collect()
+    }
+
+    /// Warm `claimed` in the background. The caller owns the in-flight claims;
+    /// this releases them when the batch finishes.
+    fn run_sticker_refs_prefetch(&self, claimed: Vec<StickerRef>) {
+        let nostr = self.nostr.clone();
+        let relays = self.relays.clone();
+        let sticker_cache = self.sticker_cache.clone();
+        let pack_gates = self.sticker_pack_fetch_gates.clone();
+        let image_gates = self.sticker_image_fetch_gates.clone();
+        let permits = self.sticker_ref_prefetch_permits.clone();
+        let inflight = self.sticker_ref_prefetch_inflight.clone();
+        let _prefetch = tokio::spawn(async move {
+            let _inflight_guard = StickerRefPrefetchClaim::new(inflight, &claimed);
+            // Cap concurrent receive-time prefetch globally. A peer flooding
+            // sticker messages queues here instead of multiplying sockets.
+            let Ok(_permit) = permits.acquire().await else {
+                return;
+            };
+            // One relay lookup per coordinate per batch: full-reference dedup
+            // keeps distinct stickers of the same pack, and each singleflight
+            // future is gone by the next iteration, so without this N refs from
+            // one pack cost N relay round-trips (N x the 10s timeout).
+            let mut packs_by_coordinate: HashMap<String, Option<StickerPack>> = HashMap::new();
+            for sticker_ref in &claimed {
+                if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                    return;
+                }
+                let coordinate = sticker_ref.pack.coordinate();
+                match sticker_cache.read_validated_image(
+                    &coordinate,
+                    &sticker_ref.shortcode,
+                    &sticker_ref.plaintext_sha256,
+                ) {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::debug!(%err, coordinate, "sticker ref prefetch: cache read failed");
+                    }
+                }
+                if !packs_by_coordinate.contains_key(&coordinate) {
+                    let fetched = cancel_on_wiped_session(
+                        &sticker_cache,
+                        fetch_sticker_pack_singleflight(
+                            &pack_gates,
+                            &sticker_cache,
+                            &nostr,
+                            &relays,
+                            &sticker_ref.pack.author_pubkey_hex,
+                            &sticker_ref.pack.identifier,
+                            &[],
+                            &coordinate,
+                        ),
+                    )
+                    .await;
+                    let pack = match fetched {
+                        None => return,
+                        Some(Ok((outcome, _))) => Some(outcome.pack.clone()),
+                        Some(Err(err)) => {
+                            tracing::debug!(%err, coordinate, "sticker ref prefetch: pack fetch failed");
+                            None
+                        }
+                    };
+                    packs_by_coordinate.insert(coordinate.clone(), pack);
+                }
+                let Some(Some(pack)) = packs_by_coordinate.get(&coordinate) else {
+                    continue;
+                };
+                let Some(sticker) = pack.stickers.iter().find(|sticker| {
+                    sticker.shortcode == sticker_ref.shortcode
+                        && sticker
+                            .sha256
+                            .eq_ignore_ascii_case(&sticker_ref.plaintext_sha256)
+                }) else {
+                    tracing::debug!(
+                        coordinate,
+                        shortcode = %sticker_ref.shortcode,
+                        "sticker ref prefetch: ref not in latest pack"
+                    );
+                    continue;
+                };
+                let fetched = cancel_on_wiped_session(
+                    &sticker_cache,
+                    fetch_sticker_image_singleflight(
+                        &image_gates,
+                        &sticker_cache,
+                        &sticker.url,
+                        &sticker.sha256,
+                        STICKER_PREFETCH_DOWNLOAD_BYTES,
+                        "prefetch",
+                    ),
+                )
+                .await;
+                match fetched {
+                    None => return,
+                    Some(Err(err)) => {
+                        tracing::debug!(%err, coordinate, "sticker ref prefetch: image fetch failed");
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
         });
     }
 
@@ -4106,6 +4348,7 @@ impl SonarClient {
         let mut report = MarmotProcessReport::default();
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
+        let mut sticker_refs: Vec<StickerRef> = Vec::new();
         let group_names: HashMap<Vec<u8>, String> = self
             .engine
             .groups()
@@ -4235,6 +4478,9 @@ impl SonarClient {
                 }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
+                    if let Some(sticker_ref) = &message.sticker_ref {
+                        sticker_refs.push(sticker_ref.clone());
+                    }
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());
@@ -4299,6 +4545,14 @@ impl SonarClient {
             }
         }
         self.notify_conversations_changed(&changed_groups);
+        // Signal-style receive-time warming: sticker attachments referenced by
+        // freshly processed messages download in the background now, so opening
+        // the chat later paints them from the local disk cache instead of doing
+        // relay + Blossom round-trips at render time.
+        self.spawn_sticker_refs_prefetch(sticker_prefetch_batch(
+            sticker_refs,
+            STICKER_REF_PREFETCH_BATCH_LIMIT,
+        ));
         (report, notifications)
     }
 
@@ -5721,6 +5975,113 @@ mod tests {
         let prefetch_limit = std::hint::black_box(STICKER_PREFETCH_DOWNLOAD_BYTES);
         assert_eq!(prefetch_limit, MAX_STICKER_CACHE_BYTES);
         assert!(prefetch_limit < MAX_MEDIA_DOWNLOAD_BYTES);
+    }
+
+    fn prefetch_ref(identifier: &str, shortcode: &str, sha_seed: u8) -> StickerRef {
+        StickerRef::new(
+            PackAddress::new("11".repeat(32), identifier).unwrap(),
+            shortcode,
+            format!("{:02x}", sha_seed).repeat(32),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sticker_prefetch_batch_dedups_full_reference_case_insensitively() {
+        let duplicate_upper = StickerRef::new(
+            PackAddress::new("11".repeat(32), "pack").unwrap(),
+            "wave",
+            "AA".repeat(32),
+        )
+        .unwrap();
+        let batch = sticker_prefetch_batch(
+            vec![
+                prefetch_ref("pack", "wave", 0xaa),
+                duplicate_upper,
+                prefetch_ref("pack", "wave", 0xbb),
+                prefetch_ref("other", "wave", 0xaa),
+            ],
+            16,
+        );
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch[0].plaintext_sha256, "aa".repeat(32));
+        assert_eq!(batch[1].plaintext_sha256, "bb".repeat(32));
+        assert_eq!(batch[2].pack.identifier, "other");
+    }
+
+    #[test]
+    fn sticker_prefetch_batch_caps_scheduled_work() {
+        let refs: Vec<StickerRef> = (0..64)
+            .map(|i| prefetch_ref("pack", &format!("s{i}"), i as u8))
+            .collect();
+        let batch = sticker_prefetch_batch(refs, STICKER_REF_PREFETCH_BATCH_LIMIT);
+        assert_eq!(batch.len(), STICKER_REF_PREFETCH_BATCH_LIMIT);
+        assert_eq!(batch[0].shortcode, "s0");
+    }
+
+    /// Pins the real client method the receive path calls, not a helper the
+    /// test feeds itself: the per-batch cap cannot bound a peer who simply
+    /// sends more batches, so cross-batch claiming is what stops duplicate
+    /// refs from stacking concurrent relay/HTTP work.
+    #[tokio::test]
+    async fn sticker_ref_prefetch_claims_are_cross_batch_and_released() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let first = prefetch_ref("pack", "wave", 0xaa);
+        let second = prefetch_ref("pack", "grin", 0xbb);
+
+        let batch_one = client.claim_sticker_refs_for_prefetch(vec![first.clone(), second.clone()]);
+        assert_eq!(batch_one.len(), 2, "first batch claims both refs");
+
+        // A peer re-sending the same stickers while batch one is in flight must
+        // not schedule the work again.
+        let batch_two = client.claim_sticker_refs_for_prefetch(vec![first.clone(), second.clone()]);
+        assert!(
+            batch_two.is_empty(),
+            "refs already in flight must not be claimed twice"
+        );
+
+        // A third ref still gets through — the bound is per-ref, not a global stall.
+        let third = prefetch_ref("pack", "shrug", 0xcc);
+        assert_eq!(
+            client
+                .claim_sticker_refs_for_prefetch(vec![first.clone(), third.clone()])
+                .len(),
+            1,
+            "only the unclaimed ref is scheduled"
+        );
+
+        drop(StickerRefPrefetchClaim::new(
+            client.sticker_ref_prefetch_inflight.clone(),
+            &[first.clone(), second, third],
+        ));
+        assert_eq!(
+            client.claim_sticker_refs_for_prefetch(vec![first]).len(),
+            1,
+            "claims are released once the batch finishes"
+        );
+    }
+
+    /// Identity wipe must stop an in-flight receive prefetch rather than let it
+    /// run three 60s HTTP attempts to completion on a dead session.
+    #[tokio::test]
+    async fn cancel_on_wiped_session_abandons_inflight_fetch_after_wipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = crate::sticker_cache::StickerCache::for_db(&db).unwrap();
+
+        // A fetch that never resolves stands in for a stalled Blossom download.
+        let never = std::future::pending::<Result<Vec<u8>>>();
+        let wipe = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            crate::sticker_cache::wipe_sticker_cache_for_db(&db).unwrap();
+        };
+        let (outcome, ()) = tokio::join!(cancel_on_wiped_session(&cache, never), wipe);
+        assert!(
+            outcome.is_none(),
+            "a wiped session must abandon the in-flight fetch"
+        );
     }
 
     #[tokio::test]

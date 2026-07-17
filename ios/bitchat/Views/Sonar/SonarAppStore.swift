@@ -5818,8 +5818,11 @@ final class SonarAppStore: ObservableObject {
         await marmot.fetchStickerImage(url: url, expectedSha256: expectedSha256)
     }
 
-    func stickerImageData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
-        await marmot.stickerData(for: ref)
+    func stickerImageData(
+        for ref: MarmotService.MarmotStickerRef,
+        userInitiated: Bool = false
+    ) async -> Data? {
+        await marmot.stickerData(for: ref, userInitiated: userInitiated)
     }
 
     func fetchInstalledPacks() async -> [String]? {

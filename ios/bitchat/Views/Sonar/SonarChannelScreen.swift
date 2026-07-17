@@ -99,7 +99,7 @@ struct SonarChannelScreen: View {
                         // we can't open a DM right now (honest "offline" signal).
                         showToast("\(m.author ?? "Questa persona") non \u{00E8} pi\u{00F9} nel canale")
                     }
-                }, loadSticker: { await store.stickerImageData(for: $0) },
+                }, loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                     onTapPack: { previewPackCoordinate = $0 })
             }
 
