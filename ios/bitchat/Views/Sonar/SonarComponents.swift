@@ -698,6 +698,35 @@ struct SNMediaPipeline {
     )
 }
 
+/// Signal keeps a reader at the tail pinned there through layout changes —
+/// keyboard show, composer growth, window resize — and only the user's own
+/// scroll may unpin (Signal-iOS decides on "was scrolled to bottom before the
+/// inset change" and re-pins inside the keyboard transition itself). A
+/// top-anchored SwiftUI ScrollView instead keeps its first visible row when
+/// the viewport shrinks, and the bottom sentinel's `onDisappear` fires as the
+/// keyboard covers it — so live "near bottom" state cannot tell layout theft
+/// from a user scroll-away. This latch is the iOS mirror of the Android
+/// `TranscriptTailPinner`: it captures at-tail state when a viewport change
+/// begins and keeps demanding re-pins until the sentinel lands back in view.
+struct SNTailPinLatch {
+    private(set) var latched = false
+
+    /// The bottom sentinel became visible again: the reader is at the tail
+    /// and any in-flight pin has delivered. Drop the latch so a later genuine
+    /// scroll-away is respected.
+    mutating func tailVisible() { latched = false }
+
+    /// A viewport change is starting or continuing (keyboard will show, the
+    /// list height shrank). Returns true when the transcript must re-anchor
+    /// its tail. `isNearBottom` may already be false mid-transition because
+    /// the shrink itself covered the sentinel — the latch carries the pin
+    /// across those frames.
+    mutating func viewportWillShrink(isNearBottom: Bool) -> Bool {
+        if isNearBottom { latched = true }
+        return latched
+    }
+}
+
 struct SNMsgList: View {
     let msgs: [SNMessage]
     let showAuthors: Bool
@@ -744,6 +773,12 @@ struct SNMsgList: View {
     /// event is a call/pay control row). Ends the pending-anchor state so tail
     /// following is not suppressed for the rest of the open.
     @State private var unreadAnchorAbandoned = false
+    /// Keeps the tail pinned through viewport shrinks (keyboard, composer
+    /// growth, window resize) even while the shrink hides the bottom sentinel.
+    @State private var tailPin = SNTailPinLatch()
+    /// Last observed list viewport height; a decrease is a shrink to re-pin
+    /// against. Seeded in onAppear — onChange alone misses the first shrink.
+    @State private var viewportHeight: CGFloat = 0
 
     /// True once the visible rows have caught up with the newest message the
     /// core index knows across the chat's folded sources. A mesh chat paints
@@ -876,6 +911,7 @@ struct SNMsgList: View {
                             .onAppear {
                                 isNearBottom = true
                                 hasReachedBottomOnce = true
+                                tailPin.tailVisible()
                                 guard hasLeftBottom, let loadNewest, !isLoadingNewest else { return }
                                 isLoadingNewest = true
                                 Task { @MainActor in
@@ -891,6 +927,7 @@ struct SNMsgList: View {
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
                 }
                 .onAppear {
+                    viewportHeight = geo.size.height
                     // Signal parity: an unread chat opens at the first unread
                     // row (divider at the top of the viewport); a fully-read
                     // chat opens pinned at the newest message.
@@ -951,16 +988,17 @@ struct SNMsgList: View {
                 #if canImport(UIKit)
                 // The keyboard shrinking the viewport must not hide the newest
                 // messages when the reader is at the tail (Signal keeps the
-                // transcript pinned under the composer). Matches the Android
-                // TranscriptTailPinner IME behavior. Pin twice: once as the
-                // keyboard starts and once after its ~0.25s animation settles —
-                // a single immediate scroll lands on pre-shrink viewport
-                // metrics and still leaves the tail behind the keyboard.
+                // transcript pinned under the composer). The notification only
+                // latches the pre-shrink at-tail state and starts an animated
+                // follow; the settle-correct pin is owned by the viewport
+                // geometry change below — a timer cannot know when the shrink
+                // actually lands, and the sentinel's onDisappear flips
+                // isNearBottom false the moment the keyboard covers it.
                 .onReceive(NotificationCenter.default.publisher(
                     for: UIResponder.keyboardWillShowNotification
                 )) { _ in
-                    guard isNearBottom else { return }
-                    let pin = {
+                    guard tailPin.viewportWillShrink(isNearBottom: isNearBottom) else { return }
+                    DispatchQueue.main.async {
                         if reduceMotion {
                             proxy.scrollTo("sn-bottom", anchor: .bottom)
                         } else {
@@ -969,10 +1007,22 @@ struct SNMsgList: View {
                             }
                         }
                     }
-                    DispatchQueue.main.async(execute: pin)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: pin)
                 }
                 #endif
+                // Any list-viewport shrink — each keyboard layout step, the
+                // composer growing a line, a macOS window resize — re-anchors
+                // the tail while the reader is pinned there. Matches the
+                // Android TranscriptTailPinner: layout may never steal a
+                // fully visible tail; only the user's scroll unpins.
+                .onChange(of: geo.size.height) { newHeight in
+                    let previous = viewportHeight
+                    viewportHeight = newHeight
+                    guard previous > 0, newHeight < previous else { return }
+                    guard tailPin.viewportWillShrink(isNearBottom: isNearBottom) else { return }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo("sn-bottom", anchor: .bottom)
+                    }
+                }
             }
         }
     }

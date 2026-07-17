@@ -259,6 +259,29 @@ invalidation for verified peer/profile changes.
   change-only, event bursts conflated, and native snapshot reads off-main.
 
 ---
+## R-009 — Layout must never steal a pinned transcript tail
+
+**Invariant:** While the reader is at the transcript tail, a layout-driven viewport shrink (keyboard opening, composer growing a line, window resize) must keep the newest message visible above the fold; only the user's own scroll may unpin. In particular, "am I at the bottom" state that the shrink itself invalidates (the bottom sentinel disappearing under the keyboard) must not gate the re-pin.
+
+**Breaks as:** Opening the keyboard hides the last screenful of messages behind the IME; once it has happened, later keyboard opens in the same chat do nothing (the sentinel-based near-bottom flag stays false).
+
+**Why:** Both list stacks are top-anchored: a viewport shrink keeps the first visible row, not the last. And both platforms' "near bottom" signals are themselves consumed by the shrink — Compose's `tailFullyVisible` and iOS's `sn-bottom` sentinel `onDisappear` flip false the moment the keyboard covers the tail — so a guard on the live value stops re-pinning exactly when the pin is needed. Timers (the #303 iOS fix pinned at now/+0.35s) lose to whatever settles after them.
+
+**Call sites:** iOS `SonarComponents.swift::SNMsgList` (`SNTailPinLatch` + the `geo.size.height` onChange + `keyboardWillShowNotification`); Compose `App.kt::TranscriptTailPinning` (`TranscriptTailPinner.onFrame`).
+
+**Guarded by:** `SNTailPinLatchTests.shrinkKeepsPinningWhileSentinelIsCovered`
+
+**Also guarded by:** `SNTailPinLatchTests.userScrollAwayIsRespectedAfterTailReturns`, `SNTailPinLatchTests.anchoredOpenNeverPins`, `TranscriptTailPinnerTest` and `TranscriptTailPinningUiTest` (Compose, real `LazyListState` wiring).
+
+**Coverage (honest):** The Swift tests pin only the latch decision — a helper the SwiftUI body feeds itself, exactly the shape rule 2 warns about; nothing exercises the `GeometryReader`/`ScrollViewReader` wiring or that `scrollTo` actually lands (and iOS tests do not run in CI). The Compose UI test is the stronger guard. A raced/failed pin on iOS is only caught by eye.
+
+**History:** #283 (Compose) -> #303 (iOS, notification + fixed delays; incomplete) -> this fix (latch + viewport-geometry re-pin).
+
+**Rejected:**
+- *Fixed-delay double pin after `keyboardWillShow` (#303).* The 0.35s timer races the safe-area animation and anything that settles later (late transport-leg merge, sticker/media decode); one lost race also strands `isNearBottom` at false, disabling every later keyboard open.
+- *`defaultScrollAnchor(.bottom)`.* iOS 17+ only (deployment target is 16.0), and it would fight the unread-anchor open, which deliberately starts in history.
+- *Flipping the ScrollView 180°.* Structurally bottom-anchored, but inverts every gesture/accessibility behaviour and would rewrite the whole transcript surface.
+
 
 ## Unguarded
 
