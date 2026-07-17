@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -31,6 +32,10 @@ const MANIFEST_KEY_SALT: &[u8] = b"sonar-media-outbox-key-v1";
 const MANIFEST_KEY_INFO: &[u8] = b"encrypted upload manifest";
 const MANIFEST_AAD: &[u8] = b"sonar-media-outbox-manifest-v1";
 const SOURCE_AAD_PREFIX: &[u8] = b"sonar-media-outbox-source-v1";
+
+type SharedMediaOutboxEntry = (Weak<Mutex<MediaOutbox>>, [u8; 32]);
+static SHARED_MEDIA_OUTBOXES: LazyLock<Mutex<HashMap<PathBuf, SharedMediaOutboxEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct MediaOutboxDisk {
@@ -162,6 +167,32 @@ pub(crate) struct MediaOutbox {
 }
 
 impl MediaOutbox {
+    /// Reuse one manifest snapshot and lock for every node opened over the same
+    /// database. Hosts briefly overlap a local-only and relay-backed node during
+    /// local-first startup; independent snapshots could otherwise overwrite the
+    /// same `manifest.enc.tmp` or recover one request twice.
+    pub(crate) fn open_shared(db_path: &Path, db_key: [u8; 32]) -> Result<Arc<Mutex<Self>>> {
+        let registry_key = fs::canonicalize(db_path).unwrap_or_else(|_| db_path.to_path_buf());
+        let manifest_key = derive_manifest_key(&db_key)?;
+        let mut registry = SHARED_MEDIA_OUTBOXES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, (outbox, _)| outbox.strong_count() > 0);
+        if let Some((outbox, registered_key)) = registry.get(&registry_key) {
+            if registered_key != &manifest_key {
+                return Err(Error::Storage(
+                    "media outbox already open with a different database key".into(),
+                ));
+            }
+            if let Some(outbox) = outbox.upgrade() {
+                return Ok(outbox);
+            }
+        }
+        let outbox = Arc::new(Mutex::new(Self::open(db_path, db_key)?));
+        registry.insert(registry_key, (Arc::downgrade(&outbox), manifest_key));
+        Ok(outbox)
+    }
+
     pub fn open(db_path: &Path, db_key: [u8; 32]) -> Result<Self> {
         let dir = media_outbox_dir_for_db(db_path);
         let key = derive_manifest_key(&db_key)?;
@@ -897,6 +928,17 @@ mod tests {
         assert!(job.items.is_empty(), "MIP-04 preparation has not started");
         assert_eq!(reloaded.load_source("request", 0).unwrap(), first);
         assert_eq!(reloaded.load_source("request", 1).unwrap(), second);
+    }
+
+    #[test]
+    fn nodes_for_one_database_share_the_media_manifest_and_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let first = MediaOutbox::open_shared(&db, [4_u8; 32]).unwrap();
+        let second = MediaOutbox::open_shared(&db, [4_u8; 32]).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(MediaOutbox::open_shared(&db, [5_u8; 32]).is_err());
     }
 
     #[test]

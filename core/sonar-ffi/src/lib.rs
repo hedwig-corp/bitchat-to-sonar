@@ -539,6 +539,7 @@ impl SonarNode {
             .iter()
             .map(|u| RelayUrl::parse(u).map_err(invalid("relay url")))
             .collect::<FfiResult<Vec<_>>>()?;
+        let should_recover_media = !relays.is_empty();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -550,13 +551,15 @@ impl SonarNode {
             &db_path,
             db_key,
         ))?);
-        // Upload recovery is deliberately detached from construction: opening
-        // an existing chat still paints from SQLCipher immediately, while the
-        // network transfer continues on the node runtime.
-        let retry_client = client.clone();
-        runtime.spawn(async move {
-            retry_client.retry_media_uploads().await;
-        });
+        // Relay-backed recovery is detached from construction so chat paint
+        // remains local-first. A temporary local-only node must not recover:
+        // both hosts replace it with a relay-backed node over the same DB.
+        if should_recover_media {
+            let retry_client = client.clone();
+            runtime.spawn(async move {
+                retry_client.retry_media_uploads().await;
+            });
+        }
         Ok(Arc::new(Self {
             runtime,
             client,

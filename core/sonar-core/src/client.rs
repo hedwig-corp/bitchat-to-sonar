@@ -149,6 +149,11 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
+static MEDIA_UPLOAD_GATES: LazyLock<
+    tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+static MEDIA_UPLOAD_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MEDIA_UPLOAD_CONCURRENCY));
 static MEDIA_DOWNLOAD_PERMITS: LazyLock<tokio::sync::Semaphore> =
     LazyLock::new(|| tokio::sync::Semaphore::new(MEDIA_DOWNLOAD_CONCURRENCY));
 static ACTIVE_MEDIA_DOWNLOAD_PARTIALS: LazyLock<Mutex<HashSet<PathBuf>>> =
@@ -1780,12 +1785,6 @@ pub struct SonarClient {
     /// manifest is encrypted with a key derived from the SQLCipher key; blobs
     /// are already MIP-04 ciphertext. Disabled for in-memory clients.
     media_outbox: Arc<Mutex<MediaOutbox>>,
-    /// Per-request single-flight gates prevent duplicate work for one retry id
-    /// without making an old stalled upload block unrelated conversations.
-    media_upload_gates: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
-    /// Bound simultaneous network uploads for phone memory/radio pressure. A
-    /// new send is journaled before waiting for a permit, so it remains durable.
-    media_upload_permits: Arc<tokio::sync::Semaphore>,
     /// Per-URL single-flight gates protect the content-addressed resume file
     /// when two views request the same attachment concurrently.
     media_download_gates: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
@@ -1915,7 +1914,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
-            MediaOutbox::open(db_path, db_key)?,
+            MediaOutbox::open_shared(db_path, db_key)?,
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             StickerCache::for_db(db_path)?,
@@ -1942,7 +1941,7 @@ impl SonarClient {
             false,
             None,
             None,
-            MediaOutbox::disabled(),
+            Arc::new(Mutex::new(MediaOutbox::disabled())),
             None,
             None,
             StickerCache::disabled(),
@@ -1958,7 +1957,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
-        media_outbox: MediaOutbox,
+        media_outbox: Arc<Mutex<MediaOutbox>>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         sticker_cache: StickerCache,
@@ -2329,9 +2328,7 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
-            media_outbox: Arc::new(Mutex::new(media_outbox)),
-            media_upload_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            media_upload_permits: Arc::new(tokio::sync::Semaphore::new(MEDIA_UPLOAD_CONCURRENCY)),
+            media_outbox,
             media_download_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_marmot_giftwraps,
             pending_marmot_groups,
@@ -4287,7 +4284,7 @@ impl SonarClient {
     }
 
     async fn media_upload_gate(&self, request_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut gates = self.media_upload_gates.lock().await;
+        let mut gates = MEDIA_UPLOAD_GATES.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
         if let Some(gate) = gates.get(request_id).and_then(Weak::upgrade) {
             return gate;
@@ -4327,12 +4324,14 @@ impl SonarClient {
                 .checkpoint_completed_message(request_id, message_id)?;
             return Ok(());
         }
-        self.prepare_media_upload_job(request_id).await?;
-        let _network_permit = self
-            .media_upload_permits
+        // Preparation can briefly hold a plaintext and ciphertext copy. Bound
+        // it together with network work so startup cannot prepare every queued
+        // video concurrently before reaching the upload scheduler.
+        let _network_permit = MEDIA_UPLOAD_PERMITS
             .acquire()
             .await
             .map_err(|_| Error::Storage("media upload scheduler is closed".into()))?;
+        self.prepare_media_upload_job(request_id).await?;
         for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
             let mut job = self
                 .media_outbox
@@ -4521,6 +4520,9 @@ impl SonarClient {
     /// this in the background after opening the local database or reattaching
     /// relays, so chat first-paint never waits for media network I/O.
     pub async fn retry_media_uploads(&self) {
+        if self.relays.is_empty() {
+            return;
+        }
         let request_ids = self.media_outbox.lock().unwrap().job_ids();
         let mut retries = FuturesUnordered::new();
         for request_id in request_ids {
@@ -6999,8 +7001,11 @@ mod tests {
         let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
             .await
             .expect("client");
+        let replacement = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("replacement client");
         let first = client.media_upload_gate("request-a").await;
-        let same = client.media_upload_gate("request-a").await;
+        let same = replacement.media_upload_gate("request-a").await;
         let unrelated = client.media_upload_gate("request-b").await;
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &unrelated));
@@ -7018,6 +7023,20 @@ mod tests {
                 .is_err(),
             "the same retry id must remain single-flight"
         );
+    }
+
+    #[tokio::test]
+    async fn media_upload_scheduler_bounds_preparation_and_network_together() {
+        let first = MEDIA_UPLOAD_PERMITS.acquire().await.unwrap();
+        let second = MEDIA_UPLOAD_PERMITS.acquire().await.unwrap();
+        assert_eq!(MEDIA_UPLOAD_PERMITS.available_permits(), 0);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), MEDIA_UPLOAD_PERMITS.acquire())
+                .await
+                .is_err(),
+            "a third queued job must wait before allocating preparation ciphertext"
+        );
+        drop((first, second));
     }
 
     #[tokio::test]
@@ -7062,6 +7081,19 @@ mod tests {
                 &[(data.as_slice(), "video/mp4", "clip.mp4")],
             )
             .unwrap();
+
+        client.retry_media_uploads().await;
+        assert!(
+            client
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(&request_id)
+                .unwrap()
+                .items
+                .is_empty(),
+            "the temporary local-only node must leave recovery to its relay-backed replacement"
+        );
 
         client
             .prepare_media_upload_job(&request_id)
