@@ -198,6 +198,26 @@ roughly halves it. The ranking is stable across all three.)
 
 ---
 
+## R-007 — Return inserts a newline in every message composer
+
+**Invariant:** Message composers are multiline fields where Return inserts a newline; only the adjacent send button sends the draft.
+
+**Breaks as:** Return intermittently sends or dismisses the keyboard instead of inserting a newline, depending on the app surface and software keyboard.
+
+**Call sites:** Apple `SNMessageComposerField` (used by `ContentView`, `SNComposer`, and `MarmotConversationView`); Compose `MessageComposerTextField` (used by `ChatScreen`, `GeoDmScreen`, and `SonarChannelScreen`)
+
+**Guarded by:** `MessageComposerFieldUiTest.returnKeyInsertsNewlineInSharedComposer`
+
+**Coverage (honest):** The JVM UI test presses a real desktop Enter key against the shared Compose field and also pins `ImeAction.None`, so both the hardware-key path and the Android software-IME contract fail if the policy regresses. Apple routes every message composer through one SwiftUI field with `.submitLabel(.return)` and no submit handler, but iOS tests do not currently exercise software-keyboard input in CI.
+
+**History:** `a4a9e6a5e` made the composers multiline but left conflicting submit/default IME behavior -> #313 reported the intermittent Return failure -> #314 centralized and pinned the policy across both apps.
+
+**Rejected:**
+- *`ImeAction.Default` on Compose.* It is already `BasicTextField`'s effective default and lets the platform/keyboard choose the action, so it does not change the failing path.
+- *Fixing only the reported screen.* The issue did not identify a platform or conversation type, and the same product contract had diverged across six reachable composers.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

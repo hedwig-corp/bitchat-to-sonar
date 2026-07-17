@@ -3147,10 +3147,9 @@ struct MarmotConversationView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            TextField("Message", text: $draft, axis: .vertical)
+            SNMessageComposerField(text: $draft, prompt: Text("Message"))
                 .font(SonarTheme.uiFont(size: 16))
                 .textFieldStyle(.plain)
-                .lineLimit(1...5)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background(SonarTheme.surface2)
