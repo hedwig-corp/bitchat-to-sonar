@@ -287,6 +287,26 @@ private struct SNPendingMarmotGroup {
     let name: String
     let members: [String]
     let createdAt: Date
+    let inviteId: String?
+    let inviteGroupId: String?
+}
+
+private struct SNPendingMarmotRouteSend {
+    let id: String
+    let text: String
+}
+
+private struct SNResolvedMarmotSend {
+    let id: String
+    let text: String
+    let chatId: String?
+}
+
+private struct SNPendingMarmotRouteContext: Codable {
+    let name: String
+    let members: [String]
+    let inviteId: String?
+    let inviteGroupId: String?
 }
 
 private struct SNPendingMarmotSend {
@@ -606,6 +626,11 @@ final class SonarAppStore: ObservableObject {
     private static let capabilitySettleWindow: TimeInterval = 1.5
     private static let pendingMarmotDirectSendQueueLimit = 100
     private static let pendingMarmotGroupSendQueueLimit = 100
+    private static let preRouteDirectNpub = "direct-npub"
+    private static let preRouteGroupCreate = "group-create"
+    private static let preRouteGroupInvite = "group-invite"
+    private static let preRoutePeer = "peer"
+    private static let preRouteMarmotGroup = "marmot-group"
 
     static let marmotIDPrefix = "marmot:"
     /// Default domain for unified handles claimed through the app. Core owns
@@ -1105,8 +1130,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingMarmotGroupSetupTokens: [String: UUID] = [:]
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
-    private var pendingMarmotSends: [String: [String]] = [:]
+    private var pendingMarmotSends: [String: [SNPendingMarmotRouteSend]] = [:]
+    private var resolvedMarmotSends: [String: [SNResolvedMarmotSend]] = [:]
     private var pendingInviteLinks: [String] = []
+    private var restoredPreRouteMessages = false
     /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
     /// destination onAppear can both fire; only one local hydrate/sync pass per
     /// chat should run at a time.
@@ -1198,6 +1225,27 @@ final class SonarAppStore: ObservableObject {
         self.unify = unify
         self.unifyReceiver = unifyReceiver
         walletState = wallet.state
+
+        chatViewModel.messageRouter.configureDurableOutbox(
+            persist: { peerID, content, nickname, messageID, timestamp in
+                do {
+                    try marmot.enqueuePreRouteMessage(
+                        id: messageID,
+                        routeKind: Self.preRoutePeer,
+                        routeId: peerID.id,
+                        routeContext: nickname,
+                        content: content,
+                        createdAtSecs: UInt64(max(0, timestamp.timeIntervalSince1970))
+                    )
+                    return true
+                } catch {
+                    return false
+                }
+            },
+            complete: { messageID in
+                marmot.completePreRouteMessage(id: messageID)
+            }
+        )
 
         // Unify receiver (mirror role): serve an AMOUNTLESS BOLT12 offer behind
         // the user's nickname so a Unify user can pay us. The offer is fetched
@@ -1313,6 +1361,7 @@ final class SonarAppStore: ObservableObject {
                 self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
                 self.drainPendingInviteLinks()
+                self.resumePreRouteMessages()
                 guard !self.refreshedKnownDescriptorsForRelaySession else { return }
                 self.refreshedKnownDescriptorsForRelaySession = true
                 self.refreshKnownContactDescriptors(clearMisses: true)
@@ -1477,6 +1526,13 @@ final class SonarAppStore: ObservableObject {
     /// the coherent Home boundary so it cannot contend with first-paint reads.
     private func runPostLocalMarmotStartupIfReady() {
         guard marmot.initialLocalHomeReady, marmot.npub != nil else { return }
+        if !restoredPreRouteMessages {
+            restoredPreRouteMessages = true
+            restorePreRouteMessages()
+            if marmot.relayConnected {
+                DispatchQueue.main.async { [weak self] in self?.resumePreRouteMessages() }
+            }
+        }
         // The wallet derives from the same identity; retry its deferred setup.
         #if os(iOS) || os(macOS)
         (wallet as? BridgedWallet)?.retrySetup()
@@ -4513,6 +4569,153 @@ final class SonarAppStore: ObservableObject {
     /// DM routing uses Bluetooth only while a Sonar peer is directly connected;
     /// retained mesh reachability means the direct BLE leg already dropped, so
     /// the conversation continues over White Noise.
+    private func journalPreRoute(
+        id: String,
+        routeKind: String,
+        routeId: String,
+        routeContext: String,
+        content: String,
+        createdAt: Date
+    ) -> Bool {
+        do {
+            try marmot.enqueuePreRouteMessage(
+                id: id,
+                routeKind: routeKind,
+                routeId: routeId,
+                routeContext: routeContext,
+                content: content,
+                createdAtSecs: UInt64(max(0, createdAt.timeIntervalSince1970))
+            )
+            return true
+        } catch {
+            showToast("Couldn't save the outgoing message. Try again.")
+            return false
+        }
+    }
+
+    private func discardPreRouteMessages(matching routeKeys: Set<String>) {
+        guard !routeKeys.isEmpty else { return }
+        for record in marmot.preRouteMessages()
+        where routeKeys.contains(record.routeId) || routeKeys.contains(record.routeContext) {
+            marmot.completePreRouteMessage(id: record.id)
+        }
+    }
+
+    private func encodedPreRouteGroupContext(_ pending: SNPendingMarmotGroup) -> String? {
+        let context = SNPendingMarmotRouteContext(
+            name: pending.name,
+            members: pending.members,
+            inviteId: pending.inviteId,
+            inviteGroupId: pending.inviteGroupId
+        )
+        guard let data = try? JSONEncoder().encode(context) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func restorePreRouteMessages() {
+        for record in marmot.preRouteMessages() {
+            let createdAt = Date(timeIntervalSince1970: TimeInterval(record.createdAtSecs))
+            switch record.routeKind {
+            case Self.preRouteDirectNpub:
+                let clean = SNMarmotProfileCache.canonicalKey(record.routeId)
+                if record.routeContext.hasPrefix(Self.pendingMarmotIDPrefix) {
+                    let pendingId = record.routeContext
+                    pendingMarmotChats[pendingId] = pendingMarmotChats[pendingId]
+                        ?? SNPendingMarmotChat(npub: clean, createdAt: createdAt)
+                    if pendingMarmotMessagesByChat[pendingId, default: []].contains(where: { $0.id == record.id }) == false {
+                        pendingMarmotMessagesByChat[pendingId, default: []].append(
+                            pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
+                        )
+                    }
+                    if pendingDirectMarmotSends[clean, default: []].contains(where: { $0.messageId == record.id }) == false {
+                        pendingDirectMarmotSends[clean, default: []].append(
+                            SNPendingMarmotSend(chatId: pendingId, text: record.content, messageId: record.id)
+                        )
+                    }
+                } else if pendingMarmotSends[clean, default: []].contains(where: { $0.id == record.id }) == false {
+                    pendingMarmotSends[clean, default: []].append(
+                        SNPendingMarmotRouteSend(id: record.id, text: record.content)
+                    )
+                }
+            case Self.preRouteGroupCreate, Self.preRouteGroupInvite:
+                guard let data = record.routeContext.data(using: .utf8),
+                      let context = try? JSONDecoder().decode(SNPendingMarmotRouteContext.self, from: data)
+                else { continue }
+                pendingMarmotGroups[record.routeId] = pendingMarmotGroups[record.routeId]
+                    ?? SNPendingMarmotGroup(
+                        name: context.name,
+                        members: context.members,
+                        createdAt: createdAt,
+                        inviteId: context.inviteId,
+                        inviteGroupId: context.inviteGroupId
+                    )
+                if pendingMarmotMessagesByChat[record.routeId, default: []].contains(where: { $0.id == record.id }) == false {
+                    pendingMarmotMessagesByChat[record.routeId, default: []].append(
+                        pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
+                    )
+                }
+                if pendingMarmotGroupSends[record.routeId, default: []].contains(where: { $0.messageId == record.id }) == false {
+                    pendingMarmotGroupSends[record.routeId, default: []].append(
+                        SNPendingMarmotGroupSend(text: record.content, messageId: record.id)
+                    )
+                }
+            case Self.preRoutePeer:
+                chatViewModel.messageRouter.restoreQueuedMessage(
+                    content: record.content,
+                    peerID: PeerID(str: record.routeId),
+                    recipientNickname: record.routeContext,
+                    messageID: record.id,
+                    timestamp: createdAt
+                )
+            case Self.preRouteMarmotGroup:
+                let realId = Self.marmotIDPrefix + record.routeId
+                if pendingMarmotMessagesByChat[realId, default: []].contains(where: { $0.id == record.id }) == false {
+                    pendingMarmotMessagesByChat[realId, default: []].append(
+                        pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
+                    )
+                }
+                queueResolvedMarmotSend(
+                    groupId: record.routeId,
+                    id: record.id,
+                    text: record.content,
+                    chatId: realId
+                )
+            default:
+                break
+            }
+        }
+    }
+
+    private func resumePreRouteMessages() {
+        for (pendingId, pending) in pendingMarmotChats {
+            startSecureChatInBackground(npub: pending.npub, pendingId: pendingId)
+        }
+        for (pendingId, pending) in pendingMarmotGroups {
+            if let inviteId = pending.inviteId {
+                let expectedGroupId = pending.inviteGroupId
+                    ?? marmot.pendingGroupInvites.first(where: { $0.id == inviteId })?.groupId
+                if let expectedGroupId {
+                    startPendingMarmotGroupAccept(
+                        pendingId: pendingId,
+                        inviteId: inviteId,
+                        expectedGroupId: expectedGroupId
+                    )
+                }
+            } else {
+                startPendingMarmotGroupCreation(pendingId: pendingId)
+            }
+        }
+        for npub in pendingMarmotSends.keys {
+            if marmotGroup(forNpub: npub) != nil {
+                flushPendingMarmotSends()
+            } else {
+                startMarmotRouteInBackground(npub: npub)
+            }
+        }
+        flushResolvedMarmotSends()
+        chatViewModel.messageRouter.flushAllOutbox()
+    }
+
     func dmTransport(_ id: String) -> SNVia {
         if meshReachable(id) { return .mesh }
         return .internet
@@ -4589,33 +4792,37 @@ final class SonarAppStore: ObservableObject {
         }
 
         if let groupId {
-            let onEchoVisible: () -> Void = { [weak self] in
-                self?.removePendingMarmotMessage(message.id)
-            }
-            let onFailure: () -> Void = { [weak self] in
-                self?.restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
-            }
-            if let ref = message.stickerRef {
-                marmot.sendSticker(
-                    groupId: groupId,
-                    packCoordinate: ref.packCoordinate,
-                    shortcode: ref.shortcode,
-                    plaintextSha256: ref.plaintextSha256,
-                    onEchoVisible: onEchoVisible
-                )
-            } else {
-                marmot.send(
-                    content,
-                    to: groupId,
-                    onEchoVisible: onEchoVisible,
-                    onFailure: onFailure
-                )
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if await self.sendQueuedMarmotContent(content, to: groupId) {
+                    self.marmot.completePreRouteMessage(id: message.id)
+                    self.removePendingMarmotMessage(message.id)
+                } else {
+                    self.queueResolvedMarmotSend(
+                        groupId: groupId,
+                        id: message.id,
+                        text: content,
+                        chatId: source.key
+                    )
+                    self.restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                }
             }
             return
         }
 
         if let npub = pendingMarmotNpub(for: id) {
             let clean = SNMarmotProfileCache.canonicalKey(npub)
+            guard journalPreRoute(
+                id: message.id,
+                routeKind: Self.preRouteDirectNpub,
+                routeId: clean,
+                routeContext: id,
+                content: content,
+                createdAt: source.message.sortDate ?? Date()
+            ) else {
+                restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                return
+            }
             pendingMarmotChats[id] = pendingMarmotChats[id]
                 ?? SNPendingMarmotChat(npub: clean, createdAt: source.message.sortDate ?? Date())
             var queue = pendingDirectMarmotSends[clean, default: []]
@@ -4635,6 +4842,20 @@ final class SonarAppStore: ObservableObject {
         }
 
         if isPendingMarmotGroup(id) {
+            guard let pending = pendingMarmotGroups[id],
+                  let context = encodedPreRouteGroupContext(pending),
+                  journalPreRoute(
+                    id: message.id,
+                    routeKind: pending.inviteId == nil ? Self.preRouteGroupCreate : Self.preRouteGroupInvite,
+                    routeId: id,
+                    routeContext: context,
+                    content: content,
+                    createdAt: source.message.sortDate ?? Date()
+                  )
+            else {
+                restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                return
+            }
             var queue = pendingMarmotGroupSends[id, default: []]
             queue.removeAll { $0.messageId == message.id }
             queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id))
@@ -4646,7 +4867,16 @@ final class SonarAppStore: ObservableObject {
                 showToast("Still setting up this group - wait before retrying more.")
             }
             pendingMarmotGroupSends[id] = queue
-            startPendingMarmotGroupCreation(pendingId: id)
+            if let inviteId = pending.inviteId,
+               let expectedGroupId = pending.inviteGroupId {
+                startPendingMarmotGroupAccept(
+                    pendingId: id,
+                    inviteId: inviteId,
+                    expectedGroupId: expectedGroupId
+                )
+            } else if pending.inviteId == nil {
+                startPendingMarmotGroupCreation(pendingId: id)
+            }
             return
         }
 
@@ -4760,9 +4990,20 @@ final class SonarAppStore: ObservableObject {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
-        pendingMarmotSends[npub, default: []].append(encoded)
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let id = "pre-route-\(UUID().uuidString)"
+        let createdAt = Date()
+        guard journalPreRoute(
+            id: id,
+            routeKind: Self.preRouteDirectNpub,
+            routeId: clean,
+            routeContext: "",
+            content: encoded,
+            createdAt: createdAt
+        ) else { return }
+        pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: encoded))
         marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        startMarmotRouteInBackground(npub: clean)
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -4770,9 +5011,31 @@ final class SonarAppStore: ObservableObject {
             marmot.send(text, to: group.id)
             return
         }
-        pendingMarmotSends[npub, default: []].append(text)
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let id = "pre-route-\(UUID().uuidString)"
+        let createdAt = Date()
+        guard journalPreRoute(
+            id: id,
+            routeKind: Self.preRouteDirectNpub,
+            routeId: clean,
+            routeContext: "",
+            content: text,
+            createdAt: createdAt
+        ) else { return }
+        pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: text))
         marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        startMarmotRouteInBackground(npub: clean)
+    }
+
+    private func startMarmotRouteInBackground(npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        guard startingMarmotChats.insert(clean).inserted else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.startingMarmotChats.remove(clean) }
+            guard await self.marmot.startChatReturningId(with: clean) != nil else { return }
+            self.flushPendingMarmotSends()
+        }
     }
 
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
@@ -4783,6 +5046,17 @@ final class SonarAppStore: ObservableObject {
         }
         let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
+        guard journalPreRoute(
+            id: message.id,
+            routeKind: Self.preRouteDirectNpub,
+            routeId: clean,
+            routeContext: chatId,
+            content: text,
+            createdAt: createdAt
+        ) else {
+            _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
+            return
+        }
         var queue = pendingDirectMarmotSends[clean, default: []]
         queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
         if queue.count > Self.pendingMarmotDirectSendQueueLimit {
@@ -4797,10 +5071,23 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func sendPendingMarmotGroup(_ text: String, chatId: String) {
-        guard isPendingMarmotGroup(chatId) else { return }
+        guard let pending = pendingMarmotGroups[chatId],
+              let context = encodedPreRouteGroupContext(pending)
+        else { return }
         let createdAt = Date()
         let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
+        guard journalPreRoute(
+            id: message.id,
+            routeKind: pending.inviteId == nil ? Self.preRouteGroupCreate : Self.preRouteGroupInvite,
+            routeId: chatId,
+            routeContext: context,
+            content: text,
+            createdAt: createdAt
+        ) else {
+            _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
+            return
+        }
         var queue = pendingMarmotGroupSends[chatId, default: []]
         queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
         if queue.count > Self.pendingMarmotGroupSendQueueLimit {
@@ -4888,9 +5175,8 @@ final class SonarAppStore: ObservableObject {
 
     private func failPendingSecureChat(pendingId: String, npub: String, setupToken: UUID? = nil) {
         guard isActivePendingSecureChatSetup(pendingId: pendingId, npub: npub, token: setupToken) else { return }
-        pendingMarmotChats[pendingId] = nil
         pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
-        let queued = pendingDirectMarmotSends.removeValue(forKey: npub) ?? []
+        let queued = pendingDirectMarmotSends[npub] ?? []
         let queuedIds = Set(queued.map(\.messageId))
         var messages = (pendingMarmotMessagesByChat[pendingId] ?? []).map {
             queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
@@ -4949,7 +5235,11 @@ final class SonarAppStore: ObservableObject {
         let setupTask = Task { @MainActor in
             defer { clearPendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) }
             do {
-                let groupId = try await marmot.startGroup(name: pending.name, members: pending.members)
+                let groupId = try await marmot.startGroup(
+                    name: pending.name,
+                    members: pending.members,
+                    operationId: pendingId
+                )
                 finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
@@ -4959,14 +5249,21 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSetupTasks[pendingId] = setupTask
     }
 
-    private func startPendingMarmotGroupAccept(pendingId: String, invite: MarmotService.GroupInvite) {
+    private func startPendingMarmotGroupAccept(
+        pendingId: String,
+        inviteId: String,
+        expectedGroupId: String
+    ) {
         guard pendingMarmotGroupSetupTasks[pendingId] == nil else { return }
         let setupToken = UUID()
         pendingMarmotGroupSetupTokens[pendingId] = setupToken
         let setupTask = Task { @MainActor in
             defer { clearPendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) }
             do {
-                let groupId = try await marmot.acceptGroupInvite(invite)
+                let groupId = try await marmot.acceptGroupInvite(
+                    inviteId: inviteId,
+                    expectedGroupId: expectedGroupId
+                )
                 finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
@@ -4998,12 +5295,10 @@ final class SonarAppStore: ObservableObject {
 
     private func failPendingMarmotGroup(pendingId: String, setupToken: UUID? = nil) {
         guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
-        pendingMarmotGroups[pendingId] = nil
         pendingMarmotRouteFailure = SNMarmotRouteFailure(pendingId: pendingId)
-        pendingMarmotGroupSends[pendingId] = nil
-        pendingMarmotMessagesByChat[pendingId] = nil
-        if currentDMId == pendingId {
-            pop()
+        let queuedIds = Set((pendingMarmotGroupSends[pendingId] ?? []).map(\.messageId))
+        pendingMarmotMessagesByChat[pendingId] = pendingMarmotMessagesByChat[pendingId]?.map {
+            queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
         }
     }
 
@@ -5063,14 +5358,30 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
+                do {
+                    try marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
+                } catch {
+                    pendingDirectMarmotSends[npub, default: []].append(item)
+                    pendingMarmotMessagesByChat[realId, default: []].append(failedPendingMessage(echo))
+                    showToast("Couldn't save the secure route. Try again.")
+                    continue
+                }
                 let ok = await sendQueuedMarmotContent(item.text, to: groupId)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
                 if !ok {
+                    queueResolvedMarmotSend(
+                        groupId: groupId,
+                        id: item.messageId,
+                        text: item.text,
+                        chatId: realId
+                    )
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
                     )
+                } else {
+                    marmot.completePreRouteMessage(id: item.messageId)
                 }
             }
         }
@@ -5091,14 +5402,30 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
+                do {
+                    try marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
+                } catch {
+                    pendingMarmotGroupSends[pendingId, default: []].append(item)
+                    pendingMarmotMessagesByChat[realId, default: []].append(failedPendingMessage(echo))
+                    showToast("Couldn't save the secure route. Try again.")
+                    continue
+                }
                 let ok = await sendQueuedMarmotContent(item.text, to: groupId)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
                 if !ok {
+                    queueResolvedMarmotSend(
+                        groupId: groupId,
+                        id: item.messageId,
+                        text: item.text,
+                        chatId: realId
+                    )
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
                     )
+                } else {
+                    marmot.completePreRouteMessage(id: item.messageId)
                 }
             }
         }
@@ -5118,19 +5445,69 @@ final class SonarAppStore: ObservableObject {
 
     private func flushPendingMarmotSends() {
         guard !pendingMarmotSends.isEmpty else { return }
-        for (npub, texts) in pendingMarmotSends {
+        for (npub, sends) in Array(pendingMarmotSends) {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for text in texts {
-                if let ref = meshParseStickerContent(content: text) {
-                    marmot.sendSticker(
-                        groupId: group.id,
-                        packCoordinate: ref.packCoordinate,
-                        shortcode: ref.shortcode,
-                        plaintextSha256: ref.plaintextSha256
-                    )
-                } else {
-                    marmot.send(text, to: group.id)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for send in sends {
+                    do {
+                        try self.marmot.resolvePreRouteMessage(id: send.id, groupId: group.id)
+                    } catch {
+                        self.pendingMarmotSends[npub, default: []].append(send)
+                        continue
+                    }
+                    if await self.sendQueuedMarmotContent(send.text, to: group.id) {
+                        self.marmot.completePreRouteMessage(id: send.id)
+                    } else {
+                        self.queueResolvedMarmotSend(
+                            groupId: group.id,
+                            id: send.id,
+                            text: send.text,
+                            chatId: nil
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func queueResolvedMarmotSend(groupId: String, id: String, text: String, chatId: String?) {
+        if resolvedMarmotSends[groupId, default: []].contains(where: { $0.id == id }) == false {
+            resolvedMarmotSends[groupId, default: []].append(
+                SNResolvedMarmotSend(id: id, text: text, chatId: chatId)
+            )
+        }
+    }
+
+    /// Replay is scheduled only after the local Home boundary. Each entry is
+    /// already checkpointed to a concrete group, so a restart does not repeat
+    /// direct/group setup.
+    private func flushResolvedMarmotSends() {
+        for (groupId, sends) in Array(resolvedMarmotSends) {
+            resolvedMarmotSends[groupId] = nil
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                for send in sends {
+                    if await self.sendQueuedMarmotContent(send.text, to: groupId) {
+                        self.marmot.completePreRouteMessage(id: send.id)
+                        if let chatId = send.chatId {
+                            self.pendingMarmotMessagesByChat[chatId]?.removeAll { $0.id == send.id }
+                        }
+                    } else {
+                        self.queueResolvedMarmotSend(
+                            groupId: groupId,
+                            id: send.id,
+                            text: send.text,
+                            chatId: send.chatId
+                        )
+                        if let chatId = send.chatId,
+                           let index = self.pendingMarmotMessagesByChat[chatId]?.firstIndex(where: { $0.id == send.id }) {
+                            self.pendingMarmotMessagesByChat[chatId]?[index] = self.failedPendingMessage(
+                                self.pendingMarmotMessagesByChat[chatId]![index]
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -6388,7 +6765,9 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
             name: cleanName,
             members: cleanMembers,
-            createdAt: Date()
+            createdAt: Date(),
+            inviteId: nil,
+            inviteGroupId: nil
         )
         marmot.connectIfNeeded()
         startPendingMarmotGroupCreation(pendingId: pendingId)
@@ -6407,12 +6786,18 @@ final class SonarAppStore: ObservableObject {
             pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
                 name: invite.groupName.isEmpty ? "Group chat" : invite.groupName,
                 members: [],
-                createdAt: Date()
+                createdAt: Date(),
+                inviteId: invite.id,
+                inviteGroupId: invite.groupId
             )
         }
         marmot.pendingGroupInvites.removeAll { $0.id == invite.id }
         marmot.connectIfNeeded()
-        startPendingMarmotGroupAccept(pendingId: pendingId, invite: invite)
+        startPendingMarmotGroupAccept(
+            pendingId: pendingId,
+            inviteId: invite.id,
+            expectedGroupId: invite.groupId
+        )
         return pendingId
     }
 
@@ -7442,12 +7827,14 @@ final class SonarAppStore: ObservableObject {
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
         if isPendingSecureChat(id) {
+            let pendingNpub = pendingMarmotNpub(for: id)
+            discardPreRouteMessages(matching: [id])
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
             pendingMarmotMessagesByChat[id] = nil
             pendingMarmotGroupSends[id] = nil
             cancelPendingMarmotGroupSetup(pendingId: id)
-            if let pendingNpub = pendingMarmotNpub(for: id) {
+            if let pendingNpub {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
@@ -7458,6 +7845,8 @@ final class SonarAppStore: ObservableObject {
             // resurface after the next refresh.
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
             let groupIds = matching.isEmpty ? [groupId] : matching
+            discardPreRouteMessages(matching: Set(groupIds))
+            groupIds.forEach { resolvedMarmotSends[$0] = nil }
             for gid in groupIds {
                 discardRetainedConversation(gid)
                 forgetMarmotGroupMappings(forGroupId: gid)
@@ -7470,11 +7859,14 @@ final class SonarAppStore: ObservableObject {
                 }
             }
         } else {
+            var discardedRoutes: Set<String> = [id]
             // Mesh / Sonar peer: delete the mesh transcript...
             chatViewModel.deleteConversation(with: PeerID(str: id))
             // ...and every folded White Noise leg, if this peer has any.
             if let profile = resolvedSonarProfile(id) {
                 let groups = marmotGroups(forNpub: profile.npub)
+                discardedRoutes.formUnion(groups.map(\.id))
+                discardedRoutes.insert(SNMarmotProfileCache.canonicalKey(profile.npub))
                 for g in groups {
                     discardRetainedConversation(g.id)
                     forgetMarmotGroupMappings(forGroupId: g.id)
@@ -7483,6 +7875,8 @@ final class SonarAppStore: ObservableObject {
                     Task { for g in groups { await marmot.deleteGroup(g.id) } }
                 }
             }
+            discardPreRouteMessages(matching: discardedRoutes)
+            discardedRoutes.forEach { resolvedMarmotSends[$0] = nil }
         }
         // If we're currently viewing this chat, return to the Messages list.
         path.removeAll { route in
@@ -7510,11 +7904,14 @@ final class SonarAppStore: ObservableObject {
         // with the SAME identity so new secure chats still work.
         Task { await marmot.eraseChatsKeepIdentity() }
         // Drop queued sends + pay-scan state that referenced the erased chats.
+        chatViewModel.messageRouter.clearOutbox(completingDurable: false)
+        marmot.clearPreRouteMessages()
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
         refreshingDMTasks.values.forEach { $0.cancel() }
         refreshingDMTasks = [:]
         pendingMarmotSends = [:]
+        resolvedMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         pendingMarmotMessagesByChat = [:]
@@ -7630,6 +8027,8 @@ final class SonarAppStore: ObservableObject {
         needsPaymentMetadataPublish = false
         refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
+        resolvedMarmotSends = [:]
+        chatViewModel.messageRouter.clearOutbox(completingDurable: false)
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         pendingMarmotMessagesByChat = [:]

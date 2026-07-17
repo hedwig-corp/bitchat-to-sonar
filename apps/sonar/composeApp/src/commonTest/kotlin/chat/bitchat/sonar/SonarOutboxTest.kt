@@ -59,4 +59,24 @@ class SonarOutboxTest {
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
     }
+
+    @Test
+    fun restoreIsIdempotentAndReestablishesTimestampOrder() {
+        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+        val later = QueuedMessage("later", "peer-1", "id-2", timestampSecs = 20)
+        val earlier = QueuedMessage("earlier", "peer-1", "id-1", timestampSecs = 10)
+
+        outbox.restore(later)
+        outbox.restore(earlier)
+        outbox.restore(later)
+
+        assertEquals(listOf("id-1", "id-2"), outbox.snapshot("peer-1").map { it.messageId })
+    }
+
+    @Test
+    fun preRouteContextRoundTripsDelimitersAndUnicode() {
+        val parts = listOf("group:name", "npub1peer", "Sarà 🚲")
+
+        assertEquals(parts, decodePreRouteContext(encodePreRouteContext(parts)))
+    }
 }

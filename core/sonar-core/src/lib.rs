@@ -18,12 +18,14 @@ pub mod mesh_engine;
 pub mod noise;
 pub mod notification;
 pub mod outbox;
+pub mod pre_route_outbox;
 pub mod push;
 pub mod relay_directory;
 pub mod sonar_descriptor;
 pub mod sticker_cache;
 
 pub use error::Error;
+pub use pre_route_outbox::PreRouteMessage;
 
 /// Re-exported so FFI/shell crates can name MLS group ids without depending
 /// on MDK directly.

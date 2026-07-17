@@ -47,6 +47,14 @@ internal class SonarOutbox(
         return OutboxEnqueueResult(message, evicted, queue.size)
     }
 
+    fun restore(message: QueuedMessage) {
+        val queue = queues.getOrPut(message.peerId) { mutableListOf() }
+        if (queue.none { it.messageId == message.messageId }) {
+            queue.add(message)
+            queue.sortBy { it.timestampSecs }
+        }
+    }
+
     fun isExpired(message: QueuedMessage, nowSecs: Long): Boolean =
         nowSecs - message.timestampSecs > ttlSecs
 

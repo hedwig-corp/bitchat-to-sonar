@@ -489,6 +489,60 @@ final class MarmotService: @unchecked Sendable {
         await readOnlyNonThrowing({ try? $0.syncStateSnapshotJson() }, default: nil)
     }
 
+    /// Tiny local-only write used on the send path before a White Noise route
+    /// exists. The core encrypts + fsyncs the bounded record with a key derived
+    /// from the SQLCipher key; no relay or MLS work runs here.
+    func enqueuePreRouteMessage(
+        id: String,
+        routeKind: String,
+        routeId: String,
+        routeContext: String,
+        content: String,
+        createdAtSecs: UInt64
+    ) throws {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        guard let current else { throw ServiceError.notConnected }
+        try current.enqueuePreRouteMessage(message: PreRouteMessageInfo(
+            id: id,
+            routeKind: routeKind,
+            routeId: routeId,
+            routeContext: routeContext,
+            content: content,
+            createdAtSecs: createdAtSecs
+        ))
+    }
+
+    func preRouteMessages() -> [PreRouteMessageInfo] {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        return current?.preRouteMessages() ?? []
+    }
+
+    func completePreRouteMessage(id: String) {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        try? current?.completePreRouteMessage(id: id)
+    }
+
+    func resolvePreRouteMessage(id: String, groupId: String) throws {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        guard let current else { throw ServiceError.notConnected }
+        try current.resolvePreRouteMessage(id: id, groupId: groupId)
+    }
+
+    func clearPreRouteMessages() {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        try? current?.clearPreRouteMessages()
+    }
+
     // MARK: - Marmot operations
 
     /// Publish our MLS KeyPackage (kind 30443) so peers can invite us.
@@ -617,6 +671,20 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    func startGroupIdempotent(
+        with members: [String],
+        name: String,
+        operationId: String
+    ) async throws -> String {
+        try await run {
+            try $0.requireNode().startGroupIdempotent(
+                members: members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                operationId: operationId
+            )
+        }
+    }
+
     /// Pending multi-member group invites awaiting explicit user action.
     func pendingGroupInvites() async throws -> [GroupInvite] {
         try await readOnly {
@@ -637,6 +705,15 @@ final class MarmotService: @unchecked Sendable {
     /// Accept a pending group invite. Returns the group id (hex).
     func acceptGroupInvite(_ inviteId: String) async throws -> String {
         try await run { try $0.requireNode().acceptGroupInvite(inviteIdHex: inviteId) }
+    }
+
+    func acceptGroupInviteIdempotent(_ inviteId: String, expectedGroupId: String) async throws -> String {
+        try await run {
+            try $0.requireNode().acceptGroupInviteIdempotent(
+                inviteIdHex: inviteId,
+                expectedGroupIdHex: expectedGroupId
+            )
+        }
     }
 
     /// Decline a pending group invite.

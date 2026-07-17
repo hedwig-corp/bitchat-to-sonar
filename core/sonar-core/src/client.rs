@@ -38,6 +38,7 @@ use crate::marmot::{
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
+use crate::pre_route_outbox::{pre_route_outbox_path_for_db, PreRouteMessage, PreRouteOutbox};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
@@ -107,6 +108,8 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
+const SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX: &str = "sonar.group-operation.v1:";
+const MAX_GROUP_OPERATION_ID_BYTES: usize = 512;
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -865,6 +868,14 @@ fn should_fetch_group_messages_on_sync(is_live: bool, force: bool, since_secs: u
     force && since_secs > 0
 }
 
+fn should_replace_group_subscription(
+    force: bool,
+    current: &HashSet<String>,
+    desired: &HashSet<String>,
+) -> bool {
+    force || current != desired
+}
+
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
 fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
     let mut dropped = false;
@@ -1349,6 +1360,10 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
+    /// Encrypted, bounded host handoff for sends created before an MLS route
+    /// exists. Unlike the relay outbox, these records are still plaintext and
+    /// therefore use a key derived from the SQLCipher database key.
+    pre_route_outbox: Arc<Mutex<PreRouteOutbox>>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1460,6 +1475,8 @@ impl SonarClient {
     ) -> Result<Self> {
         let db_path = db_path.as_ref();
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
+        let pre_route_outbox =
+            PreRouteOutbox::open(Some(pre_route_outbox_path_for_db(db_path)), Some(db_key))?;
         let index_path = index_db_path_for_db(db_path);
         let index = match ConversationIndex::open(&index_path, db_key) {
             Ok(idx) => Some(idx),
@@ -1475,6 +1492,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            pre_route_outbox,
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             StickerCache::for_db(db_path)?,
@@ -1501,6 +1519,7 @@ impl SonarClient {
             false,
             None,
             None,
+            PreRouteOutbox::open(None, None)?,
             None,
             None,
             StickerCache::disabled(),
@@ -1516,6 +1535,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        pre_route_outbox: PreRouteOutbox,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         sticker_cache: StickerCache,
@@ -1886,6 +1906,7 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
+            pre_route_outbox: Arc::new(Mutex::new(pre_route_outbox)),
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -2281,6 +2302,60 @@ impl SonarClient {
         self.publish_group_creation(creation).await
     }
 
+    /// Start a multi-member group for a durable host operation. The stable
+    /// operation id is hashed into the group metadata, allowing replay after a
+    /// process death to find the route created by an earlier completed call
+    /// instead of creating a duplicate group.
+    pub async fn start_group_idempotent(
+        &self,
+        members: Vec<PublicKey>,
+        name: &str,
+        operation_id: &str,
+    ) -> Result<GroupId> {
+        let description = group_operation_description(operation_id)?;
+        if let Some(group_id) = self.find_group_for_operation(&members, name, &description)? {
+            return Ok(group_id);
+        }
+        let key_packages = self.fetch_key_packages_for_members(members).await?;
+        let creation = self.engine.create_group_with_description(
+            name,
+            &description,
+            key_packages,
+            self.relays.clone(),
+        )?;
+        self.publish_group_creation(creation).await
+    }
+
+    fn find_group_for_operation(
+        &self,
+        members: &[PublicKey],
+        name: &str,
+        description: &str,
+    ) -> Result<Option<GroupId>> {
+        let expected_members: HashSet<_> = members
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.identity().public_key()))
+            .collect();
+        for group in self.engine.groups()? {
+            if group.description != description {
+                continue;
+            }
+            let actual_members: HashSet<_> = self
+                .engine
+                .members(&group.mls_group_id)?
+                .into_iter()
+                .collect();
+            if group.name != name || actual_members != expected_members {
+                return Err(Error::InvalidInput(
+                    "group operation id was reused with different group details".into(),
+                ));
+            }
+            return Ok(Some(group.mls_group_id));
+        }
+        Ok(None)
+    }
+
     /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
     /// group, and deliver the gift-wrapped welcome.
     ///
@@ -2609,6 +2684,44 @@ impl SonarClient {
     /// existing group history and widen the live subscription.
     pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
         let group_id = self.engine.accept_group_invite(welcome_id)?;
+        self.finish_group_invite_accept(group_id).await
+    }
+
+    /// Accept an invite idempotently using the MLS group id persisted beside
+    /// the host's pending send. If the accept committed before a process death,
+    /// replay returns the already-active group instead of treating the vanished
+    /// Welcome as an unrecoverable error.
+    pub async fn accept_group_invite_idempotent(
+        &self,
+        welcome_id: &EventId,
+        expected_group_id: &GroupId,
+    ) -> Result<GroupId> {
+        if self
+            .engine
+            .groups()?
+            .iter()
+            .any(|group| &group.mls_group_id == expected_group_id)
+        {
+            return self
+                .finish_group_invite_accept(expected_group_id.clone())
+                .await;
+        }
+        let invite = self
+            .engine
+            .pending_group_invites()?
+            .into_iter()
+            .find(|invite| &invite.id == welcome_id)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
+        if &invite.group_id != expected_group_id {
+            return Err(Error::InvalidInput(
+                "group invite id was reused with a different group".into(),
+            ));
+        }
+        let group_id = self.engine.accept_group_invite(welcome_id)?;
+        self.finish_group_invite_accept(group_id).await
+    }
+
+    async fn finish_group_invite_accept(&self, group_id: GroupId) -> Result<GroupId> {
         if let Some(group) = self
             .engine
             .groups()?
@@ -3483,6 +3596,38 @@ impl SonarClient {
         self.retry_outbox().await;
     }
 
+    /// Persist one host-owned send before its White Noise route exists. The
+    /// record is encrypted at rest and enqueue is idempotent by stable `id`.
+    pub fn enqueue_pre_route_message(&self, message: PreRouteMessage) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().enqueue(message)
+    }
+
+    /// Snapshot pending pre-route work in insertion order. This is a local-only
+    /// read; hosts may call it during startup without waiting for relay sync.
+    pub fn pre_route_messages(&self) -> Vec<PreRouteMessage> {
+        self.pre_route_outbox.lock().unwrap().messages()
+    }
+
+    /// Remove a pre-route record only after the replacement core send has been
+    /// accepted into the normal local message/outbox path.
+    pub fn complete_pre_route_message(&self, id: &str) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().remove(id)
+    }
+
+    /// Persist the concrete MLS group selected during route setup before the
+    /// host submits the journaled content to the regular send path.
+    pub fn resolve_pre_route_message(&self, id: &str, group_id: &str) -> Result<()> {
+        self.pre_route_outbox
+            .lock()
+            .unwrap()
+            .resolve_route(id, group_id)
+    }
+
+    /// Clear host-owned pre-route work when the user explicitly erases chats.
+    pub fn clear_pre_route_messages(&self) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().clear()
+    }
+
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
     /// or advances MLS state; it only republishes the original wrapper event.
@@ -3981,8 +4126,9 @@ impl SonarClient {
             .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
             .await?;
         tracing::info!(since_secs, "marmot welcomes subscription opened");
+        self.subscribe_group_messages(true).await?;
         *self.live_marmot_enabled.lock().unwrap() = true;
-        self.subscribe_group_messages().await
+        Ok(())
     }
 
     /// (Re)subscribe the kind-445 tail to the CURRENT group set, using the
@@ -3990,7 +4136,7 @@ impl SonarClient {
     /// REPLACES the filter, so calling this after a welcome adds a group widens
     /// the subscription. History for a newly-added group is fetched separately
     /// by `backfill_group`.
-    async fn subscribe_group_messages(&self) -> Result<()> {
+    async fn subscribe_group_messages(&self, force: bool) -> Result<()> {
         let group_ids = self.current_group_ids()?;
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
 
@@ -4009,7 +4155,7 @@ impl SonarClient {
 
         {
             let current = self.marmot_group_subscriptions.lock().unwrap();
-            if *current == group_ids {
+            if !should_replace_group_subscription(force, &current, &group_ids) {
                 return Ok(());
             }
         }
@@ -4195,7 +4341,7 @@ impl SonarClient {
         if !is_live {
             return Ok(());
         }
-        self.subscribe_group_messages().await
+        self.subscribe_group_messages(false).await
     }
 
     /// Prefer catch-up for the open chat.
@@ -4236,7 +4382,7 @@ impl SonarClient {
     /// bounded per-chat repair fetch for existing installs, so callers must keep
     /// it on a background/IO queue and never in the local-first chat-open path.
     pub async fn ensure_subscriptions(&self) -> Result<()> {
-        if !*self.live_marmot_enabled.lock().unwrap() {
+        if self.relays.is_empty() {
             return Ok(());
         }
         // P2: hosts call this every 25-60s. Avoid thrashing welcome/group REQs
@@ -5754,6 +5900,19 @@ fn require_relay_success(
     )))
 }
 
+fn group_operation_description(operation_id: &str) -> Result<String> {
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() || operation_id.len() > MAX_GROUP_OPERATION_ID_BYTES {
+        return Err(Error::InvalidInput(
+            "group operation id is empty or too large".into(),
+        ));
+    }
+    Ok(format!(
+        "{SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX}{}",
+        sha256_hex(operation_id.as_bytes())
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5766,6 +5925,19 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn group_operation_description_is_stable_and_does_not_expose_host_id() {
+        let description = group_operation_description("marmot-group-pending:private-host-id")
+            .expect("valid operation id");
+        assert!(description.starts_with(SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX));
+        assert!(!description.contains("private-host-id"));
+        assert_eq!(
+            description,
+            group_operation_description("marmot-group-pending:private-host-id").unwrap()
+        );
+        assert!(group_operation_description(" ").is_err());
     }
 
     #[tokio::test]
@@ -6928,6 +7100,20 @@ mod tests {
     }
 
     #[test]
+    fn forced_subscription_repair_replaces_unchanged_group_filter() {
+        let groups = HashSet::from(["group-a".to_string(), "group-b".to_string()]);
+        assert!(should_replace_group_subscription(true, &groups, &groups));
+        assert!(!should_replace_group_subscription(false, &groups, &groups));
+
+        let widened = HashSet::from([
+            "group-a".to_string(),
+            "group-b".to_string(),
+            "group-c".to_string(),
+        ]);
+        assert!(should_replace_group_subscription(false, &groups, &widened));
+    }
+
+    #[test]
     fn forced_sync_fetches_group_messages_even_when_live() {
         // The live tail's since floor never reaches further back than
         // LIVE_GROUP_TAIL_SECS, so a foreground/push sync_force after a long
@@ -7325,5 +7511,81 @@ mod tests {
             vec![expected],
             "pending invite must notify the conversation listener exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_group_operation_finds_the_existing_local_route() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let members = vec![carol.identity().public_key(), dave.identity().public_key()];
+        let description = group_operation_description("stable-host-operation").unwrap();
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Recovery group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays).unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.engine.merge_pending_commit(&group_id).unwrap();
+
+        assert_eq!(
+            bob.find_group_for_operation(&members, "Recovery group", &description)
+                .unwrap(),
+            Some(group_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_invite_accept_is_idempotent_after_welcome_is_consumed() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let creation = alice
+            .create_group(
+                "Recovery invite",
+                vec![
+                    bob.engine.key_package_event(relays.clone()).unwrap(),
+                    carol.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays,
+            )
+            .unwrap();
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .unwrap();
+        let wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .unwrap();
+        bob.process_marmot_events([wrapped], "durable invite test")
+            .await;
+        let invite = bob.pending_group_invites().unwrap().pop().unwrap();
+
+        let first = bob
+            .accept_group_invite_idempotent(&invite.id, &invite.group_id)
+            .await
+            .unwrap();
+        let replayed = bob
+            .accept_group_invite_idempotent(&invite.id, &invite.group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(first, replayed);
+        assert_eq!(bob.engine.groups().unwrap().len(), 1);
     }
 }

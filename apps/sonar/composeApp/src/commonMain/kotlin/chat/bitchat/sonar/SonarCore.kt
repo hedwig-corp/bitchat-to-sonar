@@ -28,6 +28,17 @@ data class SonarJoinRequest(
     val receivedAt: Long,
 )
 
+/** Outgoing text retained by the encrypted core before a White Noise route is
+ * available. [routeContext] is host-owned JSON used to resume group setup. */
+data class SonarPreRouteMessage(
+    val id: String,
+    val routeKind: String,
+    val routeId: String,
+    val routeContext: String,
+    val content: String,
+    val createdAtSecs: Long,
+)
+
 /** A decrypted message in a chat. [viaInternet] marks the transport for the
  *  per-message bubble colour: false = BLE mesh (cyan), true = White Noise /
  *  Nostr internet (indigo). A Sonar-peer DM merges both legs into one thread. */
@@ -461,11 +472,17 @@ expect object SonarCore {
     /** Start a multi-member group with peers (npub or hex). Returns chat id. */
     suspend fun startGroup(members: List<String>, name: String): String
 
+    /** Replay-safe group creation for a durable pending host route. */
+    suspend fun startGroupIdempotent(members: List<String>, name: String, operationId: String): String
+
     /** Pending multi-member group invites. */
     suspend fun pendingGroupInvites(): List<SonarGroupInvite>
 
     /** Accept a pending group invite. Returns chat id. */
     suspend fun acceptGroupInvite(inviteId: String): String
+
+    /** Replay-safe invite acceptance for a durable pending host route. */
+    suspend fun acceptGroupInviteIdempotent(inviteId: String, expectedGroupId: String): String
 
     /** Decline a pending group invite. */
     suspend fun declineGroupInvite(inviteId: String)
@@ -607,6 +624,20 @@ expect object SonarCore {
      *  relay disconnects. May perform one bounded chat repair fetch; call from
      *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
+
+    /** Write-before-network handoff for a send whose MLS group does not exist. */
+    fun enqueuePreRouteMessage(message: SonarPreRouteMessage)
+
+    /** Local-only startup recovery; never waits for relay state. */
+    suspend fun preRouteMessages(): List<SonarPreRouteMessage>
+
+    /** Remove only after the normal core send has accepted the message. */
+    fun completePreRouteMessage(id: String)
+
+    /** Checkpoint the concrete MLS group selected before replay. */
+    fun resolvePreRouteMessage(id: String, groupId: String)
+
+    suspend fun clearPreRouteMessages()
 
     /** Park up to [timeoutSecs] until the relay subscriptions push a live
      *  Marmot event (welcome or group message). Returns true when there is

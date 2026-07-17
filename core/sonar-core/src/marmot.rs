@@ -29,6 +29,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
+use crate::pre_route_outbox::PRE_ROUTE_OUTBOX_FILE_SUFFIX;
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -1355,13 +1356,34 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
+        PRE_ROUTE_OUTBOX_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!("{name}{PRE_ROUTE_OUTBOX_FILE_SUFFIX}.tmp")));
     paths
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::{sidecar_paths, MarmotEngine};
+
+    #[test]
+    fn wipe_removes_encrypted_pre_route_journal_and_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let paths = sidecar_paths(&db);
+        for path in &paths {
+            std::fs::write(path, b"test").unwrap();
+        }
+
+        MarmotEngine::wipe(&db).unwrap();
+
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
 }
 
 #[cfg(test)]

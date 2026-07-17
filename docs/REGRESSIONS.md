@@ -314,6 +314,52 @@ invalidation for verified peer/profile changes.
 
 **Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
+## R-011 — An offline send is durable before route setup starts
+
+**Invariant:** A user send accepted before a White Noise route/group exists is written to the encrypted shared-core journal before either host mirrors it in memory. The journal is bounded, idempotent by stable message id, checkpointed to the concrete MLS group before replay, and removed only after the normal local send/outbox accepts it.
+
+**Breaks as:** Killing Android or iOS while connectivity is scarce loses the send, retry says the media/message is no longer available, or restart creates a duplicate group.
+
+**Call sites:** core `pre_route_outbox.rs::PreRouteOutbox`; iOS `SonarAppStore.restorePreRouteMessages` / `MessageRouter.configureDurableOutbox`; Compose `SonarAppState.restorePreRouteMessages` / `SonarOutbox.restore`
+
+**Guarded by:** `pre_route_outbox.rs::encrypted_journal_survives_restart_and_removal`
+
+**Also guarded by:** `pre_route_outbox.rs::resolved_route_survives_restart_and_is_idempotent`, `pre_route_outbox.rs::enqueue_is_idempotent_but_rejects_id_reuse`, `marmot.rs::wipe_removes_encrypted_pre_route_journal_and_temporary_file`, `SonarOutboxTest.restoreIsIdempotentAndReestablishesTimestampOrder`, `SonarOutboxTest.preRouteContextRoundTripsDelimitersAndUnicode`
+
+**Partly guarded:** Rust pins encrypted persistence, idempotence, route checkpointing, and panic-wipe cleanup. Compose pins rebuilding a transient host mirror. Neither app state can be constructed in tests, so the actual startup scheduling and per-chat delete/leave call sites remain review-guarded. Recovery is deliberately split: local restore runs at the local-Home boundary; relay/group replay starts later and never delays first paint.
+
+**Rejected:** *Host-only arrays/dictionaries.* They disappear on process death, which is common during prolonged offline/background operation.
+
+---
+
+## R-012 — Prolonged offline delivery never exhausts a durable send
+
+**Invariant:** Retry attempts may control backoff/observability but must never make a durable relay-outbox entry permanently ineligible. A later relay recovery always gets another publish attempt.
+
+**Breaks as:** After enough hours offline, reconnecting does nothing and the message remains failed forever unless local data is erased.
+
+**Call sites:** shared core `outbox.rs::OutboxState.retryable_events`; consumed by both apps through the same `SonarClient` outbox
+
+**Guarded by:** `outbox.rs::automatic_retry_does_not_exhaust_during_prolonged_outage`
+
+**Rejected:** *A fixed attempt cap.* It turns a temporary network outage into permanent message loss without a user-visible recovery path.
+
+---
+
+## R-013 — Subscription repair must replace unchanged cached filters
+
+**Invariant:** Foreground/heartbeat repair force-reissues the stable welcome and group subscriptions after disconnect even when the desired group-id set equals the cached set. Initial subscription failure must also remain retryable.
+
+**Breaks as:** The relay indicator reconnects, but incoming messages/welcomes stay frozen until the process restarts or group membership changes.
+
+**Call sites:** shared core `client.rs::subscribe_marmot` / `subscribe_group_messages(force:)` / `ensure_subscriptions`; iOS and Compose invoke the same core repair after local paint
+
+**Guarded by:** `client.rs::forced_subscription_repair_replaces_unchanged_group_filter`
+
+**Rejected:** *Treating an equal filter as proof of a live REQ.* The cache describes desired state, not the relay socket's current subscription state.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -323,6 +369,7 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". The merge lives in `SonarAppState.duplicateDirectMarmotChats` (private, needs an instance); `dedupeDirectMarmotChats` — the pure seam the tests use — only covers the chat-list half. Closing it means extracting the transcript-source selection into a pure function, or an injectable `SonarCore`.
 - **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
 - **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
+- **R-011 host scheduling and per-chat cleanup.** The encrypted core journal and transient Compose mirror are pinned, but neither host instance is constructible in tests. A regression that removed `restorePreRouteMessages`, moved replay ahead of local Home paint, or stopped calling `discardPreRouteMessages` on delete/leave would not fail the cited tests.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
 - **Compose side of R-006 (Bluetooth-adapter-off).** Compose has no `ACTION_STATE_CHANGED` receiver — nothing pushes adapter-off into `MeshRadio`, whose `stop()` has the right teardown but only runs on discovery-policy changes. Android links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, so whether R-006 applies there is unproven; needs a Pixel with a peer in range to confirm. `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
