@@ -793,18 +793,44 @@ enum SNUserScrollActivity: Equatable {
 
 struct SNUserScrollOffsetClassifier {
     private var previousY: CGFloat?
+    private var previousViewportHeight: CGFloat?
+    private var previousBottomInset: CGFloat?
 
-    mutating func reset(to y: CGFloat) {
+    mutating func reset(
+        y: CGFloat,
+        viewportHeight: CGFloat,
+        bottomInset: CGFloat
+    ) {
         previousY = y
+        previousViewportHeight = viewportHeight
+        previousBottomInset = bottomInset
     }
 
     mutating func observe(
         y: CGFloat,
+        viewportHeight: CGFloat,
+        bottomInset: CGFloat,
+        isAtBottom: Bool,
         isTouchScrolling: Bool
     ) -> SNUserScrollActivity {
-        defer { previousY = y }
-        guard let previousY else { return .none }
-        if y < previousY - 0.5 { return .towardHistory }
+        defer {
+            previousY = y
+            previousViewportHeight = viewportHeight
+            previousBottomInset = bottomInset
+        }
+        guard let previousY,
+              let previousViewportHeight,
+              let previousBottomInset else { return .none }
+        let layoutChanged = abs(viewportHeight - previousViewportHeight) > 0.5
+            || abs(bottomInset - previousBottomInset) > 0.5
+        if y < previousY - 0.5 {
+            // A keyboard/composer dismissal expands the viewport (or reduces
+            // its inset) and clamps the bottom offset upward without user
+            // input. Status-bar and accessibility scrolling keep both stable.
+            return !isTouchScrolling && layoutChanged && isAtBottom
+                ? .none
+                : .towardHistory
+        }
         if isTouchScrolling, y > previousY + 0.5 { return .towardTail }
         return .none
     }
@@ -874,15 +900,29 @@ private struct SNUserScrollObserver: UIViewRepresentable {
             guard let scrollView = ancestor as? UIScrollView,
                   scrollView !== observedScrollView else { return }
             observedScrollView = scrollView
-            offsetClassifier.reset(to: scrollView.contentOffset.y)
+            offsetClassifier.reset(
+                y: scrollView.contentOffset.y,
+                viewportHeight: scrollView.bounds.height,
+                bottomInset: scrollView.adjustedContentInset.bottom
+            )
             contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) {
                 [weak self] scrollView, _ in
                 guard let self else { return }
                 let isTouchScrolling = scrollView.isTracking
                     || scrollView.isDragging
                     || scrollView.isDecelerating
+                let minimumY = -scrollView.adjustedContentInset.top
+                let maximumY = max(
+                    minimumY,
+                    scrollView.contentSize.height
+                        - scrollView.bounds.height
+                        + scrollView.adjustedContentInset.bottom
+                )
                 let activity = self.offsetClassifier.observe(
                     y: scrollView.contentOffset.y,
+                    viewportHeight: scrollView.bounds.height,
+                    bottomInset: scrollView.adjustedContentInset.bottom,
+                    isAtBottom: scrollView.contentOffset.y >= maximumY - 1,
                     isTouchScrolling: isTouchScrolling
                 )
                 guard activity != .none else { return }

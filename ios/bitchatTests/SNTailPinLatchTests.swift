@@ -137,9 +137,12 @@ struct SNTailPinLatchTests {
     @Test
     func nonTouchScrollTowardTopCountsAsUserScroll() {
         var classifier = SNUserScrollOffsetClassifier()
-        classifier.reset(to: 900)
+        classifier.reset(y: 900, viewportHeight: 600, bottomInset: 0)
         let activity = classifier.observe(
             y: 500,
+            viewportHeight: 600,
+            bottomInset: 0,
+            isAtBottom: false,
             isTouchScrolling: false
         )
         #expect(activity == .towardHistory)
@@ -151,9 +154,12 @@ struct SNTailPinLatchTests {
     @Test
     func programmaticTailFollowIsNotUserScroll() {
         var classifier = SNUserScrollOffsetClassifier()
-        classifier.reset(to: 500)
+        classifier.reset(y: 500, viewportHeight: 600, bottomInset: 0)
         let activity = classifier.observe(
             y: 900,
+            viewportHeight: 600,
+            bottomInset: 0,
+            isAtBottom: true,
             isTouchScrolling: false
         )
         #expect(activity == .none)
@@ -164,12 +170,48 @@ struct SNTailPinLatchTests {
     @Test
     func downwardDecelerationAtVisibleTailIsIgnored() {
         var classifier = SNUserScrollOffsetClassifier()
-        classifier.reset(to: 500)
+        classifier.reset(y: 500, viewportHeight: 600, bottomInset: 0)
         let activity = classifier.observe(
             y: 600,
+            viewportHeight: 600,
+            bottomInset: 0,
+            isAtBottom: true,
             isTouchScrolling: true
         )
         #expect(activity == .towardTail)
         #expect(!snShouldRecordUserScroll(activity, isNearBottom: true))
+    }
+
+    /// Keyboard dismissal expands the native viewport and clamps its bottom
+    /// offset upward. That is layout bookkeeping, not status-bar scrolling.
+    @Test
+    func layoutDrivenUpwardOffsetIsNotUserScroll() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(y: 900, viewportHeight: 400, bottomInset: 300)
+        let activity = classifier.observe(
+            y: 600,
+            viewportHeight: 700,
+            bottomInset: 0,
+            isAtBottom: true,
+            isTouchScrolling: false
+        )
+        #expect(activity == .none)
+    }
+
+    /// If a prior resize did not move the offset, a later accessibility or
+    /// status-bar scroll still leaves the tail and must not be hidden merely
+    /// because the classifier's last viewport sample is stale.
+    @Test
+    func nonTouchHistoryScrollAfterResizeStillCounts() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(y: 900, viewportHeight: 400, bottomInset: 300)
+        let activity = classifier.observe(
+            y: 500,
+            viewportHeight: 700,
+            bottomInset: 0,
+            isAtBottom: false,
+            isTouchScrolling: false
+        )
+        #expect(activity == .towardHistory)
     }
 }
