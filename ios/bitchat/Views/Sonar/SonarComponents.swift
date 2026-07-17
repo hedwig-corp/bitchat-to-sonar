@@ -785,6 +785,12 @@ struct SNTailPinLatch {
 /// layout/programmatic moves toward it. UIKit does not set its drag flags for
 /// status-bar scroll-to-top or accessibility paging, but both move the content
 /// offset toward the top. Tail-following scrolls move in the opposite direction.
+enum SNUserScrollActivity: Equatable {
+    case none
+    case towardHistory
+    case towardTail
+}
+
 struct SNUserScrollOffsetClassifier {
     private var previousY: CGFloat?
 
@@ -792,11 +798,31 @@ struct SNUserScrollOffsetClassifier {
         previousY = y
     }
 
-    mutating func observe(y: CGFloat, isTouchScrolling: Bool) -> Bool {
+    mutating func observe(
+        y: CGFloat,
+        isTouchScrolling: Bool
+    ) -> SNUserScrollActivity {
         defer { previousY = y }
-        if isTouchScrolling { return true }
-        guard let previousY else { return false }
-        return y < previousY - 0.5
+        guard let previousY else { return .none }
+        if y < previousY - 0.5 { return .towardHistory }
+        if isTouchScrolling, y > previousY + 0.5 { return .towardTail }
+        return .none
+    }
+}
+
+func snShouldRecordUserScroll(
+    _ activity: SNUserScrollActivity,
+    isNearBottom: Bool
+) -> Bool {
+    switch activity {
+    case .none:
+        return false
+    case .towardHistory:
+        return true
+    case .towardTail:
+        // The sentinel can appear before deceleration ends. Ignore remaining
+        // downward frames after it has synchronously re-armed the tail.
+        return !isNearBottom
     }
 }
 
@@ -807,7 +833,7 @@ struct SNUserScrollOffsetClassifier {
 /// toward the top also cover status-bar and accessibility scrolling, whose
 /// UIKit drag flags remain false.
 private struct SNUserScrollObserver: UIViewRepresentable {
-    let onUserScroll: () -> Void
+    let onUserScroll: (SNUserScrollActivity) -> Void
 
     func makeUIView(context: Context) -> ObserverView {
         let view = ObserverView()
@@ -821,7 +847,7 @@ private struct SNUserScrollObserver: UIViewRepresentable {
     }
 
     final class ObserverView: UIView {
-        var onUserScroll: () -> Void = {}
+        var onUserScroll: (SNUserScrollActivity) -> Void = { _ in }
         private weak var observedScrollView: UIScrollView?
         private var contentOffsetObservation: NSKeyValueObservation?
         private var offsetClassifier = SNUserScrollOffsetClassifier()
@@ -855,11 +881,12 @@ private struct SNUserScrollObserver: UIViewRepresentable {
                 let isTouchScrolling = scrollView.isTracking
                     || scrollView.isDragging
                     || scrollView.isDecelerating
-                guard self.offsetClassifier.observe(
+                let activity = self.offsetClassifier.observe(
                     y: scrollView.contentOffset.y,
                     isTouchScrolling: isTouchScrolling
-                ) else { return }
-                self.onUserScroll()
+                )
+                guard activity != .none else { return }
+                self.onUserScroll(activity)
             }
         }
     }
@@ -1009,7 +1036,18 @@ struct SNMsgList: View {
         if anchor == nil { unreadAnchorAbandoned = true }
     }
 
+    #if os(iOS)
+    private func noteUserScroll(_ activity: SNUserScrollActivity) {
+        guard snShouldRecordUserScroll(activity, isNearBottom: isNearBottom) else { return }
+        recordUserScroll()
+    }
+    #else
     private func noteUserScroll() {
+        recordUserScroll()
+    }
+    #endif
+
+    private func recordUserScroll() {
         isUserScrolling = true
         tailPin.userScrolled(isNearBottom: isNearBottom)
         userScrollGeneration &+= 1

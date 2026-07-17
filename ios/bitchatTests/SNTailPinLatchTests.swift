@@ -138,8 +138,12 @@ struct SNTailPinLatchTests {
     func nonTouchScrollTowardTopCountsAsUserScroll() {
         var classifier = SNUserScrollOffsetClassifier()
         classifier.reset(to: 900)
-        let isUserScroll = classifier.observe(y: 500, isTouchScrolling: false)
-        #expect(isUserScroll)
+        let activity = classifier.observe(
+            y: 500,
+            isTouchScrolling: false
+        )
+        #expect(activity == .towardHistory)
+        #expect(snShouldRecordUserScroll(activity, isNearBottom: false))
     }
 
     /// Tail-following and keyboard adjustments move the offset toward the
@@ -148,7 +152,24 @@ struct SNTailPinLatchTests {
     func programmaticTailFollowIsNotUserScroll() {
         var classifier = SNUserScrollOffsetClassifier()
         classifier.reset(to: 500)
-        let isUserScroll = classifier.observe(y: 900, isTouchScrolling: false)
-        #expect(!isUserScroll)
+        let activity = classifier.observe(
+            y: 900,
+            isTouchScrolling: false
+        )
+        #expect(activity == .none)
+    }
+
+    /// The tail sentinel can appear before UIKit's downward deceleration ends.
+    /// Remaining frames must not recreate the debounce the sentinel consumed.
+    @Test
+    func downwardDecelerationAtVisibleTailIsIgnored() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(to: 500)
+        let activity = classifier.observe(
+            y: 600,
+            isTouchScrolling: true
+        )
+        #expect(activity == .towardTail)
+        #expect(!snShouldRecordUserScroll(activity, isNearBottom: true))
     }
 }
