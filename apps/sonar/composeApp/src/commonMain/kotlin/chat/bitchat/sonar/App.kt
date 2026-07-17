@@ -2828,6 +2828,10 @@ private sealed interface TranscriptMediaLoad {
  * Load + decode a transcript image once, off the UI thread, and keep the result
  * in [MediaImageMemoryCache] (Signal ThumbnailView parity). A cache hit paints
  * on the FIRST frame of a reopened chat — no skeleton, no re-read, no re-decode.
+ *
+ * Three tiers, cheapest first: decoded pixels in memory → a downscaled
+ * thumbnail on disk ([MediaThumbnailDiskCache], survives process death) → the
+ * original attachment, decoded bounded and thumbnailed for next time.
  */
 @Composable
 private fun rememberTranscriptMediaLoad(
@@ -2846,16 +2850,32 @@ private fun rememberTranscriptMediaLoad(
             value = TranscriptMediaLoad.Loading
             return@produceState
         }
+        // A GIF needs its original bytes to animate, so it has no thumbnail
+        // tier — the disk hit below is for static images only.
+        val animates = media.isGif
+        if (!animates) {
+            val thumb = withContext(Dispatchers.Default) {
+                MediaThumbnailDiskCache.load(media.url)
+            }
+            if (thumb != null) {
+                val decoded = DecodedTranscriptMedia(bitmap = thumb.bitmap, gifBytes = null)
+                MediaImageMemoryCache.put(media.url, decoded)
+                value = TranscriptMediaLoad.Ready(decoded)
+                return@produceState
+            }
+        }
         val bytes = state.mediaData(chatId, media)
         if (bytes == null) {
             value = TranscriptMediaLoad.Missing
             return@produceState
         }
         val decoded = withContext(Dispatchers.Default) {
-            if (media.isGif && bytes.looksLikeGifBytes()) {
+            if (animates && bytes.looksLikeGifBytes()) {
                 DecodedTranscriptMedia(bitmap = null, gifBytes = bytes)
             } else {
-                DecodedTranscriptMedia(bitmap = decodeImageBitmap(bytes), gifBytes = null)
+                val thumb = decodeThumbnail(bytes, TRANSCRIPT_THUMB_MAX_EDGE_PX)
+                thumb?.encoded?.let { MediaThumbnailDiskCache.store(media.url, it) }
+                DecodedTranscriptMedia(bitmap = thumb?.bitmap, gifBytes = null)
             }
         }
         MediaImageMemoryCache.put(media.url, decoded)
