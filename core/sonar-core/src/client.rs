@@ -1614,6 +1614,29 @@ impl SonarClient {
                         );
                         continue;
                     }
+                    RelayPoolNotification::Message {
+                        relay_url,
+                        message:
+                            RelayMessage::Closed {
+                                subscription_id,
+                                message,
+                            },
+                    } => {
+                        tracing::warn!(
+                            relay = %relay_url,
+                            subscription = %subscription_id,
+                            reason = %message,
+                            "relay subscription rejected"
+                        );
+                        continue;
+                    }
+                    RelayPoolNotification::Message {
+                        relay_url,
+                        message: RelayMessage::Notice(message),
+                    } => {
+                        tracing::warn!(relay = %relay_url, notice = %message, "relay notice");
+                        continue;
+                    }
                     _ => continue,
                 };
                 let kind = event.kind.as_u16();

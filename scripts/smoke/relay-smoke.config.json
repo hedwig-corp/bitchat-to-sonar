@@ -10,6 +10,7 @@
   "fanout": 2,
   "messages_per_pair": 2,
   "receive_timeout_secs": 20,
+  "send_ack_timeout_secs": 10,
   "thresholds": {
     "max_loss_pct": 0,
     "max_p95_latency_ms": 5000,

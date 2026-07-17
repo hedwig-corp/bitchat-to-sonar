@@ -5275,6 +5275,7 @@ dependencies = [
  "hex",
  "nostr",
  "nostr-blossom",
+ "nostr-relay-builder",
  "nostr-sdk",
  "serde",
  "serde_json",
@@ -5283,6 +5284,8 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

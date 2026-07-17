@@ -8,17 +8,18 @@
 # set (default: the Sonar bootstrap relays), measures delivery/loss/latency/errors
 # for each, and classifies the outcome:
 #
-#   - relay_issue   target fails, control passes  -> problem is the TARGET relay
-#   - regression    target fails, control fails   -> Sonar/Marmot regression
+#   - relay_issue   target fails while controls prove delivery -> target relay
+#   - regression    all relay sets acknowledge but deliver zero -> shared path
+#   - inconclusive  both relay sets fail without strong attribution
 #   - target_fail   target fails, control skipped -> cannot classify further
-#   - pass          target passes                 -> healthy
+#   - pass          target passes -> healthy
 #
 # A failure optionally:
 #   - DMs a report to a Sonar npub (needs SONAR_SMOKE_REPORTER_NSEC)
 #   - opens a GitHub issue (needs GITHUB_TOKEN / gh auth + OPEN_ISSUES=1)
 #
-# The receiver must be subscribed before the sender fires (NIP-17 gift-wrap events
-# are delivered live); the harness starts each receiver's listener, then sends.
+# The harness starts each receiver's listener before sending to exercise live
+# delivery and capture subscription errors; sync also fetches stored gift wraps.
 #
 # Written for bash 3.2 (macOS default) as well as bash 4+: no associative arrays.
 #
@@ -36,6 +37,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$ROOT/scripts/smoke"
+# shellcheck source=scripts/smoke/relay-smoke-classifier.sh
+source "$SCRIPT_DIR/relay-smoke-classifier.sh"
 
 # ---- config precedence: env > config file > built-in default ----
 CONFIG_FILE="${CONFIG_FILE:-$SCRIPT_DIR/relay-smoke.config.json}"
@@ -60,6 +63,8 @@ RECEIVE_TIMEOUT_SECS="${RECEIVE_TIMEOUT_SECS:-$(cfg '.receive_timeout_secs')}"
 RECEIVE_TIMEOUT_SECS="${RECEIVE_TIMEOUT_SECS:-20}"
 RECEIVE_POLL_SECS="${RECEIVE_POLL_SECS:-2}"
 SEND_GAP_SECS="${SEND_GAP_SECS:-1}"
+SEND_ACK_TIMEOUT_SECS="${SEND_ACK_TIMEOUT_SECS:-$(cfg '.send_ack_timeout_secs')}"
+SEND_ACK_TIMEOUT_SECS="${SEND_ACK_TIMEOUT_SECS:-10}"
 MAX_RETRIES="${MAX_RETRIES:-2}"
 SEED="${SEED:-}"
 
@@ -108,8 +113,11 @@ RUN_ID="$(printf '%s' "$RUN_TAG" | tr -dc 'A-Za-z0-9:' | tr -d '\n')"
 SEED_NUM="${SEED:-$(date +%s)}"
 WORK="$(mktemp -d /tmp/relay-smoke.XXXXXX)"
 METRICS_JSON="${METRICS_JSON:-$WORK/metrics.json}"
-[[ "$DEBUG" == "1" ]] && trap 'echo "[relay-smoke] DEBUG work dir kept: $WORK" >&2' EXIT \
-                    || trap 'rm -rf "$WORK"' EXIT
+if [[ "$DEBUG" == "1" ]]; then
+  trap 'echo "[relay-smoke] DEBUG work dir kept: $WORK" >&2' EXIT
+else
+  trap 'rm -rf "$WORK"' EXIT
+fi
 
 log() { printf '[relay-smoke] %s\n' "$*" >&2; }
 
@@ -131,6 +139,21 @@ cli() {
     if (( attempt >= MAX_RETRIES )); then return "$rc"; fi
     sleep 1
   done
+}
+
+# A send has already mutated the durable local outbox before --wait-for-ack can
+# fail. Do not replay that side-effecting command: a restarted client will retry
+# the original encrypted event from the outbox, while issuing send again would
+# create a duplicate transcript row.
+cli_once() {
+  local out rc
+  if out=$("$@" 2>"$WORK/.clierr"); then
+    echo "$out"
+    return 0
+  else
+    rc=$?
+    return "$rc"
+  fi
 }
 
 # ---- enhanced diagnostics helpers ----
@@ -182,31 +205,31 @@ infer_root_cause() {
   local recv_all="$WORK/recv-all-$label.tsv"
   local errlog="$WORK/errors-$label.txt"
   local send_err="$WORK/send-$label.err"
-  local raw_count=0 sent_count=0 recv_count=0 err_count=0 send_err_lines=0
-  raw_count=$(find "$WORK" -maxdepth 1 -name "raw-$label-b*.jsonl" -print0 2>/dev/null | xargs -0 -r wc -l | awk '{s+=$1} END {print s+0}')
+  local output_count=0 sent_count=0 recv_count=0 err_count=0 send_err_lines=0
+  output_count=$(find "$WORK" -maxdepth 1 -name "decrypted-$label-b*.jsonl" -print0 2>/dev/null | xargs -0 -r wc -l | awk '{s+=$1} END {print s+0}')
   sent_count=$(wc -l < "$sent_tsv" 2>/dev/null | tr -d ' ' || echo 0)
   recv_count=$(wc -l < "$recv_all" 2>/dev/null | tr -d ' ' || echo 0)
   err_count=$(wc -l < "$errlog" 2>/dev/null | tr -d ' ' || echo 0)
   send_err_lines=$(wc -l < "$send_err" 2>/dev/null | tr -d ' ' || echo 0)
 
   if (( err_count > 0 || send_err_lines > 0 )) && (( sent_count == 0 )); then
-    printf 'send_failed: sonar-cli send or provision failed before any message was accepted'
+    printf 'send_unacknowledged: no send received a relay OK; inspect send stderr for rejection or timeout details'
     return 0
   fi
   if (( sent_count == 0 )); then
     printf 'no_send_attempts: graph produced zero send attempts (check identities/fanout)'
     return 0
   fi
-  if (( raw_count == 0 )); then
-    printf 'listener_zero_events: send succeeded (%d messages) but listeners received zero raw events; likely relay did not store/propagate NIP-17 gift-wraps' "$sent_count"
+  if (( output_count == 0 )); then
+    printf 'listener_zero_messages: relays acknowledged %d sends but listeners emitted zero decrypted messages; inspect listener stderr for subscription rejection, authentication, or sync errors' "$sent_count"
     return 0
   fi
   if (( recv_count == 0 )); then
-    printf 'decrypt_failure: listeners saw %d raw events but none decrypted to expected payload; KeyPackage may be missing or MLS group setup failed' "$raw_count"
+    printf 'expected_payload_absent: listeners emitted %d decrypted messages but none matched this run; inspect welcome delivery and MLS processing' "$output_count"
     return 0
   fi
   if (( recv_count < sent_count )); then
-    printf 'partial_delivery: listeners decrypted %d/%d messages; relay dropped some events or listener timing missed them' "$recv_count" "$sent_count"
+    printf 'partial_delivery: listeners emitted %d/%d relay-acknowledged messages; inspect listener timing and subscription diagnostics' "$recv_count" "$sent_count"
     return 0
   fi
   printf 'healthy'
@@ -217,7 +240,7 @@ listener_error_digest() {
   local label="$1" limit="${2:-20}"
   local combined=""
   local f
-  for f in "$WORK"/recv-$label-b*.err; do
+  for f in "$WORK"/recv-"$label"-b*.err; do
     [[ -f "$f" && -s "$f" ]] || continue
     local b
     b=$(basename "$f" | sed -E "s/recv-$label-b([0-9]+)\.err/\1/")
@@ -301,22 +324,23 @@ run_exchange() {
   LABEL="$1"
   local sent_tsv="$WORK/sent-$LABEL.tsv"
   local errors=0
-  local errlog="$WORK/errors-$LABEL.txt"; : > "$errlog"
+  local errlog="$WORK/errors-$LABEL.txt"; : > "$errlog"; : > "$sent_tsv"
+  local send_err_file="$WORK/send-$LABEL.err"; : > "$send_err_file"
 
-  local b sender seq payload t0 out home_b recvf rawf liserr lis_pid
+  local b sender seq payload t0 out home_b recvf decryptedf liserr lis_pid
   for ((b = 0; b < IDENTITIES; b++)); do
     # senders targeting b (from the seeded graph) -> space-separated indices
     local senders
     senders=$(awk -F'\t' -v b="$b" '$2 == b {printf "%s ", $1}' "$GRAPH_FILE")
     [[ -z "$senders" || "$senders" == " " ]] && continue
     home_b="${HOMES[$b]}"
-    recvf="$WORK/recv-$LABEL-b$b.tsv"; rawf="$WORK/raw-$LABEL-b$b.jsonl"
-    liserr="$WORK/recv-$LABEL-b$b.err"; : > "$recvf"; : > "$rawf"
-    # receiver listener FIRST (gift-wrap events arrive live)
+    recvf="$WORK/recv-$LABEL-b$b.tsv"; decryptedf="$WORK/decrypted-$LABEL-b$b.jsonl"
+    liserr="$WORK/recv-$LABEL-b$b.err"; : > "$recvf"; : > "$decryptedf"
+    # Start the receiver first to exercise live delivery and capture CLOSED/NOTICE.
     (
       "$SONAR_CLI" --home "$home_b" "${RELAY_ARGS[@]}" \
         listen --timeout-secs "$RECEIVE_TIMEOUT_SECS" --poll-secs "$RECEIVE_POLL_SECS" --no-publish 2>>"$liserr" \
-        | tee "$rawf" \
+        | tee "$decryptedf" \
         | while IFS= read -r line; do [[ -n "$line" ]] && printf '%s\t%s\n' "$(now_ms)" "$line"; done > "$recvf"
     ) &
     lis_pid=$!
@@ -326,12 +350,14 @@ run_exchange() {
       for ((seq = 1; seq <= MESSAGES_PER_PAIR; seq++)); do
         payload="$RUN_ID:b$b:a$sender:s$seq"
         t0=$(now_ms)
-        if out=$(cli "$SONAR_CLI" --home "${HOMES[$sender]}" "${RELAY_ARGS[@]}" \
-                   send --to "${NPUBS[$b]}" --text "$payload" 2>>"$WORK/send-$LABEL.err"); then
+        if out=$(cli_once "$SONAR_CLI" --home "${HOMES[$sender]}" "${RELAY_ARGS[@]}" \
+                   send --to "${NPUBS[$b]}" --text "$payload" \
+                   --wait-for-ack --ack-timeout-secs "$SEND_ACK_TIMEOUT_SECS"); then
           printf '%s\t%s\t%s\t%s\t%s\n' "$sender" "$b" "$seq" "$t0" "$payload" >> "$sent_tsv"
         else
           errors=$((errors + 1))
-          printf '[send-fail] a%s->b%s s%s: %s\n' "$sender" "$b" "$seq" "$(cat "$WORK/.clierr")" >> "$errlog"
+          cat "$WORK/.clierr" >> "$send_err_file"
+          printf '[send-unacknowledged] a%s->b%s s%s: %s\n' "$sender" "$b" "$seq" "$(cat "$WORK/.clierr")" >> "$errlog"
         fi
         sleep "$SEND_GAP_SECS"
       done
@@ -340,16 +366,16 @@ run_exchange() {
   done
 
   if [[ "$DEBUG" == "1" ]]; then
-    log "DEBUG raw recv ($LABEL):" >&2
-    for rf in "$WORK"/raw-$LABEL-b*.jsonl; do [[ -f "$rf" ]] && { echo "--- $rf ($(wc -l < "$rf" | tr -d ' ') lines) ---"; cat "$rf"; } >&2; done
+    log "DEBUG decrypted listener output ($LABEL):" >&2
+    for rf in "$WORK"/decrypted-"$LABEL"-b*.jsonl; do [[ -f "$rf" ]] && { echo "--- $rf ($(wc -l < "$rf" | tr -d ' ') lines) ---"; cat "$rf"; } >&2; done
     log "DEBUG sent_tsv ($LABEL):" >&2; cat "$sent_tsv" >&2 2>/dev/null || true
-    log "DEBUG listen errs ($LABEL):" >&2; cat "$WORK"/recv-$LABEL-b*.err 2>/dev/null >&2 || true
+    log "DEBUG listen errs ($LABEL):" >&2; cat "$WORK"/recv-"$LABEL"-b*.err 2>/dev/null >&2 || true
   fi
 
   # combined received: payload<TAB>emit_ms across all receivers for this label
   local recv_all="$WORK/recv-all-$LABEL.tsv"; : > "$recv_all"
   local rf rline rem rcontent
-  for rf in "$WORK"/recv-$LABEL-b*.tsv; do
+  for rf in "$WORK"/recv-"$LABEL"-b*.tsv; do
     [[ -f "$rf" ]] || continue
     while IFS=$'\t' read -r rem rline; do
       [[ -z "$rline" ]] && continue
@@ -363,7 +389,7 @@ run_exchange() {
   [[ -z "$sent" ]] && sent=0
   latfile="$WORK/latency-$LABEL.txt"; : > "$latfile"
   if (( sent > 0 )); then
-    while IFS=$'\t' read -r sa sb ssq st0 spayload; do
+    while IFS=$'\t' read -r _sa _sb _ssq st0 spayload; do
       emit=$(awk -F'\t' -v p="$spayload" '$1 == p {print $2}' "$recv_all" | sort -n | head -1)
       if [[ -n "$emit" ]]; then
         received=$((received + 1))
@@ -401,6 +427,7 @@ run_exchange() {
   ' "$topology_tsv_file")
 
   local _filter
+  # shellcheck disable=SC2016 # jq variables intentionally expand inside jq.
   _filter='{"name":$name,"sent":$sent,"received":$received,"lost":$lost,"loss_pct":$loss_pct,"latency_ms":{"min":$lat_min,"median":$lat_med,"p95":$lat_p95,"max":$lat_max},"errors":$errors,"root_cause":$root_cause,"diagnostics":{"send_errors":$send_err,"listener_errors":$listener_err},"topology":$topo_json,"pair_delivery":$pair_json}'
   jq -n \
     --arg name "$LABEL" \
@@ -442,15 +469,18 @@ main() {
   provision "target"
   build_graph
   target_metrics=$(run_exchange "target")
-  local t_loss t_p95 t_err t_lost
+  local t_loss t_p95 t_err t_lost t_sent t_received
   t_loss=$(printf '%s' "$target_metrics" | jq -r '.loss_pct')
   t_lost=$(printf '%s' "$target_metrics" | jq -r '.lost')
+  t_sent=$(printf '%s' "$target_metrics" | jq -r '.sent')
+  t_received=$(printf '%s' "$target_metrics" | jq -r '.received')
   t_p95=$(printf '%s' "$target_metrics" | jq -r '.latency_ms.p95')
   t_err=$(printf '%s' "$target_metrics" | jq -r '.errors')
   target_status=$(set_status "$t_loss" "$t_p95" "$t_err" "$t_lost")
   log "target: $target_status (loss=${t_loss}% lost=${t_lost} p95=${t_p95}ms errors=${t_err})"
 
   # control relay set (unless skipped)
+  local c_sent=0 c_received=0
   if [[ "$SKIP_CONTROL" != "1" ]]; then
     set_relay_args "$CONTROL_RELAYS"
     log "CONTROL relays: $CONTROL_RELAYS"
@@ -460,6 +490,8 @@ main() {
     local c_loss c_p95 c_err c_lost
     c_loss=$(printf '%s' "$control_metrics" | jq -r '.loss_pct')
     c_lost=$(printf '%s' "$control_metrics" | jq -r '.lost')
+    c_sent=$(printf '%s' "$control_metrics" | jq -r '.sent')
+    c_received=$(printf '%s' "$control_metrics" | jq -r '.received')
     c_p95=$(printf '%s' "$control_metrics" | jq -r '.latency_ms.p95')
     c_err=$(printf '%s' "$control_metrics" | jq -r '.errors')
     control_status=$(set_status "$c_loss" "$c_p95" "$c_err" "$c_lost")
@@ -470,15 +502,9 @@ main() {
   local overall root_cause_target root_cause_control
   root_cause_target=$(printf '%s' "$target_metrics" | jq -r '.root_cause // "unknown"')
   root_cause_control=$(printf '%s' "$control_metrics" | jq -r '.root_cause // "unknown"')
-  if [[ "$target_status" == "pass" ]]; then
-    overall="pass"
-  elif [[ "$control_status" == "pass" ]]; then
-    overall="relay_issue"        # target fails, control healthy -> the relay
-  elif [[ "$control_status" == "skipped" ]]; then
-    overall="target_fail"        # no control run -> cannot classify further
-  else
-    overall="regression"         # target and control both fail -> Sonar-side
-  fi
+  overall=$(classify_relay_smoke \
+    "$target_status" "$control_status" \
+    "$t_sent" "$t_received" "$c_sent" "$c_received")
   log "overall: $overall"
 
   ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -489,6 +515,7 @@ main() {
     --argjson identities "$IDENTITIES" --argjson fanout "$FANOUT" \
     --argjson messages_per_pair "$MESSAGES_PER_PAIR" \
     --argjson receive_timeout_secs "$RECEIVE_TIMEOUT_SECS" \
+    --argjson send_ack_timeout_secs "$SEND_ACK_TIMEOUT_SECS" \
     --arg max_loss_pct "$MAX_LOSS_PCT" --arg max_p95_latency_ms "$MAX_P95_LATENCY_MS" \
     --argjson max_errors "$MAX_ERRORS" --argjson max_lost "$MAX_LOST" \
     --arg target_status "$target_status" --arg control_status "$control_status" \
@@ -499,7 +526,7 @@ main() {
     '{run_id:$run_id, seed:$seed, started_at:$started_at, ended_at:$ended_at,
       config:{target_relay:$target_relay, control_relays:($control_relays|split(" ")),
               identities:$identities, fanout:$fanout, messages_per_pair:$messages_per_pair,
-              receive_timeout_secs:$receive_timeout_secs},
+              receive_timeout_secs:$receive_timeout_secs, send_ack_timeout_secs:$send_ack_timeout_secs},
       thresholds:{max_loss_pct:($max_loss_pct|tonumber), max_p95_latency_ms:($max_p95_latency_ms|tonumber), max_errors:$max_errors, max_lost:$max_lost},
       target_status:$target_status, control_status:$control_status, overall:$overall,
       root_causes:{target:$root_cause_target, control:$root_cause_control},
@@ -545,14 +572,15 @@ report_if_needed() {
     " | seed=" + (.seed|tostring) +
     " | topology=" + (.config.identities|tostring) + "x" + (.config.fanout|tostring) + "x" + (.config.messages_per_pair|tostring)'
     "$METRICS_JSON")
-  if cli "$SONAR_CLI" --home "$rhome" "${RELAY_ARGS[@]}" send --to "$REPORT_NPUB" --text "$summary" >/dev/null; then
+  if cli_once "$SONAR_CLI" --home "$rhome" "${RELAY_ARGS[@]}" send --to "$REPORT_NPUB" --text "$summary" \
+       --wait-for-ack --ack-timeout-secs "$SEND_ACK_TIMEOUT_SECS" >/dev/null; then
     log "report DM sent to $REPORT_NPUB"
   else
     log "report DM failed: $(cat "$WORK/.clierr") (recipient KeyPackage may be missing on the relay)"
   fi
 }
 
-# Open a GitHub issue on failure (relay_issue / regression / target_fail).
+# Open a GitHub issue on failure (relay_issue / regression / inconclusive / target_fail).
 issue_if_needed() {
   local overall="$1"
   [[ "$OPEN_ISSUES" == "1" ]] || { log "OPEN_ISSUES!=1 -> no issue"; return 0; }
@@ -582,8 +610,9 @@ issue_if_needed() {
     "- expected edges: identities × fanout × messages = " + ((.config.identities * .config.fanout * .config.messages_per_pair)|tostring) + "\n" +
     "- receive timeout: " + (.config.receive_timeout_secs|tostring) + "s\n\n" +
     "**Classification**\n" +
-    "- `relay_issue` = target fails, control passes (problem is the target relay)\n" +
-    "- `regression` = target and control both fail (Sonar/Marmot regression)\n" +
+    "- `relay_issue` = target fails while controls prove the shared delivery path works\n" +
+    "- `regression` = target and control acknowledge sends but both deliver zero\n" +
+    "- `inconclusive` = both sets fail without enough evidence to attribute the fault\n" +
     "- `target_fail` = target fails, control was skipped\n\n" +
     "**Reproduce locally**\n" +
     "```\nSEED=" + (.seed|tostring) + " SKIP_REPORT=1 RELAY_SMOKE_DEBUG=1 scripts/smoke/relay-smoke.sh\n```\n\n" +

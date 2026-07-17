@@ -12,6 +12,7 @@ use nostr_sdk::Client as NostrClient;
 use serde::{Deserialize, Serialize};
 use sonar_core::client::{MediaUpload, SonarClient, DEFAULT_BLOSSOM_SERVER};
 use sonar_core::identity::Identity;
+use sonar_core::marmot::DeliveryState;
 use sonar_core::GroupId;
 use sonar_stickers::signal::{
     import_signal_pack_with_options, ImportedSignalPack, ImportedSignalSticker, SignalImportOptions,
@@ -25,6 +26,7 @@ const CONFIG_FILE: &str = "config.json";
 const SEEN_FILE: &str = "seen.json";
 const DB_DIR: &str = "marmot";
 const DB_FILE: &str = "marmot.sqlite";
+const ACK_MESSAGE_WINDOW: usize = 32;
 const DEFAULT_STICKERS_SITE_URL: &str = "https://hedwig-corp.github.io/bitchat-to-sonar/stickers";
 const DEFAULT_RELAYS: [&str; 3] = [
     "wss://relay.damus.io",
@@ -136,6 +138,13 @@ struct SendArgs {
     /// Group name if a new 1:1 Marmot group must be created.
     #[arg(long, default_value = "Sonar agent DM")]
     group_name: String,
+    /// Keep this CLI process alive until a relay acknowledges the new message.
+    /// App sends remain local-first; this is intended for automation/smoke tests.
+    #[arg(long)]
+    wait_for_ack: bool,
+    /// Bound for --wait-for-ack. Defaults to 10 seconds.
+    #[arg(long, requires = "wait_for_ack")]
+    ack_timeout_secs: Option<u64>,
 }
 
 /// Media kind drives the default MIME type when none is given explicitly.
@@ -314,6 +323,14 @@ struct MediaRefOut {
 
 #[tokio::main]
 async fn main() {
+    // Surface relay subscription rejections and transport warnings to callers.
+    // stdout remains newline-delimited JSON; diagnostics stay on stderr.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_target(false)
+        .with_ansi(false)
+        .without_time()
+        .try_init();
     if let Err(err) = run(Cli::parse()).await {
         eprintln!("sonar-cli: {err}");
         std::process::exit(1);
@@ -372,6 +389,11 @@ async fn run(cli: Cli) -> Result<()> {
                     "--stdin requires --mime (a pipe has no extension to sniff)".to_owned(),
                 ));
             }
+            if args.wait_for_ack && args.ack_timeout_secs == Some(0) {
+                return Err(CliError::Message(
+                    "--ack-timeout-secs must be greater than zero".to_owned(),
+                ));
+            }
 
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
@@ -382,13 +404,17 @@ async fn run(cli: Cli) -> Result<()> {
                 Some(group_id) => group_id,
                 None => client.start_dm(peer, &args.group_name).await?,
             };
+            let message_ids_before = args
+                .wait_for_ack
+                .then(|| outbound_message_ids(&client, &group_id))
+                .transpose()?;
             let to_npub = peer.to_bech32().expect("valid public key encodes as npub");
-            if let Some(text) = args.text.as_deref() {
+            let output = if let Some(text) = args.text.as_deref() {
                 client.send_text(&group_id, text).await?;
-                print_json(&Output::Sent {
+                Output::Sent {
                     to: to_npub,
                     group_id: hex::encode(group_id.as_slice()),
-                })?;
+                }
             } else {
                 let mut payloads = resolve_media_payloads(&args)?;
                 let group_id_hex = hex::encode(group_id.as_slice());
@@ -405,7 +431,7 @@ async fn run(cli: Cli) -> Result<()> {
                             &args.blossom,
                         )
                         .await?;
-                    print_json(&Output::SentMedia {
+                    Output::SentMedia {
                         to: to_npub,
                         group_id: group_id_hex,
                         kind: media_kind_label(&kind).to_owned(),
@@ -413,7 +439,7 @@ async fn run(cli: Cli) -> Result<()> {
                         filename,
                         size_bytes: size,
                         blossom_server: args.blossom.clone(),
-                    })?;
+                    }
                 } else {
                     // Multiple --file paths → one album message (N imeta tags on
                     // a single event). Albums are photos-only: the iOS/Compose
@@ -442,16 +468,26 @@ async fn run(cli: Cli) -> Result<()> {
                     client
                         .send_media_multi(&group_id, items, &args.caption, &args.blossom)
                         .await?;
-                    print_json(&Output::SentAlbum {
+                    Output::SentAlbum {
                         to: to_npub,
                         group_id: group_id_hex,
                         count,
                         filenames,
                         total_bytes,
                         blossom_server: args.blossom.clone(),
-                    })?;
+                    }
                 }
+            };
+            if let Some(message_ids_before) = message_ids_before {
+                wait_for_new_outbound_ack(
+                    &client,
+                    &group_id,
+                    &message_ids_before,
+                    Duration::from_secs(args.ack_timeout_secs.unwrap_or(10)),
+                )
+                .await?;
             }
+            print_json(&output)?;
             Ok(())
         }
         Command::Fetch(args) => {
@@ -865,6 +901,75 @@ fn find_dm_group(client: &SonarClient, peer: PublicKey) -> Result<Option<GroupId
         }
     }
     Ok(None)
+}
+
+fn outbound_message_ids(client: &SonarClient, group_id: &GroupId) -> Result<BTreeSet<String>> {
+    Ok(client
+        .messages_page(group_id, ACK_MESSAGE_WINDOW, 0)?
+        .into_iter()
+        .filter(|message| message.mine)
+        .map(|message| message.id.to_hex())
+        .collect())
+}
+
+/// Wait for the exact local row created by this `send` invocation to reach a
+/// terminal outbox state. This keeps the short-lived CLI runtime alive long
+/// enough for its background publisher, without changing app send semantics.
+async fn wait_for_new_outbound_ack(
+    client: &SonarClient,
+    group_id: &GroupId,
+    message_ids_before: &BTreeSet<String>,
+    timeout: Duration,
+) -> Result<String> {
+    let started = Instant::now();
+    let mut message_id: Option<String> = None;
+    loop {
+        let messages = client.messages_page(group_id, ACK_MESSAGE_WINDOW, 0)?;
+        if message_id.is_none() {
+            let new_ids: Vec<String> = messages
+                .iter()
+                .filter(|message| message.mine)
+                .map(|message| message.id.to_hex())
+                .filter(|id| !message_ids_before.contains(id))
+                .collect();
+            match new_ids.as_slice() {
+                [id] => message_id = Some(id.clone()),
+                [] => {}
+                _ => {
+                    return Err(CliError::Message(
+                        "multiple outbound messages appeared while waiting for relay acknowledgement"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+
+        if let Some(id) = message_id.as_deref() {
+            if let Some(message) = messages.iter().find(|message| message.id.to_hex() == id) {
+                match message.delivery_state {
+                    DeliveryState::Sent => return Ok(id.to_owned()),
+                    DeliveryState::Failed => {
+                        return Err(CliError::Message(format!(
+                            "all relays failed to accept message {id}; it remains in the local outbox for retry"
+                        )));
+                    }
+                    DeliveryState::Pending | DeliveryState::Received => {}
+                }
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            let detail = message_id
+                .as_deref()
+                .map(|id| format!("message {id}"))
+                .unwrap_or_else(|| "the new outbound message".to_owned());
+            return Err(CliError::Message(format!(
+                "timed out after {}s waiting for a relay acknowledgement for {detail}; it remains in the local outbox for retry",
+                timeout.as_secs()
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// A resolved media attachment ready to send: (plaintext bytes, filename, MIME, kind).
@@ -1366,6 +1471,8 @@ mod tests {
             mime,
             blossom: DEFAULT_BLOSSOM_SERVER.to_owned(),
             group_name: "g".to_owned(),
+            wait_for_ack: false,
+            ack_timeout_secs: None,
         }
     }
 

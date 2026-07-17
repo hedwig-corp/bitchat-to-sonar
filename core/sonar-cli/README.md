@@ -11,8 +11,16 @@ messages without linking to Sonar internals.
 cargo run -p sonar-cli -- init
 cargo run -p sonar-cli -- publish
 cargo run -p sonar-cli -- send --to npub1... --text "hello"
+cargo run -p sonar-cli -- send --to npub1... --text "verified" --wait-for-ack
 cargo run -p sonar-cli -- listen
 ```
+
+Like the apps, a normal `send` is local-first: success means the encrypted
+message was durably queued and relay publication continues in the background.
+Automation that must distinguish local enqueue from relay acceptance should use
+`--wait-for-ack`; it keeps only the CLI process alive until the first relay `OK`
+or a bounded timeout (`--ack-timeout-secs`, default 10). It does not change the
+Apple or Compose app send path.
 
 Use `--home <dir>` or `SONAR_CLI_HOME` to isolate an agent identity. The CLI
 stores `config.json`, the encrypted Marmot database, and the seen-message cursor
@@ -155,8 +163,8 @@ record: `identity`, `published`, `sent`, `sent_media`, `fetched`, `message`,
 | `init [--nsec-file p \| --nsec-env VAR \| --nsec s] [--force]` | Provision/replace the identity. |
 | `identity` | Print `{npub, pubkey_hex, home, config_path}`. |
 | `publish` | Publish the Marmot KeyPackage so peers can DM the agent. |
-| `send --to <npub\|hex> --text <s> [--group-name <s>]` | Send a direct message (find/create the 1:1 group). |
-| `send --to <npub\|hex> --file <p> --kind {voice\|audio\|image\|video} [--caption s] [--mime m] [--blossom url]` | Send encrypted media (MIP-04). |
+| `send --to <npub\|hex> --text <s> [--group-name <s>] [--wait-for-ack] [--ack-timeout-secs n]` | Send a direct message (find/create the 1:1 group). |
+| `send --to <npub\|hex> --file <p> --kind {voice\|audio\|image\|video} [--caption s] [--mime m] [--blossom url] [--wait-for-ack]` | Send encrypted media (MIP-04). |
 | `fetch --group <hex> --url <url> [--out <p> \| --stdout]` | Download + decrypt an inbound media blob. |
 | `listen [--once] [--timeout-secs n] [--poll-secs n] [--no-publish]` | Drain inbound messages (text + media) as JSON lines. |
 | `groups` | List known Marmot groups `{id, name, members[]}`. |
@@ -173,7 +181,9 @@ The command records seen message IDs before exiting, so rerunning `listen` only
 emits new messages, and it never emits the agent's own messages (`mine` is
 filtered out). A bare `listen` streams until interrupted; `listen --once`
 performs a single sync/drain cycle, which is what cron-style agents and tests
-should use. `send` is direct-message only (it targets an npub), and transport is
+should use. These JSON lines are decrypted local messages, not raw Nostr relay
+events. Relay subscription `CLOSED` and `NOTICE` diagnostics are written to
+stderr. `send` is direct-message only (it targets an npub), and transport is
 Nostr-relay only — the CLI does not drive BLE mesh.
 
 To run this as an autonomous Hermes agent, see
