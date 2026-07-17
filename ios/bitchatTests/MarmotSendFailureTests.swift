@@ -2,23 +2,24 @@
 // MarmotSendFailureTests.swift
 // bitchatTests
 //
-// Regression tests for the blank-chat-after-send failure: when the Marmot
-// local store cannot be opened (missing account key, wrong DB encryption key),
-// a direct text send used to time out and silently discard its optimistic
-// echo — the message vanished and the chat looked blank with no error. The
-// send must instead keep a retryable "Couldn't send" row and the model must
-// surface the blocking failure for the restore/error UI.
+// Regression tests for R-007 (docs/REGRESSIONS.md): a failed send stays
+// visible, exactly once. When the Marmot local store cannot be opened (missing
+// account key, wrong DB encryption key), a direct text send used to time out
+// and silently discard its optimistic echo — the message vanished and the chat
+// looked blank with no error. The send must instead keep a retryable
+// "Couldn't send" row, and the model must surface the blocking failure for the
+// restore/error UI.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
 //
 
-import XCTest
+import Foundation
+import Testing
 @testable import Sonar
-import SonarCore
 
 @MainActor
-final class MarmotSendFailureTests: XCTestCase {
+struct MarmotSendFailureTests {
     private static let groupId = "send-failure-group"
 
     /// A model whose connect can never succeed: the mock keychain holds no
@@ -49,6 +50,7 @@ final class MarmotSendFailureTests: XCTestCase {
         return model.messagesByGroup[groupId] ?? []
     }
 
+    @Test
     func testFailedDirectTextSendKeepsRetryableFailedRow() async throws {
         let suite = "MarmotSendFailureTests.\(UUID().uuidString)"
         defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
@@ -58,24 +60,25 @@ final class MarmotSendFailureTests: XCTestCase {
 
         // The optimistic echo paints immediately.
         let echoes = model.messagesByGroup[Self.groupId] ?? []
-        XCTAssertEqual(echoes.count, 1)
-        XCTAssertTrue(echoes[0].id.hasPrefix(MarmotChatModel.optimisticIDPrefix))
+        #expect(echoes.count == 1)
+        #expect(echoes.first?.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) == true)
 
         // Once the connect times out, the echo must convert into a retryable
         // failed row — never vanish from the transcript.
         let rows = try await waitForFailedRow(in: model, groupId: Self.groupId)
-        XCTAssertEqual(rows.count, 1)
-        let failed = try XCTUnwrap(rows.first)
-        XCTAssertTrue(failed.id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix))
-        XCTAssertEqual(failed.content, "hello there")
-        XCTAssertTrue(failed.isMine)
-        XCTAssertEqual(MarmotChatModel.stateText(for: failed), "Couldn't send")
-        XCTAssertFalse(rows.contains { $0.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) })
+        #expect(rows.count == 1)
+        let failed = try #require(rows.first)
+        #expect(failed.id.hasPrefix(MarmotChatModel.failedOptimisticIDPrefix))
+        #expect(failed.content == "hello there")
+        #expect(failed.isMine)
+        #expect(MarmotChatModel.stateText(for: failed) == "Couldn't send")
+        #expect(!rows.contains { $0.id.hasPrefix(MarmotChatModel.optimisticIDPrefix) })
 
         // The blocking account/store failure is surfaced for the UI banner.
-        XCTAssertNotNil(model.localStoreFailure)
+        #expect(model.localStoreFailure != nil)
     }
 
+    @Test
     func testFailedReceiptLineBatchSendLeavesNoFailedRow() async throws {
         let suite = "MarmotSendFailureTests.\(UUID().uuidString)"
         defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
@@ -85,8 +88,8 @@ final class MarmotSendFailureTests: XCTestCase {
         // send must report failure and leave no lingering failed row.
         let delivered = await model.send(["\u{26A1}PAY|1|payment-id|21"], to: Self.groupId)
 
-        XCTAssertFalse(delivered)
+        #expect(delivered == false)
         let rows = model.messagesByGroup[Self.groupId] ?? []
-        XCTAssertTrue(rows.isEmpty, "receipt lines must not leave transcript rows, got \(rows.map(\.id))")
+        #expect(rows.isEmpty, "receipt lines must not leave transcript rows, got \(rows.map(\.id))")
     }
 }

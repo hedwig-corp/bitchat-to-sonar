@@ -402,6 +402,31 @@ the send echo was cleared before the canonical row merged.
 
 ---
 
+
+## R-011 — A failed send stays visible, exactly once
+
+**Invariant:** When an outgoing text send fails, the user keeps exactly one row for it: a retryable "Couldn't send" bubble. It must never silently vanish, and it must never sit beside a canonical row the core did commit.
+
+**Breaks as:** Two symptoms from one call site. Discarding the echo: "I sent a message and it disappeared" — with no error, since the send path only sets `errorText`, which no transcript surface renders. Keeping it unconditionally: two identical outgoing bubbles, and Retry publishes the message a second time.
+
+**Why:** Both halves are timing, not logic. `send_text` can throw *after* the core committed the canonical row (the durable-outbox sidecar write is a separate step), so "threw" does not imply "not sent". And unlike an in-flight echo, a `failed-` row is deliberately excluded from echo matching (`isLocalTranscriptEcho`, and `serverMessage(_:matchesOptimistic:)` rejects `failedOptimisticIDPrefix`), so once created it is never reconciled away — the duplicate is permanent. The failure path must therefore re-read the local page and let R-001's matcher decide, *before* it converts the echo.
+
+**Call sites:** iOS `MarmotChatView.swift::send(_:to:onEchoVisible:onFailure:)` (catch branch: `loadLocalPage` -> is the echo still in `pendingOptimistic`? -> convert); Compose `SonarAppState.failSendEcho` (marks the echo `"Couldn't send"` **in place**, leaving it in `pendingSendEchoes` so `withSendEchoes`/`planSendEchoDisplay` keep reconciling it against canonical rows — the same invariant reached by not converting at all).
+
+**Guarded by:** `MarmotSendFailureTests.testFailedDirectTextSendKeepsRetryableFailedRow` (fails without the fix: the echo count drops to 0 — the message vanishes)
+
+**Also guarded by:** `MarmotSendFailureTests.testFailedReceiptLineBatchSendLeavesNoFailedRow` (⚡PAY receipt lines own their redelivery and must leave no transcript row)
+
+**Coverage (honest):** Both tests reach the failure branch by making the connect fail (no account key), so they pin "echo becomes a retryable row" and the receipt-line exemption. They do **not** pin the post-commit half — that needs a `send_text` that throws *after* committing, i.e. an injectable core (see Unguarded). That path is guarded only by the `loadLocalPage`+`pendingOptimistic` check being read in review. iOS tests also do not run in CI.
+
+**History:** iOS discarded the echo on failure from the start; #207 reports the vanishing message. Compose already kept it (`failSendEcho`) — the mirror image of R-001, where Compose was the platform missing iOS's `freshCanonical`. The duplicate-row half was caught in review before merge, not in production.
+
+**Rejected:**
+- *Converting the echo unconditionally.* The shape reviewed out of the first draft: correct only while "threw" implies "not committed", which the outbox sidecar breaks.
+- *Reconciling `failed-` rows against canonical rows instead.* Would make a failed row disappear under the user when an unrelated identical send lands — R-002's bug, re-introduced on the failure path.
+- *Surfacing `errorText` only (toast, no row).* Already rejected under R-001 for the same reason: the message vanishes and the user cannot retry.
+
+---
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -418,6 +443,8 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
 - **Compose side of R-006 (Bluetooth-adapter-off).** Compose has no `ACTION_STATE_CHANGED` receiver — nothing pushes adapter-off into `MeshRadio`, whose `stop()` has the right teardown but only runs on discovery-policy changes. Android links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, so whether R-006 applies there is unproven; needs a Pixel with a peer in range to confirm. `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
 - **iOS NIP-05 verified badge cache key.** `nip05Verified` is keyed by `"canonicalKey(npub)|address"`, but the badge branch in `SonarContactProfileScreen.swift` read it by `address` alone, so the lookup always missed and the checkmark never rendered while the handle text rendered unconditionally. Verified and forged handles were therefore indistinguishable. Fixed by routing all three sites through one `static func nip05CacheKey(npub:address:)` (PR #411), which is deliberately static and npub-explicit so it is reachable without constructing the screen — unlike the `SonarAppStore` gaps above. `Nip05BadgeCacheKeyTests` pins that one handle claimed by two different keys yields two different entries. **The citation is weak on purpose:** iOS tests do not run in CI (see below), so nothing verifies it still passes. What is *not* pinned is the call-site wiring — a fourth site hand-building the key again, or the badge reading a different key than `verifyHandleIfNeeded` writes, is exactly the original bug and no test would catch it. Compose is structurally immune (`SonarContactProfileScreen.kt` scopes the state with `remember(peerNpub, nip05)`), so there is no Android mirror to pin.
+
+- **R-011, the post-commit half.** "`send_text` threw but the row was committed" is unreachable in a test without a core that can be made to throw after committing — the same injectable-core root cause as the three gaps above. The cited tests only cover the never-committed path.
 - **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
 - **Mesh-folded chat id resolution.** Group-keyed state (`unreadByChat`, snapshots, read-marking) must be resolved through `transcriptGroupIds`, never indexed with a `mesh:` route id — and position/count logic must not trust a mesh chat's first painted feed before it catches up with `latestKnownMessageSecs` (the BLE window publishes before the White Noise leg merges). Both broke the unread divider for mesh chats only (PR #303, commits 070c00f3e + 80feb4ade); no test pins either invariant. `transcriptGroupIds` needs instance state, so pinning likely means extracting the resolver or an in-process store test. See `docs/CHAT-TYPES.md`.
 - **Sticker ref resolution on the hosts (#307).** The bug fixed there — a stale session pack LRU pinning a validated-local fallback, so a newly-added sticker showed the failed placeholder for the session while older ones rendered — lives in `SonarAppState.stickerImage(ref)` and `MarmotChatModel.stickerData(for:)`. Both need a real `SonarCore`, so none of the following is pinned; the helper tests in `StickerSendEchoTest` / `MarmotStickerOptimisticTests` only self-feed the key and retry-schedule functions and would stay green if the whole repair were deleted. Same root cause as the three gaps above. Unpinned invariants, all of which have already broken once:
