@@ -1128,12 +1128,15 @@ struct SNMsgList: View {
                             }
                     }
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
+                    // This representable must live inside the scroll content.
+                    // A modifier on ScrollView itself is a native sibling, so
+                    // ancestor lookup cannot reach UIScrollView/NSScrollView.
+                    .background(
+                        SNUserScrollObserver(onUserScroll: noteUserScroll)
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
+                    )
                 }
-                .background(
-                    SNUserScrollObserver(onUserScroll: noteUserScroll)
-                        .frame(width: 0, height: 0)
-                        .accessibilityHidden(true)
-                )
                 .onAppear {
                     viewportHeight = geo.size.height
                     // Signal parity: an unread chat opens at the first unread
