@@ -130,4 +130,25 @@ struct SNTailPinLatchTests {
         )
         #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
     }
+
+    /// UIKit leaves its touch flags false for status-bar scroll-to-top and
+    /// accessibility paging, so an offset moving toward history must still
+    /// count as the user's scroll-away.
+    @Test
+    func nonTouchScrollTowardTopCountsAsUserScroll() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(to: 900)
+        let isUserScroll = classifier.observe(y: 500, isTouchScrolling: false)
+        #expect(isUserScroll)
+    }
+
+    /// Tail-following and keyboard adjustments move the offset toward the
+    /// bottom. They must not be mistaken for non-touch user scrolling.
+    @Test
+    func programmaticTailFollowIsNotUserScroll() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(to: 500)
+        let isUserScroll = classifier.observe(y: 900, isTouchScrolling: false)
+        #expect(!isUserScroll)
+    }
 }

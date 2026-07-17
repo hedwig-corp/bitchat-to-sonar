@@ -781,10 +781,31 @@ struct SNTailPinLatch {
     }
 }
 
+/// Distinguishes scrolls that can move the reader away from the tail from
+/// layout/programmatic moves toward it. UIKit does not set its drag flags for
+/// status-bar scroll-to-top or accessibility paging, but both move the content
+/// offset toward the top. Tail-following scrolls move in the opposite direction.
+struct SNUserScrollOffsetClassifier {
+    private var previousY: CGFloat?
+
+    mutating func reset(to y: CGFloat) {
+        previousY = y
+    }
+
+    mutating func observe(y: CGFloat, isTouchScrolling: Bool) -> Bool {
+        defer { previousY = y }
+        if isTouchScrolling { return true }
+        guard let previousY else { return false }
+        return y < previousY - 0.5
+    }
+}
+
 #if os(iOS)
 /// Bridges the underlying scroll view's user-driven offset changes without
 /// taking over its delegate. Programmatic `scrollTo` calls and keyboard layout
-/// adjustments do not report as user scrolling.
+/// adjustments toward the tail do not report as user scrolling. Offset moves
+/// toward the top also cover status-bar and accessibility scrolling, whose
+/// UIKit drag flags remain false.
 private struct SNUserScrollObserver: UIViewRepresentable {
     let onUserScroll: () -> Void
 
@@ -803,6 +824,7 @@ private struct SNUserScrollObserver: UIViewRepresentable {
         var onUserScroll: () -> Void = {}
         private weak var observedScrollView: UIScrollView?
         private var contentOffsetObservation: NSKeyValueObservation?
+        private var offsetClassifier = SNUserScrollOffsetClassifier()
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -826,10 +848,18 @@ private struct SNUserScrollObserver: UIViewRepresentable {
             guard let scrollView = ancestor as? UIScrollView,
                   scrollView !== observedScrollView else { return }
             observedScrollView = scrollView
+            offsetClassifier.reset(to: scrollView.contentOffset.y)
             contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) {
                 [weak self] scrollView, _ in
-                guard scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating else { return }
-                self?.onUserScroll()
+                guard let self else { return }
+                let isTouchScrolling = scrollView.isTracking
+                    || scrollView.isDragging
+                    || scrollView.isDecelerating
+                guard self.offsetClassifier.observe(
+                    y: scrollView.contentOffset.y,
+                    isTouchScrolling: isTouchScrolling
+                ) else { return }
+                self.onUserScroll()
             }
         }
     }
