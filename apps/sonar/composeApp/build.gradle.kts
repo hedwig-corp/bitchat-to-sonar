@@ -189,6 +189,11 @@ kotlin {
             // QR encoding for shareable group invite links.
             implementation("com.google.zxing:core:3.5.3")
         }
+        androidInstrumentedTest.dependencies {
+            implementation(libs.androidx.test.runner)
+            implementation(libs.androidx.test.ext.junit)
+            implementation(libs.junit)
+        }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
             // (gitignored generated dir), mirroring Android's BuildConfig field.
@@ -271,6 +276,7 @@ android {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 10
         versionName = "0.1-alpha.10"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")

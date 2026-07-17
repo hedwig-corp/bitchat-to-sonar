@@ -220,7 +220,7 @@ private fun extractRelayEntries(json: String): List<RelaySyncEntry> {
         .find(json)
         ?: return emptyList()
     val body = arrayMatch.groupValues[1]
-    val objects = Regex("\\{(.*?)}", setOf(RegexOption.DOT_MATCHES_ALL)).findAll(body)
+    val objects = Regex("\\{(.*?)\\}", setOf(RegexOption.DOT_MATCHES_ALL)).findAll(body)
     val out = ArrayList<RelaySyncEntry>()
     for (obj in objects) {
         val chunk = obj.groupValues[1]
