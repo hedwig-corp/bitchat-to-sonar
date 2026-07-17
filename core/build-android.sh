@@ -102,9 +102,15 @@ fi
 # --- Generate the Kotlin bindings (library mode, reads metadata from a .so) ---
 echo "Generating Kotlin bindings..."
 SONAR_BINDINGS_ABI="${SONAR_BINDINGS_ABI:-arm64-v8a}"
-if command -v uniffi-bindgen >/dev/null 2>&1; then
+# Keep this aligned with core/Cargo.lock and the standalone CI install.
+UNIFFI_BINDGEN_VERSION="0.31.1"
+INSTALLED_BINDGEN_VERSION="$(uniffi-bindgen --version 2>/dev/null || true)"
+if [[ "$INSTALLED_BINDGEN_VERSION" == "uniffi-bindgen $UNIFFI_BINDGEN_VERSION" ]]; then
   BINDGEN=(uniffi-bindgen)
 else
+  if [[ -n "$INSTALLED_BINDGEN_VERSION" ]]; then
+    echo "warn: ignoring $INSTALLED_BINDGEN_VERSION; expected uniffi-bindgen $UNIFFI_BINDGEN_VERSION" >&2
+  fi
   # Local fallback. CI installs the standalone binary so binding generation
   # does not rebuild and link the full Sonar dependency graph for the host.
   BINDGEN=(cargo run -p "$CRATE" --features cli --bin uniffi-bindgen --)
