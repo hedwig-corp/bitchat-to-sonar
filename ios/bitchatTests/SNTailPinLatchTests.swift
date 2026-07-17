@@ -37,6 +37,17 @@ struct SNTailPinLatchTests {
         #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
     }
 
+    /// Reaching the tail again consumes the UI's transient user-scroll marker
+    /// before re-arming this state, so an immediate keyboard shrink still pins.
+    @Test
+    func returningToTailRearmsAfterUserScroll() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        latch.userScrolled(isNearBottom: false)
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
+    }
+
     /// An unread-anchored open starts in history (never at the tail): opening
     /// the keyboard keeps the reading position, Signal-style — no pin.
     @Test

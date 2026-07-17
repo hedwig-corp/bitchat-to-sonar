@@ -1100,6 +1100,13 @@ struct SNMsgList: View {
                             .onAppear {
                                 isNearBottom = true
                                 hasReachedBottomOnce = true
+                                // Reaching the tail consumes any transient
+                                // drag/deceleration marker. Without this, a
+                                // composer tap inside the 0.2-second debounce
+                                // can make the keyboard shrink look like the
+                                // user's scroll-away and incorrectly unpin.
+                                isUserScrolling = false
+                                userScrollGeneration &+= 1
                                 tailPin.tailVisible(itemCount: msgs.count, tailID: msgs.last?.id)
                                 guard hasLeftBottom, let loadNewest, !isLoadingNewest else { return }
                                 isLoadingNewest = true
