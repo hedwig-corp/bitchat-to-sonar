@@ -390,6 +390,17 @@ func snIsFailedOptimisticStickerMessage(_ message: SNMessage) -> Bool {
         && message.stickerRef != nil
 }
 
+/// Resolve retained upload bytes without forcing large, file-backed media back
+/// into the reactive in-memory cache. Video previews are promoted to disk once
+/// rendered, so retry must treat that local file as an equally valid source.
+func snRetryMediaData(memoryData: Data?, localURL: URL?) async -> Data? {
+    if let memoryData { return memoryData }
+    guard let localURL else { return nil }
+    return await Task.detached(priority: .userInitiated) {
+        try? Data(contentsOf: localURL, options: .mappedIfSafe)
+    }.value
+}
+
 /// A media attachment on a Sonar message. `url` is the Blossom URL of the
 /// CIPHERTEXT; `groupId` is the Marmot group needed to download + decrypt it.
 struct SNMediaItem: Equatable {
@@ -5086,15 +5097,36 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func retryFailedMedia(_ message: SNMessage, groupId: String) {
-        let payloads: [(item: SNMediaItem, data: Data)] = message.media.compactMap { item in
-            mediaImageCache[item.url].map { (item, $0) }
-        }
-        guard payloads.count == message.media.count, !payloads.isEmpty else {
+        guard !message.media.isEmpty else {
             showToast("This media is no longer available to retry.")
             return
         }
         guard retryingFailedOptimisticMessageIDs.insert(message.id).inserted else { return }
 
+        Task { [weak self] in
+            guard let self else { return }
+            var payloads: [(item: SNMediaItem, data: Data)] = []
+            for item in message.media {
+                let data = await snRetryMediaData(
+                    memoryData: self.mediaImageCache[item.url],
+                    localURL: self.existingMediaURL(item)
+                )
+                guard let data else {
+                    self.retryingFailedOptimisticMessageIDs.remove(message.id)
+                    self.showToast("This media is no longer available to retry.")
+                    return
+                }
+                payloads.append((item, data))
+            }
+            self.resendFailedMedia(message, groupId: groupId, payloads: payloads)
+        }
+    }
+
+    private func resendFailedMedia(
+        _ message: SNMessage,
+        groupId: String,
+        payloads: [(item: SNMediaItem, data: Data)]
+    ) {
         for payload in payloads {
             rememberPendingUploadMedia(
                 groupId: groupId,

@@ -230,4 +230,18 @@ struct SonarConversationRegressionSmokeTests {
             stickerRef: message.stickerRef
         )))
     }
+
+    @Test
+    func failedVideoRetryLoadsPayloadFromPromotedDiskCache() async throws {
+        let expected = Data(repeating: 0x5a, count: 1024 * 1024 + 1)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("mov")
+        try expected.write(to: url, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let loaded = await snRetryMediaData(memoryData: nil, localURL: url)
+
+        #expect(loaded == expected)
+    }
 }
