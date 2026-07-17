@@ -99,8 +99,10 @@ app layer only when both sides qualify.
    and sends `MARMOT_WELCOME`. It does **not** `merge_pending_commit` yet.
 5. Responder ingests the Welcome and auto-accepts (see below), joining the
    group, and replies `MARMOT_ACK(welcome_event_id)`.
-6. On ACK — or on the relay outbox confirming the commit, whichever first —
-   the initiator calls `merge_pending_commit`. The group is live on both sides.
+6. The initiator calls `merge_pending_commit` once the commit is written to
+   the local relay outbox (see the commit gate under Decisions). The mesh
+   `MARMOT_ACK` confirms fast delivery but does not gate the merge. The group
+   is live on both sides.
 
 The UI never blocks on this. Per the XChat-Style Chat Startup Rule, tapping the
 peer opens a **local pending Marmot conversation** immediately; steps 2–6 run on
@@ -115,15 +117,20 @@ queued to the relay outbox. Receipt over either leg ingests through the same
 MDK path; the second copy dedups by event id. Out of range, only the outbox
 (relay) leg carries it — the same group, no new chat.
 
-### Auto-accept semantics
+### Auto-accept semantics (decided)
 
-White Noise requires manual invite acceptance. Over mesh, a Welcome arriving on
-an **authenticated Noise link whose peer identity matches the KeyPackage
-owner's npub-linked identity** is auto-accepted for Sonar-to-Sonar peers —
-physical proximity plus a signed announce is treated as consent. If the
-identity does not match, or the peer is not Sonar-verified, fall back to the
-normal invite UX. This is the one place v2 relaxes WN behavior and is called
-out for review.
+White Noise requires manual invite acceptance. Over mesh, a Welcome **is
+auto-accepted** — no invite UX, no tap. The consent signal is that the Welcome
+arrived on an **authenticated Noise link whose peer identity matches the
+KeyPackage owner's npub-linked identity**: the peer is physically nearby, the
+link is Noise-authenticated, and they answered our KeyPackage request. The
+group appears as a normal chat immediately.
+
+Guard: auto-accept applies **only** when the link identity matches the
+KeyPackage owner. A Welcome whose signer does not match the authenticated peer
+(or over a leg that is not an authenticated Sonar link) is rejected, not queued
+to the invite UX — v2 Welcomes only ever legitimately arrive over the matched
+link. The relay leg keeps normal WN invite semantics.
 
 ## Fragmentation & sizing
 
@@ -135,8 +142,8 @@ transfer. No new fragmentation logic.
 ## Invariants (must not regress)
 
 - **MLS discipline:** fresh ephemeral signer per 445; `merge_pending_commit`
-  only after the commit is delivered (mesh ACK or outbox-queued for relay,
-  per the flow above). The no-lock MDK invariant is unchanged.
+  only after the commit is written to the local relay outbox (the commit gate
+  under Decisions). The no-lock MDK invariant is unchanged.
 - **Wire compatibility with White Noise:** a group created over mesh must be a
   wire-valid WN group on relays (same MDK rev / framing). Any MDK bump
   re-triggers `sonar-sim group-scale` and the WN 0.8/0.9 interop check
@@ -172,16 +179,24 @@ transfer. No new fragmentation logic.
    [`REGRESSIONS.md`](REGRESSIONS.md) entries where a fix pins a real call site,
    iOS follow-up issue.
 
-## Open questions (resolve in review before step 3)
+## Decisions & proposed defaults
 
-- Auto-accept rule wording — is "authenticated link + identity match" a
-  sufficient consent signal, or is a lightweight one-tap confirm required for
-  the first message from a new peer?
-- Commit "published" definition — mesh ACK alone, or mesh ACK **and**
-  outbox-queued for relay? (Leaning: whichever is first, but never before at
-  least one durable path has the commit.)
-- Event encoding — JSON in v2.0 (id-identical to the relay copy) vs a binary
-  encoding behind the reserved header field. v2.0 = JSON.
-- Legacy upgrade — when a known mesh-folded peer advertises v2, opportunistically
-  create the group and stop writing `MessageStore` rows? (Deferred; spec must
-  not preclude it.)
+- **Auto-accept:** decided — mesh Welcomes auto-accept on the matched
+  authenticated link (see "Auto-accept semantics" above).
+- **Commit "published" gate — proposed default:** `merge_pending_commit` fires
+  when the commit is **written to the local relay outbox** (a local, durable,
+  non-blocking write — this is exactly what the existing relay path already
+  treats as "published"). The mesh `MARMOT_ACK` is a delivery-latency signal
+  only, **not** the merge trigger, so the safety argument is identical to
+  today's relay-only groups: the commit is guaranteed to reach relays and is
+  therefore recoverable. Revisit in step 3 only if a mesh-first/offline-relay
+  scenario shows the outbox write is not durable enough.
+- **Both-sides-create race — proposed default:** deterministic initiator = the
+  peer with the **lower npub** (hex compare); the other side waits. Existing
+  `duplicateDirectMarmotChats` folding stays as the backstop if both create
+  anyway. Revisit only if the tie-break proves racy under real BLE timing.
+- **Event encoding:** JSON in v2.0 (id-identical to the relay copy). Binary
+  encoding reserved behind the frame header field, deferred.
+- **Legacy upgrade:** when a known mesh-folded peer advertises v2,
+  opportunistically create the group and stop writing `MessageStore` rows —
+  deferred to a follow-up, but the spec must not preclude it.
