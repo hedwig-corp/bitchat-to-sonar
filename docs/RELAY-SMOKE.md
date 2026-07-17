@@ -13,30 +13,31 @@ pairwise-DM graph, and exchanges encrypted messages over two relay sets:
 - **target** — `wss://nostr.relay.hedwig.sh` (the relay under test)
 - **control** — the default Sonar bootstrap relays (`damus`, `nos.lol`, `primal`)
 
-Per relay set: `sent`, `received`, `lost`, `loss_pct`, latency
+Per relay set: relay-acknowledged `sent`, `received`, `lost`, `loss_pct`, latency
 (min/median/p95/max in ms), and CLI errors. The run is then classified:
 
-| `overall`     | target | control | meaning                          |
-|---------------|--------|---------|----------------------------------|
-| `pass`        | pass   | *       | healthy                          |
-| `relay_issue` | fail   | pass    | problem is the **target relay**  |
-| `regression`  | fail   | fail    | **Sonar/Marmot** regression      |
+| `overall` | evidence | meaning |
+|-----------|----------|---------|
+| `pass` | target passes | healthy |
+| `relay_issue` | target fails while controls deliver | problem is the **target relay** |
+| `regression` | both sets acknowledge sends and deliver zero | shared **Sonar/Marmot** receive regression |
+| `inconclusive` | both sets fail without strong attribution | needs investigation; do not label a regression |
+| `target_fail` | control skipped | target failed, comparison unavailable |
 
-The control set is what makes a target-relay failure actionable: if the control
-passes, the Sonar stack is healthy and the target relay is at fault. If both
-fail, it's a Sonar-side regression. The harness exits non-zero on any non-`pass`
-classification (usable as a gate).
+The control set is what makes a target-relay failure actionable. Even if a
+strict control threshold fails, partial control delivery proves the shared
+Sonar/Marmot receive path is operating; target zero-delivery is therefore a
+`relay_issue`, not automatically a regression. Ambiguous partial failures are
+`inconclusive`. The harness exits non-zero on any non-`pass` classification.
 
 ## Why a control set, and why "listen before send"
 
-NIP-17/Marmot gift-wrap events are delivered **live** — the receiver must be
-subscribed before the sender fires. A naive "send, then drain" sequence reports
-false loss (the event has already passed). The harness starts each receiver's
-`sonar-cli listen` first, waits for it to connect, then has the senders fire, and
-matches received messages by their decrypted `content` payload (the `send`
-output carries no message id; the receive side carries `id`, `sender`, and
-`content`). The control relay set then isolates relay-side delivery bugs from
-Sonar-side ones.
+The harness starts each receiver's `sonar-cli listen` first so it exercises live
+delivery and captures subscription rejections; sync also fetches stored gift
+wraps. Each sender uses `send --wait-for-ack`, so `sent` is recorded only after
+an actual relay `OK`, not merely after the local-first outbox enqueue. Listener
+JSON is decrypted/persisted message output—not raw relay events—and messages are
+matched by their decrypted `content` payload.
 
 ## Run locally
 
@@ -61,7 +62,7 @@ Output is a single metrics JSON object on stdout. Tunables
 (env > `scripts/smoke/relay-smoke.config.json` > built-in default):
 
 `TARGET_RELAY`, `CONTROL_RELAYS`, `SKIP_CONTROL`, `IDENTITIES`, `FANOUT`,
-`MESSAGES_PER_PAIR`, `RECEIVE_TIMEOUT_SECS`, `SEED`, and thresholds
+`MESSAGES_PER_PAIR`, `RECEIVE_TIMEOUT_SECS`, `SEND_ACK_TIMEOUT_SECS`, `SEED`, and thresholds
 `MAX_LOSS_PCT` / `MAX_P95_LATENCY_MS` / `MAX_ERRORS` / `MAX_LOST`
 (tolerates a single transient lost message by default).
 

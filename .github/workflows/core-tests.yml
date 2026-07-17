@@ -28,3 +28,6 @@ jobs:
       - name: Run core tests
         run: cargo test --workspace
         working-directory: core
+
+      - name: Test relay smoke classification
+        run: scripts/smoke/test-relay-smoke-classifier.sh
