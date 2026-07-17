@@ -714,16 +714,18 @@ final class MarmotService: @unchecked Sendable {
         filename: String,
         mime: String,
         caption: String,
-        serverUrl: String = ""
+        serverUrl: String = "",
+        requestId: String = ""
     ) async throws {
         try await run {
-            try $0.requireNode().sendMedia(
+            try $0.requireNode().sendMediaRetryable(
                 groupIdHex: groupId,
                 data: data,
                 filename: filename,
                 mime: mime,
                 caption: caption,
-                serverUrl: serverUrl
+                serverUrl: serverUrl,
+                requestId: requestId
             )
         }
     }
@@ -743,16 +745,18 @@ final class MarmotService: @unchecked Sendable {
         groupId: String,
         items: [MediaAlbumItem],
         caption: String,
-        serverUrl: String = ""
+        serverUrl: String = "",
+        requestId: String = ""
     ) async throws {
         try await run {
-            try $0.requireNode().sendMediaMulti(
+            try $0.requireNode().sendMediaMultiRetryable(
                 groupIdHex: groupId,
                 items: items.map {
                     MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
                 },
                 caption: caption,
-                serverUrl: serverUrl
+                serverUrl: serverUrl,
+                requestId: requestId
             )
         }
     }

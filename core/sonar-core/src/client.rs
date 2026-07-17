@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -15,11 +16,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
+use mdk_core::encrypted_media::EncryptedMediaUpload;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use nostr_sdk::{Client, RelayPoolNotification, RelayStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use sonar_stickers::{
     build_installed_packs_tags, parse_installed_pack_list, parse_pack_event, sha256_hex,
@@ -37,6 +40,7 @@ use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
+use crate::media_outbox::{wipe_media_outbox_for_db, MediaOutbox};
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
@@ -100,6 +104,9 @@ const BLOSSOM_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
 const BLOSSOM_UPLOAD_ATTEMPTS: usize = 4;
 const BLOSSOM_UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
 const BLOSSOM_UPLOAD_RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
+/// Bound re-encryption if MLS membership keeps changing during a long upload.
+/// The durable source remains queued and a later retry can continue.
+const MEDIA_UPLOAD_EPOCH_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -123,7 +130,11 @@ const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60))
+        // A total request deadline rejects a healthy 25 MiB transfer whenever
+        // constrained cellular takes more than 60 seconds. This is an idle-read
+        // deadline instead: every received chunk proves the connection is still
+        // making progress, while a truly stalled socket still fails promptly.
+        .read_timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
@@ -265,6 +276,277 @@ async fn http_get_with_limit_observer(
         observer.on_progress(out.len() as u64, total.or(Some(out.len() as u64)));
     }
     Ok(out)
+}
+
+fn validate_media_download_url(url: &str) -> Result<()> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    // Unit tests exercise Range recovery against a loopback TCP server. This
+    // branch is absent from production and does not weaken the SSRF boundary.
+    #[cfg(test)]
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://[::1]:") {
+        return Ok(());
+    }
+    Err(Error::Http(format!("refusing non-https media url: {url}")))
+}
+
+fn media_download_resume_path(destination: &Path, url: &str) -> Result<PathBuf> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| Error::InvalidInput("media destination has no parent".into()))?;
+    Ok(parent.join(format!(
+        ".sonar-download-{}.part",
+        hex::encode(Sha256::digest(url.as_bytes()))
+    )))
+}
+
+async fn http_get_to_resume_file_with_retries(
+    url: &str,
+    resume_path: &Path,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
+    for attempt in 1..=MEDIA_DOWNLOAD_ATTEMPTS {
+        match http_get_to_resume_file(url, resume_path, max_bytes, observer).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error)
+                if attempt < MEDIA_DOWNLOAD_ATTEMPTS && retryable_media_http_error(&error) =>
+            {
+                tokio::select! {
+                    _ = tokio::time::sleep(MEDIA_DOWNLOAD_RETRY_DELAY) => {}
+                    _ = async {
+                        while !media_download_cancelled(observer) {
+                            tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL).await;
+                        }
+                    } => return Err(Error::MediaDownloadCancelled),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("media download retry loop always returns")
+}
+
+async fn http_get_to_resume_file(
+    url: &str,
+    resume_path: &Path,
+    max_bytes: usize,
+    observer: Option<&dyn MediaDownloadObserver>,
+) -> Result<Vec<u8>> {
+    validate_media_download_url(url)?;
+    if media_download_cancelled(observer) {
+        return Err(Error::MediaDownloadCancelled);
+    }
+    let parent = resume_path
+        .parent()
+        .ok_or_else(|| Error::InvalidInput("media resume path has no parent".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| Error::Storage(format!("create media cache directory: {error}")))?;
+
+    let mut existing = fs::metadata(resume_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    if existing > max_bytes as u64 {
+        let _ = fs::remove_file(resume_path);
+        existing = 0;
+    }
+    let mut request = HTTP_CLIENT.get(url);
+    if existing > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={existing}-"));
+    }
+    let send = request.send();
+    tokio::pin!(send);
+    let mut response = loop {
+        tokio::select! {
+            result = &mut send => break result.map_err(|error| Error::Http(error.to_string()))?,
+            _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                if media_download_cancelled(observer) {
+                    return Err(Error::MediaDownloadCancelled);
+                }
+            }
+        }
+    };
+
+    if response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE && existing > 0 {
+        let complete = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("bytes */"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|total| total == existing);
+        if complete {
+            return fs::read(resume_path).map_err(|error| {
+                Error::Storage(format!("read completed media resume file: {error}"))
+            });
+        }
+        let _ = fs::remove_file(resume_path);
+        return Err(Error::Http("stale media resume range".into()));
+    }
+    if !response.status().is_success() {
+        return Err(Error::Http(format!(
+            "GET {url} -> HTTP {}",
+            response.status()
+        )));
+    }
+
+    let mut append = false;
+    let mut expected_end_exclusive = None;
+    let mut total = response.content_length();
+    if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let content_range = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range);
+        let Some(content_range) = content_range else {
+            let _ = fs::remove_file(resume_path);
+            return Err(Error::Http("invalid or missing Content-Range".into()));
+        };
+        if content_range.0 != existing {
+            let _ = fs::remove_file(resume_path);
+            return Err(Error::Http(format!(
+                "media range resumed at {}, expected {existing}",
+                content_range.0
+            )));
+        }
+        if content_range
+            .2
+            .is_some_and(|declared_total| content_range.1 >= declared_total)
+        {
+            let _ = fs::remove_file(resume_path);
+            return Err(Error::Http("invalid Content-Range bounds".into()));
+        }
+        let end_exclusive = content_range
+            .1
+            .checked_add(1)
+            .ok_or_else(|| Error::Http("invalid Content-Range end".into()))?;
+        let response_bytes = end_exclusive - content_range.0;
+        if response
+            .content_length()
+            .is_some_and(|content_length| content_length != response_bytes)
+        {
+            let _ = fs::remove_file(resume_path);
+            return Err(Error::Http(
+                "Content-Length does not match Content-Range".into(),
+            ));
+        }
+        expected_end_exclusive = Some(end_exclusive);
+        append = true;
+        total = content_range.2.or_else(|| {
+            response
+                .content_length()
+                .map(|remaining| existing.saturating_add(remaining))
+        });
+    } else if existing > 0 {
+        // BUD-01 says servers should support Range, but a compliant HTTP server
+        // may ignore it and return 200. Restart this attempt safely instead of
+        // appending a second full blob to the partial file.
+        existing = 0;
+    }
+    if total.is_some_and(|bytes| bytes > max_bytes as u64) {
+        let _ = fs::remove_file(resume_path);
+        return Err(Error::Http(format!(
+            "media too large: {} bytes (cap {max_bytes})",
+            total.unwrap_or_default()
+        )));
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(resume_path)
+        .map_err(|error| Error::Storage(format!("open media resume file: {error}")))?;
+    if let Some(observer) = observer {
+        observer.on_progress(existing, total);
+    }
+    let mut received = existing;
+    let mut last_progress = Instant::now();
+    loop {
+        let chunk = loop {
+            let next = response.chunk();
+            tokio::pin!(next);
+            tokio::select! {
+                result = &mut next => match result {
+                    Ok(chunk) => break chunk,
+                    Err(error) => {
+                        let _ = file.sync_data();
+                        return Err(Error::Http(error.to_string()));
+                    }
+                },
+                _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                    if media_download_cancelled(observer) {
+                        let _ = file.sync_data();
+                        return Err(Error::MediaDownloadCancelled);
+                    }
+                }
+            }
+        };
+        let Some(chunk) = chunk else { break };
+        if chunk.len() as u64 > (max_bytes as u64).saturating_sub(received) {
+            drop(file);
+            let _ = fs::remove_file(resume_path);
+            return Err(Error::Http("media exceeds size cap".into()));
+        }
+        file.write_all(&chunk)
+            .map_err(|error| Error::Storage(format!("write media resume file: {error}")))?;
+        received += chunk.len() as u64;
+        if let Some(observer) = observer {
+            let finished = total.is_some_and(|expected| received >= expected);
+            if finished || last_progress.elapsed() >= MEDIA_DOWNLOAD_PROGRESS_INTERVAL {
+                file.sync_data()
+                    .map_err(|error| Error::Storage(format!("sync media resume file: {error}")))?;
+                observer.on_progress(received, total);
+                last_progress = Instant::now();
+            }
+        }
+    }
+    file.sync_all()
+        .map_err(|error| Error::Storage(format!("sync media resume file: {error}")))?;
+    if total.is_some_and(|expected| received != expected) {
+        return Err(Error::Http(format!(
+            "media response ended at {received} bytes, expected {}",
+            total.unwrap_or_default()
+        )));
+    }
+    if expected_end_exclusive.is_some_and(|expected| received != expected) {
+        return Err(Error::Http(format!(
+            "media range ended at {received} bytes, expected {}",
+            expected_end_exclusive.unwrap_or_default()
+        )));
+    }
+    if let Some(observer) = observer {
+        observer.on_progress(received, total.or(Some(received)));
+    }
+    fs::read(resume_path)
+        .map_err(|error| Error::Storage(format!("read media resume file: {error}")))
+}
+
+fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
+    let range = value.strip_prefix("bytes ")?;
+    let (bounds, total) = range.split_once('/')?;
+    let (start, end) = bounds.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    if end < start {
+        return None;
+    }
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse().ok()?)
+    };
+    Some((start, end, total))
 }
 
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
@@ -783,6 +1065,43 @@ fn retryable_media_http_error(error: &Error) -> bool {
         return false;
     }
     true
+}
+
+fn media_upload_request_id(
+    group_id: &GroupId,
+    items: &[MediaUpload],
+    caption: &str,
+    server_url: &str,
+    host_request_id: &str,
+) -> String {
+    fn field(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"sonar-media-upload-request-v1");
+    field(&mut hasher, group_id.as_slice());
+    if !host_request_id.trim().is_empty() {
+        field(&mut hasher, host_request_id.as_bytes());
+        return hex::encode(hasher.finalize());
+    }
+    field(&mut hasher, caption.as_bytes());
+    field(
+        &mut hasher,
+        if server_url.is_empty() {
+            DEFAULT_BLOSSOM_SERVER.as_bytes()
+        } else {
+            server_url.as_bytes()
+        },
+    );
+    hasher.update((items.len() as u64).to_be_bytes());
+    for item in items {
+        field(&mut hasher, item.filename.as_bytes());
+        field(&mut hasher, item.mime.as_bytes());
+        field(&mut hasher, &Sha256::digest(&item.data));
+    }
+    hex::encode(hasher.finalize())
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1357,6 +1676,16 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
+    /// Process-durable encrypted upload inputs and per-item Blossom URLs. The
+    /// manifest is encrypted with a key derived from the SQLCipher key; blobs
+    /// are already MIP-04 ciphertext. Disabled for in-memory clients.
+    media_outbox: Arc<Mutex<MediaOutbox>>,
+    /// One upload job mutates the durable manifest at a time. This also avoids
+    /// two host retry taps uploading the same content-addressed blob together.
+    media_upload_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-URL single-flight gates protect the content-addressed resume file
+    /// when two views request the same attachment concurrently.
+    media_download_gates: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1483,6 +1812,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            MediaOutbox::open(db_path, db_key)?,
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             StickerCache::for_db(db_path)?,
@@ -1509,6 +1839,7 @@ impl SonarClient {
             false,
             None,
             None,
+            MediaOutbox::disabled(),
             None,
             None,
             StickerCache::disabled(),
@@ -1524,6 +1855,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        media_outbox: MediaOutbox,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         sticker_cache: StickerCache,
@@ -1894,6 +2226,9 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
+            media_outbox: Arc::new(Mutex::new(media_outbox)),
+            media_upload_gate: Arc::new(tokio::sync::Mutex::new(())),
+            media_download_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -2507,6 +2842,10 @@ impl SonarClient {
         };
         self.publish_membership_update(leave_update).await?;
         self.engine.delete_group(group_id)?;
+        self.media_outbox
+            .lock()
+            .unwrap()
+            .remove_group_jobs(&hex::encode(group_id.as_slice()))?;
         let _ = self.resubscribe_marmot_groups_if_live().await;
         Ok(())
     }
@@ -3573,7 +3912,22 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
-        self.send_media_multi(
+        self.send_media_with_request_id(group_id, data, filename, mime, caption, server_url, "")
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn send_media_with_request_id(
+        &self,
+        group_id: &GroupId,
+        data: Vec<u8>,
+        filename: &str,
+        mime: &str,
+        caption: &str,
+        server_url: &str,
+        request_id: &str,
+    ) -> Result<()> {
+        self.send_media_multi_with_request_id(
             group_id,
             vec![MediaUpload {
                 data,
@@ -3582,6 +3936,7 @@ impl SonarClient {
             }],
             caption,
             server_url,
+            request_id,
         )
         .await
     }
@@ -3599,6 +3954,18 @@ impl SonarClient {
         items: Vec<MediaUpload>,
         caption: &str,
         server_url: &str,
+    ) -> Result<()> {
+        self.send_media_multi_with_request_id(group_id, items, caption, server_url, "")
+            .await
+    }
+
+    pub async fn send_media_multi_with_request_id(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+        request_id: &str,
     ) -> Result<()> {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
@@ -3623,8 +3990,119 @@ impl SonarClient {
                 max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
             });
         }
-        // Encrypt + upload every attachment first; only then build + publish the
-        // single message. Any failure aborts the whole album with nothing sent.
+
+        // Persistent clients journal MIP-04 ciphertext before any network I/O.
+        // The fingerprint is stable across host retries but disappears with the
+        // completed job, so deliberately sending the same file again later is
+        // still a new message.
+        if self.media_outbox.lock().unwrap().is_persistent() {
+            let _gate = self.media_upload_gate.lock().await;
+            let request_id =
+                media_upload_request_id(group_id, &items, caption, server_url, request_id);
+            let existing_job = self.media_outbox.lock().unwrap().job(&request_id);
+            if let Some(job) = existing_job.as_ref() {
+                let expected_server = if server_url.is_empty() {
+                    DEFAULT_BLOSSOM_SERVER
+                } else {
+                    server_url
+                };
+                let stored_server = if job.server_url.is_empty() {
+                    DEFAULT_BLOSSOM_SERVER
+                } else {
+                    &job.server_url
+                };
+                let metadata_matches = job.group_id_hex == hex::encode(group_id.as_slice())
+                    && job.caption == caption
+                    && stored_server == expected_server
+                    && job.expected_items == items.len();
+                let prepared_items_match = job.items.iter().zip(&items).all(|(stored, input)| {
+                    let input_hash: [u8; 32] = Sha256::digest(&input.data).into();
+                    stored.source_hash == input_hash
+                        && stored.source_size == input.data.len() as u64
+                        && stored.filename == input.filename
+                        && stored.source_mime == input.mime
+                });
+                if !metadata_matches || !prepared_items_match {
+                    return Err(Error::InvalidInput(
+                        "media retry id belongs to different attachment data".into(),
+                    ));
+                }
+            }
+            let mut existing_items = existing_job.map(|job| job.items.len()).unwrap_or(0);
+            // If application storage was externally purged/corrupted while the
+            // encrypted manifest survived, a user retry still has the original
+            // attachment bytes. Rebuild the job instead of repeating the old
+            // "media is no longer available" dead end.
+            let stored_inputs_valid = (0..existing_items).all(|index| {
+                let outbox = self.media_outbox.lock().unwrap();
+                outbox.load_upload(&request_id, index).is_ok()
+                    && outbox.load_source(&request_id, index).is_ok()
+            });
+            if !stored_inputs_valid {
+                self.media_outbox.lock().unwrap().remove(&request_id)?;
+            }
+            if !self.media_outbox.lock().unwrap().contains(&request_id) {
+                self.media_outbox.lock().unwrap().begin_job(
+                    request_id.clone(),
+                    hex::encode(group_id.as_slice()),
+                    caption.to_string(),
+                    server_url.to_string(),
+                    Timestamp::now().as_secs(),
+                    items.len(),
+                )?;
+            }
+            // Encrypt + persist missing source items without allowing a group
+            // epoch change to mix keys within the preparation pass. If a
+            // membership commit lands between album items, retry locally while
+            // the host still owns every source byte.
+            for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+                existing_items = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .job(&request_id)
+                    .map(|job| job.items.len())
+                    .unwrap_or(0);
+                if existing_items == items.len() {
+                    break;
+                }
+                let epoch = self.engine.group_epoch(group_id)?;
+                let mut epoch_changed = false;
+                for item in items.iter().skip(existing_items) {
+                    let upload = match self.engine.encrypt_media_for_epoch(
+                        group_id,
+                        &item.data,
+                        &item.mime,
+                        &item.filename,
+                        Some(epoch),
+                    ) {
+                        Ok((_, upload)) => upload,
+                        Err(Error::MediaEpochChanged) => {
+                            epoch_changed = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    self.media_outbox.lock().unwrap().append_upload(
+                        &request_id,
+                        &item.data,
+                        &item.mime,
+                        epoch,
+                        upload,
+                    )?;
+                }
+                if !epoch_changed {
+                    break;
+                }
+                if attempt == MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+                    return Err(Error::MediaEpochChanged);
+                }
+            }
+            return self.process_media_upload_job_locked(&request_id).await;
+        }
+
+        // In-memory clients retain the original direct path used by protocol
+        // tests. No durable filesystem exists for them by definition.
         let mut uploads = Vec::with_capacity(items.len());
         for item in &items {
             let mut upload =
@@ -3637,6 +4115,17 @@ impl SonarClient {
             let url = self.blossom_upload(server_url, ciphertext).await?;
             uploads.push((upload, url));
         }
+        self.finish_media_send(group_id, uploads, caption, None)
+            .await
+    }
+
+    async fn finish_media_send(
+        &self,
+        group_id: &GroupId,
+        uploads: Vec<(EncryptedMediaUpload, String)>,
+        caption: &str,
+        expected_epoch: Option<u64>,
+    ) -> Result<()> {
         let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
         // Local-first, same sequencing as `send_text`: encrypt + write the
         // local row under one MLS guard, mark the durable outbox pending, and
@@ -3646,8 +4135,17 @@ impl SonarClient {
         // could have stranded a false-Sent row.
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
-            self.engine
-                .create_and_process_media_event_multi(group_id, &refs, caption)?
+            if let Some(expected_epoch) = expected_epoch {
+                self.engine.create_and_process_media_event_multi_at_epoch(
+                    group_id,
+                    &refs,
+                    caption,
+                    expected_epoch,
+                )?
+            } else {
+                self.engine
+                    .create_and_process_media_event_multi(group_id, &refs, caption)?
+            }
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -3664,6 +4162,142 @@ impl SonarClient {
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
         Ok(())
+    }
+
+    /// Continue one durable upload job. Completed item URLs are reused; only
+    /// the currently interrupted BUD-02 whole-blob PUT restarts from byte zero.
+    async fn process_media_upload_job(&self, request_id: &str) -> Result<()> {
+        let _gate = self.media_upload_gate.lock().await;
+        self.process_media_upload_job_locked(request_id).await
+    }
+
+    async fn process_media_upload_job_locked(&self, request_id: &str) -> Result<()> {
+        for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+            let mut job = self
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+            if job.items.len() != job.expected_items {
+                return Err(Error::Media(
+                    "media upload preparation was interrupted; retry from the attachment".into(),
+                ));
+            }
+            let group_bytes = hex::decode(&job.group_id_hex)
+                .map_err(|error| Error::Storage(format!("media upload group id: {error}")))?;
+            let group_id = GroupId::from_slice(&group_bytes);
+            let epoch = self.engine.group_epoch(&group_id)?;
+
+            let mut epoch_changed = false;
+            for index in 0..job.items.len() {
+                if job.items[index].encryption_epoch == epoch {
+                    continue;
+                }
+                let source = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .load_source(request_id, index)?;
+                let upload = match self.engine.encrypt_media_for_epoch(
+                    &group_id,
+                    &source,
+                    &job.items[index].source_mime,
+                    &job.items[index].filename,
+                    Some(epoch),
+                ) {
+                    Ok((_, upload)) => upload,
+                    Err(Error::MediaEpochChanged) => {
+                        epoch_changed = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.media_outbox
+                    .lock()
+                    .unwrap()
+                    .replace_upload(request_id, index, epoch, upload)?;
+            }
+            if epoch_changed {
+                if attempt == MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+                    return Err(Error::MediaEpochChanged);
+                }
+                continue;
+            }
+
+            job = self
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+            for index in 0..job.items.len() {
+                if job.items[index].uploaded_url.is_some() {
+                    continue;
+                }
+                let mut upload = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .load_upload(request_id, index)?;
+                let ciphertext = std::mem::take(&mut upload.encrypted_data);
+                let url = self.blossom_upload(&job.server_url, ciphertext).await?;
+                self.media_outbox
+                    .lock()
+                    .unwrap()
+                    .checkpoint_url(request_id, index, url.clone())?;
+                job.items[index].uploaded_url = Some(url);
+            }
+
+            // Rebuild only the small imeta metadata objects. Ciphertext is
+            // loaded one item at a time and dropped before the next.
+            let mut completed = Vec::with_capacity(job.items.len());
+            for (index, item) in job.items.iter().enumerate() {
+                let mut upload = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .load_upload(request_id, index)?;
+                upload.encrypted_data.clear();
+                let url = item.uploaded_url.clone().ok_or_else(|| {
+                    Error::Storage("media upload URL checkpoint is missing".into())
+                })?;
+                completed.push((upload, url));
+            }
+            match self
+                .finish_media_send(&group_id, completed, &job.caption, Some(epoch))
+                .await
+            {
+                Ok(()) => {
+                    self.media_outbox.lock().unwrap().remove(request_id)?;
+                    return Ok(());
+                }
+                Err(Error::MediaEpochChanged) if attempt < MEDIA_UPLOAD_EPOCH_ATTEMPTS => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::MediaEpochChanged)
+    }
+
+    /// Resume all complete encrypted upload jobs in creation order. Hosts start
+    /// this in the background after opening the local database or reattaching
+    /// relays, so chat first-paint never waits for media network I/O.
+    pub async fn retry_media_uploads(&self) {
+        let request_ids = self.media_outbox.lock().unwrap().job_ids();
+        for request_id in request_ids {
+            let complete = self
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(&request_id)
+                .is_some_and(|job| job.items.len() == job.expected_items);
+            if !complete {
+                continue;
+            }
+            if let Err(error) = self.process_media_upload_job(&request_id).await {
+                tracing::debug!(%error, %request_id, "durable media upload retry failed");
+            }
+        }
     }
 
     /// Download the encrypted blob at `url` and decrypt it with the group media
@@ -3684,13 +4318,49 @@ impl SonarClient {
         destination: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
-        let ciphertext = http_get_with_retries(url, Some(observer)).await?;
+        let download_gate = {
+            let mut gates = self.media_download_gates.lock().await;
+            gates.retain(|_, gate| gate.strong_count() > 0);
+            if let Some(gate) = gates.get(url).and_then(Weak::upgrade) {
+                gate
+            } else {
+                let gate = Arc::new(tokio::sync::Mutex::new(()));
+                gates.insert(url.to_string(), Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let lock = download_gate.lock();
+        tokio::pin!(lock);
+        let _download = loop {
+            tokio::select! {
+                guard = &mut lock => break guard,
+                _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                    if observer.is_cancelled() {
+                        return Err(Error::MediaDownloadCancelled);
+                    }
+                }
+            }
+        };
+        let resume_path = media_download_resume_path(destination, url)?;
+        let ciphertext = http_get_to_resume_file_with_retries(
+            url,
+            &resume_path,
+            MAX_MEDIA_DOWNLOAD_BYTES,
+            Some(observer),
+        )
+        .await?;
         if observer.is_cancelled() {
             return Err(Error::MediaDownloadCancelled);
         }
-        let plaintext = self
-            .engine
-            .decrypt_media_by_url(group_id, url, &ciphertext)?;
+        let plaintext = match self.engine.decrypt_media_by_url(group_id, url, &ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(error) => {
+                // A clean HTTP completion with failed MIP-04 authentication is
+                // not resumable; discard it so the next attempt starts fresh.
+                let _ = fs::remove_file(&resume_path);
+                return Err(error);
+            }
+        };
         if observer.is_cancelled() {
             return Err(Error::MediaDownloadCancelled);
         }
@@ -3709,12 +4379,12 @@ impl SonarClient {
         let mut file = options
             .open(destination)
             .map_err(|error| Error::Storage(format!("create media cache file: {error}")))?;
-        use std::io::Write as _;
         if let Err(error) = file.write_all(&plaintext).and_then(|_| file.sync_all()) {
             drop(file);
             let _ = fs::remove_file(destination);
             return Err(Error::Storage(format!("write media cache file: {error}")));
         }
+        let _ = fs::remove_file(resume_path);
         Ok(plaintext.len() as u64)
     }
 
@@ -5030,6 +5700,10 @@ impl SonarClient {
             .lock()
             .unwrap()
             .remove_group_entries(&group_id_hex)?;
+        self.media_outbox
+            .lock()
+            .unwrap()
+            .remove_group_jobs(&group_id_hex)?;
         self.remove_index_for_group(group_id);
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
@@ -5502,11 +6176,13 @@ impl SonarClient {
         let push_result = wipe_push_token_cache_for_db(db_path);
         let sticker_result = wipe_sticker_cache_for_db(db_path);
         let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
+        let media_outbox_result = wipe_media_outbox_for_db(db_path);
         db_result?;
         index_result?;
         push_result?;
         sticker_result?;
-        handle_result
+        handle_result?;
+        media_outbox_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.
@@ -5900,6 +6576,134 @@ mod tests {
 
         assert!(matches!(error, Error::MediaDownloadCancelled));
     }
+
+    fn read_http_request_headers(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read as _;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut chunk).expect("read HTTP request");
+            assert!(count > 0, "request ended before headers");
+            request.extend_from_slice(&chunk[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8_lossy(&request).into_owned();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn media_download_resumes_from_partial_file_after_disconnect() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/blob", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let first_headers = read_http_request_headers(&mut first);
+            assert!(!first_headers.to_ascii_lowercase().contains("range:"));
+            first
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcde",
+                )
+                .unwrap();
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let second_headers = read_http_request_headers(&mut second);
+            assert!(
+                second_headers
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=5-"),
+                "second request must resume: {second_headers}"
+            );
+            second
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 5\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\nfghij",
+                )
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let resume = dir.path().join("resume.part");
+
+        let bytes = http_get_to_resume_file_with_retries(&url, &resume, 100, None)
+            .await
+            .expect("download resumes");
+
+        server.join().unwrap();
+        assert_eq!(bytes, b"abcdefghij");
+        assert_eq!(fs::read(resume).unwrap(), b"abcdefghij");
+    }
+
+    #[tokio::test]
+    async fn media_download_restarts_when_server_ignores_range() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/blob", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let headers = read_http_request_headers(&mut stream);
+            assert!(headers.to_ascii_lowercase().contains("range: bytes=5-"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij",
+                )
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let resume = dir.path().join("resume.part");
+        fs::write(&resume, b"abcde").unwrap();
+
+        let bytes = http_get_to_resume_file_with_retries(&url, &resume, 100, None)
+            .await
+            .expect("server fallback restarts safely");
+
+        server.join().unwrap();
+        assert_eq!(bytes, b"abcdefghij");
+        assert_eq!(fs::read(resume).unwrap(), b"abcdefghij");
+    }
+
+    #[tokio::test]
+    async fn media_download_rejects_inconsistent_content_range() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/blob", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let headers = read_http_request_headers(&mut stream);
+            assert!(headers.to_ascii_lowercase().contains("range: bytes=5-"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 5-9/10\r\nConnection: close\r\n\r\nfghi",
+                )
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let resume = dir.path().join("resume.part");
+        fs::write(&resume, b"abcde").unwrap();
+
+        let error = http_get_to_resume_file(&url, &resume, 100, None)
+            .await
+            .expect_err("mismatched range must fail");
+
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            Error::Http(message) if message.contains("Content-Length does not match Content-Range")
+        ));
+        assert!(!resume.exists());
+    }
+
+    #[test]
+    fn media_upload_host_request_id_distinguishes_intentional_duplicate_sends() {
+        let group = GroupId::from_slice(&[1, 2, 3]);
+        let items = vec![MediaUpload {
+            data: b"same attachment".to_vec(),
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+        }];
+        let first = media_upload_request_id(&group, &items, "", "", "optimistic-1");
+        let retry = media_upload_request_id(&group, &items, "", "", "optimistic-1");
+        let second = media_upload_request_id(&group, &items, "", "", "optimistic-2");
+        assert_eq!(first, retry, "one optimistic row must resume one job");
+        assert_ne!(first, second, "a new row is an intentional new send");
+    }
+
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };
@@ -6959,6 +7763,62 @@ mod tests {
             .expect("bob decrypts received media");
         assert_eq!(alice_plain, original);
         assert_eq!(bob_plain, original);
+
+        // A delayed durable upload must not publish ciphertext from an older
+        // exporter epoch after membership changes.
+        let old_epoch = alice.group_epoch(&group_id).expect("old epoch");
+        let charlie = MarmotEngine::in_memory(Identity::generate());
+        let charlie_kp = charlie
+            .key_package_event(vec![RelayUrl::parse("wss://relay.example.com").unwrap()])
+            .expect("charlie kp");
+        alice
+            .add_members(&group_id, vec![charlie_kp])
+            .expect("stage add member");
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("advance epoch");
+        let new_epoch = alice.group_epoch(&group_id).expect("new epoch");
+        assert!(new_epoch > old_epoch);
+        assert!(matches!(
+            alice.encrypt_media_for_epoch(
+                &group_id,
+                &original,
+                "audio/mp4",
+                "voice.m4a",
+                Some(old_epoch),
+            ),
+            Err(Error::MediaEpochChanged)
+        ));
+        assert!(matches!(
+            alice.create_and_process_media_event_multi_at_epoch(
+                &group_id,
+                &[(&upload, "https://blossom.test/stale")],
+                "stale",
+                old_epoch,
+            ),
+            Err(Error::MediaEpochChanged)
+        ));
+        let (_, refreshed) = alice
+            .encrypt_media_for_epoch(
+                &group_id,
+                &original,
+                "audio/mp4",
+                "voice.m4a",
+                Some(new_epoch),
+            )
+            .expect("re-encrypt at current epoch");
+        assert!(matches!(
+            alice
+                .create_and_process_media_event_multi_at_epoch(
+                    &group_id,
+                    &[(&refreshed, "https://blossom.test/current")],
+                    "current",
+                    new_epoch,
+                )
+                .expect("current epoch media event")
+                .1,
+            Incoming::Message(_)
+        ));
     }
 
     #[test]

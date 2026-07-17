@@ -645,10 +645,32 @@ impl MarmotEngine {
         mime: &str,
         filename: &str,
     ) -> Result<EncryptedMediaUpload> {
-        dispatch!(&self.storage, |mdk| mdk
+        self.encrypt_media_for_epoch(group_id, data, mime, filename, None)
+            .map(|(_, upload)| upload)
+    }
+
+    /// Encrypt media while atomically recording/checking the MLS epoch whose
+    /// exporter secret produced the ciphertext. A durable upload can be delayed
+    /// across membership changes, so callers must never publish old-epoch
+    /// ciphertext in a new-epoch message.
+    pub fn encrypt_media_for_epoch(
+        &self,
+        group_id: &GroupId,
+        data: &[u8],
+        mime: &str,
+        filename: &str,
+        expected_epoch: Option<u64>,
+    ) -> Result<(u64, EncryptedMediaUpload)> {
+        let _mls = self.mls_write();
+        let epoch = self.group_epoch(group_id)?;
+        if expected_epoch.is_some_and(|expected| expected != epoch) {
+            return Err(Error::MediaEpochChanged);
+        }
+        let upload = dispatch!(&self.storage, |mdk| mdk
             .media_manager(group_id.clone())
             .encrypt_for_upload(data, mime, filename)
-            .map_err(|e| Error::Media(e.to_string())))
+            .map_err(|e| Error::Media(e.to_string())))?;
+        Ok((epoch, upload))
     }
 
     /// Build a signed kind-445 media message: a kind-9 rumor carrying `caption`
@@ -694,6 +716,28 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    /// Epoch-checked variant used by durable uploads. The check, event
+    /// encryption, and local processing share one MLS guard, closing the race
+    /// where a membership commit lands immediately before message creation.
+    pub fn create_and_process_media_event_multi_at_epoch(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+        expected_epoch: u64,
+    ) -> Result<(Event, Incoming)> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        if self.group_epoch(group_id)? != expected_epoch {
+            return Err(Error::MediaEpochChanged);
+        }
         let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
         let incoming = self.process_group_message(&event)?;
         Ok((event, incoming))
@@ -837,6 +881,14 @@ impl MarmotEngine {
             .into_iter()
             .filter(|g| g.state == group_types::GroupState::Active)
             .collect())
+    }
+
+    pub fn group_epoch(&self, group_id: &GroupId) -> Result<u64> {
+        self.groups()?
+            .into_iter()
+            .find(|group| group.mls_group_id == *group_id)
+            .map(|group| group.epoch)
+            .ok_or_else(|| Error::Media("media group is no longer available".into()))
     }
 
     /// Pending multi-member welcomes waiting for user acceptance.

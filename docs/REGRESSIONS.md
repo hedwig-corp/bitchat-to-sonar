@@ -317,23 +317,45 @@ invalidation for verified peer/profile changes.
 
 ## R-011 — Media uploads survive a scarce or intermittent connection
 
-**Invariant:** A Blossom upload retries idempotent transient transport failures, 408/425/429 responses, and 5xx responses with bounded exponential backoff; permanent client/auth/content errors fail immediately. All attempts share one overall size-scaled deadline that must admit a progressing 25 MiB upload at roughly 32 KiB/s.
+**Invariant:** A Blossom upload retries idempotent transient transport failures, 408/425/429 responses, and 5xx responses with bounded exponential backoff; permanent client/auth/content errors fail immediately. All attempts share one overall size-scaled deadline that must admit a progressing 25 MiB upload at roughly 32 KiB/s. Before network I/O, the shared core journals each MIP-04 ciphertext, a locally encrypted source copy, and an encrypted manifest; completed album-item URLs are checkpointed atomically. The host's stable optimistic-row id makes retry reuse that exact job while a separate user send remains distinct. If MLS membership advances while the upload is delayed, the core re-encrypts from the protected source and clears stale URL checkpoints before publishing, so the ciphertext and media message always use the same group epoch.
 
-**Breaks as:** A photo, video, album, or voice note flips to "Couldn't send" after one brief connection drop, or a progressing video is killed only because the uplink is slower than 100 KiB/s.
+**Breaks as:** A photo, video, album, or voice note flips to "Couldn't send" after one brief connection drop, loses its retry bytes after process death, re-uploads completed album items, or a progressing video is killed only because the uplink is slower than 100 KiB/s.
 
 **Call sites:** shared core `client.rs::blossom_upload`; iOS `MarmotChatView.swift::sendMedia` / `sendMediaAlbum`; Compose `SonarAppState.kt::sendMediaAttachment` / `sendImageAlbum` / `sendVoiceNote`
 
 **Guarded by:** `client.rs::blossom_upload_retries_transient_failure`
 
-**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`, `client.rs::blossom_retry_after_accepts_seconds_and_http_date`
+**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`, `client.rs::blossom_retry_after_accepts_seconds_and_http_date`, `media_outbox.rs::persists_encrypted_jobs_and_completed_item_urls`, `media_outbox.rs::removal_deletes_ciphertext_blobs`, `media_outbox.rs::epoch_replacement_preserves_source_and_clears_uploaded_url`, `media_outbox.rs::group_removal_only_deletes_matching_jobs`, `client.rs::media_upload_host_request_id_distinguishes_intentional_duplicate_sends`, `client.rs::media_roundtrip_decrypts_for_sender_and_peer`
 
-**History:** #287 bounded a permanently stalled PUT at 60s -> #293 scaled the deadline for video but assumed at least 100 KiB/s -> this change adds transient retry/backoff and a constrained-cellular deadline for both apps.
+**History:** #287 bounded a permanently stalled PUT at 60s -> #293 scaled the deadline for video but assumed at least 100 KiB/s -> #317 adds transient retry/backoff, a constrained-cellular deadline, and process-durable encrypted upload checkpoints for both apps.
 
 **Rejected:**
 - *Separate retry loops in Swift and Kotlin.* They drift, re-run encryption/album work, and cannot distinguish Blossom's permanent statuses as precisely as the shared transport layer.
 - *Retrying every failure.* Authentication, invalid request, unsupported content, and over-limit failures are deterministic; retrying them wastes data and battery.
 
-**Not guarded:** Blossom BUD-02 is a whole-blob PUT, so an interrupted attempt restarts from byte zero rather than resuming. Upload inputs are not yet a durable core job across process death. Signal persists resumable upload jobs; Sonar adopts its retry classification/backoff pattern here, while durable resumable uploads remain a tracked architecture gap.
+**Protocol limit:** Blossom BUD-02 defines only a whole-blob PUT. The interrupted *current item* therefore restarts from byte zero; there is no interoperable `Content-Range` upload extension to use. The durable journal still survives process death and reuses every already-completed item URL, so an album resumes at its first incomplete item.
+
+**Partly guarded:** The journal's encrypted persistence, item-URL checkpoint, cleanup, and stable request identity are pinned independently. No automated test kills and relaunches a native app in the middle of a real Blossom PUT; that remains device-level coverage.
+
+---
+
+## R-009 — Media downloads progress on constrained links and resume partial ciphertext
+
+**Invariant:** A progressing media response has a 60-second **idle-read** deadline, never a 60-second total-transfer deadline. File-backed attachment downloads persist a content-addressed ciphertext partial and retry/relaunch with BUD-01 `Range`; a valid `206 Content-Range` appends at the exact prior offset, while a server that ignores Range and returns `200` safely truncates and restarts. MIP-04 authentication still runs before plaintext is promoted into the host cache.
+
+**Breaks as:** A large video always fails on a usable low-bandwidth link, and tapping retry repeatedly downloads the same prefix until the UI eventually says the media is unavailable.
+
+**Call sites:** shared core `client.rs::fetch_media_to_file`; iOS `SonarAppStore.swift::requestMediaDownload`; Compose `SonarAppState.kt::requestMediaDownload`
+
+**Guarded by:** `client.rs::media_download_resumes_from_partial_file_after_disconnect`
+
+**Also guarded by:** `client.rs::media_download_restarts_when_server_ignores_range`, `client.rs::media_download_rejects_inconsistent_content_range`, `client.rs::media_download_honors_cancellation_before_network_io`
+
+**History:** #317 replaces the total request timeout with an idle-read timeout and adds BUD-01 Range recovery shared by Apple and Compose.
+
+**Rejected:**
+- *Raising the fixed total timeout.* Any finite total still rejects a sufficiently slow but progressing link and makes every retry restart from byte zero.
+- *Trusting a partial response without validating `Content-Range`.* A wrong offset corrupts the ciphertext and only fails later as a misleading MIP-04 authentication error.
 
 ---
 

@@ -1758,6 +1758,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String) throws
 
+    func sendMediaMultiRetryable(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String, requestId: String) throws
+
+    /**
+     * Durable media send keyed by a host-owned optimistic-row id. Retrying
+     * with the same id resumes the exact encrypted upload job; a distinct id
+     * intentionally sends a second copy even when the bytes are identical.
+     */
+    func sendMediaRetryable(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String, requestId: String) throws
+
     /**
      * Encrypt + publish a sticker message to the group.
      */
@@ -2721,6 +2730,37 @@ open func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: 
         FfiConverterSequenceTypeMediaUploadItem.lower(items),
         FfiConverterString.lower(caption),
         FfiConverterString.lower(serverUrl),$0
+    )
+}
+}
+
+open func sendMediaMultiRetryable(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String, requestId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_media_multi_retryable(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceTypeMediaUploadItem.lower(items),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(serverUrl),
+        FfiConverterString.lower(requestId),$0
+    )
+}
+}
+
+    /**
+     * Durable media send keyed by a host-owned optimistic-row id. Retrying
+     * with the same id resumes the exact encrypted upload job; a distinct id
+     * intentionally sends a second copy even when the bytes are identical.
+     */
+open func sendMediaRetryable(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String, requestId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_media_retryable(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterData.lower(data),
+        FfiConverterString.lower(filename),
+        FfiConverterString.lower(mime),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(serverUrl),
+        FfiConverterString.lower(requestId),$0
     )
 }
 }
@@ -7891,6 +7931,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_multi() != 39384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_multi_retryable() != 37983) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_retryable() != 8326) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {

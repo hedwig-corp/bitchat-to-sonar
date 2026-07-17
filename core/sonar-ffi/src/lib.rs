@@ -504,7 +504,7 @@ pub fn sonar_render_notification(
 #[derive(uniffi::Object)]
 pub struct SonarNode {
     runtime: tokio::runtime::Runtime,
-    client: SonarClient,
+    client: Arc<SonarClient>,
     /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
     /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
     #[cfg(feature = "calls-audio")]
@@ -544,12 +544,19 @@ impl SonarNode {
             .enable_all()
             .build()
             .map_err(|e| SonarFfiError::Core(format!("tokio runtime: {e}")))?;
-        let client = runtime.block_on(SonarClient::connect(
+        let client = Arc::new(runtime.block_on(SonarClient::connect(
             identity.inner.clone(),
             relays,
             &db_path,
             db_key,
-        ))?;
+        ))?);
+        // Upload recovery is deliberately detached from construction: opening
+        // an existing chat still paints from SQLCipher immediately, while the
+        // network transfer continues on the node runtime.
+        let retry_client = client.clone();
+        runtime.spawn(async move {
+            retry_client.retry_media_uploads().await;
+        });
         Ok(Arc::new(Self {
             runtime,
             client,
@@ -974,6 +981,10 @@ impl SonarNode {
     /// during relay connect are not stranded until app restart.
     pub fn retry_outbox(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.reload_outbox_and_retry());
+        let client = self.client.clone();
+        self.runtime.spawn(async move {
+            client.retry_media_uploads().await;
+        });
         Ok(())
     }
 
@@ -1005,6 +1016,10 @@ impl SonarNode {
     /// so hosts must keep it off the local-first chat-open path.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.ensure_subscriptions())?;
+        let client = self.client.clone();
+        self.runtime.spawn(async move {
+            client.retry_media_uploads().await;
+        });
         Ok(())
     }
 
@@ -1203,6 +1218,34 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Durable media send keyed by a host-owned optimistic-row id. Retrying
+    /// with the same id resumes the exact encrypted upload job; a distinct id
+    /// intentionally sends a second copy even when the bytes are identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_media_retryable(
+        &self,
+        group_id_hex: String,
+        data: Vec<u8>,
+        filename: String,
+        mime: String,
+        caption: String,
+        server_url: String,
+        request_id: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.runtime
+            .block_on(self.client.send_media_with_request_id(
+                &group_id,
+                data,
+                &filename,
+                &mime,
+                &caption,
+                &server_url,
+                &request_id,
+            ))?;
+        Ok(())
+    }
+
     /// Encrypt + upload every `item`, then publish them as ONE album message
     /// (a single kind-445 event with N `imeta` tags, in order) carrying the
     /// optional `caption`. `server_url` empty → the core default. Blocks on the
@@ -1230,6 +1273,34 @@ impl SonarNode {
             &caption,
             &server_url,
         ))?;
+        Ok(())
+    }
+
+    pub fn send_media_multi_retryable(
+        &self,
+        group_id_hex: String,
+        items: Vec<MediaUploadItem>,
+        caption: String,
+        server_url: String,
+        request_id: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let uploads = items
+            .into_iter()
+            .map(|item| sonar_core::client::MediaUpload {
+                data: item.data,
+                filename: item.filename,
+                mime: item.mime,
+            })
+            .collect();
+        self.runtime
+            .block_on(self.client.send_media_multi_with_request_id(
+                &group_id,
+                uploads,
+                &caption,
+                &server_url,
+                &request_id,
+            ))?;
         Ok(())
     }
 

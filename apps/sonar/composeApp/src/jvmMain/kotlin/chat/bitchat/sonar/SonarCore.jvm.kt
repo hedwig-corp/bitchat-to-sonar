@@ -196,8 +196,9 @@ actual object SonarCore {
         mime: String,
         caption: String,
         serverUrl: String,
+        requestId: String,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
+        requireNode().sendMediaRetryable(chatId, data, filename, mime, caption, serverUrl, requestId)
     }
 
     actual suspend fun sendMediaMulti(
@@ -205,12 +206,14 @@ actual object SonarCore {
         items: List<AlbumUpload>,
         caption: String,
         serverUrl: String,
+        requestId: String,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendMediaMulti(
+        requireNode().sendMediaMultiRetryable(
             chatId,
             items.map { uniffi.sonar_ffi.MediaUploadItem(it.bytes, it.filename, it.mime) },
             caption,
             serverUrl,
+            requestId,
         )
     }
 

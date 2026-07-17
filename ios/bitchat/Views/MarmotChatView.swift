@@ -2228,7 +2228,12 @@ final class MarmotChatModel: ObservableObject {
                 // core records the message locally and its durable outbox will
                 // publish when relays recover, matching the text-send path.
                 try await service.sendMedia(
-                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                    groupId: groupId,
+                    data: data,
+                    filename: filename,
+                    mime: mime,
+                    caption: caption,
+                    requestId: echo.media[0].url
                 )
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
@@ -2295,7 +2300,12 @@ final class MarmotChatModel: ObservableObject {
                 onEchoVisible?()
                 // See sendMedia: relay delivery is owned by the core outbox,
                 // so a temporarily disconnected relay must not block upload.
-                try await service.sendMediaMulti(groupId: groupId, items: items, caption: caption)
+                try await service.sendMediaMulti(
+                    groupId: groupId,
+                    items: items,
+                    caption: caption,
+                    requestId: echo.media[0].url
+                )
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {

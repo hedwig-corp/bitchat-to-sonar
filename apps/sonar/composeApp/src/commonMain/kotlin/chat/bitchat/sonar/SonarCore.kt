@@ -509,6 +509,7 @@ expect object SonarCore {
         mime: String,
         caption: String,
         serverUrl: String = "",
+        requestId: String = "",
     )
 
     /** Encrypt + upload every [items] entry, then publish them as ONE album
@@ -519,6 +520,7 @@ expect object SonarCore {
         items: List<AlbumUpload>,
         caption: String,
         serverUrl: String = "",
+        requestId: String = "",
     )
 
     /** Send a sticker message to a chat. */
