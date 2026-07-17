@@ -8,11 +8,18 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
     alias(libs.plugins.compose.compiler)
-    alias(libs.plugins.google.services)
+    alias(libs.plugins.google.services) apply false
     // Bakes the generated Baseline Profile (src/androidRelease/generated/baselineProfiles)
     // into release APKs so cold starts and first compositions run AOT-compiled
     // (issue #305). Generation lives in :baselineprofile.
     alias(libs.plugins.baselineprofile)
+}
+
+// CI device tests do not need Firebase and must not depend on a production
+// google-services.json. Normal app builds still apply the plugin by default.
+val skipGoogleServices = providers.gradleProperty("sonar.skipGoogleServices").orNull == "true"
+if (!skipGoogleServices) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 // Breez API key from a gitignored secret — NEVER hardcode or commit it.
@@ -109,6 +116,15 @@ val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
     inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
     inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
     inputs.dir(repoRootDir.resolve("core/vendor/nostr-blossom/src"))
+    inputs.property(
+        "sonarAbis",
+        providers.environmentVariable("SONAR_ABIS")
+            .orElse("-t arm64-v8a -t armeabi-v7a -t x86_64"),
+    )
+    inputs.property(
+        "sonarBindingsAbi",
+        providers.environmentVariable("SONAR_BINDINGS_ABI").orElse("arm64-v8a"),
+    )
     outputs.file(androidBindingsFile)
     outputs.dir(androidJniLibsDir)
 
@@ -179,6 +195,8 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
+            // Android-supported WebSocket transport for relay diagnostics.
+            implementation(libs.okhttp.client)
             // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY.
             implementation(libs.breez.sdk.liquid)
             // UniFFI Kotlin bindings for the Rust core use JNA at runtime.
@@ -188,6 +206,12 @@ kotlin {
             implementation("net.java.dev.jna:jna:5.14.0@aar")
             // QR encoding for shareable group invite links.
             implementation("com.google.zxing:core:3.5.3")
+        }
+        androidInstrumentedTest.dependencies {
+            implementation(libs.androidx.test.runner)
+            implementation(libs.androidx.test.ext.junit)
+            implementation(libs.junit)
+            implementation(libs.okhttp.mockwebserver)
         }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
@@ -271,6 +295,7 @@ android {
         applicationId = "chat.bitchat.sonar"
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 10
         versionName = "0.1-alpha.10"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
@@ -374,11 +399,15 @@ android {
             }
         }
         getByName("debug") {
-            // Debug builds only run on the local dev device. Both the Apple-
-            // Silicon emulator and the Pixel 8 are arm64-v8a, so ship just that
-            // ABI — keeps the debug APK small (the full multi-ABI build bundles
-            // the Rust + Breez .so for every ABI and overflows small partitions).
-            ndk { abiFilters += "arm64-v8a" }
+            // Local debug builds target arm64. CI passes
+            // -Psonar.androidDebugAbi=x86_64 for its Linux emulator; keeping the
+            // selection explicit avoids a multi-ABI APK overflowing small
+            // emulator partitions.
+            val debugAbi =
+                (project.findProperty("sonar.androidDebugAbi") as String?)
+                    ?.takeIf { it in setOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+                    ?: "arm64-v8a"
+            ndk { abiFilters += debugAbi }
         }
     }
 }

@@ -46,6 +46,25 @@ class RelayDiagnosticsTest {
     }
 
     @Test
+    fun parseSnapshotPreservesBracketedIpv6RelayAndFollowingEntries() {
+        val snap = parseSyncStateSnapshot(
+            """
+            {
+              "relays": [
+                {"url": "wss://[2001:db8::1]:443/path", "status": "Connected"},
+                {"url": "wss://relay.example", "status": "disconnected"}
+              ]
+            }
+            """.trimIndent(),
+        )
+
+        assertNotNull(snap)
+        assertEquals(2, snap.relays.size)
+        assertEquals("wss://[2001:db8::1]:443/path", snap.relays[0].url)
+        assertEquals("wss://relay.example", snap.relays[1].url)
+    }
+
+    @Test
     fun canonicalRelayUrlNormalizesTrailingSlashAndDefaultPort() {
         assertEquals(
             "wss://nostr.relay.hedwig.sh",

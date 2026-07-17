@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Instrumentation uses a loopback ws:// MockWebServer. Release builds
+         retain Android's default cleartext-network denial. -->
+    <application android:usesCleartextTraffic="true" />
+</manifest>
