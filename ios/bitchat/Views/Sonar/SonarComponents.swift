@@ -698,34 +698,196 @@ struct SNMediaPipeline {
     )
 }
 
-/// Signal keeps a reader at the tail pinned there through layout changes —
-/// keyboard show, composer growth, window resize — and only the user's own
-/// scroll may unpin (Signal-iOS decides on "was scrolled to bottom before the
-/// inset change" and re-pins inside the keyboard transition itself). A
-/// top-anchored SwiftUI ScrollView instead keeps its first visible row when
-/// the viewport shrinks, and the bottom sentinel's `onDisappear` fires as the
-/// keyboard covers it — so live "near bottom" state cannot tell layout theft
-/// from a user scroll-away. This latch is the iOS mirror of the Android
-/// `TranscriptTailPinner`: it captures at-tail state when a viewport change
-/// begins and keeps demanding re-pins until the sentinel lands back in view.
+enum SNTailPinAction: Equatable {
+    case none
+    case snap
+    case animate
+}
+
+/// Previous-frame tail state, mirroring Android's `TranscriptTailPinner`.
+/// Sentinel disappearance alone is ambiguous: a keyboard/composer shrink, a
+/// newly appended row, and a user's scroll all hide it. Keep the prior pinned
+/// state until explicit user-scroll activity or a history anchor unpins it.
 struct SNTailPinLatch {
-    private(set) var latched = false
+    private(set) var wasPinned = false
+    private(set) var lastItemCount = 0
+    private(set) var lastTailID: String?
 
-    /// The bottom sentinel became visible again: the reader is at the tail
-    /// and any in-flight pin has delivered. Drop the latch so a later genuine
-    /// scroll-away is respected.
-    mutating func tailVisible() { latched = false }
+    mutating func tailVisible(itemCount: Int, tailID: String?) {
+        wasPinned = true
+        updateSnapshot(itemCount: itemCount, tailID: tailID)
+    }
 
-    /// A viewport change is starting or continuing (keyboard will show, the
-    /// list height shrank). Returns true when the transcript must re-anchor
-    /// its tail. `isNearBottom` may already be false mid-transition because
-    /// the shrink itself covered the sentinel — the latch carries the pin
-    /// across those frames.
-    mutating func viewportWillShrink(isNearBottom: Bool) -> Bool {
-        if isNearBottom { latched = true }
-        return latched
+    mutating func openInHistory(itemCount: Int, tailID: String?) {
+        wasPinned = false
+        updateSnapshot(itemCount: itemCount, tailID: tailID)
+    }
+
+    mutating func userScrolled(isNearBottom: Bool) {
+        if !isNearBottom { wasPinned = false }
+    }
+
+    mutating func itemsChanged(
+        itemCount: Int,
+        tailID: String?,
+        isNearBottom: Bool,
+        userScrolling: Bool,
+        isPrepending: Bool
+    ) -> SNTailPinAction {
+        let appendedAtTail = itemCount > lastItemCount && tailID != lastTailID
+        updateSnapshot(itemCount: itemCount, tailID: tailID)
+        if isPrepending {
+            // A deliberate history-page insert owns the scroll position even
+            // when the old short transcript still fits and reports its tail
+            // visible during the first update frame.
+            wasPinned = false
+            return .none
+        }
+        if userScrolling {
+            wasPinned = isNearBottom
+            return .none
+        }
+        guard wasPinned, appendedAtTail else { return .none }
+        return .animate
+    }
+
+    mutating func tailHidden(
+        itemCount: Int,
+        tailID: String?,
+        userScrolling: Bool,
+        isPrepending: Bool
+    ) -> SNTailPinAction {
+        let appendedAtTail = itemCount > lastItemCount && tailID != lastTailID
+        updateSnapshot(itemCount: itemCount, tailID: tailID)
+        if userScrolling || isPrepending {
+            wasPinned = false
+            return .none
+        }
+        guard wasPinned, itemCount > 0 else { return .none }
+        return appendedAtTail ? .animate : .snap
+    }
+
+    mutating func viewportShrank(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
+        if userScrolling || isPrepending {
+            wasPinned = false
+            return .none
+        }
+        return wasPinned ? .snap : .none
+    }
+
+    private mutating func updateSnapshot(itemCount: Int, tailID: String?) {
+        lastItemCount = itemCount
+        lastTailID = tailID
     }
 }
+
+#if os(iOS)
+/// Bridges the underlying scroll view's user-driven offset changes without
+/// taking over its delegate. Programmatic `scrollTo` calls and keyboard layout
+/// adjustments do not report as user scrolling.
+private struct SNUserScrollObserver: UIViewRepresentable {
+    let onUserScroll: () -> Void
+
+    func makeUIView(context: Context) -> ObserverView {
+        let view = ObserverView()
+        view.onUserScroll = onUserScroll
+        return view
+    }
+
+    func updateUIView(_ uiView: ObserverView, context: Context) {
+        uiView.onUserScroll = onUserScroll
+        uiView.attachWhenReady()
+    }
+
+    final class ObserverView: UIView {
+        var onUserScroll: () -> Void = {}
+        private weak var observedScrollView: UIScrollView?
+        private var contentOffsetObservation: NSKeyValueObservation?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            attachWhenReady()
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            attachWhenReady()
+        }
+
+        func attachWhenReady() {
+            DispatchQueue.main.async { [weak self] in self?.attachToEnclosingScrollView() }
+        }
+
+        private func attachToEnclosingScrollView() {
+            var ancestor = superview
+            while let view = ancestor, !(view is UIScrollView) {
+                ancestor = view.superview
+            }
+            guard let scrollView = ancestor as? UIScrollView,
+                  scrollView !== observedScrollView else { return }
+            observedScrollView = scrollView
+            contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) {
+                [weak self] scrollView, _ in
+                guard scrollView.isTracking || scrollView.isDragging || scrollView.isDecelerating else { return }
+                self?.onUserScroll()
+            }
+        }
+    }
+}
+#else
+private struct SNUserScrollObserver: NSViewRepresentable {
+    let onUserScroll: () -> Void
+
+    func makeNSView(context: Context) -> ObserverView {
+        let view = ObserverView()
+        view.onUserScroll = onUserScroll
+        return view
+    }
+
+    func updateNSView(_ nsView: ObserverView, context: Context) {
+        nsView.onUserScroll = onUserScroll
+        nsView.attachWhenReady()
+    }
+
+    final class ObserverView: NSView {
+        var onUserScroll: () -> Void = {}
+        private weak var observedScrollView: NSScrollView?
+        private var liveScrollObserver: NSObjectProtocol?
+
+        deinit {
+            if let liveScrollObserver { NotificationCenter.default.removeObserver(liveScrollObserver) }
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            attachWhenReady()
+        }
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            attachWhenReady()
+        }
+
+        func attachWhenReady() {
+            DispatchQueue.main.async { [weak self] in self?.attachToEnclosingScrollView() }
+        }
+
+        private func attachToEnclosingScrollView() {
+            guard let scrollView = enclosingScrollView,
+                  scrollView !== observedScrollView else { return }
+            if let liveScrollObserver { NotificationCenter.default.removeObserver(liveScrollObserver) }
+            observedScrollView = scrollView
+            liveScrollObserver = NotificationCenter.default.addObserver(
+                forName: NSScrollView.didLiveScrollNotification,
+                object: scrollView,
+                queue: .main
+            ) { [weak self] _ in
+                self?.onUserScroll()
+            }
+        }
+    }
+}
+#endif
 
 struct SNMsgList: View {
     let msgs: [SNMessage]
@@ -773,12 +935,13 @@ struct SNMsgList: View {
     /// event is a call/pay control row). Ends the pending-anchor state so tail
     /// following is not suppressed for the rest of the open.
     @State private var unreadAnchorAbandoned = false
-    /// Keeps the tail pinned through viewport shrinks (keyboard, composer
-    /// growth, window resize) even while the shrink hides the bottom sentinel.
+    /// Carries the prior pinned state across viewport/content layout changes.
     @State private var tailPin = SNTailPinLatch()
     /// Last observed list viewport height; a decrease is a shrink to re-pin
     /// against. Seeded in onAppear — onChange alone misses the first shrink.
     @State private var viewportHeight: CGFloat = 0
+    @State private var isUserScrolling = false
+    @State private var userScrollGeneration = 0
 
     /// True once the visible rows have caught up with the newest message the
     /// core index knows across the chat's folded sources. A mesh chat paints
@@ -814,6 +977,32 @@ struct SNMsgList: View {
         }
         unreadAnchorId = anchor
         if anchor == nil { unreadAnchorAbandoned = true }
+    }
+
+    private func noteUserScroll() {
+        isUserScrolling = true
+        tailPin.userScrolled(isNearBottom: isNearBottom)
+        userScrollGeneration &+= 1
+        let generation = userScrollGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+            guard userScrollGeneration == generation else { return }
+            isUserScrolling = false
+        }
+    }
+
+    private func followTail(
+        _ action: SNTailPinAction,
+        proxy: ScrollViewProxy,
+        animateAppends: Bool = true
+    ) {
+        guard action != .none else { return }
+        DispatchQueue.main.async {
+            if action == .animate, animateAppends, !reduceMotion {
+                withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
+            } else {
+                proxy.scrollTo("sn-bottom", anchor: .bottom)
+            }
+        }
     }
 
     var body: some View {
@@ -911,7 +1100,7 @@ struct SNMsgList: View {
                             .onAppear {
                                 isNearBottom = true
                                 hasReachedBottomOnce = true
-                                tailPin.tailVisible()
+                                tailPin.tailVisible(itemCount: msgs.count, tailID: msgs.last?.id)
                                 guard hasLeftBottom, let loadNewest, !isLoadingNewest else { return }
                                 isLoadingNewest = true
                                 Task { @MainActor in
@@ -921,11 +1110,23 @@ struct SNMsgList: View {
                             }
                             .onDisappear {
                                 isNearBottom = false
-                                if hasReachedBottomOnce { hasLeftBottom = true }
+                                let action = tailPin.tailHidden(
+                                    itemCount: msgs.count,
+                                    tailID: msgs.last?.id,
+                                    userScrolling: isUserScrolling,
+                                    isPrepending: isLoadingOlder
+                                )
+                                if !tailPin.wasPinned, hasReachedBottomOnce { hasLeftBottom = true }
+                                followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                             }
                     }
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
                 }
+                .background(
+                    SNUserScrollObserver(onUserScroll: noteUserScroll)
+                        .frame(width: 0, height: 0)
+                        .accessibilityHidden(true)
+                )
                 .onAppear {
                     viewportHeight = geo.size.height
                     // Signal parity: an unread chat opens at the first unread
@@ -934,6 +1135,7 @@ struct SNMsgList: View {
                     resolveUnreadAnchor()
                     if unreadAnchorId != nil {
                         isNearBottom = false
+                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
                         // The divider enters the hierarchy on the render pass
                         // that applies the state set above; scroll after it.
                         DispatchQueue.main.async {
@@ -951,6 +1153,7 @@ struct SNMsgList: View {
                     resolveUnreadAnchor()
                     guard unreadAnchorId != nil else { return }
                     isNearBottom = false
+                    tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
                     DispatchQueue.main.async {
                         proxy.scrollTo("sn-unread", anchor: .top)
                     }
@@ -962,6 +1165,7 @@ struct SNMsgList: View {
                         // A late-merged transport leg just made the divider
                         // resolvable: it owns this scroll, not the tail.
                         isNearBottom = false
+                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
                         DispatchQueue.main.async {
                             proxy.scrollTo("sn-unread", anchor: .top)
                         }
@@ -971,44 +1175,17 @@ struct SNMsgList: View {
                     // rows to the bottom — the anchor scroll would lose the
                     // race. An abandoned anchor is no longer pending.
                     if unreadCountAtOpen > 0, unreadAnchorId == nil, !unreadAnchorAbandoned { return }
-                    guard isNearBottom else { return }
-                    // A mesh chat paints the BLE window before the White Noise
-                    // leg merges async; following that merge with an ANIMATED
-                    // scroll is the visible jump users see on open (a pure
-                    // Marmot chat never does it — its first page already holds
-                    // the newest rows). Re-pin instantly until the rows catch
-                    // up with the newest known message; animate only genuinely
-                    // new post-settle messages.
-                    if reduceMotion || !feedCaughtUp {
-                        proxy.scrollTo("sn-bottom", anchor: .bottom)
-                    } else {
-                        withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
-                    }
+                    let action = tailPin.itemsChanged(
+                        itemCount: msgs.count,
+                        tailID: msgs.last?.id,
+                        isNearBottom: isNearBottom,
+                        userScrolling: isUserScrolling,
+                        isPrepending: isLoadingOlder
+                    )
+                    // Hydration is not a new message: absorb it instantly so a
+                    // folded chat never visibly chases its late local rows.
+                    followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                 }
-                #if canImport(UIKit)
-                // The keyboard shrinking the viewport must not hide the newest
-                // messages when the reader is at the tail (Signal keeps the
-                // transcript pinned under the composer). The notification only
-                // latches the pre-shrink at-tail state and starts an animated
-                // follow; the settle-correct pin is owned by the viewport
-                // geometry change below — a timer cannot know when the shrink
-                // actually lands, and the sentinel's onDisappear flips
-                // isNearBottom false the moment the keyboard covers it.
-                .onReceive(NotificationCenter.default.publisher(
-                    for: UIResponder.keyboardWillShowNotification
-                )) { _ in
-                    guard tailPin.viewportWillShrink(isNearBottom: isNearBottom) else { return }
-                    DispatchQueue.main.async {
-                        if reduceMotion {
-                            proxy.scrollTo("sn-bottom", anchor: .bottom)
-                        } else {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                proxy.scrollTo("sn-bottom", anchor: .bottom)
-                            }
-                        }
-                    }
-                }
-                #endif
                 // Any list-viewport shrink — each keyboard layout step, the
                 // composer growing a line, a macOS window resize — re-anchors
                 // the tail while the reader is pinned there. Matches the
@@ -1018,10 +1195,11 @@ struct SNMsgList: View {
                     let previous = viewportHeight
                     viewportHeight = newHeight
                     guard previous > 0, newHeight < previous else { return }
-                    guard tailPin.viewportWillShrink(isNearBottom: isNearBottom) else { return }
-                    DispatchQueue.main.async {
-                        proxy.scrollTo("sn-bottom", anchor: .bottom)
-                    }
+                    let action = tailPin.viewportShrank(
+                        userScrolling: isUserScrolling,
+                        isPrepending: isLoadingOlder
+                    )
+                    followTail(action, proxy: proxy)
                 }
             }
         }

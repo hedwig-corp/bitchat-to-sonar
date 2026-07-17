@@ -2,8 +2,8 @@
 // SNTailPinLatchTests.swift
 // bitchatTests
 //
-// Regression coverage for the transcript tail staying pinned through
-// keyboard/viewport shrinks (iOS mirror of the Android TranscriptTailPinner).
+// Regression coverage for the transcript tail staying pinned through content
+// and viewport changes (iOS mirror of the Android TranscriptTailPinner).
 // This is free and unencumbered software released into the public domain.
 //
 
@@ -19,28 +19,22 @@ struct SNTailPinLatchTests {
     @Test
     func shrinkKeepsPinningWhileSentinelIsCovered() {
         var latch = SNTailPinLatch()
-        // keyboardWillShow fires with the reader at the tail.
-        let atStart = latch.viewportWillShrink(isNearBottom: true)
-        #expect(atStart)
-        // The safe-area shrink lands in layout steps; the sentinel is already
-        // covered, so isNearBottom is false — the pin must still be demanded.
-        let midTransition = latch.viewportWillShrink(isNearBottom: false)
-        #expect(midTransition)
-        let lateSettle = latch.viewportWillShrink(isNearBottom: false)
-        #expect(lateSettle)
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
+        // The sentinel is covered now, but the prior pinned frame still owns
+        // every later keyboard-animation step.
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
     }
 
-    /// Once a pin delivers the sentinel back into view, the latch drops: a
-    /// genuine user scroll-away afterwards must not be yanked back by the
-    /// next viewport change (composer growth, keyboard re-open).
+    /// Once a pin delivers the sentinel back into view, a genuine user
+    /// scroll-away afterwards must not be yanked back by the next viewport
+    /// change (composer growth, keyboard re-open).
     @Test
     func userScrollAwayIsRespectedAfterTailReturns() {
         var latch = SNTailPinLatch()
-        _ = latch.viewportWillShrink(isNearBottom: true)
-        latch.tailVisible()
-        // Reader scrolls up into history, then the viewport shrinks again.
-        let afterScrollAway = latch.viewportWillShrink(isNearBottom: false)
-        #expect(!afterScrollAway)
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        latch.userScrolled(isNearBottom: false)
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
     }
 
     /// An unread-anchored open starts in history (never at the tail): opening
@@ -48,22 +42,81 @@ struct SNTailPinLatchTests {
     @Test
     func anchoredOpenNeverPins() {
         var latch = SNTailPinLatch()
-        let first = latch.viewportWillShrink(isNearBottom: false)
-        #expect(!first)
-        let second = latch.viewportWillShrink(isNearBottom: false)
-        #expect(!second)
+        latch.openInHistory(itemCount: 40, tailID: "40")
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
     }
 
-    /// Multi-step transitions re-latch: sentinel returns mid-animation, then
-    /// the next shrink step with the reader still at the tail pins again.
+    /// A keyboard notification without a real safe-area shrink (floating iPad
+    /// keyboard) creates no sticky latch that can yank a later history reader.
     @Test
-    func relatchesAcrossTransitionSteps() {
+    func keyboardShowWithoutShrinkDoesNotLeaveStickyPin() {
         var latch = SNTailPinLatch()
-        _ = latch.viewportWillShrink(isNearBottom: true)
-        latch.tailVisible()
-        let relatched = latch.viewportWillShrink(isNearBottom: true)
-        #expect(relatched)
-        let carried = latch.viewportWillShrink(isNearBottom: false)
-        #expect(carried)
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        // No viewport event occurs. The next real event is the user's scroll.
+        latch.userScrolled(isNearBottom: false)
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
+    }
+
+    @Test
+    func nonKeyboardLayoutTheftSnapsBack() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(
+            latch.tailHidden(
+                itemCount: 40,
+                tailID: "40",
+                userScrolling: false,
+                isPrepending: false
+            ) == .snap
+        )
+    }
+
+    @Test
+    func appendedOutgoingRowAtTailFollows() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(
+            latch.itemsChanged(
+                itemCount: 41,
+                tailID: "outgoing-41",
+                isNearBottom: false,
+                userScrolling: false,
+                isPrepending: false
+            ) == .animate
+        )
+    }
+
+    @Test
+    func historyPrependNeverYanksToTail() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(
+            latch.itemsChanged(
+                itemCount: 80,
+                tailID: "40",
+                // Event ordering can leave the old short transcript's
+                // sentinel visible during the count update. Prepending still
+                // owns the position and must unpin unconditionally.
+                isNearBottom: true,
+                userScrolling: false,
+                isPrepending: true
+            ) == .none
+        )
+        #expect(!latch.wasPinned)
+    }
+
+    @Test
+    func userScrollThatHidesTailNeverRepins() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 40, tailID: "40")
+        #expect(
+            latch.tailHidden(
+                itemCount: 40,
+                tailID: "40",
+                userScrolling: true,
+                isPrepending: false
+            ) == .none
+        )
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .none)
     }
 }

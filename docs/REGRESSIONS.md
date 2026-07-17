@@ -261,21 +261,21 @@ invalidation for verified peer/profile changes.
 ---
 ## R-009 — Layout must never steal a pinned transcript tail
 
-**Invariant:** While the reader is at the transcript tail, a layout-driven viewport shrink (keyboard opening, composer growing a line, window resize) must keep the newest message visible above the fold; only the user's own scroll may unpin. In particular, "am I at the bottom" state that the shrink itself invalidates (the bottom sentinel disappearing under the keyboard) must not gate the re-pin.
+**Invariant:** While the reader is at the transcript tail, a layout/content change (keyboard opening, composer growth, window resize, media growth, or an appended message) must keep the newest message visible above the fold; only the user's own scroll may unpin. In particular, "am I at the bottom" state that the change itself invalidates must not gate the re-pin.
 
-**Breaks as:** Opening the keyboard hides the last screenful of messages behind the IME; once it has happened, later keyboard opens in the same chat do nothing (the sentinel-based near-bottom flag stays false).
+**Breaks as:** Opening the keyboard hides the last screenful of messages behind the IME, or a newly sent bubble remains below the fold until manual scroll. Once the sentinel-based near-bottom flag flips false, later layout changes can become no-ops.
 
-**Why:** Both list stacks are top-anchored: a viewport shrink keeps the first visible row, not the last. And both platforms' "near bottom" signals are themselves consumed by the shrink — Compose's `tailFullyVisible` and iOS's `sn-bottom` sentinel `onDisappear` flip false the moment the keyboard covers the tail — so a guard on the live value stops re-pinning exactly when the pin is needed. Timers (the #303 iOS fix pinned at now/+0.35s) lose to whatever settles after them.
+**Why:** Both list stacks are top-anchored: viewport shrink or content growth keeps the first visible row, not the last. Both platforms' live "near bottom" signals are consumed by that same change, so the pinner must carry the previous frame's tail state and separately observe genuine user scrolling. Timers (the #303 iOS fix pinned at now/+0.35s) lose to whatever settles after them.
 
-**Call sites:** iOS `SonarComponents.swift::SNMsgList` (`SNTailPinLatch` + the `geo.size.height` onChange + `keyboardWillShowNotification`); Compose `App.kt::TranscriptTailPinning` (`TranscriptTailPinner.onFrame`).
+**Call sites:** iOS `SonarComponents.swift::SNMsgList` (`SNTailPinLatch` + `SNUserScrollObserver` + sentinel/count/viewport events); Compose `App.kt::TranscriptTailPinning` (`TranscriptTailPinner.onFrame`).
 
 **Guarded by:** `SNTailPinLatchTests.shrinkKeepsPinningWhileSentinelIsCovered`
 
-**Also guarded by:** `SNTailPinLatchTests.userScrollAwayIsRespectedAfterTailReturns`, `SNTailPinLatchTests.anchoredOpenNeverPins`, `TranscriptTailPinnerTest` and `TranscriptTailPinningUiTest` (Compose, real `LazyListState` wiring).
+**Also guarded by:** `SNTailPinLatchTests.appendedOutgoingRowAtTailFollows`, `SNTailPinLatchTests.nonKeyboardLayoutTheftSnapsBack`, `SNTailPinLatchTests.keyboardShowWithoutShrinkDoesNotLeaveStickyPin`, `SNTailPinLatchTests.userScrollAwayIsRespectedAfterTailReturns`, `SNTailPinLatchTests.anchoredOpenNeverPins`, `TranscriptTailPinnerTest` and `TranscriptTailPinningUiTest` (Compose, real `LazyListState` wiring).
 
 **Coverage (honest):** The Swift tests pin only the latch decision — a helper the SwiftUI body feeds itself, exactly the shape rule 2 warns about; nothing exercises the `GeometryReader`/`ScrollViewReader` wiring or that `scrollTo` actually lands (and iOS tests do not run in CI). The Compose UI test is the stronger guard. A raced/failed pin on iOS is only caught by eye.
 
-**History:** #283 (Compose) -> #303 (iOS, notification + fixed delays; incomplete) -> this fix (latch + viewport-geometry re-pin).
+**History:** #283 (Compose) -> #303 (iOS, notification + fixed delays; incomplete) -> this fix (previous-frame pinner + explicit user-scroll observation).
 
 **Rejected:**
 - *Fixed-delay double pin after `keyboardWillShow` (#303).* The 0.35s timer races the safe-area animation and anything that settles later (late transport-leg merge, sticker/media decode); one lost race also strands `isNearBottom` at false, disabling every later keyboard open.
