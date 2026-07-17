@@ -16,6 +16,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.ParcelUuid
 import android.os.SystemClock
+import chat.bitchat.sonar.BuildConfig
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -160,6 +161,9 @@ actual object MeshRadio {
     }
 
     private fun notifyPeerUpdate() {
+        if (BuildConfig.DEBUG) {
+            android.util.Log.i("SonarCore", "SONAR_BENCH mesh_peer_invalidate")
+        }
         peerUpdateListener?.let { listener -> runCatching(listener) }
     }
 

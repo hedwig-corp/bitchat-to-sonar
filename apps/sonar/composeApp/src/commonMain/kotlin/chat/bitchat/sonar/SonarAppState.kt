@@ -112,20 +112,48 @@ internal fun visibleRadarMeshPeers(
     isBlocked(peer.id.removePrefix("mesh:"))
 }
 
+/** Compact percent-encoding for Debug SONAR_BENCH nick tokens (spaces/emoji-safe). */
+internal fun benchNickToken(nick: String): String {
+    if (nick.isEmpty()) return "_"
+    val out = StringBuilder(nick.length)
+    for (ch in nick) {
+        when {
+            ch.isLetterOrDigit() || ch == '-' || ch == '_' || ch == '.' || ch == '~' -> out.append(ch)
+            else -> {
+                val bytes = ch.toString().encodeToByteArray()
+                for (b in bytes) out.append('%').append(((b.toInt() and 0xFF)).toString(16).padStart(2, '0').uppercase())
+            }
+        }
+    }
+    return out.toString()
+}
+
 /** A burst of radio/profile invalidations needs at most one refresh in flight
  * and one follow-up refresh. Conflation prevents BLE callback volume from
- * turning into an unbounded main-thread coroutine queue. */
+ * turning into an unbounded main-thread coroutine queue — the same 1+1 trailing
+ * shape used by [chat.bitchat.sonar.wallet.WalletBridge] balance refresh and
+ * Signal-style DB invalidation (react once, don't enqueue every callback). */
 internal class ConflatedRefreshQueue(
     scope: CoroutineScope,
     refresh: suspend () -> Unit,
 ) {
     private val requests = Channel<Unit>(Channel.CONFLATED)
+    /** Requests dropped because a trailing refresh was already pending. Bench-only. */
+    private var droppedRequests = 0L
     private val worker = scope.launch {
         for (ignored in requests) refresh()
     }
 
     fun request() {
+        if (!requests.isEmpty) droppedRequests++
         requests.trySend(Unit)
+    }
+
+    /** Consume and reset the conflation counter (Debug SONAR_BENCH mesh_refresh_end). */
+    fun takeDroppedRequests(): Long {
+        val n = droppedRequests
+        droppedRequests = 0
+        return n
     }
 
     fun cancel() {
@@ -1573,6 +1601,11 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Read and decode the native radio snapshot away from the UI thread. */
     private suspend fun refreshMeshRadioState() {
+        val dropped = meshPeerRefreshQueue.takeDroppedRequests()
+        val started = if (sonarBenchMarkersEnabled) TimeSource.Monotonic.markNow() else null
+        if (sonarBenchMarkersEnabled) {
+            sonarLog("SonarCore", "SONAR_BENCH mesh_refresh_begin dropped=$dropped")
+        }
         val snapshot = withContext(Dispatchers.Default) {
             MeshRadioSnapshot(
                 peers = MeshRadio.peers(),
@@ -1581,8 +1614,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                     .toMap(),
             )
         }
+        val offMainMs = started?.elapsedNow()?.inWholeMicroseconds?.div(1000.0)
+        val beforePeers = meshPeers
+        val beforeProfiles = sonarPeerProfiles
         applySonarDiscoveryProfiles(snapshot.profiles)
         updateMeshPeersFromRadio(rawPeers = snapshot.peers)
+        if (sonarBenchMarkersEnabled && started != null && offMainMs != null) {
+            val totalMs = started.elapsedNow().inWholeMicroseconds / 1000.0
+            val published = if (meshPeers != beforePeers || sonarPeerProfiles != beforeProfiles) 1 else 0
+            sonarLog(
+                "SonarCore",
+                "SONAR_BENCH mesh_refresh_end peers=${snapshot.peers.size} " +
+                    "profiles=${snapshot.profiles.size} off_main_ms=$offMainMs " +
+                    "total_ms=$totalMs published=$published dropped=$dropped",
+            )
+        }
     }
 
     private fun applySonarDiscoveryProfiles(profiles: Map<String, SonarAnnounce>) {
@@ -1598,6 +1644,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         nowMs: Long = SonarClock.nowMillis(),
     ) {
         val previousPeerIds = rawMeshPeerIds
+        val previousVisibleIds = meshPeers.map { it.id }.toSet()
         rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
         val visiblePeers = visibleRadarMeshPeers(rawPeers, ::isMeshContactBlocked)
@@ -1607,6 +1654,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshPeerFirstSeenMs.putIfAbsent(peerId, nowMs)
         }
         if (meshPeers != visiblePeers) meshPeers = visiblePeers
+        if (sonarBenchMarkersEnabled) {
+            for (peer in visiblePeers) {
+                if (peer.id in previousVisibleIds) continue
+                val nick = benchNickToken(peer.name)
+                val fp = meshPeerId(peer.id).take(8)
+                val sonar = if (peer.sonar) 1 else 0
+                sonarLog(
+                    "SonarCore",
+                    "SONAR_BENCH radar_peer_paint nick=$nick fp=$fp sonar=$sonar",
+                )
+            }
+        }
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
         for (peerId in rawMeshPeerIds) {
