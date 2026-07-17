@@ -786,7 +786,7 @@ private struct MacConversationPane: View {
                             showToast("\(message.author ?? "This person") is no longer in the channel")
                         }
                     },
-                    loadSticker: { await store.stickerImageData(for: $0) },
+                    loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                     onTapPack: { previewPackCoordinate = $0 }
                 )
             }
@@ -3516,7 +3516,7 @@ private struct MacDMTranscript: View {
                     cancel: { store.cancelMediaDownload($0) },
                     loadLocal: { await store.mediaData($0) }
                 ),
-                loadSticker: { await store.stickerImageData(for: $0) },
+                loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                 onTapPack: onTapPack,
                 onRetry: { store.retryDm(peerId, message: $0) },
                 loadOlder: { await convo.loadOlder() },
