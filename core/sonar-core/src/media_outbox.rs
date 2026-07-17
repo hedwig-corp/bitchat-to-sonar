@@ -47,6 +47,11 @@ pub(crate) struct MediaUploadJob {
     pub created_at_secs: u64,
     pub expected_items: usize,
     pub items: Vec<MediaUploadItem>,
+    /// Set only after the local transcript row and durable relay outbox entry
+    /// have both been committed. Recovery treats this as a terminal handoff
+    /// and retries cleanup instead of creating a second MLS message.
+    #[serde(default)]
+    pub completed_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -295,6 +300,7 @@ impl MediaOutbox {
                 created_at_secs,
                 expected_items,
                 items: Vec::with_capacity(expected_items),
+                completed_message_id: None,
             },
         );
         if let Err(error) = self.save() {
@@ -486,6 +492,26 @@ impl MediaOutbox {
             .ok_or_else(|| Error::Storage("media upload checkpoint is missing".into()))?;
         item.uploaded_url = Some(url);
         self.save()
+    }
+
+    pub fn checkpoint_completed_message(
+        &mut self,
+        request_id: &str,
+        message_id: String,
+    ) -> Result<()> {
+        let job = self
+            .jobs
+            .get_mut(request_id)
+            .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+        let previous = job.completed_message_id.replace(message_id);
+        if let Err(error) = self.save() {
+            self.jobs
+                .get_mut(request_id)
+                .expect("job checked above")
+                .completed_message_id = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn remove(&mut self, request_id: &str) -> Result<()> {
@@ -760,6 +786,9 @@ mod tests {
         outbox
             .checkpoint_url("request", 0, "https://blossom.example/a".into())
             .unwrap();
+        outbox
+            .checkpoint_completed_message("request", "message-id".into())
+            .unwrap();
 
         let reloaded = MediaOutbox::open(&db, key).unwrap();
         let job = reloaded.job("request").unwrap();
@@ -767,6 +796,7 @@ mod tests {
             job.items[0].uploaded_url.as_deref(),
             Some("https://blossom.example/a")
         );
+        assert_eq!(job.completed_message_id.as_deref(), Some("message-id"));
         assert_eq!(
             reloaded.load_upload("request", 1).unwrap().encrypted_data,
             vec![2; 32]

@@ -35,6 +35,11 @@ pub(crate) struct OutboxEntry {
     pub attempts: u32,
     pub state: DeliveryState,
     pub last_error: Option<String>,
+    /// Stable encrypted-media upload request handed off to this relay event.
+    /// Recovery uses it to avoid rebuilding an MLS message when the upload
+    /// journal's final cleanup/checkpoint was interrupted.
+    #[serde(default)]
+    pub media_request_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -81,6 +86,44 @@ impl OutboxState {
         event_json: String,
         now_secs: u64,
     ) -> Result<()> {
+        self.mark_pending_inner(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            None,
+        )
+    }
+
+    pub fn mark_pending_media(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+        media_request_id: String,
+    ) -> Result<()> {
+        self.mark_pending_inner(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            Some(media_request_id),
+        )
+    }
+
+    fn mark_pending_inner(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+        media_request_id: Option<String>,
+    ) -> Result<()> {
         let entry = OutboxEntry {
             group_id_hex,
             message_id_hex: message_id_hex.clone(),
@@ -91,10 +134,28 @@ impl OutboxState {
             attempts: 0,
             state: DeliveryState::Pending,
             last_error: None,
+            media_request_id,
         };
-        self.entries.insert(message_id_hex, entry);
+        let was_dirty = self.dirty;
+        let previous = self.entries.insert(message_id_hex.clone(), entry);
         self.dirty = true;
-        self.save_if_dirty()
+        if let Err(error) = self.save_if_dirty() {
+            if let Some(previous) = previous {
+                self.entries.insert(message_id_hex, previous);
+            } else {
+                self.entries.remove(&message_id_hex);
+            }
+            self.dirty = was_dirty;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn message_id_for_media_request(&self, request_id: &str) -> Option<String> {
+        self.entries
+            .values()
+            .find(|entry| entry.media_request_id.as_deref() == Some(request_id))
+            .map(|entry| entry.message_id_hex.clone())
     }
 
     pub fn mark_sent_by_message_id(&mut self, message_id_hex: &str, _now_secs: u64) -> Result<()> {
@@ -299,6 +360,31 @@ mod tests {
         assert_eq!(
             stale.status_for_message("message"),
             Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn media_handoff_identity_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox
+            .mark_pending_media(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+                "media-request".into(),
+            )
+            .expect("mark media pending");
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded
+                .message_id_for_media_request("media-request")
+                .as_deref(),
+            Some("message")
         );
     }
 

@@ -15,7 +15,8 @@ use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::{BoxFuture, Shared};
-use futures_util::FutureExt;
+use futures_util::stream::FuturesUnordered;
+use futures_util::{FutureExt, StreamExt};
 use mdk_core::encrypted_media::EncryptedMediaUpload;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
@@ -107,6 +108,7 @@ const BLOSSOM_UPLOAD_RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
 /// Bound re-encryption if MLS membership keeps changing during a long upload.
 /// The durable source remains queued and a later retry can continue.
 const MEDIA_UPLOAD_EPOCH_ATTEMPTS: usize = 3;
+const MEDIA_UPLOAD_CONCURRENCY: usize = 2;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -1680,9 +1682,12 @@ pub struct SonarClient {
     /// manifest is encrypted with a key derived from the SQLCipher key; blobs
     /// are already MIP-04 ciphertext. Disabled for in-memory clients.
     media_outbox: Arc<Mutex<MediaOutbox>>,
-    /// One upload job mutates the durable manifest at a time. This also avoids
-    /// two host retry taps uploading the same content-addressed blob together.
-    media_upload_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Per-request single-flight gates prevent duplicate work for one retry id
+    /// without making an old stalled upload block unrelated conversations.
+    media_upload_gates: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
+    /// Bound simultaneous network uploads for phone memory/radio pressure. A
+    /// new send is journaled before waiting for a permit, so it remains durable.
+    media_upload_permits: Arc<tokio::sync::Semaphore>,
     /// Per-URL single-flight gates protect the content-addressed resume file
     /// when two views request the same attachment concurrently.
     media_download_gates: Arc<tokio::sync::Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
@@ -2227,7 +2232,8 @@ impl SonarClient {
             sync_state,
             outbox_state,
             media_outbox: Arc::new(Mutex::new(media_outbox)),
-            media_upload_gate: Arc::new(tokio::sync::Mutex::new(())),
+            media_upload_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            media_upload_permits: Arc::new(tokio::sync::Semaphore::new(MEDIA_UPLOAD_CONCURRENCY)),
             media_download_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             pending_marmot_giftwraps,
             pending_marmot_groups,
@@ -3703,6 +3709,23 @@ impl SonarClient {
         )
     }
 
+    fn mark_media_outbox_pending(
+        &self,
+        group_id: &GroupId,
+        message: &ChatMessage,
+        event: &Event,
+        request_id: &str,
+    ) -> Result<()> {
+        self.outbox_state.lock().unwrap().mark_pending_media(
+            hex::encode(group_id.as_slice()),
+            message.id.to_hex(),
+            event.id.to_hex(),
+            event.as_json(),
+            Timestamp::now().as_secs(),
+            request_id.to_string(),
+        )
+    }
+
     /// Publish an outbox event and notify hosts when delivery state flips.
     ///
     /// [group_id_hex] must be the **MLS** group id hosts use for
@@ -3996,9 +4019,10 @@ impl SonarClient {
         // completed job, so deliberately sending the same file again later is
         // still a new message.
         if self.media_outbox.lock().unwrap().is_persistent() {
-            let _gate = self.media_upload_gate.lock().await;
             let request_id =
                 media_upload_request_id(group_id, &items, caption, server_url, request_id);
+            let upload_gate = self.media_upload_gate(&request_id).await;
+            let _job = upload_gate.lock().await;
             let existing_job = self.media_outbox.lock().unwrap().job(&request_id);
             if let Some(job) = existing_job.as_ref() {
                 let expected_server = if server_url.is_empty() {
@@ -4117,6 +4141,7 @@ impl SonarClient {
         }
         self.finish_media_send(group_id, uploads, caption, None)
             .await
+            .map(|_| ())
     }
 
     async fn finish_media_send(
@@ -4124,8 +4149,8 @@ impl SonarClient {
         group_id: &GroupId,
         uploads: Vec<(EncryptedMediaUpload, String)>,
         caption: &str,
-        expected_epoch: Option<u64>,
-    ) -> Result<()> {
+        durable_identity: Option<(&str, u64, u64)>,
+    ) -> Result<String> {
         let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
         // Local-first, same sequencing as `send_text`: encrypt + write the
         // local row under one MLS guard, mark the durable outbox pending, and
@@ -4135,13 +4160,16 @@ impl SonarClient {
         // could have stranded a false-Sent row.
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
-            if let Some(expected_epoch) = expected_epoch {
-                self.engine.create_and_process_media_event_multi_at_epoch(
-                    group_id,
-                    &refs,
-                    caption,
-                    expected_epoch,
-                )?
+            if let Some((request_id, created_at_secs, expected_epoch)) = durable_identity {
+                self.engine
+                    .create_and_process_media_event_multi_for_request_at_epoch(
+                        group_id,
+                        &refs,
+                        caption,
+                        expected_epoch,
+                        request_id,
+                        created_at_secs,
+                    )?
             } else {
                 self.engine
                     .create_and_process_media_event_multi(group_id, &refs, caption)?
@@ -4154,24 +4182,76 @@ impl SonarClient {
         };
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
-        self.mark_outbox_pending(group_id, &message, &event)?;
+        if let Some((request_id, _, _)) = durable_identity {
+            self.mark_media_outbox_pending(group_id, &message, &event, request_id)?;
+            // Checkpoint the handoff before the publish task can receive an ACK
+            // and compact the relay-outbox entry. Recovery then only retries
+            // cleanup; it never recreates the MLS media message.
+            self.media_outbox
+                .lock()
+                .unwrap()
+                .checkpoint_completed_message(request_id, message.id.to_hex())?;
+        } else {
+            self.mark_outbox_pending(group_id, &message, &event)?;
+        }
         let event_id = event.id;
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        let message_id = message.id.to_hex();
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
-        Ok(())
+        Ok(message_id)
+    }
+
+    async fn media_upload_gate(&self, request_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut gates = self.media_upload_gates.lock().await;
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(request_id).and_then(Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        gates.insert(request_id.to_string(), Arc::downgrade(&gate));
+        gate
     }
 
     /// Continue one durable upload job. Completed item URLs are reused; only
     /// the currently interrupted BUD-02 whole-blob PUT restarts from byte zero.
     async fn process_media_upload_job(&self, request_id: &str) -> Result<()> {
-        let _gate = self.media_upload_gate.lock().await;
+        let upload_gate = self.media_upload_gate(request_id).await;
+        let _job = upload_gate.lock().await;
         self.process_media_upload_job_locked(request_id).await
     }
 
     async fn process_media_upload_job_locked(&self, request_id: &str) -> Result<()> {
+        let initial = self
+            .media_outbox
+            .lock()
+            .unwrap()
+            .job(request_id)
+            .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+        if initial.completed_message_id.is_some() {
+            self.media_outbox.lock().unwrap().remove(request_id)?;
+            return Ok(());
+        }
+        if let Some(message_id) = self
+            .outbox_state
+            .lock()
+            .unwrap()
+            .message_id_for_media_request(request_id)
+        {
+            self.media_outbox
+                .lock()
+                .unwrap()
+                .checkpoint_completed_message(request_id, message_id)?;
+            self.media_outbox.lock().unwrap().remove(request_id)?;
+            return Ok(());
+        }
+        let _network_permit = self
+            .media_upload_permits
+            .acquire()
+            .await
+            .map_err(|_| Error::Storage("media upload scheduler is closed".into()))?;
         for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
             let mut job = self
                 .media_outbox
@@ -4179,6 +4259,10 @@ impl SonarClient {
                 .unwrap()
                 .job(request_id)
                 .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+            if job.completed_message_id.is_some() {
+                self.media_outbox.lock().unwrap().remove(request_id)?;
+                return Ok(());
+            }
             if job.items.len() != job.expected_items {
                 return Err(Error::Media(
                     "media upload preparation was interrupted; retry from the attachment".into(),
@@ -4265,10 +4349,15 @@ impl SonarClient {
                 completed.push((upload, url));
             }
             match self
-                .finish_media_send(&group_id, completed, &job.caption, Some(epoch))
+                .finish_media_send(
+                    &group_id,
+                    completed,
+                    &job.caption,
+                    Some((request_id, job.created_at_secs, epoch)),
+                )
                 .await
             {
-                Ok(()) => {
+                Ok(_message_id) => {
                     self.media_outbox.lock().unwrap().remove(request_id)?;
                     return Ok(());
                 }
@@ -4284,6 +4373,7 @@ impl SonarClient {
     /// relays, so chat first-paint never waits for media network I/O.
     pub async fn retry_media_uploads(&self) {
         let request_ids = self.media_outbox.lock().unwrap().job_ids();
+        let mut retries = FuturesUnordered::new();
         for request_id in request_ids {
             let complete = self
                 .media_outbox
@@ -4294,7 +4384,13 @@ impl SonarClient {
             if !complete {
                 continue;
             }
-            if let Err(error) = self.process_media_upload_job(&request_id).await {
+            retries.push(async move {
+                let result = self.process_media_upload_job(&request_id).await;
+                (request_id, result)
+            });
+        }
+        while let Some((request_id, result)) = retries.next().await {
+            if let Err(error) = result {
                 tracing::debug!(%error, %request_id, "durable media upload retry failed");
             }
         }
@@ -6704,6 +6800,32 @@ mod tests {
         assert_ne!(first, second, "a new row is an intentional new send");
     }
 
+    #[tokio::test]
+    async fn media_upload_gates_only_serialize_the_same_request() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let first = client.media_upload_gate("request-a").await;
+        let same = client.media_upload_gate("request-a").await;
+        let unrelated = client.media_upload_gate("request-b").await;
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &unrelated));
+
+        let _first_guard = first.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), unrelated.lock())
+                .await
+                .is_ok(),
+            "an unrelated upload must not wait for the stalled request"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), same.lock())
+                .await
+                .is_err(),
+            "the same retry id must remain single-flight"
+        );
+    }
+
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };
@@ -7819,6 +7941,43 @@ mod tests {
                 .1,
             Incoming::Message(_)
         ));
+
+        // A crash after the local/outbox handoff but before media-journal
+        // cleanup may recreate the wrapper. Stable request identity must keep
+        // the inner rumor/transcript row idempotent.
+        let created_at = Timestamp::now().as_secs();
+        let before = alice.messages(&group_id).expect("messages before").len();
+        let first = alice
+            .create_and_process_media_event_multi_for_request_at_epoch(
+                &group_id,
+                &[(&refreshed, "https://blossom.test/durable")],
+                "durable",
+                new_epoch,
+                "durable-request-id",
+                created_at,
+            )
+            .expect("first durable wrapper")
+            .1;
+        let second = alice
+            .create_and_process_media_event_multi_for_request_at_epoch(
+                &group_id,
+                &[(&refreshed, "https://blossom.test/durable")],
+                "durable",
+                new_epoch,
+                "durable-request-id",
+                created_at,
+            )
+            .expect("recreated durable wrapper")
+            .1;
+        let (Incoming::Message(first), Incoming::Message(second)) = (first, second) else {
+            panic!("durable wrappers must produce the local media row");
+        };
+        assert_eq!(first.id, second.id);
+        assert_eq!(
+            alice.messages(&group_id).expect("messages after").len(),
+            before + 1,
+            "recovery must replace the stable row instead of appending a duplicate"
+        );
     }
 
     #[test]
