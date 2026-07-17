@@ -351,6 +351,18 @@ object MeshGatt {
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
         }
+        // Client links: policy per instance link (several peer apps can share
+        // one address); dropClientLink closes the connection once empty.
+        val keys = HashSet<String>()
+        keys.addAll(clientChar.keys)
+        keys.addAll(clientLinks.keys)
+        keys.forEach { key ->
+            if (!addrAllowedByPolicy(key)) {
+                val fp = fingerprintByAddr[key]
+                android.util.Log.i(TAG, "dropping non-allowlisted mesh link $key fp=${fp?.take(8) ?: "unknown"}")
+                dropClientLink(key)
+            }
+        }
     }
 
     private fun dispatchEvents(out: MeshEngineOutput) {
