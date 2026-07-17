@@ -499,19 +499,17 @@ final class MarmotService: @unchecked Sendable {
         routeContext: String,
         content: String,
         createdAtSecs: UInt64
-    ) throws {
-        nodeLock.lock()
-        let current = node
-        nodeLock.unlock()
-        guard let current else { throw ServiceError.notConnected }
-        try current.enqueuePreRouteMessage(message: PreRouteMessageInfo(
-            id: id,
-            routeKind: routeKind,
-            routeId: routeId,
-            routeContext: routeContext,
-            content: content,
-            createdAtSecs: createdAtSecs
-        ))
+    ) async throws {
+        try await run { service in
+            try service.requireNode().enqueuePreRouteMessage(message: PreRouteMessageInfo(
+                id: id,
+                routeKind: routeKind,
+                routeId: routeId,
+                routeContext: routeContext,
+                content: content,
+                createdAtSecs: createdAtSecs
+            ))
+        }
     }
 
     func preRouteMessages() -> [PreRouteMessageInfo] {

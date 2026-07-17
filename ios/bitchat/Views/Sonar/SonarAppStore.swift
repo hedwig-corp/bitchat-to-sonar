@@ -1126,6 +1126,7 @@ final class SonarAppStore: ObservableObject {
     private var pendingDirectMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingMarmotGroupSends: [String: [SNPendingMarmotGroupSend]] = [:]
     private var startingMarmotChats = Set<String>()
+    private var journalingGroupCreation = false
     private var pendingMarmotSetupTasks: [String: Task<Void, Never>] = [:]
     private var pendingMarmotSetupTokens: [String: UUID] = [:]
     private var pendingMarmotGroupSetupTasks: [String: Task<Void, Never>] = [:]
@@ -1231,7 +1232,7 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.messageRouter.configureDurableOutbox(
             persist: { peerID, content, nickname, messageID, timestamp in
                 do {
-                    try marmot.enqueuePreRouteMessage(
+                    try await marmot.enqueuePreRouteMessage(
                         id: messageID,
                         routeKind: Self.preRoutePeer,
                         routeId: peerID.id,
@@ -4578,9 +4579,9 @@ final class SonarAppStore: ObservableObject {
         routeContext: String,
         content: String,
         createdAt: Date
-    ) -> Bool {
+    ) async -> Bool {
         do {
-            try marmot.enqueuePreRouteMessage(
+            try await marmot.enqueuePreRouteMessage(
                 id: id,
                 routeKind: routeKind,
                 routeId: routeId,
@@ -4621,12 +4622,12 @@ final class SonarAppStore: ObservableObject {
     private func journalPendingGroupOperation(
         pendingId: String,
         pending: SNPendingMarmotGroup
-    ) -> Bool {
+    ) async -> Bool {
         guard let context = encodedPreRouteGroupContext(pending) else {
             showToast("Couldn't save the group setup. Try again.")
             return false
         }
-        return journalPreRoute(
+        return await journalPreRoute(
             id: pendingGroupOperationSentinelId(pendingId),
             routeKind: Self.preRouteGroupOperation,
             routeId: pendingId,
@@ -4837,70 +4838,79 @@ final class SonarAppStore: ObservableObject {
 
         if let npub = pendingMarmotNpub(for: id) {
             let clean = SNMarmotProfileCache.canonicalKey(npub)
-            guard journalPreRoute(
-                id: message.id,
-                routeKind: Self.preRouteDirectNpub,
-                routeId: clean,
-                routeContext: id,
-                content: content,
-                createdAt: source.message.sortDate ?? Date()
-            ) else {
-                restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
-                return
-            }
-            pendingMarmotChats[id] = pendingMarmotChats[id]
-                ?? SNPendingMarmotChat(npub: clean, createdAt: source.message.sortDate ?? Date())
-            var queue = pendingDirectMarmotSends[clean, default: []]
-            queue.removeAll { $0.messageId == message.id }
-            queue.append(SNPendingMarmotSend(chatId: id, text: content, messageId: message.id))
-            if queue.count > Self.pendingMarmotDirectSendQueueLimit {
-                let dropped = queue.removeFirst()
-                pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
-                    $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard await journalPreRoute(
+                    id: message.id,
+                    routeKind: Self.preRouteDirectNpub,
+                    routeId: clean,
+                    routeContext: id,
+                    content: content,
+                    createdAt: source.message.sortDate ?? Date()
+                ) else {
+                    restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                    return
                 }
-                showToast("Still setting up this chat - wait before retrying more.")
+                pendingMarmotChats[id] = pendingMarmotChats[id]
+                    ?? SNPendingMarmotChat(npub: clean, createdAt: source.message.sortDate ?? Date())
+                var queue = pendingDirectMarmotSends[clean, default: []]
+                queue.removeAll { $0.messageId == message.id }
+                queue.append(SNPendingMarmotSend(chatId: id, text: content, messageId: message.id))
+                if queue.count > Self.pendingMarmotDirectSendQueueLimit {
+                    let dropped = queue.removeFirst()
+                    pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
+                        $0.id == dropped.messageId ? self.failedPendingMessage($0) : $0
+                    }
+                    showToast("Still setting up this chat - wait before retrying more.")
+                }
+                pendingDirectMarmotSends[clean] = queue
+                marmot.connectIfNeeded()
+                startSecureChatInBackground(npub: clean, pendingId: id)
             }
-            pendingDirectMarmotSends[clean] = queue
-            marmot.connectIfNeeded()
-            startSecureChatInBackground(npub: clean, pendingId: id)
             return
         }
 
         if isPendingMarmotGroup(id) {
             guard let pending = pendingMarmotGroups[id],
-                  let context = encodedPreRouteGroupContext(pending),
-                  journalPreRoute(
+                  let context = encodedPreRouteGroupContext(pending)
+            else {
+                restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                return
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard await journalPreRoute(
                     id: message.id,
                     routeKind: pending.inviteId == nil ? Self.preRouteGroupCreate : Self.preRouteGroupInvite,
                     routeId: id,
                     routeContext: context,
                     content: content,
                     createdAt: source.message.sortDate ?? Date()
-                  )
-            else {
-                restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
-                return
-            }
-            var queue = pendingMarmotGroupSends[id, default: []]
-            queue.removeAll { $0.messageId == message.id }
-            queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id))
-            if queue.count > Self.pendingMarmotGroupSendQueueLimit {
-                let dropped = queue.removeFirst()
-                pendingMarmotMessagesByChat[id] = pendingMarmotMessagesByChat[id]?.map {
-                    $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+                ) else {
+                    restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                    return
                 }
-                showToast("Still setting up this group - wait before retrying more.")
-            }
-            pendingMarmotGroupSends[id] = queue
-            if let inviteId = pending.inviteId,
-               let expectedGroupId = pending.inviteGroupId {
-                startPendingMarmotGroupAccept(
-                    pendingId: id,
-                    inviteId: inviteId,
-                    expectedGroupId: expectedGroupId
-                )
-            } else if pending.inviteId == nil {
-                startPendingMarmotGroupCreation(pendingId: id)
+                var queue = pendingMarmotGroupSends[id, default: []]
+                queue.removeAll { $0.messageId == message.id }
+                queue.append(SNPendingMarmotGroupSend(text: content, messageId: message.id))
+                if queue.count > Self.pendingMarmotGroupSendQueueLimit {
+                    let dropped = queue.removeFirst()
+                    pendingMarmotMessagesByChat[id] = pendingMarmotMessagesByChat[id]?.map {
+                        $0.id == dropped.messageId ? self.failedPendingMessage($0) : $0
+                    }
+                    showToast("Still setting up this group - wait before retrying more.")
+                }
+                pendingMarmotGroupSends[id] = queue
+                if let inviteId = pending.inviteId,
+                   let expectedGroupId = pending.inviteGroupId {
+                    startPendingMarmotGroupAccept(
+                        pendingId: id,
+                        inviteId: inviteId,
+                        expectedGroupId: expectedGroupId
+                    )
+                } else if pending.inviteId == nil {
+                    startPendingMarmotGroupCreation(pendingId: id)
+                }
             }
             return
         }
@@ -5018,17 +5028,20 @@ final class SonarAppStore: ObservableObject {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let id = "pre-route-\(UUID().uuidString)"
         let createdAt = Date()
-        guard journalPreRoute(
-            id: id,
-            routeKind: Self.preRouteDirectNpub,
-            routeId: clean,
-            routeContext: "",
-            content: encoded,
-            createdAt: createdAt
-        ) else { return }
-        pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: encoded))
-        marmot.connectIfNeeded()
-        startMarmotRouteInBackground(npub: clean)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard await journalPreRoute(
+                id: id,
+                routeKind: Self.preRouteDirectNpub,
+                routeId: clean,
+                routeContext: "",
+                content: encoded,
+                createdAt: createdAt
+            ) else { return }
+            pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: encoded))
+            marmot.connectIfNeeded()
+            startMarmotRouteInBackground(npub: clean)
+        }
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -5039,17 +5052,20 @@ final class SonarAppStore: ObservableObject {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let id = "pre-route-\(UUID().uuidString)"
         let createdAt = Date()
-        guard journalPreRoute(
-            id: id,
-            routeKind: Self.preRouteDirectNpub,
-            routeId: clean,
-            routeContext: "",
-            content: text,
-            createdAt: createdAt
-        ) else { return }
-        pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: text))
-        marmot.connectIfNeeded()
-        startMarmotRouteInBackground(npub: clean)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard await journalPreRoute(
+                id: id,
+                routeKind: Self.preRouteDirectNpub,
+                routeId: clean,
+                routeContext: "",
+                content: text,
+                createdAt: createdAt
+            ) else { return }
+            pendingMarmotSends[clean, default: []].append(SNPendingMarmotRouteSend(id: id, text: text))
+            marmot.connectIfNeeded()
+            startMarmotRouteInBackground(npub: clean)
+        }
     }
 
     private func startMarmotRouteInBackground(npub: String) {
@@ -5071,28 +5087,31 @@ final class SonarAppStore: ObservableObject {
         }
         let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
-        guard journalPreRoute(
-            id: message.id,
-            routeKind: Self.preRouteDirectNpub,
-            routeId: clean,
-            routeContext: chatId,
-            content: text,
-            createdAt: createdAt
-        ) else {
-            _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
-            return
-        }
-        var queue = pendingDirectMarmotSends[clean, default: []]
-        queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
-        if queue.count > Self.pendingMarmotDirectSendQueueLimit {
-            let dropped = queue.removeFirst()
-            pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
-                $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard await journalPreRoute(
+                id: message.id,
+                routeKind: Self.preRouteDirectNpub,
+                routeId: clean,
+                routeContext: chatId,
+                content: text,
+                createdAt: createdAt
+            ) else {
+                _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
+                return
             }
-            showToast("Still setting up this chat - wait before sending more.")
+            var queue = pendingDirectMarmotSends[clean, default: []]
+            queue.append(SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id))
+            if queue.count > Self.pendingMarmotDirectSendQueueLimit {
+                let dropped = queue.removeFirst()
+                pendingMarmotMessagesByChat[dropped.chatId] = pendingMarmotMessagesByChat[dropped.chatId]?.map {
+                    $0.id == dropped.messageId ? self.failedPendingMessage($0) : $0
+                }
+                showToast("Still setting up this chat - wait before sending more.")
+            }
+            pendingDirectMarmotSends[clean] = queue
+            startSecureChatInBackground(npub: clean, pendingId: chatId)
         }
-        pendingDirectMarmotSends[clean] = queue
-        startSecureChatInBackground(npub: clean, pendingId: chatId)
     }
 
     private func sendPendingMarmotGroup(_ text: String, chatId: String) {
@@ -5102,27 +5121,30 @@ final class SonarAppStore: ObservableObject {
         let createdAt = Date()
         let message = pendingMarmotEcho(text: text, createdAt: createdAt)
         pendingMarmotMessagesByChat[chatId, default: []].append(message)
-        guard journalPreRoute(
-            id: message.id,
-            routeKind: pending.inviteId == nil ? Self.preRouteGroupCreate : Self.preRouteGroupInvite,
-            routeId: chatId,
-            routeContext: context,
-            content: text,
-            createdAt: createdAt
-        ) else {
-            _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
-            return
-        }
-        var queue = pendingMarmotGroupSends[chatId, default: []]
-        queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
-        if queue.count > Self.pendingMarmotGroupSendQueueLimit {
-            let dropped = queue.removeFirst()
-            pendingMarmotMessagesByChat[chatId] = pendingMarmotMessagesByChat[chatId]?.map {
-                $0.id == dropped.messageId ? failedPendingMessage($0) : $0
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard await journalPreRoute(
+                id: message.id,
+                routeKind: pending.inviteId == nil ? Self.preRouteGroupCreate : Self.preRouteGroupInvite,
+                routeId: chatId,
+                routeContext: context,
+                content: text,
+                createdAt: createdAt
+            ) else {
+                _ = setPendingMarmotMessageState(message.id, to: "Couldn't send")
+                return
             }
-            showToast("Still setting up this group - wait before sending more.")
+            var queue = pendingMarmotGroupSends[chatId, default: []]
+            queue.append(SNPendingMarmotGroupSend(text: text, messageId: message.id))
+            if queue.count > Self.pendingMarmotGroupSendQueueLimit {
+                let dropped = queue.removeFirst()
+                pendingMarmotMessagesByChat[chatId] = pendingMarmotMessagesByChat[chatId]?.map {
+                    $0.id == dropped.messageId ? self.failedPendingMessage($0) : $0
+                }
+                showToast("Still setting up this group - wait before sending more.")
+            }
+            pendingMarmotGroupSends[chatId] = queue
         }
-        pendingMarmotGroupSends[chatId] = queue
     }
 
     private func pendingMarmotEcho(
@@ -6779,7 +6801,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     @discardableResult
-    func startGroup(name: String, members: [String]) -> String? {
+    func startGroup(name: String, members: [String]) async -> String? {
         let cleanName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "Group chat"
             : name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6790,6 +6812,9 @@ final class SonarAppStore: ObservableObject {
             showToast("Add at least two people")
             return nil
         }
+        guard !journalingGroupCreation else { return nil }
+        journalingGroupCreation = true
+        defer { journalingGroupCreation = false }
         let pendingId = pendingMarmotGroupId()
         let pending = SNPendingMarmotGroup(
             name: cleanName,
@@ -6798,7 +6823,7 @@ final class SonarAppStore: ObservableObject {
             inviteId: nil,
             inviteGroupId: nil
         )
-        guard journalPendingGroupOperation(pendingId: pendingId, pending: pending) else { return nil }
+        guard await journalPendingGroupOperation(pendingId: pendingId, pending: pending) else { return nil }
         pendingMarmotGroups[pendingId] = pending
         marmot.connectIfNeeded()
         startPendingMarmotGroupCreation(pendingId: pendingId)

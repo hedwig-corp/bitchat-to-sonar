@@ -21,7 +21,8 @@ final class MessageRouter {
     }
 
     private var outbox: [PeerID: [QueuedMessage]] = [:]
-    private var persistQueuedMessage: ((PeerID, String, String, String, Date) -> Bool)?
+    private var pendingQueueWrites: [PeerID: Int] = [:]
+    private var persistQueuedMessage: ((PeerID, String, String, String, Date) async -> Bool)?
     private var completeQueuedMessage: ((String) -> Void)?
 
     // Outbox limits to prevent unbounded memory growth
@@ -70,7 +71,7 @@ final class MessageRouter {
     /// only a transient mirror; restored records are supplied separately after
     /// local startup and replay happens later in the background.
     func configureDurableOutbox(
-        persist: @escaping (PeerID, String, String, String, Date) -> Bool,
+        persist: @escaping (PeerID, String, String, String, Date) async -> Bool,
         complete: @escaping (String) -> Void
     ) {
         persistQueuedMessage = persist
@@ -103,9 +104,9 @@ final class MessageRouter {
         to peerID: PeerID,
         recipientNickname: String,
         messageID: String
-    ) -> PrivateMessageRoutingResult {
-        if outbox[peerID]?.isEmpty == false {
-            let result = queuePrivate(
+    ) async -> PrivateMessageRoutingResult {
+        if outbox[peerID]?.isEmpty == false || pendingQueueWrites[peerID, default: 0] > 0 {
+            let result = await queuePrivate(
                 content,
                 to: peerID,
                 recipientNickname: recipientNickname,
@@ -121,12 +122,15 @@ final class MessageRouter {
             transport.sendPrivateMessage(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
             return .routed
         }
-        return queuePrivate(
+        let result = await queuePrivate(
             content,
             to: peerID,
             recipientNickname: recipientNickname,
             messageID: messageID
         )
+        // Reachability may have changed while the durable write was in flight.
+        flushOutbox(for: peerID)
+        return result
     }
 
     private func queuePrivate(
@@ -134,11 +138,20 @@ final class MessageRouter {
         to peerID: PeerID,
         recipientNickname: String,
         messageID: String
-    ) -> PrivateMessageRoutingResult {
+    ) async -> PrivateMessageRoutingResult {
         // Queue for later with a timestamp for stable restore ordering.
         let message = QueuedMessage(content: content, nickname: recipientNickname, messageID: messageID, timestamp: Date())
+        pendingQueueWrites[peerID, default: 0] += 1
+        defer {
+            let remaining = pendingQueueWrites[peerID, default: 1] - 1
+            if remaining == 0 {
+                pendingQueueWrites.removeValue(forKey: peerID)
+            } else {
+                pendingQueueWrites[peerID] = remaining
+            }
+        }
         guard let persistQueuedMessage,
-              persistQueuedMessage(peerID, content, recipientNickname, messageID, message.timestamp)
+              await persistQueuedMessage(peerID, content, recipientNickname, messageID, message.timestamp)
         else {
             SecureLogger.error("Could not durably queue PM for \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
             return .rejected

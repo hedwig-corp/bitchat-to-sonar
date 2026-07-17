@@ -626,7 +626,7 @@ expect object SonarCore {
     suspend fun ensureSubscriptions()
 
     /** Write-before-network handoff for a send whose MLS group does not exist. */
-    fun enqueuePreRouteMessage(message: SonarPreRouteMessage)
+    suspend fun enqueuePreRouteMessage(message: SonarPreRouteMessage)
 
     /** Local-only startup recovery; never waits for relay state. */
     suspend fun preRouteMessages(): List<SonarPreRouteMessage>

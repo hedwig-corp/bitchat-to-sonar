@@ -479,8 +479,8 @@ final class MarmotChatModel: ObservableObject {
         routeContext: String,
         content: String,
         createdAtSecs: UInt64
-    ) throws {
-        try service.enqueuePreRouteMessage(
+    ) async throws {
+        try await service.enqueuePreRouteMessage(
             id: id,
             routeKind: routeKind,
             routeId: routeId,

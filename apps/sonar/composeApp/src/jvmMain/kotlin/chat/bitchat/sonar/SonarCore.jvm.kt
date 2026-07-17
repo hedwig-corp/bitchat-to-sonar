@@ -537,7 +537,7 @@ actual object SonarCore {
         Unit
     }
 
-    actual fun enqueuePreRouteMessage(message: SonarPreRouteMessage) {
+    actual suspend fun enqueuePreRouteMessage(message: SonarPreRouteMessage) = withContext(Dispatchers.IO) {
         requireNode().enqueuePreRouteMessage(
             uniffi.sonar_ffi.PreRouteMessageInfo(
                 id = message.id,

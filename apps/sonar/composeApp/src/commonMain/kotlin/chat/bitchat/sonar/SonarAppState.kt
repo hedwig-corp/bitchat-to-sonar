@@ -4813,25 +4813,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = canonicalNpubHex(peerNpub) ?: return
         val echo = createSendEcho(chatId, text)
         messages = (messages + echo).sortedBy { it.tsSecs }
-        if (!journalPreRoute(
-                id = echo.id,
-                routeKind = PRE_ROUTE_DIRECT_NPUB,
-                routeId = npubHex,
-                routeContext = chatId,
-                content = text,
-                createdAtSecs = echo.tsSecs,
-            )) {
-            failSendEcho(chatId, echo.id)
-            return
+        scope.launch {
+            if (!journalPreRoute(
+                    id = echo.id,
+                    routeKind = PRE_ROUTE_DIRECT_NPUB,
+                    routeId = npubHex,
+                    routeContext = chatId,
+                    content = text,
+                    createdAtSecs = echo.tsSecs,
+                )) {
+                failSendEcho(chatId, echo.id)
+                return@launch
+            }
+            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
+            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(dropped.pendingChatId, dropped.echoId)
+                toast = "Still setting up this chat — wait before sending more."
+            }
+            startPendingMarmotChat(peerNpub, chatId)
         }
-        val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-        queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
-        if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
-            val dropped = queue.removeAt(0)
-            failSendEcho(dropped.pendingChatId, dropped.echoId)
-            toast = "Still setting up this chat — wait before sending more."
-        }
-        startPendingMarmotChat(peerNpub, chatId)
     }
 
     private suspend fun flushPendingDirectMarmot(npubHex: String, chatId: String) {
@@ -4867,7 +4869,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         pending.takeIf { it.inviteId == null }
             ?.let { encodePreRouteContext(listOf("create", it.name) + it.members) }
 
-    private fun journalPendingGroupOperation(
+    private suspend fun journalPendingGroupOperation(
         pendingChatId: String,
         pending: PendingMarmotGroup,
     ): Boolean {
@@ -4997,23 +4999,25 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             encodePreRouteContext(listOf(pending.name, pending.inviteId, groupId))
         }
-        if (!journalPreRoute(
-                id = echo.id,
-                routeKind = routeKind,
-                routeId = chatId,
-                routeContext = context,
-                content = text,
-                createdAtSecs = echo.tsSecs,
-            )) {
-            failSendEcho(chatId, echo.id)
-            return
-        }
-        val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
-        queue.add(PendingMarmotGroupSend(text, echo.id))
-        if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
-            val dropped = queue.removeAt(0)
-            failSendEcho(chatId, dropped.echoId)
-            toast = "Still setting up this group — wait before sending more."
+        scope.launch {
+            if (!journalPreRoute(
+                    id = echo.id,
+                    routeKind = routeKind,
+                    routeId = chatId,
+                    routeContext = context,
+                    content = text,
+                    createdAtSecs = echo.tsSecs,
+                )) {
+                failSendEcho(chatId, echo.id)
+                return@launch
+            }
+            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+            queue.add(PendingMarmotGroupSend(text, echo.id))
+            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(chatId, dropped.echoId)
+                toast = "Still setting up this group — wait before sending more."
+            }
         }
     }
 
@@ -5541,26 +5545,28 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "This message is no longer available to retry."
                 return
             }
-            if (!journalPreRoute(
-                    id = echoId,
-                    routeKind = PRE_ROUTE_DIRECT_NPUB,
-                    routeId = npubHex,
-                    routeContext = chatId,
-                    content = content,
-                    createdAtSecs = retrying.tsSecs,
-                )) {
-                failSendEcho(chatId, echoId)
-                return
+            scope.launch {
+                if (!journalPreRoute(
+                        id = echoId,
+                        routeKind = PRE_ROUTE_DIRECT_NPUB,
+                        routeId = npubHex,
+                        routeContext = chatId,
+                        content = content,
+                        createdAtSecs = retrying.tsSecs,
+                    )) {
+                    failSendEcho(chatId, echoId)
+                    return@launch
+                }
+                val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+                queue.removeAll { it.echoId == echoId }
+                queue.add(PendingDirectMarmotSend(chatId, content, echoId))
+                if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                    val dropped = queue.removeAt(0)
+                    failSendEcho(dropped.pendingChatId, dropped.echoId)
+                    toast = "Still setting up this chat — wait before retrying more."
+                }
+                startPendingMarmotChat(pendingNpub, chatId)
             }
-            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-            queue.removeAll { it.echoId == echoId }
-            queue.add(PendingDirectMarmotSend(chatId, content, echoId))
-            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
-                val dropped = queue.removeAt(0)
-                failSendEcho(dropped.pendingChatId, dropped.echoId)
-                toast = "Still setting up this chat — wait before retrying more."
-            }
-            startPendingMarmotChat(pendingNpub, chatId)
             return
         }
 
@@ -5578,22 +5584,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 encodePreRouteContext(listOf(pending.name, pending.inviteId, groupId))
             }
-            if (!journalPreRoute(echoId, routeKind, chatId, context, content, retrying.tsSecs)) {
-                failSendEcho(chatId, echoId)
-                return
-            }
-            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
-            queue.removeAll { it.echoId == echoId }
-            queue.add(PendingMarmotGroupSend(content, echoId))
-            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
-                val dropped = queue.removeAt(0)
-                failSendEcho(chatId, dropped.echoId)
-                toast = "Still setting up this group — wait before retrying more."
-            }
-            if (pending.inviteId != null && pending.inviteGroupId != null) {
-                startPendingMarmotGroupAccept(chatId, pending.inviteId, pending.inviteGroupId)
-            } else if (pending.inviteId == null) {
-                startPendingMarmotGroupCreation(chatId)
+            scope.launch {
+                if (!journalPreRoute(echoId, routeKind, chatId, context, content, retrying.tsSecs)) {
+                    failSendEcho(chatId, echoId)
+                    return@launch
+                }
+                val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+                queue.removeAll { it.echoId == echoId }
+                queue.add(PendingMarmotGroupSend(content, echoId))
+                if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                    val dropped = queue.removeAt(0)
+                    failSendEcho(chatId, dropped.echoId)
+                    toast = "Still setting up this group — wait before retrying more."
+                }
+                if (pending.inviteId != null && pending.inviteGroupId != null) {
+                    startPendingMarmotGroupAccept(chatId, pending.inviteId, pending.inviteGroupId)
+                } else if (pending.inviteId == null) {
+                    startPendingMarmotGroupCreation(chatId)
+                }
             }
             return
         }
@@ -7121,8 +7129,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
-        if (outbox.contains(peerId)) {
-            if (enqueueOutbox(peerId, text)) {
+        if (outbox.contains(peerId) || pendingOutboxJournalWrites.getOrElse(peerId) { 0 } > 0) {
+            enqueueOutbox(peerId, text) {
                 flushOutbox(peerId)
                 toast = "Message queued and will send in order."
             }
@@ -7135,7 +7143,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text)
                 canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, text)
                 else -> {
-                    if (enqueueOutbox(peerId, text)) {
+                    enqueueOutbox(peerId, text) {
+                        flushOutbox(peerId)
                         toast = "Out of range — add each other as favorites to continue over Nostr."
                     }
                 }
@@ -7143,7 +7152,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         // Neither BLE mesh link nor npub available — queue for later delivery.
-        if (enqueueOutbox(peerId, text)) {
+        enqueueOutbox(peerId, text) {
+            flushOutbox(peerId)
             toast = "Out of range — message queued and will send automatically."
         }
     }
@@ -7403,31 +7413,35 @@ class SonarAppState(private val scope: CoroutineScope) {
     )
     private val pendingDirectMarmotSends = mutableMapOf<String, MutableList<PendingDirectMarmotSend>>()
     private val pendingMarmotGroupSends = mutableMapOf<String, MutableList<PendingMarmotGroupSend>>()
+    private val preRouteJournalMutex = Mutex()
     private val pendingMarmotGroupSetupJobs = mutableMapOf<String, Job>()
     private val pendingMarmotGroupSetupTokens = mutableMapOf<String, Long>()
     private var pendingMarmotGroupSetupNonce = 0L
+    private var journalingGroupCreation = false
 
-    private fun journalPreRoute(
+    private suspend fun journalPreRoute(
         id: String,
         routeKind: String,
         routeId: String,
         routeContext: String,
         content: String,
         createdAtSecs: Long,
-    ): Boolean = runCatching {
-        SonarCore.enqueuePreRouteMessage(
-            SonarPreRouteMessage(
-                id = id,
-                routeKind = routeKind,
-                routeId = routeId,
-                routeContext = routeContext,
-                content = content,
-                createdAtSecs = createdAtSecs,
+    ): Boolean = preRouteJournalMutex.withLock {
+        runCatching {
+            SonarCore.enqueuePreRouteMessage(
+                SonarPreRouteMessage(
+                    id = id,
+                    routeKind = routeKind,
+                    routeId = routeId,
+                    routeContext = routeContext,
+                    content = content,
+                    createdAtSecs = createdAtSecs,
+                )
             )
-        )
-    }.onFailure {
-        toast = "Couldn't save the outgoing message. Try again."
-    }.isSuccess
+        }.onFailure {
+            toast = "Couldn't save the outgoing message. Try again."
+        }.isSuccess
+    }
 
     private suspend fun discardPreRouteMessages(routeKeys: Set<String>) {
         if (routeKeys.isEmpty()) return
@@ -7610,6 +7624,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // automatically when the peer reconnects over BLE or their npub is learned.
     private val outbox = SonarOutbox()
     private val flushingOutboxPeers = mutableSetOf<String>()
+    private val pendingOutboxJournalWrites = mutableMapOf<String, Int>()
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
      *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
@@ -7636,10 +7651,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = npubRaw.toHexLower()
         val id = randomMeshId()
         val createdAt = SonarClock.nowSecs()
-        if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), text, createdAt)) return
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, text, meshChatId(peerId)))
-        toast = "Out of range — continuing over White Noise…"
-        startBackgroundMarmotRoute(npubHex, peerId)
+        scope.launch {
+            if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), text, createdAt)) return@launch
+            pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, text, meshChatId(peerId)))
+            toast = "Out of range — continuing over White Noise…"
+            startBackgroundMarmotRoute(npubHex, peerId)
+        }
     }
 
     /** Flush texts queued for Sonar peers whose White Noise group now exists. */
@@ -7670,10 +7687,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
         val id = randomMeshId()
         val createdAt = SonarClock.nowSecs()
-        if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), encoded, createdAt)) return
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, encoded, meshChatId(peerId)))
-        toast = "Out of range — continuing over White Noise…"
-        startBackgroundMarmotRoute(npubHex, peerId)
+        scope.launch {
+            if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), encoded, createdAt)) return@launch
+            pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, encoded, meshChatId(peerId)))
+            toast = "Out of range — continuing over White Noise…"
+            startBackgroundMarmotRoute(npubHex, peerId)
+        }
     }
 
     private fun startBackgroundMarmotRoute(npubHex: String, peerId: String? = null) {
@@ -7743,17 +7762,26 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Queue a message for [peerId] when no transport is available. Enforces
      *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
-    private fun enqueueOutbox(peerId: String, text: String): Boolean {
+    private fun enqueueOutbox(peerId: String, text: String, onQueued: () -> Unit = {}) {
         val id = randomMeshId()
         val createdAt = SonarClock.nowSecs()
-        if (!journalPreRoute(id, PRE_ROUTE_PEER, peerId, "", text, createdAt)) return false
-        val result = outbox.enqueue(peerId, text, id, createdAt)
-        result.evicted?.let { evicted ->
-            runCatching { SonarCore.completePreRouteMessage(evicted.messageId) }
-            sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
+        pendingOutboxJournalWrites[peerId] = pendingOutboxJournalWrites.getOrElse(peerId) { 0 } + 1
+        scope.launch {
+            try {
+                if (!journalPreRoute(id, PRE_ROUTE_PEER, peerId, "", text, createdAt)) return@launch
+                val result = outbox.enqueue(peerId, text, id, createdAt)
+                result.evicted?.let { evicted ->
+                    runCatching { SonarCore.completePreRouteMessage(evicted.messageId) }
+                    sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
+                }
+                sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
+                onQueued()
+            } finally {
+                val remaining = pendingOutboxJournalWrites.getOrElse(peerId) { 1 } - 1
+                if (remaining == 0) pendingOutboxJournalWrites.remove(peerId)
+                else pendingOutboxJournalWrites[peerId] = remaining
+            }
         }
-        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
-        return true
     }
 
     /** Try to deliver all queued messages for [peerId]. Messages that still
@@ -7894,15 +7922,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Add at least two people"
             return
         }
+        if (journalingGroupCreation) return
+        journalingGroupCreation = true
         val pendingChatId = pendingMarmotGroupId()
         val pending = PendingMarmotGroup(
             name = cleanName,
             members = cleanMembers,
             createdAtSecs = SonarClock.nowSecs(),
         )
-        if (!journalPendingGroupOperation(pendingChatId, pending)) return
-        openPendingMarmotGroup(pendingChatId, pending)
-        startPendingMarmotGroupCreation(pendingChatId)
+        scope.launch {
+            try {
+                if (!journalPendingGroupOperation(pendingChatId, pending)) return@launch
+                openPendingMarmotGroup(pendingChatId, pending)
+                startPendingMarmotGroupCreation(pendingChatId)
+            } finally {
+                journalingGroupCreation = false
+            }
+        }
     }
 
     fun addGroupMembers(chatId: String, members: List<String>) {

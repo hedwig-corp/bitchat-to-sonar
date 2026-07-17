@@ -1656,7 +1656,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 switch sessionState {
                 case .established:
                     // Send the message directly without going through sendPrivateMessage to avoid local echo
-                    messageRouter.sendPrivate(screenshotMessage, to: peerID, recipientNickname: peerNickname, messageID: UUID().uuidString)
+                    Task { @MainActor in
+                        await messageRouter.sendPrivate(
+                            screenshotMessage,
+                            to: peerID,
+                            recipientNickname: peerNickname,
+                            messageID: UUID().uuidString
+                        )
+                    }
                 case  .none, .failed, .handshakeQueued, .handshaking:
                     // Don't send screenshot notification if no session exists
                     SecureLogger.debug("Skipping screenshot notification to \(peerID) - no established session", category: .security)

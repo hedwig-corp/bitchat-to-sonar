@@ -98,31 +98,34 @@ extension ChatViewModel {
         
         // The router owns reachability and the durable offline queue. Calling it
         // unconditionally keeps a fully-offline local echo pending for replay.
-        let result = messageRouter.sendPrivate(
-            content,
-            to: peerID,
-            recipientNickname: recipientNickname,
-            messageID: messageID
-        )
-        if result == .routed {
-            // Optimistically mark as sent for both transports; delivery/read will update subsequently
-            if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                privateChats[peerID]?[idx].deliveryStatus = .sent
-            }
-        } else if Self.shouldMarkPrivateMessageFailed(after: result) {
-            // Update delivery status to failed
-            if let index = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                privateChats[peerID]?[index].deliveryStatus = .failed(
-                    reason: String(localized: "content.delivery.reason.unreachable", comment: "Failure reason when a peer is unreachable")
-                )
-            }
-            addSystemMessage(
-                String(
-                    format: String(localized: "system.dm.unreachable", comment: "System message when a recipient is unreachable"),
-                    locale: .current,
-                    recipientNickname
-                )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await messageRouter.sendPrivate(
+                content,
+                to: peerID,
+                recipientNickname: recipientNickname,
+                messageID: messageID
             )
+            if result == .routed {
+                // Optimistically mark as sent for both transports; delivery/read will update subsequently
+                if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                    privateChats[peerID]?[idx].deliveryStatus = .sent
+                }
+            } else if Self.shouldMarkPrivateMessageFailed(after: result) {
+                // Update delivery status to failed
+                if let index = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                    privateChats[peerID]?[index].deliveryStatus = .failed(
+                        reason: String(localized: "content.delivery.reason.unreachable", comment: "Failure reason when a peer is unreachable")
+                    )
+                }
+                addSystemMessage(
+                    String(
+                        format: String(localized: "system.dm.unreachable", comment: "System message when a recipient is unreachable"),
+                        locale: .current,
+                        recipientNickname
+                    )
+                )
+            }
         }
     }
     

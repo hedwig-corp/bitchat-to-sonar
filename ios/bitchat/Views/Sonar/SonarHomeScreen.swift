@@ -431,8 +431,10 @@ struct SonarHomeScreen: View {
                     let name = groupNameDraft
                     guard members.count >= 2 else { return }
                     composeSheet = false
-                    if let id = store.startGroup(name: name, members: members) {
-                        store.push(.dm(id))
+                    Task { @MainActor in
+                        if let id = await store.startGroup(name: name, members: members) {
+                            store.push(.dm(id))
+                        }
                     }
                 }
             }
