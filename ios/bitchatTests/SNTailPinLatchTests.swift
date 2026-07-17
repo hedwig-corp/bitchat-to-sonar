@@ -93,6 +93,23 @@ struct SNTailPinLatchTests {
                 isNearBottom: false,
                 userScrolling: false,
                 isPrepending: false
+        ) == .animate
+        )
+    }
+
+    /// A full retained window replaces its oldest row when a send arrives,
+    /// so the count stays constant while the live-edge ID changes.
+    @Test
+    func replacedTailAtCapacityStillFollows() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 100, tailID: "old-tail")
+        #expect(
+            latch.itemsChanged(
+                itemCount: 100,
+                tailID: "new-tail",
+                isNearBottom: true,
+                userScrolling: false,
+                isPrepending: false
             ) == .animate
         )
     }

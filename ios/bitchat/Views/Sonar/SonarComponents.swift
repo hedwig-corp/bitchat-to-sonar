@@ -734,7 +734,10 @@ struct SNTailPinLatch {
         userScrolling: Bool,
         isPrepending: Bool
     ) -> SNTailPinAction {
-        let appendedAtTail = itemCount > lastItemCount && tailID != lastTailID
+        // A full bounded window can replace its oldest row when a new message
+        // arrives, leaving the item count unchanged. The tail identity is the
+        // authoritative live-edge signal in that case.
+        let appendedAtTail = tailID != lastTailID
         updateSnapshot(itemCount: itemCount, tailID: tailID)
         if isPrepending {
             // A deliberate history-page insert owns the scroll position even
@@ -757,7 +760,7 @@ struct SNTailPinLatch {
         userScrolling: Bool,
         isPrepending: Bool
     ) -> SNTailPinAction {
-        let appendedAtTail = itemCount > lastItemCount && tailID != lastTailID
+        let appendedAtTail = tailID != lastTailID
         updateSnapshot(itemCount: itemCount, tailID: tailID)
         if userScrolling || isPrepending {
             wasPinned = false
@@ -1040,6 +1043,14 @@ struct SNMsgList: View {
     @State private var isUserScrolling = false
     @State private var userScrollGeneration = 0
 
+    /// The live-edge identity must participate in change detection. Once the
+    /// bounded transcript reaches capacity, a send replaces an old row and
+    /// keeps `msgs.count` constant; observing only the count strands the new
+    /// tail below the keyboard until the user scrolls manually.
+    private var messageRevision: [String] {
+        msgs.map(\.id)
+    }
+
     /// True once the visible rows have caught up with the newest message the
     /// core index knows across the chat's folded sources. A mesh chat paints
     /// the BLE window before the White Noise leg merges async, so before this
@@ -1276,7 +1287,7 @@ struct SNMsgList: View {
                         proxy.scrollTo("sn-unread", anchor: .top)
                     }
                 }
-                .onChange(of: msgs.count) { _ in
+                .onChange(of: messageRevision) { _ in
                     let hadAnchor = unreadAnchorId != nil
                     resolveUnreadAnchor()
                     if !hadAnchor, unreadAnchorId != nil {
