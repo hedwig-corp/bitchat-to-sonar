@@ -33,8 +33,9 @@ actual object MeshRadio {
     }
 
     actual fun setKnownPeerIds(ids: Set<String>) {
+        val normalized = changedKnownMeshPeerIds(knownPeerIds, ids) ?: return
         knownPeerIds.clear()
-        ids.mapTo(knownPeerIds) { it.lowercase() }
+        knownPeerIds.addAll(normalized)
         if (discoveryMode == BleDiscoveryMode.KnownOnly) {
             if (knownPeerIds.isEmpty()) stop()
             else if (available()) start()

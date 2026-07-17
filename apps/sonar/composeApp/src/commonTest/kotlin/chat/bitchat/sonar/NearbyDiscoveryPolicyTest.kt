@@ -1,5 +1,6 @@
 package chat.bitchat.sonar
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.test.advanceTimeBy
@@ -12,6 +13,65 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class NearbyDiscoveryPolicyTest {
+    @Test
+    fun unchangedKnownPeerPolicyIsACompleteNoOp() {
+        assertNull(
+            changedKnownMeshPeerIds(
+                current = setOf("abcdef", "123456"),
+                requested = setOf("ABCDEF", "123456"),
+            ),
+        )
+        assertEquals(
+            setOf("abcdef", "fedcba"),
+            changedKnownMeshPeerIds(
+                current = setOf("abcdef"),
+                requested = setOf("ABCDEF", "FEDCBA"),
+            ),
+        )
+    }
+
+    @Test
+    fun freshAnnounceNeverCrossesNativeLinkBoundary() {
+        var linkChecks = 0
+        assertFalse(
+            shouldExpireAnnouncedMeshPeer(nowMs = 1_000, lastSeenMs = 900, staleMs = 200) {
+                linkChecks++
+                false
+            },
+        )
+        assertEquals(0, linkChecks)
+
+        assertTrue(
+            shouldExpireAnnouncedMeshPeer(nowMs = 1_200, lastSeenMs = 900, staleMs = 200) {
+                linkChecks++
+                false
+            },
+        )
+        assertEquals(1, linkChecks)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun peerUpdateBurstKeepsOnlyOnePendingRefresh() = runTest {
+        val releaseFirstRefresh = CompletableDeferred<Unit>()
+        var refreshCount = 0
+        val queue = ConflatedRefreshQueue(this) {
+            refreshCount++
+            if (refreshCount == 1) releaseFirstRefresh.await()
+        }
+
+        repeat(1_000) { queue.request() }
+        runCurrent()
+        assertEquals(1, refreshCount)
+
+        repeat(1_000) { queue.request() }
+        releaseFirstRefresh.complete(Unit)
+        runCurrent()
+        assertEquals(2, refreshCount)
+
+        queue.cancel()
+    }
+
     @Test
     fun verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive() {
         val whitewholf = MeshPeer(

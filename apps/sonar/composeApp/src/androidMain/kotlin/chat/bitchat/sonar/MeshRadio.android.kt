@@ -181,11 +181,11 @@ actual object MeshRadio {
     }
 
     actual fun setKnownPeerIds(ids: Set<String>) {
+        val normalized = changedKnownMeshPeerIds(knownPeerIds, ids) ?: return
         knownPeerIds.clear()
-        ids.mapTo(knownPeerIds) { it.lowercase() }
+        knownPeerIds.addAll(normalized)
         applyMeshGattPolicy()
-        pruneForDiscoveryMode()
-        notifyPeerUpdate()
+        if (pruneForDiscoveryMode()) notifyPeerUpdate()
         if (discoveryMode == BleDiscoveryMode.KnownOnly) {
             if (knownPeerIds.isEmpty()) stop()
             else if (!scanning) start()
@@ -287,11 +287,12 @@ actual object MeshRadio {
         MeshGatt.setKnownOnlyPeerAllowlist(allowed)
     }
 
-    private fun pruneForDiscoveryMode() {
-        if (discoveryMode == BleDiscoveryMode.Normal) return
-        announcedPeers.keys.removeIf { !isKnownPeer(it) }
-        announcedSeen.keys.removeIf { !isKnownPeer(it) }
-        sonarProfiles.keys.removeIf { !isKnownPeer(it) }
+    private fun pruneForDiscoveryMode(): Boolean {
+        if (discoveryMode == BleDiscoveryMode.Normal) return false
+        val peersPruned = announcedPeers.keys.removeIf { !isKnownPeer(it) }
+        val sightingsPruned = announcedSeen.keys.removeIf { !isKnownPeer(it) }
+        val profilesPruned = sonarProfiles.keys.removeIf { !isKnownPeer(it) }
+        return peersPruned || sightingsPruned || profilesPruned
     }
 
     /** Revive a scanner that a `connectGatt` dial has starved, either by stopping
@@ -329,7 +330,7 @@ actual object MeshRadio {
     actual fun hasActivePeer(): Boolean =
         // No list build/sort — called every 150ms by the adaptive drain loop.
         // A live Noise link (definitely present) or any recent announce peer.
-        announcedPeers.keys.any { MeshGatt.hasLink(it) } || announcedSeen.isNotEmpty()
+        announcedSeen.isNotEmpty() || announcedPeers.keys.any { MeshGatt.hasLink(it) }
 
     actual fun peers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
@@ -341,7 +342,7 @@ actual object MeshRadio {
         // Keep a peer while it has a live Noise link (definitely present), or
         // within the grace window after we last heard from it.
         for ((id, t) in announcedSeen) {
-            if (!MeshGatt.hasLink(id) && now - t > ANNOUNCE_STALE_MS) {
+            if (shouldExpireAnnouncedMeshPeer(now, t, ANNOUNCE_STALE_MS) { MeshGatt.hasLink(id) }) {
                 announcedPeers.remove(id); announcedSeen.remove(id)
             }
         }

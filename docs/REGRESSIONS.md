@@ -232,10 +232,16 @@ when no later UI refresh publishes the already-verified radio snapshot.
 
 **Guarded by:** `NearbyDiscoveryPolicyTest.verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive`
 
-**Partly guarded:** the test pins the shared Compose Radar filter used by the
-real call site. Android/JVM callback delivery and the native iOS call site are
-compile-checked but have no platform-runtime test; iOS tests still do not run in
-CI.
+**Also guarded by:** `NearbyDiscoveryPolicyTest.unchangedKnownPeerPolicyIsACompleteNoOp`,
+`NearbyDiscoveryPolicyTest.peerUpdateBurstKeepsOnlyOnePendingRefresh`,
+`NearbyDiscoveryPolicyTest.freshAnnounceNeverCrossesNativeLinkBoundary`
+
+**Partly guarded:** the tests pin the shared Compose Radar filter, the
+change-only policy gate, conflated callback queue, and fresh-peer native-call
+gate used by the real call sites. Android listener wiring and the native iOS
+call site are compile-checked but have no platform-runtime test; iOS tests still
+do not run in CI. PR #316 was additionally reproduced and verified on the
+physical Pixel 10 Pro that reported the ANR.
 
 **History:** #57 introduced the 1.5-second conversation recovery hold on both
 platforms -> #316 added a bounded Compose snapshot refresh but left the Radar
@@ -247,6 +253,10 @@ invalidation for verified peer/profile changes.
   the same person as separate mesh and White Noise conversation rows.
 - *Depending only on the one-second snapshot poll.* Avoids a permanent stale UI
   but still adds visible latency after the radio has already verified the peer.
+- *Launching one UI coroutine per radio callback and notifying after every
+  policy assignment.* Creates a feedback loop (`profile refresh` -> `policy`
+  -> `peer update`) and an unbounded main-thread queue. Policy writes must be
+  change-only, event bursts conflated, and native snapshot reads off-main.
 
 ---
 

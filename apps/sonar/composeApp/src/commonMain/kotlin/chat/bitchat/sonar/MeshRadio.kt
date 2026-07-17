@@ -156,6 +156,27 @@ internal fun bleScanRestartReason(
     return null
 }
 
+/** Normalize a requested discovery allow-list and return it only when applying
+ * it would change the radio policy. This keeps repeated state reconciliation
+ * idempotent and, critically, prevents policy application from feeding back
+ * into peer-update invalidation forever. */
+internal fun changedKnownMeshPeerIds(
+    current: Set<String>,
+    requested: Set<String>,
+): Set<String>? {
+    val normalized = requested.mapTo(linkedSetOf()) { it.lowercase() }
+    return normalized.takeUnless { it == current }
+}
+
+/** A fresh announce is retained without crossing the Kotlin/UniFFI boundary.
+ * Link liveness is needed only after the announce grace window expires. */
+internal inline fun shouldExpireAnnouncedMeshPeer(
+    nowMs: Long,
+    lastSeenMs: Long,
+    staleMs: Long,
+    hasLiveLink: () -> Boolean,
+): Boolean = nowMs - lastSeenMs > staleMs && !hasLiveLink()
+
 /**
  * The BLE mesh radio: scans for and advertises the bitchat mesh service so
  * nearby Sonar/bitchat phones discover each other over Bluetooth. This is the
