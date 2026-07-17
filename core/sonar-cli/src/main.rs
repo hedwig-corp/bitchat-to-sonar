@@ -330,6 +330,7 @@ async fn main() {
         .with_target(false)
         .with_ansi(false)
         .without_time()
+        .with_writer(io::stderr)
         .try_init();
     if let Err(err) = run(Cli::parse()).await {
         eprintln!("sonar-cli: {err}");

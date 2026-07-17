@@ -177,24 +177,7 @@ pair_delivery_matrix() {
   local sent_tsv="$WORK/sent-$label.tsv"
   local recv_all="$WORK/recv-all-$label.tsv"
   local matrix="$WORK/matrix-$label.tsv"
-  : > "$matrix"
-  [[ -f "$sent_tsv" ]] || { printf '%s' "$matrix"; return 0; }
-  awk -F'\t' '
-  NR==FNR { sent[$1"\t"$2]++; next }
-  {
-    payload=$1
-    # payload format: RUN_ID:b<receiver>:a<sender>:s<seq>
-    if (match(payload, ":b([0-9]+):a([0-9]+):s", m)) {
-      recv[m[2]"\t"m[1]]++
-    }
-  }
-  END {
-    for (pair in sent) {
-      split(pair, p, "\t")
-      printf "%s\t%s\t%s\t%s\n", p[1], p[2], sent[pair], (recv[pair] ? recv[pair] : 0)
-    }
-  }
-  ' "$sent_tsv" "$recv_all" 2>/dev/null >> "$matrix" || true
+  build_pair_delivery_matrix "$sent_tsv" "$recv_all" "$matrix"
   printf '%s' "$matrix"
 }
 
@@ -414,16 +397,13 @@ run_exchange() {
 
   # pair delivery matrix as JSON array of {sender,receiver,sent,received}
   local pair_json
-  pair_json=$(awk -F'\t' 'BEGIN{ printf "[" }
-    { printf "%s{\"sender\":%s,\"receiver\":%s,\"sent\":%s,\"received\":%s}", (NR>1?",":""), $1, $2, $3, $4 }
-    END { if (NR==0) print "[]"; else print "]" }
-  ' "$matrix_tsv_file")
+  pair_json=$(pair_delivery_json "$matrix_tsv_file")
 
   # topology as JSON array of {sender,receiver,sender_npub,receiver_npub}
   local topo_json
   topo_json=$(awk -F'\t' 'BEGIN{ printf "[" }
     { printf "%s{\"sender\":%s,\"receiver\":%s,\"sender_npub\":\"%s\",\"receiver_npub\":\"%s\"}", (NR>1?",":""), $1, $2, $3, $4 }
-    END { if (NR==0) print "[]"; else print "]" }
+    END { print "]" }
   ' "$topology_tsv_file")
 
   local _filter
