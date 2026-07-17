@@ -1500,12 +1500,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
                         color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
-                    BasicTextField(
+                    MessageComposerTextField(
                         value = draft, onValueChange = { draft = it },
                         textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                         cursorBrush = SolidColor(s.accent),
-                        singleLine = false,
-                        maxLines = 5,
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
@@ -2012,10 +2010,11 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                 contentAlignment = Alignment.CenterStart
             ) {
                 if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
-                BasicTextField(
+                MessageComposerTextField(
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
-                    cursorBrush = SolidColor(s.accent), modifier = Modifier.fillMaxWidth()
+                    cursorBrush = SolidColor(s.accent),
+                    modifier = Modifier.fillMaxWidth()
                 )
             }
             Spacer(Modifier.width(8.dp))

@@ -634,26 +634,21 @@ struct ContentView: View {
             }
 
             HStack(alignment: .bottom, spacing: 4) {
-                TextField(
-                    "",
+                SNMessageComposerField(
                     text: $messageText,
                     prompt: Text(
                         String(localized: "content.input.message_placeholder", comment: "Placeholder shown in the chat composer")
                     )
-                    .foregroundColor(secondaryTextColor.opacity(0.6)),
-                    axis: .vertical
+                    .foregroundColor(secondaryTextColor.opacity(0.6))
                 )
                 .textFieldStyle(.plain)
                 .font(.bitchatSystem(size: 15, design: .monospaced))
-                .lineLimit(1...5)
                 .foregroundColor(textColor)
                 .focused($isTextFieldFocused)
                 .autocorrectionDisabled(true)
 #if os(iOS)
                 .textInputAutocapitalization(.sentences)
 #endif
-                .submitLabel(.send)
-                .onSubmit { sendMessage() }
                 .padding(.vertical, 7)
                 .padding(.horizontal, 12)
                 .background(

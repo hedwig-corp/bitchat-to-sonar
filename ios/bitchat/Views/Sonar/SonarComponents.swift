@@ -2861,14 +2861,14 @@ struct SNComposer: View {
             .buttonStyle(SNScaleStyle(scale: 0.92))
 
             HStack {
-                TextField("", text: $text, prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3), axis: .vertical)
+                SNMessageComposerField(
+                    text: $text,
+                    prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3)
+                )
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 16))
-                    .lineLimit(1...5)
                     .foregroundColor(SonarTheme.text)
                     .accessibilityIdentifier("sonar-message-composer")
-                    .submitLabel(.send)
-                    .onSubmit(send)
                 Button {
                     if !showEmojiTray {
                         stickerPacks = cachedStickerPacks()
@@ -3024,6 +3024,20 @@ struct SNLiveWave: View {
             }
             .frame(height: 20)
         }
+    }
+}
+
+/// Shared Apple message field: Return always inserts a newline and sending is
+/// owned exclusively by the composer's explicit send button.
+struct SNMessageComposerField: View {
+    @Binding var text: String
+    let prompt: Text
+
+    var body: some View {
+        TextField("", text: $text, prompt: prompt, axis: .vertical)
+            .lineLimit(1...5)
+            .submitLabel(.return)
+            .accessibilityLabel(prompt)
     }
 }
 
