@@ -178,6 +178,11 @@ expect object MeshRadio {
     /** Currently-visible mesh peers (pruned of stale entries). */
     fun peers(): List<MeshPeer>
 
+    /** Install the UI invalidation hook for verified peer/profile changes. The
+     *  radio invokes it after updating its snapshot; callers re-read [peers]
+     *  and [sonarPeers]. Passing null removes the hook. */
+    fun setPeerUpdateListener(listener: (() -> Unit)?)
+
     /** Cheap "is any announce peer around" probe for hot-path polling — does
      *  NOT build/filter/sort the peer list (see the adaptive mesh-drain loop). */
     fun hasActivePeer(): Boolean

@@ -27,6 +27,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -47,6 +48,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import chat.bitchat.sonar.CallScreen
 import chat.bitchat.sonar.HomeMessageRow
+import chat.bitchat.sonar.MeshRadio
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
@@ -74,13 +76,17 @@ import chat.bitchat.sonar.ui.sonar
 fun DesktopApp() {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope).also { it.callOverlay = true } }
+    DisposableEffect(state) {
+        MeshRadio.setPeerUpdateListener(state::onMeshPeersChanged)
+        onDispose { MeshRadio.setPeerUpdateListener(null) }
+    }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()
     }
     // Start the BLE radio (desktop: native CoreBluetooth/BlueZ scan via the
-    // sonar-ble bridge). No-op where BLE is unavailable. The poll loop then
-    // refreshes meshPeers, so the radar lights up with nearby mesh devices.
+    // sonar-ble bridge). No-op where BLE is unavailable. Verified announces
+    // push peer updates immediately; the bounded refresh remains a TTL fallback.
     LaunchedEffect(Unit) { state.startMesh() }
     SonarTheme(dark = state.dark) {
         val s = sonar

@@ -13,6 +13,30 @@ import kotlin.test.assertTrue
 
 class NearbyDiscoveryPolicyTest {
     @Test
+    fun verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive() {
+        val whitewholf = MeshPeer(
+            id = "mesh:whitewholf-fingerprint",
+            name = "whitewholf",
+            rssi = -50,
+            sonar = false,
+        )
+
+        assertEquals(
+            listOf(whitewholf),
+            visibleRadarMeshPeers(listOf(whitewholf), isBlocked = { false }),
+        )
+    }
+
+    @Test
+    fun radarStillExcludesBlockedVerifiedPeers() {
+        val blocked = MeshPeer("mesh:blocked-fingerprint", "blocked", -50)
+
+        assertTrue(
+            visibleRadarMeshPeers(listOf(blocked), isBlocked = { it == "blocked-fingerprint" }).isEmpty(),
+        )
+    }
+
+    @Test
     fun nearbyScanRequiresVisibleForegroundOnboardedRadarAndOpenDiscovery() {
         assertTrue(shouldScanForNearbyPayments(true, true, true, false))
         assertFalse(shouldScanForNearbyPayments(false, true, true, false))

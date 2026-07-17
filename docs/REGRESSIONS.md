@@ -218,6 +218,38 @@ roughly halves it. The ranking is stable across all three.)
 
 ---
 
+## R-008 — Verified bitchat peers appear in Radar before Sonar capabilities
+
+**Invariant:** A verified normal bitchat announce is immediately visible in
+Radar. The later Sonar `0x53` packet upgrades that stable-fingerprint item in
+place; capability settling applies only to conversation folding.
+
+**Breaks as:** A nearby stock bitchat user is absent for 1.5 seconds, or forever
+when no later UI refresh publishes the already-verified radio snapshot.
+
+**Call sites:** iOS `SonarAppStore.swift::nearbyPeers`; Compose
+`SonarAppState.updateMeshPeersFromRadio` / `MeshRadio.setPeerUpdateListener`
+
+**Guarded by:** `NearbyDiscoveryPolicyTest.verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive`
+
+**Partly guarded:** the test pins the shared Compose Radar filter used by the
+real call site. Android/JVM callback delivery and the native iOS call site are
+compile-checked but have no platform-runtime test; iOS tests still do not run in
+CI.
+
+**History:** #57 introduced the 1.5-second conversation recovery hold on both
+platforms -> #316 added a bounded Compose snapshot refresh but left the Radar
+hold in place -> #316 scoped settling back to conversations and added push
+invalidation for verified peer/profile changes.
+
+**Rejected:**
+- *Removing the settle window everywhere.* Reopens R-003 by briefly rendering
+  the same person as separate mesh and White Noise conversation rows.
+- *Depending only on the one-second snapshot poll.* Avoids a permanent stale UI
+  but still adds visible latency after the radio has already verified the peer.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

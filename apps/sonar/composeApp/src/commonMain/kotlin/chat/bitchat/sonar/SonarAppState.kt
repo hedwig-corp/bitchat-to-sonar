@@ -102,6 +102,16 @@ internal fun shouldRefreshNearbyPeers(
     isOnboarded: Boolean,
 ): Boolean = isNearbyVisible && isForeground && isOnboarded
 
+/** Radar presence follows the verified bitchat announce immediately. The later
+ *  Sonar 0x53 profile upgrades the same stable peer in place; capability
+ *  settling belongs only to conversation folding. */
+internal fun visibleRadarMeshPeers(
+    rawPeers: List<MeshPeer>,
+    isBlocked: (String) -> Boolean,
+): List<MeshPeer> = rawPeers.filterNot { peer ->
+    isBlocked(peer.id.removePrefix("mesh:"))
+}
+
 internal fun <M, U> CoroutineScope.launchNearbyPeerRefresh(
     intervalMs: Long = NEARBY_PEER_REFRESH_MS,
     readMeshPeers: () -> List<M>,
@@ -1549,17 +1559,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val previousPeerIds = rawMeshPeerIds
         rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
-        meshPeers = rawPeers.filter { peer ->
+        val visiblePeers = visibleRadarMeshPeers(rawPeers, ::isMeshContactBlocked)
+        visiblePeers.forEach { peer ->
             val peerId = meshPeerId(peer.id)
-            if (isMeshContactBlocked(peerId)) return@filter false
             if (peer.name.isNotBlank()) rememberMeshName(peerId, peer.name)
-            val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
-            val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
-            val hasMessages = meshChats[peerId]?.isNotEmpty() == true
-            val wait = shouldWaitForCapabilities(first, nowMs, hasProfile, hasMessages)
-            if (wait) scheduleCapabilitySettleRefresh(peerId, first, nowMs)
-            !wait
+            meshPeerFirstSeenMs.putIfAbsent(peerId, nowMs)
         }
+        if (meshPeers != visiblePeers) meshPeers = visiblePeers
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
         for (peerId in rawMeshPeerIds) {
@@ -2574,6 +2580,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         MeshRadio.start()
         refreshSonarDiscoveryProfiles()
         updateMeshPeersFromRadio()
+    }
+
+    /** Radio callbacks may arrive on BLE/native worker threads. Hop through the
+     *  app scope before mutating Compose state, then publish the verified peer
+     *  and any later 0x53 capability upgrade from the same snapshot. */
+    internal fun onMeshPeersChanged() {
+        scope.launch {
+            refreshSonarDiscoveryProfiles()
+            updateMeshPeersFromRadio()
+        }
     }
 
     // ── Unify nearby payments (separate BLE service; payments-only) ──

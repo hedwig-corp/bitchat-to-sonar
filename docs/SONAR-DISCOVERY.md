@@ -71,6 +71,15 @@ The normal bitchat announce remains untouched. `0x53` is deliberately not added
 to bitchat's `MessageType` enum; stock bitchat clients hit the unknown-type
 branch, ignore the payload, and continue relaying by TTL.
 
+### Presentation Ordering
+
+A verified normal bitchat announce is sufficient to show a peer in Radar.
+Receivers must not delay nearby presence while waiting for `0x53`: when the
+Sonar packet arrives, the existing stable-fingerprint item upgrades in place
+with its Sonar capabilities. A short `0x53` settle window may be used only while
+folding conversation rows, where it prevents one person from briefly rendering
+as separate bitchat and White Noise chats.
+
 ### Discovery Power Policy
 
 Sonar has two BLE discovery modes:

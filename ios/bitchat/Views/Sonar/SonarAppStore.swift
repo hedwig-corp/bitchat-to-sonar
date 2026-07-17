@@ -1100,9 +1100,9 @@ final class SonarAppStore: ObservableObject {
     private let localNotificationStartedAt = Date()
     private var seenMarmotNotificationMessageIDs = Set<String>()
     private var seenPrivateChatPaymentNotificationMessageIDs = Set<String>()
-    /// Stable mesh peer key -> first sighting time. We briefly hold unresolved
-    /// fresh peers so their 0x53 Sonar capabilities can arrive before the UI
-    /// commits to a plain Bitchat row.
+    /// Stable mesh peer key -> first sighting time. Conversation rows briefly
+    /// hold unresolved peers so 0x53 can fold their transports; Radar always
+    /// shows the verified bitchat announce immediately.
     private var meshPeerFirstSeenAt: [String: Date] = [:]
     private var pendingCapabilityRefreshKeys = Set<String>()
     private var publishedCallDescriptor = false
@@ -3093,11 +3093,6 @@ final class SonarAppStore: ObservableObject {
         for peer in chatViewModel.allPeers where peer.peerID != my {
             let peerKey = markMeshPeerSeen(peer.peerID, now: now)
             let sonar = resolvedSonarProfile(peer.peerID.id) != nil || resolvedSonarProfile(peerKey) != nil
-            let hasMessages = hasMeshMessages(peerID: peer.peerID, key: peerKey)
-            if (peer.isConnected || peer.isReachable),
-               shouldWaitForCapabilities(peerID: peer.peerID, key: peerKey, now: now, hasMessages: hasMessages) {
-                continue
-            }
             let h = snHash(peer.peerID.id)
             let angle = Double(h % 360)
             let jitter = Double((h >> 9) % 11) - 5

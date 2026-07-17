@@ -77,6 +77,7 @@ actual object MeshRadio {
      *  announce carries a stable peerID — keying by address loses the name). */
     private val announcedPeers = ConcurrentHashMap<String, MeshPeer>()
     private val announcedSeen = ConcurrentHashMap<String, Long>()
+    @Volatile private var peerUpdateListener: (() -> Unit)? = null
     /** How long a verified peer stays listed after we last heard from it WITHOUT
      *  a live link. A peer announces only once per Noise connection (not on a
      *  heartbeat), and connections re-form only every few minutes as BLE private
@@ -113,17 +114,22 @@ actual object MeshRadio {
         // Stash peers' 0x53 payloads + register named, verified announce peers,
         // keyed by stable fingerprint.
         MeshGatt.addSonarListener { fingerprint, payload ->
-            if (isKnownPeer(fingerprint)) sonarProfiles[fingerprint] = payload
+            if (isKnownPeer(fingerprint)) {
+                val previous = sonarProfiles.put(fingerprint, payload)
+                if (previous == null || !previous.contentEquals(payload)) notifyPeerUpdate()
+            }
         }
         MeshGatt.addAnnounceListener { _, info, fingerprint ->
             if (fingerprint.isEmpty()) return@addAnnounceListener
             if (!isKnownPeer(fingerprint)) return@addAnnounceListener
-            announcedPeers[fingerprint] = MeshPeer(
+            val peer = MeshPeer(
                 id = "mesh:" + fingerprint,
                 name = info.nickname,
                 rssi = -50, // connected ⇒ close; no per-packet RSSI on the GATT path
             )
+            val previous = announcedPeers.put(fingerprint, peer)
             announcedSeen[fingerprint] = System.currentTimeMillis()
+            if (previous != peer) notifyPeerUpdate()
         }
         // Keep a peer fresh while its encrypted link is (re)established.
         MeshGatt.addLinkListener { fingerprint -> announcedSeen[fingerprint] = System.currentTimeMillis() }
@@ -149,11 +155,20 @@ actual object MeshRadio {
         return a.isEnabled && permitted()
     }
 
+    actual fun setPeerUpdateListener(listener: (() -> Unit)?) {
+        peerUpdateListener = listener
+    }
+
+    private fun notifyPeerUpdate() {
+        peerUpdateListener?.let { listener -> runCatching(listener) }
+    }
+
     actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
         if (discoveryMode == mode) return
         discoveryMode = mode
         applyMeshGattPolicy()
         pruneForDiscoveryMode()
+        notifyPeerUpdate()
         if (scanning) {
             if (mode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) {
                 stop()
@@ -170,6 +185,7 @@ actual object MeshRadio {
         ids.mapTo(knownPeerIds) { it.lowercase() }
         applyMeshGattPolicy()
         pruneForDiscoveryMode()
+        notifyPeerUpdate()
         if (discoveryMode == BleDiscoveryMode.KnownOnly) {
             if (knownPeerIds.isEmpty()) stop()
             else if (!scanning) start()
@@ -212,6 +228,7 @@ actual object MeshRadio {
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
+        notifyPeerUpdate()
     }
 
     private fun restartRadioForPolicy() {

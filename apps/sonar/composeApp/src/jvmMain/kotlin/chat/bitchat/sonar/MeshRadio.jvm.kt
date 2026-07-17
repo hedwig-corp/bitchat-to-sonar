@@ -18,6 +18,10 @@ actual object MeshRadio {
 
     actual fun available(): Boolean = BleBridge.available
 
+    actual fun setPeerUpdateListener(listener: (() -> Unit)?) {
+        MeshLink.setPeerUpdateListener(listener)
+    }
+
     actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
         if (discoveryMode == mode) return
         discoveryMode = mode
