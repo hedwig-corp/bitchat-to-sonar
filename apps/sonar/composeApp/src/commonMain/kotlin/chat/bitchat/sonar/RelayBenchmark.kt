@@ -7,7 +7,8 @@ import kotlinx.coroutines.withContext
  * Platform WebSocket probe: open [url], send disposable REQ kinds:[0] limit:1,
  * wait for matching EOSE, CLOSE, return RTT ms. Throws / returns error on timeout.
  *
- * Implemented with java.net.http WebSocket on Android (API 26+) and desktop JVM.
+ * Implemented with an Android-supported client on Android and java.net.http on
+ * desktop JVM.
  */
 internal expect suspend fun platformProbeRelayLatency(
     url: String,

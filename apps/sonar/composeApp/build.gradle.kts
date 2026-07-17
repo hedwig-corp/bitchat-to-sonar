@@ -179,6 +179,8 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
+            // Android-supported WebSocket transport for relay diagnostics.
+            implementation(libs.okhttp.client)
             // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY.
             implementation(libs.breez.sdk.liquid)
             // UniFFI Kotlin bindings for the Rust core use JNA at runtime.
@@ -193,6 +195,7 @@ kotlin {
             implementation(libs.androidx.test.runner)
             implementation(libs.androidx.test.ext.junit)
             implementation(libs.junit)
+            implementation(libs.okhttp.mockwebserver)
         }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
@@ -380,11 +383,15 @@ android {
             }
         }
         getByName("debug") {
-            // Debug builds only run on the local dev device. Both the Apple-
-            // Silicon emulator and the Pixel 8 are arm64-v8a, so ship just that
-            // ABI — keeps the debug APK small (the full multi-ABI build bundles
-            // the Rust + Breez .so for every ABI and overflows small partitions).
-            ndk { abiFilters += "arm64-v8a" }
+            // Local debug builds target arm64. CI passes
+            // -Psonar.androidDebugAbi=x86_64 for its Linux emulator; keeping the
+            // selection explicit avoids a multi-ABI APK overflowing small
+            // emulator partitions.
+            val debugAbi =
+                (project.findProperty("sonar.androidDebugAbi") as String?)
+                    ?.takeIf { it in setOf("arm64-v8a", "armeabi-v7a", "x86_64") }
+                    ?: "arm64-v8a"
+            ndk { abiFilters += debugAbi }
         }
     }
 }

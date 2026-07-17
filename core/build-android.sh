@@ -16,6 +16,8 @@
 # Usage: ANDROID_NDK_HOME=/path/to/ndk core/build-android.sh
 # Prereqs: cargo-ndk, rustup targets aarch64/armv7/x86_64-linux-android
 #          (auto-added below), an Android NDK (ANDROID_NDK_HOME or auto-detect).
+# For a single-ABI CI build, set both SONAR_ABIS (cargo-ndk arguments) and
+# SONAR_BINDINGS_ABI (the built ABI used to generate platform-neutral bindings).
 #
 set -euo pipefail
 
@@ -71,7 +73,7 @@ rm -rf "$JNILIBS" "$KOTLIN_DIR/uniffi"
 mkdir -p "$JNILIBS" "$KOTLIN_DIR"
 
 # --- Build the 3 ABIs (cargo-ndk copies each .so into jniLibs/<abi>/) ---------
-echo "Building $CRATE for arm64-v8a, armeabi-v7a, x86_64 ${SONAR_FEATURES:+($SONAR_FEATURES)}..."
+echo "Building $CRATE for ${SONAR_ABIS:-arm64-v8a, armeabi-v7a, x86_64} ${SONAR_FEATURES:+($SONAR_FEATURES)}..."
 cargo ndk -o "$JNILIBS" \
   ${SONAR_ABIS:--t arm64-v8a -t armeabi-v7a -t x86_64} \
   build -p "$CRATE" --lib --release ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
@@ -83,6 +85,8 @@ if [[ "$SONAR_FEATURES" == *calls-audio* ]]; then
   NDK_HOST="$(ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt" 2>/dev/null | head -1)"
   SYSROOT_LIB="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$NDK_HOST/sysroot/usr/lib"
   copy_libcxx() { # <abi> <triple>
+    # Single-ABI CI builds only create one destination directory.
+    [[ -d "$JNILIBS/$1" ]] || return 0
     local src="$SYSROOT_LIB/$2/libc++_shared.so"
     if [[ -f "$src" ]]; then
       cp "$src" "$JNILIBS/$1/" && echo "  shipped libc++_shared.so for $1"
@@ -97,8 +101,9 @@ fi
 
 # --- Generate the Kotlin bindings (library mode, reads metadata from a .so) ---
 echo "Generating Kotlin bindings..."
+SONAR_BINDINGS_ABI="${SONAR_BINDINGS_ABI:-arm64-v8a}"
 cargo run -p "$CRATE" --features cli --bin uniffi-bindgen -- generate \
-  --library "$JNILIBS/arm64-v8a/$LIB" \
+  --library "$JNILIBS/$SONAR_BINDINGS_ABI/$LIB" \
   --language kotlin --out-dir "$KOTLIN_DIR"
 
 echo ""

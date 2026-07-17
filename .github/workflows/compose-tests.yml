@@ -64,3 +64,62 @@ jobs:
         working-directory: apps/sonar
         env:
           SONAR_SKIP_BLE: '1'
+
+  android-device-test:
+    name: Compose device tests (Android API 35)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Update Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 4.1.2 --locked
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: android-x86_64
+
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27d
+          local-cache: true
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Android device tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          profile: pixel_6
+          script: >-
+            ./gradlew :composeApp:connectedDebugAndroidTest
+            -Psonar.androidDebugAbi=x86_64
+            -x :composeApp:processDebugGoogleServices
+            --console=plain
+          working-directory: apps/sonar
+        env:
+          SONAR_ABIS: '-t x86_64'
+          SONAR_BINDINGS_ABI: x86_64
