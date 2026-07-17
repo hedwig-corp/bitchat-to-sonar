@@ -629,8 +629,10 @@ final class SonarAppStore: ObservableObject {
     private static let preRouteDirectNpub = "direct-npub"
     private static let preRouteGroupCreate = "group-create"
     private static let preRouteGroupInvite = "group-invite"
+    private static let preRouteGroupOperation = "group-operation"
     private static let preRoutePeer = "peer"
     private static let preRouteMarmotGroup = "marmot-group"
+    private static let preRouteGroupOperationIDPrefix = "group-operation:"
 
     static let marmotIDPrefix = "marmot:"
     /// Default domain for unified handles claimed through the app. Core owns
@@ -4612,6 +4614,28 @@ final class SonarAppStore: ObservableObject {
         return String(data: data, encoding: .utf8)
     }
 
+    private func pendingGroupOperationSentinelId(_ pendingId: String) -> String {
+        Self.preRouteGroupOperationIDPrefix + pendingId
+    }
+
+    private func journalPendingGroupOperation(
+        pendingId: String,
+        pending: SNPendingMarmotGroup
+    ) -> Bool {
+        guard let context = encodedPreRouteGroupContext(pending) else {
+            showToast("Couldn't save the group setup. Try again.")
+            return false
+        }
+        return journalPreRoute(
+            id: pendingGroupOperationSentinelId(pendingId),
+            routeKind: Self.preRouteGroupOperation,
+            routeId: pendingId,
+            routeContext: context,
+            content: "",
+            createdAt: pending.createdAt
+        )
+    }
+
     private func restorePreRouteMessages() {
         for record in marmot.preRouteMessages() {
             let createdAt = Date(timeIntervalSince1970: TimeInterval(record.createdAtSecs))
@@ -4637,7 +4661,7 @@ final class SonarAppStore: ObservableObject {
                         SNPendingMarmotRouteSend(id: record.id, text: record.content)
                     )
                 }
-            case Self.preRouteGroupCreate, Self.preRouteGroupInvite:
+            case Self.preRouteGroupOperation, Self.preRouteGroupCreate, Self.preRouteGroupInvite:
                 guard let data = record.routeContext.data(using: .utf8),
                       let context = try? JSONDecoder().decode(SNPendingMarmotRouteContext.self, from: data)
                 else { continue }
@@ -4649,6 +4673,7 @@ final class SonarAppStore: ObservableObject {
                         inviteId: context.inviteId,
                         inviteGroupId: context.inviteGroupId
                     )
+                if record.routeKind == Self.preRouteGroupOperation { continue }
                 if pendingMarmotMessagesByChat[record.routeId, default: []].contains(where: { $0.id == record.id }) == false {
                     pendingMarmotMessagesByChat[record.routeId, default: []].append(
                         pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
@@ -5279,6 +5304,7 @@ final class SonarAppStore: ObservableObject {
         if setupToken == nil {
             cancelPendingMarmotGroupSetup(pendingId: pendingId)
         }
+        marmot.completePreRouteMessage(id: pendingGroupOperationSentinelId(pendingId))
         pendingMarmotGroups[pendingId] = nil
         let realId = Self.marmotIDPrefix + groupId
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
@@ -5313,10 +5339,13 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSetupTasks[pendingId] = nil
     }
 
-    private func cancelPendingMarmotGroupSetup(pendingId: String) {
-        pendingMarmotGroupSetupTasks[pendingId]?.cancel()
+    @discardableResult
+    private func cancelPendingMarmotGroupSetup(pendingId: String) -> Task<Void, Never>? {
+        let task = pendingMarmotGroupSetupTasks[pendingId]
+        task?.cancel()
         pendingMarmotGroupSetupTasks[pendingId] = nil
         pendingMarmotGroupSetupTokens[pendingId] = nil
+        return task
     }
 
     private func cancelPendingMarmotGroupSetups() {
@@ -6762,20 +6791,22 @@ final class SonarAppStore: ObservableObject {
             return nil
         }
         let pendingId = pendingMarmotGroupId()
-        pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
+        let pending = SNPendingMarmotGroup(
             name: cleanName,
             members: cleanMembers,
             createdAt: Date(),
             inviteId: nil,
             inviteGroupId: nil
         )
+        guard journalPendingGroupOperation(pendingId: pendingId, pending: pending) else { return nil }
+        pendingMarmotGroups[pendingId] = pending
         marmot.connectIfNeeded()
         startPendingMarmotGroupCreation(pendingId: pendingId)
         return pendingId
     }
 
     @discardableResult
-    func acceptGroupInvite(_ invite: MarmotService.GroupInvite) -> String {
+    func acceptGroupInvite(_ invite: MarmotService.GroupInvite) -> String? {
         if marmot.groups.contains(where: { $0.id == invite.groupId }) {
             let id = Self.marmotIDPrefix + invite.groupId
             openedDM(id, marmotGroupId: invite.groupId)
@@ -6783,13 +6814,14 @@ final class SonarAppStore: ObservableObject {
         }
         let pendingId = pendingMarmotGroupId(seed: "invite:\(invite.id)")
         if pendingMarmotGroups[pendingId] == nil {
-            pendingMarmotGroups[pendingId] = SNPendingMarmotGroup(
+            let pending = SNPendingMarmotGroup(
                 name: invite.groupName.isEmpty ? "Group chat" : invite.groupName,
                 members: [],
                 createdAt: Date(),
                 inviteId: invite.id,
                 inviteGroupId: invite.groupId
             )
+            pendingMarmotGroups[pendingId] = pending
         }
         marmot.pendingGroupInvites.removeAll { $0.id == invite.id }
         marmot.connectIfNeeded()
@@ -7828,15 +7860,33 @@ final class SonarAppStore: ObservableObject {
         discardRetainedConversation(id)
         if isPendingSecureChat(id) {
             let pendingNpub = pendingMarmotNpub(for: id)
-            discardPreRouteMessages(matching: [id])
+            let pendingGroup = pendingMarmotGroups[id]
+            let cancelledGroupSetup = cancelPendingMarmotGroupSetup(pendingId: id)
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
             pendingMarmotMessagesByChat[id] = nil
             pendingMarmotGroupSends[id] = nil
-            cancelPendingMarmotGroupSetup(pendingId: id)
             if let pendingNpub {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
+            }
+            if let pendingGroup {
+                Task { @MainActor in
+                    await cancelledGroupSetup?.value
+                    if pendingGroup.inviteId == nil {
+                        do {
+                            try await marmot.discardPreRouteGroupOperation(operationId: id)
+                        } catch {
+                            showToast("Couldn't discard group setup: \(error.localizedDescription)")
+                            return
+                        }
+                    } else if let expectedGroupId = pendingGroup.inviteGroupId {
+                        await marmot.deleteGroup(expectedGroupId)
+                    }
+                    discardPreRouteMessages(matching: [id])
+                }
+            } else {
+                discardPreRouteMessages(matching: [id])
             }
         } else if let groupId = marmotGroupId(id) {
             let shouldLeave = isMultiMemberMarmotGroupId(id)

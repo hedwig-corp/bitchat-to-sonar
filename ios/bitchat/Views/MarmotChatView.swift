@@ -3169,6 +3169,11 @@ final class MarmotChatModel: ObservableObject {
         return id
     }
 
+    func discardPreRouteGroupOperation(operationId: String) async throws {
+        try await service.discardPreRouteGroupOperation(operationId: operationId)
+        await loadLocal()
+    }
+
     func declineGroupInvite(_ invite: MarmotService.GroupInvite) async throws {
         try await service.declineGroupInvite(invite.id)
         await loadLocal()

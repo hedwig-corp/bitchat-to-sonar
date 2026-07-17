@@ -184,6 +184,13 @@ impl OutboxState {
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
             }
+            // A wall-clock correction must not strand a durable send behind a
+            // timestamp that is now days or months in the future. Rebase it
+            // onto the current clock and preserve only the bounded backoff.
+            if entry.updated_at_secs > now_secs {
+                entry.updated_at_secs = now_secs;
+                self.dirty = true;
+            }
             let retry_at = entry
                 .updated_at_secs
                 .saturating_add(automatic_retry_delay_secs(entry.attempts));
@@ -454,6 +461,46 @@ mod tests {
         let retryable = outbox
             .retryable_events(32, &active)
             .expect("automatic retry remains available after a prolonged outage");
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].2.id, event.id);
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn automatic_retry_rebases_future_timestamp_after_clock_correction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                10_000,
+            )
+            .expect("mark pending");
+        outbox
+            .mark_failed_by_message_id("message", "offline".into(), 10_000)
+            .expect("mark failed");
+
+        let active = HashSet::from(["group".to_string()]);
+        assert!(outbox
+            .retryable_events(100, &active)
+            .expect("future timestamp is rebased")
+            .is_empty());
+        let retryable = outbox
+            .retryable_events(101, &active)
+            .expect("bounded retry becomes due");
         assert_eq!(retryable.len(), 1);
         assert_eq!(retryable[0].2.id, event.id);
 

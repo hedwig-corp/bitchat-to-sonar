@@ -8,9 +8,11 @@
 //! SQLCipher database key. Hosts own route interpretation and remove an entry
 //! only after the normal core send has accepted it into local storage.
 
+use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -21,6 +23,7 @@ use sha2::Sha256;
 use crate::{Error, Result};
 
 pub(crate) const PRE_ROUTE_OUTBOX_FILE_SUFFIX: &str = ".sonar-pre-route-outbox";
+pub(crate) const GROUP_OPERATION_ROUTE_KIND: &str = "group-operation";
 const FILE_MAGIC: &[u8; 8] = b"SNPROBX1";
 const FILE_AAD: &[u8] = b"sonar-pre-route-outbox-v1";
 const HKDF_SALT: &[u8] = b"sonar-pre-route-outbox-salt-v1";
@@ -31,6 +34,13 @@ const MAX_ENTRIES_PER_ROUTE: usize = 100;
 const MAX_FIELD_BYTES: usize = 16 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_PLAINTEXT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PENDING_GROUP_CREATIONS: usize = 32;
+const MAX_WELCOMES_PER_GROUP: usize = 500;
+const MAX_WELCOME_EVENT_BYTES: usize = 512 * 1024;
+const MAX_PENDING_GROUP_RECOVERY_BYTES: usize = 4 * 1024 * 1024;
+
+static SHARED_OUTBOXES: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<PreRouteOutbox>>>>> =
+    OnceLock::new();
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreRouteMessage {
@@ -43,10 +53,27 @@ pub struct PreRouteMessage {
     pub created_at_secs: u64,
 }
 
+/// Replay material for an idempotent group operation whose signed Welcomes may
+/// not all have reached a relay yet. Every ready Welcome is already
+/// gift-wrapped, so the journal contains no plaintext group content and
+/// retrying the same signed events is relay-idempotent by event id.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PendingGroupCreation {
+    /// The hashed operation marker stored in the group description.
+    pub operation_description: String,
+    /// Absent until MDK has created the group and every Welcome is wrapped.
+    /// This intent-only checkpoint proves that a group found with this marker
+    /// crashed before publication began and is therefore safe to recreate.
+    pub group_id_hex: Option<String>,
+    pub welcome_event_jsons: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct PreRouteStateDisk {
     version: u32,
     entries: Vec<PreRouteMessage>,
+    #[serde(default)]
+    pending_group_creations: Vec<PendingGroupCreation>,
 }
 
 #[derive(Debug)]
@@ -54,20 +81,126 @@ pub(crate) struct PreRouteOutbox {
     path: Option<PathBuf>,
     key: Option<[u8; 32]>,
     entries: Vec<PreRouteMessage>,
+    pending_group_creations: Vec<PendingGroupCreation>,
 }
 
 impl PreRouteOutbox {
     pub fn open(path: Option<PathBuf>, db_key: Option<[u8; 32]>) -> Result<Self> {
         let key = db_key.map(derive_key).transpose()?;
-        let entries = match (&path, &key) {
-            (Some(path), Some(key)) if path.exists() => decrypt_state(path, key)?.entries,
-            _ => Vec::new(),
+        let state = match (&path, &key) {
+            (Some(path), Some(key)) if path.exists() => decrypt_state(path, key)?,
+            _ => PreRouteStateDisk {
+                version: 1,
+                entries: Vec::new(),
+                pending_group_creations: Vec::new(),
+            },
         };
-        Ok(Self { path, key, entries })
+        Ok(Self {
+            path,
+            key,
+            entries: state.entries,
+            pending_group_creations: state.pending_group_creations,
+        })
     }
 
     pub fn messages(&self) -> Vec<PreRouteMessage> {
         self.entries.clone()
+    }
+
+    pub fn pending_group_creation(
+        &self,
+        operation_description: &str,
+    ) -> Option<PendingGroupCreation> {
+        self.pending_group_creations
+            .iter()
+            .find(|entry| entry.operation_description == operation_description)
+            .cloned()
+    }
+
+    /// Checkpoint all signed Welcome events before the first relay publish.
+    /// If this write fails the caller can safely discard the staged MLS group,
+    /// because no recipient could have observed it yet.
+    pub fn save_pending_group_creation(&mut self, creation: PendingGroupCreation) -> Result<()> {
+        validate_pending_group_creation(&creation)?;
+        if let Some(index) = self
+            .pending_group_creations
+            .iter()
+            .position(|entry| entry.operation_description == creation.operation_description)
+        {
+            if self.pending_group_creations[index] == creation {
+                return Ok(());
+            }
+            if self.pending_group_creations[index].group_id_hex.is_none()
+                && creation.group_id_hex.is_some()
+            {
+                let previous =
+                    std::mem::replace(&mut self.pending_group_creations[index], creation);
+                if let Err(error) = self.save() {
+                    self.pending_group_creations[index] = previous;
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            return Err(Error::InvalidInput(
+                "group operation already has different recovery state".into(),
+            ));
+        }
+        if self.pending_group_creations.len() >= MAX_PENDING_GROUP_CREATIONS {
+            return Err(Error::InvalidInput(
+                "pending group creation recovery journal is full".into(),
+            ));
+        }
+
+        self.pending_group_creations.push(creation);
+        if let Err(error) = self.save() {
+            self.pending_group_creations.pop();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn complete_pending_group_creation(&mut self, operation_description: &str) -> Result<()> {
+        let Some(index) = self
+            .pending_group_creations
+            .iter()
+            .position(|entry| entry.operation_description == operation_description)
+        else {
+            return Ok(());
+        };
+        let removed = self.pending_group_creations.remove(index);
+        if let Err(error) = self.save() {
+            self.pending_group_creations.insert(index, removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Explicitly cancel a host group operation. The operation sentinel and
+    /// internal Welcome checkpoint are removed in one encrypted manifest
+    /// replacement so restart cannot resurrect or leak the cancelled work.
+    pub fn discard_pending_group_operation(
+        &mut self,
+        operation_id: &str,
+        operation_description: &str,
+    ) -> Result<()> {
+        let previous_entries = self.entries.clone();
+        let previous_group_creations = self.pending_group_creations.clone();
+        self.entries.retain(|entry| {
+            entry.route_kind != GROUP_OPERATION_ROUTE_KIND || entry.route_id != operation_id
+        });
+        self.pending_group_creations
+            .retain(|entry| entry.operation_description != operation_description);
+        if self.entries == previous_entries
+            && self.pending_group_creations == previous_group_creations
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.save() {
+            self.entries = previous_entries;
+            self.pending_group_creations = previous_group_creations;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn enqueue(&mut self, message: PreRouteMessage) -> Result<()> {
@@ -172,8 +305,10 @@ impl PreRouteOutbox {
 
     pub fn clear(&mut self) -> Result<()> {
         let previous = std::mem::take(&mut self.entries);
+        let previous_group_creations = std::mem::take(&mut self.pending_group_creations);
         if let Err(error) = self.save() {
             self.entries = previous;
+            self.pending_group_creations = previous_group_creations;
             return Err(error);
         }
         Ok(())
@@ -183,7 +318,7 @@ impl PreRouteOutbox {
         let (Some(path), Some(key)) = (&self.path, &self.key) else {
             return Ok(());
         };
-        if self.entries.is_empty() {
+        if self.entries.is_empty() && self.pending_group_creations.is_empty() {
             match fs::remove_file(path) {
                 Ok(()) => sync_parent(path),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -204,9 +339,11 @@ impl PreRouteOutbox {
                 parent.display()
             ))
         })?;
+        validate_pending_group_recovery_bytes(&self.pending_group_creations)?;
         let state = PreRouteStateDisk {
             version: 1,
             entries: self.entries.clone(),
+            pending_group_creations: self.pending_group_creations.clone(),
         };
         let plaintext = serde_json::to_vec(&state)?;
         if plaintext.len() > MAX_PLAINTEXT_BYTES {
@@ -258,7 +395,7 @@ impl PreRouteOutbox {
             .map_err(|error| {
                 Error::Storage(format!("write pre-route outbox {}: {error}", tmp.display()))
             })?;
-        fs::rename(&tmp, path).map_err(|error| {
+        atomic_replace_file(&tmp, path).map_err(|error| {
             Error::Storage(format!(
                 "replace pre-route outbox {}: {error}",
                 path.display()
@@ -274,6 +411,66 @@ pub(crate) fn pre_route_outbox_path_for_db(db_path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("marmot.sqlite");
     db_path.with_file_name(format!("{file_name}{PRE_ROUTE_OUTBOX_FILE_SUFFIX}"))
+}
+
+/// Return one process-wide journal instance for a durable path. Apple and
+/// Compose can briefly overlap a local-only node with its relay-connected
+/// replacement; sharing the same mutex prevents two stale snapshots from
+/// independently rewriting the sidecar and losing each other's entries.
+pub(crate) fn shared_pre_route_outbox(
+    path: Option<PathBuf>,
+    db_key: Option<[u8; 32]>,
+) -> Result<Arc<Mutex<PreRouteOutbox>>> {
+    let Some(path) = path else {
+        return Ok(Arc::new(Mutex::new(PreRouteOutbox::open(None, db_key)?)));
+    };
+    let registry_key = registry_key(&path);
+    let expected_key = db_key.map(derive_key).transpose()?;
+    let registry = SHARED_OUTBOXES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(shared) = registry.get(&registry_key).and_then(Weak::upgrade) {
+        let uses_expected_key = shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .key
+            == expected_key;
+        if !uses_expected_key {
+            return Err(Error::Storage(
+                "pre-route outbox path is already open with another key".into(),
+            ));
+        }
+        return Ok(shared);
+    }
+
+    let shared = Arc::new(Mutex::new(PreRouteOutbox::open(Some(path), db_key)?));
+    registry.insert(registry_key, Arc::downgrade(&shared));
+    Ok(shared)
+}
+
+fn registry_key(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let Some(parent) = absolute.parent() else {
+        return absolute;
+    };
+    match parent.canonicalize() {
+        Ok(parent) => absolute
+            .file_name()
+            .map(|name| parent.join(name))
+            .unwrap_or(parent),
+        Err(_) => absolute,
+    }
 }
 
 fn validate_message(message: &PreRouteMessage) -> Result<()> {
@@ -296,6 +493,60 @@ fn validate_message(message: &PreRouteMessage) -> Result<()> {
         return Err(Error::InvalidInput(
             "pre-route message content is too large".into(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_pending_group_creation(creation: &PendingGroupCreation) -> Result<()> {
+    if creation.operation_description.trim().is_empty()
+        || creation.operation_description.len() > MAX_FIELD_BYTES
+    {
+        return Err(Error::InvalidInput(
+            "pending group creation operation description is invalid".into(),
+        ));
+    }
+    match &creation.group_id_hex {
+        None if creation.welcome_event_jsons.is_empty() => return Ok(()),
+        Some(group_id) if !group_id.trim().is_empty() && group_id.len() <= MAX_FIELD_BYTES => {}
+        _ => {
+            return Err(Error::InvalidInput(
+                "pending group creation checkpoint is incomplete".into(),
+            ))
+        }
+    }
+    if creation.welcome_event_jsons.is_empty()
+        || creation.welcome_event_jsons.len() > MAX_WELCOMES_PER_GROUP
+    {
+        return Err(Error::InvalidInput(
+            "pending group creation welcome count is invalid".into(),
+        ));
+    }
+    if creation
+        .welcome_event_jsons
+        .iter()
+        .any(|event| event.len() > MAX_WELCOME_EVENT_BYTES)
+    {
+        return Err(Error::InvalidInput(
+            "pending group creation Welcome is too large".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pending_group_recovery_bytes(creations: &[PendingGroupCreation]) -> Result<()> {
+    let mut total = 0usize;
+    for event in creations
+        .iter()
+        .flat_map(|creation| &creation.welcome_event_jsons)
+    {
+        total = total.checked_add(event.len()).ok_or_else(|| {
+            Error::InvalidInput("pending group creation recovery material is too large".into())
+        })?;
+        if total > MAX_PENDING_GROUP_RECOVERY_BYTES {
+            return Err(Error::InvalidInput(
+                "pending group creation recovery material is too large".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -349,13 +600,14 @@ fn decrypt_state(path: &Path, key: &[u8; 32]) -> Result<PreRouteStateDisk> {
             state.version
         )));
     }
-    validate_loaded_entries(&state.entries)?;
+    validate_loaded_state(&state)?;
     Ok(state)
 }
 
-fn validate_loaded_entries(entries: &[PreRouteMessage]) -> Result<()> {
+fn validate_loaded_state(state: &PreRouteStateDisk) -> Result<()> {
     use std::collections::{HashMap, HashSet};
 
+    let entries = &state.entries;
     if entries.len() > MAX_ENTRIES {
         return Err(Error::Storage("pre-route outbox exceeds entry cap".into()));
     }
@@ -378,6 +630,21 @@ fn validate_loaded_entries(entries: &[PreRouteMessage]) -> Result<()> {
             ));
         }
     }
+    if state.pending_group_creations.len() > MAX_PENDING_GROUP_CREATIONS {
+        return Err(Error::Storage(
+            "pending group creation recovery journal exceeds entry cap".into(),
+        ));
+    }
+    let mut operations = HashSet::with_capacity(state.pending_group_creations.len());
+    for creation in &state.pending_group_creations {
+        validate_pending_group_creation(creation)?;
+        if !operations.insert(creation.operation_description.as_str()) {
+            return Err(Error::Storage(
+                "pending group creation recovery journal contains duplicate operations".into(),
+            ));
+        }
+    }
+    validate_pending_group_recovery_bytes(&state.pending_group_creations)?;
     Ok(())
 }
 
@@ -387,6 +654,43 @@ fn tmp_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("sonar-pre-route-outbox");
     path.with_file_name(format!("{file_name}.tmp"))
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -412,6 +716,7 @@ fn sync_parent(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn message(id: &str) -> PreRouteMessage {
         PreRouteMessage {
@@ -421,6 +726,14 @@ mod tests {
             route_context: "{}".into(),
             content: "survive restart".into(),
             created_at_secs: 42,
+        }
+    }
+
+    fn group_creation(operation: &str) -> PendingGroupCreation {
+        PendingGroupCreation {
+            operation_description: operation.into(),
+            group_id_hex: Some("ab".repeat(32)),
+            welcome_event_jsons: vec!["{\"id\":\"welcome\"}".into()],
         }
     }
 
@@ -439,6 +752,20 @@ mod tests {
 
         reopened.remove("one").expect("remove");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn encrypted_journal_replaces_existing_file_on_update() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("pre-route");
+        let key = [7u8; 32];
+        let mut outbox = PreRouteOutbox::open(Some(path.clone()), Some(key)).expect("open");
+        outbox.enqueue(message("one")).expect("first save");
+        outbox.enqueue(message("two")).expect("replacement save");
+        drop(outbox);
+
+        let reopened = PreRouteOutbox::open(Some(path), Some(key)).expect("reopen");
+        assert_eq!(reopened.messages(), vec![message("one"), message("two")]);
     }
 
     #[test]
@@ -482,6 +809,132 @@ mod tests {
 
         assert!(outbox.resolve_route("stable-id", "group-456").is_err());
         assert_eq!(outbox.messages()[0].route_id, "group-123");
+    }
+
+    #[test]
+    fn pending_group_creation_recovery_survives_restart_and_clears_with_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let key = [5u8; 32];
+        let mut outbox = PreRouteOutbox::open(Some(path.clone()), Some(key)).unwrap();
+        outbox
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: "operation-hash".into(),
+                group_id_hex: None,
+                welcome_event_jsons: Vec::new(),
+            })
+            .unwrap();
+        outbox
+            .save_pending_group_creation(group_creation("operation-hash"))
+            .unwrap();
+        drop(outbox);
+
+        let mut restored = PreRouteOutbox::open(Some(path.clone()), Some(key)).unwrap();
+        assert_eq!(
+            restored.pending_group_creation("operation-hash"),
+            Some(group_creation("operation-hash"))
+        );
+        restored.clear().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pending_group_creation_rejects_aggregate_recovery_material_before_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let key = [5u8; 32];
+        let mut outbox = PreRouteOutbox::open(Some(path.clone()), Some(key)).unwrap();
+        let large_events = vec!["x".repeat(MAX_WELCOME_EVENT_BYTES); 5];
+        let first = PendingGroupCreation {
+            operation_description: "first-operation".into(),
+            group_id_hex: Some("ab".repeat(32)),
+            welcome_event_jsons: large_events.clone(),
+        };
+        outbox.save_pending_group_creation(first.clone()).unwrap();
+        let second = PendingGroupCreation {
+            operation_description: "second-operation".into(),
+            group_id_hex: Some("cd".repeat(32)),
+            welcome_event_jsons: large_events,
+        };
+
+        assert!(outbox.save_pending_group_creation(second).is_err());
+        assert_eq!(
+            outbox.pending_group_creation("first-operation"),
+            Some(first)
+        );
+        assert_eq!(outbox.pending_group_creation("second-operation"), None);
+        drop(outbox);
+
+        let reopened = PreRouteOutbox::open(Some(path), Some(key)).unwrap();
+        assert!(reopened.pending_group_creation("first-operation").is_some());
+        assert_eq!(reopened.pending_group_creation("second-operation"), None);
+    }
+
+    #[test]
+    fn discard_group_operation_removes_sentinel_and_recovery_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let key = [5u8; 32];
+        let mut outbox = PreRouteOutbox::open(Some(path.clone()), Some(key)).unwrap();
+        let mut sentinel = message("operation-sentinel");
+        sentinel.route_kind = GROUP_OPERATION_ROUTE_KIND.into();
+        sentinel.route_id = "pending-group-id".into();
+        sentinel.content.clear();
+        outbox.enqueue(sentinel).unwrap();
+        outbox
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: "operation-description".into(),
+                group_id_hex: None,
+                welcome_event_jsons: Vec::new(),
+            })
+            .unwrap();
+
+        outbox
+            .discard_pending_group_operation("pending-group-id", "operation-description")
+            .unwrap();
+        assert!(outbox.messages().is_empty());
+        assert_eq!(outbox.pending_group_creation("operation-description"), None);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn shared_instance_serializes_overlapping_nodes_without_lost_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let key = [9u8; 32];
+        let local_node = shared_pre_route_outbox(Some(path.clone()), Some(key)).unwrap();
+        let relay_node = shared_pre_route_outbox(Some(path.clone()), Some(key)).unwrap();
+        assert!(Arc::ptr_eq(&local_node, &relay_node));
+
+        local_node
+            .lock()
+            .unwrap()
+            .enqueue(message("local"))
+            .unwrap();
+        relay_node
+            .lock()
+            .unwrap()
+            .enqueue(message("relay"))
+            .unwrap();
+        drop(local_node);
+        drop(relay_node);
+
+        let reopened = PreRouteOutbox::open(Some(path), Some(key)).unwrap();
+        let ids: HashSet<_> = reopened
+            .messages()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        assert_eq!(ids, HashSet::from(["local".into(), "relay".into()]));
+    }
+
+    #[test]
+    fn shared_instance_rejects_an_overlapping_different_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let _open = shared_pre_route_outbox(Some(path.clone()), Some([1u8; 32])).unwrap();
+
+        assert!(shared_pre_route_outbox(Some(path), Some([2u8; 32])).is_err());
     }
 
     #[test]

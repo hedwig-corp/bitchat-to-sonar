@@ -1,7 +1,6 @@
 package chat.bitchat.sonar
 
 internal const val OUTBOX_MAX_PER_PEER = 100
-internal const val OUTBOX_TTL_SECS = 24 * 60 * 60L
 
 internal data class QueuedMessage(
     val content: String,
@@ -18,7 +17,6 @@ internal data class OutboxEnqueueResult(
 
 internal class SonarOutbox(
     private val maxPerPeer: Int = OUTBOX_MAX_PER_PEER,
-    private val ttlSecs: Long = OUTBOX_TTL_SECS,
 ) {
     private val queues = mutableMapOf<String, MutableList<QueuedMessage>>()
 
@@ -55,11 +53,8 @@ internal class SonarOutbox(
         }
     }
 
-    fun isExpired(message: QueuedMessage, nowSecs: Long): Boolean =
-        nowSecs - message.timestampSecs > ttlSecs
-
-    fun remainingAfterFailure(snapshot: List<QueuedMessage>, failedIndex: Int, nowSecs: Long): List<QueuedMessage> =
-        snapshot.drop(failedIndex).filterNot { isExpired(it, nowSecs) }
+    fun remainingAfterFailure(snapshot: List<QueuedMessage>, failedIndex: Int): List<QueuedMessage> =
+        snapshot.drop(failedIndex)
 
     fun finishFlush(peerId: String, snapshotSize: Int, remaining: List<QueuedMessage>) {
         val appended = queues[peerId].orEmpty().drop(snapshotSize)

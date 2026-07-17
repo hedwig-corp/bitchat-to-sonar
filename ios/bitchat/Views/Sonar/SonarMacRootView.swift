@@ -269,8 +269,9 @@ private struct SonarMacSidebar: View {
                         ForEach(store.marmot.pendingGroupInvites, id: \.id) { invite in
                             let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
                             MacPaletteRow(icon: .people, title: title, sub: "\(invite.memberCount) members · invite") {
-                                let id = store.acceptGroupInvite(invite)
-                                selection = .dm(id)
+                                if let id = store.acceptGroupInvite(invite) {
+                                    selection = .dm(id)
+                                }
                             }
                             .contextMenu {
                                 Button(role: .destructive) {

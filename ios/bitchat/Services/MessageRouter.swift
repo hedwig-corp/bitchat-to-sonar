@@ -1,12 +1,18 @@
 import BitLogger
 import Foundation
 
+enum PrivateMessageRoutingResult: Equatable {
+    case routed
+    case queued
+    case rejected
+}
+
 /// Routes messages using available transports (Mesh, Nostr, etc.)
 @MainActor
 final class MessageRouter {
     private let transports: [Transport]
 
-    // Outbox entry with timestamp for TTL-based eviction
+    // Outbox entry with timestamp for stable restore ordering.
     private struct QueuedMessage {
         let content: String
         let nickname: String
@@ -20,7 +26,6 @@ final class MessageRouter {
 
     // Outbox limits to prevent unbounded memory growth
     private static let maxMessagesPerPeer = 100
-    private static let messageTTLSeconds: TimeInterval = 24 * 60 * 60 // 24 hours
 
     init(transports: [Transport]) {
         self.transports = transports
@@ -92,31 +97,64 @@ final class MessageRouter {
         outbox[peerID] = queue
     }
 
-    func sendPrivate(_ content: String, to peerID: PeerID, recipientNickname: String, messageID: String) {
+    @discardableResult
+    func sendPrivate(
+        _ content: String,
+        to peerID: PeerID,
+        recipientNickname: String,
+        messageID: String
+    ) -> PrivateMessageRoutingResult {
+        if outbox[peerID]?.isEmpty == false {
+            let result = queuePrivate(
+                content,
+                to: peerID,
+                recipientNickname: recipientNickname,
+                messageID: messageID
+            )
+            // Drain the older durable backlog whenever possible even if this
+            // newest row was rejected by persistence.
+            flushOutbox(for: peerID)
+            return result
+        }
         if let transport = reachableTransport(for: peerID) {
             SecureLogger.debug("Routing PM via \(type(of: transport)) to \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
             transport.sendPrivateMessage(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
-        } else {
-            // Queue for later with timestamp for TTL tracking
-            if outbox[peerID] == nil { outbox[peerID] = [] }
-
-            let message = QueuedMessage(content: content, nickname: recipientNickname, messageID: messageID, timestamp: Date())
-            if let persistQueuedMessage,
-               persistQueuedMessage(peerID, content, recipientNickname, messageID, message.timestamp) == false {
-                SecureLogger.error("Could not durably queue PM for \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
-                return
-            }
-            outbox[peerID]?.append(message)
-
-            // Enforce per-peer size limit with FIFO eviction
-            if let count = outbox[peerID]?.count, count > Self.maxMessagesPerPeer {
-                let evicted = outbox[peerID]?.removeFirst()
-                if let id = evicted?.messageID { completeQueuedMessage?(id) }
-                SecureLogger.warning("📤 Outbox overflow for \(peerID.id.prefix(8))… - evicted oldest message: \(evicted?.messageID.prefix(8) ?? "?")…", category: .session)
-            }
-
-            SecureLogger.debug("Queued PM for \(peerID.id.prefix(8))… (no reachable transport) id=\(messageID.prefix(8))… queue=\(outbox[peerID]?.count ?? 0)", category: .session)
+            return .routed
         }
+        return queuePrivate(
+            content,
+            to: peerID,
+            recipientNickname: recipientNickname,
+            messageID: messageID
+        )
+    }
+
+    private func queuePrivate(
+        _ content: String,
+        to peerID: PeerID,
+        recipientNickname: String,
+        messageID: String
+    ) -> PrivateMessageRoutingResult {
+        // Queue for later with a timestamp for stable restore ordering.
+        let message = QueuedMessage(content: content, nickname: recipientNickname, messageID: messageID, timestamp: Date())
+        guard let persistQueuedMessage,
+              persistQueuedMessage(peerID, content, recipientNickname, messageID, message.timestamp)
+        else {
+            SecureLogger.error("Could not durably queue PM for \(peerID.id.prefix(8))… id=\(messageID.prefix(8))…", category: .session)
+            return .rejected
+        }
+        if outbox[peerID] == nil { outbox[peerID] = [] }
+        outbox[peerID]?.append(message)
+
+        // Enforce per-peer size limit with FIFO eviction
+        if let count = outbox[peerID]?.count, count > Self.maxMessagesPerPeer {
+            let evicted = outbox[peerID]?.removeFirst()
+            if let id = evicted?.messageID { completeQueuedMessage?(id) }
+            SecureLogger.warning("📤 Outbox overflow for \(peerID.id.prefix(8))… - evicted oldest message: \(evicted?.messageID.prefix(8) ?? "?")…", category: .session)
+        }
+
+        SecureLogger.debug("Queued PM for \(peerID.id.prefix(8))… (no reachable transport) id=\(messageID.prefix(8))… queue=\(outbox[peerID]?.count ?? 0)", category: .session)
+        return .queued
     }
 
     func sendReadReceipt(_ receipt: ReadReceipt, to peerID: PeerID) {
@@ -149,17 +187,9 @@ final class MessageRouter {
         guard let queued = outbox[peerID], !queued.isEmpty else { return }
         SecureLogger.debug("Flushing outbox for \(peerID.id.prefix(8))… count=\(queued.count)", category: .session)
 
-        let now = Date()
         var remaining: [QueuedMessage] = []
 
         for message in queued {
-            // Skip expired messages (TTL exceeded)
-            if now.timeIntervalSince(message.timestamp) > Self.messageTTLSeconds {
-                completeQueuedMessage?(message.messageID)
-                SecureLogger.debug("⏰ Expired queued message for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))… (age: \(Int(now.timeIntervalSince(message.timestamp)))s)", category: .session)
-                continue
-            }
-
             if let transport = reachableTransport(for: peerID) {
                 SecureLogger.debug("Outbox -> \(type(of: transport)) for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))…", category: .session)
                 transport.sendPrivateMessage(message.content, to: peerID, recipientNickname: message.nickname, messageID: message.messageID)
@@ -178,21 +208,6 @@ final class MessageRouter {
 
     func flushAllOutbox() {
         for key in Array(outbox.keys) { flushOutbox(for: key) }
-    }
-
-    /// Periodically clean up expired messages from all outboxes
-    func cleanupExpiredMessages() {
-        let now = Date()
-        for peerID in Array(outbox.keys) {
-            outbox[peerID]?.removeAll { message in
-                let expired = now.timeIntervalSince(message.timestamp) > Self.messageTTLSeconds
-                if expired { completeQueuedMessage?(message.messageID) }
-                return expired
-            }
-            if outbox[peerID]?.isEmpty == true {
-                outbox.removeValue(forKey: peerID)
-            }
-        }
     }
 
     func clearOutbox(completingDurable: Bool = true) {

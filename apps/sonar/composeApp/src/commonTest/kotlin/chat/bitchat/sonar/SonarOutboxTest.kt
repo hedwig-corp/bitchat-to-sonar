@@ -3,11 +3,12 @@ package chat.bitchat.sonar
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 
 class SonarOutboxTest {
     @Test
     fun enqueueEvictsOldestMessageWhenPeerQueueIsFull() {
-        val outbox = SonarOutbox(maxPerPeer = 3, ttlSecs = 100)
+        val outbox = SonarOutbox(maxPerPeer = 3)
 
         outbox.enqueue("peer-1", "one", "id-1", timestampSecs = 1)
         outbox.enqueue("peer-1", "two", "id-2", timestampSecs = 2)
@@ -20,24 +21,24 @@ class SonarOutboxTest {
     }
 
     @Test
-    fun failureKeepsFailedAndLaterUnexpiredMessagesQueued() {
-        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
-        outbox.enqueue("peer-1", "expired-before-failure", "id-1", timestampSecs = 50)
+    fun failureKeepsEveryLaterMessageQueuedRegardlessOfAge() {
+        val outbox = SonarOutbox(maxPerPeer = 10)
+        outbox.enqueue("peer-1", "old-before-failure", "id-1", timestampSecs = 50)
         outbox.enqueue("peer-1", "delivered", "id-2", timestampSecs = 120)
         outbox.enqueue("peer-1", "failed", "id-3", timestampSecs = 130)
         outbox.enqueue("peer-1", "later", "id-4", timestampSecs = 140)
-        outbox.enqueue("peer-1", "expired-after-failure", "id-5", timestampSecs = 80)
+        outbox.enqueue("peer-1", "old-after-failure", "id-5", timestampSecs = 80)
         val snapshot = outbox.snapshot("peer-1")
 
-        val remaining = outbox.remainingAfterFailure(snapshot, failedIndex = 2, nowSecs = 200)
+        val remaining = outbox.remainingAfterFailure(snapshot, failedIndex = 2)
         outbox.finishFlush("peer-1", snapshotSize = snapshot.size, remaining = remaining)
 
-        assertEquals(listOf("failed", "later"), outbox.snapshot("peer-1").map { it.content })
+        assertEquals(listOf("failed", "later", "old-after-failure"), outbox.snapshot("peer-1").map { it.content })
     }
 
     @Test
     fun successfulFlushClearsPeerQueue() {
-        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+        val outbox = SonarOutbox(maxPerPeer = 10)
         outbox.enqueue("peer-1", "one", "id-1", timestampSecs = 1)
         outbox.enqueue("peer-1", "two", "id-2", timestampSecs = 2)
         val snapshot = outbox.snapshot("peer-1")
@@ -49,7 +50,7 @@ class SonarOutboxTest {
 
     @Test
     fun finishFlushPreservesMessagesQueuedDuringInFlightFlush() {
-        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+        val outbox = SonarOutbox(maxPerPeer = 10)
         outbox.enqueue("peer-1", "one", "id-1", timestampSecs = 1)
         outbox.enqueue("peer-1", "two", "id-2", timestampSecs = 2)
         val snapshot = outbox.snapshot("peer-1")
@@ -62,7 +63,7 @@ class SonarOutboxTest {
 
     @Test
     fun restoreIsIdempotentAndReestablishesTimestampOrder() {
-        val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
+        val outbox = SonarOutbox(maxPerPeer = 10)
         val later = QueuedMessage("later", "peer-1", "id-2", timestampSecs = 20)
         val earlier = QueuedMessage("earlier", "peer-1", "id-1", timestampSecs = 10)
 
@@ -78,5 +79,24 @@ class SonarOutboxTest {
         val parts = listOf("group:name", "npub1peer", "Sarà 🚲")
 
         assertEquals(parts, decodePreRouteContext(encodePreRouteContext(parts)))
+    }
+
+    @Test
+    fun groupOperationSentinelRestoresRouteWithoutCreatingAnEmptyMessage() {
+        val create = preRouteGroupRestorePlan(
+            PRE_ROUTE_GROUP_OPERATION,
+            encodePreRouteContext(listOf("create", "Low signal", "npub1alice", "npub1bob")),
+        )
+
+        assertEquals("Low signal", create?.name)
+        assertEquals(listOf("npub1alice", "npub1bob"), create?.members)
+        assertEquals(false, create?.restoreMessage)
+        assertNull(create?.inviteId)
+
+        val queuedMessage = preRouteGroupRestorePlan(
+            PRE_ROUTE_GROUP_CREATE,
+            encodePreRouteContext(listOf("Low signal", "npub1alice", "npub1bob")),
+        )
+        assertEquals(true, queuedMessage?.restoreMessage)
     }
 }

@@ -637,6 +637,10 @@ expect object SonarCore {
     /** Checkpoint the concrete MLS group selected before replay. */
     fun resolvePreRouteMessage(id: String, groupId: String)
 
+    /** Delete a durable group setup, including any local marker group and the
+     *  operation checkpoint that would otherwise replay after restart. */
+    suspend fun discardPreRouteGroupOperation(operationId: String)
+
     suspend fun clearPreRouteMessages()
 
     /** Park up to [timeoutSecs] until the relay subscriptions push a live

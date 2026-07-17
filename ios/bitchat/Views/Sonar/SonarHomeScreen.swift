@@ -462,9 +462,10 @@ struct SonarHomeScreen: View {
                 .frame(maxWidth: .infinity)
             SNPrimaryButton(label: "Accept") {
                 let invite = invite
-                pendingInvite = nil
-                let id = store.acceptGroupInvite(invite)
-                store.push(.dm(id))
+                if let id = store.acceptGroupInvite(invite) {
+                    pendingInvite = nil
+                    store.push(.dm(id))
+                }
             }
             Button {
                 let invite = invite

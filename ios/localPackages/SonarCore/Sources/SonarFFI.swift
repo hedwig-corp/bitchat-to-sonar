@@ -1532,6 +1532,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func deleteGroup(groupIdHex: String) throws
 
     /**
+     * Cancel a pending host group operation and remove any local marker group,
+     * encrypted operation sentinel, and Welcome recovery checkpoint.
+     */
+    func discardPreRouteGroupOperation(operationId: String) throws
+
+    /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
     func drainDirectDms()  -> [DirectDmInfo]
@@ -2245,6 +2251,18 @@ open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConv
     uniffi_sonar_ffi_fn_method_sonarnode_delete_group(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),$0
+    )
+}
+}
+
+    /**
+     * Cancel a pending host group operation and remove any local marker group,
+     * encrypted operation sentinel, and Welcome recovery checkpoint.
+     */
+open func discardPreRouteGroupOperation(operationId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_discard_pre_route_group_operation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(operationId),$0
     )
 }
 }
@@ -7991,6 +8009,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_discard_pre_route_group_operation() != 1236) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_direct_dms() != 64423) {

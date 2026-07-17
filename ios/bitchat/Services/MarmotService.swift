@@ -536,6 +536,12 @@ final class MarmotService: @unchecked Sendable {
         try current.resolvePreRouteMessage(id: id, groupId: groupId)
     }
 
+    func discardPreRouteGroupOperation(operationId: String) async throws {
+        try await run {
+            try $0.requireNode().discardPreRouteGroupOperation(operationId: operationId)
+        }
+    }
+
     func clearPreRouteMessages() {
         nodeLock.lock()
         let current = node

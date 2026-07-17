@@ -571,6 +571,10 @@ actual object SonarCore {
         requireNode().resolvePreRouteMessage(id, groupId)
     }
 
+    actual suspend fun discardPreRouteGroupOperation(operationId: String) = withContext(Dispatchers.IO) {
+        requireNode().discardPreRouteGroupOperation(operationId)
+    }
+
     actual suspend fun clearPreRouteMessages() = withContext(Dispatchers.IO) {
         node?.clearPreRouteMessages()
         Unit

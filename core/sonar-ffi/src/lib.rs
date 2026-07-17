@@ -1076,6 +1076,14 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Cancel a pending host group operation and remove any local marker group,
+    /// encrypted operation sentinel, and Welcome recovery checkpoint.
+    pub fn discard_pre_route_group_operation(&self, operation_id: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.discard_pre_route_group_operation(&operation_id))?;
+        Ok(())
+    }
+
     /// Prefer catch-up for the open chat. Pass the MLS group id hex (same id
     /// hosts use for send_text / messages). Empty clears. Local-first: does not
     /// block paint or send. Core maps MLS to nostr group id for the catch-up queue.
