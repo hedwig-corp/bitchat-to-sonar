@@ -2419,6 +2419,401 @@ fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {
     }
 }
 
+// ── BLE mesh link engine ─────────────────────────────────────────────────────
+//
+// The platform-neutral link state machine (announce/identity, dial policy,
+// per-instance links, liveness, Noise lifecycle, pending sends, relay) lives
+// in `sonar_core::mesh_engine`. Platform drivers feed it radio events and
+// execute the returned commands; timestamps are MONOTONIC milliseconds
+// supplied by the driver (the engine reads no clocks).
+
+use sonar_core::mesh_engine;
+
+#[derive(uniffi::Enum)]
+pub enum MeshEngineCommand {
+    /// Open a GATT connection to `conn` (an opaque connection handle: Android
+    /// passes the address of the scanned device, iOS a peripheral UUID).
+    Dial { conn: String },
+    /// Tear down the CLIENT connection (close the outbound GATT). Must not
+    /// touch a server-role leg the same peer holds toward us.
+    Disconnect { conn: String },
+    /// Cancel the SERVER-role connection from an inbound central. Must not
+    /// touch a client GATT we hold toward the same address.
+    CancelServer { conn: String },
+    /// Re-run service discovery on an existing client connection (a lost
+    /// instance link has no other recovery while the connection lives).
+    RefreshInstances { conn: String },
+    /// Enable notifications on the mesh characteristic of service `instance`.
+    Subscribe { conn: String, instance: i32 },
+    /// Write one packet value to a client link, `after_ms` from now.
+    WriteLink {
+        conn: String,
+        instance: i32,
+        bytes: Vec<u8>,
+        after_ms: i64,
+    },
+    /// Notify one packet value to a subscribed central, `after_ms` from now.
+    NotifyConn {
+        conn: String,
+        bytes: Vec<u8>,
+        after_ms: i64,
+    },
+}
+
+#[derive(uniffi::Enum)]
+pub enum MeshEngineEvent {
+    PeerAnnounced {
+        fingerprint: String,
+        nickname: String,
+        peer_id_hex: String,
+        direct: bool,
+    },
+    SonarPayload {
+        fingerprint: String,
+        payload: Vec<u8>,
+    },
+    TextReceived {
+        fingerprint: String,
+        message_id: String,
+        content: String,
+    },
+    FileReceived {
+        fingerprint: String,
+        transfer_key: String,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        content: Vec<u8>,
+        timestamp_ms: i64,
+    },
+    BroadcastReceived {
+        fingerprint: String,
+        sender_id_hex: String,
+        content: String,
+        timestamp_ms: i64,
+    },
+    LinkEstablished {
+        fingerprint: String,
+    },
+}
+
+#[derive(uniffi::Record)]
+pub struct MeshEngineOutput {
+    pub commands: Vec<MeshEngineCommand>,
+    pub events: Vec<MeshEngineEvent>,
+}
+
+fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
+    MeshEngineOutput {
+        commands: out
+            .commands
+            .into_iter()
+            .map(|c| match c {
+                mesh_engine::Command::Dial { conn } => MeshEngineCommand::Dial { conn },
+                mesh_engine::Command::Disconnect { conn } => {
+                    MeshEngineCommand::Disconnect { conn }
+                }
+                mesh_engine::Command::CancelServer { conn } => {
+                    MeshEngineCommand::CancelServer { conn }
+                }
+                mesh_engine::Command::RefreshInstances { conn } => {
+                    MeshEngineCommand::RefreshInstances { conn }
+                }
+                mesh_engine::Command::Subscribe { conn, instance } => {
+                    MeshEngineCommand::Subscribe { conn, instance }
+                }
+                mesh_engine::Command::WriteLink {
+                    conn,
+                    instance,
+                    bytes,
+                    after_ms,
+                } => MeshEngineCommand::WriteLink {
+                    conn,
+                    instance,
+                    bytes,
+                    after_ms: after_ms as i64,
+                },
+                mesh_engine::Command::NotifyConn {
+                    conn,
+                    bytes,
+                    after_ms,
+                } => MeshEngineCommand::NotifyConn {
+                    conn,
+                    bytes,
+                    after_ms: after_ms as i64,
+                },
+            })
+            .collect(),
+        events: out
+            .events
+            .into_iter()
+            .map(|e| match e {
+                mesh_engine::AppEvent::PeerAnnounced {
+                    fingerprint,
+                    nickname,
+                    peer_id_hex,
+                    direct,
+                } => MeshEngineEvent::PeerAnnounced {
+                    fingerprint,
+                    nickname,
+                    peer_id_hex,
+                    direct,
+                },
+                mesh_engine::AppEvent::SonarPayload {
+                    fingerprint,
+                    payload,
+                } => MeshEngineEvent::SonarPayload {
+                    fingerprint,
+                    payload,
+                },
+                mesh_engine::AppEvent::TextReceived {
+                    fingerprint,
+                    message_id,
+                    content,
+                } => MeshEngineEvent::TextReceived {
+                    fingerprint,
+                    message_id,
+                    content,
+                },
+                mesh_engine::AppEvent::FileReceived {
+                    fingerprint,
+                    transfer_key,
+                    file_name,
+                    mime_type,
+                    content,
+                    timestamp_ms,
+                } => MeshEngineEvent::FileReceived {
+                    fingerprint,
+                    transfer_key,
+                    file_name,
+                    mime_type,
+                    content,
+                    timestamp_ms: timestamp_ms as i64,
+                },
+                mesh_engine::AppEvent::BroadcastReceived {
+                    fingerprint,
+                    sender_id_hex,
+                    content,
+                    timestamp_ms,
+                } => MeshEngineEvent::BroadcastReceived {
+                    fingerprint,
+                    sender_id_hex,
+                    content,
+                    timestamp_ms: timestamp_ms as i64,
+                },
+                mesh_engine::AppEvent::LinkEstablished { fingerprint } => {
+                    MeshEngineEvent::LinkEstablished { fingerprint }
+                }
+            })
+            .collect(),
+    }
+}
+
+fn ms(now_ms: i64) -> u64 {
+    now_ms.max(0) as u64
+}
+
+#[derive(uniffi::Object)]
+pub struct MeshLinkEngine {
+    inner: Mutex<mesh_engine::Engine>,
+}
+
+impl MeshLinkEngine {
+    fn lock(&self) -> std::sync::MutexGuard<'_, mesh_engine::Engine> {
+        self.inner.lock().expect("mesh engine lock not poisoned")
+    }
+}
+
+#[uniffi::export]
+impl MeshLinkEngine {
+    /// `noise_private_hex`/`noise_public_hex` are the account's static Noise
+    /// keypair; `ed25519_seed_hex` the announce-signing seed.
+    #[uniffi::constructor]
+    pub fn new(
+        noise_private_hex: String,
+        noise_public_hex: String,
+        ed25519_seed_hex: String,
+        nickname: String,
+    ) -> FfiResult<Arc<Self>> {
+        let sk = hex::decode(&noise_private_hex).map_err(invalid("noise private key"))?;
+        let seed = hex::decode(&ed25519_seed_hex).map_err(invalid("mesh seed"))?;
+        let sk: [u8; 32] = sk
+            .try_into()
+            .map_err(|_| SonarFfiError::InvalidInput("noise private key must be 32 bytes".into()))?;
+        let seed: [u8; 32] = seed
+            .try_into()
+            .map_err(|_| SonarFfiError::InvalidInput("mesh seed must be 32 bytes".into()))?;
+        let engine = mesh_engine::Engine::new(sk, noise_public_hex, seed, nickname)
+            .ok_or_else(|| SonarFfiError::InvalidInput("invalid noise public key".into()))?;
+        Ok(Arc::new(Self {
+            inner: Mutex::new(engine),
+        }))
+    }
+
+    pub fn my_peer_id_hex(&self) -> String {
+        self.lock().my_peer_id_hex().to_string()
+    }
+
+    pub fn should_dial_first(&self, peer_node_id: Vec<u8>) -> bool {
+        self.lock().should_dial_first(&peer_node_id)
+    }
+
+    pub fn is_linked_conn(&self, conn: String) -> bool {
+        self.lock().is_linked_conn(&conn)
+    }
+
+    pub fn has_link(&self, fingerprint: String) -> bool {
+        self.lock().has_link(&fingerprint)
+    }
+
+    pub fn connected_count(&self) -> u32 {
+        self.lock().connected_count() as u32
+    }
+
+    pub fn on_dial_request(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_dial_request(&conn, ms(now_ms)))
+    }
+
+    pub fn on_client_connected(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_client_connected(&conn, ms(now_ms)))
+    }
+
+    pub fn on_client_connect_failed(&self, conn: String) -> MeshEngineOutput {
+        engine_output(self.lock().on_client_connect_failed(&conn))
+    }
+
+    pub fn on_client_disconnected(&self, conn: String) -> MeshEngineOutput {
+        engine_output(self.lock().on_client_disconnected(&conn))
+    }
+
+    pub fn on_dial_deadline(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_dial_deadline(&conn, ms(now_ms)))
+    }
+
+    pub fn on_instances_discovered(
+        &self,
+        conn: String,
+        instances: Vec<i32>,
+        now_ms: i64,
+    ) -> MeshEngineOutput {
+        engine_output(self.lock().on_instances_discovered(&conn, &instances, ms(now_ms)))
+    }
+
+    pub fn on_subscribe_result(
+        &self,
+        conn: String,
+        instance: i32,
+        subscribed: bool,
+        now_ms: i64,
+    ) -> MeshEngineOutput {
+        engine_output(
+            self.lock()
+                .on_subscribe_result(&conn, instance, subscribed, ms(now_ms)),
+        )
+    }
+
+    pub fn on_client_rx(
+        &self,
+        conn: String,
+        instance: i32,
+        bytes: Vec<u8>,
+        now_ms: i64,
+    ) -> MeshEngineOutput {
+        engine_output(self.lock().on_client_rx(&conn, instance, &bytes, ms(now_ms)))
+    }
+
+    pub fn on_server_connected(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_server_connected(&conn, ms(now_ms)))
+    }
+
+    pub fn on_server_disconnected(&self, conn: String) -> MeshEngineOutput {
+        engine_output(self.lock().on_server_disconnected(&conn))
+    }
+
+    pub fn on_server_subscribed(&self, conn: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_server_subscribed(&conn, ms(now_ms)))
+    }
+
+    pub fn on_server_rx(&self, conn: String, bytes: Vec<u8>, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_server_rx(&conn, &bytes, ms(now_ms)))
+    }
+
+    pub fn on_tick(&self, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().on_tick(ms(now_ms)))
+    }
+
+    /// Sync the wall clock: wire timestamps are wall-clock ms while every
+    /// deadline uses the monotonic `now_ms`. Call at start and on each tick.
+    pub fn set_wall_clock(&self, now_ms: i64, wall_ms: i64) {
+        self.lock().set_wall_clock(ms(now_ms), ms(wall_ms));
+    }
+
+    /// None = the peer is rejected by the known-only policy. Queues when no
+    /// live route exists (flushed on the next establish).
+    pub fn send_text(
+        &self,
+        fingerprint: String,
+        message_id: String,
+        text: String,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        self.lock()
+            .send_text(&fingerprint, &message_id, &text, ms(now_ms))
+            .map(engine_output)
+    }
+
+    /// None = no live route right now (never queues).
+    pub fn send_text_now(
+        &self,
+        fingerprint: String,
+        message_id: String,
+        text: String,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        self.lock()
+            .send_text_now(&fingerprint, &message_id, &text, ms(now_ms))
+            .map(engine_output)
+    }
+
+    /// None = no live route / oversized (never queues).
+    pub fn send_file(
+        &self,
+        fingerprint: String,
+        content: Vec<u8>,
+        file_name: String,
+        mime_type: String,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        self.lock()
+            .send_file(&fingerprint, &content, &file_name, &mime_type, ms(now_ms))
+            .map(engine_output)
+    }
+
+    /// None = nothing connected.
+    pub fn broadcast(&self, text: String, now_ms: i64) -> Option<MeshEngineOutput> {
+        self.lock().broadcast(&text, ms(now_ms)).map(engine_output)
+    }
+
+    pub fn set_nickname(&self, nickname: String, now_ms: i64) -> MeshEngineOutput {
+        engine_output(self.lock().set_nickname(&nickname, ms(now_ms)))
+    }
+
+    pub fn set_sonar_payload(
+        &self,
+        payload: Option<Vec<u8>>,
+        now_ms: i64,
+    ) -> MeshEngineOutput {
+        engine_output(self.lock().set_sonar_payload(payload, ms(now_ms)))
+    }
+
+    pub fn set_allowlist(&self, allowed: Option<Vec<String>>) -> MeshEngineOutput {
+        engine_output(self.lock().set_allowlist(allowed))
+    }
+
+    pub fn reset(&self) {
+        self.lock().reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

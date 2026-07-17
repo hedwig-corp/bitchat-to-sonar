@@ -13,6 +13,7 @@ pub mod identity;
 pub mod invite_link;
 pub mod marmot;
 pub mod mesh;
+pub mod mesh_engine;
 pub mod noise;
 pub mod notification;
 pub mod outbox;

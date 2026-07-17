@@ -1,0 +1,2328 @@
+//! Platform-neutral BLE mesh link state machine.
+//!
+//! Every platform used to re-implement the same orchestration around the mesh
+//! protocol — announce/identity handling, dial policy, per-instance links,
+//! liveness, Noise session lifecycle, pending sends, relay — and every bug had
+//! to be found and fixed once per platform (see PR #291: zombie links, the
+//! multi-service-instance lottery, write-queue races). This module owns that
+//! machine once, deterministically:
+//!
+//! ```text
+//! driver event ──▶ Engine::on_*(…, now_ms) ──▶ Output {
+//!     commands: what the driver must do to the radio,
+//!     events:   what the app layer must be told,
+//! }
+//! ```
+//!
+//! The engine performs no I/O and reads no clocks — `now_ms` (a MONOTONIC
+//! timestamp; wall-clock would cull every link on an NTP jump) comes in with
+//! every call, so every scenario is unit-testable, including process-freeze
+//! recovery. Platform drivers stay thin: radio access (scan/advertise/GATT),
+//! platform flow control (e.g. Android's one-outstanding-GATT-op queue and its
+//! stuck-op recovery), permissions/background modes, and scheduling of the
+//! `after_ms` command delays.
+//!
+//! Links are keyed by `(connection handle, service instance)`: one remote
+//! device can expose SEVERAL instances of the mesh service behind one address
+//! (a Mac running Sonar.app and the bitchat iOS-wrapper registers it twice in
+//! the shared GATT database), and two apps on one controller can never hear
+//! each other over the air — each instance is a distinct peer app. The handle
+//! is opaque (Android: MAC address; iOS: CBPeripheral UUID — iOS never exposes
+//! MAC addresses).
+
+use std::collections::{HashMap, HashSet};
+
+use sha2::{Digest, Sha256};
+
+use crate::mesh::{self, msg_type, noise_payload};
+use crate::noise::{NoiseHandshake, NoiseSession};
+
+// ── Wire/behavior constants ──
+// These values are load-bearing: they are the on-device-proven behavior from
+// the Kotlin implementation (announce cadence interop with iOS, Android GATT
+// MTU realities, bitchat compatibility). Do not tune casually.
+pub const DEFAULT_TTL: u8 = 7;
+pub const MAX_CLIENTS: usize = 4;
+pub const CONNECT_ESTABLISH_MS: u64 = 5_000;
+pub const ANNOUNCE_TIMEOUT_MS: u64 = 6_000;
+pub const REDIAL_BACKOFF_MS: u64 = 30_000;
+pub const HANDSHAKE_RETRY_MS: u64 = 8_000;
+/// A healthy link carries rx at least every ~30s (our heartbeat plus iOS's
+/// 15–38s connected announce cadence): 90s of silence means the link is dead
+/// even though no disconnect callback ever fired (Pixel 10 stack).
+pub const LINK_STALE_MS: u64 = 90_000;
+pub const TICK_MS: u64 = 15_000;
+pub const HEARTBEAT_MS: u64 = 30_000;
+/// A tick arriving later than this means OUR process was frozen/dozed while
+/// the monotonic clock ran on — re-seed instead of culling for our downtime.
+pub const SWEEP_RESUME_GAP_MS: u64 = TICK_MS * 3;
+pub const MAX_SINGLE_GATT_PACKET_BYTES: usize = 480;
+pub const FRAGMENT_CHUNK_SIZE: usize = 350;
+pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
+pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
+const MAX_PENDING_SONAR: usize = 128;
+const SEEN_CAP: usize = 1024;
+const MAX_PENDING_SENDS_PER_PEER: usize = 64;
+/// Minimum spacing between instance re-discoveries on one connection.
+const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
+/// Soft cap on the identity maps (signing key / fingerprint per sender id):
+/// sender ids rotate and can be attacker-minted, so an unbounded map is a
+/// slow leak. Clearing wholesale is safe — entries repopulate from the next
+/// verified announce.
+const IDENTITY_MAP_CAP: usize = 4096;
+/// Server discovery burst: the first notification pair is easy to lose during
+/// role setup, so announce three times with these delays after a subscribe.
+const DISCOVERY_BURST_DELAYS_MS: [u64; 3] = [0, 350, 1_200];
+/// Stagger the 0x53 behind the announce so back-to-back writes don't collide.
+const SONAR_STAGGER_MS: u64 = 150;
+
+/// One client link: a peer APP on a connection (`conn`, opaque handle) at a
+/// mesh service `instance`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LinkId {
+    pub conn: String,
+    pub instance: i32,
+}
+
+/// What the driver must do to the radio. `after_ms` delays are scheduled by
+/// the driver (the engine has no timers).
+#[derive(Debug)]
+pub enum Command {
+    Dial { conn: String },
+    /// Tear down the CLIENT connection (close the outbound GATT). Must not
+    /// touch a server-role leg the same peer holds toward us.
+    Disconnect { conn: String },
+    /// Cancel the SERVER-role connection from an inbound central. Must not
+    /// touch a client GATT we hold toward the same address.
+    CancelServer { conn: String },
+    /// Re-run service discovery on an existing client connection. Emitted when
+    /// a server-leg Direct announce proves a peer app is alive behind a client
+    /// connection that has no instance link for it (e.g. its CCC subscribe
+    /// failed and the dead link was culled) — without this, a lost instance
+    /// has no recovery path until the whole connection drops.
+    RefreshInstances { conn: String },
+    Subscribe { conn: String, instance: i32 },
+    WriteLink { conn: String, instance: i32, bytes: Vec<u8>, after_ms: u64 },
+    NotifyConn { conn: String, bytes: Vec<u8>, after_ms: u64 },
+}
+
+/// What the app layer must be told (the old `MeshGatt` listener surface).
+/// `fingerprint` is the peer's STABLE identity (SHA-256 of its Noise static
+/// key) so conversations survive peerID and address rotation.
+#[derive(Debug, Clone)]
+pub enum AppEvent {
+    PeerAnnounced {
+        fingerprint: String,
+        nickname: String,
+        peer_id_hex: String,
+        direct: bool,
+    },
+    SonarPayload {
+        fingerprint: String,
+        payload: Vec<u8>,
+    },
+    TextReceived {
+        fingerprint: String,
+        message_id: String,
+        content: String,
+    },
+    FileReceived {
+        fingerprint: String,
+        transfer_key: String,
+        file_name: Option<String>,
+        mime_type: Option<String>,
+        content: Vec<u8>,
+        timestamp_ms: u64,
+    },
+    BroadcastReceived {
+        fingerprint: String,
+        /// The 8-byte packet sender id (hex) — distinct from the fingerprint
+        /// fallback so listeners get honest wire metadata.
+        sender_id_hex: String,
+        content: String,
+        timestamp_ms: u64,
+    },
+    LinkEstablished {
+        fingerprint: String,
+    },
+}
+
+#[derive(Debug, Default)]
+pub struct Output {
+    pub commands: Vec<Command>,
+    pub events: Vec<AppEvent>,
+}
+
+impl Output {
+    fn merge(&mut self, other: Output) {
+        self.commands.extend(other.commands);
+        self.events.extend(other.events);
+    }
+}
+
+enum NoiseState {
+    Handshake { hs: NoiseHandshake, started_ms: u64 },
+    Session(NoiseSession),
+}
+
+impl NoiseState {
+    fn established(&self) -> bool {
+        matches!(self, NoiseState::Session(_))
+    }
+}
+
+#[derive(Default)]
+struct PeerBinding {
+    peer_id_hex: Option<String>,
+    fingerprint: Option<String>,
+}
+
+struct ClientLink {
+    bind: PeerBinding,
+    noise: Option<NoiseState>,
+    last_rx_ms: u64,
+    subscribed: bool,
+}
+
+struct ServerConn {
+    bind: PeerBinding,
+    noise: Option<NoiseState>,
+    last_rx_ms: u64,
+}
+
+struct DialState {
+    started_ms: u64,
+    connected: bool,
+}
+
+enum Origin {
+    Client(LinkId),
+    Server(String),
+}
+
+pub struct Engine {
+    // Identity (never changes for the engine's lifetime).
+    noise_private: [u8; 32],
+    noise_public_hex: String,
+    signer: mesh::MeshSigner,
+    my_peer_id: [u8; 8],
+    my_peer_id_hex: String,
+    nickname: String,
+    sonar_payload: Option<Vec<u8>>,
+    /// Known-only discovery: lowercase fingerprints allowed, None = everyone.
+    allowlist: Option<HashSet<String>>,
+
+    links: HashMap<LinkId, ClientLink>,
+    server_conns: HashMap<String, ServerConn>,
+    /// In-flight dials (from Dial until the first Direct announce answers).
+    dialing: HashMap<String, DialState>,
+    /// Client connections that reached GATT-connected.
+    connected: HashSet<String>,
+    recent_dials: HashMap<String, u64>,
+
+    /// Once a sender ID has established an Ed25519 signing key, later announces
+    /// must not replace it (reinstall rotates the sender ID too, so an in-place
+    /// signing-key change is an impersonation).
+    signing_key_by_peer: HashMap<String, String>,
+    fingerprint_by_peer: HashMap<String, String>,
+    /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
+    pending_sonar: HashMap<String, Vec<u8>>,
+    /// DMs queued for a peer with no live link, flushed on (re)establish.
+    pending_sends: HashMap<String, Vec<(String, String)>>,
+    seen_broadcasts: HashSet<String>,
+    seen_files: HashSet<String>,
+    reassembler: mesh::fragment::Reassembler,
+
+    last_heartbeat_ms: u64,
+    last_tick_ms: u64,
+    /// Last instance re-discovery per connection (see `RefreshInstances`).
+    last_refresh_ms: HashMap<String, u64>,
+    /// Wire timestamps are WALL-clock milliseconds (bitchat protocol), while
+    /// every deadline/liveness decision uses the monotonic `now_ms` — a wall
+    /// clock would cull links on an NTP jump, and a monotonic clock on the
+    /// wire would hand peers uptime-scale timestamps. The driver syncs this
+    /// offset (wall − monotonic) at start and on every tick.
+    wall_minus_mono_ms: i64,
+    /// Monotonic per-send counter mixed into fragment ids so two fragmented
+    /// sends in the same millisecond cannot collide.
+    fragment_seq: u64,
+}
+
+impl Engine {
+    /// `noise_public_hex` is the static public key matching `noise_private`
+    /// (the platform key store holds both; deriving X25519 public keys is not
+    /// this module's business).
+    pub fn new(
+        noise_private: [u8; 32],
+        noise_public_hex: String,
+        ed25519_seed: [u8; 32],
+        nickname: String,
+    ) -> Option<Self> {
+        let noise_public = hex::decode(&noise_public_hex).ok()?;
+        if noise_public.len() != 32 {
+            return None;
+        }
+        let my_peer_id_hex = mesh::peer_id_from_noise_key(&noise_public);
+        let mut my_peer_id = [0u8; 8];
+        hex::decode_to_slice(&my_peer_id_hex, &mut my_peer_id).ok()?;
+        Some(Self {
+            noise_private,
+            noise_public_hex,
+            signer: mesh::MeshSigner::from_seed(&ed25519_seed),
+            my_peer_id,
+            my_peer_id_hex,
+            nickname,
+            sonar_payload: None,
+            allowlist: None,
+            links: HashMap::new(),
+            server_conns: HashMap::new(),
+            dialing: HashMap::new(),
+            connected: HashSet::new(),
+            recent_dials: HashMap::new(),
+            signing_key_by_peer: HashMap::new(),
+            fingerprint_by_peer: HashMap::new(),
+            pending_sonar: HashMap::new(),
+            pending_sends: HashMap::new(),
+            seen_broadcasts: HashSet::new(),
+            seen_files: HashSet::new(),
+            reassembler: mesh::fragment::Reassembler::new(),
+            last_heartbeat_ms: 0,
+            last_tick_ms: 0,
+            last_refresh_ms: HashMap::new(),
+            wall_minus_mono_ms: 0,
+            fragment_seq: 0,
+        })
+    }
+
+    pub fn my_peer_id_hex(&self) -> &str {
+        &self.my_peer_id_hex
+    }
+
+    /// Sync the wall clock (driver-supplied, at start and each tick). Wire
+    /// timestamps are accurate to within one tick of NTP drift, which is all
+    /// the protocol needs (peers stamp their own packets).
+    pub fn set_wall_clock(&mut self, now_ms: u64, wall_ms: u64) {
+        self.wall_minus_mono_ms = wall_ms as i64 - now_ms as i64;
+    }
+
+    /// The wall-clock time to stamp into a wire packet built "now".
+    fn wall(&self, now_ms: u64) -> u64 {
+        (now_ms as i64 + self.wall_minus_mono_ms).max(0) as u64
+    }
+
+    /// Dialer election between two node-id-advertising Sonar-Androids: the
+    /// lexicographically SMALLER id dials first (the larger follows after a
+    /// head-start delay, driver-scheduled). Peers with no node id (iOS / stock
+    /// bitchat) are dialed immediately by the caller.
+    pub fn should_dial_first(&self, peer_node_id: &[u8]) -> bool {
+        let mine = &self.my_peer_id[..];
+        let n = mine.len().min(peer_node_id.len());
+        for i in 0..n {
+            if mine[i] != peer_node_id[i] {
+                return mine[i] < peer_node_id[i];
+            }
+        }
+        mine.len() < peer_node_id.len()
+    }
+
+    /// True iff `conn` is currently linked (dialed, dialing, or accepted as a
+    /// server) — the scanner uses this to gate recovery re-dials.
+    pub fn is_linked_conn(&self, conn: &str) -> bool {
+        self.connected.contains(conn)
+            || self.dialing.contains_key(conn)
+            || self.server_conns.contains_key(conn)
+    }
+
+    /// True iff there is an established, writable Noise route to `fingerprint`.
+    pub fn has_link(&self, fingerprint: &str) -> bool {
+        self.sendable_route(fingerprint).is_some()
+    }
+
+    /// Peer-app count currently reachable with a broadcast.
+    pub fn connected_count(&self) -> usize {
+        let links = self
+            .links
+            .iter()
+            .filter(|(_, l)| self.bind_allowed(&l.bind))
+            .count();
+        let servers = self
+            .server_conns
+            .values()
+            .filter(|s| self.bind_allowed(&s.bind))
+            .count();
+        links + servers
+    }
+
+    // ── Dial policy ──
+
+    /// The driver asks to dial a scan-result connection. Gated on dedup,
+    /// redial backoff, and the concurrent-client cap (BLE MAC rotation makes
+    /// one device a stream of fresh handles; dialing each floods the radio).
+    pub fn on_dial_request(&mut self, conn: &str, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        if self.connected.contains(conn) || self.dialing.contains_key(conn) {
+            return out;
+        }
+        if let Some(t) = self.recent_dials.get(conn) {
+            if now_ms.saturating_sub(*t) < REDIAL_BACKOFF_MS {
+                return out;
+            }
+        }
+        let open = self.connected.len()
+            + self
+                .dialing
+                .keys()
+                .filter(|c| !self.connected.contains(*c))
+                .count();
+        if open >= MAX_CLIENTS {
+            return out;
+        }
+        self.recent_dials.insert(conn.to_string(), now_ms);
+        if self.recent_dials.len() > 256 {
+            self.recent_dials
+                .retain(|_, t| now_ms.saturating_sub(*t) <= REDIAL_BACKOFF_MS);
+        }
+        self.dialing.insert(
+            conn.to_string(),
+            DialState {
+                started_ms: now_ms,
+                connected: false,
+            },
+        );
+        out.commands.push(Command::Dial {
+            conn: conn.to_string(),
+        });
+        out
+    }
+
+    pub fn on_client_connected(&mut self, conn: &str, now_ms: u64) -> Output {
+        let _ = now_ms;
+        if let Some(d) = self.dialing.get_mut(conn) {
+            d.connected = true;
+        }
+        self.connected.insert(conn.to_string());
+        Output::default()
+    }
+
+    /// Driver-scheduled deadline check (at CONNECT_ESTABLISH_MS and again at
+    /// CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS after each dial). Fail fast:
+    /// a rotated-away address often hangs with no callback at all, and a
+    /// connection that never produces an announce is not a mesh peer.
+    pub fn on_dial_deadline(&mut self, conn: &str, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        let Some(d) = self.dialing.get(conn) else {
+            return out;
+        };
+        let age = now_ms.saturating_sub(d.started_ms);
+        let dead_unconnected = !d.connected && age >= CONNECT_ESTABLISH_MS;
+        let dead_unannounced = age >= CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS;
+        if dead_unconnected || dead_unannounced {
+            self.cleanup_client_conn(conn);
+            out.commands.push(Command::Disconnect {
+                conn: conn.to_string(),
+            });
+        }
+        out
+    }
+
+    /// A failed connect (transient 133, dial-race 19, …) is frequently
+    /// retryable — clear the backoff so the next scan hit can re-dial at once.
+    pub fn on_client_connect_failed(&mut self, conn: &str) -> Output {
+        self.recent_dials.remove(conn);
+        self.cleanup_client_conn(conn);
+        Output::default()
+    }
+
+    pub fn on_client_disconnected(&mut self, conn: &str) -> Output {
+        self.cleanup_client_conn(conn);
+        Output::default()
+    }
+
+    pub fn on_instances_discovered(
+        &mut self,
+        conn: &str,
+        instances: &[i32],
+        now_ms: u64,
+    ) -> Output {
+        let mut out = Output::default();
+        for &instance in instances {
+            let id = LinkId {
+                conn: conn.to_string(),
+                instance,
+            };
+            self.links.entry(id).or_insert(ClientLink {
+                bind: PeerBinding::default(),
+                noise: None,
+                last_rx_ms: now_ms,
+                subscribed: false,
+            });
+            out.commands.push(Command::Subscribe {
+                conn: conn.to_string(),
+                instance,
+            });
+        }
+        out
+    }
+
+    /// CCC write completed (`subscribed=false` = the instance has no CCC: we
+    /// can't receive its notifies but can still write our announce to it).
+    pub fn on_subscribe_result(
+        &mut self,
+        conn: &str,
+        instance: i32,
+        subscribed: bool,
+        now_ms: u64,
+    ) -> Output {
+        let mut out = Output::default();
+        let id = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+        let Some(link) = self.links.get_mut(&id) else {
+            // Dropped (policy) while the CCC write was in flight — don't
+            // announce ourselves to it.
+            return out;
+        };
+        link.subscribed = subscribed;
+        link.last_rx_ms = now_ms;
+        if let Some(ann) = self.announce_bytes(now_ms) {
+            out.commands.push(Command::WriteLink {
+                conn: conn.to_string(),
+                instance,
+                bytes: ann,
+                after_ms: 0,
+            });
+        }
+        if subscribed {
+            if let Some(p) = self.sonar_bytes(now_ms) {
+                out.commands.push(Command::WriteLink {
+                    conn: conn.to_string(),
+                    instance,
+                    bytes: p,
+                    after_ms: SONAR_STAGGER_MS,
+                });
+            }
+        }
+        out
+    }
+
+    // ── Server role ──
+
+    pub fn on_server_connected(&mut self, conn: &str, now_ms: u64) -> Output {
+        self.server_conns.insert(
+            conn.to_string(),
+            ServerConn {
+                bind: PeerBinding::default(),
+                noise: None,
+                last_rx_ms: now_ms,
+            },
+        );
+        Output::default()
+    }
+
+    pub fn on_server_disconnected(&mut self, conn: &str) -> Output {
+        self.server_conns.remove(conn);
+        Output::default()
+    }
+
+    /// The central subscribed → send the discovery burst (the first pair of
+    /// notifications is easy to lose during role setup, so repeat it).
+    pub fn on_server_subscribed(&mut self, conn: &str, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        self.server_conns
+            .entry(conn.to_string())
+            .or_insert(ServerConn {
+                bind: PeerBinding::default(),
+                noise: None,
+                last_rx_ms: now_ms,
+            });
+        for delay in DISCOVERY_BURST_DELAYS_MS {
+            if let Some(ann) = self.announce_bytes(now_ms) {
+                out.commands.push(Command::NotifyConn {
+                    conn: conn.to_string(),
+                    bytes: ann,
+                    after_ms: delay,
+                });
+            }
+            if let Some(p) = self.sonar_bytes(now_ms) {
+                out.commands.push(Command::NotifyConn {
+                    conn: conn.to_string(),
+                    bytes: p,
+                    after_ms: delay + SONAR_STAGGER_MS,
+                });
+            }
+        }
+        out
+    }
+
+    // ── Receive ──
+
+    pub fn on_client_rx(
+        &mut self,
+        conn: &str,
+        instance: i32,
+        bytes: &[u8],
+        now_ms: u64,
+    ) -> Output {
+        let id = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+        if let Some(l) = self.links.get_mut(&id) {
+            l.last_rx_ms = now_ms;
+        }
+        self.handle_packet(Origin::Client(id), bytes, now_ms)
+    }
+
+    pub fn on_server_rx(&mut self, conn: &str, bytes: &[u8], now_ms: u64) -> Output {
+        let entry = self
+            .server_conns
+            .entry(conn.to_string())
+            .or_insert(ServerConn {
+                bind: PeerBinding::default(),
+                noise: None,
+                last_rx_ms: now_ms,
+            });
+        entry.last_rx_ms = now_ms;
+        self.handle_packet(Origin::Server(conn.to_string()), bytes, now_ms)
+    }
+
+    // ── Tick: heartbeat + liveness ──
+
+    pub fn on_tick(&mut self, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        let gap = if self.last_tick_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(self.last_tick_ms)
+        };
+        let resumed_from_gap = self.last_tick_ms != 0 && gap >= SWEEP_RESUME_GAP_MS;
+        self.last_tick_ms = now_ms;
+
+        if (!self.links.is_empty() || !self.server_conns.is_empty())
+            && now_ms.saturating_sub(self.last_heartbeat_ms) >= HEARTBEAT_MS
+        {
+            self.last_heartbeat_ms = now_ms;
+            out.merge(self.discovery_broadcast(now_ms));
+        }
+
+        if resumed_from_gap {
+            // Our process was frozen/dozed: silence measured across that gap
+            // is OUR downtime, not the peer's. Re-seed every window and judge
+            // on the next tick.
+            for l in self.links.values_mut() {
+                l.last_rx_ms = now_ms;
+            }
+            for s in self.server_conns.values_mut() {
+                s.last_rx_ms = now_ms;
+            }
+            return out;
+        }
+
+        // Cull zombie links the stack never reported as disconnected: a stale
+        // entry would gate off every re-dial (`is_linked_conn`) and a
+        // static-address peer (a Mac) would stay undetectable forever. A dead
+        // instance culls itself while a chatty sibling keeps the connection.
+        let stale_links: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| now_ms.saturating_sub(l.last_rx_ms) >= LINK_STALE_MS)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale_links {
+            self.recent_dials.remove(&id.conn); // allow an immediate re-dial
+            out.merge(self.drop_client_link(&id));
+        }
+        let stale_servers: Vec<String> = self
+            .server_conns
+            .iter()
+            .filter(|(_, s)| now_ms.saturating_sub(s.last_rx_ms) >= LINK_STALE_MS)
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in stale_servers {
+            self.recent_dials.remove(&conn); // let us dial the peer back
+            self.server_conns.remove(&conn);
+            out.commands.push(Command::CancelServer { conn });
+        }
+
+        // Keep the refresh-cooldown map from growing across rotating handles.
+        self.last_refresh_ms
+            .retain(|_, t| now_ms.saturating_sub(*t) < REFRESH_INSTANCES_COOLDOWN_MS);
+
+        // Backstop for dial deadlines the driver failed to schedule.
+        let expired: Vec<String> = self
+            .dialing
+            .iter()
+            .filter(|(_, d)| {
+                now_ms.saturating_sub(d.started_ms)
+                    >= CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS
+            })
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in expired {
+            self.cleanup_client_conn(&conn);
+            out.commands.push(Command::Disconnect { conn });
+        }
+        out
+    }
+
+    // ── App-facing sends ──
+
+    /// Send a DM by stable fingerprint. Sends over a live Noise route, else
+    /// QUEUES it (mesh links are intermittent; the flush happens on
+    /// re-establish). Returns None when policy rejects the peer.
+    pub fn send_text(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint) {
+            return None;
+        }
+        let mut out = Output::default();
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+            let q = self.pending_sends.entry(fingerprint.to_string()).or_default();
+            // Bound the queue: a peer that never comes back must not grow it
+            // forever. Oldest messages drop first (they'd be the stalest).
+            if q.len() >= MAX_PENDING_SENDS_PER_PEER {
+                q.remove(0);
+            }
+            q.push((message_id.to_string(), text.to_string()));
+        }
+        Some(out)
+    }
+
+    /// Immediate send for real-time controls; never queues. Refreshes our
+    /// discovery on the route first (pre-control), like the Kotlin path.
+    pub fn send_text_now(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        text: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint) {
+            return None;
+        }
+        let route = self.sendable_route(fingerprint)?;
+        let mut out = self.discovery_to_route(&route, now_ms);
+        if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Private file transfer over a live route. Never queued: a large stale
+    /// transfer after a reconnect is worse than an immediate route failure.
+    pub fn send_file(
+        &mut self,
+        fingerprint: &str,
+        content: &[u8],
+        file_name: &str,
+        mime_type: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint) || content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
+            return None;
+        }
+        let route = self.sendable_route(fingerprint)?;
+        let peer_id_hex = self.route_peer_id(&route)?;
+        let peer_id = parse_id8(&peer_id_hex)?;
+        let payload = mesh::file_packet::FilePacket {
+            file_name: Some(file_name.to_string()),
+            file_size: Some(content.len() as u64),
+            mime_type: Some(mime_type.to_string()),
+            content: content.to_vec(),
+        }
+        .encode()?;
+        let mut packet = mesh::Packet::new(msg_type::FILE_TRANSFER, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
+        packet.recipient_id = Some(peer_id);
+        packet.payload = payload;
+        if packet.payload.len() > MAX_V1_FILE_PAYLOAD_BYTES {
+            packet.version = 2;
+        }
+        if !mesh::sign_packet(&mut packet, &self.signer) {
+            return None;
+        }
+        let bytes = packet.encode()?;
+        let mut out = self.discovery_to_route(&route, now_ms);
+        self.write_maybe_fragmented(&route, bytes, msg_type::FILE_TRANSFER, now_ms, &mut out);
+        Some(out)
+    }
+
+    /// PUBLIC broadcast (the BLE "Mesh" channel) to every connected peer app.
+    /// Returns None when nothing is connected.
+    pub fn broadcast(&mut self, text: &str, now_ms: u64) -> Option<Output> {
+        let mut packet = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
+        packet.payload = text.as_bytes().to_vec();
+        if !mesh::sign_packet(&mut packet, &self.signer) {
+            return None;
+        }
+        let bytes = packet.encode()?;
+        // Skip our own echo if it loops back through a relay. The key must use
+        // the SAME timestamp the packet carries on the wire.
+        self.remember_broadcast(format!("{}-{}", self.my_peer_id_hex, packet.timestamp));
+        let mut out = Output::default();
+        let mut peers = 0;
+        let link_ids: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| self.bind_allowed(&l.bind))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in link_ids {
+            out.commands.push(Command::WriteLink {
+                conn: id.conn,
+                instance: id.instance,
+                bytes: bytes.clone(),
+                after_ms: 0,
+            });
+            peers += 1;
+        }
+        let servers: Vec<String> = self
+            .server_conns
+            .iter()
+            .filter(|(_, s)| self.bind_allowed(&s.bind))
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in servers {
+            out.commands.push(Command::NotifyConn {
+                conn,
+                bytes: bytes.clone(),
+                after_ms: 0,
+            });
+            peers += 1;
+        }
+        if peers == 0 {
+            return None;
+        }
+        Some(out)
+    }
+
+    // ── Config ──
+
+    pub fn set_nickname(&mut self, nickname: &str, now_ms: u64) -> Output {
+        let next = nickname.trim().to_string();
+        if next == self.nickname {
+            return Output::default();
+        }
+        self.nickname = next;
+        self.discovery_broadcast(now_ms)
+    }
+
+    pub fn set_sonar_payload(&mut self, payload: Option<Vec<u8>>, now_ms: u64) -> Output {
+        if payload == self.sonar_payload {
+            return Output::default();
+        }
+        self.sonar_payload = payload;
+        self.discovery_broadcast(now_ms)
+    }
+
+    /// Known-only policy. A disallowed client instance drops only ITS link
+    /// (an allowed sibling app keeps the shared connection); a disallowed
+    /// server peer is disconnected.
+    pub fn set_allowlist(&mut self, allowed: Option<Vec<String>>) -> Output {
+        self.allowlist =
+            allowed.map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
+        let mut out = Output::default();
+        if self.allowlist.is_none() {
+            return out;
+        }
+        let bad_links: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| !self.bind_allowed(&l.bind))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in bad_links {
+            out.merge(self.drop_client_link(&id));
+        }
+        let bad_servers: Vec<String> = self
+            .server_conns
+            .iter()
+            .filter(|(_, s)| !self.bind_allowed(&s.bind))
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in bad_servers {
+            self.server_conns.remove(&conn);
+            out.commands.push(Command::CancelServer { conn });
+        }
+        // Pending dials have no identity yet: conservatively cut them.
+        let pending: Vec<String> = self.dialing.keys().cloned().collect();
+        for conn in pending {
+            self.cleanup_client_conn(&conn);
+            out.commands.push(Command::Disconnect { conn });
+        }
+        out
+    }
+
+    pub fn reset(&mut self) {
+        self.links.clear();
+        self.server_conns.clear();
+        self.dialing.clear();
+        self.connected.clear();
+        self.recent_dials.clear();
+        self.signing_key_by_peer.clear();
+        self.fingerprint_by_peer.clear();
+        self.pending_sonar.clear();
+        self.pending_sends.clear();
+        self.seen_broadcasts.clear();
+        self.seen_files.clear();
+        self.reassembler = mesh::fragment::Reassembler::new();
+        self.last_heartbeat_ms = 0;
+        self.last_tick_ms = 0;
+        self.last_refresh_ms.clear();
+    }
+
+    // ── Internals ──
+
+    fn fp_allowed(&self, fingerprint: &str) -> bool {
+        match &self.allowlist {
+            None => true,
+            Some(a) => !fingerprint.is_empty() && a.contains(&fingerprint.to_lowercase()),
+        }
+    }
+
+    fn bind_allowed(&self, bind: &PeerBinding) -> bool {
+        match &self.allowlist {
+            None => true,
+            Some(_) => bind
+                .fingerprint
+                .as_deref()
+                .map(|fp| self.fp_allowed(fp))
+                .unwrap_or(false),
+        }
+    }
+
+    fn announce_bytes(&self, now_ms: u64) -> Option<Vec<u8>> {
+        if self.nickname.is_empty() {
+            return None;
+        }
+        let announce = mesh::Announce {
+            nickname: self.nickname.clone(),
+            noise_public_key: hex::decode(&self.noise_public_hex).ok()?,
+            signing_public_key: self.signer.public_key().to_vec(),
+            direct_neighbors: None,
+        };
+        let mut packet =
+            mesh::Packet::new(msg_type::ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
+        packet.payload = announce.encode()?;
+        if !mesh::sign_packet(&mut packet, &self.signer) {
+            return None;
+        }
+        packet.encode()
+    }
+
+    fn sonar_bytes(&self, now_ms: u64) -> Option<Vec<u8>> {
+        let payload = self.sonar_payload.clone()?;
+        // Signed with the same Ed25519 key as the announce — iOS rejects an
+        // unsigned 0x53 as unverified.
+        let mut packet =
+            mesh::Packet::new(msg_type::SONAR_ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
+        packet.payload = payload;
+        if !mesh::sign_packet(&mut packet, &self.signer) {
+            return None;
+        }
+        packet.encode()
+    }
+
+    /// Announce + 0x53 to every link and server connection ("heartbeat" /
+    /// nickname / payload refresh). Android had no periodic announce before
+    /// PR #291; iOS announces every 15–38s while connected.
+    fn discovery_broadcast(&mut self, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        let ann = self.announce_bytes(now_ms);
+        let sonar = self.sonar_bytes(now_ms);
+        let link_ids: Vec<LinkId> = self.links.keys().cloned().collect();
+        for id in link_ids {
+            if let Some(a) = &ann {
+                out.commands.push(Command::WriteLink {
+                    conn: id.conn.clone(),
+                    instance: id.instance,
+                    bytes: a.clone(),
+                    after_ms: 0,
+                });
+            }
+            if let Some(p) = &sonar {
+                out.commands.push(Command::WriteLink {
+                    conn: id.conn.clone(),
+                    instance: id.instance,
+                    bytes: p.clone(),
+                    after_ms: SONAR_STAGGER_MS,
+                });
+            }
+        }
+        let servers: Vec<String> = self.server_conns.keys().cloned().collect();
+        for conn in servers {
+            if let Some(a) = &ann {
+                out.commands.push(Command::NotifyConn {
+                    conn: conn.clone(),
+                    bytes: a.clone(),
+                    after_ms: 0,
+                });
+            }
+            if let Some(p) = &sonar {
+                out.commands.push(Command::NotifyConn {
+                    conn: conn.clone(),
+                    bytes: p.clone(),
+                    after_ms: SONAR_STAGGER_MS,
+                });
+            }
+        }
+        out
+    }
+
+    fn discovery_to_route(&self, route: &Origin, now_ms: u64) -> Output {
+        let mut out = Output::default();
+        let ann = self.announce_bytes(now_ms);
+        let sonar = self.sonar_bytes(now_ms);
+        for bytes in [ann, sonar].into_iter().flatten() {
+            match route {
+                Origin::Client(id) => out.commands.push(Command::WriteLink {
+                    conn: id.conn.clone(),
+                    instance: id.instance,
+                    bytes,
+                    after_ms: 0,
+                }),
+                Origin::Server(conn) => out.commands.push(Command::NotifyConn {
+                    conn: conn.clone(),
+                    bytes,
+                    after_ms: 0,
+                }),
+            }
+        }
+        out
+    }
+
+    /// The route with an established, writable Noise session to `fingerprint`
+    /// (client links first — we were the initiator there).
+    fn sendable_route(&self, fingerprint: &str) -> Option<Origin> {
+        if !self.fp_allowed(fingerprint) {
+            return None;
+        }
+        for (id, l) in &self.links {
+            if l.bind.fingerprint.as_deref() == Some(fingerprint)
+                && l.noise.as_ref().map(|n| n.established()).unwrap_or(false)
+            {
+                return Some(Origin::Client(id.clone()));
+            }
+        }
+        for (conn, s) in &self.server_conns {
+            if s.bind.fingerprint.as_deref() == Some(fingerprint)
+                && s.noise.as_ref().map(|n| n.established()).unwrap_or(false)
+            {
+                return Some(Origin::Server(conn.clone()));
+            }
+        }
+        None
+    }
+
+    fn route_peer_id(&self, route: &Origin) -> Option<String> {
+        match route {
+            Origin::Client(id) => self.links.get(id)?.bind.peer_id_hex.clone(),
+            Origin::Server(conn) => self.server_conns.get(conn)?.bind.peer_id_hex.clone(),
+        }
+    }
+
+    fn try_send_text(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        text: &str,
+        now_ms: u64,
+        out: &mut Output,
+    ) -> bool {
+        let Some(route) = self.sendable_route(fingerprint) else {
+            return false;
+        };
+        let Some(peer_id_hex) = self.route_peer_id(&route) else {
+            return false;
+        };
+        let Some(peer_id) = parse_id8(&peer_id_hex) else {
+            return false;
+        };
+        let pm = mesh::PrivateMessage {
+            message_id: message_id.to_string(),
+            content: text.to_string(),
+        };
+        let Some(plain) = mesh::encode_private_message_plaintext(&pm) else {
+            return false;
+        };
+        let Some(ciphertext) = self.encrypt_on_route(&route, &plain) else {
+            return false;
+        };
+        let packet =
+            mesh::encrypted_packet(self.my_peer_id, peer_id, DEFAULT_TTL, self.wall(now_ms), ciphertext);
+        let Some(bytes) = packet.encode() else {
+            return false;
+        };
+        self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, out);
+        true
+    }
+
+    fn encrypt_on_route(&mut self, route: &Origin, plain: &[u8]) -> Option<Vec<u8>> {
+        let noise = match route {
+            Origin::Client(id) => self.links.get_mut(id)?.noise.as_mut(),
+            Origin::Server(conn) => self.server_conns.get_mut(conn)?.noise.as_mut(),
+        }?;
+        match noise {
+            NoiseState::Session(s) => s.encrypt(plain).ok(),
+            _ => None,
+        }
+    }
+
+    /// One value per GATT write; fragment anything over the MTU-safe bound.
+    fn write_maybe_fragmented(
+        &mut self,
+        route: &Origin,
+        packet_bytes: Vec<u8>,
+        original_type: u8,
+        now_ms: u64,
+        out: &mut Output,
+    ) {
+        let peer_id_hex = self.route_peer_id(route).unwrap_or_default();
+        let mut pieces: Vec<Vec<u8>> = Vec::new();
+        if packet_bytes.len() <= MAX_SINGLE_GATT_PACKET_BYTES {
+            pieces.push(packet_bytes);
+        } else {
+            let frag_id = self.random_fragment_id(now_ms);
+            let Some(frags) = mesh::file_packet::fragment(
+                &packet_bytes,
+                frag_id,
+                original_type,
+                FRAGMENT_CHUNK_SIZE,
+            ) else {
+                return;
+            };
+            let recipient = parse_id8(&peer_id_hex);
+            for f in frags {
+                let mut p = mesh::Packet::new(
+                    msg_type::FRAGMENT,
+                    DEFAULT_TTL,
+                    self.wall(now_ms),
+                    self.my_peer_id,
+                );
+                p.recipient_id = recipient;
+                p.payload = f.encode_payload();
+                if let Some(b) = p.encode() {
+                    pieces.push(b);
+                }
+            }
+        }
+        for bytes in pieces {
+            match route {
+                Origin::Client(id) => out.commands.push(Command::WriteLink {
+                    conn: id.conn.clone(),
+                    instance: id.instance,
+                    bytes,
+                    after_ms: 0,
+                }),
+                Origin::Server(conn) => out.commands.push(Command::NotifyConn {
+                    conn: conn.clone(),
+                    bytes,
+                    after_ms: 0,
+                }),
+            }
+        }
+    }
+
+    /// Deterministic enough for fragment correlation; uniqueness comes from
+    /// the (sender, id) reassembly key plus a strictly monotonic sequence —
+    /// two fragmented sends in the same millisecond must not collide.
+    fn random_fragment_id(&mut self, now_ms: u64) -> [u8; 8] {
+        self.fragment_seq += 1;
+        let mut h = Sha256::new();
+        h.update(self.my_peer_id);
+        h.update(now_ms.to_be_bytes());
+        h.update(self.fragment_seq.to_be_bytes());
+        let d = h.finalize();
+        let mut id = [0u8; 8];
+        id.copy_from_slice(&d[..8]);
+        id
+    }
+
+    fn remember_broadcast(&mut self, key: String) -> bool {
+        if self.seen_broadcasts.len() > SEEN_CAP {
+            self.seen_broadcasts.clear();
+        }
+        self.seen_broadcasts.insert(key)
+    }
+
+    fn cleanup_client_conn(&mut self, conn: &str) {
+        self.links.retain(|id, _| id.conn != conn);
+        self.dialing.remove(conn);
+        self.connected.remove(conn);
+    }
+
+    /// Drop ONE client instance link; close the connection once no instance
+    /// remains on it (a sibling app on the same controller may still be live).
+    fn drop_client_link(&mut self, id: &LinkId) -> Output {
+        let mut out = Output::default();
+        self.links.remove(id);
+        if !self.links.keys().any(|k| k.conn == id.conn) {
+            self.cleanup_client_conn(&id.conn);
+            out.commands.push(Command::Disconnect {
+                conn: id.conn.clone(),
+            });
+        }
+        out
+    }
+
+    fn fingerprint_of(noise_public_key_hex: &str) -> String {
+        match hex::decode(noise_public_key_hex) {
+            Ok(bytes) => hex::encode(Sha256::digest(&bytes)),
+            Err(_) => String::new(),
+        }
+    }
+
+    fn handle_packet(&mut self, origin: Origin, bytes: &[u8], now_ms: u64) -> Output {
+        let mut out = Output::default();
+        let Some(packet) = mesh::Packet::decode(bytes) else {
+            return out;
+        };
+        match packet.type_ {
+            msg_type::ANNOUNCE => self.handle_announce(origin, bytes, &packet, now_ms, &mut out),
+            msg_type::MESSAGE => self.handle_broadcast(origin, bytes, &packet, &mut out),
+            msg_type::NOISE_HANDSHAKE => {
+                self.handle_handshake(origin, &packet, now_ms, &mut out)
+            }
+            msg_type::NOISE_ENCRYPTED => self.handle_encrypted(origin, &packet, &mut out),
+            msg_type::FRAGMENT => {
+                if let Some(frag) = mesh::fragment::Fragment::decode_payload(&packet.payload) {
+                    if let Some(full) = self.reassembler.add(packet.sender_id, &frag) {
+                        out.merge(self.handle_packet(origin, &full, now_ms));
+                    }
+                }
+            }
+            msg_type::FILE_TRANSFER => self.handle_file(origin, bytes, &packet, &mut out),
+            msg_type::SONAR_ANNOUNCE => self.handle_sonar(origin, bytes, &packet, &mut out),
+            _ => {}
+        }
+        out
+    }
+
+    fn origin_bind(&mut self, origin: &Origin) -> Option<&mut PeerBinding> {
+        match origin {
+            Origin::Client(id) => self.links.get_mut(id).map(|l| &mut l.bind),
+            Origin::Server(conn) => self.server_conns.get_mut(conn).map(|s| &mut s.bind),
+        }
+    }
+
+    fn handle_announce(
+        &mut self,
+        origin: Origin,
+        raw: &[u8],
+        packet: &mesh::Packet,
+        now_ms: u64,
+        out: &mut Output,
+    ) {
+        let Some(announce) = mesh::Announce::decode(&packet.payload) else {
+            return;
+        };
+        let sender_hex = hex::encode(packet.sender_id);
+        if mesh::peer_id_from_noise_key(&announce.noise_public_key) != sender_hex {
+            return;
+        }
+        if !mesh::verify_packet(packet, &announce.signing_public_key) {
+            return;
+        }
+        // Our own announce can loop back over a second connection via a relay.
+        if sender_hex.eq_ignore_ascii_case(&self.my_peer_id_hex) {
+            return;
+        }
+        let _ = raw;
+        // Only a full-TTL announce may bind the physical neighbour; a relayed
+        // one still belongs in the radar but must never own link routing.
+        let direct = packet.ttl == DEFAULT_TTL;
+        let noise_pub_hex = hex::encode(&announce.noise_public_key);
+        let fp = Self::fingerprint_of(&noise_pub_hex);
+        let signing_hex = hex::encode(&announce.signing_public_key);
+        let sender_key = sender_hex.to_lowercase();
+        match self.signing_key_by_peer.get(&sender_key) {
+            Some(existing) if !existing.eq_ignore_ascii_case(&signing_hex) => return,
+            Some(_) => {}
+            None => {
+                if self.signing_key_by_peer.len() >= IDENTITY_MAP_CAP {
+                    self.signing_key_by_peer.clear();
+                    self.fingerprint_by_peer.clear();
+                }
+                self.signing_key_by_peer
+                    .insert(sender_key.clone(), signing_hex.clone());
+            }
+        }
+        if !fp.is_empty() {
+            self.fingerprint_by_peer.insert(sender_key.clone(), fp.clone());
+        }
+        if !self.fp_allowed(&fp) {
+            if direct {
+                match &origin {
+                    Origin::Client(id) => out.merge(self.drop_client_link(&id.clone())),
+                    Origin::Server(conn) => {
+                        self.server_conns.remove(conn);
+                        out.commands.push(Command::CancelServer { conn: conn.clone() });
+                    }
+                }
+            }
+            return;
+        }
+        if direct {
+            if let Some(bind) = self.origin_bind(&origin) {
+                bind.peer_id_hex = Some(sender_hex.clone());
+                if !fp.is_empty() {
+                    bind.fingerprint = Some(fp.clone());
+                }
+            }
+            // A real peer answered — keep this connection past the dial window.
+            if let Origin::Client(id) = &origin {
+                self.dialing.remove(&id.conn);
+            }
+        }
+        out.events.push(AppEvent::PeerAnnounced {
+            fingerprint: fp.clone(),
+            nickname: announce.nickname.clone(),
+            peer_id_hex: sender_hex.clone(),
+            direct,
+        });
+        // A 0x53 that arrived before this announce can be verified now.
+        if let Some(pending) = self.pending_sonar.remove(&sender_key) {
+            if let Some(p) = mesh::Packet::decode(&pending) {
+                if p.type_ == msg_type::SONAR_ANNOUNCE
+                    && mesh::verify_packet(&p, &announce.signing_public_key)
+                    && !fp.is_empty()
+                {
+                    out.events.push(AppEvent::SonarPayload {
+                        fingerprint: fp.clone(),
+                        payload: p.payload,
+                    });
+                }
+            }
+        }
+        if !direct {
+            return;
+        }
+        // A Direct announce over the SERVER role proves the peer app is alive
+        // — but the peripheral waits for the peer's 0x10, so if our CLIENT
+        // connection to the same handle has no instance link for this peer
+        // (its CCC subscribe failed, or the dead link was culled), the peer is
+        // unreachable for DMs with no recovery until the whole connection
+        // drops. Re-discover instances so the client side can re-subscribe and
+        // initiate. (On platforms where server/client handles differ this
+        // never fires; the cooldown bounds discovery churn.)
+        if let Origin::Server(conn) = &origin {
+            let has_client_route = self
+                .links
+                .iter()
+                .any(|(id, l)| id.conn == *conn && l.bind.fingerprint.as_deref() == Some(&fp));
+            if self.connected.contains(conn) && !has_client_route && self.sendable_route(&fp).is_none() {
+                let due = self
+                    .last_refresh_ms
+                    .get(conn)
+                    .map(|t| now_ms.saturating_sub(*t) >= REFRESH_INSTANCES_COOLDOWN_MS)
+                    .unwrap_or(true);
+                if due {
+                    self.last_refresh_ms.insert(conn.clone(), now_ms);
+                    out.commands.push(Command::RefreshInstances { conn: conn.clone() });
+                }
+            }
+        }
+        // Central opens the Noise link for DMs (initiator); peripheral waits
+        // for the peer's 0x10. Retry a half-open handshake after
+        // HANDSHAKE_RETRY_MS — a lost m2/m3 must not block DMs forever.
+        if let Origin::Client(id) = &origin {
+            let start = match self.links.get(id).and_then(|l| l.noise.as_ref()) {
+                None => true,
+                Some(NoiseState::Handshake { started_ms, .. }) => {
+                    now_ms.saturating_sub(*started_ms) > HANDSHAKE_RETRY_MS
+                }
+                Some(NoiseState::Session(_)) => false,
+            };
+            if start {
+                if let Ok(mut hs) = NoiseHandshake::initiator(&self.noise_private) {
+                    if let Ok(m1) = hs.write_message() {
+                        if let Some(l) = self.links.get_mut(id) {
+                            l.noise = Some(NoiseState::Handshake {
+                                hs,
+                                started_ms: now_ms,
+                            });
+                        }
+                        if let Some(peer_id) = parse_id8(&sender_hex) {
+                            let p = mesh::handshake_packet(
+                                self.my_peer_id,
+                                peer_id,
+                                DEFAULT_TTL,
+                                self.wall(now_ms),
+                                m1,
+                            );
+                            if let Some(b) = p.encode() {
+                                out.commands.push(Command::WriteLink {
+                                    conn: id.conn.clone(),
+                                    instance: id.instance,
+                                    bytes: b,
+                                    after_ms: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_broadcast(
+        &mut self,
+        origin: Origin,
+        raw: &[u8],
+        packet: &mesh::Packet,
+        out: &mut Output,
+    ) {
+        let Ok(content) = String::from_utf8(packet.payload.clone()) else {
+            return;
+        };
+        let sender_hex = hex::encode(packet.sender_id);
+        let key = format!("{}-{}", sender_hex, packet.timestamp);
+        if !self.remember_broadcast(key) {
+            return;
+        }
+        let fp = self
+            .fingerprint_by_peer
+            .get(&sender_hex.to_lowercase())
+            .cloned()
+            .unwrap_or_else(|| sender_hex.clone());
+        if !self.fp_allowed(&fp) {
+            return;
+        }
+        out.events.push(AppEvent::BroadcastReceived {
+            fingerprint: fp,
+            sender_id_hex: sender_hex.clone(),
+            content,
+            timestamp_ms: packet.timestamp,
+        });
+        // Multi-hop: flood onward so the mesh extends past direct neighbours.
+        // A SIBLING instance on the same connection is a different app and
+        // DOES get the relay — two apps on one controller can't hear each
+        // other over the air; we are their only bridge.
+        if packet.ttl <= 1 {
+            return;
+        }
+        let mut relayed = raw.to_vec();
+        relayed[2] = packet.ttl - 1; // TTL is header byte 2, signed as zero
+        let (skip_link, skip_conn) = match &origin {
+            Origin::Client(id) => (Some(id.clone()), id.conn.clone()),
+            Origin::Server(conn) => (None, conn.clone()),
+        };
+        let link_ids: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(id, l)| Some(*id) != skip_link.as_ref().map(|s| s).map(|s| s) && self.bind_allowed(&l.bind))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in link_ids {
+            if skip_link.as_ref() == Some(&id) {
+                continue;
+            }
+            out.commands.push(Command::WriteLink {
+                conn: id.conn,
+                instance: id.instance,
+                bytes: relayed.clone(),
+                after_ms: 0,
+            });
+        }
+        let servers: Vec<String> = self
+            .server_conns
+            .iter()
+            .filter(|(c, s)| **c != skip_conn && self.bind_allowed(&s.bind))
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in servers {
+            out.commands.push(Command::NotifyConn {
+                conn,
+                bytes: relayed.clone(),
+                after_ms: 0,
+            });
+        }
+    }
+
+    fn handle_handshake(
+        &mut self,
+        origin: Origin,
+        packet: &mesh::Packet,
+        now_ms: u64,
+        out: &mut Output,
+    ) {
+        let sender_hex = hex::encode(packet.sender_id);
+        match origin {
+            Origin::Server(conn) => {
+                let Some(s) = self.server_conns.get_mut(&conn) else {
+                    return;
+                };
+                if s.noise.as_ref().map(|n| n.established()).unwrap_or(false) {
+                    return;
+                }
+                if s.noise.is_none() {
+                    match NoiseHandshake::responder(&self.noise_private) {
+                        Ok(hs) => {
+                            s.noise = Some(NoiseState::Handshake {
+                                hs,
+                                started_ms: now_ms,
+                            })
+                        }
+                        Err(_) => return,
+                    }
+                }
+                let Some(NoiseState::Handshake { hs, .. }) = s.noise.as_mut() else {
+                    return;
+                };
+                if hs.read_message(&packet.payload).is_err() {
+                    s.noise = None;
+                    return;
+                }
+                // Bind the sender id so replies are addressed correctly even
+                // before the announce lands on this connection.
+                if s.bind.peer_id_hex.is_none() {
+                    s.bind.peer_id_hex = Some(sender_hex.clone());
+                }
+                if hs.is_finished() {
+                    self.finish_noise_server(&conn, out, now_ms);
+                } else {
+                    let m2 = match hs.write_message() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            s.noise = None;
+                            return;
+                        }
+                    };
+                    let peer = parse_id8(&sender_hex).unwrap_or([0u8; 8]);
+                    let p = mesh::handshake_packet(
+                        self.my_peer_id,
+                        peer,
+                        DEFAULT_TTL,
+                        self.wall(now_ms),
+                        m2,
+                    );
+                    if let Some(b) = p.encode() {
+                        out.commands.push(Command::NotifyConn {
+                            conn: conn.clone(),
+                            bytes: b,
+                            after_ms: 0,
+                        });
+                    }
+                }
+            }
+            Origin::Client(id) => {
+                let Some(l) = self.links.get_mut(&id) else {
+                    return;
+                };
+                let Some(NoiseState::Handshake { hs, .. }) = l.noise.as_mut() else {
+                    return;
+                };
+                if hs.read_message(&packet.payload).is_err() {
+                    l.noise = None;
+                    return;
+                }
+                if !hs.is_finished() {
+                    let m3 = match hs.write_message() {
+                        Ok(m) => m,
+                        Err(_) => {
+                            l.noise = None;
+                            return;
+                        }
+                    };
+                    let peer = l
+                        .bind
+                        .peer_id_hex
+                        .as_deref()
+                        .and_then(parse_id8)
+                        .unwrap_or([0u8; 8]);
+                    let p = mesh::handshake_packet(
+                        self.my_peer_id,
+                        peer,
+                        DEFAULT_TTL,
+                        self.wall(now_ms),
+                        m3,
+                    );
+                    if let Some(b) = p.encode() {
+                        out.commands.push(Command::WriteLink {
+                            conn: id.conn.clone(),
+                            instance: id.instance,
+                            bytes: b,
+                            after_ms: 0,
+                        });
+                    }
+                }
+                // Re-borrow: is_finished may have flipped after m3.
+                let finished = matches!(
+                    self.links.get(&id).and_then(|l| l.noise.as_ref()),
+                    Some(NoiseState::Handshake { hs, .. }) if hs.is_finished()
+                );
+                if finished {
+                    self.finish_noise_client(&id, out, now_ms);
+                }
+            }
+        }
+    }
+
+    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output, now_ms: u64) {
+        let Some(l) = self.links.get_mut(id) else {
+            return;
+        };
+        let Some(NoiseState::Handshake { hs, .. }) = l.noise.take() else {
+            return;
+        };
+        match hs.into_session() {
+            Ok(session) => {
+                l.noise = Some(NoiseState::Session(session));
+                let fp = l
+                    .bind
+                    .fingerprint
+                    .clone()
+                    .or_else(|| l.bind.peer_id_hex.clone())
+                    .unwrap_or_else(|| id.conn.clone());
+                self.link_established(&fp, out, now_ms);
+            }
+            Err(_) => l.noise = None,
+        }
+    }
+
+    fn finish_noise_server(&mut self, conn: &str, out: &mut Output, now_ms: u64) {
+        let Some(s) = self.server_conns.get_mut(conn) else {
+            return;
+        };
+        let Some(NoiseState::Handshake { hs, .. }) = s.noise.take() else {
+            return;
+        };
+        match hs.into_session() {
+            Ok(session) => {
+                // The responder authenticates the initiator's static key here;
+                // bind the fingerprint even if the announce is still in flight.
+                s.noise = Some(NoiseState::Session(session));
+                let fp = s
+                    .bind
+                    .fingerprint
+                    .clone()
+                    .or_else(|| s.bind.peer_id_hex.clone())
+                    .unwrap_or_else(|| conn.to_string());
+                self.link_established(&fp, out, now_ms);
+            }
+            Err(_) => s.noise = None,
+        }
+    }
+
+    fn link_established(&mut self, fingerprint: &str, out: &mut Output, now_ms: u64) {
+        if !self.fp_allowed(fingerprint) {
+            return;
+        }
+        out.events.push(AppEvent::LinkEstablished {
+            fingerprint: fingerprint.to_string(),
+        });
+        // Flush DMs queued while there was no live link.
+        let queued = self.pending_sends.remove(fingerprint).unwrap_or_default();
+        let mut requeue: Vec<(String, String)> = Vec::new();
+        for (mid, text) in queued {
+            let mut o = Output::default();
+            if self.try_send_text(fingerprint, &mid, &text, now_ms, &mut o) {
+                out.merge(o);
+            } else {
+                requeue.push((mid, text));
+            }
+        }
+        if !requeue.is_empty() {
+            self.pending_sends
+                .insert(fingerprint.to_string(), requeue);
+        }
+    }
+
+    fn handle_encrypted(&mut self, origin: Origin, packet: &mesh::Packet, out: &mut Output) {
+        let fp = match &origin {
+            Origin::Client(id) => self.links.get(id).and_then(|l| l.bind.fingerprint.clone()),
+            Origin::Server(conn) => self
+                .server_conns
+                .get(conn)
+                .and_then(|s| s.bind.fingerprint.clone()),
+        };
+        if self.allowlist.is_some() {
+            let allowed = fp.as_deref().map(|f| self.fp_allowed(f)).unwrap_or(false);
+            if !allowed {
+                match &origin {
+                    Origin::Client(id) => out.merge(self.drop_client_link(&id.clone())),
+                    Origin::Server(conn) => {
+                        self.server_conns.remove(conn);
+                        out.commands.push(Command::CancelServer { conn: conn.clone() });
+                    }
+                }
+                return;
+            }
+        }
+        // Prefer this route's own session; fall back to the peer's session on
+        // its OTHER route (snow does not advance the nonce on a failed
+        // decrypt, so the fallback can't desync a healthy session).
+        let plain = self
+            .decrypt_on_origin(&origin, &packet.payload)
+            .or_else(|| {
+                fp.as_deref()
+                    .and_then(|f| self.decrypt_on_any_route(f, &packet.payload))
+            });
+        let Some(plain) = plain else {
+            return;
+        };
+        let Some((t, rest)) = mesh::split_noise_plaintext(&plain) else {
+            return;
+        };
+        if t != noise_payload::PRIVATE_MESSAGE {
+            // read receipts / delivered acks are surfaced at a later stage.
+            return;
+        }
+        let Some(pm) = mesh::PrivateMessage::decode(rest) else {
+            return;
+        };
+        let id_fp = fp
+            .or_else(|| match &origin {
+                Origin::Client(id) => self
+                    .links
+                    .get(id)
+                    .and_then(|l| l.bind.peer_id_hex.clone()),
+                Origin::Server(conn) => self
+                    .server_conns
+                    .get(conn)
+                    .and_then(|s| s.bind.peer_id_hex.clone()),
+            })
+            .unwrap_or_else(|| match &origin {
+                Origin::Client(id) => id.conn.clone(),
+                Origin::Server(conn) => conn.clone(),
+            });
+        out.events.push(AppEvent::TextReceived {
+            fingerprint: id_fp,
+            message_id: pm.message_id,
+            content: pm.content,
+        });
+    }
+
+    fn decrypt_on_origin(&mut self, origin: &Origin, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let noise = match origin {
+            Origin::Client(id) => self.links.get_mut(id)?.noise.as_mut()?,
+            Origin::Server(conn) => self.server_conns.get_mut(conn)?.noise.as_mut()?,
+        };
+        match noise {
+            NoiseState::Session(s) => s.decrypt(ciphertext).ok(),
+            _ => None,
+        }
+    }
+
+    fn decrypt_on_any_route(&mut self, fingerprint: &str, ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let link_ids: Vec<LinkId> = self
+            .links
+            .iter()
+            .filter(|(_, l)| l.bind.fingerprint.as_deref() == Some(fingerprint))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in link_ids {
+            if let Some(p) = self.decrypt_on_origin(&Origin::Client(id), ciphertext) {
+                return Some(p);
+            }
+        }
+        let conns: Vec<String> = self
+            .server_conns
+            .iter()
+            .filter(|(_, s)| s.bind.fingerprint.as_deref() == Some(fingerprint))
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conn in conns {
+            if let Some(p) = self.decrypt_on_origin(&Origin::Server(conn), ciphertext) {
+                return Some(p);
+            }
+        }
+        None
+    }
+
+    fn handle_file(
+        &mut self,
+        origin: Origin,
+        raw: &[u8],
+        packet: &mesh::Packet,
+        out: &mut Output,
+    ) {
+        let _ = raw;
+        let Some(recipient) = packet.recipient_id else {
+            return;
+        };
+        if hex::encode(recipient) != self.my_peer_id_hex {
+            return;
+        }
+        let fp = match &origin {
+            Origin::Client(id) => self.links.get(id).and_then(|l| {
+                l.bind
+                    .fingerprint
+                    .clone()
+                    .or_else(|| l.bind.peer_id_hex.clone())
+            }),
+            Origin::Server(conn) => self.server_conns.get(conn).and_then(|s| {
+                s.bind
+                    .fingerprint
+                    .clone()
+                    .or_else(|| s.bind.peer_id_hex.clone())
+            }),
+        };
+        let Some(fp) = fp else {
+            return;
+        };
+        let payload_hash8 = {
+            let d = Sha256::digest(&packet.payload);
+            hex::encode(&d[..8])
+        };
+        let transfer_key = format!(
+            "{}-{}-{}",
+            hex::encode(packet.sender_id),
+            packet.timestamp,
+            payload_hash8
+        );
+        if self.seen_files.len() > SEEN_CAP {
+            self.seen_files.clear();
+        }
+        if !self.seen_files.insert(transfer_key.clone()) {
+            return;
+        }
+        let Some(file) = mesh::file_packet::FilePacket::decode(&packet.payload) else {
+            return;
+        };
+        if file.content.is_empty() || file.content.len() > MAX_FILE_TRANSFER_BYTES {
+            return;
+        }
+        out.events.push(AppEvent::FileReceived {
+            fingerprint: fp,
+            transfer_key,
+            file_name: file.file_name,
+            mime_type: file.mime_type,
+            content: file.content,
+            timestamp_ms: packet.timestamp,
+        });
+    }
+
+    fn handle_sonar(
+        &mut self,
+        origin: Origin,
+        raw: &[u8],
+        packet: &mesh::Packet,
+        out: &mut Output,
+    ) {
+        let _ = origin;
+        let sender_hex = hex::encode(packet.sender_id);
+        if sender_hex.eq_ignore_ascii_case(&self.my_peer_id_hex) {
+            return;
+        }
+        let sender_key = sender_hex.to_lowercase();
+        let (Some(fp), Some(signing_hex)) = (
+            self.fingerprint_by_peer.get(&sender_key).cloned(),
+            self.signing_key_by_peer.get(&sender_key).cloned(),
+        ) else {
+            // Packet order is not guaranteed: cache the full signed packet by
+            // sender until its verified announce supplies the signing key.
+            if self.pending_sonar.len() >= MAX_PENDING_SONAR {
+                self.pending_sonar.clear();
+            }
+            self.pending_sonar.insert(sender_key, raw.to_vec());
+            return;
+        };
+        let Ok(signing_key) = hex::decode(&signing_hex) else {
+            return;
+        };
+        if !mesh::verify_packet(packet, &signing_key) {
+            return;
+        }
+        if !self.fp_allowed(&fp) {
+            return;
+        }
+        out.events.push(AppEvent::SonarPayload {
+            fingerprint: fp,
+            payload: packet.payload.clone(),
+        });
+    }
+}
+
+fn parse_id8(hexs: &str) -> Option<[u8; 8]> {
+    let bytes = hex::decode(hexs).ok()?;
+    bytes.try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::noise::NoiseKeypair;
+
+    fn engine(seed: u8, nickname: &str) -> Engine {
+        let kp = NoiseKeypair::generate().expect("keypair");
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&kp.private);
+        Engine::new(sk, hex::encode(&kp.public), [seed; 32], nickname.to_string())
+            .expect("engine")
+    }
+
+    /// Pump packets between an initiator engine (client link) and a responder
+    /// engine (server conn) until both stop emitting, returning app events.
+    fn pump(
+        a: &mut Engine,
+        link: &LinkId,
+        b: &mut Engine,
+        b_conn: &str,
+        first: Output,
+        now: u64,
+    ) -> (Vec<AppEvent>, Vec<AppEvent>) {
+        let mut a_events = first.events.clone();
+        let mut b_events = Vec::new();
+        let mut a_out: Vec<Command> = first.commands;
+        let mut b_out: Vec<Command> = Vec::new();
+        for _ in 0..12 {
+            if a_out.is_empty() && b_out.is_empty() {
+                break;
+            }
+            for c in std::mem::take(&mut a_out) {
+                if let Command::WriteLink { bytes, .. } = c {
+                    let o = b.on_server_rx(b_conn, &bytes, now);
+                    b_events.extend(o.events);
+                    b_out.extend(o.commands);
+                }
+            }
+            for c in std::mem::take(&mut b_out) {
+                if let Command::NotifyConn { bytes, .. } = c {
+                    let o = a.on_client_rx(&link.conn, link.instance, &bytes, now);
+                    a_events.extend(o.events);
+                    a_out.extend(o.commands);
+                }
+            }
+        }
+        (a_events, b_events)
+    }
+
+    /// Drive A (central) fully up against B (peripheral): dial, discover one
+    /// instance, subscribe, exchange announces, complete the Noise handshake.
+    fn establish(a: &mut Engine, b: &mut Engine, conn: &str, instance: i32, now: u64) -> LinkId {
+        let out = a.on_dial_request(conn, now);
+        assert!(matches!(out.commands.as_slice(), [Command::Dial { .. }]));
+        a.on_client_connected(conn, now);
+        b.on_server_connected("droid", now);
+        let out = a.on_instances_discovered(conn, &[instance], now);
+        assert_eq!(out.commands.len(), 1);
+        let sub = a.on_subscribe_result(conn, instance, true, now);
+        let link = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+        // B's announce arrives (as if from its discovery burst).
+        let b_ann = b.announce_bytes(now).expect("b announce");
+        let ann_out = a.on_client_rx(conn, instance, &b_ann, now);
+        // A's announce + handshake m1 flow to B; pump to completion.
+        let mut first = Output::default();
+        first.merge(sub);
+        first.merge(ann_out);
+        let (a_events, b_events) = pump(a, &link, b, "droid", first, now);
+        assert!(
+            a_events
+                .iter()
+                .any(|e| matches!(e, AppEvent::LinkEstablished { .. })),
+            "initiator link must establish, got {a_events:?}"
+        );
+        assert!(
+            b_events
+                .iter()
+                .any(|e| matches!(e, AppEvent::LinkEstablished { .. })),
+            "responder link must establish, got {b_events:?}"
+        );
+        link
+    }
+
+    fn fp_of(e: &Engine) -> String {
+        Engine::fingerprint_of(&e.noise_public_hex)
+    }
+
+    #[test]
+    fn announce_binds_and_starts_handshake_then_dm_round_trip() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "vincent-osx");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        assert!(a.has_link(&fp_of(&b)));
+        assert!(b.has_link(&fp_of(&a)));
+
+        // DM A→B over the established session.
+        let out = a
+            .send_text(&fp_of(&b), "mid-1", "e2e-test", 2_000)
+            .expect("allowed");
+        let mut got = Vec::new();
+        for c in out.commands {
+            if let Command::WriteLink { bytes, .. } = c {
+                got.extend(b.on_server_rx("droid", &bytes, 2_000).events);
+            }
+        }
+        assert!(
+            got.iter().any(|e| matches!(
+                e,
+                AppEvent::TextReceived { content, .. } if content == "e2e-test"
+            )),
+            "B must receive the DM, got {got:?}"
+        );
+        let _ = link;
+    }
+
+    #[test]
+    fn two_instances_on_one_connection_are_distinct_peers() {
+        let mut a = engine(1, "pixel");
+        let mut sonar_mac = engine(5, "Vincenzo-Mac");
+        let mut bitchat_mac = engine(9, "vincent-osx");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25, 34], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        a.on_subscribe_result("84:2F", 34, true, now);
+        let ann25 = sonar_mac.announce_bytes(now).unwrap();
+        let ann34 = bitchat_mac.announce_bytes(now).unwrap();
+        let e25 = a.on_client_rx("84:2F", 25, &ann25, now);
+        let e34 = a.on_client_rx("84:2F", 34, &ann34, now);
+        let name = |o: &Output| {
+            o.events
+                .iter()
+                .find_map(|e| match e {
+                    AppEvent::PeerAnnounced { nickname, direct, .. } if *direct => {
+                        Some(nickname.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(name(&e25), "Vincenzo-Mac");
+        assert_eq!(name(&e34), "vincent-osx");
+        assert_eq!(a.connected_count(), 2);
+    }
+
+    #[test]
+    fn dead_instance_culls_itself_while_sibling_lives() {
+        let mut a = engine(1, "pixel");
+        let sonar_mac = engine(5, "Vincenzo-Mac");
+        let bitchat_mac = engine(9, "vincent-osx");
+        let now = 10_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25, 34], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        a.on_subscribe_result("84:2F", 34, true, now);
+        // Both peers answer (clears the dial's announce deadline).
+        let ann25 = sonar_mac.announce_bytes(now).unwrap();
+        let ann34 = bitchat_mac.announce_bytes(now).unwrap();
+        a.on_client_rx("84:2F", 25, &ann25, now);
+        a.on_client_rx("84:2F", 34, &ann34, now);
+        // Instance 25 chatters, 34 goes silent. Regular ticks keep arriving.
+        let mut t = now;
+        let mut disconnected = false;
+        while t < now + LINK_STALE_MS + 2 * TICK_MS {
+            t += TICK_MS;
+            a.on_client_rx("84:2F", 25, &[0u8; 4], t); // undecodable but rx
+            let out = a.on_tick(t);
+            disconnected |= out
+                .commands
+                .iter()
+                .any(|c| matches!(c, Command::Disconnect { .. }));
+        }
+        assert!(!disconnected, "sibling keeps the connection alive");
+        assert!(a.is_linked_conn("84:2F"));
+        // Now BOTH go silent → the connection closes.
+        let mut closed = false;
+        while t < now + 3 * LINK_STALE_MS {
+            t += TICK_MS;
+            closed |= a
+                .on_tick(t)
+                .commands
+                .iter()
+                .any(|c| matches!(c, Command::Disconnect { .. }));
+        }
+        assert!(closed, "fully-silent connection must be culled");
+        assert!(!a.is_linked_conn("84:2F"));
+    }
+
+    #[test]
+    fn freeze_resume_does_not_cull() {
+        let mut a = engine(1, "pixel");
+        let peer = engine(5, "mac");
+        let now = 10_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        let ann = peer.announce_bytes(now).unwrap();
+        a.on_client_rx("84:2F", 25, &ann, now);
+        a.on_tick(now + TICK_MS);
+        // Process frozen for 10 minutes; first tick after resume must re-seed,
+        // not cull.
+        let resumed = now + TICK_MS + 600_000;
+        let out = a.on_tick(resumed);
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, Command::Disconnect { .. })),
+            "resume tick must not cull for our own downtime"
+        );
+        assert!(a.is_linked_conn("84:2F"));
+    }
+
+    #[test]
+    fn dial_gating_backoff_and_cap() {
+        let mut a = engine(1, "pixel");
+        assert_eq!(a.on_dial_request("c1", 1_000).commands.len(), 1);
+        // Dedup while dialing.
+        assert_eq!(a.on_dial_request("c1", 1_100).commands.len(), 0);
+        // Backoff after cleanup.
+        a.on_client_disconnected("c1");
+        assert_eq!(a.on_dial_request("c1", 2_000).commands.len(), 0);
+        assert_eq!(
+            a.on_dial_request("c1", 1_000 + REDIAL_BACKOFF_MS).commands.len(),
+            1
+        );
+        // Cap at MAX_CLIENTS concurrent.
+        let mut accepted = 1;
+        for i in 0..10 {
+            let conn = format!("x{i}");
+            accepted += a.on_dial_request(&conn, 50_000).commands.len();
+        }
+        assert_eq!(accepted, MAX_CLIENTS);
+    }
+
+    #[test]
+    fn self_echo_announce_is_ignored() {
+        let mut a = engine(1, "pixel");
+        let now = 1_000;
+        a.on_dial_request("relay", now);
+        a.on_client_connected("relay", now);
+        a.on_instances_discovered("relay", &[7], now);
+        a.on_subscribe_result("relay", 7, true, now);
+        let own = a.announce_bytes(now).unwrap();
+        let out = a.on_client_rx("relay", 7, &own, now);
+        assert!(out.events.is_empty(), "own announce must not surface");
+    }
+
+    #[test]
+    fn relayed_announce_lists_but_does_not_bind_or_handshake() {
+        let mut a = engine(1, "pixel");
+        let far = engine(7, "far-peer");
+        let now = 1_000;
+        a.on_dial_request("relay", now);
+        a.on_client_connected("relay", now);
+        a.on_instances_discovered("relay", &[7], now);
+        a.on_subscribe_result("relay", 7, true, now);
+        let mut ann = far.announce_bytes(now).unwrap();
+        ann[2] = DEFAULT_TTL - 1; // relayed: TTL already decremented
+        let out = a.on_client_rx("relay", 7, &ann, now);
+        assert!(out.events.iter().any(|e| matches!(
+            e,
+            AppEvent::PeerAnnounced { direct: false, .. }
+        )));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, Command::WriteLink { .. })),
+            "no handshake toward a relayed peer"
+        );
+    }
+
+    #[test]
+    fn broadcast_relays_to_sibling_instance_with_decremented_ttl() {
+        let mut a = engine(1, "pixel");
+        let sender = engine(7, "sender");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25, 34], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        a.on_subscribe_result("84:2F", 34, true, now);
+        let bytes = {
+            let mut p = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, now, sender.my_peer_id);
+            p.payload = b"hello mesh".to_vec();
+            assert!(mesh::sign_packet(&mut p, &sender.signer));
+            p.encode().unwrap()
+        };
+        let out = a.on_client_rx("84:2F", 25, &bytes, now);
+        assert!(out
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::BroadcastReceived { .. })));
+        let relayed: Vec<_> = out
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::WriteLink {
+                    instance, bytes, ..
+                } => Some((*instance, bytes.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(relayed.len(), 1, "only the sibling instance gets the relay");
+        assert_eq!(relayed[0].0, 34);
+        assert_eq!(relayed[0].1[2], DEFAULT_TTL - 1);
+        // Duplicate delivery of the same broadcast is dropped.
+        let dup = a.on_client_rx("84:2F", 34, &bytes, now);
+        assert!(dup.events.is_empty());
+    }
+
+    #[test]
+    fn pending_send_flushes_on_establish() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "peer");
+        let fp = fp_of(&b);
+        let out = a.send_text(&fp, "mid-q", "queued", 500).expect("queued ok");
+        assert!(out.commands.is_empty(), "no link yet: must queue");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        // The establish pump already flushed; B must have received the DM.
+        // Re-drive: establish() asserted establishment; verify B got the text
+        // by checking A's queue drained and the route exists.
+        assert!(a.has_link(&fp));
+        assert!(a.pending_sends.get(&fp).is_none(), "queue must drain");
+        let _ = link;
+    }
+
+    #[test]
+    fn allowlist_drops_disallowed_instance_but_keeps_sibling() {
+        let mut a = engine(1, "pixel");
+        let mut sonar_mac = engine(5, "Vincenzo-Mac");
+        let bitchat_mac = engine(9, "vincent-osx");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25, 34], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        a.on_subscribe_result("84:2F", 34, true, now);
+        let ann25 = sonar_mac.announce_bytes(now).unwrap();
+        let ann34 = bitchat_mac.announce_bytes(now).unwrap();
+        a.on_client_rx("84:2F", 25, &ann25, now);
+        a.on_client_rx("84:2F", 34, &ann34, now);
+        // Allow only Sonar-Mac.
+        let out = a.set_allowlist(Some(vec![fp_of(&sonar_mac)]));
+        assert!(
+            !out.commands
+                .iter()
+                .any(|c| matches!(c, Command::Disconnect { .. })),
+            "the allowed sibling keeps the shared connection"
+        );
+        assert_eq!(a.connected_count(), 1);
+        // A fresh disallowed announce drops only its own instance link.
+        let ann34b = bitchat_mac.announce_bytes(now + 10).unwrap();
+        let out = a.on_client_rx("84:2F", 34, &ann34b, now + 10);
+        assert!(out.events.is_empty());
+        // The connection survives because instance 25 is still allowed.
+        assert!(a.is_linked_conn("84:2F"));
+        let _ = sonar_mac.set_nickname("x", now); // silence unused-mut lint
+    }
+
+    #[test]
+    fn signing_key_change_is_rejected() {
+        let mut a = engine(1, "pixel");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[7], now);
+        a.on_subscribe_result("84:2F", 7, true, now);
+        // Two announcers with the SAME noise key (same sender id) but
+        // different signing keys — the second must be rejected.
+        let kp = NoiseKeypair::generate().unwrap();
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(&kp.private);
+        let pk = hex::encode(&kp.public);
+        let e1 = Engine::new(sk, pk.clone(), [11u8; 32], "p".into()).unwrap();
+        let e2 = Engine::new(sk, pk, [22u8; 32], "p".into()).unwrap();
+        let a1 = e1.announce_bytes(now).unwrap();
+        let a2 = e2.announce_bytes(now).unwrap();
+        assert!(!a.on_client_rx("84:2F", 7, &a1, now).events.is_empty());
+        assert!(
+            a.on_client_rx("84:2F", 7, &a2, now).events.is_empty(),
+            "in-place signing-key change is an impersonation"
+        );
+    }
+
+    #[test]
+    fn dial_deadline_recycles_unanswered_connections() {
+        let mut a = engine(1, "pixel");
+        a.on_dial_request("dead", 1_000);
+        // Never connected: recycled at the establish deadline.
+        let out = a.on_dial_deadline("dead", 1_000 + CONNECT_ESTABLISH_MS);
+        assert!(out
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Disconnect { .. })));
+        assert!(!a.is_linked_conn("dead"));
+        // Connected but never announced: recycled at the announce deadline.
+        a.on_dial_request("mute", 60_000);
+        a.on_client_connected("mute", 60_100);
+        assert!(a
+            .on_dial_deadline("mute", 60_000 + CONNECT_ESTABLISH_MS)
+            .commands
+            .is_empty());
+        let out =
+            a.on_dial_deadline("mute", 60_000 + CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS);
+        assert!(out
+            .commands
+            .iter()
+            .any(|c| matches!(c, Command::Disconnect { .. })));
+    }
+
+    #[test]
+    fn server_direct_announce_without_client_route_triggers_rediscovery() {
+        // Peer app alive behind our live client connection (it announces over
+        // its own inbound central leg) but its instance link is gone: the
+        // engine must ask the driver to re-discover so the client side can
+        // re-subscribe and initiate — otherwise the peer is unreachable for
+        // DMs until the whole connection drops.
+        let mut a = engine(1, "pixel");
+        let peer = engine(9, "vincent-osx");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        // Complete the dial with the OTHER app's announce so the connection
+        // survives the announce deadline.
+        let sonar_mac = engine(5, "Vincenzo-Mac");
+        let ann = sonar_mac.announce_bytes(now).unwrap();
+        a.on_client_rx("84:2F", 25, &ann, now);
+        // vincent-osx announces via the server leg (same handle on Android).
+        a.on_server_connected("84:2F", now);
+        let ann_osx = peer.announce_bytes(now).unwrap();
+        let out = a.on_server_rx("84:2F", &ann_osx, now);
+        assert!(
+            out.commands
+                .iter()
+                .any(|c| matches!(c, Command::RefreshInstances { conn } if conn == "84:2F")),
+            "must re-discover instances, got {:?}",
+            out.commands
+        );
+        // Cooldown: an immediate repeat announce must not re-trigger.
+        let again = a.on_server_rx("84:2F", &peer.announce_bytes(now + 10).unwrap(), now + 10);
+        assert!(
+            !again
+                .commands
+                .iter()
+                .any(|c| matches!(c, Command::RefreshInstances { .. })),
+            "cooldown must suppress repeats"
+        );
+    }
+
+    #[test]
+    fn heartbeat_covers_all_links_and_servers() {
+        let mut a = engine(1, "pixel");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25, 34], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        a.on_subscribe_result("84:2F", 34, true, now);
+        a.on_server_connected("central-1", now);
+        let out = a.on_tick(now + HEARTBEAT_MS + 1);
+        let writes = out
+            .commands
+            .iter()
+            .filter(|c| matches!(c, Command::WriteLink { .. }))
+            .count();
+        let notifies = out
+            .commands
+            .iter()
+            .filter(|c| matches!(c, Command::NotifyConn { .. }))
+            .count();
+        assert_eq!(writes, 2, "one announce per instance link");
+        assert_eq!(notifies, 1, "one announce per server connection");
+    }
+}

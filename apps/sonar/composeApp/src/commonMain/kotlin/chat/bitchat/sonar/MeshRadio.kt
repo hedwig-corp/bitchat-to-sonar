@@ -94,6 +94,48 @@ internal fun meshSigningKeyMatches(existingKeyHex: String?, announcedKeyHex: Str
     existingKeyHex == null || existingKeyHex.equals(announcedKeyHex, ignoreCase = true)
 
 /**
+ * Mesh links whose receive side has gone silent for [staleMs].
+ *
+ * The Pixel 10 BLE stack can silently stop delivering a link's data without
+ * ever firing a disconnect callback. The stale address then stays in the
+ * client/server link maps, `isLinkedAddr` keeps gating off every re-dial, and a
+ * static-address peer (e.g. a Mac) becomes permanently undetectable while the
+ * scanner still reports it. Culling such zombies lets the next scan result
+ * re-dial and recover the link. Addresses with no recorded receive time are
+ * left alone — the caller seeds them first so a fresh link gets a full window.
+ *
+ * Called once per GATT role with that role's own linked set and rx times: one
+ * address can hold a client and a server link at once, and a shared per-address
+ * entry would let a healthy role mask a dead one. Timestamps must come from a
+ * MONOTONIC clock — a wall-clock jump would otherwise cull every live link.
+ */
+internal fun meshStaleLinkAddrs(
+    nowMs: Long,
+    linkedAddrs: Set<String>,
+    lastRxMsByAddr: Map<String, Long>,
+    staleMs: Long,
+): List<String> = linkedAddrs.filter { addr ->
+    val lastRx = lastRxMsByAddr[addr] ?: return@filter false
+    nowMs - lastRx >= staleMs
+}
+
+/**
+ * True when the liveness sweep did not run for [gapMs], i.e. our own process was
+ * frozen (Android caches a backgrounded app and stops its handler callbacks) or
+ * the device dozed.
+ *
+ * The monotonic clock keeps advancing through that downtime, so every link would
+ * look silent and be culled for OUR outage rather than the peer's. On such a tick
+ * the caller re-seeds and skips the cull. [lastSweepMs] of 0 means "first tick" —
+ * never a gap.
+ */
+internal fun meshSweepResumedFromGap(
+    nowMs: Long,
+    lastSweepMs: Long,
+    gapMs: Long,
+): Boolean = lastSweepMs != 0L && nowMs - lastSweepMs >= gapMs
+
+/**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.
  */
