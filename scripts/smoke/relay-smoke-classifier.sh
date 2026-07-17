@@ -26,3 +26,39 @@ classify_relay_smoke() {
     printf 'inconclusive'
   fi
 }
+
+# Write sender<TAB>receiver<TAB>sent<TAB>received rows using only POSIX awk.
+# sent_tsv contains sender, receiver, sequence, timestamp, payload; recv_all_tsv
+# contains payload, receive timestamp.
+build_pair_delivery_matrix() {
+  local sent_tsv="$1" recv_all_tsv="$2" matrix_tsv="$3"
+  : > "$matrix_tsv"
+  [[ -s "$sent_tsv" ]] || return 0
+
+  awk -F'\t' '
+    NR == FNR {
+      pair = $1 SUBSEP $2
+      sent[pair]++
+      payload_pair[$5] = pair
+      next
+    }
+    {
+      pair = payload_pair[$1]
+      if (pair != "") recv[pair]++
+    }
+    END {
+      for (pair in sent) {
+        split(pair, fields, SUBSEP)
+        printf "%s\t%s\t%s\t%s\n", fields[1], fields[2], sent[pair], (recv[pair] ? recv[pair] : 0)
+      }
+    }
+  ' "$sent_tsv" "$recv_all_tsv" > "$matrix_tsv"
+}
+
+pair_delivery_json() {
+  local matrix_tsv="$1"
+  awk -F'\t' 'BEGIN { printf "[" }
+    { printf "%s{\"sender\":%s,\"receiver\":%s,\"sent\":%s,\"received\":%s}", (NR > 1 ? "," : ""), $1, $2, $3, $4 }
+    END { print "]" }
+  ' "$matrix_tsv"
+}
