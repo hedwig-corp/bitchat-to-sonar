@@ -9,6 +9,10 @@ plugins {
     alias(libs.plugins.compose)
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.google.services)
+    // Bakes the generated Baseline Profile (src/androidRelease/generated/baselineProfiles)
+    // into release APKs so cold starts and first compositions run AOT-compiled
+    // (issue #305). Generation lives in :baselineprofile.
+    alias(libs.plugins.baselineprofile)
 }
 
 // Breez API key from a gitignored secret — NEVER hardcode or commit it.
@@ -385,4 +389,8 @@ dependencies {
     // so Firebase goes through the standard Gradle dependencies block.
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.messaging)
+    // Installs the baked Baseline Profile into ART on first run (API < 34
+    // devices don't apply APK profiles at install time without it).
+    implementation(libs.androidx.profileinstaller)
+    baselineProfile(project(":baselineprofile"))
 }

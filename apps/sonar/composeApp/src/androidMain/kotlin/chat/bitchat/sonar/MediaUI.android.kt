@@ -310,6 +310,55 @@ actual fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>? {
     return if (opts.outWidth > 0 && opts.outHeight > 0) opts.outWidth to opts.outHeight else null
 }
 
+internal actual fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): ThumbnailDecode? {
+    // Pass 1: header only — no pixel buffer is allocated, so the full-size
+    // bitmap never exists even for a 12MP photo.
+    val (width, height) = decodeImageBounds(bytes) ?: return null // not an image
+    val longestEdge = maxOf(width, height)
+
+    // inSampleSize must be a power of two; BitmapFactory rounds down to one
+    // anyway. Halve until the decoded edge fits, so the sampled bitmap is at
+    // most 2x the target before the exact scale below.
+    var sample = 1
+    while (longestEdge / (sample * 2) >= maxEdgePx) sample *= 2
+
+    val options = BitmapFactory.Options().apply { inSampleSize = sample }
+    val sampled = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+
+    val sampledEdge = maxOf(sampled.width, sampled.height)
+    val scaled = if (sampledEdge > maxEdgePx) {
+        val ratio = maxEdgePx.toFloat() / sampledEdge
+        val target = Bitmap.createScaledBitmap(
+            sampled,
+            (sampled.width * ratio).toInt().coerceAtLeast(1),
+            (sampled.height * ratio).toInt().coerceAtLeast(1),
+            /* filter = */ true,
+        )
+        if (target !== sampled) sampled.recycle()
+        target
+    } else {
+        sampled
+    }
+
+    // Re-encode only when sampling actually shrank the source; a photo already
+    // under the bound would round-trip through JPEG for nothing (lossy, and no
+    // decode saved next time — the original is already thumbnail-sized).
+    val encoded = if (scaled !== sampled || sample > 1 || sampledEdge > maxEdgePx) {
+        runCatching {
+            java.io.ByteArrayOutputStream().use { out ->
+                @Suppress("DEPRECATION") // WEBP_LOSSY is API 30+; WEBP covers 26+.
+                val format =
+                    if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY
+                    else Bitmap.CompressFormat.WEBP
+                if (scaled.compress(format, 80, out)) out.toByteArray() else null
+            }
+        }.getOrNull()
+    } else {
+        null
+    }
+    return ThumbnailDecode(bitmap = scaled.asImageBitmap(), encoded = encoded)
+}
+
 actual fun decodeVideoPosterFrame(path: String): ImageBitmap? =
     runCatching {
         val retriever = android.media.MediaMetadataRetriever()

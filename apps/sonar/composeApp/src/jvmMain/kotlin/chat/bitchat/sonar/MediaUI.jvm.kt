@@ -194,6 +194,36 @@ actual fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>? = runCatching {
         }
 }.getOrNull()
 
+internal actual fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): ThumbnailDecode? =
+    runCatching {
+        val source = SkiaImage.makeFromEncoded(bytes)
+        val longestEdge = maxOf(source.width, source.height)
+        if (longestEdge <= maxEdgePx) {
+            // Already within bounds: paint it, and skip the thumbnail — a
+            // re-encode would cost quality and save no decode later.
+            return@runCatching ThumbnailDecode(source.toComposeImageBitmap(), encoded = null)
+        }
+        // Skia has no sampled decode like BitmapFactory's inSampleSize, so the
+        // full image does exist briefly here. Desktop has no per-app heap cap
+        // and far more RAM than the phones this bound protects, so a scale-
+        // after-decode is an acceptable trade for a much simpler path.
+        val ratio = maxEdgePx.toFloat() / longestEdge
+        val surface = org.jetbrains.skia.Surface.makeRasterN32Premul(
+            (source.width * ratio).toInt().coerceAtLeast(1),
+            (source.height * ratio).toInt().coerceAtLeast(1),
+        )
+        surface.canvas.drawImageRect(
+            source,
+            org.jetbrains.skia.Rect.makeWH(source.width.toFloat(), source.height.toFloat()),
+            org.jetbrains.skia.Rect.makeWH(surface.width.toFloat(), surface.height.toFloat()),
+        )
+        val scaled = surface.makeImageSnapshot()
+        val encoded = scaled
+            .encodeToData(org.jetbrains.skia.EncodedImageFormat.WEBP, quality = 80)
+            ?.bytes
+        ThumbnailDecode(scaled.toComposeImageBitmap(), encoded)
+    }.getOrNull()
+
 // The stock JVM has no video decoder — the preview falls back to a generic
 // video tile (filename + play glyph) instead of a poster frame.
 actual fun decodeVideoPosterFrame(path: String): ImageBitmap? = null

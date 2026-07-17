@@ -48,4 +48,41 @@ class SonarApp : Application() {
         Notifier.ensureChannel()
         SonarPushRegistration.ensureRegistered()
     }
+
+    /**
+     * Give decoded transcript pixels back under memory pressure.
+     *
+     * MediaImageMemoryCache holds up to 48MB of bitmaps that are pure cache:
+     * each costs only a re-decode from its disk thumbnail, which is a far
+     * better trade than letting the OS kill a backgrounded chat app — Sonar
+     * losing its process drops BLE links and relay subscriptions.
+     *
+     * The thresholds mirror Glide's `LruResourceCache.trimMemory` (the cache
+     * Signal-Android relies on for exactly this): once the app is on the LRU
+     * kill list keep nothing, and halve when it is merely under pressure.
+     *
+     * Deprecation: API 35 deprecated every level except TRIM_MEMORY_UI_HIDDEN,
+     * but minSdk is 26 and API 26-34 devices — the ones actually tight on RAM —
+     * still deliver the rest, so both paths stay until minSdk rises.
+     *
+     * Runs on the main thread, where the cache is already confined, so this
+     * introduces no locking.
+     */
+    @Suppress("DEPRECATION")
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        when {
+            level >= TRIM_MEMORY_BACKGROUND -> MediaImageMemoryCache.clear()
+            level >= TRIM_MEMORY_UI_HIDDEN || level == TRIM_MEMORY_RUNNING_CRITICAL ->
+                MediaImageMemoryCache.trimTo(MediaImageMemoryCache.costBytes / 2)
+            else -> Unit
+        }
+    }
+
+    /** Pre-API-14 fallback the platform still invokes on real memory pressure. */
+    @Suppress("DEPRECATION")
+    override fun onLowMemory() {
+        super.onLowMemory()
+        MediaImageMemoryCache.clear()
+    }
 }

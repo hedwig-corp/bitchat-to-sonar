@@ -31,6 +31,9 @@ internal object MediaImageMemoryCache {
     private val entries = LinkedHashMap<String, DecodedTranscriptMedia>()
     private var totalCost = 0L
 
+    /** Current cost, for tests and trim diagnostics. */
+    val costBytes: Long get() = totalCost
+
     fun get(url: String): DecodedTranscriptMedia? {
         val hit = entries.remove(url) ?: return null
         entries[url] = hit // move to the newest LRU position
@@ -41,11 +44,23 @@ internal object MediaImageMemoryCache {
         entries.remove(url)?.let { totalCost -= it.costBytes }
         entries[url] = decoded
         totalCost += decoded.costBytes
+        trimTo(MAX_COST_BYTES, keep = url)
+    }
+
+    /**
+     * Evict eldest-first until the cache fits [maxCostBytes]. [keep] is never
+     * evicted — `put` passes the entry it just painted so an image larger than
+     * the whole budget still survives its own insertion.
+     *
+     * The OS calls this under memory pressure (see the Android
+     * ComponentCallbacks2 hook in `SonarApp`): dropping decoded pixels costs a
+     * re-decode from the disk thumbnail, which is far cheaper than being killed.
+     */
+    fun trimTo(maxCostBytes: Long, keep: String? = null) {
         val eldestFirst = entries.entries.iterator()
-        while (totalCost > MAX_COST_BYTES && eldestFirst.hasNext()) {
+        while (totalCost > maxCostBytes && eldestFirst.hasNext()) {
             val eldest = eldestFirst.next()
-            // Keep the entry just painted even when it alone exceeds the budget.
-            if (eldest.key == url) continue
+            if (eldest.key == keep) continue
             eldestFirst.remove()
             totalCost -= eldest.value.costBytes
         }

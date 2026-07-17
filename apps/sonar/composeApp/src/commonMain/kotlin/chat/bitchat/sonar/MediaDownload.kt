@@ -53,6 +53,10 @@ internal fun mediaCacheKey(url: String): String =
 expect object MediaCache {
     fun finalPath(url: String): String
     fun partialPath(url: String, token: String): String
+
+    /** Downscaled transcript thumbnail for [url] (see [MediaThumbnailDiskCache]).
+     *  Lives under the cache root so `wipe()` removes it with the attachment. */
+    fun thumbnailPath(url: String): String
     suspend fun prepare()
     suspend fun exists(path: String): Boolean
     suspend fun read(path: String): ByteArray?

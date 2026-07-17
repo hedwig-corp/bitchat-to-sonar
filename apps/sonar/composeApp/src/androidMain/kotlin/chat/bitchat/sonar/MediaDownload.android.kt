@@ -12,6 +12,9 @@ actual object MediaCache {
     actual fun partialPath(url: String, token: String): String =
         File(root(), ".${mediaCacheKey(url)}.$token.part").absolutePath
 
+    actual fun thumbnailPath(url: String): String =
+        File(File(root(), "thumbs"), "${mediaCacheKey(url)}.thumb").absolutePath
+
     actual suspend fun prepare(): Unit = withContext(Dispatchers.IO) {
         check(root().isDirectory || root().mkdirs()) { "could not create media cache" }
     }

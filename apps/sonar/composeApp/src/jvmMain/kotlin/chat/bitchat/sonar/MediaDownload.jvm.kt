@@ -11,6 +11,9 @@ import java.nio.file.attribute.PosixFilePermission
 actual object MediaCache {
     private fun root(): File = DesktopEnv.file("media-cache")
 
+    actual fun thumbnailPath(url: String): String =
+        File(File(root(), "thumbs"), "${mediaCacheKey(url)}.thumb").absolutePath
+
     private fun restrictPermissions(file: File, directory: Boolean = false) {
         runCatching {
             val permissions = buildSet {

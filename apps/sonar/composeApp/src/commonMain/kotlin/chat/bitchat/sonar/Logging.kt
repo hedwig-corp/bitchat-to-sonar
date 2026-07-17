@@ -8,3 +8,12 @@ package chat.bitchat.sonar
  *  - jvmMain (desktop) → stdout.
  */
 internal expect fun sonarLog(tag: String, message: String)
+
+/**
+ * Whether `SONAR_BENCH` timing markers may be emitted (scripts/bench/ parses
+ * them; see docs/PERFORMANCE.md). Debug builds only — mirrors the iOS rule
+ * that a benchmark hook must never change Release behavior:
+ *  - androidMain → BuildConfig.DEBUG,
+ *  - jvmMain (desktop) → the `sonar.bench.markers` system property.
+ */
+internal expect val sonarBenchMarkersEnabled: Boolean
