@@ -11,7 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
@@ -5728,17 +5728,30 @@ fn blossom_upload_retry_delay(
     base_delay: Duration,
 ) -> Duration {
     if let nostr_blossom::error::Error::Response { res, .. } = error {
-        if let Some(seconds) = res
+        if let Some(delay) = res
             .headers()
             .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
+            .and_then(|value| blossom_retry_after_delay(value, SystemTime::now()))
         {
-            return Duration::from_secs(seconds).min(BLOSSOM_UPLOAD_RETRY_AFTER_MAX);
+            return delay;
         }
     }
     let exponent = failed_attempt.saturating_sub(1).min(31) as u32;
     base_delay.saturating_mul(1u32 << exponent)
+}
+
+fn blossom_retry_after_delay(
+    value: &reqwest::header::HeaderValue,
+    now: SystemTime,
+) -> Option<Duration> {
+    let value = value.to_str().ok()?;
+    let delay = value.parse::<u64>().map(Duration::from_secs).or_else(|_| {
+        httpdate::parse_http_date(value)
+            .map(|retry_at| retry_at.duration_since(now).unwrap_or_default())
+    });
+    delay
+        .ok()
+        .map(|delay| delay.min(BLOSSOM_UPLOAD_RETRY_AFTER_MAX))
 }
 
 /// Chat-list preview text stored in the conversation index for `message`.
@@ -6290,6 +6303,40 @@ mod tests {
         ] {
             assert!(retryable_blossom_upload_status(status), "{status}");
         }
+    }
+
+    #[test]
+    fn blossom_retry_after_accepts_seconds_and_http_date() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let seconds = reqwest::header::HeaderValue::from_static("12");
+        assert_eq!(
+            blossom_retry_after_delay(&seconds, now),
+            Some(Duration::from_secs(12))
+        );
+
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(20));
+        let date = reqwest::header::HeaderValue::from_str(&date).expect("valid HTTP date");
+        assert_eq!(
+            blossom_retry_after_delay(&date, now),
+            Some(Duration::from_secs(20))
+        );
+
+        let capped = httpdate::fmt_http_date(now + Duration::from_secs(60));
+        let capped = reqwest::header::HeaderValue::from_str(&capped).expect("valid HTTP date");
+        assert_eq!(
+            blossom_retry_after_delay(&capped, now),
+            Some(BLOSSOM_UPLOAD_RETRY_AFTER_MAX)
+        );
+
+        let stale = httpdate::fmt_http_date(now - Duration::from_secs(1));
+        let stale = reqwest::header::HeaderValue::from_str(&stale).expect("valid HTTP date");
+        assert_eq!(blossom_retry_after_delay(&stale, now), Some(Duration::ZERO));
+
+        assert_eq!(
+            blossom_retry_after_delay(&reqwest::header::HeaderValue::from_static("later"), now),
+            None
+        );
     }
 
     #[tokio::test]

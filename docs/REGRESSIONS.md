@@ -325,7 +325,7 @@ invalidation for verified peer/profile changes.
 
 **Guarded by:** `client.rs::blossom_upload_retries_transient_failure`
 
-**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`
+**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`, `client.rs::blossom_retry_after_accepts_seconds_and_http_date`
 
 **History:** #287 bounded a permanently stalled PUT at 60s -> #293 scaled the deadline for video but assumed at least 100 KiB/s -> this change adds transient retry/backoff and a constrained-cellular deadline for both apps.
 
