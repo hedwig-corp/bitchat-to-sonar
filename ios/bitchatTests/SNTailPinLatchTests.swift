@@ -12,6 +12,33 @@ import Testing
 
 struct SNTailPinLatchTests {
 
+    @Test
+    func tailRevisionTracksOnlyCountAndLiveEdge() {
+        let original = SNTailRevision(itemCount: 100, tailID: "old-tail")
+        #expect(original == SNTailRevision(itemCount: 100, tailID: "old-tail"))
+        #expect(original != SNTailRevision(itemCount: 100, tailID: "new-tail"))
+        #expect(original != SNTailRevision(itemCount: 99, tailID: "old-tail"))
+    }
+
+    /// Signal's 10 ms last-event-only limiter means a burst of safe-area
+    /// updates owns one pending correction instead of one main-queue job each.
+    @Test
+    func tailSnapBurstCoalescesUntilDelivery() {
+        var coalescer = SNTailSnapCoalescer()
+        let firstRequest = coalescer.request()
+        #expect(firstRequest)
+        for _ in 0..<30 {
+            let duplicateRequest = coalescer.request()
+            #expect(!duplicateRequest)
+        }
+        let firstDelivery = coalescer.consume()
+        let duplicateDelivery = coalescer.consume()
+        let nextRequest = coalescer.request()
+        #expect(firstDelivery)
+        #expect(!duplicateDelivery)
+        #expect(nextRequest)
+    }
+
     /// The regression: the keyboard's own shrink covers the bottom sentinel,
     /// flipping live "near bottom" state false mid-transition. A guard on the
     /// live state alone stops re-pinning exactly when the pin is needed and

@@ -425,6 +425,54 @@ model live radio, TLS, device scheduling, or native UI contention. Exact
 build, log-capture, launch, and validation commands are in
 [`scripts/bench/README.md`](../scripts/bench/README.md#repeatable-send-smoke-checks).
 
+## iOS keyboard-tail structural benchmark
+
+The keyboard benchmark measures the amount of main-thread coordination Sonar
+performs while preserving a pinned transcript tail. It intentionally reports
+work counts rather than keyboard animation duration: the latter is chosen by
+iOS and is not evidence that Sonar became faster. The benchmark build logs no
+message content, identifiers, or keys.
+
+Build a Release-optimized app with the probe compiled in, install it over the
+existing app (preserving its real conversation database), then launch it with
+the probe enabled:
+
+```bash
+xcodebuild -project ios/bitchat.xcodeproj -scheme 'bitchat (iOS)' \
+  -destination 'id=<core-device-id>' -configuration Release \
+  -derivedDataPath /tmp/sonar-keyboard-bench \
+  CURRENT_PROJECT_VERSION=<unique-build> \
+  OTHER_SWIFT_FLAGS=-DSONAR_KEYBOARD_BENCH build
+
+xcrun devicectl device process launch --device <core-device-id> \
+  --terminate-existing --environment-variables \
+  '{"SONAR_BENCH_KEYBOARD_TAIL":"1"}' sh.hedwig.sonar
+```
+
+Open a chat at its newest message and repeat keyboard show/dismiss transitions.
+The marker records transcript-revision evaluations and IDs visited, native
+observer attachment requests/scans, offset samples, viewport shrink callbacks,
+and requested/executed tail corrections. Copy the bounded app log through
+CoreDevice and aggregate only the content-free markers:
+
+```bash
+xcrun devicectl device copy from --device <core-device-id> \
+  --domain-type appDataContainer --domain-identifier sh.hedwig.sonar \
+  --source 'Library/Application Support/sonar-marmot/logs/ios/sonar-ios.log' \
+  --destination /tmp/sonar-ios.log
+scripts/bench/_keyboard_tail_aggregate.py --last 16 /tmp/sonar-ios.log
+```
+
+The implementation follows Signal-iOS's conversation pattern: capture
+`wasScrolledToBottom` before changing insets, preserve the tail with a
+non-animated correction, and coalesce rapid safe-area changes with a 10 ms
+last-event-only limiter. See Signal's
+[`updateContentInsets`](https://github.com/signalapp/Signal-iOS/blob/2f109075a7a3471686fbd4308991746fec7677a5/Signal/ConversationView/ConversationViewController%2BOWS.swift#L95-L132)
+and
+[`updateContentInsetsEvent`](https://github.com/signalapp/Signal-iOS/blob/2f109075a7a3471686fbd4308991746fec7677a5/Signal/ConversationView/ConversationViewController.swift#L56-L64),
+backed by Signal's
+[`DebouncedEventLastOnly`](https://github.com/signalapp/Signal-iOS/blob/2f109075a7a3471686fbd4308991746fec7677a5/SignalServiceKit/Util/DebouncedEvent.swift#L91-L137).
+
 ## Where to speed up (highest impact first)
 
 1. ~~**Don't block sync on the publishes.**~~ **DONE (2026-07):**

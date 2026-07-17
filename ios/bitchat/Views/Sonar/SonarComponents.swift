@@ -15,6 +15,9 @@ import SwiftUI
 import WebKit
 import QuickLook
 import SonarCore
+#if SONAR_KEYBOARD_BENCH
+import os.log
+#endif
 #if canImport(BitLogger)
 import BitLogger
 #endif
@@ -704,6 +707,33 @@ enum SNTailPinAction: Equatable {
     case animate
 }
 
+/// O(1) identity for transcript changes that can affect the live edge. A
+/// bounded window can replace its tail without changing count, so both fields
+/// are required; intermediate row identities do not change tail-following.
+struct SNTailRevision: Equatable {
+    let itemCount: Int
+    let tailID: String?
+}
+
+/// Signal coalesces rapid safe-area/inset notifications with a 10 ms,
+/// last-event-only debounce. Keyboard layout steps all request the same snap,
+/// so keep at most one pending main-queue correction per debounce window.
+struct SNTailSnapCoalescer {
+    private(set) var isScheduled = false
+
+    mutating func request() -> Bool {
+        guard !isScheduled else { return false }
+        isScheduled = true
+        return true
+    }
+
+    mutating func consume() -> Bool {
+        guard isScheduled else { return false }
+        isScheduled = false
+        return true
+    }
+}
+
 /// Previous-frame tail state, mirroring Android's `TranscriptTailPinner`.
 /// Sentinel disappearance alone is ambiguous: a keyboard/composer shrink, a
 /// newly appended row, and a user's scroll all hide it. Keep the prior pinned
@@ -865,6 +895,105 @@ struct SNUserScrollOffsetClassifier {
     }
 }
 
+#if SONAR_KEYBOARD_BENCH && os(iOS)
+/// Opt-in, content-free counters for the keyboard/tail benchmark. Normal
+/// builds contain none of this probe; benchmark builds also require
+/// `SONAR_BENCH_KEYBOARD_TAIL=1` at launch.
+final class SNKeyboardTailBenchmark {
+    static let shared = SNKeyboardTailBenchmark()
+    private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "keyboard-bench")
+
+    private let enabled = ProcessInfo.processInfo.environment["SONAR_BENCH_KEYBOARD_TAIL"] == "1"
+    private var generation = 0
+    private var startedAt: TimeInterval?
+    private var animationDurationMs = 0.0
+    private var messageRevisionEvaluations = 0
+    private var messageIDsVisited = 0
+    private var observerAttachRequests = 0
+    private var observerAncestorScans = 0
+    private var offsetSamples = 0
+    private var viewportShrinks = 0
+    private var tailRequests = 0
+    private var tailExecutions = 0
+
+    private init() {}
+
+    func begin(_ notification: Notification) {
+        guard enabled else { return }
+        if startedAt != nil { finish(overlapped: true) }
+        generation &+= 1
+        startedAt = ProcessInfo.processInfo.systemUptime
+        animationDurationMs = ((notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey]
+            as? NSNumber)?.doubleValue ?? 0.25) * 1_000
+        messageRevisionEvaluations = 0
+        messageIDsVisited = 0
+        observerAttachRequests = 0
+        observerAncestorScans = 0
+        offsetSamples = 0
+        viewportShrinks = 0
+        tailRequests = 0
+        tailExecutions = 0
+
+        let currentGeneration = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(animationDurationMs / 1_000, 0.25) + 0.15) {
+            [weak self] in
+            guard let self, self.generation == currentGeneration else { return }
+            self.finish(overlapped: false)
+        }
+    }
+
+    func recordMessageRevision(idsVisited: Int) {
+        guard enabled, startedAt != nil else { return }
+        messageRevisionEvaluations += 1
+        messageIDsVisited += idsVisited
+    }
+
+    func recordObserverAttachRequest() {
+        guard enabled, startedAt != nil else { return }
+        observerAttachRequests += 1
+    }
+
+    func recordObserverAncestorScan() {
+        guard enabled, startedAt != nil else { return }
+        observerAncestorScans += 1
+    }
+
+    func recordOffsetSample() {
+        guard enabled, startedAt != nil else { return }
+        offsetSamples += 1
+    }
+
+    func recordViewportShrink() {
+        guard enabled, startedAt != nil else { return }
+        viewportShrinks += 1
+    }
+
+    func recordTailRequest() {
+        guard enabled, startedAt != nil else { return }
+        tailRequests += 1
+    }
+
+    func recordTailExecution() {
+        guard enabled, startedAt != nil else { return }
+        tailExecutions += 1
+    }
+
+    private func finish(overlapped: Bool) {
+        guard enabled, let startedAt else { return }
+        let wallMs = (ProcessInfo.processInfo.systemUptime - startedAt) * 1_000
+        let marker = "SONAR_BENCH keyboard_tail generation=\(generation) wall_ms=\(String(format: "%.2f", wallMs)) "
+                + "animation_ms=\(String(format: "%.2f", animationDurationMs)) revisions=\(messageRevisionEvaluations) "
+                + "ids_visited=\(messageIDsVisited) attach_requests=\(observerAttachRequests) "
+                + "ancestor_scans=\(observerAncestorScans) offset_samples=\(offsetSamples) "
+                + "viewport_shrinks=\(viewportShrinks) tail_requests=\(tailRequests) "
+                + "tail_executions=\(tailExecutions) overlapped=\(overlapped ? 1 : 0)"
+        os_log("%{public}@", log: Self.log, type: .info, marker)
+        SecureLogger.info(marker, category: .session)
+        self.startedAt = nil
+    }
+}
+#endif
+
 func snShouldRecordUserScroll(
     _ activity: SNUserScrollActivity,
     isNearBottom: Bool
@@ -889,25 +1018,33 @@ func snShouldRecordUserScroll(
 /// UIKit drag flags remain false.
 private struct SNUserScrollObserver: UIViewRepresentable {
     let onUserScroll: (SNUserScrollActivity) -> Void
+    let onViewportWillChange: (Notification) -> Void
 
     func makeUIView(context: Context) -> ObserverView {
         let view = ObserverView()
         view.onUserScroll = onUserScroll
+        view.onViewportWillChange = onViewportWillChange
         return view
     }
 
     func updateUIView(_ uiView: ObserverView, context: Context) {
         uiView.onUserScroll = onUserScroll
-        uiView.attachWhenReady()
+        uiView.onViewportWillChange = onViewportWillChange
+        #if SONAR_KEYBOARD_BENCH
+        SNKeyboardTailBenchmark.shared.recordObserverAttachRequest()
+        #endif
+        uiView.attachWhenNeeded()
     }
 
     final class ObserverView: UIView {
         var onUserScroll: (SNUserScrollActivity) -> Void = { _ in }
+        var onViewportWillChange: (Notification) -> Void = { _ in }
         private weak var observedScrollView: UIScrollView?
         private var contentOffsetObservation: NSKeyValueObservation?
         private var offsetClassifier = SNUserScrollOffsetClassifier()
         private var keyboardFrameObserver: NSObjectProtocol?
         private var viewportTransitionDeadline: TimeInterval = 0
+        private var attachmentScheduled = false
 
         deinit {
             if let keyboardFrameObserver {
@@ -927,7 +1064,23 @@ private struct SNUserScrollObserver: UIViewRepresentable {
 
         func attachWhenReady() {
             observeKeyboardFramesIfNeeded()
-            DispatchQueue.main.async { [weak self] in self?.attachToEnclosingScrollView() }
+            scheduleAttachment()
+        }
+
+        func attachWhenNeeded() {
+            observeKeyboardFramesIfNeeded()
+            guard observedScrollView == nil else { return }
+            scheduleAttachment()
+        }
+
+        private func scheduleAttachment() {
+            guard !attachmentScheduled else { return }
+            attachmentScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.attachmentScheduled = false
+                self.attachToEnclosingScrollView()
+            }
         }
 
         private func observeKeyboardFramesIfNeeded() {
@@ -937,15 +1090,20 @@ private struct SNUserScrollObserver: UIViewRepresentable {
                 object: nil,
                 queue: .main
             ) { [weak self] notification in
+                guard let self else { return }
                 let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey]
                     as? NSNumber)?.doubleValue ?? 0.25
-                self?.viewportTransitionDeadline = Date.timeIntervalSinceReferenceDate
+                self.viewportTransitionDeadline = Date.timeIntervalSinceReferenceDate
                     + max(duration, 0.25)
                     + 0.1
+                self.onViewportWillChange(notification)
             }
         }
 
         private func attachToEnclosingScrollView() {
+            #if SONAR_KEYBOARD_BENCH
+            SNKeyboardTailBenchmark.shared.recordObserverAncestorScan()
+            #endif
             var ancestor = superview
             while let view = ancestor, !(view is UIScrollView) {
                 ancestor = view.superview
@@ -961,6 +1119,9 @@ private struct SNUserScrollObserver: UIViewRepresentable {
             contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) {
                 [weak self] scrollView, _ in
                 guard let self else { return }
+                #if SONAR_KEYBOARD_BENCH
+                SNKeyboardTailBenchmark.shared.recordOffsetSample()
+                #endif
                 let isTouchScrolling = scrollView.isTracking
                     || scrollView.isDragging
                     || scrollView.isDecelerating
@@ -989,6 +1150,7 @@ private struct SNUserScrollObserver: UIViewRepresentable {
 #else
 private struct SNUserScrollObserver: NSViewRepresentable {
     let onUserScroll: () -> Void
+    let onViewportWillChange: (Notification) -> Void
 
     func makeNSView(context: Context) -> ObserverView {
         let view = ObserverView()
@@ -1089,6 +1251,8 @@ struct SNMsgList: View {
     @State private var unreadAnchorAbandoned = false
     /// Carries the prior pinned state across viewport/content layout changes.
     @State private var tailPin = SNTailPinLatch()
+    /// At most one non-animated tail correction per Signal-style 10 ms window.
+    @State private var tailSnapCoalescer = SNTailSnapCoalescer()
     /// Last observed list viewport height; a decrease is a shrink to re-pin
     /// against. Seeded in onAppear — onChange alone misses the first shrink.
     @State private var viewportHeight: CGFloat = 0
@@ -1099,8 +1263,11 @@ struct SNMsgList: View {
     /// bounded transcript reaches capacity, a send replaces an old row and
     /// keeps `msgs.count` constant; observing only the count strands the new
     /// tail below the keyboard until the user scrolls manually.
-    private var messageRevision: [String] {
-        msgs.map(\.id)
+    private var messageRevision: SNTailRevision {
+        #if SONAR_KEYBOARD_BENCH && os(iOS)
+        SNKeyboardTailBenchmark.shared.recordMessageRevision(idsVisited: msgs.isEmpty ? 0 : 1)
+        #endif
+        return SNTailRevision(itemCount: msgs.count, tailID: msgs.last?.id)
     }
 
     /// True once the visible rows have caught up with the newest message the
@@ -1167,7 +1334,24 @@ struct SNMsgList: View {
         animateAppends: Bool = true
     ) {
         guard action != .none else { return }
+        #if SONAR_KEYBOARD_BENCH && os(iOS)
+        SNKeyboardTailBenchmark.shared.recordTailRequest()
+        #endif
+        if action == .snap {
+            guard tailSnapCoalescer.request() else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+                guard tailSnapCoalescer.consume() else { return }
+                #if SONAR_KEYBOARD_BENCH && os(iOS)
+                SNKeyboardTailBenchmark.shared.recordTailExecution()
+                #endif
+                proxy.scrollTo("sn-bottom", anchor: .bottom)
+            }
+            return
+        }
         DispatchQueue.main.async {
+            #if SONAR_KEYBOARD_BENCH && os(iOS)
+            SNKeyboardTailBenchmark.shared.recordTailExecution()
+            #endif
             if action == .animate, animateAppends, !reduceMotion {
                 withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
             } else {
@@ -1303,7 +1487,20 @@ struct SNMsgList: View {
                     // A modifier on ScrollView itself is a native sibling, so
                     // ancestor lookup cannot reach UIScrollView/NSScrollView.
                     .background(
-                        SNUserScrollObserver(onUserScroll: noteUserScroll)
+                        SNUserScrollObserver(
+                            onUserScroll: noteUserScroll,
+                            onViewportWillChange: { notification in
+                                #if SONAR_KEYBOARD_BENCH && os(iOS)
+                                SNKeyboardTailBenchmark.shared.begin(notification)
+                                #endif
+                                let action = tailPin.viewportWillChange(
+                                    isNearBottom: isNearBottom,
+                                    userScrolling: isUserScrolling,
+                                    isPrepending: isLoadingOlder
+                                )
+                                followTail(action, proxy: proxy)
+                            }
+                        )
                             .frame(width: 0, height: 0)
                             .accessibilityHidden(true)
                     )
@@ -1367,22 +1564,6 @@ struct SNMsgList: View {
                     // folded chat never visibly chases its late local rows.
                     followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                 }
-                #if os(iOS)
-                // Capture the pre-keyboard tail state before SwiftUI changes
-                // the safe-area/viewport. The native observer suppresses the
-                // matching non-touch offset clamp until this transition ends;
-                // actual finger scrolling remains authoritative.
-                .onReceive(NotificationCenter.default.publisher(
-                    for: UIResponder.keyboardWillChangeFrameNotification
-                )) { _ in
-                    let action = tailPin.viewportWillChange(
-                        isNearBottom: isNearBottom,
-                        userScrolling: isUserScrolling,
-                        isPrepending: isLoadingOlder
-                    )
-                    followTail(action, proxy: proxy)
-                }
-                #endif
                 // Any list-viewport shrink — each keyboard layout step, the
                 // composer growing a line, a macOS window resize — re-anchors
                 // the tail while the reader is pinned there. Matches the
@@ -1392,6 +1573,9 @@ struct SNMsgList: View {
                     let previous = viewportHeight
                     viewportHeight = newHeight
                     guard previous > 0, newHeight < previous else { return }
+                    #if SONAR_KEYBOARD_BENCH && os(iOS)
+                    SNKeyboardTailBenchmark.shared.recordViewportShrink()
+                    #endif
                     let action = tailPin.viewportShrank(
                         userScrolling: isUserScrolling,
                         isPrepending: isLoadingOlder
