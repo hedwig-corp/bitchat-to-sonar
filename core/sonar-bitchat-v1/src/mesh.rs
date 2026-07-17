@@ -475,12 +475,9 @@ impl Announce {
 /// `SHA256(noise_pubkey)` → first 8 bytes → 16 lowercase hex chars
 /// (== `BLEService` peerID derivation).
 pub fn peer_id_from_noise_key(noise_public_key: &[u8]) -> String {
-    use nostr::hashes::{sha256, Hash};
-    let digest = sha256::Hash::hash(noise_public_key);
-    digest.as_byte_array()[..8]
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(noise_public_key);
+    digest[..8].iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 // ── Ed25519 mesh signing identity + announce sign/verify ──

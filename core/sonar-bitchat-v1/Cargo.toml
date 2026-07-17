@@ -1,0 +1,15 @@
+[package]
+name = "sonar-bitchat-v1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "bitchat v1 mesh: byte-exact wire protocol, Noise XX sessions, and the platform-neutral link state machine"
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
+getrandom = "0.2"
+hex.workspace = true
+sha2 = "0.10"
+snow = "0.9"

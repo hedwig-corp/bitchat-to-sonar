@@ -14,7 +14,7 @@ const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_SHA256";
 
 impl From<snow::Error> for Error {
     fn from(e: snow::Error) -> Self {
-        Error::Storage(format!("noise: {e:?}"))
+        Error::Noise(format!("noise: {e:?}"))
     }
 }
 
@@ -126,7 +126,7 @@ impl NoiseSession {
     /// and out-of-order / gap messages are rejected before decryption.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         if ciphertext.len() < 4 + 16 {
-            return Err(Error::Storage("noise: transport message too short".into()));
+            return Err(Error::Noise("noise: transport message too short".into()));
         }
         let wire_nonce =
             u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
