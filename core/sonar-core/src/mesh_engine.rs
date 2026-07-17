@@ -63,6 +63,8 @@ pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
 const SEEN_CAP: usize = 1024;
 const MAX_PENDING_SENDS_PER_PEER: usize = 64;
+/// Minimum spacing between instance re-discoveries on one connection.
+const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
 /// Soft cap on the identity maps (signing key / fingerprint per sender id):
 /// sender ids rotate and can be attacker-minted, so an unbounded map is a
 /// slow leak. Clearing wholesale is safe — entries repopulate from the next
@@ -93,6 +95,12 @@ pub enum Command {
     /// Cancel the SERVER-role connection from an inbound central. Must not
     /// touch a client GATT we hold toward the same address.
     CancelServer { conn: String },
+    /// Re-run service discovery on an existing client connection. Emitted when
+    /// a server-leg Direct announce proves a peer app is alive behind a client
+    /// connection that has no instance link for it (e.g. its CCC subscribe
+    /// failed and the dead link was culled) — without this, a lost instance
+    /// has no recovery path until the whole connection drops.
+    RefreshInstances { conn: String },
     Subscribe { conn: String, instance: i32 },
     WriteLink { conn: String, instance: i32, bytes: Vec<u8>, after_ms: u64 },
     NotifyConn { conn: String, bytes: Vec<u8>, after_ms: u64 },
@@ -227,6 +235,8 @@ pub struct Engine {
 
     last_heartbeat_ms: u64,
     last_tick_ms: u64,
+    /// Last instance re-discovery per connection (see `RefreshInstances`).
+    last_refresh_ms: HashMap<String, u64>,
     /// Wire timestamps are WALL-clock milliseconds (bitchat protocol), while
     /// every deadline/liveness decision uses the monotonic `now_ms` — a wall
     /// clock would cull links on an NTP jump, and a monotonic clock on the
@@ -278,6 +288,7 @@ impl Engine {
             reassembler: mesh::fragment::Reassembler::new(),
             last_heartbeat_ms: 0,
             last_tick_ms: 0,
+            last_refresh_ms: HashMap::new(),
             wall_minus_mono_ms: 0,
             fragment_seq: 0,
         })
@@ -634,6 +645,10 @@ impl Engine {
             out.commands.push(Command::CancelServer { conn });
         }
 
+        // Keep the refresh-cooldown map from growing across rotating handles.
+        self.last_refresh_ms
+            .retain(|_, t| now_ms.saturating_sub(*t) < REFRESH_INSTANCES_COOLDOWN_MS);
+
         // Backstop for dial deadlines the driver failed to schedule.
         let expired: Vec<String> = self
             .dialing
@@ -858,6 +873,7 @@ impl Engine {
         self.reassembler = mesh::fragment::Reassembler::new();
         self.last_heartbeat_ms = 0;
         self.last_tick_ms = 0;
+        self.last_refresh_ms.clear();
     }
 
     // ── Internals ──
@@ -1285,6 +1301,31 @@ impl Engine {
         }
         if !direct {
             return;
+        }
+        // A Direct announce over the SERVER role proves the peer app is alive
+        // — but the peripheral waits for the peer's 0x10, so if our CLIENT
+        // connection to the same handle has no instance link for this peer
+        // (its CCC subscribe failed, or the dead link was culled), the peer is
+        // unreachable for DMs with no recovery until the whole connection
+        // drops. Re-discover instances so the client side can re-subscribe and
+        // initiate. (On platforms where server/client handles differ this
+        // never fires; the cooldown bounds discovery churn.)
+        if let Origin::Server(conn) = &origin {
+            let has_client_route = self
+                .links
+                .iter()
+                .any(|(id, l)| id.conn == *conn && l.bind.fingerprint.as_deref() == Some(&fp));
+            if self.connected.contains(conn) && !has_client_route && self.sendable_route(&fp).is_none() {
+                let due = self
+                    .last_refresh_ms
+                    .get(conn)
+                    .map(|t| now_ms.saturating_sub(*t) >= REFRESH_INSTANCES_COOLDOWN_MS)
+                    .unwrap_or(true);
+                if due {
+                    self.last_refresh_ms.insert(conn.clone(), now_ms);
+                    out.commands.push(Command::RefreshInstances { conn: conn.clone() });
+                }
+            }
         }
         // Central opens the Noise link for DMs (initiator); peripheral waits
         // for the peer's 0x10. Retry a half-open handshake after
@@ -2217,6 +2258,47 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, Command::Disconnect { .. })));
+    }
+
+    #[test]
+    fn server_direct_announce_without_client_route_triggers_rediscovery() {
+        // Peer app alive behind our live client connection (it announces over
+        // its own inbound central leg) but its instance link is gone: the
+        // engine must ask the driver to re-discover so the client side can
+        // re-subscribe and initiate — otherwise the peer is unreachable for
+        // DMs until the whole connection drops.
+        let mut a = engine(1, "pixel");
+        let peer = engine(9, "vincent-osx");
+        let now = 1_000;
+        a.on_dial_request("84:2F", now);
+        a.on_client_connected("84:2F", now);
+        a.on_instances_discovered("84:2F", &[25], now);
+        a.on_subscribe_result("84:2F", 25, true, now);
+        // Complete the dial with the OTHER app's announce so the connection
+        // survives the announce deadline.
+        let sonar_mac = engine(5, "Vincenzo-Mac");
+        let ann = sonar_mac.announce_bytes(now).unwrap();
+        a.on_client_rx("84:2F", 25, &ann, now);
+        // vincent-osx announces via the server leg (same handle on Android).
+        a.on_server_connected("84:2F", now);
+        let ann_osx = peer.announce_bytes(now).unwrap();
+        let out = a.on_server_rx("84:2F", &ann_osx, now);
+        assert!(
+            out.commands
+                .iter()
+                .any(|c| matches!(c, Command::RefreshInstances { conn } if conn == "84:2F")),
+            "must re-discover instances, got {:?}",
+            out.commands
+        );
+        // Cooldown: an immediate repeat announce must not re-trigger.
+        let again = a.on_server_rx("84:2F", &peer.announce_bytes(now + 10).unwrap(), now + 10);
+        assert!(
+            !again
+                .commands
+                .iter()
+                .any(|c| matches!(c, Command::RefreshInstances { .. })),
+            "cooldown must suppress repeats"
+        );
     }
 
     #[test]

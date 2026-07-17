@@ -2440,6 +2440,9 @@ pub enum MeshEngineCommand {
     /// Cancel the SERVER-role connection from an inbound central. Must not
     /// touch a client GATT we hold toward the same address.
     CancelServer { conn: String },
+    /// Re-run service discovery on an existing client connection (a lost
+    /// instance link has no other recovery while the connection lives).
+    RefreshInstances { conn: String },
     /// Enable notifications on the mesh characteristic of service `instance`.
     Subscribe { conn: String, instance: i32 },
     /// Write one packet value to a client link, `after_ms` from now.
@@ -2511,6 +2514,9 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                 }
                 mesh_engine::Command::CancelServer { conn } => {
                     MeshEngineCommand::CancelServer { conn }
+                }
+                mesh_engine::Command::RefreshInstances { conn } => {
+                    MeshEngineCommand::RefreshInstances { conn }
                 }
                 mesh_engine::Command::Subscribe { conn, instance } => {
                     MeshEngineCommand::Subscribe { conn, instance }

@@ -324,6 +324,11 @@ object MeshGatt {
             is MeshEngineCommand.Dial -> dial(cmd.conn)
             is MeshEngineCommand.Disconnect -> disconnectClient(cmd.conn)
             is MeshEngineCommand.CancelServer -> cancelServer(cmd.conn)
+            is MeshEngineCommand.RefreshInstances -> {
+                android.util.Log.i(TAG, "re-discovering services on ${cmd.conn}")
+                @SuppressLint("MissingPermission")
+                gattByAddr[cmd.conn]?.discoverServices()
+            }
             is MeshEngineCommand.Subscribe -> subscribe(cmd.conn, cmd.instance)
             is MeshEngineCommand.WriteLink -> {
                 val run = Runnable {
@@ -530,6 +535,9 @@ object MeshGatt {
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
+            // Keep the per-packet rx trace the diagnostics bundle relied on
+            // (the engine itself never logs).
+            android.util.Log.i(TAG, "rx ${value.size}B ← ${gatt.device.address}#${ch.service.instanceId}")
             transact { engine.onClientRx(gatt.device.address, ch.service.instanceId, value, nowMs()) }
         }
 
@@ -577,6 +585,7 @@ object MeshGatt {
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+            android.util.Log.i(TAG, "rx ${value.size}B ← ${device.address} (server)")
             transact { engine.onServerRx(device.address, value, nowMs()) }
         }
     }
