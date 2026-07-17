@@ -18,6 +18,7 @@ class RelayDiagnosticsAndroidTest {
               "live_marmot_enabled": true,
               "subscribed_group_count": 3,
               "relays": [
+                {"url": "wss://[2001:db8::1]:443/path", "status": "Connected"},
                 {"url": "wss://nostr.relay.hedwig.sh/", "status": "Connected"},
                 {"url": "wss://relay.damus.io", "status": "disconnected"}
               ]
@@ -26,10 +27,11 @@ class RelayDiagnosticsAndroidTest {
         )
 
         assertNotNull(snapshot)
-        assertEquals(2, snapshot!!.relays.size)
-        assertEquals("wss://nostr.relay.hedwig.sh/", snapshot.relays[0].url)
+        assertEquals(3, snapshot!!.relays.size)
+        assertEquals("wss://[2001:db8::1]:443/path", snapshot.relays[0].url)
         assertEquals("Connected", snapshot.relays[0].status)
-        assertEquals("wss://relay.damus.io", snapshot.relays[1].url)
-        assertEquals("disconnected", snapshot.relays[1].status)
+        assertEquals("wss://nostr.relay.hedwig.sh/", snapshot.relays[1].url)
+        assertEquals("wss://relay.damus.io", snapshot.relays[2].url)
+        assertEquals("disconnected", snapshot.relays[2].status)
     }
 }

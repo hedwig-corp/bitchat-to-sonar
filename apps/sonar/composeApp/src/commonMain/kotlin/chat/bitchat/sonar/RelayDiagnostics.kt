@@ -216,19 +216,89 @@ private fun extractBoolField(json: String, key: String): Boolean? {
 }
 
 private fun extractRelayEntries(json: String): List<RelaySyncEntry> {
-    val arrayMatch = Regex("\"relays\"\\s*:\\s*\\[(.*?)]", setOf(RegexOption.DOT_MATCHES_ALL))
-        .find(json)
-        ?: return emptyList()
-    val body = arrayMatch.groupValues[1]
-    val objects = Regex("\\{(.*?)\\}", setOf(RegexOption.DOT_MATCHES_ALL)).findAll(body)
+    val body = extractJsonArrayBody(json, "relays") ?: return emptyList()
     val out = ArrayList<RelaySyncEntry>()
-    for (obj in objects) {
-        val chunk = obj.groupValues[1]
+    for (chunk in extractTopLevelJsonObjects(body)) {
         val url = extractStringField(chunk, "url") ?: continue
         val status = extractStringField(chunk, "status") ?: "unknown"
         out.add(RelaySyncEntry(url = url, status = status))
     }
     return out
+}
+
+private fun extractJsonArrayBody(json: String, key: String): String? {
+    val match = Regex("\"${Regex.escape(key)}\"\\s*:\\s*\\[").find(json) ?: return null
+    val openingBracket = match.range.last
+    val closingBracket = findClosingJsonDelimiter(json, openingBracket, '[', ']') ?: return null
+    return json.substring(openingBracket + 1, closingBracket)
+}
+
+private fun findClosingJsonDelimiter(
+    json: String,
+    start: Int,
+    opening: Char,
+    closing: Char,
+): Int? {
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (i in start until json.length) {
+        val c = json[i]
+        if (inString) {
+            when {
+                escaped -> escaped = false
+                c == '\\' -> escaped = true
+                c == '"' -> inString = false
+            }
+            continue
+        }
+        when (c) {
+            '"' -> inString = true
+            opening -> depth++
+            closing -> {
+                depth--
+                if (depth == 0) return i
+                if (depth < 0) return null
+            }
+        }
+    }
+    return null
+}
+
+private fun extractTopLevelJsonObjects(json: String): List<String> {
+    val objects = ArrayList<String>()
+    var objectStart = -1
+    var depth = 0
+    var inString = false
+    var escaped = false
+    for (i in json.indices) {
+        val c = json[i]
+        if (inString) {
+            when {
+                escaped -> escaped = false
+                c == '\\' -> escaped = true
+                c == '"' -> inString = false
+            }
+            continue
+        }
+        when (c) {
+            '"' -> inString = true
+            '{' -> {
+                if (depth == 0) objectStart = i
+                depth++
+            }
+            '}' -> {
+                if (depth > 0) {
+                    depth--
+                    if (depth == 0 && objectStart >= 0) {
+                        objects.add(json.substring(objectStart + 1, i))
+                        objectStart = -1
+                    }
+                }
+            }
+        }
+    }
+    return objects
 }
 
 private fun extractStringField(json: String, key: String): String? {
