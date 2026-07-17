@@ -2224,9 +2224,9 @@ final class MarmotChatModel: ObservableObject {
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
+                // Blossom upload does not require an active relay socket. The
+                // core records the message locally and its durable outbox will
+                // publish when relays recover, matching the text-send path.
                 try await service.sendMedia(
                     groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
                 )
@@ -2293,9 +2293,8 @@ final class MarmotChatModel: ObservableObject {
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
+                // See sendMedia: relay delivery is owned by the core outbox,
+                // so a temporarily disconnected relay must not block upload.
                 try await service.sendMediaMulti(groupId: groupId, items: items, caption: caption)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)

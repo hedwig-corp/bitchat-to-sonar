@@ -88,10 +88,18 @@ const MAX_MEDIA_DOWNLOAD_BYTES: usize = MAX_MEDIA_PLAINTEXT_BYTES + MIP04_AEAD_T
 const BLOSSOM_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Ceiling for the size-scaled upload deadline: even a max-size blob on a slow
 /// uplink must eventually fail into the retryable state instead of hanging.
-const BLOSSOM_UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(300);
+const BLOSSOM_UPLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(15 * 60);
 /// Worst-case sustained uplink assumed when scaling the upload deadline
-/// (slow cellular). 25 MiB at this rate needs ~256s, still under the ceiling.
-const BLOSSOM_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 100 * 1024;
+/// (constrained cellular). 25 MiB at this rate needs ~800s, still under the
+/// ceiling. The old 100 KiB/s assumption rejected a progressing upload on a
+/// scarce but usable connection.
+const BLOSSOM_UPLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
+/// Blossom PUT is content-addressed and idempotent, so transient transport and
+/// server failures can safely restart the upload. Keep the attempt count
+/// bounded because Blossom does not support resuming a partial PUT yet.
+const BLOSSOM_UPLOAD_ATTEMPTS: usize = 4;
+const BLOSSOM_UPLOAD_RETRY_DELAY: Duration = Duration::from_secs(1);
+const BLOSSOM_UPLOAD_RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -3619,12 +3627,14 @@ impl SonarClient {
         // single message. Any failure aborts the whole album with nothing sent.
         let mut uploads = Vec::with_capacity(items.len());
         for item in &items {
-            let upload =
+            let mut upload =
                 self.engine
                     .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
-            let url = self
-                .blossom_upload(server_url, upload.encrypted_data.clone())
-                .await?;
+            // The imeta builder only needs metadata after the PUT. Moving the
+            // ciphertext out avoids retaining an extra full-size copy during
+            // retry, which matters on memory-constrained Android devices.
+            let ciphertext = std::mem::take(&mut upload.encrypted_data);
+            let url = self.blossom_upload(server_url, ciphertext).await?;
             uploads.push((upload, url));
         }
         let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
@@ -3712,16 +3722,36 @@ impl SonarClient {
     /// Nostr key, returning the URL where it can be fetched.
     async fn blossom_upload(&self, server_url: &str, data: Vec<u8>) -> Result<String> {
         let timeout = blossom_upload_timeout(data.len());
-        self.blossom_upload_with_timeout(server_url, data, timeout)
-            .await
+        self.blossom_upload_with_policy(
+            server_url,
+            data,
+            timeout,
+            BLOSSOM_UPLOAD_ATTEMPTS,
+            BLOSSOM_UPLOAD_RETRY_DELAY,
+        )
+        .await
     }
 
+    #[cfg(test)]
     async fn blossom_upload_with_timeout(
         &self,
         server_url: &str,
         data: Vec<u8>,
         timeout: Duration,
     ) -> Result<String> {
+        self.blossom_upload_with_policy(server_url, data, timeout, 1, Duration::ZERO)
+            .await
+    }
+
+    async fn blossom_upload_with_policy(
+        &self,
+        server_url: &str,
+        data: Vec<u8>,
+        timeout: Duration,
+        attempts: usize,
+        retry_delay: Duration,
+    ) -> Result<String> {
+        debug_assert!(attempts > 0);
         let server = if server_url.is_empty() {
             DEFAULT_BLOSSOM_SERVER
         } else {
@@ -3730,24 +3760,64 @@ impl SonarClient {
         let base = Url::parse(server)
             .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
         let client = BlossomClient::new(base);
-        let descriptor = tokio::time::timeout(
-            timeout,
-            client.upload_blob(
-                data,
-                Some(ENCRYPTED_BLOB_MIME_TYPE.to_string()),
-                None,
-                Some(self.identity().keys()),
-            ),
-        )
-        .await
-        .map_err(|_| {
+        // Attempts and backoff share one deadline. A server that waits for the
+        // whole body and then returns 5xx must not multiply a 15-minute upload
+        // budget by the retry count.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let timeout_error = || {
             Error::Blossom(format!(
                 "upload to {server} timed out after {} seconds",
                 timeout.as_secs()
             ))
-        })?
-        .map_err(|e| Error::Blossom(e.to_string()))?;
-        Ok(descriptor.url.to_string())
+        };
+        let mut data = Some(data);
+        for attempt in 1..=attempts {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(timeout_error());
+            }
+            // Retain one source buffer until the final attempt. reqwest owns
+            // each request body, so a retry necessarily needs a fresh Vec.
+            let attempt_data = if attempt == attempts {
+                data.take().expect("upload data available")
+            } else {
+                data.as_ref().expect("upload data available").clone()
+            };
+            let result = tokio::time::timeout(
+                remaining,
+                client.upload_blob(
+                    attempt_data,
+                    Some(ENCRYPTED_BLOB_MIME_TYPE.to_string()),
+                    None,
+                    Some(self.identity().keys()),
+                ),
+            )
+            .await;
+            match result {
+                Ok(Ok(descriptor)) => return Ok(descriptor.url.to_string()),
+                Ok(Err(error)) if attempt < attempts && retryable_blossom_upload_error(&error) => {
+                    let delay = blossom_upload_retry_delay(&error, attempt, retry_delay);
+                    tracing::warn!(
+                        attempt,
+                        attempts,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %error,
+                        "Blossom upload failed transiently; retrying"
+                    );
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(timeout_error());
+                    }
+                    tokio::time::sleep(delay.min(remaining)).await;
+                }
+                Ok(Err(error)) => return Err(Error::Blossom(error.to_string())),
+                // The deadline is already sized for a 32 KiB/s transfer. A
+                // timeout therefore represents a stalled request; starting it
+                // over repeatedly could retain media for up to an hour.
+                Err(_) => return Err(timeout_error()),
+            }
+        }
+        unreachable!("Blossom upload retry loop always returns")
     }
 
     /// The user's Blossom server list (kind-10063 / BUD-03). Empty if unset.
@@ -5633,6 +5703,44 @@ fn blossom_upload_timeout(len: usize) -> Duration {
     (BLOSSOM_UPLOAD_TIMEOUT + transfer).min(BLOSSOM_UPLOAD_TIMEOUT_MAX)
 }
 
+fn retryable_blossom_upload_error(error: &nostr_blossom::error::Error) -> bool {
+    match error {
+        // Connection resets, body I/O, timeouts, and malformed success bodies
+        // can all be transient. Builder and redirect errors are deterministic.
+        nostr_blossom::error::Error::Reqwest(error) => !error.is_builder() && !error.is_redirect(),
+        nostr_blossom::error::Error::Response { res, .. } => {
+            retryable_blossom_upload_status(res.status())
+        }
+        _ => false,
+    }
+}
+
+fn retryable_blossom_upload_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_EARLY
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn blossom_upload_retry_delay(
+    error: &nostr_blossom::error::Error,
+    failed_attempt: usize,
+    base_delay: Duration,
+) -> Duration {
+    if let nostr_blossom::error::Error::Response { res, .. } = error {
+        if let Some(seconds) = res
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            return Duration::from_secs(seconds).min(BLOSSOM_UPLOAD_RETRY_AFTER_MAX);
+        }
+    }
+    let exponent = failed_attempt.saturating_sub(1).min(31) as u32;
+    base_delay.saturating_mul(1u32 << exponent)
+}
+
 /// Chat-list preview text stored in the conversation index for `message`.
 /// The caption/text wins when present; a caption-less media message previews
 /// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
@@ -5785,7 +5893,39 @@ mod tests {
     use sha2::Digest;
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+
+    fn read_blossom_upload(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut chunk).expect("read upload request");
+            assert!(read > 0, "upload request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos;
+            }
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .expect("upload content length");
+        let body_start = header_end + 4;
+        while request.len() < body_start + content_length {
+            let read = stream.read(&mut chunk).expect("read upload body");
+            assert!(read > 0, "upload request ended before its body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        (
+            headers,
+            request[body_start..body_start + content_length].to_vec(),
+        )
+    }
 
     #[tokio::test]
     async fn blossom_upload_sends_binary_content_type_and_accepts_created() {
@@ -5796,33 +5936,8 @@ mod tests {
         );
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept upload");
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 4096];
-            let header_end = loop {
-                let read = stream.read(&mut chunk).expect("read upload request");
-                assert!(read > 0, "upload request ended before its headers");
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break pos;
-                }
-            };
-            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().expect("content length"))
-                })
-                .expect("upload content length");
-            let body_start = header_end + 4;
-            while request.len() < body_start + content_length {
-                let read = stream.read(&mut chunk).expect("read upload body");
-                assert!(read > 0, "upload request ended before its body");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let body = &request[body_start..body_start + content_length];
-            let sha = hex::encode(sha2::Sha256::digest(body));
+            let (headers, body) = read_blossom_upload(&mut stream);
+            let sha = hex::encode(sha2::Sha256::digest(&body));
             let json = format!(
                 "{{\"url\":\"http://blossom.test/{sha}\",\"sha256\":\"{sha}\",\"size\":{},\"type\":\"application/octet-stream\",\"uploaded\":0}}",
                 body.len()
@@ -5858,6 +5973,55 @@ mod tests {
             }),
             "encrypted uploads must use {ENCRYPTED_BLOB_MIME_TYPE}, got:\n{headers}"
         );
+    }
+
+    #[tokio::test]
+    async fn blossom_upload_retries_transient_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let server = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for attempt in 1..=2 {
+                let (mut stream, _) = listener.accept().expect("accept upload attempt");
+                let (_, body) = read_blossom_upload(&mut stream);
+                bodies.push(body);
+                if attempt == 1 {
+                    // Simulate an intermittent mobile connection disappearing
+                    // after the request body reached the server but before a
+                    // response came back.
+                    drop(stream);
+                    continue;
+                }
+                let sha = hex::encode(sha2::Sha256::digest(&bodies[1]));
+                let json = format!(
+                    "{{\"url\":\"http://blossom.test/{sha}\",\"sha256\":\"{sha}\",\"size\":{},\"type\":\"application/octet-stream\",\"uploaded\":0}}",
+                    bodies[1].len()
+                );
+                let response = format!(
+                    "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write success response");
+            }
+            bodies
+        });
+
+        let ciphertext = b"encrypted video ciphertext".to_vec();
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        client
+            .blossom_upload(&base, ciphertext.clone())
+            .await
+            .expect("transient failure is retried");
+
+        let bodies = server.join().expect("mock Blossom exits");
+        assert_eq!(bodies, vec![ciphertext.clone(), ciphertext]);
     }
 
     #[tokio::test]
@@ -6091,15 +6255,41 @@ mod tests {
         assert_eq!(blossom_upload_timeout(0), Duration::from_secs(60));
         assert_eq!(
             blossom_upload_timeout(1024 * 1024),
-            Duration::from_secs(60 + 10)
+            Duration::from_secs(60 + 32)
         );
         // A max-size video gets time to transfer on a slow uplink...
         assert_eq!(
             blossom_upload_timeout(MAX_MEDIA_PLAINTEXT_BYTES),
-            Duration::from_secs(300)
+            Duration::from_secs(60 + 800)
         );
         // ...but never beyond the ceiling, so stalls still fail retryable.
-        assert_eq!(blossom_upload_timeout(usize::MAX), Duration::from_secs(300));
+        assert_eq!(
+            blossom_upload_timeout(usize::MAX),
+            Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[test]
+    fn blossom_upload_retry_classifier_rejects_permanent_statuses() {
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ] {
+            assert!(!retryable_blossom_upload_status(status), "{status}");
+        }
+        for status in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_EARLY,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(retryable_blossom_upload_status(status), "{status}");
+        }
     }
 
     #[tokio::test]

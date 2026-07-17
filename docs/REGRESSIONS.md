@@ -314,6 +314,29 @@ invalidation for verified peer/profile changes.
 
 **Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
+
+## R-011 — Media uploads survive a scarce or intermittent connection
+
+**Invariant:** A Blossom upload retries idempotent transient transport failures, 408/425/429 responses, and 5xx responses with bounded exponential backoff; permanent client/auth/content errors fail immediately. All attempts share one overall size-scaled deadline that must admit a progressing 25 MiB upload at roughly 32 KiB/s.
+
+**Breaks as:** A photo, video, album, or voice note flips to "Couldn't send" after one brief connection drop, or a progressing video is killed only because the uplink is slower than 100 KiB/s.
+
+**Call sites:** shared core `client.rs::blossom_upload`; iOS `MarmotChatView.swift::sendMedia` / `sendMediaAlbum`; Compose `SonarAppState.kt::sendMediaAttachment` / `sendImageAlbum` / `sendVoiceNote`
+
+**Guarded by:** `client.rs::blossom_upload_retries_transient_failure`
+
+**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`
+
+**History:** #287 bounded a permanently stalled PUT at 60s -> #293 scaled the deadline for video but assumed at least 100 KiB/s -> this change adds transient retry/backoff and a constrained-cellular deadline for both apps.
+
+**Rejected:**
+- *Separate retry loops in Swift and Kotlin.* They drift, re-run encryption/album work, and cannot distinguish Blossom's permanent statuses as precisely as the shared transport layer.
+- *Retrying every failure.* Authentication, invalid request, unsupported content, and over-limit failures are deterministic; retrying them wastes data and battery.
+
+**Not guarded:** Blossom BUD-02 is a whole-blob PUT, so an interrupted attempt restarts from byte zero rather than resuming. Upload inputs are not yet a durable core job across process death. Signal persists resumable upload jobs; Sonar adopts its retry classification/backoff pattern here, while durable resumable uploads remain a tracked architecture gap.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
