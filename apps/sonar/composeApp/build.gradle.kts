@@ -8,11 +8,18 @@ plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose)
     alias(libs.plugins.compose.compiler)
-    alias(libs.plugins.google.services)
+    alias(libs.plugins.google.services) apply false
     // Bakes the generated Baseline Profile (src/androidRelease/generated/baselineProfiles)
     // into release APKs so cold starts and first compositions run AOT-compiled
     // (issue #305). Generation lives in :baselineprofile.
     alias(libs.plugins.baselineprofile)
+}
+
+// CI device tests do not need Firebase and must not depend on a production
+// google-services.json. Normal app builds still apply the plugin by default.
+val skipGoogleServices = providers.gradleProperty("sonar.skipGoogleServices").orNull == "true"
+if (!skipGoogleServices) {
+    apply(plugin = "com.google.gms.google-services")
 }
 
 // Breez API key from a gitignored secret — NEVER hardcode or commit it.
