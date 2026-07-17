@@ -52,6 +52,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -169,6 +170,10 @@ fun App(
 ) {
     val scope = rememberCoroutineScope()
     val state = remember { SonarAppState(scope) }
+    DisposableEffect(state) {
+        MeshRadio.setPeerUpdateListener(state::onMeshPeersChanged)
+        onDispose { MeshRadio.setPeerUpdateListener(null) }
+    }
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }

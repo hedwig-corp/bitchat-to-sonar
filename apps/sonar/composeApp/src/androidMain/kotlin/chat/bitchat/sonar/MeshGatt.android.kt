@@ -13,6 +13,7 @@ import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.os.SystemClock
+import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.crypto.Sha256
 import java.security.SecureRandom
 import java.util.UUID
@@ -355,6 +356,17 @@ object MeshGatt {
                     TAG,
                     "ANNOUNCE '${event.nickname}' peerId=${event.peerIdHex} fp=${event.fingerprint.take(8)}… direct=${event.direct}",
                 )
+                // Debug-only announce→Radar latency marker (PR #316 / R-008).
+                // Parsed with radar_peer_paint by scripts/bench/android-mesh-radar-bench.sh.
+                // Nick is URL-encoded so spaces/emoji stay one token for log parsers.
+                if (BuildConfig.DEBUG) {
+                    val nickToken = java.net.URLEncoder.encode(event.nickname, Charsets.UTF_8.name())
+                    android.util.Log.i(
+                        "SonarCore",
+                        "SONAR_BENCH mesh_announce nick=$nickToken " +
+                            "fp=${event.fingerprint.take(8)} direct=${if (event.direct) 1 else 0}",
+                    )
+                }
                 val info = MeshAnnounceInfo(
                     nickname = event.nickname,
                     noisePublicKeyHex = "",

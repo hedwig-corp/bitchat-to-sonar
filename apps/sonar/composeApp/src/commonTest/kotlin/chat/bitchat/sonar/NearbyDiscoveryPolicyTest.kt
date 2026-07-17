@@ -1,5 +1,6 @@
 package chat.bitchat.sonar
 
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.test.advanceTimeBy
@@ -13,6 +14,109 @@ import kotlin.test.assertTrue
 
 class NearbyDiscoveryPolicyTest {
     @Test
+    fun unchangedKnownPeerPolicyIsACompleteNoOp() {
+        assertNull(
+            changedKnownMeshPeerIds(
+                current = setOf("abcdef", "123456"),
+                requested = setOf("ABCDEF", "123456"),
+            ),
+        )
+        assertEquals(
+            setOf("abcdef", "fedcba"),
+            changedKnownMeshPeerIds(
+                current = setOf("abcdef"),
+                requested = setOf("ABCDEF", "FEDCBA"),
+            ),
+        )
+    }
+
+    @Test
+    fun freshAnnounceNeverCrossesNativeLinkBoundary() {
+        var linkChecks = 0
+        assertFalse(
+            shouldExpireAnnouncedMeshPeer(nowMs = 1_000, lastSeenMs = 900, staleMs = 200) {
+                linkChecks++
+                false
+            },
+        )
+        assertEquals(0, linkChecks)
+
+        assertTrue(
+            shouldExpireAnnouncedMeshPeer(nowMs = 1_200, lastSeenMs = 900, staleMs = 200) {
+                linkChecks++
+                false
+            },
+        )
+        assertEquals(1, linkChecks)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun peerUpdateBurstKeepsOnlyOnePendingRefresh() = runTest {
+        val releaseFirstRefresh = CompletableDeferred<Unit>()
+        var refreshCount = 0
+        val queue = ConflatedRefreshQueue(this) {
+            refreshCount++
+            if (refreshCount == 1) releaseFirstRefresh.await()
+        }
+
+        repeat(1_000) { queue.request() }
+        runCurrent()
+        assertEquals(1, refreshCount)
+
+        repeat(1_000) { queue.request() }
+        releaseFirstRefresh.complete(Unit)
+        runCurrent()
+        assertEquals(2, refreshCount)
+
+        queue.cancel()
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun refreshWorkerSurvivesTransientFailures() = runTest {
+        var refreshCount = 0
+        val queue = ConflatedRefreshQueue(this) {
+            refreshCount++
+            if (refreshCount == 1) error("transient radio failure")
+        }
+
+        queue.request()
+        runCurrent()
+        assertEquals(1, refreshCount)
+
+        queue.request()
+        runCurrent()
+        assertEquals(2, refreshCount)
+
+        queue.cancel()
+    }
+
+    @Test
+    fun verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive() {
+        val whitewholf = MeshPeer(
+            id = "mesh:whitewholf-fingerprint",
+            name = "whitewholf",
+            rssi = -50,
+            sonar = false,
+        )
+
+        assertEquals(
+            listOf(whitewholf),
+            visibleRadarMeshPeers(listOf(whitewholf), isBlocked = { false }),
+        )
+    }
+
+    @Test
+    fun radarStillExcludesBlockedVerifiedPeers() {
+        val blocked = MeshPeer("mesh:blocked-fingerprint", "blocked", -50)
+
+        assertTrue(
+            visibleRadarMeshPeers(listOf(blocked), isBlocked = { it == "blocked-fingerprint" }).isEmpty(),
+        )
+    }
+
+    @Test
     fun nearbyScanRequiresVisibleForegroundOnboardedRadarAndOpenDiscovery() {
         assertTrue(shouldScanForNearbyPayments(true, true, true, false))
         assertFalse(shouldScanForNearbyPayments(false, true, true, false))
@@ -21,30 +125,73 @@ class NearbyDiscoveryPolicyTest {
         assertFalse(shouldScanForNearbyPayments(true, true, true, true))
     }
 
+    @Test
+    fun nearbyMeshRefreshContinuesForKnownPeersWhenOpenDiscoveryIsRestricted() {
+        assertTrue(shouldRefreshNearbyPeers(true, true, true))
+        assertFalse(shouldRefreshNearbyPeers(false, true, true))
+        assertFalse(shouldRefreshNearbyPeers(true, false, true))
+        assertFalse(shouldRefreshNearbyPeers(true, true, false))
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun nearbyRefreshPublishesPeersWithoutWaitingForHousekeepingHeartbeat() = runTest {
-        val radioPeers = mutableListOf<String>()
-        var publishedPeers = emptyList<String>()
+    fun nearbyRefreshPublishesMeshAndUnifyPeersWithoutWaitingForHousekeepingHeartbeat() = runTest {
+        val radioMeshPeers = mutableListOf<MeshPeer>()
+        val radioUnifyPeers = mutableListOf<String>()
+        var publishedMeshPeers = emptyList<MeshPeer>()
+        var publishedUnifyPeers = emptyList<String>()
         val refreshJob = launchNearbyPeerRefresh(
             intervalMs = 100,
-            readPeers = { radioPeers.toList() },
-            publishPeers = { publishedPeers = it },
+            readMeshPeers = { radioMeshPeers.toList() },
+            publishMeshPeers = { publishedMeshPeers = it },
+            readUnifyPeers = { radioUnifyPeers.toList() },
+            publishUnifyPeers = { publishedUnifyPeers = it },
         )
 
         runCurrent()
-        assertTrue(publishedPeers.isEmpty())
+        assertTrue(publishedMeshPeers.isEmpty())
+        assertTrue(publishedUnifyPeers.isEmpty())
 
-        radioPeers += "payer"
+        radioMeshPeers += MeshPeer("mesh:whitewholf-fingerprint", "whitewholf", -50)
+        radioUnifyPeers += "payer"
         advanceTimeBy(100)
         runCurrent()
-        assertEquals(listOf("payer"), publishedPeers)
+        assertEquals(listOf("whitewholf"), publishedMeshPeers.map { it.name })
+        assertEquals(listOf("payer"), publishedUnifyPeers)
 
         refreshJob.cancelAndJoin()
-        radioPeers += "late payer"
+        radioMeshPeers += MeshPeer("mesh:late-fingerprint", "late peer", -60)
+        radioUnifyPeers += "late payer"
         advanceTimeBy(100)
         runCurrent()
-        assertEquals(listOf("payer"), publishedPeers)
+        assertEquals(listOf("whitewholf"), publishedMeshPeers.map { it.name })
+        assertEquals(listOf("payer"), publishedUnifyPeers)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun nearbyMeshRefreshRecoversAfterInterveningEmptyPublish() = runTest {
+        // Simulates push/housekeeping writing empty between poll ticks so a
+        // job-local lastMeshPeers==A cache would wrongly suppress republishing A.
+        val radioMeshPeers = mutableListOf(MeshPeer("mesh:a", "A", -50))
+        var publishedMeshPeers = emptyList<MeshPeer>()
+        val refreshJob = launchNearbyPeerRefresh(
+            intervalMs = 100,
+            readMeshPeers = { radioMeshPeers.toList() },
+            publishMeshPeers = { publishedMeshPeers = it },
+            readUnifyPeers = { emptyList<String>() },
+            publishUnifyPeers = {},
+        )
+
+        runCurrent()
+        assertEquals(listOf("A"), publishedMeshPeers.map { it.name })
+
+        publishedMeshPeers = emptyList() // intervening writer cleared Radar
+        advanceTimeBy(100)
+        runCurrent()
+        assertEquals(listOf("A"), publishedMeshPeers.map { it.name })
+
+        refreshJob.cancelAndJoin()
     }
 
     @Test

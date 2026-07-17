@@ -359,3 +359,15 @@ core records microsecond durations inside each operation, so Apple os_log,
 Android logcat, and desktop stderr formatting do not affect the result. Live
 relay/HTTPS timings are observational and must not become a latency CI gate;
 cache-hit correctness and prefetch completion counts are suitable smoke checks.
+
+## Android mesh → Radar publish (PR #316 / R-008)
+
+Measures verified bitchat announce → conflated off-main snapshot → Radar state
+paint on a physical Android device (Signal-style invalidation; same 1+1 trailing
+shape as wallet balance refresh). See `docs/PERFORMANCE.md`.
+
+```bash
+# Debug APK on device, Bluetooth on, peer in range:
+scripts/bench/android-mesh-radar-bench.sh --serial <adb serial> \
+  --peer whitewholf --seconds 60 --open-radar --cold-start
+```

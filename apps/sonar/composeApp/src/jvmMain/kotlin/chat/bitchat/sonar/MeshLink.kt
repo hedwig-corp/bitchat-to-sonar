@@ -51,11 +51,20 @@ object MeshLink {
      *  when out of BLE range. Null = nothing to advertise yet. */
     @Volatile private var sonarPayload: ByteArray? = null
     @Volatile private var lastSonarSendMs = 0L
+    @Volatile private var peerUpdateListener: (() -> Unit)? = null
 
     @Volatile private var running = false
 
     /** Set/clear the SonarAnnounce payload broadcast as our 0x53 (from the app). */
     fun setSonarPayload(payload: ByteArray?) { sonarPayload = payload }
+
+    fun setPeerUpdateListener(listener: (() -> Unit)?) {
+        peerUpdateListener = listener
+    }
+
+    private fun notifyPeerUpdate() {
+        peerUpdateListener?.let { listener -> runCatching(listener) }
+    }
 
     fun start() {
         if (running) return
@@ -81,26 +90,33 @@ object MeshLink {
                     val ann = runCatching { meshParseAnnounce(pkt) }.getOrNull() ?: continue
                     val fp = MeshIdentity.fingerprintOf(ann.noisePublicKeyHex)
                     if (fp.isNotEmpty()) {
+                        val now = System.currentTimeMillis()
+                        val wasVisible = now - (seenByFp[fp] ?: 0L) < PEER_TTL_MS
                         fpByPeerId[sender] = fp; peerIdByFp[fp] = sender
-                        nameByFp[fp] = ann.nickname; touch(fp)
+                        val previousName = nameByFp.put(fp, ann.nickname)
+                        seenByFp[fp] = now
+                        if (!wasVisible || previousName != ann.nickname) notifyPeerUpdate()
                     }
                 }
                 TYPE_NOISE_HANDSHAKE -> handleHandshake(sender, info.payload)
                 TYPE_NOISE_ENCRYPTED -> handleEncrypted(sender, info.payload)
                 TYPE_SONAR -> {
                     sonarSeenAt[sender] = System.currentTimeMillis()
-                    if (sonarByPeerId.put(sender, info.payload) == null) {
+                    val previous = sonarByPeerId.put(sender, info.payload)
+                    if (previous == null) {
                         sonarLog("MeshLink", "RX 0x53 Sonar announce from ${nameByFp[fpByPeerId[sender]] ?: sender} → peer is a full Sonar user (npub for WN fallback)")
                     }
+                    if (previous == null || !previous.contentEquals(info.payload)) notifyPeerUpdate()
                 }
             }
         }
         val now = System.currentTimeMillis()
-        seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
+        val peersExpired = seenByFp.entries.removeIf { now - it.value > PEER_TTL_MS }
         // Expire stale 0x53 payloads too (parity with seenByFp) so a peer that left
         // range stops being reported as a live Sonar user by [sonarPeers].
-        sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
-        sonarByPeerId.keys.retainAll(sonarSeenAt.keys)
+        val sonarExpired = sonarSeenAt.entries.removeIf { now - it.value > PEER_TTL_MS }
+        val sonarRemoved = sonarByPeerId.keys.retainAll(sonarSeenAt.keys)
+        if (peersExpired || sonarExpired || sonarRemoved) notifyPeerUpdate()
 
         // Broadcast our signed 0x53 Sonar announce every ~3s so connected phones
         // learn our npub and can continue the chat over White Noise out of range.
@@ -221,9 +237,17 @@ object MeshLink {
     /** Named, deduped mesh peers (from the announce), fresh within the TTL. */
     fun namedPeers(): List<MeshPeer> {
         val now = System.currentTimeMillis()
+        val sonarFingerprints = sonarByPeerId.keys.mapNotNullTo(hashSetOf<String>()) { fpByPeerId[it] }
         return nameByFp.entries
             .filter { (fp, _) -> now - (seenByFp[fp] ?: 0L) < PEER_TTL_MS }
-            .map { (fp, name) -> MeshPeer("mesh:$fp", name.ifBlank { "mesh peer" }, rssi = -50, sonar = true) }
+            .map { (fp, name) ->
+                MeshPeer(
+                    "mesh:$fp",
+                    name.ifBlank { "mesh peer" },
+                    rssi = -50,
+                    sonar = fp in sonarFingerprints,
+                )
+            }
     }
 
     /** Sonar Discovery (0x53) payloads, keyed by the radar peer id (the fp). */
@@ -236,5 +260,6 @@ object MeshLink {
     fun wipe() {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
         nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); pending.clear()
+        notifyPeerUpdate()
     }
 }

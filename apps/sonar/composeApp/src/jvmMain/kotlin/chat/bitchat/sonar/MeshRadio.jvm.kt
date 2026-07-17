@@ -18,6 +18,10 @@ actual object MeshRadio {
 
     actual fun available(): Boolean = BleBridge.available
 
+    actual fun setPeerUpdateListener(listener: (() -> Unit)?) {
+        MeshLink.setPeerUpdateListener(listener)
+    }
+
     actual fun setDiscoveryMode(mode: BleDiscoveryMode) {
         if (discoveryMode == mode) return
         discoveryMode = mode
@@ -29,8 +33,9 @@ actual object MeshRadio {
     }
 
     actual fun setKnownPeerIds(ids: Set<String>) {
+        val normalized = changedKnownMeshPeerIds(knownPeerIds, ids) ?: return
         knownPeerIds.clear()
-        ids.mapTo(knownPeerIds) { it.lowercase() }
+        knownPeerIds.addAll(normalized)
         if (discoveryMode == BleDiscoveryMode.KnownOnly) {
             if (knownPeerIds.isEmpty()) stop()
             else if (available()) start()

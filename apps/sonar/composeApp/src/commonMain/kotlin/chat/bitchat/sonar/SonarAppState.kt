@@ -69,7 +69,7 @@ data class StickerBenchmarkRequest(
 // profile TTLs). Foreground idle CPU is set by the heartbeat cadence.
 private const val HEARTBEAT_FG_MS = 30_000L
 private const val HEARTBEAT_BG_MS = 60_000L
-/** Visible-Radar cadence for publishing payment-only BLE scan results to UI. */
+/** Visible-Radar cadence for publishing BLE mesh + payment scan results to UI. */
 private const val NEARBY_PEER_REFRESH_MS = 1_000L
 /** Relay `sync()` cadence (was every ~60 s on the old 4 s tick). */
 private const val SYNC_INTERVAL_MS = 60_000L
@@ -96,13 +96,101 @@ internal fun shouldScanForNearbyPayments(
     isDiscoveryRestricted: Boolean,
 ): Boolean = isNearbyVisible && isForeground && isOnboarded && !isDiscoveryRestricted
 
-internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
+internal fun shouldRefreshNearbyPeers(
+    isNearbyVisible: Boolean,
+    isForeground: Boolean,
+    isOnboarded: Boolean,
+): Boolean = isNearbyVisible && isForeground && isOnboarded
+
+/** Radar presence follows the verified bitchat announce immediately. The later
+ *  Sonar 0x53 profile upgrades the same stable peer in place; capability
+ *  settling belongs only to conversation folding. */
+internal fun visibleRadarMeshPeers(
+    rawPeers: List<MeshPeer>,
+    isBlocked: (String) -> Boolean,
+): List<MeshPeer> = rawPeers.filterNot { peer ->
+    isBlocked(peer.id.removePrefix("mesh:"))
+}
+
+/** Compact percent-encoding for Debug SONAR_BENCH nick tokens (spaces/emoji-safe). */
+internal fun benchNickToken(nick: String): String {
+    if (nick.isEmpty()) return "_"
+    val out = StringBuilder(nick.length)
+    for (ch in nick) {
+        when {
+            ch.isLetterOrDigit() || ch == '-' || ch == '_' || ch == '.' || ch == '~' -> out.append(ch)
+            else -> {
+                val bytes = ch.toString().encodeToByteArray()
+                for (b in bytes) out.append('%').append(((b.toInt() and 0xFF)).toString(16).padStart(2, '0').uppercase())
+            }
+        }
+    }
+    return out.toString()
+}
+
+/** A burst of radio/profile invalidations needs at most one refresh in flight
+ * and one follow-up refresh. Conflation prevents BLE callback volume from
+ * turning into an unbounded main-thread coroutine queue — the same 1+1 trailing
+ * shape used by [chat.bitchat.sonar.wallet.WalletBridge] balance refresh and
+ * Signal-style DB invalidation (react once, don't enqueue every callback). */
+internal class ConflatedRefreshQueue(
+    scope: CoroutineScope,
+    refresh: suspend () -> Unit,
+) {
+    private val requests = Channel<Unit>(Channel.CONFLATED)
+    /** Requests dropped because a trailing refresh was already pending. Bench-only. */
+    private var droppedRequests = 0L
+    private val worker = scope.launch {
+        for (ignored in requests) {
+            // A transient UniFFI/radio failure must not kill the sole worker —
+            // later invalidations still need to be consumed from the channel.
+            try {
+                refresh()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Throwable) {
+                // Best-effort: the next request retries.
+            }
+        }
+    }
+
+    fun request() {
+        if (!requests.isEmpty) droppedRequests++
+        requests.trySend(Unit)
+    }
+
+    /** Consume and reset the conflation counter (Debug SONAR_BENCH mesh_refresh_end). */
+    fun takeDroppedRequests(): Long {
+        val n = droppedRequests
+        droppedRequests = 0
+        return n
+    }
+
+    fun cancel() {
+        requests.close()
+        worker.cancel()
+    }
+}
+
+internal fun <M, U> CoroutineScope.launchNearbyPeerRefresh(
     intervalMs: Long = NEARBY_PEER_REFRESH_MS,
-    readPeers: () -> List<T>,
-    publishPeers: (List<T>) -> Unit,
+    readMeshPeers: suspend () -> List<M>,
+    publishMeshPeers: (List<M>) -> Unit,
+    readUnifyPeers: suspend () -> List<U>,
+    publishUnifyPeers: (List<U>) -> Unit,
 ): Job = launch {
+    // Mesh publishes every tick: other writers (push invalidation, housekeeping,
+    // capability settle) also call updateMeshPeersFromRadio, so a job-local
+    // lastMeshPeers cache can suppress a real A→empty→A recovery. The publisher
+    // itself is change-only. Unify has a single writer, so it keeps the cache.
+    var lastUnifyPeers: List<U>? = null
     while (isActive) {
-        publishPeers(readPeers())
+        publishMeshPeers(readMeshPeers().toList())
+        val unifyPeers = readUnifyPeers().toList()
+        if (unifyPeers != lastUnifyPeers) {
+            lastUnifyPeers = unifyPeers
+            publishUnifyPeers(unifyPeers)
+        }
         delay(intervalMs)
     }
 }
@@ -766,8 +854,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             UnifyRadio.stopScanning()
             UnifyRadio.stopAdvertising()
             unifyOffer = null; unifyPeers = emptyList()
+            nearbyPeerRefreshJob?.cancel(); nearbyPeerRefreshJob = null
+            // Gate push invalidation before MeshRadio.stop() — stop notifies the
+            // peer listener, which must not re-persist wiped mesh names/links.
+            onboarded = false; started = false
+            MeshRadio.stop()
             MeshRadio.setMeshNickname("")
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
+            meshPeers = emptyList()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             meshChats.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
@@ -795,7 +889,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
-            onboarded = false; nick = ""; npub = ""; started = false
+            nick = ""; npub = ""
             localCoreReady = false; homeMessagesHydrated = false
             walletState = WalletState.NotConfigured
             presenceByGeohash = emptyMap()
@@ -805,6 +899,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             callLogs.clear(); callVersion++
             resetCallState()
             pollJob?.cancel(); pollJob = null
+            housekeepingJob?.cancel(); housekeepingJob = null
             stopMarmotWakeLoop()
             if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
                 toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
@@ -1510,34 +1605,95 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Sonar Discovery profiles received over mesh links, keyed by peer id. */
     var sonarPeerProfiles by mutableStateOf<Map<String, SonarAnnounce>>(emptyMap())
         private set
+    private val meshPeerRefreshQueue = ConflatedRefreshQueue(scope, ::refreshMeshRadioState)
+    /** Bumped at the start of every mesh snapshot refresh; older concurrent
+     *  readers discard their result so a stale Default-dispatcher decode cannot
+     *  overwrite a newer publish (queue + housekeeping + settle overlap). */
+    private var meshRadioRefreshEpoch = 0
+    private val meshRadioRefreshLock = Mutex()
 
     /** The Sonar Discovery profile for a mesh peer (its BLE id), if any. */
     fun sonarProfile(peerId: String): SonarAnnounce? = sonarPeerProfiles[peerId]
 
-    private fun refreshSonarDiscoveryProfiles() {
-        sonarPeerProfiles = MeshRadio.sonarPeers()
-            .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
-            .toMap()
-        sonarPeerProfiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
+    private data class MeshRadioSnapshot(
+        val peers: List<MeshPeer>,
+        val profiles: Map<String, SonarAnnounce>,
+    )
+
+    /** Read and decode the native radio snapshot away from the UI thread. */
+    private suspend fun refreshMeshRadioState() {
+        if (!onboarded) return
+        val dropped = meshPeerRefreshQueue.takeDroppedRequests()
+        val started = if (sonarBenchMarkersEnabled) TimeSource.Monotonic.markNow() else null
+        if (sonarBenchMarkersEnabled) {
+            sonarLog("SonarCore", "SONAR_BENCH mesh_refresh_begin dropped=$dropped")
+        }
+        val epoch = meshRadioRefreshLock.withLock { ++meshRadioRefreshEpoch }
+        val snapshot = withContext(Dispatchers.Default) {
+            MeshRadioSnapshot(
+                peers = MeshRadio.peers(),
+                profiles = MeshRadio.sonarPeers()
+                    .mapNotNull { (id, raw) -> SonarAnnounce.decode(raw)?.let { id to it } }
+                    .toMap(),
+            )
+        }
+        val offMainMs = started?.elapsedNow()?.inWholeMicroseconds?.div(1000.0)
+        val published = meshRadioRefreshLock.withLock {
+            if (!onboarded || epoch != meshRadioRefreshEpoch) return@withLock null
+            val beforePeers = meshPeers
+            val beforeProfiles = sonarPeerProfiles
+            applySonarDiscoveryProfiles(snapshot.profiles)
+            updateMeshPeersFromRadio(rawPeers = snapshot.peers)
+            meshPeers != beforePeers || sonarPeerProfiles != beforeProfiles
+        } ?: return
+        if (sonarBenchMarkersEnabled && started != null && offMainMs != null) {
+            val totalMs = started.elapsedNow().inWholeMicroseconds / 1000.0
+            sonarLog(
+                "SonarCore",
+                "SONAR_BENCH mesh_refresh_end peers=${snapshot.peers.size} " +
+                    "profiles=${snapshot.profiles.size} off_main_ms=$offMainMs " +
+                    "total_ms=$totalMs published=${if (published) 1 else 0} dropped=$dropped",
+            )
+        }
+        // Fold mesh + White Noise legs as soon as a 0x53 profile/link lands —
+        // do not wait for the next housekeeping heartbeat (Radar may be open).
+        if (published) recomputeConversations()
+    }
+
+    private fun applySonarDiscoveryProfiles(profiles: Map<String, SonarAnnounce>) {
+        if (sonarPeerProfiles == profiles) return
+        sonarPeerProfiles = profiles
+        profiles.forEach { (peerId, ann) -> rememberLink(peerId, ann) }
         // 0x53 profiles / links feed the capability-settle hold in [visibleChats].
         bumpHoldInputs()
     }
 
-    private fun updateMeshPeersFromRadio(nowMs: Long = SonarClock.nowMillis()) {
-        val rawPeers = MeshRadio.peers()
+    private fun updateMeshPeersFromRadio(
+        rawPeers: List<MeshPeer> = MeshRadio.peers(),
+        nowMs: Long = SonarClock.nowMillis(),
+    ) {
         val previousPeerIds = rawMeshPeerIds
+        val previousVisibleIds = meshPeers.map { it.id }.toSet()
         rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
-        meshPeers = rawPeers.filter { peer ->
+        val visiblePeers = visibleRadarMeshPeers(rawPeers, ::isMeshContactBlocked)
+        visiblePeers.forEach { peer ->
             val peerId = meshPeerId(peer.id)
-            if (isMeshContactBlocked(peerId)) return@filter false
             if (peer.name.isNotBlank()) rememberMeshName(peerId, peer.name)
-            val first = meshPeerFirstSeenMs.getOrPut(peerId) { nowMs }
-            val hasProfile = peer.sonar || sonarPeerProfiles.containsKey(peerId) || linkByFp.containsKey(peerId)
-            val hasMessages = meshChats[peerId]?.isNotEmpty() == true
-            val wait = shouldWaitForCapabilities(first, nowMs, hasProfile, hasMessages)
-            if (wait) scheduleCapabilitySettleRefresh(peerId, first, nowMs)
-            !wait
+            meshPeerFirstSeenMs.putIfAbsent(peerId, nowMs)
+        }
+        if (meshPeers != visiblePeers) meshPeers = visiblePeers
+        if (sonarBenchMarkersEnabled) {
+            for (peer in visiblePeers) {
+                if (peer.id in previousVisibleIds) continue
+                val nick = benchNickToken(peer.name)
+                val fp = meshPeerId(peer.id).take(8)
+                val sonar = if (peer.sonar) 1 else 0
+                sonarLog(
+                    "SonarCore",
+                    "SONAR_BENCH radar_peer_paint nick=$nick fp=$fp sonar=$sonar",
+                )
+            }
         }
         // When a peer (re)appears on the BLE mesh, flush any queued messages.
         // This mirrors iOS MessageRouter's flush-on-transport-available path.
@@ -1556,8 +1712,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             delay(remaining + 50)
             pendingCapabilityRefreshPeers.remove(peerId)
-            refreshSonarDiscoveryProfiles()
-            updateMeshPeersFromRadio()
+            if (!onboarded) return@launch
+            // Route through the conflated queue so settle does not race a
+            // concurrent push/housekeeping snapshot publish.
+            meshPeerRefreshQueue.request()
             recomputeConversations()
         }
     }
@@ -2222,7 +2380,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             linkCapsByFp[peerId] = ann.capabilities
             persistLinkCaps()
         }
-        updateBleDiscoveryPolicy()
+        if (isNewLink) updateBleDiscoveryPolicy()
         ensureSonarDescriptorHex(npubHex)
         // A new or updated link means we can now reach this peer via White Noise
         // — flush any queued messages that were waiting for this route.
@@ -2551,15 +2709,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         refreshBatterySaving()
         updateBleDiscoveryPolicy()
         MeshRadio.start()
-        refreshSonarDiscoveryProfiles()
-        updateMeshPeersFromRadio()
+        meshPeerRefreshQueue.request()
+    }
+
+    /** Radio callbacks may arrive on BLE/native worker threads. Conflate bursts,
+     *  read native state off-main, then publish Compose state on the app scope. */
+    internal fun onMeshPeersChanged() {
+        if (!onboarded) return
+        meshPeerRefreshQueue.request()
     }
 
     // ── Unify nearby payments (separate BLE service; payments-only) ──
     /** Cached amountless BOLT12 offer we advertise as the Unify receiver. */
     private var unifyOffer: String? = null
 
-    /** Keep the payment-only scan and its bounded visible-Radar refresh aligned
+    /** Keep the payment-only scan and bounded visible-Radar peer refresh aligned
      *  with navigation, foreground, onboarding, and discovery restrictions. */
     private fun updateNearbyScanning() {
         val shouldScan = shouldScanForNearbyPayments(
@@ -2568,19 +2732,33 @@ class SonarAppState(private val scope: CoroutineScope) {
             isOnboarded = onboarded,
             isDiscoveryRestricted = bleDiscoveryRestricted,
         )
-        if (!shouldScan) {
-            nearbyPeerRefreshJob?.cancel()
-            nearbyPeerRefreshJob = null
+        if (shouldScan) {
+            UnifyRadio.startScanning()
+        } else {
             UnifyRadio.stopScanning()
             unifyPeers = emptyList()
-        } else {
-            UnifyRadio.startScanning()
-            if (nearbyPeerRefreshJob?.isActive != true) {
-                nearbyPeerRefreshJob = scope.launchNearbyPeerRefresh(
-                    readPeers = UnifyRadio::peers,
-                    publishPeers = { unifyPeers = it },
-                )
-            }
+        }
+        val shouldRefresh = shouldRefreshNearbyPeers(
+            isNearbyVisible = isNearbyVisible,
+            isForeground = foreground,
+            isOnboarded = onboarded,
+        )
+        if (!shouldRefresh) {
+            nearbyPeerRefreshJob?.cancel()
+            nearbyPeerRefreshJob = null
+        } else if (nearbyPeerRefreshJob?.isActive != true) {
+            nearbyPeerRefreshJob = scope.launchNearbyPeerRefresh(
+                readMeshPeers = { withContext(Dispatchers.Default) { MeshRadio.peers() } },
+                publishMeshPeers = { updateMeshPeersFromRadio(rawPeers = it) },
+                readUnifyPeers = {
+                    if (bleDiscoveryRestricted) {
+                        emptyList()
+                    } else {
+                        withContext(Dispatchers.Default) { UnifyRadio.peers() }
+                    }
+                },
+                publishUnifyPeers = { unifyPeers = it },
+            )
         }
     }
 
@@ -8321,10 +8499,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         updateBleDiscoveryPolicy()
         // Persist each peer's fingerprint→npub so its conversation stays unified
         // after it leaves range / after a restart, then re-fold the White Noise
-        // legs into the mesh rows (one row per person).
-        refreshSonarDiscoveryProfiles()
-        updateMeshPeersFromRadio()
-        recomputeConversations()
+        // legs into the mesh rows (one row per person). Route through the same
+        // conflated queue as push invalidation so snapshot publishes serialize.
+        if (onboarded) {
+            meshPeerRefreshQueue.request()
+            recomputeConversations()
+        }
         // Unify nearby: scan + publish only while Radar is visible and foregrounded.
         updateNearbyScanning()
         updateUnifyReceiver()

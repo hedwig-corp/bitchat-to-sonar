@@ -515,6 +515,59 @@ contain `assets/dexopt/baseline.prof` (tens of KB, not the 7 KB library-only
 default), and after installing it `adb shell dumpsys package dexopt | grep -A2
 chat.bitchat.sonar` must show `speed-profile`.
 
+## Android mesh → Radar publish benchmark (PR #316 / R-008)
+
+Nearby presence must follow a **verified bitchat announce** immediately (stock
+bitchat peers never send Sonar `0x53`). The Compose path matches the in-app
+Signal-style invalidation shape already used for housekeeping and
+`WalletBridge` balance refresh: BLE callbacks **conflate** to one in-flight
+snapshot plus one trailing refresh, native `peers()` / decode run **off the UI
+thread**, and Radar publishes change-only Compose state. Capability settling
+(1.5 s) stays scoped to conversation folding only.
+
+Debug-only markers (gated like `chat_open_first_frame` — never in Release):
+
+```
+SONAR_BENCH mesh_announce nick=<urlencoded> fp=<8> direct=<0|1>
+SONAR_BENCH mesh_peer_invalidate
+SONAR_BENCH mesh_refresh_begin dropped=<n>
+SONAR_BENCH mesh_refresh_end peers=<n> profiles=<n> off_main_ms=<ms> total_ms=<ms> published=<0|1> dropped=<n>
+SONAR_BENCH radar_peer_paint nick=<urlencoded> fp=<8> sonar=<0|1>
+```
+
+Drive a Pixel (or any Android device) with a Debug APK, Bluetooth on, and a
+stock bitchat peer in range. Use `--cold-start` for first Radar appearance
+(re-announces of already-visible peers are change-only and do not re-paint):
+
+```bash
+scripts/bench/android-mesh-radar-bench.sh --serial <adb serial> \
+  --peer whitewholf --seconds 60 --open-radar --cold-start
+```
+
+Report `announce→paint` (must be ≪ 1500 ms; settle must not gate Radar),
+`off_main_ms` / `total_ms` for snapshot refresh, conflation `dropped` under
+bursts, RSS stability, and ANR absence. The broken feedback loop on a Pixel 10
+Pro sat near ~552 MB RSS with repeated 200+ MB GC reclaim; the fixed path stayed
+near ~372 MB with occasional ~22 MB reclaim and no ANR.
+
+### Pixel 10 Pro baseline (2026-07-18, PR #316 Debug APK)
+
+Cold-start windows with live mesh peers (`whitewholf` stock bitchat + nearby Sonar peers):
+
+| metric | result |
+|---|---|
+| `announce→paint` (all first paints) | min 4 / median 15 / max 23 ms (n=3) |
+| `announce→paint` (`whitewholf`, `sonar=0`) | **9–23 ms** |
+| `invalidate→refresh_end` | min 4 / median ~14–22 / max 85 ms |
+| `mesh_refresh` `off_main_ms` | median ~2.5–4 ms (max ~65 ms warm) |
+| `mesh_refresh` `total_ms` | median ~7–16 ms |
+| RSS | ~305–383 MB (vs ~552 MB broken loop) |
+| ANR / input-dispatch timeout | **0** |
+
+Capability settle is 1500 ms and must not appear on the Radar path; a
+`sonar=0` `whitewholf` first-paint in tens of milliseconds confirms R-008 on
+device.
+
 ## Relay smoke test (delivery / loss)
 
 Separate from the cold-start benchmark above: `scripts/smoke/relay-smoke.sh`

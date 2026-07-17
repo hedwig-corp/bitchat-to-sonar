@@ -65,6 +65,17 @@ class RelayDiagnosticsTest {
     }
 
     @Test
+    fun parseSnapshotTreatsBracesInsideStringsAsData() {
+        val snap = parseSyncStateSnapshot(
+            """{"relays":[{"url":"wss://relay.example","status":"Connected } still"}]}""",
+        )
+
+        assertNotNull(snap)
+        assertEquals(1, snap.relays.size)
+        assertEquals("Connected } still", snap.relays.single().status)
+    }
+
+    @Test
     fun canonicalRelayUrlNormalizesTrailingSlashAndDefaultPort() {
         assertEquals(
             "wss://nostr.relay.hedwig.sh",
