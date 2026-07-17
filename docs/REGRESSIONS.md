@@ -349,7 +349,7 @@ invalidation for verified peer/profile changes.
 
 **Guarded by:** `client.rs::media_download_resumes_from_partial_file_after_disconnect`
 
-**Also guarded by:** `client.rs::media_download_restarts_when_server_ignores_range`, `client.rs::media_download_rejects_inconsistent_content_range`, `client.rs::media_download_honors_cancellation_before_network_io`, `client.rs::media_download_partial_pruning_bounds_storage_and_expires_old_files`
+**Also guarded by:** `client.rs::media_download_restarts_when_server_ignores_range`, `client.rs::media_download_rejects_inconsistent_content_range`, `client.rs::media_download_honors_cancellation_before_network_io`, `client.rs::media_download_partial_pruning_bounds_storage_and_expires_old_files`, `client.rs::media_download_partial_registration_rejects_a_second_writer_and_releases_on_drop`
 
 **History:** #317 replaces the total request timeout with an idle-read timeout and adds BUD-01 Range recovery shared by Apple and Compose.
 

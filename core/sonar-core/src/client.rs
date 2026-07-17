@@ -383,6 +383,24 @@ fn prune_media_download_partials(parent: &Path, active: &HashSet<PathBuf>) -> Re
     Ok(())
 }
 
+fn register_media_download_partial(
+    parent: &Path,
+    path: &Path,
+) -> Result<ActiveMediaDownloadPartial> {
+    let mut active = ACTIVE_MEDIA_DOWNLOAD_PARTIALS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_media_download_partials(parent, &active)?;
+    if !active.insert(path.to_path_buf()) {
+        return Err(Error::Storage(
+            "media resume file already has an active writer".into(),
+        ));
+    }
+    Ok(ActiveMediaDownloadPartial {
+        path: path.to_path_buf(),
+    })
+}
+
 async fn http_get_to_resume_file_with_retries(
     url: &str,
     resume_path: &Path,
@@ -4589,16 +4607,7 @@ impl SonarClient {
             .ok_or_else(|| Error::InvalidInput("media resume path has no parent".into()))?;
         fs::create_dir_all(parent)
             .map_err(|error| Error::Storage(format!("create media cache directory: {error}")))?;
-        let active_partial = {
-            let mut active = ACTIVE_MEDIA_DOWNLOAD_PARTIALS
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            prune_media_download_partials(parent, &active)?;
-            active.insert(resume_path.clone());
-            ActiveMediaDownloadPartial {
-                path: resume_path.clone(),
-            }
-        };
+        let active_partial = register_media_download_partial(parent, &resume_path)?;
         let result = self
             .fetch_media_to_file_active(group_id, url, destination, &resume_path, observer)
             .await;
@@ -7635,6 +7644,21 @@ mod tests {
         .unwrap();
         prune_media_download_partials(dir.path(), &active).unwrap();
         assert!(!expired.exists());
+    }
+
+    #[test]
+    fn media_download_partial_registration_rejects_a_second_writer_and_releases_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(format!(
+            "{MEDIA_DOWNLOAD_PARTIAL_PREFIX}same{MEDIA_DOWNLOAD_PARTIAL_SUFFIX}"
+        ));
+        let first = register_media_download_partial(dir.path(), &path).unwrap();
+        assert!(register_media_download_partial(dir.path(), &path).is_err());
+
+        drop(first);
+
+        register_media_download_partial(dir.path(), &path)
+            .expect("an aborted writer releases the resume path");
     }
 
     #[test]
