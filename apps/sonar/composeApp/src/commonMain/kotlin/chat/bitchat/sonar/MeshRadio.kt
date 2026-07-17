@@ -57,6 +57,38 @@ enum class BleDiscoveryMode {
     KnownOnly,
 }
 
+/** Android adapter power transitions are reduced to this platform-neutral
+ * decision so the route-demotion invariant can run in common CI. */
+internal enum class BleAdapterLifecycleState {
+    TurningOff,
+    Off,
+    TurningOn,
+    On,
+}
+
+internal enum class BleRadioLifecycleAction {
+    Ignore,
+    Suspend,
+    Resume,
+}
+
+internal fun bleRadioLifecycleAction(
+    state: BleAdapterLifecycleState,
+    radioRequested: Boolean,
+): BleRadioLifecycleAction = when (state) {
+    BleAdapterLifecycleState.TurningOff,
+    BleAdapterLifecycleState.Off,
+    -> BleRadioLifecycleAction.Suspend
+    BleAdapterLifecycleState.On ->
+        if (radioRequested) BleRadioLifecycleAction.Resume else BleRadioLifecycleAction.Ignore
+    BleAdapterLifecycleState.TurningOn -> BleRadioLifecycleAction.Ignore
+}
+
+/** A platform link cannot remain a route after its radio is unusable, even if
+ * the OS has not delivered the asynchronous GATT disconnect callback yet. */
+internal fun meshRouteAvailable(radioUsable: Boolean, gattLinked: Boolean): Boolean =
+    radioUsable && gattLinked
+
 internal enum class BleScanRestartReason(val logValue: String) {
     NoCallbacks("no_callbacks"),
     RepeatingKnownWithoutUsableLink("no_new_address_no_link"),
