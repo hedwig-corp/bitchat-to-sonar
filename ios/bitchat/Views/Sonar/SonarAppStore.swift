@@ -2130,6 +2130,11 @@ final class SonarAppStore: ObservableObject {
         // current identity, chats, wallet, and push registrations untouched.
         _ = try SonarIdentity.import(nsec: key)
 
+        // Hold Marmot's send/setup suspension across wallet deletion and every
+        // host-owned cache mutation, not just the core database replacement.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+
         #if os(iOS) || os(macOS)
         let bridged = wallet as? BridgedWallet
         #if os(iOS)
@@ -8740,6 +8745,17 @@ final class SonarAppStore: ObservableObject {
     /// to start fresh (e.g. to drop a broken Marmot group) without re-running
     /// onboarding. Contrast with `wipe()`, which destroys everything.
     func eraseAllChats() {
+        Task { @MainActor [weak self] in
+            await self?.performEraseAllChats()
+        }
+    }
+
+    private func performEraseAllChats() async {
+        // Quiesce Marmot sends before any host-side state is cleared. Otherwise
+        // a queued send can publish after the UI and databases were erased.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        await marmot.eraseChatsKeepIdentity()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8747,9 +8763,6 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
-        // White Noise / Marmot groups: wipe the encrypted DB then reconnect
-        // with the SAME identity so new secure chats still work.
-        Task { await marmot.eraseChatsKeepIdentity() }
         // Drop queued sends + pay-scan state that referenced the erased chats.
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -8805,6 +8818,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func performWipe() async {
+        // Treat the user's tap as the privacy boundary: suspend and join every
+        // Marmot text/media/setup task before wallet or host state changes.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        marmot.stopPolling()
+        await marmot.wipeDatabase()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8825,7 +8844,6 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
-        marmot.stopPolling()
         // Wipes Noise/Nostr keys, all keychain data (incl. marmot-nsec),
         // messages, favorites, verified fingerprints and the nickname.
         // panicClearAllData() also erases the on-disk MessageStore; call it
@@ -8834,9 +8852,6 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.panicClearAllData()
         MessageStore.shared.wipeAll()
         _ = keychain.deleteIdentityKey(forKey: Keys.marmotNsecKeychainKey)
-        // Erase the encrypted Marmot (White Noise) SQLCipher database + its
-        // Keychain DB key; also resets in-memory Marmot state.
-        marmot.wipeDatabase()
         // Drop diagnostics logs too: at verbose level they can contain peer
         // npubs, so a panic wipe must not leave them on disk.
         SonarDiagnostics.clearLogs()

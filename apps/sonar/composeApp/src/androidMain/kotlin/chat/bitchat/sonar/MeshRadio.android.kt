@@ -236,6 +236,10 @@ actual object MeshRadio {
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
+        // The driver invalidates delayed callbacks first; failures already
+        // handed to the app are then cancelled with this intentional shutdown.
+        meshSendFailureInbox.clear()
+        meshMediaSendFailureInbox.clear()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
         notifyPeerUpdate()
     }

@@ -127,6 +127,7 @@ object MeshGatt {
 
     private sealed interface OutboundDelivery {
         val attemptId: Long
+        val generation: Long
         val peerId: String
         val messageId: String
         val tsSecs: Long
@@ -134,6 +135,7 @@ object MeshGatt {
 
     private data class TextDelivery(
         override val attemptId: Long,
+        override val generation: Long,
         override val peerId: String,
         override val messageId: String,
         val text: String,
@@ -142,6 +144,7 @@ object MeshGatt {
 
     private data class MediaDelivery(
         override val attemptId: Long,
+        override val generation: Long,
         override val peerId: String,
         override val messageId: String,
         val bytes: ByteArray,
@@ -176,20 +179,21 @@ object MeshGatt {
     fun shouldDial(peerNodeId: ByteArray): Boolean = engine.shouldDialFirst(peerNodeId)
 
     fun setKnownOnlyPeerAllowlist(allowedFingerprints: Set<String>?) {
-        transact { engine.setAllowlist(allowedFingerprints?.toList()) }
+        transact(requireRunning = false) { engine.setAllowlist(allowedFingerprints?.toList()) }
     }
 
     fun updateNickname(value: String) {
-        transact { engine.setNickname(value.trim(), nowMs()) }
+        transact(requireRunning = false) { engine.setNickname(value.trim(), nowMs()) }
     }
 
     fun updateSonarPayload(payload: ByteArray?) {
-        transact { engine.setSonarPayload(payload?.copyOf(), nowMs()) }
+        transact(requireRunning = false) { engine.setSonarPayload(payload?.copyOf(), nowMs()) }
     }
 
     // ── Lifecycle ──
 
     @Volatile private var tickArmed = false
+    @Volatile private var requestedStartGeneration = -1L
 
     private val tick = object : Runnable {
         override fun run() {
@@ -239,16 +243,23 @@ object MeshGatt {
         }
     }
 
+    private val armTick = Runnable {
+        synchronized(txLock) {
+            if (requestedStartGeneration != deliveryGeneration.get() || tickArmed) return@Runnable
+            tickArmed = true
+        }
+        handler.postDelayed(tick, TICK_MS)
+    }
+
     fun startServer() {
         // Arm on the handler thread: start()/stop() are called off the main
         // looper; (dis)arming serialized on the tick's own looper avoids two
         // ticks rescheduling each other forever.
         engine.setWallClock(nowMs(), System.currentTimeMillis())
-        handler.post {
-            if (tickArmed) return@post
-            tickArmed = true
-            handler.postDelayed(tick, TICK_MS)
+        synchronized(txLock) {
+            requestedStartGeneration = deliveryGeneration.get()
         }
+        handler.post(armTick)
         if (server != null) return
         android.util.Log.i(TAG, "MY node id = $myPeerIdHex")
         val mgr = manager() ?: return
@@ -271,9 +282,17 @@ object MeshGatt {
     }
 
     fun stop() {
-        tickArmed = false
+        handler.removeCallbacks(armTick)
         handler.removeCallbacks(tick)
-        engine.reset()
+        // Invalidate every accepted delivery before draining the platform
+        // queues. This also makes already-posted failure callbacks no-ops, so
+        // an intentional privacy teardown can never turn into router retry.
+        synchronized(txLock) {
+            tickArmed = false
+            requestedStartGeneration = -1L
+            deliveryGeneration.incrementAndGet()
+            engine.reset()
+        }
         (gattByAddr.keys + clientWriteQueue.keys + clientInFlight.keys).toSet()
             .forEach(::disconnectClient)
         (serverDevices.keys + serverNotifyQueue.keys + serverInFlight.keys).toSet()
@@ -283,8 +302,8 @@ object MeshGatt {
         gattByAddr.clear(); charByKey.clear(); serverDevices.clear(); deviceByAddr.clear()
         // A stuck in-flight flag surviving stop() would permanently block the
         // same address's queue after the next start().
-        clientWriteQueue.clear(); clientWriting.clear(); opInFlightSinceMs.clear()
-        serverNotifyQueue.clear(); serverNotifying.clear(); notifyInFlightSinceMs.clear()
+        clientWriteQueue.clear(); clientInFlight.clear(); clientWriting.clear(); opInFlightSinceMs.clear()
+        serverNotifyQueue.clear(); serverInFlight.clear(); serverNotifying.clear(); notifyInFlightSinceMs.clear()
     }
 
     // ── Dialing ──
@@ -308,26 +327,26 @@ object MeshGatt {
     // can invert their nonce order on the wire.
 
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
-        val delivery = TextDelivery(
-            nextDeliveryAttempt.incrementAndGet(),
-            fingerprint,
-            messageId,
-            text,
-            System.currentTimeMillis() / 1000,
-        )
-        return transact(delivery) { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
+        return transactDelivery(
+            delivery = { generation ->
+                TextDelivery(
+                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId, text,
+                    System.currentTimeMillis() / 1000,
+                )
+            },
+        ) { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
     }
 
     /** Immediate send for real-time controls. Never queues. */
     fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
-        val delivery = TextDelivery(
-            nextDeliveryAttempt.incrementAndGet(),
-            fingerprint,
-            messageId,
-            text,
-            System.currentTimeMillis() / 1000,
-        )
-        return transact(delivery) { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
+        return transactDelivery(
+            delivery = { generation ->
+                TextDelivery(
+                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId, text,
+                    System.currentTimeMillis() / 1000,
+                )
+            },
+        ) { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
     }
 
     /** Send a private file transfer to a live peer route (never queued).
@@ -337,16 +356,14 @@ object MeshGatt {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return false
         val mime = normalizedMime(mimeType, bytes) ?: return false
         val safeName = safeFileName(filename, mime, System.currentTimeMillis())
-        val delivery = MediaDelivery(
-            nextDeliveryAttempt.incrementAndGet(),
-            fingerprint,
-            messageId,
-            bytes.copyOf(),
-            filename,
-            mime,
-            System.currentTimeMillis() / 1000,
-        )
-        return transact(delivery) { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
+        return transactDelivery(
+            delivery = { generation ->
+                MediaDelivery(
+                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId,
+                    bytes.copyOf(), filename, mime, System.currentTimeMillis() / 1000,
+                )
+            },
+        ) { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
     }
 
     /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected
@@ -369,11 +386,13 @@ object MeshGatt {
      *  sequence). Events fire outside the lock. Reentrant (`synchronized`) so
      *  command handlers may run nested transitions (dial failure paths). */
     private fun transact(
+        requireRunning: Boolean = true,
         delivery: OutboundDelivery? = null,
         block: () -> MeshEngineOutput?,
     ): MeshEngineOutput? {
         val out: MeshEngineOutput?
         synchronized(txLock) {
+            if (requireRunning && !tickArmed) return null
             out = block()
             out?.let { executeCommands(it, delivery) }
         }
@@ -381,7 +400,25 @@ object MeshGatt {
         return out
     }
 
+    /** Capture the privacy generation under the same lock as encryption and
+     * queueing, so stop() cannot split generation capture from acceptance. */
+    private fun transactDelivery(
+        delivery: (Long) -> OutboundDelivery,
+        block: () -> MeshEngineOutput?,
+    ): MeshEngineOutput? {
+        val out: MeshEngineOutput?
+        synchronized(txLock) {
+            if (!tickArmed) return null
+            val acceptedDelivery = delivery(deliveryGeneration.get())
+            out = block()
+            out?.let { executeCommands(it, acceptedDelivery) }
+        }
+        out?.let { dispatchEvents(it) }
+        return out
+    }
+
     private fun executeCommands(out: MeshEngineOutput, delivery: OutboundDelivery? = null) {
+        val commandGeneration = delivery?.generation ?: deliveryGeneration.get()
         for (cmd in out.commands) when (cmd) {
             is MeshEngineCommand.Dial -> dial(cmd.conn)
             is MeshEngineCommand.Disconnect -> disconnectClient(cmd.conn)
@@ -394,24 +431,37 @@ object MeshGatt {
             is MeshEngineCommand.Subscribe -> subscribe(cmd.conn, cmd.instance)
             is MeshEngineCommand.WriteLink -> {
                 val run = Runnable {
-                    val gatt = gattByAddr[cmd.conn]
-                    val ch = charByKey["${cmd.conn}#${cmd.instance}"]
-                    if (gatt == null || ch == null) {
-                        delivery?.let { failClientRoute(cmd.conn, it) }
-                        return@Runnable
+                    synchronized(txLock) {
+                        // Delayed engine commands may outlive stop(). Serialize
+                        // the epoch check with teardown so an old encrypted
+                        // packet cannot enter a newly started radio's queue.
+                        if (commandGeneration != deliveryGeneration.get()) {
+                            return@synchronized
+                        }
+                        val gatt = gattByAddr[cmd.conn]
+                        val ch = charByKey["${cmd.conn}#${cmd.instance}"]
+                        if (gatt == null || ch == null) {
+                            delivery?.let { failClientRoute(cmd.conn, it) }
+                            return@synchronized
+                        }
+                        writePacket(gatt, ch, cmd.bytes, delivery)
                     }
-                    writePacket(gatt, ch, cmd.bytes, delivery)
                 }
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
             is MeshEngineCommand.NotifyConn -> {
                 val run = Runnable {
-                    val device = serverDevices[cmd.conn]
-                    if (device == null) {
-                        delivery?.let { failServerRoute(cmd.conn, it) }
-                        return@Runnable
+                    synchronized(txLock) {
+                        if (commandGeneration != deliveryGeneration.get()) {
+                            return@synchronized
+                        }
+                        val device = serverDevices[cmd.conn]
+                        if (device == null) {
+                            delivery?.let { failServerRoute(cmd.conn, it) }
+                            return@synchronized
+                        }
+                        notify(device, cmd.bytes, delivery)
                     }
-                    notify(device, cmd.bytes, delivery)
                 }
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
@@ -881,6 +931,9 @@ object MeshGatt {
     }
 
     private val nextDeliveryAttempt = java.util.concurrent.atomic.AtomicLong()
+    /** Incremented by [stop] so delayed callbacks cannot escape a completed
+     * radio lifecycle and resurrect app-owned plaintext after erase/wipe. */
+    private val deliveryGeneration = java.util.concurrent.atomic.AtomicLong()
     private val reportedDeliveryAttempts = ConcurrentHashMap<Long, Long>()
 
     private fun reportSendFailures(deliveries: List<OutboundDelivery>) {
@@ -892,32 +945,42 @@ object MeshGatt {
                 }
             }
         }
-        deliveries.distinctBy { it.attemptId }.forEach { delivery ->
-            if (reportedDeliveryAttempts.putIfAbsent(delivery.attemptId, now) != null) return@forEach
-            handler.post {
-                when (delivery) {
-                    is TextDelivery -> onSendFailure.forEach { listener ->
-                        runCatching {
-                            listener(MeshSendFailure(delivery.peerId, delivery.messageId, delivery.text, delivery.tsSecs))
-                        }
-                    }
-                    is MediaDelivery -> onMediaSendFailure.forEach { listener ->
-                        runCatching {
-                            listener(
-                                MeshMediaSendFailure(
-                                    delivery.peerId,
-                                    delivery.messageId,
-                                    delivery.bytes.copyOf(),
-                                    delivery.filename,
-                                    delivery.mimeType,
-                                    delivery.tsSecs,
-                                )
-                            )
+        val activeGeneration = deliveryGeneration.get()
+        deliveries.asSequence()
+            .filter { it.generation == activeGeneration }
+            .distinctBy { it.attemptId }
+            .forEach { delivery ->
+                if (reportedDeliveryAttempts.putIfAbsent(delivery.attemptId, now) != null) return@forEach
+                handler.post {
+                    // Serialize this final epoch check with stop()'s invalidation.
+                    // Listeners only append to lock-free inboxes and never re-enter
+                    // the engine, so holding txLock here cannot invert its locks.
+                    synchronized(txLock) {
+                        if (delivery.generation != deliveryGeneration.get()) return@synchronized
+                        when (delivery) {
+                            is TextDelivery -> onSendFailure.forEach { listener ->
+                                runCatching {
+                                    listener(MeshSendFailure(delivery.peerId, delivery.messageId, delivery.text, delivery.tsSecs))
+                                }
+                            }
+                            is MediaDelivery -> onMediaSendFailure.forEach { listener ->
+                                runCatching {
+                                    listener(
+                                        MeshMediaSendFailure(
+                                            delivery.peerId,
+                                            delivery.messageId,
+                                            delivery.bytes.copyOf(),
+                                            delivery.filename,
+                                            delivery.mimeType,
+                                            delivery.tsSecs,
+                                        )
+                                    )
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
     }
 
     @SuppressLint("MissingPermission")

@@ -24,6 +24,7 @@ import chat.bitchat.sonar.wallet.paymentDestinationHash
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -893,6 +894,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
             relayStartupCompleted = false
+            val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+            try {
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             val walletShutdownFailure = runCatching { WalletBridge.shutdown() }.exceptionOrNull()
@@ -951,6 +954,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (coreWipeFailure != null || walletShutdownFailure != null || walletWipeFailure != null) {
                 toast = "Local storage wipe was incomplete; Sonar will retry before reusing caches."
             }
+            } finally {
+                resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
+            }
         }
     }
 
@@ -971,6 +977,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun eraseAllChats() {
         scope.launch {
             endTranscriptSession()
+            val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
+            try {
             cancelPendingMarmotSetups()
             cancelPendingMarmotGroupSetups()
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
@@ -989,6 +997,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
             retainedTranscriptByChat.clear()
             transcriptWindows.clear()
+            // Leave the old composer before the delivery suspension is lifted.
+            stack = listOf(Screen.Home)
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -1002,6 +1012,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             scanWatermark.clear(); stagedChangedPages.clear(); failedChangedPageReads.clear()
             // White Noise / Marmot DB: wipe + reconnect with the SAME identity.
             runCatching { SonarCore.eraseChats() }
+            } finally {
+                resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
+            }
             relayStartupCompleted = false
             localCoreReady = true
             homeMessagesHydrated = true
@@ -1009,8 +1022,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             resetCallState()
             startRelayConnection()
             ensureCallStarted()
+            refreshMeshIdentity()
+            MeshRadio.start()
             refreshChats()
-            stack = listOf(Screen.Home)
             toast = "All chats erased"
         }
     }
@@ -1311,6 +1325,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Match Apple's sendChain: preserve composer order across text, sticker,
      * control, receipt, and queued Marmot sends without serializing downloads. */
     private val marmotSendMutex = Mutex()
+    private var marmotAccountGeneration = 0L
+    private var marmotAccountMutationSuspended = false
     private var refreshRunning = false
     private var refreshPending = false
     private var refreshCompletion: CompletableDeferred<Unit>? = null
@@ -2075,13 +2091,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         val raw = npubRawFor(peerId) ?: return
         scope.launch {
             runCatching {
-                SonarCore.sendDirectDm(
-                    recipientHex = raw.toHexLower(),
-                    senderPeerIdHex = MeshRadio.localPeerIdHex(),
-                    recipientPeerIdHex = "",
-                    messageId = randomMeshId(),
-                    text = payload,
-                )
+                runMarmotAccountOperation {
+                    SonarCore.sendDirectDm(
+                        recipientHex = raw.toHexLower(),
+                        senderPeerIdHex = MeshRadio.localPeerIdHex(),
+                        recipientPeerIdHex = "",
+                        messageId = randomMeshId(),
+                        text = payload,
+                    )
+                }
             }.onFailure {
                 sonarLog("SonarDirect", "favorite notify failed peer=${peerId.take(10)} err=${it.message}")
             }
@@ -3343,6 +3361,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
         scope.launch {
+            var marmotDeliveryGeneration: Long? = null
             val result = runCatching {
                 val key = nsec.trim()
                 val expectedNpub = try {
@@ -3389,6 +3408,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     runCatching { withTimeoutOrNull(3_000) { job.join() } }
                 }
                 resetCallState()
+                marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()
 
@@ -3485,6 +3505,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                         getString(Res.string.account_restored_chat_backup_restore)
                 }
             }
+            marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
             onResult(result.map { Unit })
         }
     }
@@ -4997,7 +5018,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             if (!awaitRelayConnection()) return@launch
             try {
-                val chatId = SonarCore.startChat(p)
+                val chatId = runMarmotAccountOperation { SonarCore.startChat(p) }
                 refreshChats()
                 val chat = chats.firstOrNull { it.id == chatId }
                 if (chat != null) {
@@ -5030,11 +5051,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupJob = scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
-                val chatId = SonarCore.startChat(npubHex)
+                val chatId = runMarmotAccountOperation { SonarCore.startChat(npubHex) }
                 finishPendingMarmotChat(npubHex, canonicalPeer, pendingChatId, chatId, setupToken = setupToken)
+            } catch (error: CancellationException) {
+                throw error
             } catch (t: Throwable) {
                 if (failPendingMarmotChat(npubHex, pendingChatId, setupToken)) {
-                    toast = "couldn't start secure chat: ${t.message}"
+                    toast = "couldn’t start secure chat: ${t.message}"
                 }
             } finally {
                 clearPendingMarmotSetup(pendingChatId, npubHex, setupToken)
@@ -5140,8 +5163,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupJob = scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
-                val chatId = SonarCore.startGroup(pending.members, pending.name)
+                val chatId = runMarmotAccountOperation { SonarCore.startGroup(pending.members, pending.name) }
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
+            } catch (error: CancellationException) {
+                throw error
             } catch (t: Throwable) {
                 if (failPendingMarmotGroup(pendingChatId, setupToken)) {
                     toast = "couldn’t create group: ${t.message}"
@@ -5159,8 +5184,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupJob = scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
-                val chatId = SonarCore.acceptGroupInvite(inviteId)
+                val chatId = runMarmotAccountOperation { SonarCore.acceptGroupInvite(inviteId) }
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
+            } catch (error: CancellationException) {
+                throw error
             } catch (t: Throwable) {
                 if (failPendingMarmotGroup(pendingChatId, setupToken)) {
                     toast = "couldn’t accept invite: ${t.message}"
@@ -5259,7 +5286,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun sendMarmotTextOrdered(chatId: String, text: String) {
-        marmotSendMutex.withLock { SonarCore.send(chatId, text) }
+        runMarmotAccountOperation { SonarCore.send(chatId, text) }
     }
 
     private suspend fun sendMarmotStickerOrdered(
@@ -5268,8 +5295,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         shortcode: String,
         plaintextSha256: String,
     ) {
-        marmotSendMutex.withLock {
+        runMarmotAccountOperation {
             SonarCore.sendSticker(chatId, packCoordinate, shortcode, plaintextSha256)
+        }
+    }
+
+    /** Serialize every plaintext-publishing Marmot operation with account
+     * mutation. Capturing the generation before waiting prevents a send that
+     * was queued against the old account from running after erase/restore. */
+    private suspend inline fun <T> runMarmotAccountOperation(block: () -> T): T {
+        if (marmotAccountMutationSuspended) {
+            throw CancellationException("Marmot account state is being replaced")
+        }
+        val generation = marmotAccountGeneration
+        return marmotSendMutex.withLock {
+            if (marmotAccountMutationSuspended || generation != marmotAccountGeneration) {
+                throw CancellationException("Marmot account state is being replaced")
+            }
+            block()
         }
     }
 
@@ -5621,7 +5664,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  republish their original encrypted event; optimistic setup/media rows
      *  reuse the local plaintext/bytes that are already held for that row. */
     fun retryMessage(chatId: String, message: SonarMsg) {
-        if (!sonarCanRetryMessage(message)) return
+        if (marmotAccountMutationSuspended || !sonarCanRetryMessage(message)) return
         val mediaUploads = pendingMediaUploads[chatId]
             ?.filter { it.message.id == message.id }
             .orEmpty()
@@ -5641,9 +5684,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (it.id == message.id) retrying else it
         }
         scope.launch {
-            runCatching { SonarCore.retryMessage(message.id) }
+            runCatching { runMarmotAccountOperation { SonarCore.retryMessage(message.id) } }
                 .onSuccess { refreshRetriedMarmotMessage(chatId) }
                 .onFailure { error ->
+                    if (error is CancellationException) return@onFailure
                     if ((screen as? Screen.Chat)?.id == chatId) {
                         messages = messages.map {
                             if (it.id == message.id) it.copy(state = "Couldn't send") else it
@@ -5710,6 +5754,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 markPendingMediaCompleted(chatId, pendingId)
                 clearMediaUploadProgress(pendingId)
                 refreshRetriedMarmotMessage(chatId)
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: Throwable) {
                 if (isMediaUploadInFlight(error)) {
                     // Owner still uploading — keep Uploading UI / progress.
@@ -6506,6 +6552,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         failureLabel: String,
         skipMesh: Boolean = false,
     ) {
+        if (marmotAccountMutationSuspended) return
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         if (!skipMesh && isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             // Only attempt the BLE route for payloads the file packet can
@@ -6602,6 +6649,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                         }
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Throwable) {
                 if (isMediaUploadInFlight(e)) {
                     return@launch
@@ -6624,6 +6673,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  tags) that renders as the swipeable card deck. BLE mesh has no album
      *  packet, so a mesh-linked peer gets N individual image sends. */
     fun sendImageAlbum(chatId: String, items: List<PickedPhoto>) {
+        if (marmotAccountMutationSuspended) return
         if (items.size <= 1) {
             items.firstOrNull()?.let { sendImage(chatId, it.bytes, it.filename, it.mime) }
             return
@@ -6744,6 +6794,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                         }
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Throwable) {
                 if (isMediaUploadInFlight(e)) {
                     return@launch
@@ -6797,6 +6849,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Send a recorded voice note (AAC .m4a bytes) to a White Noise chat or a
      *  live BLE mesh peer, using the same media bubble model as photos. */
     fun sendVoiceNote(chatId: String, bytes: ByteArray) {
+        if (marmotAccountMutationSuspended) return
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
         val filename = "vn-${(1000..99999).random()}.m4a"
         val mime = "audio/mp4"
@@ -6873,6 +6926,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                         }
                     }
                 }
+            } catch (error: CancellationException) {
+                throw error
             } catch (e: Throwable) {
                 if (isMediaUploadInFlight(e)) {
                     return@launch
@@ -7564,7 +7619,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             refreshChats()
             val groupId = marmotGroupForNpub(npubRaw)?.id ?: run {
                 if (!awaitRelayConnection()) return false
-                SonarCore.startChat(npubRaw.toHexLower())
+                runMarmotAccountOperation { SonarCore.startChat(npubRaw.toHexLower()) }
             }.also {
                 refreshChats()
                 recomputeConversations()
@@ -7768,13 +7823,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         text: String,
     ): Boolean {
         return try {
-            SonarCore.sendDirectDm(
-                recipientHex = npubRaw.toHexLower(),
-                senderPeerIdHex = MeshRadio.localPeerIdHex(),
-                recipientPeerIdHex = "",
-                messageId = messageId,
-                text = text,
-            )
+            runMarmotAccountOperation {
+                SonarCore.sendDirectDm(
+                    recipientHex = npubRaw.toHexLower(),
+                    senderPeerIdHex = MeshRadio.localPeerIdHex(),
+                    recipientPeerIdHex = "",
+                    messageId = messageId,
+                    text = text,
+                )
+            }
             true
         } catch (e: Throwable) {
             toast = "send failed: ${e.message}"
@@ -7914,8 +7971,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         startingMarmotChats.remove(npubHex)
     }
 
-    private fun cancelPendingMarmotSetups() {
-        pendingMarmotSetupJobs.values.forEach { it.cancel() }
+    private suspend fun cancelPendingMarmotSetups() {
+        val jobs = pendingMarmotSetupJobs.values.toList()
+        jobs.forEach { it.cancel() }
+        jobs.forEach { it.join() }
         pendingMarmotSetupJobs.clear()
         pendingMarmotSetupTokens.clear()
         startingMarmotChats.clear()
@@ -7943,10 +8002,47 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotGroupSetupTokens.remove(pendingChatId)
     }
 
-    private fun cancelPendingMarmotGroupSetups() {
-        pendingMarmotGroupSetupJobs.values.forEach { it.cancel() }
+    private suspend fun cancelPendingMarmotGroupSetups() {
+        val jobs = pendingMarmotGroupSetupJobs.values.toList()
+        jobs.forEach { it.cancel() }
+        jobs.forEach { it.join() }
         pendingMarmotGroupSetupJobs.clear()
         pendingMarmotGroupSetupTokens.clear()
+    }
+
+    /** Cancellation is joined before any host/core state is erased. A core
+     * send already inside FFI may not be interruptible, so clearing first and
+     * merely cancelling would still let that old plaintext publish afterward. */
+    private suspend fun cancelPendingMarmotPeerDeliveryJobs(onSuspended: () -> Unit = {}): Long {
+        val generation = ++marmotAccountGeneration
+        marmotAccountMutationSuspended = true
+        // Invalidate accepted GATT deliveries immediately after the account
+        // gate closes, before awaiting any non-cancellable core operation.
+        onSuspended()
+        val setupPeers = startingMarmotChatJobs.keys.toSet()
+        val jobs = (
+            pendingMarmotFlushJobs.values +
+                startingMarmotChatJobs.values +
+                outboxFlushJobs.values
+            ).distinct()
+        jobs.forEach { it.cancel() }
+        jobs.forEach { it.join() }
+        pendingMarmotFlushJobs.clear()
+        startingMarmotChatJobs.clear()
+        outboxFlushJobs.clear()
+        flushingOutboxPeers.clear()
+        startingMarmotChats.removeAll(setupPeers)
+        pendingMarmotSends.clear()
+        // Join any direct/receipt send that was already inside the serialized
+        // FFI section. Older waiters observe the generation change and abort.
+        marmotSendMutex.withLock {}
+        return generation
+    }
+
+    private fun resumePendingMarmotPeerDelivery(generation: Long) {
+        if (marmotAccountGeneration == generation) {
+            marmotAccountMutationSuspended = false
+        }
     }
 
     // ── Outbox: per-peer message queue for offline/unreachable peers ──
@@ -7968,6 +8064,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun sendOverMarmot(peerId: String, npubRaw: ByteArray, text: String) {
         val chatId = meshChatId(peerId)
         val group = marmotGroupForNpub(npubRaw)
+        val chatId = meshChatId(peerId)
+        val echo = createSendEcho(chatId, text)
+        messages = (messages + echo).sortedBy { it.tsSecs }
+        pendingMarmotSends.enqueue(
+            npubHex,
+            PendingMarmotSend(text, peerId, chatId, echo.id),
+        )
         if (group != null) {
             val echo = createSendEcho(chatId, text)
             messages = (messages + echo).sortedBy { it.tsSecs }
@@ -8019,6 +8122,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val chatId = meshChatId(peerId)
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
         val group = marmotGroupForNpub(npubRaw)
+        val chatId = meshChatId(peerId)
+        val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
+        val echo = createSendEcho(chatId, encoded)
+        messages = (messages + echo).sortedBy { it.tsSecs }
+        pendingMarmotSends.enqueue(
+            npubHex,
+            PendingMarmotSend(encoded, peerId, chatId, echo.id),
+        )
         if (group != null) {
             val echo = createSendEcho(chatId, encoded)
             messages = (messages + echo).sortedBy { it.tsSecs }
@@ -8044,8 +8155,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }
             .add(PendingMeshMarmotSend(meshChatId = chatId, text = encoded, echoId = echo.id))
         toast = "Out of range — continuing over White Noise…"
+        startMarmotChatForPendingPeer(npubHex, peerId)
+    }
+
+    private fun startMarmotChatForPendingPeer(npubHex: String, peerId: String) {
+        if (marmotAccountMutationSuspended) return
+        if (startingMarmotChatJobs[npubHex]?.isActive == true) return
         if (!startingMarmotChats.add(npubHex)) return
-        scope.launch {
+        val generation = marmotAccountGeneration
+        val job = scope.launch {
             try {
                 if (!awaitRelayConnection()) {
                     failPendingMeshMarmotSends(npubHex)
@@ -8062,6 +8180,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 startingMarmotChats.remove(npubHex)
             }
         }
+        startingMarmotChatJobs[npubHex] = job
     }
 
     private fun failPendingMeshMarmotSends(npubHex: String) {
@@ -8097,6 +8216,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (pendingMarmotSends.isEmpty()) return
         for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
+            if (pendingMarmotFlushJobs[npubHex]?.isActive == true) continue
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             val queued = texts.toList()
             pendingMarmotSends.remove(npubHex)
@@ -8127,6 +8247,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
             }
+            pendingMarmotFlushJobs[npubHex] = job
         }
     }
 
@@ -8148,14 +8269,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
      *  are silently dropped. Messages that still can't be sent remain queued. */
     private fun flushOutbox(peerId: String) {
-        if (!outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
-        scope.launch {
+        if (marmotAccountMutationSuspended || !outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
+        val job = scope.launch {
             try {
                 flushOutboxNow(peerId)
             } finally {
-                flushingOutboxPeers.remove(peerId)
+                val owner = currentCoroutineContext()[Job]
+                if (outboxFlushJobs[peerId] === owner) {
+                    outboxFlushJobs.remove(peerId)
+                    flushingOutboxPeers.remove(peerId)
+                }
             }
         }
+        outboxFlushJobs[peerId] = job
     }
 
     private suspend fun flushOutboxNow(peerId: String) {
@@ -8243,7 +8369,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             marmotGroupForNpub(npubRaw)?.id ?: run {
                 if (!startingMarmotChats.add(npubHex)) return null
                 try {
-                    SonarCore.startChat(npubHex).also {
+                    runMarmotAccountOperation { SonarCore.startChat(npubHex) }.also {
                         refreshChats()
                         recomputeConversations()
                         flushPendingMarmot()

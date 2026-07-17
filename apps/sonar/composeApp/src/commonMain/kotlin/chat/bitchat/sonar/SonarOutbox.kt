@@ -16,6 +16,48 @@ internal data class OutboxEnqueueResult(
     val depth: Int,
 )
 
+/** One folded-mesh send waiting for its Marmot group/worker. Keeping the echo
+ * identity beside the plaintext lets the single per-peer owner reconcile the
+ * optimistic row only after the core accepted this exact queue head. */
+internal data class PendingMarmotSend(
+    val content: String,
+    val peerId: String,
+    val chatId: String,
+    val echoId: String,
+)
+
+/** FIFO storage for folded-mesh Marmot fallback. The caller owns execution;
+ * this type deliberately exposes only the head so a failed send cannot be
+ * removed/requeued behind a message appended while it was in flight. */
+internal class PendingMarmotOutbox {
+    private val queues = mutableMapOf<String, MutableList<PendingMarmotSend>>()
+
+    fun clear() {
+        queues.clear()
+    }
+
+    fun isEmpty(): Boolean = queues.isEmpty()
+
+    fun peerIds(): List<String> = queues.keys.toList()
+
+    fun enqueue(npubHex: String, send: PendingMarmotSend) {
+        queues.getOrPut(npubHex) { mutableListOf() }.add(send)
+    }
+
+    fun peek(npubHex: String): PendingMarmotSend? = queues[npubHex]?.firstOrNull()
+
+    fun snapshot(npubHex: String): List<PendingMarmotSend> = queues[npubHex]?.toList().orEmpty()
+
+    /** A stale worker may never acknowledge a newer head. */
+    fun removeFirst(npubHex: String, expected: PendingMarmotSend): Boolean {
+        val queue = queues[npubHex] ?: return false
+        if (queue.firstOrNull() !== expected) return false
+        queue.removeAt(0)
+        if (queue.isEmpty()) queues.remove(npubHex)
+        return true
+    }
+}
+
 internal class SonarOutbox(
     private val maxPerPeer: Int = OUTBOX_MAX_PER_PEER,
     private val ttlSecs: Long = OUTBOX_TTL_SECS,
