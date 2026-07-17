@@ -325,7 +325,8 @@ object MeshGatt {
     // burning a MAX_CLIENTS slot and stay eligible as a (broken) send route.
     // Per-role keys also make cleanup exact: each cleanup drops only its own key,
     // so no cross-map guard can leak an entry.
-    /** Last rx per address on the CLIENT role (we are central; peer notifies us). */
+    /** Last rx per client LINK KEY ("addr#instanceId" — we are central; that
+     *  peer app notifies us on its own characteristic instance). */
     private val lastClientRxMs = ConcurrentHashMap<String, Long>()
     /** Last rx per address on the SERVER role (we are peripheral; peer writes us). */
     private val lastServerRxMs = ConcurrentHashMap<String, Long>()
@@ -358,6 +359,12 @@ object MeshGatt {
     @Volatile private var livenessArmed = false
     /** Tick time of the previous sweep, to spot a frozen/dozed process (below). */
     @Volatile private var lastSweepMs = 0L
+    /** When [clientWriting]'s in-flight GATT op was issued, per connection. The
+     *  stack can accept an op and never deliver its completion callback (same
+     *  lost-callback family as the silent disconnects) — the sweep unblocks the
+     *  queue after this long so sibling instances still get their turn. */
+    private val opInFlightSinceMs = ConcurrentHashMap<String, Long>()
+    private const val OP_STUCK_MS = 10_000L
     /** A scheduling gap longer than this means our own process was frozen (Android
      *  caches a backgrounded app: `cch/LAST`, handler callbacks stop) or the device
      *  dozed. elapsedRealtime keeps running through it, so every link would look
@@ -381,34 +388,52 @@ object MeshGatt {
             val sweepGapMs = if (lastSweepMs == 0L) 0L else now - lastSweepMs
             val resumedFromGap = meshSweepResumedFromGap(now, lastSweepMs, SWEEP_RESUME_GAP_MS)
             lastSweepMs = now
-            val clients = clientGatt.keys.toSet()
+            // Client liveness is tracked per LINK KEY: one address can host
+            // several peer apps (service instances), and a dead instance must
+            // cull itself while a chatty sibling keeps the connection alive —
+            // per-address rx would let the sibling mask it forever and DMs to
+            // the dead app's fingerprint would sink into its stale characteristic.
+            val clientKeys = clientChar.keys.toSet()
             val servers = serverDevices.keys.toSet()
-            if ((clients.isNotEmpty() || servers.isNotEmpty()) && now - lastHeartbeatMs >= HEARTBEAT_MS) {
+            if ((clientGatt.isNotEmpty() || servers.isNotEmpty()) && now - lastHeartbeatMs >= HEARTBEAT_MS) {
                 lastHeartbeatMs = now
                 broadcastDiscoveryNow("heartbeat")
             }
+            // Un-stick a lost GATT-op completion: the same stack that loses
+            // disconnect callbacks can accept a write/CCC op and never call back,
+            // which would freeze that connection's op queue (and with it any
+            // sibling instance still waiting to subscribe).
+            for (addr in clientWriting) {
+                val since = opInFlightSinceMs[addr] ?: continue
+                if (now - since >= OP_STUCK_MS) {
+                    android.util.Log.w(TAG, "gatt op stuck ${now - since}ms on $addr — unblocking queue")
+                    opInFlightSinceMs.remove(addr)
+                    clientWriting.remove(addr)
+                    pumpClientWrites(addr)
+                }
+            }
             // Seed first so a link that just formed gets a full LINK_STALE_MS window.
-            clients.forEach { lastClientRxMs.putIfAbsent(it, now) }
+            clientKeys.forEach { lastClientRxMs.putIfAbsent(it, now) }
             servers.forEach { lastServerRxMs.putIfAbsent(it, now) }
             // Drop entries a late callback re-added after cleanup, so neither map
             // grows without bound across a long session of rotating addresses.
-            lastClientRxMs.keys.removeAll { it !in clients && it !in clientPending }
+            lastClientRxMs.keys.removeAll { it !in clientKeys }
             lastServerRxMs.keys.removeAll { it !in servers }
             if (resumedFromGap) {
                 // Our process was frozen/dozed: silence measured across that gap is
                 // our downtime, not the peer's. Re-arm every window and judge on the
                 // next tick, once peers have had a fair chance to talk.
                 android.util.Log.i(TAG, "liveness sweep resumed after ${sweepGapMs}ms gap — re-seeding, no cull this tick")
-                clients.forEach { lastClientRxMs[it] = now }
+                clientKeys.forEach { lastClientRxMs[it] = now }
                 servers.forEach { lastServerRxMs[it] = now }
                 if (livenessArmed) handler.postDelayed(this, LIVENESS_TICK_MS)
                 return
             }
-            for (addr in meshStaleLinkAddrs(now, clients, lastClientRxMs, LINK_STALE_MS)) {
-                if (!stillStale(lastClientRxMs[addr])) continue
-                android.util.Log.i(TAG, "client link $addr zombie (no rx in ${LINK_STALE_MS}ms) — closing so scan can re-dial")
-                recentDials.remove(addr) // allow an immediate re-dial
-                cleanupClient(addr)
+            for (key in meshStaleLinkAddrs(now, clientKeys, lastClientRxMs, LINK_STALE_MS)) {
+                if (!stillStale(lastClientRxMs[key])) continue
+                android.util.Log.i(TAG, "client link $key zombie (no rx in ${LINK_STALE_MS}ms) — dropping so scan can re-dial")
+                recentDials.remove(addrOf(key)) // allow an immediate re-dial
+                dropClientLink(key) // closes the connection once no instance remains
             }
             for (addr in meshStaleLinkAddrs(now, servers, lastServerRxMs, LINK_STALE_MS)) {
                 if (!stillStale(lastServerRxMs[addr])) continue
@@ -469,6 +494,10 @@ object MeshGatt {
         server = null; characteristic = null
         clientGatt.values.forEach { runCatching { it.disconnect(); it.close() } }
         clientGatt.clear(); clientChar.clear(); clientLinks.clear(); clientPending.clear(); clientConnected.clear()
+        // Clear the op queues too: a stuck in-flight flag surviving stop() would
+        // permanently block the same address's queue after the next start().
+        clientWriteQueue.clear(); clientWriting.clear(); opInFlightSinceMs.clear()
+        serverNotifyQueue.clear(); serverNotifying.clear()
         serverLinks.clear(); serverDevices.clear(); peerIdByAddr.clear(); fingerprintByAddr.clear()
         fingerprintByPeerId.clear(); signingKeyByPeerId.clear(); recentDials.clear()
         clearPendingSonar()
@@ -493,6 +522,7 @@ object MeshGatt {
     private fun dropClientLink(key: String) {
         clientLinks.remove(key); clientChar.remove(key)
         peerIdByAddr.remove(key); fingerprintByAddr.remove(key)
+        lastClientRxMs.remove(key)
         val addr = addrOf(key)
         if (clientChar.keys.none { addrOf(it) == addr }) cleanupClient(addr)
     }
@@ -675,7 +705,6 @@ object MeshGatt {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 clientGatt[addr] = gatt
                 clientConnected.add(addr) // earns the longer announce window
-                lastClientRxMs[addr] = nowMonotonic()
                 gatt.requestMtu(517)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (status != 0) gatt.close()
@@ -734,9 +763,17 @@ object MeshGatt {
             // notifications are enabled on THIS instance, send it our announce and
             // (queued behind it) our 0x53.
             val addr = gatt.device.address
+            opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
             val ch = descriptor.characteristic
             val key = clientKey(addr, ch)
+            if (clientChar[key] == null) {
+                // The instance link was dropped (policy) while this CCC write was
+                // in flight — don't announce ourselves to it.
+                android.util.Log.i(TAG, "client $key: notify enabled but link dropped — skipping announce")
+                pumpClientWrites(addr)
+                return
+            }
             val ann = announceBytes()
             android.util.Log.i(TAG, "client $key: notify enabled (status=$status) → send announce (${ann?.size}B)")
             ann?.let { writePacket(gatt, ch, it) }
@@ -749,6 +786,7 @@ object MeshGatt {
             // next queued write (one outstanding write at a time is the hard limit
             // that was dropping our handshake m1).
             val addr = gatt.device.address
+            opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
             pumpClientWrites(addr)
         }
@@ -765,17 +803,17 @@ object MeshGatt {
     }
 
     private fun cleanupClient(addr: String) {
-        lastClientRxMs.remove(addr)
         // Client link state is keyed "addr#instanceId" — drop every instance link
         // riding this connection. Plain-address entries in the shared peer maps
         // belong to the SERVER role and stay (cleanupServer owns those).
         val prefix = "$addr#"
+        lastClientRxMs.keys.removeAll { it.startsWith(prefix) }
         clientLinks.keys.removeAll { it.startsWith(prefix) }
         clientChar.keys.removeAll { it.startsWith(prefix) }
         peerIdByAddr.keys.removeAll { it.startsWith(prefix) }
         fingerprintByAddr.keys.removeAll { it.startsWith(prefix) }
         clientPending.remove(addr); clientConnected.remove(addr)
-        clientWriteQueue.remove(addr); clientWriting.remove(addr)
+        clientWriteQueue.remove(addr); clientWriting.remove(addr); opInFlightSinceMs.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
     }
 
@@ -788,7 +826,7 @@ object MeshGatt {
         addr: String, value: ByteArray, fromServer: Boolean,
         device: BluetoothDevice? = null, gatt: BluetoothGatt? = null,
     ) {
-        if (fromServer) lastServerRxMs[addr] = nowMonotonic() else lastClientRxMs[addrOf(addr)] = nowMonotonic()
+        if (fromServer) lastServerRxMs[addr] = nowMonotonic() else lastClientRxMs[addr] = nowMonotonic()
         val info = runCatching { meshDecodePacket(value) }.getOrNull()
         if (info == null) {
             android.util.Log.i(TAG, "rx undecodable value (${value.size}B) from $addr")
@@ -1342,6 +1380,7 @@ object MeshGatt {
         val next = q.poll() ?: return
         val gatt = clientGatt[addr] ?: return
         clientWriting.add(addr)
+        opInFlightSinceMs[addr] = nowMonotonic()
         val accepted = when (next) {
             is GattOp.WriteChar -> issueWrite(gatt, next.ch, next.bytes)
             is GattOp.WriteDesc -> issueDescWrite(gatt, next.desc)
@@ -1350,6 +1389,7 @@ object MeshGatt {
             // The op wasn't accepted ⇒ its completion callback won't fire; don't
             // stall the queue — drop it and move on.
             android.util.Log.w(TAG, "gatt op not accepted for $addr — skipping")
+            opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
             pumpClientWrites(addr)
         }
