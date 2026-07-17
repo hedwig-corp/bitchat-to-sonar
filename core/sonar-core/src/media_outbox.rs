@@ -46,6 +46,10 @@ pub(crate) struct MediaUploadJob {
     pub server_url: String,
     pub created_at_secs: u64,
     pub expected_items: usize,
+    /// Every plaintext input is encrypted into the journal before the job is
+    /// made visible in the manifest. Recovery can therefore finish media
+    /// preparation even if the process dies before the first MIP-04 blob.
+    pub sources: Vec<MediaUploadSource>,
     pub items: Vec<MediaUploadItem>,
     /// Set only after the local transcript row and durable relay outbox entry
     /// have both been committed. Recovery treats this as a terminal handoff
@@ -55,13 +59,18 @@ pub(crate) struct MediaUploadJob {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct MediaUploadItem {
-    blob_file: String,
+pub(crate) struct MediaUploadSource {
     source_file: String,
     source_nonce: [u8; 12],
     pub source_hash: [u8; 32],
     pub source_size: u64,
-    pub source_mime: String,
+    pub mime: String,
+    pub filename: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct MediaUploadItem {
+    blob_file: String,
     pub encryption_epoch: u64,
     pub original_hash: [u8; 32],
     pub encrypted_hash: [u8; 32],
@@ -82,19 +91,11 @@ impl MediaUploadItem {
     fn from_upload(
         request_id: &str,
         index: usize,
-        source: &[u8],
-        source_mime: &str,
-        source_nonce: [u8; 12],
         encryption_epoch: u64,
         upload: &EncryptedMediaUpload,
     ) -> Self {
         Self {
             blob_file: upload_blob_file(request_id, index, &upload.nonce),
-            source_file: format!("{request_id}-{index}.source"),
-            source_nonce,
-            source_hash: Sha256::digest(source).into(),
-            source_size: source.len() as u64,
-            source_mime: source_mime.to_string(),
             encryption_epoch,
             original_hash: upload.original_hash,
             encrypted_hash: upload.encrypted_hash,
@@ -189,10 +190,12 @@ impl MediaOutbox {
         if dir.exists() {
             let referenced: std::collections::HashSet<_> = jobs
                 .values()
+                .filter(|job| job.completed_message_id.is_none())
                 .flat_map(|job| {
-                    job.items
+                    job.sources
                         .iter()
-                        .flat_map(|item| [item.blob_file.as_str(), item.source_file.as_str()])
+                        .map(|source| source.source_file.as_str())
+                        .chain(job.items.iter().map(|item| item.blob_file.as_str()))
                 })
                 .collect();
             if let Ok(entries) = fs::read_dir(&dir) {
@@ -260,36 +263,80 @@ impl MediaOutbox {
         uploads: Vec<(Vec<u8>, String, u64, EncryptedMediaUpload)>,
     ) -> Result<()> {
         let expected_items = uploads.len();
-        self.begin_job(
+        let sources: Vec<_> = uploads
+            .iter()
+            .map(|(source, mime, _, upload)| {
+                (source.as_slice(), mime.as_str(), upload.filename.as_str())
+            })
+            .collect();
+        self.begin_job_with_sources(
             request_id.clone(),
             group_id_hex,
             caption,
             server_url,
             created_at_secs,
-            expected_items,
+            &sources,
         )?;
-        for (source, source_mime, encryption_epoch, upload) in uploads {
-            self.append_upload(&request_id, &source, &source_mime, encryption_epoch, upload)?;
+        debug_assert_eq!(expected_items, sources.len());
+        for (_, _, encryption_epoch, upload) in uploads {
+            self.append_upload(&request_id, encryption_epoch, upload)?;
         }
         Ok(())
     }
 
-    pub fn begin_job(
+    pub fn begin_job_with_sources(
         &mut self,
         request_id: String,
         group_id_hex: String,
         caption: String,
         server_url: String,
         created_at_secs: u64,
-        expected_items: usize,
+        inputs: &[(&[u8], &str, &str)],
     ) -> Result<()> {
         if self.jobs.contains_key(&request_id) {
             return Ok(());
         }
-        let Some(dir) = self.dir.as_ref() else {
+        let (Some(dir), Some(key)) = (self.dir.as_ref(), self.key.as_ref()) else {
             return Err(Error::Storage("media outbox is not persistent".into()));
         };
         create_private_dir(dir)?;
+        let mut sources: Vec<MediaUploadSource> = Vec::with_capacity(inputs.len());
+        for (index, (data, mime, filename)) in inputs.iter().enumerate() {
+            let mut source_nonce = [0_u8; 12];
+            if let Err(error) = getrandom::getrandom(&mut source_nonce) {
+                for source in &sources {
+                    let _ = fs::remove_file(dir.join(&source.source_file));
+                }
+                return Err(error.into());
+            }
+            let source = MediaUploadSource {
+                source_file: format!("{request_id}-{index}.source"),
+                source_nonce,
+                source_hash: Sha256::digest(data).into(),
+                source_size: data.len() as u64,
+                mime: (*mime).to_string(),
+                filename: (*filename).to_string(),
+            };
+            let source_path = dir.join(&source.source_file);
+            let ciphertext = match encrypt_source(key, &request_id, index, source_nonce, data) {
+                Ok(ciphertext) => ciphertext,
+                Err(error) => {
+                    for source in &sources {
+                        let _ = fs::remove_file(dir.join(&source.source_file));
+                    }
+                    return Err(error);
+                }
+            };
+            if let Err(error) = write_private_file(&source_path, &ciphertext) {
+                for source in &sources {
+                    let _ = fs::remove_file(dir.join(&source.source_file));
+                }
+                let _ = fs::remove_file(source_path);
+                return Err(error);
+            }
+            sources.push(source);
+        }
+        let expected_items = sources.len();
         self.jobs.insert(
             request_id.clone(),
             MediaUploadJob {
@@ -299,12 +346,17 @@ impl MediaOutbox {
                 server_url,
                 created_at_secs,
                 expected_items,
+                sources,
                 items: Vec::with_capacity(expected_items),
                 completed_message_id: None,
             },
         );
         if let Err(error) = self.save() {
-            self.jobs.remove(&request_id);
+            if let Some(job) = self.jobs.remove(&request_id) {
+                for source in job.sources {
+                    let _ = fs::remove_file(dir.join(source.source_file));
+                }
+            }
             return Err(error);
         }
         Ok(())
@@ -316,12 +368,10 @@ impl MediaOutbox {
     pub fn append_upload(
         &mut self,
         request_id: &str,
-        source: &[u8],
-        source_mime: &str,
         encryption_epoch: u64,
         upload: EncryptedMediaUpload,
     ) -> Result<()> {
-        let (Some(dir), Some(key)) = (self.dir.as_ref(), self.key.as_ref()) else {
+        let Some(dir) = self.dir.as_ref() else {
             return Err(Error::Storage("media outbox is not persistent".into()));
         };
         let job = self
@@ -332,25 +382,18 @@ impl MediaOutbox {
             return Err(Error::Storage("media upload job already complete".into()));
         }
         let index = job.items.len();
-        let mut source_nonce = [0_u8; 12];
-        getrandom::getrandom(&mut source_nonce)?;
-        let item = MediaUploadItem::from_upload(
-            request_id,
-            index,
-            source,
-            source_mime,
-            source_nonce,
-            encryption_epoch,
-            &upload,
-        );
-        let source_path = dir.join(&item.source_file);
-        let source_ciphertext = encrypt_source(key, request_id, index, source_nonce, source)?;
-        write_private_file(&source_path, &source_ciphertext)?;
-        let blob_path = dir.join(&item.blob_file);
-        if let Err(error) = write_private_file(&blob_path, &upload.encrypted_data) {
-            let _ = fs::remove_file(source_path);
-            return Err(error);
+        let source = job
+            .sources
+            .get(index)
+            .ok_or_else(|| Error::Storage("media upload source is missing".into()))?;
+        if source.filename != upload.filename || source.mime != upload.mime_type {
+            return Err(Error::Storage(
+                "media upload metadata does not match durable source".into(),
+            ));
         }
+        let item = MediaUploadItem::from_upload(request_id, index, encryption_epoch, &upload);
+        let blob_path = dir.join(&item.blob_file);
+        write_private_file(&blob_path, &upload.encrypted_data)?;
         self.jobs
             .get_mut(request_id)
             .expect("job checked above")
@@ -362,7 +405,6 @@ impl MediaOutbox {
                 .expect("job checked above")
                 .items
                 .pop();
-            let _ = fs::remove_file(source_path);
             let _ = fs::remove_file(blob_path);
             return Err(error);
         }
@@ -408,19 +450,19 @@ impl MediaOutbox {
         let (Some(dir), Some(key)) = (self.dir.as_ref(), self.key.as_ref()) else {
             return Err(Error::Storage("media outbox is not persistent".into()));
         };
-        let item = self
+        let source = self
             .jobs
             .get(request_id)
-            .and_then(|job| job.items.get(index))
+            .and_then(|job| job.sources.get(index))
             .ok_or_else(|| Error::Storage("media upload source is missing".into()))?;
-        let path = dir.join(&item.source_file);
+        let path = dir.join(&source.source_file);
         let ciphertext = fs::read(&path).map_err(|error| {
             Error::Storage(format!(
                 "read media upload source {}: {error}",
                 path.display()
             ))
         })?;
-        let expected_ciphertext_size = item
+        let expected_ciphertext_size = source
             .source_size
             .checked_add(16)
             .ok_or_else(|| Error::Storage("media upload source size overflow".into()))?;
@@ -432,15 +474,15 @@ impl MediaOutbox {
                 expected_ciphertext_size
             )));
         }
-        let source = decrypt_source(key, request_id, index, item.source_nonce, &ciphertext)?;
-        let source_hash: [u8; 32] = Sha256::digest(&source).into();
-        if source.len() as u64 != item.source_size || source_hash != item.source_hash {
+        let plaintext = decrypt_source(key, request_id, index, source.source_nonce, &ciphertext)?;
+        let source_hash: [u8; 32] = Sha256::digest(&plaintext).into();
+        if plaintext.len() as u64 != source.source_size || source_hash != source.source_hash {
             return Err(Error::Storage(format!(
                 "media upload source {} failed integrity verification",
                 path.display()
             )));
         }
-        Ok(source)
+        Ok(plaintext)
     }
 
     pub fn replace_upload(
@@ -511,6 +553,19 @@ impl MediaOutbox {
                 .completed_message_id = previous;
             return Err(error);
         }
+        // The small manifest tombstone must survive until an explicit host
+        // retry observes success, but the large source/ciphertext payloads are
+        // no longer needed once the canonical message is durable.
+        if let Some(dir) = self.dir.as_ref() {
+            if let Some(job) = self.jobs.get(request_id) {
+                for item in &job.items {
+                    let _ = fs::remove_file(dir.join(&item.blob_file));
+                }
+                for source in &job.sources {
+                    let _ = fs::remove_file(dir.join(&source.source_file));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -525,7 +580,9 @@ impl MediaOutbox {
         if let Some(dir) = self.dir.as_ref() {
             for item in &job.items {
                 let _ = fs::remove_file(dir.join(&item.blob_file));
-                let _ = fs::remove_file(dir.join(&item.source_file));
+            }
+            for source in &job.sources {
+                let _ = fs::remove_file(dir.join(&source.source_file));
             }
         }
         Ok(())
@@ -786,6 +843,14 @@ mod tests {
         outbox
             .checkpoint_url("request", 0, "https://blossom.example/a".into())
             .unwrap();
+        assert_eq!(
+            outbox.load_upload("request", 1).unwrap().encrypted_data,
+            vec![2; 32]
+        );
+        assert_eq!(outbox.load_source("request", 1).unwrap(), vec![2; 16]);
+        let prepared = outbox.job("request").unwrap();
+        let source_file = media_outbox_dir_for_db(&db).join(&prepared.sources[1].source_file);
+        assert_ne!(fs::read(&source_file).unwrap(), vec![2; 16]);
         outbox
             .checkpoint_completed_message("request", "message-id".into())
             .unwrap();
@@ -797,15 +862,41 @@ mod tests {
             Some("https://blossom.example/a")
         );
         assert_eq!(job.completed_message_id.as_deref(), Some("message-id"));
-        assert_eq!(
-            reloaded.load_upload("request", 1).unwrap().encrypted_data,
-            vec![2; 32]
-        );
-        assert_eq!(reloaded.load_source("request", 1).unwrap(), vec![2; 16]);
-        let source_file = media_outbox_dir_for_db(&db).join(&job.items[1].source_file);
-        assert_ne!(fs::read(source_file).unwrap(), vec![2; 16]);
+        assert!(reloaded.load_upload("request", 1).is_err());
+        assert!(reloaded.load_source("request", 1).is_err());
+        assert!(!source_file.exists());
         let manifest = fs::read(media_outbox_dir_for_db(&db).join(MANIFEST_FILE)).unwrap();
         assert!(!String::from_utf8_lossy(&manifest).contains("caption"));
+    }
+
+    #[test]
+    fn source_journal_survives_before_first_ciphertext_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let key = [8_u8; 32];
+        let first = vec![1_u8; 1024];
+        let second = vec![2_u8; 2048];
+        let mut outbox = MediaOutbox::open(&db, key).unwrap();
+        outbox
+            .begin_job_with_sources(
+                "request".into(),
+                "group".into(),
+                String::new(),
+                String::new(),
+                10,
+                &[
+                    (first.as_slice(), "video/mp4", "first.mp4"),
+                    (second.as_slice(), "image/jpeg", "second.jpg"),
+                ],
+            )
+            .unwrap();
+
+        let reloaded = MediaOutbox::open(&db, key).unwrap();
+        let job = reloaded.job("request").unwrap();
+        assert_eq!(job.sources.len(), 2);
+        assert!(job.items.is_empty(), "MIP-04 preparation has not started");
+        assert_eq!(reloaded.load_source("request", 0).unwrap(), first);
+        assert_eq!(reloaded.load_source("request", 1).unwrap(), second);
     }
 
     #[test]
@@ -825,7 +916,7 @@ mod tests {
             .unwrap();
         let job = outbox.job("request").unwrap();
         let blob = media_outbox_dir_for_db(&db).join(&job.items[0].blob_file);
-        let source = media_outbox_dir_for_db(&db).join(&job.items[0].source_file);
+        let source = media_outbox_dir_for_db(&db).join(&job.sources[0].source_file);
         assert!(blob.exists());
         assert!(source.exists());
         outbox.remove("request").unwrap();
@@ -857,7 +948,7 @@ mod tests {
         }
         let removed_job = outbox.job("one").unwrap();
         let removed_blob = removed_job.items[0].blob_file.clone();
-        let removed_source = removed_job.items[0].source_file.clone();
+        let removed_source = removed_job.sources[0].source_file.clone();
 
         outbox.remove_group_jobs("group-a").unwrap();
 
@@ -868,7 +959,7 @@ mod tests {
         assert!(!outbox_dir.join(removed_blob).exists());
         assert!(!outbox_dir.join(removed_source).exists());
         assert!(outbox_dir.join(&kept_job.items[0].blob_file).exists());
-        assert!(outbox_dir.join(&kept_job.items[0].source_file).exists());
+        assert!(outbox_dir.join(&kept_job.sources[0].source_file).exists());
     }
 
     #[test]

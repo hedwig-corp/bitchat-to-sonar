@@ -110,9 +110,18 @@ const BLOSSOM_UPLOAD_RETRY_AFTER_MAX: Duration = Duration::from_secs(30);
 const MEDIA_UPLOAD_EPOCH_ATTEMPTS: usize = 3;
 const MEDIA_UPLOAD_CONCURRENCY: usize = 2;
 const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
+const MEDIA_DOWNLOAD_CONCURRENCY: usize = 4;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+const MEDIA_DOWNLOAD_PARTIAL_PREFIX: &str = ".sonar-download-";
+const MEDIA_DOWNLOAD_PARTIAL_SUFFIX: &str = ".part";
+const MEDIA_DOWNLOAD_PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Retained, inactive resume prefixes are bounded separately from at most four
+/// active 25 MiB downloads, keeping worst-case partial storage under 200 MiB.
+const MEDIA_DOWNLOAD_PARTIAL_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
+const MEDIA_DOWNLOAD_PARTIAL_RETAINED_BYTES: u64 = MEDIA_DOWNLOAD_PARTIAL_TOTAL_BYTES
+    - (MEDIA_DOWNLOAD_CONCURRENCY as u64 * MAX_MEDIA_DOWNLOAD_BYTES as u64);
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
 /// Upper bound on receive-time sticker prefetch work per processed event batch.
@@ -140,6 +149,25 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 });
+static MEDIA_DOWNLOAD_PERMITS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(MEDIA_DOWNLOAD_CONCURRENCY));
+static ACTIVE_MEDIA_DOWNLOAD_PARTIALS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Removes a resume file from the active-writer set even if its future is
+/// aborted by the host/runtime before the normal cleanup path runs.
+struct ActiveMediaDownloadPartial {
+    path: PathBuf,
+}
+
+impl Drop for ActiveMediaDownloadPartial {
+    fn drop(&mut self) {
+        ACTIVE_MEDIA_DOWNLOAD_PARTIALS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.path);
+    }
+}
 
 /// Per-request bounds for handle registrar/NIP-05 traffic. Tighter than the
 /// shared client's 60s default: handle claim/resolve is interactive UI work.
@@ -298,9 +326,61 @@ fn media_download_resume_path(destination: &Path, url: &str) -> Result<PathBuf> 
         .parent()
         .ok_or_else(|| Error::InvalidInput("media destination has no parent".into()))?;
     Ok(parent.join(format!(
-        ".sonar-download-{}.part",
+        "{MEDIA_DOWNLOAD_PARTIAL_PREFIX}{}{MEDIA_DOWNLOAD_PARTIAL_SUFFIX}",
         hex::encode(Sha256::digest(url.as_bytes()))
     )))
+}
+
+fn prune_media_download_partials(parent: &Path, active: &HashSet<PathBuf>) -> Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::Storage(format!(
+                "read media partial cache {}: {error}",
+                parent.display()
+            )))
+        }
+    };
+    let now = SystemTime::now();
+    let mut retained = Vec::new();
+    let mut retained_bytes = 0_u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_partial = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with(MEDIA_DOWNLOAD_PARTIAL_PREFIX)
+                    && name.ends_with(MEDIA_DOWNLOAD_PARTIAL_SUFFIX)
+            });
+        if !is_partial || active.contains(&path) {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let expired = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > MEDIA_DOWNLOAD_PARTIAL_MAX_AGE);
+        if expired || metadata.len() > MAX_MEDIA_DOWNLOAD_BYTES as u64 {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        retained_bytes = retained_bytes.saturating_add(metadata.len());
+        retained.push((modified, path, metadata.len()));
+    }
+    retained.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    for (_, path, bytes) in retained {
+        if retained_bytes <= MEDIA_DOWNLOAD_PARTIAL_RETAINED_BYTES {
+            break;
+        }
+        if fs::remove_file(path).is_ok() {
+            retained_bytes = retained_bytes.saturating_sub(bytes);
+        }
+    }
+    Ok(())
 }
 
 async fn http_get_to_resume_file_with_retries(
@@ -4039,90 +4119,74 @@ impl SonarClient {
                     && job.caption == caption
                     && stored_server == expected_server
                     && job.expected_items == items.len();
-                let prepared_items_match = job.items.iter().zip(&items).all(|(stored, input)| {
-                    let input_hash: [u8; 32] = Sha256::digest(&input.data).into();
-                    stored.source_hash == input_hash
-                        && stored.source_size == input.data.len() as u64
-                        && stored.filename == input.filename
-                        && stored.source_mime == input.mime
-                });
-                if !metadata_matches || !prepared_items_match {
+                if !metadata_matches {
                     return Err(Error::InvalidInput(
                         "media retry id belongs to different attachment data".into(),
                     ));
                 }
+                let prepared_sources_match =
+                    job.sources.iter().zip(&items).all(|(stored, input)| {
+                        let input_hash: [u8; 32] = Sha256::digest(&input.data).into();
+                        stored.source_hash == input_hash
+                            && stored.source_size == input.data.len() as u64
+                            && stored.filename == input.filename
+                            && stored.mime == input.mime
+                    });
+                if job.sources.len() != items.len() || !prepared_sources_match {
+                    return Err(Error::InvalidInput(
+                        "media retry id belongs to different attachment data".into(),
+                    ));
+                }
+                // A detached recovery may have completed after the foreground
+                // call failed. Once the caller's attachment identity is
+                // verified, consuming the tombstone acknowledges success
+                // without publishing a duplicate message.
+                if job.completed_message_id.is_some() {
+                    self.media_outbox.lock().unwrap().remove(&request_id)?;
+                    return Ok(());
+                }
             }
-            let mut existing_items = existing_job.map(|job| job.items.len()).unwrap_or(0);
             // If application storage was externally purged/corrupted while the
             // encrypted manifest survived, a user retry still has the original
             // attachment bytes. Rebuild the job instead of repeating the old
             // "media is no longer available" dead end.
-            let stored_inputs_valid = (0..existing_items).all(|index| {
+            let stored_inputs_valid = existing_job.as_ref().is_none_or(|job| {
                 let outbox = self.media_outbox.lock().unwrap();
-                outbox.load_upload(&request_id, index).is_ok()
-                    && outbox.load_source(&request_id, index).is_ok()
+                (0..job.sources.len()).all(|index| outbox.load_source(&request_id, index).is_ok())
+                    && (0..job.items.len())
+                        .all(|index| outbox.load_upload(&request_id, index).is_ok())
             });
             if !stored_inputs_valid {
                 self.media_outbox.lock().unwrap().remove(&request_id)?;
             }
             if !self.media_outbox.lock().unwrap().contains(&request_id) {
-                self.media_outbox.lock().unwrap().begin_job(
+                let sources: Vec<_> = items
+                    .iter()
+                    .map(|item| {
+                        (
+                            item.data.as_slice(),
+                            item.mime.as_str(),
+                            item.filename.as_str(),
+                        )
+                    })
+                    .collect();
+                self.media_outbox.lock().unwrap().begin_job_with_sources(
                     request_id.clone(),
                     hex::encode(group_id.as_slice()),
                     caption.to_string(),
                     server_url.to_string(),
                     Timestamp::now().as_secs(),
-                    items.len(),
+                    &sources,
                 )?;
             }
-            // Encrypt + persist missing source items without allowing a group
-            // epoch change to mix keys within the preparation pass. If a
-            // membership commit lands between album items, retry locally while
-            // the host still owns every source byte.
-            for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
-                existing_items = self
-                    .media_outbox
-                    .lock()
-                    .unwrap()
-                    .job(&request_id)
-                    .map(|job| job.items.len())
-                    .unwrap_or(0);
-                if existing_items == items.len() {
-                    break;
-                }
-                let epoch = self.engine.group_epoch(group_id)?;
-                let mut epoch_changed = false;
-                for item in items.iter().skip(existing_items) {
-                    let upload = match self.engine.encrypt_media_for_epoch(
-                        group_id,
-                        &item.data,
-                        &item.mime,
-                        &item.filename,
-                        Some(epoch),
-                    ) {
-                        Ok((_, upload)) => upload,
-                        Err(Error::MediaEpochChanged) => {
-                            epoch_changed = true;
-                            break;
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    self.media_outbox.lock().unwrap().append_upload(
-                        &request_id,
-                        &item.data,
-                        &item.mime,
-                        epoch,
-                        upload,
-                    )?;
-                }
-                if !epoch_changed {
-                    break;
-                }
-                if attempt == MEDIA_UPLOAD_EPOCH_ATTEMPTS {
-                    return Err(Error::MediaEpochChanged);
-                }
+            let result = self.process_media_upload_job_locked(&request_id).await;
+            if result.is_ok() {
+                // Only an explicit host call consumes the completion tombstone.
+                // Detached recovery leaves it behind so a failed optimistic row
+                // can acknowledge the canonical message on its next retry.
+                self.media_outbox.lock().unwrap().remove(&request_id)?;
             }
-            return self.process_media_upload_job_locked(&request_id).await;
+            return result;
         }
 
         // In-memory clients retain the original direct path used by protocol
@@ -4231,7 +4295,6 @@ impl SonarClient {
             .job(request_id)
             .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
         if initial.completed_message_id.is_some() {
-            self.media_outbox.lock().unwrap().remove(request_id)?;
             return Ok(());
         }
         if let Some(message_id) = self
@@ -4244,9 +4307,9 @@ impl SonarClient {
                 .lock()
                 .unwrap()
                 .checkpoint_completed_message(request_id, message_id)?;
-            self.media_outbox.lock().unwrap().remove(request_id)?;
             return Ok(());
         }
+        self.prepare_media_upload_job(request_id).await?;
         let _network_permit = self
             .media_upload_permits
             .acquire()
@@ -4260,7 +4323,6 @@ impl SonarClient {
                 .job(request_id)
                 .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
             if job.completed_message_id.is_some() {
-                self.media_outbox.lock().unwrap().remove(request_id)?;
                 return Ok(());
             }
             if job.items.len() != job.expected_items {
@@ -4286,8 +4348,8 @@ impl SonarClient {
                 let upload = match self.engine.encrypt_media_for_epoch(
                     &group_id,
                     &source,
-                    &job.items[index].source_mime,
-                    &job.items[index].filename,
+                    &job.sources[index].mime,
+                    &job.sources[index].filename,
                     Some(epoch),
                 ) {
                     Ok((_, upload)) => upload,
@@ -4357,12 +4419,81 @@ impl SonarClient {
                 )
                 .await
             {
-                Ok(_message_id) => {
-                    self.media_outbox.lock().unwrap().remove(request_id)?;
-                    return Ok(());
-                }
+                Ok(_message_id) => return Ok(()),
                 Err(Error::MediaEpochChanged) if attempt < MEDIA_UPLOAD_EPOCH_ATTEMPTS => continue,
                 Err(error) => return Err(error),
+            }
+        }
+        Err(Error::MediaEpochChanged)
+    }
+
+    /// Complete MIP-04 preparation only from source bytes that were already
+    /// committed to the encrypted journal. Startup recovery can therefore
+    /// finish a job interrupted before its first ciphertext checkpoint.
+    async fn prepare_media_upload_job(&self, request_id: &str) -> Result<()> {
+        for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+            let job = self
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
+            if job.sources.len() != job.expected_items {
+                return Err(Error::Storage(
+                    "durable media source journal is incomplete".into(),
+                ));
+            }
+            if job.items.len() == job.expected_items {
+                return Ok(());
+            }
+            let group_bytes = hex::decode(&job.group_id_hex)
+                .map_err(|error| Error::Storage(format!("media upload group id: {error}")))?;
+            let group_id = GroupId::from_slice(&group_bytes);
+            let epoch = self.engine.group_epoch(&group_id)?;
+            let mut epoch_changed = false;
+            for index in job.items.len()..job.sources.len() {
+                let source = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .load_source(request_id, index)?;
+                let metadata = &job.sources[index];
+                let upload = match self.engine.encrypt_media_for_epoch(
+                    &group_id,
+                    &source,
+                    &metadata.mime,
+                    &metadata.filename,
+                    Some(epoch),
+                ) {
+                    Ok((_, upload)) => upload,
+                    Err(Error::MediaEpochChanged) => {
+                        epoch_changed = true;
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.media_outbox
+                    .lock()
+                    .unwrap()
+                    .append_upload(request_id, epoch, upload)?;
+            }
+            if !epoch_changed {
+                let prepared = self
+                    .media_outbox
+                    .lock()
+                    .unwrap()
+                    .job(request_id)
+                    .is_some_and(|job| job.items.len() == job.expected_items);
+                return if prepared {
+                    Ok(())
+                } else {
+                    Err(Error::Storage(
+                        "durable media preparation did not complete".into(),
+                    ))
+                };
+            }
+            if attempt == MEDIA_UPLOAD_EPOCH_ATTEMPTS {
+                return Err(Error::MediaEpochChanged);
             }
         }
         Err(Error::MediaEpochChanged)
@@ -4380,7 +4511,9 @@ impl SonarClient {
                 .lock()
                 .unwrap()
                 .job(&request_id)
-                .is_some_and(|job| job.items.len() == job.expected_items);
+                .is_some_and(|job| {
+                    job.completed_message_id.is_none() && job.sources.len() == job.expected_items
+                });
             if !complete {
                 continue;
             }
@@ -4437,10 +4570,62 @@ impl SonarClient {
                 }
             }
         };
+        let permit = MEDIA_DOWNLOAD_PERMITS.acquire();
+        tokio::pin!(permit);
+        let _permit = loop {
+            tokio::select! {
+                permit = &mut permit => break permit
+                    .map_err(|_| Error::Storage("media download scheduler is closed".into()))?,
+                _ = tokio::time::sleep(MEDIA_DOWNLOAD_CANCEL_POLL) => {
+                    if observer.is_cancelled() {
+                        return Err(Error::MediaDownloadCancelled);
+                    }
+                }
+            }
+        };
         let resume_path = media_download_resume_path(destination, url)?;
+        let parent = resume_path
+            .parent()
+            .ok_or_else(|| Error::InvalidInput("media resume path has no parent".into()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| Error::Storage(format!("create media cache directory: {error}")))?;
+        let active_partial = {
+            let mut active = ACTIVE_MEDIA_DOWNLOAD_PARTIALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_media_download_partials(parent, &active)?;
+            active.insert(resume_path.clone());
+            ActiveMediaDownloadPartial {
+                path: resume_path.clone(),
+            }
+        };
+        let result = self
+            .fetch_media_to_file_active(group_id, url, destination, &resume_path, observer)
+            .await;
+        drop(active_partial);
+        let prune_result = {
+            let active = ACTIVE_MEDIA_DOWNLOAD_PARTIALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            prune_media_download_partials(parent, &active)
+        };
+        if let Err(error) = prune_result {
+            tracing::debug!(%error, "failed to prune media download partials");
+        }
+        result
+    }
+
+    async fn fetch_media_to_file_active(
+        &self,
+        group_id: &GroupId,
+        url: &str,
+        destination: &Path,
+        resume_path: &Path,
+        observer: &dyn MediaDownloadObserver,
+    ) -> Result<u64> {
         let ciphertext = http_get_to_resume_file_with_retries(
             url,
-            &resume_path,
+            resume_path,
             MAX_MEDIA_DOWNLOAD_BYTES,
             Some(observer),
         )
@@ -4453,7 +4638,7 @@ impl SonarClient {
             Err(error) => {
                 // A clean HTTP completion with failed MIP-04 authentication is
                 // not resumable; discard it so the next attempt starts fresh.
-                let _ = fs::remove_file(&resume_path);
+                let _ = fs::remove_file(resume_path);
                 return Err(error);
             }
         };
@@ -6826,6 +7011,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_media_source_recovery_and_completion_tombstone_are_idempotent() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let creation = client
+            .engine
+            .create_group(
+                "durable media",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        client.engine.merge_pending_commit(&group_id).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        *client.media_outbox.lock().unwrap() = MediaOutbox::open(&db, [5_u8; 32]).unwrap();
+        let data = b"recoverable-source".to_vec();
+        let uploads = vec![MediaUpload {
+            data: data.clone(),
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+        }];
+        let host_request_id = "pending-media-recovery";
+        let request_id = media_upload_request_id(&group_id, &uploads, "", "", host_request_id);
+        client
+            .media_outbox
+            .lock()
+            .unwrap()
+            .begin_job_with_sources(
+                request_id.clone(),
+                hex::encode(group_id.as_slice()),
+                String::new(),
+                String::new(),
+                Timestamp::now().as_secs(),
+                &[(data.as_slice(), "video/mp4", "clip.mp4")],
+            )
+            .unwrap();
+
+        client
+            .prepare_media_upload_job(&request_id)
+            .await
+            .expect("prepare solely from durable source");
+        assert_eq!(
+            client
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(&request_id)
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        client
+            .media_outbox
+            .lock()
+            .unwrap()
+            .checkpoint_completed_message(&request_id, "canonical-message".into())
+            .unwrap();
+        client
+            .send_media_multi_with_request_id(&group_id, uploads, "", "", host_request_id)
+            .await
+            .expect("explicit retry acknowledges detached completion");
+        assert!(
+            !client.media_outbox.lock().unwrap().contains(&request_id),
+            "host acknowledgement consumes the tombstone"
+        );
+    }
+
     use crate::sonar_descriptor::{
         descriptor_content_json, meta_descriptor_content_json, SONAR_CALL_DESCRIPTOR_D_TAG,
     };
@@ -7322,6 +7582,59 @@ mod tests {
             (25 * 1024 * 1024) + MIP04_AEAD_TAG_BYTES
         );
         assert_eq!(MAX_MEDIA_DOWNLOAD_BYTES - MAX_MEDIA_PLAINTEXT_BYTES, 16);
+        assert_eq!(
+            MEDIA_DOWNLOAD_PARTIAL_RETAINED_BYTES
+                + MEDIA_DOWNLOAD_CONCURRENCY as u64 * MAX_MEDIA_DOWNLOAD_BYTES as u64,
+            MEDIA_DOWNLOAD_PARTIAL_TOTAL_BYTES
+        );
+    }
+
+    #[test]
+    fn media_download_partial_pruning_bounds_storage_and_expires_old_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..5 {
+            let path = dir.path().join(format!(
+                "{MEDIA_DOWNLOAD_PARTIAL_PREFIX}{index}{MEDIA_DOWNLOAD_PARTIAL_SUFFIX}"
+            ));
+            fs::File::create(path)
+                .unwrap()
+                .set_len(25 * 1024 * 1024)
+                .unwrap();
+        }
+        let active_path = dir.path().join(format!(
+            "{MEDIA_DOWNLOAD_PARTIAL_PREFIX}active{MEDIA_DOWNLOAD_PARTIAL_SUFFIX}"
+        ));
+        fs::File::create(&active_path)
+            .unwrap()
+            .set_len(MAX_MEDIA_DOWNLOAD_BYTES as u64)
+            .unwrap();
+        let active = HashSet::from([active_path.clone()]);
+
+        prune_media_download_partials(dir.path(), &active).unwrap();
+
+        let retained_bytes: u64 = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path() != active_path)
+            .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+            .sum();
+        assert!(retained_bytes <= MEDIA_DOWNLOAD_PARTIAL_RETAINED_BYTES);
+        assert!(
+            active_path.exists(),
+            "an active writer must never be evicted"
+        );
+
+        let expired = dir.path().join(format!(
+            "{MEDIA_DOWNLOAD_PARTIAL_PREFIX}expired{MEDIA_DOWNLOAD_PARTIAL_SUFFIX}"
+        ));
+        let file = fs::File::create(&expired).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(SystemTime::now() - MEDIA_DOWNLOAD_PARTIAL_MAX_AGE * 2),
+        )
+        .unwrap();
+        prune_media_download_partials(dir.path(), &active).unwrap();
+        assert!(!expired.exists());
     }
 
     #[test]
