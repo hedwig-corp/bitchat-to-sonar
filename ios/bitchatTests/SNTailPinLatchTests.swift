@@ -26,6 +26,22 @@ struct SNTailPinLatchTests {
         #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
     }
 
+    /// Signal captures this state before changing its collection-view inset.
+    /// The keyboard notification must do the same before SwiftUI publishes
+    /// the safe-area shrink or its offset clamp.
+    @Test
+    func keyboardFrameChangeCapturesVisibleTailBeforeShrink() {
+        var latch = SNTailPinLatch()
+        #expect(
+            latch.viewportWillChange(
+                isNearBottom: true,
+                userScrolling: false,
+                isPrepending: false
+            ) == .snap
+        )
+        #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
+    }
+
     /// Once a pin delivers the sentinel back into view, a genuine user
     /// scroll-away afterwards must not be yanked back by the next viewport
     /// change (composer growth, keyboard re-open).
@@ -93,7 +109,7 @@ struct SNTailPinLatchTests {
                 isNearBottom: false,
                 userScrolling: false,
                 isPrepending: false
-        ) == .animate
+            ) == .animate
         )
     }
 
@@ -211,6 +227,24 @@ struct SNTailPinLatchTests {
             bottomInset: 0,
             isAtBottom: true,
             isTouchScrolling: false
+        )
+        #expect(activity == .none)
+    }
+
+    /// UIKit may report the offset clamp before the keyboard safe-area change,
+    /// so the instantaneous bounds/inset sample still looks unchanged. The
+    /// frame-transition bracket must prevent that ordering gap from unpinning.
+    @Test
+    func preLayoutKeyboardClampIsNotUserScroll() {
+        var classifier = SNUserScrollOffsetClassifier()
+        classifier.reset(y: 900, viewportHeight: 700, bottomInset: 0)
+        let activity = classifier.observe(
+            y: 600,
+            viewportHeight: 700,
+            bottomInset: 0,
+            isAtBottom: false,
+            isTouchScrolling: false,
+            isViewportTransitioning: true
         )
         #expect(activity == .none)
     }

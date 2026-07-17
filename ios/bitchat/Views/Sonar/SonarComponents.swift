@@ -778,6 +778,27 @@ struct SNTailPinLatch {
         return wasPinned ? .snap : .none
     }
 
+    /// Capture the tail state before UIKit/SwiftUI apply a keyboard-driven
+    /// safe-area change. Signal makes the same decision before changing its
+    /// collection-view inset; waiting for the viewport shrink is too late
+    /// because the offset callback can arrive first.
+    mutating func viewportWillChange(
+        isNearBottom: Bool,
+        userScrolling: Bool,
+        isPrepending: Bool
+    ) -> SNTailPinAction {
+        if isPrepending {
+            wasPinned = false
+            return .none
+        }
+        if userScrolling {
+            wasPinned = isNearBottom
+            return .none
+        }
+        if isNearBottom { wasPinned = true }
+        return wasPinned ? .snap : .none
+    }
+
     private mutating func updateSnapshot(itemCount: Int, tailID: String?) {
         lastItemCount = itemCount
         lastTailID = tailID
@@ -814,7 +835,8 @@ struct SNUserScrollOffsetClassifier {
         viewportHeight: CGFloat,
         bottomInset: CGFloat,
         isAtBottom: Bool,
-        isTouchScrolling: Bool
+        isTouchScrolling: Bool,
+        isViewportTransitioning: Bool = false
     ) -> SNUserScrollActivity {
         defer {
             previousY = y
@@ -827,6 +849,10 @@ struct SNUserScrollOffsetClassifier {
         let layoutChanged = abs(viewportHeight - previousViewportHeight) > 0.5
             || abs(bottomInset - previousBottomInset) > 0.5
         if y < previousY - 0.5 {
+            // UIKit can publish the keyboard-driven offset clamp before its
+            // bounds/inset update. The keyboard frame notification brackets
+            // that ordering gap; never turn it into a synthetic user scroll.
+            if !isTouchScrolling && isViewportTransitioning { return .none }
             // A keyboard/composer dismissal expands the viewport (or reduces
             // its inset) and clamps the bottom offset upward without user
             // input. Status-bar and accessibility scrolling keep both stable.
@@ -880,6 +906,14 @@ private struct SNUserScrollObserver: UIViewRepresentable {
         private weak var observedScrollView: UIScrollView?
         private var contentOffsetObservation: NSKeyValueObservation?
         private var offsetClassifier = SNUserScrollOffsetClassifier()
+        private var keyboardFrameObserver: NSObjectProtocol?
+        private var viewportTransitionDeadline: TimeInterval = 0
+
+        deinit {
+            if let keyboardFrameObserver {
+                NotificationCenter.default.removeObserver(keyboardFrameObserver)
+            }
+        }
 
         override func didMoveToWindow() {
             super.didMoveToWindow()
@@ -892,7 +926,23 @@ private struct SNUserScrollObserver: UIViewRepresentable {
         }
 
         func attachWhenReady() {
+            observeKeyboardFramesIfNeeded()
             DispatchQueue.main.async { [weak self] in self?.attachToEnclosingScrollView() }
+        }
+
+        private func observeKeyboardFramesIfNeeded() {
+            guard keyboardFrameObserver == nil else { return }
+            keyboardFrameObserver = NotificationCenter.default.addObserver(
+                forName: UIResponder.keyboardWillChangeFrameNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey]
+                    as? NSNumber)?.doubleValue ?? 0.25
+                self?.viewportTransitionDeadline = Date.timeIntervalSinceReferenceDate
+                    + max(duration, 0.25)
+                    + 0.1
+            }
         }
 
         private func attachToEnclosingScrollView() {
@@ -926,7 +976,9 @@ private struct SNUserScrollObserver: UIViewRepresentable {
                     viewportHeight: scrollView.bounds.height,
                     bottomInset: scrollView.adjustedContentInset.bottom,
                     isAtBottom: scrollView.contentOffset.y >= maximumY - 1,
-                    isTouchScrolling: isTouchScrolling
+                    isTouchScrolling: isTouchScrolling,
+                    isViewportTransitioning: !isTouchScrolling
+                        && Date.timeIntervalSinceReferenceDate < self.viewportTransitionDeadline
                 )
                 guard activity != .none else { return }
                 self.onUserScroll(activity)
@@ -1315,6 +1367,22 @@ struct SNMsgList: View {
                     // folded chat never visibly chases its late local rows.
                     followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                 }
+                #if os(iOS)
+                // Capture the pre-keyboard tail state before SwiftUI changes
+                // the safe-area/viewport. The native observer suppresses the
+                // matching non-touch offset clamp until this transition ends;
+                // actual finger scrolling remains authoritative.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIResponder.keyboardWillChangeFrameNotification
+                )) { _ in
+                    let action = tailPin.viewportWillChange(
+                        isNearBottom: isNearBottom,
+                        userScrolling: isUserScrolling,
+                        isPrepending: isLoadingOlder
+                    )
+                    followTail(action, proxy: proxy)
+                }
+                #endif
                 // Any list-viewport shrink — each keyboard layout step, the
                 // composer growing a line, a macOS window resize — re-anchors
                 // the tail while the reader is pinned there. Matches the
