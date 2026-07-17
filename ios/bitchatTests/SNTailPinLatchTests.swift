@@ -53,6 +53,94 @@ struct SNTailPinLatchTests {
         #expect(latch.viewportShrank(userScrolling: false, isPrepending: false) == .snap)
     }
 
+    /// A chat that first paints under a keyboard-sized safe area, then expands
+    /// when that inset clears (keyboard never shown / already dismissed), must
+    /// keep the tail — otherwise the transcript stays top-stranded with a
+    /// phantom empty band above the composer until close/re-open.
+    @Test
+    func expandKeepsPinningAfterPhantomKeyboardInsetClears() {
+        var latch = SNTailPinLatch()
+        latch.tailVisible(itemCount: 6, tailID: "6")
+        #expect(latch.viewportExpanded(userScrolling: false, isPrepending: false) == .snap)
+        latch.userScrolled(isNearBottom: false)
+        #expect(latch.viewportExpanded(userScrolling: false, isPrepending: false) == .none)
+    }
+
+    /// Signal's `updateContentInsets` clamps a resting reader to
+    /// `maxContentOffsetY` after the keyboard inset shrinks. Without the
+    /// clamp, dismissing the keyboard away from the tail leaves a
+    /// keyboard-sized blank band under the last message.
+    @Test
+    func keyboardDismissOvershootIsClampedToContentBounds() {
+        // Reader mid-history; keyboard dismissed grew bounds 400 -> 700,
+        // offset now rests past the new maximum.
+        let corrected = snRestingOffsetOvershootCorrection(
+            offsetY: 900,
+            boundsHeight: 700,
+            contentHeight: 1500,
+            topInset: 0,
+            bottomInset: 60
+        )
+        #expect(corrected == 860)
+
+        // At rest within bounds: no programmatic move.
+        let atRest = snRestingOffsetOvershootCorrection(
+            offsetY: 500,
+            boundsHeight: 700,
+            contentHeight: 1500,
+            topInset: 0,
+            bottomInset: 60
+        )
+        #expect(atRest == nil)
+
+        // Short chat (content shorter than viewport): Signal's max() floor —
+        // rest is top-aligned at -topInset, never a negative scroll band.
+        let shortChat = snRestingOffsetOvershootCorrection(
+            offsetY: 200,
+            boundsHeight: 700,
+            contentHeight: 300,
+            topInset: 50,
+            bottomInset: 60
+        )
+        #expect(shortChat == -50)
+    }
+
+    /// Composer is a sibling ⇒ owned bottom inset is always 0. Fully-read
+    /// opens use a bottom scroll anchor; unread opens must not.
+    @Test
+    func transcriptOpenUsesBottomAnchorOnlyWhenFullyRead() {
+        #expect(snOwnedTranscriptBottomContentInset(automaticBottomInset: 336) == 0)
+        #expect(
+            snUsesBottomScrollAnchor(
+                unreadAnchorId: nil,
+                unreadCountAtOpen: 0,
+                unreadAnchorAbandoned: false
+            )
+        )
+        #expect(
+            !snUsesBottomScrollAnchor(
+                unreadAnchorId: nil,
+                unreadCountAtOpen: 3,
+                unreadAnchorAbandoned: false
+            )
+        )
+        #expect(
+            !snUsesBottomScrollAnchor(
+                unreadAnchorId: "oldest-unread",
+                unreadCountAtOpen: 3,
+                unreadAnchorAbandoned: false
+            )
+        )
+        #expect(
+            snScrollToBottomOfLoadWindowOffsetY(
+                boundsHeight: 700,
+                contentHeight: 2000,
+                topInset: 0,
+                bottomInset: 0
+            ) == 1300
+        )
+    }
+
     /// Signal captures this state before changing its collection-view inset.
     /// The keyboard notification must do the same before SwiftUI publishes
     /// the safe-area shrink or its offset clamp.

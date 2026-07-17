@@ -734,10 +734,19 @@ struct SNTailSnapCoalescer {
     }
 }
 
-/// Previous-frame tail state, mirroring Android's `TranscriptTailPinner`.
-/// Sentinel disappearance alone is ambiguous: a keyboard/composer shrink, a
-/// newly appended row, and a user's scroll all hide it. Keep the prior pinned
-/// state until explicit user-scroll activity or a history anchor unpins it.
+/// Reference-semantic height scratchpad. Mutating `last` does not invalidate
+/// SwiftUI the way `@State CGFloat` would, so keyboard animation can update
+/// the previous-height sample without rebuilding the transcript.
+final class SNViewportHeightTracker {
+    var last: CGFloat = 0
+}
+
+/// Previous-frame tail state, mirroring Signal-iOS `updateContentInsets`:
+/// capture `wasScrolledToBottom` before the inset/viewport change, then
+/// `scrollToBottomOfLoadWindow(animated: false)` when pinned
+/// (`ConversationViewController+OWS.updateContentInsets`). Sentinel
+/// disappearance alone is ambiguous — keyboard shrink, append, and user
+/// scroll all hide it — so keep prior pin until user scroll or history open.
 struct SNTailPinLatch {
     private(set) var wasPinned = false
     private(set) var lastItemCount = 0
@@ -801,6 +810,17 @@ struct SNTailPinLatch {
     }
 
     mutating func viewportShrank(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
+        viewportResized(userScrolling: userScrolling, isPrepending: isPrepending)
+    }
+
+    /// Signal `updateContentInsets` re-pins whenever insets change while
+    /// `wasScrolledToBottom` — grow or shrink (keyboard dismiss / phantom
+    /// safe-area clear). Only user scroll unpins.
+    mutating func viewportExpanded(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
+        viewportResized(userScrolling: userScrolling, isPrepending: isPrepending)
+    }
+
+    private mutating func viewportResized(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
         if userScrolling || isPrepending {
             wasPinned = false
             return .none
@@ -808,10 +828,9 @@ struct SNTailPinLatch {
         return wasPinned ? .snap : .none
     }
 
-    /// Capture the tail state before UIKit/SwiftUI apply a keyboard-driven
-    /// safe-area change. Signal makes the same decision before changing its
-    /// collection-view inset; waiting for the viewport shrink is too late
-    /// because the offset callback can arrive first.
+    /// Signal: `let wasScrolledToBottom = self.isScrolledToBottom` before
+    /// mutating `contentInset`. Keyboard frame notification is the SwiftUI
+    /// equivalent — capture before the safe-area shrink/offset clamp.
     mutating func viewportWillChange(
         isNearBottom: Bool,
         userScrolling: Bool,
@@ -843,6 +862,84 @@ enum SNUserScrollActivity: Equatable {
     case none
     case towardHistory
     case towardTail
+}
+
+/// Signal `updateContentInsets` non-pinned branch: a reader away from the
+/// tail is shifted in lockstep with the inset change, clamped to the content
+/// bounds (`(oldYOffset + insetChange).clamp(minYOffset, safeContentHeight)`),
+/// with `maxContentOffsetY` using `max()` so a short chat rests top-aligned.
+/// UIKit performs the lockstep itself for safe-area-driven insets; what the
+/// SwiftUI stack lacks is the clamp — after keyboard dismiss the offset can
+/// rest past the new maximum, leaving a keyboard-sized blank band under the
+/// last message. Returns the corrected offset, or nil when already at rest
+/// within bounds.
+func snRestingOffsetOvershootCorrection(
+    offsetY: CGFloat,
+    boundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    topInset: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat? {
+    let minY = -topInset
+    let maxY = max(minY, contentHeight + bottomInset - boundsHeight)
+    return offsetY > maxY + 1 ? maxY : nil
+}
+
+/// Signal owns the conversation scroll view's bottom inset itself
+/// (`newInsets.bottom = bottomBarContainer.frame.height - safeAreaInsets.bottom`)
+/// and never lets UIKit's keyboard automatic adjustment add a second band.
+/// Sonar's composer is a VStack sibling below the transcript (not an overlay
+/// inside the scroll view), so the owned bottom inset is always 0 — any
+/// leftover keyboard `contentInset.bottom` is exactly the phantom empty band
+/// above the composer on short chats like GIAN after dismiss.
+func snOwnedTranscriptBottomContentInset(
+    automaticBottomInset: CGFloat
+) -> CGFloat {
+    // Composer is outside the scroll view; never keep UIKit keyboard inset.
+    _ = automaticBottomInset
+    return 0
+}
+
+/// Signal `scrollToBottomOfLoadWindow`: `contentOffset.y = maxContentOffsetY`.
+func snScrollToBottomOfLoadWindowOffsetY(
+    boundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    topInset: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat {
+    let minY = -topInset
+    return max(minY, contentHeight + bottomInset - boundsHeight)
+}
+
+/// Fully-read opens may use `defaultScrollAnchor(.bottom)` (iOS 17+). Unread
+/// / pending-unread opens stay top-anchored so the divider owns first paint.
+func snUsesBottomScrollAnchor(
+    unreadAnchorId: String?,
+    unreadCountAtOpen: UInt64,
+    unreadAnchorAbandoned: Bool
+) -> Bool {
+    unreadAnchorId == nil && (unreadCountAtOpen == 0 || unreadAnchorAbandoned)
+}
+
+/// iOS 17+ / macOS 14+: start (and keep) the scroll view at the live edge —
+/// Signal `scrollToInitialPosition` → `scrollToBottomOfLoadWindow` for
+/// fully-read opens. Avoids LazyVStack `contentSize`-based top insets that
+/// under-measure and open DMs away from the last message.
+private struct SNTranscriptScrollAnchor: ViewModifier {
+    let bottomAligned: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if bottomAligned {
+            if #available(iOS 17.0, macOS 14.0, *) {
+                content.defaultScrollAnchor(.bottom)
+            } else {
+                content
+            }
+        } else {
+            content
+        }
+    }
 }
 
 struct SNUserScrollOffsetClassifier {
@@ -1030,8 +1127,13 @@ private struct SNUserScrollObserver: UIViewRepresentable {
     func updateUIView(_ uiView: ObserverView, context: Context) {
         uiView.onUserScroll = onUserScroll
         uiView.onViewportWillChange = onViewportWillChange
+        // Only scan/attach when we are not already observing. Calling this on
+        // every keyboard-driven body pass was a major agent-DM cost (bench:
+        // attach_requests≈revisions per transition).
         #if SONAR_KEYBOARD_BENCH
-        SNKeyboardTailBenchmark.shared.recordObserverAttachRequest()
+        if !uiView.isAttached {
+            SNKeyboardTailBenchmark.shared.recordObserverAttachRequest()
+        }
         #endif
         uiView.attachWhenNeeded()
     }
@@ -1045,6 +1147,8 @@ private struct SNUserScrollObserver: UIViewRepresentable {
         private var keyboardFrameObserver: NSObjectProtocol?
         private var viewportTransitionDeadline: TimeInterval = 0
         private var attachmentScheduled = false
+
+        var isAttached: Bool { observedScrollView != nil }
 
         deinit {
             if let keyboardFrameObserver {
@@ -1097,7 +1201,77 @@ private struct SNUserScrollObserver: UIViewRepresentable {
                     + max(duration, 0.25)
                     + 0.1
                 self.onViewportWillChange(notification)
+                // Apply Signal's inset ownership immediately (clear any
+                // automatic keyboard bottom inset), then again after the
+                // animation so a late UIKit write cannot leave a phantom band.
+                self.applyOwnedInsetsAndSettleOffset()
+                DispatchQueue.main.asyncAfter(
+                    deadline: .now() + max(duration, 0.25) + 0.05
+                ) { [weak self] in
+                    self?.applyOwnedInsetsAndSettleOffset()
+                }
             }
+        }
+
+        /// Signal `updateContentInsets` for our layout: own bottom inset
+        /// (always 0 — composer is a sibling), never leave a keyboard
+        /// `contentInset.bottom`, then stay at `maxContentOffsetY` or clamp
+        /// overshoot. Do **not** derive a top inset from LazyVStack
+        /// `contentSize` — it under-measures and opens DMs away from the tail.
+        func applyOwnedInsetsAndSettleOffset() {
+            guard let scrollView = observedScrollView,
+                  !scrollView.isTracking,
+                  !scrollView.isDragging,
+                  !scrollView.isDecelerating else { return }
+
+            if scrollView.contentInsetAdjustmentBehavior != .never {
+                scrollView.contentInsetAdjustmentBehavior = .never
+            }
+            let ownedBottom = snOwnedTranscriptBottomContentInset(
+                automaticBottomInset: scrollView.contentInset.bottom
+            )
+            let insetChanged =
+                abs(scrollView.contentInset.bottom - ownedBottom) > 0.5
+                || abs(scrollView.contentInset.top) > 0.5
+            if insetChanged {
+                var inset = scrollView.contentInset
+                inset.top = 0
+                inset.bottom = ownedBottom
+                UIView.performWithoutAnimation {
+                    let offset = scrollView.contentOffset
+                    scrollView.contentInset = inset
+                    scrollView.scrollIndicatorInsets.top = 0
+                    scrollView.scrollIndicatorInsets.bottom = ownedBottom
+                    scrollView.setContentOffset(offset, animated: false)
+                }
+            }
+
+            let topInset = scrollView.adjustedContentInset.top
+            let bottomInset = scrollView.adjustedContentInset.bottom
+            let maxY = snScrollToBottomOfLoadWindowOffsetY(
+                boundsHeight: scrollView.bounds.height,
+                contentHeight: scrollView.contentSize.height,
+                topInset: topInset,
+                bottomInset: bottomInset
+            )
+            let nearBottom = scrollView.contentOffset.y >= maxY - 5
+            let targetY: CGFloat?
+            if nearBottom {
+                targetY = abs(scrollView.contentOffset.y - maxY) > 1 ? maxY : nil
+            } else {
+                targetY = snRestingOffsetOvershootCorrection(
+                    offsetY: scrollView.contentOffset.y,
+                    boundsHeight: scrollView.bounds.height,
+                    contentHeight: scrollView.contentSize.height,
+                    topInset: topInset,
+                    bottomInset: bottomInset
+                )
+            }
+            guard let targetY else { return }
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: targetY),
+                animated: false
+            )
         }
 
         private func attachToEnclosingScrollView() {
@@ -1111,6 +1285,17 @@ private struct SNUserScrollObserver: UIViewRepresentable {
             guard let scrollView = ancestor as? UIScrollView,
                   scrollView !== observedScrollView else { return }
             observedScrollView = scrollView
+            // Signal owns conversation insets; disable UIKit keyboard
+            // automatic adjustment so it cannot leave a phantom bottom band.
+            scrollView.contentInsetAdjustmentBehavior = .never
+            if scrollView.contentInset.top != 0 || scrollView.contentInset.bottom != 0 {
+                var inset = scrollView.contentInset
+                inset.top = 0
+                inset.bottom = 0
+                scrollView.contentInset = inset
+                scrollView.scrollIndicatorInsets.top = 0
+                scrollView.scrollIndicatorInsets.bottom = 0
+            }
             offsetClassifier.reset(
                 y: scrollView.contentOffset.y,
                 viewportHeight: scrollView.bounds.height,
@@ -1253,9 +1438,10 @@ struct SNMsgList: View {
     @State private var tailPin = SNTailPinLatch()
     /// At most one non-animated tail correction per Signal-style 10 ms window.
     @State private var tailSnapCoalescer = SNTailSnapCoalescer()
-    /// Last observed list viewport height; a decrease is a shrink to re-pin
-    /// against. Seeded in onAppear — onChange alone misses the first shrink.
-    @State private var viewportHeight: CGFloat = 0
+    /// Previous GeometryReader height for pin decisions. Stored off the
+    /// `@State` value path so keyboard-animation frames do not write SwiftUI
+    /// state (each write would rebuild the LazyVStack again).
+    @State private var viewportHeightTracker = SNViewportHeightTracker()
     @State private var isUserScrolling = false
     @State private var userScrollGeneration = 0
 
@@ -1264,10 +1450,7 @@ struct SNMsgList: View {
     /// keeps `msgs.count` constant; observing only the count strands the new
     /// tail below the keyboard until the user scrolls manually.
     private var messageRevision: SNTailRevision {
-        #if SONAR_KEYBOARD_BENCH && os(iOS)
-        SNKeyboardTailBenchmark.shared.recordMessageRevision(idsVisited: msgs.isEmpty ? 0 : 1)
-        #endif
-        return SNTailRevision(itemCount: msgs.count, tailID: msgs.last?.id)
+        SNTailRevision(itemCount: msgs.count, tailID: msgs.last?.id)
     }
 
     /// True once the visible rows have caught up with the newest message the
@@ -1276,8 +1459,19 @@ struct SNMsgList: View {
     /// is true the feed is missing its newest (and unread) rows.
     private var feedCaughtUp: Bool {
         guard let expected = expectedNewestDate else { return true }
-        guard let newest = msgs.compactMap(\.sortDate).max() else { return false }
+        // Visible feed is chronological; prefer O(1) at the live edge. Fall
+        // back to a scan only when the tail row lacks a sortDate.
+        if let newest = msgs.last?.sortDate { return newest >= expected }
+        guard let newest = msgs.lazy.compactMap(\.sortDate).max() else { return false }
         return newest >= expected
+    }
+
+    private var usesBottomScrollAnchor: Bool {
+        snUsesBottomScrollAnchor(
+            unreadAnchorId: unreadAnchorId,
+            unreadCountAtOpen: unreadCountAtOpen,
+            unreadAnchorAbandoned: unreadAnchorAbandoned
+        )
     }
 
     /// The [unreadCountAtOpen]-th non-mine message from the tail — core
@@ -1505,11 +1699,14 @@ struct SNMsgList: View {
                             .accessibilityHidden(true)
                     )
                 }
+                // Signal fully-read open → bottom of load window. Without this,
+                // SwiftUI ScrollView starts at the top and async scrollTo often
+                // loses to LazyVStack layout (DM opens mid-history).
+                .modifier(SNTranscriptScrollAnchor(bottomAligned: usesBottomScrollAnchor))
                 .onAppear {
-                    viewportHeight = geo.size.height
-                    // Signal parity: an unread chat opens at the first unread
-                    // row (divider at the top of the viewport); a fully-read
-                    // chat opens pinned at the newest message.
+                    viewportHeightTracker.last = geo.size.height
+                    // Signal `scrollToInitialPosition`: unread divider at top,
+                    // otherwise `scrollToBottomOfLoadWindow`.
                     resolveUnreadAnchor()
                     if unreadAnchorId != nil {
                         isNearBottom = false
@@ -1520,7 +1717,14 @@ struct SNMsgList: View {
                             proxy.scrollTo("sn-unread", anchor: .top)
                         }
                     } else {
-                        proxy.scrollTo("sn-bottom", anchor: .bottom)
+                        // Wait one turn so LazyVStack has materialised the tail;
+                        // scroll the last row and the sentinel (Signal bottom).
+                        DispatchQueue.main.async {
+                            if let tailID = msgs.last?.id {
+                                proxy.scrollTo(tailID, anchor: .bottom)
+                            }
+                            proxy.scrollTo("sn-bottom", anchor: .bottom)
+                        }
                     }
                 }
                 .onChange(of: unreadCountAtOpen) { _ in
@@ -1537,6 +1741,11 @@ struct SNMsgList: View {
                     }
                 }
                 .onChange(of: messageRevision) { _ in
+                    #if SONAR_KEYBOARD_BENCH && os(iOS)
+                    SNKeyboardTailBenchmark.shared.recordMessageRevision(
+                        idsVisited: msgs.isEmpty ? 0 : 1
+                    )
+                    #endif
                     let hadAnchor = unreadAnchorId != nil
                     resolveUnreadAnchor()
                     if !hadAnchor, unreadAnchorId != nil {
@@ -1564,22 +1773,29 @@ struct SNMsgList: View {
                     // folded chat never visibly chases its late local rows.
                     followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                 }
-                // Any list-viewport shrink — each keyboard layout step, the
-                // composer growing a line, a macOS window resize — re-anchors
-                // the tail while the reader is pinned there. Matches the
-                // Android TranscriptTailPinner: layout may never steal a
-                // fully visible tail; only the user's scroll unpins.
+                // Viewport shrink (keyboard/composer) and expand (keyboard
+                // dismiss / phantom safe-area clear) both re-anchor while
+                // pinned — Signal keeps the tail across either inset change.
+                // Only the user's scroll unpins.
                 .onChange(of: geo.size.height) { newHeight in
-                    let previous = viewportHeight
-                    viewportHeight = newHeight
-                    guard previous > 0, newHeight < previous else { return }
-                    #if SONAR_KEYBOARD_BENCH && os(iOS)
-                    SNKeyboardTailBenchmark.shared.recordViewportShrink()
-                    #endif
-                    let action = tailPin.viewportShrank(
-                        userScrolling: isUserScrolling,
-                        isPrepending: isLoadingOlder
-                    )
+                    let previous = viewportHeightTracker.last
+                    viewportHeightTracker.last = newHeight
+                    guard previous > 0, abs(newHeight - previous) > 0.5 else { return }
+                    let action: SNTailPinAction
+                    if newHeight < previous {
+                        #if SONAR_KEYBOARD_BENCH && os(iOS)
+                        SNKeyboardTailBenchmark.shared.recordViewportShrink()
+                        #endif
+                        action = tailPin.viewportShrank(
+                            userScrolling: isUserScrolling,
+                            isPrepending: isLoadingOlder
+                        )
+                    } else {
+                        action = tailPin.viewportExpanded(
+                            userScrolling: isUserScrolling,
+                            isPrepending: isLoadingOlder
+                        )
+                    }
                     followTail(action, proxy: proxy)
                 }
             }
