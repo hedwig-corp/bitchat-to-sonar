@@ -285,8 +285,8 @@ object MeshGatt {
                 TAG,
                 "refresh discovery ($reason) announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
             )
-            clientGatt.forEach { (_, gatt) ->
-                val ch = clientChar[gatt.device.address] ?: return@forEach
+            clientChar.forEach { (key, ch) ->
+                val gatt = clientGatt[addrOf(key)] ?: return@forEach
                 ann?.let { writePacket(gatt, ch, it) }
                 sonar?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
             }
@@ -304,7 +304,7 @@ object MeshGatt {
             TAG,
             "refresh discovery ($reason) addr=$addr announce=${ann?.size ?: 0}B sonar=${sonar?.size ?: 0}B",
         )
-        val gatt = clientGatt[addr]
+        val gatt = clientGatt[addrOf(addr)]
         val ch = clientChar[addr]
         if (gatt != null && ch != null) {
             ann?.let { writePacket(gatt, ch, it) }
@@ -487,12 +487,21 @@ object MeshGatt {
         return allowlist.contains(fp.lowercase())
     }
 
+    /** Drop ONE client instance link's state without touching the connection —
+     *  a sibling app on the same controller may still be allowed. Closes the
+     *  connection only when no instance link remains on it. */
+    private fun dropClientLink(key: String) {
+        clientLinks.remove(key); clientChar.remove(key)
+        peerIdByAddr.remove(key); fingerprintByAddr.remove(key)
+        val addr = addrOf(key)
+        if (clientChar.keys.none { addrOf(it) == addr }) cleanupClient(addr)
+    }
+
     private fun pruneDisallowedLinksForPolicy() {
         if (knownOnlyPeerAllowlist == null) return
+        // Server links + in-flight dials: policy per physical address.
         val addrs = HashSet<String>()
-        addrs.addAll(clientGatt.keys)
         addrs.addAll(clientPending)
-        addrs.addAll(clientLinks.keys)
         addrs.addAll(serverDevices.keys)
         addrs.addAll(serverLinks.keys)
         addrs.forEach { addr ->
@@ -502,11 +511,26 @@ object MeshGatt {
                 disconnectAddr(addr)
             }
         }
+        // Client links: policy per instance link (several peer apps can share
+        // one address); dropClientLink closes the connection once empty.
+        val keys = HashSet<String>()
+        keys.addAll(clientChar.keys)
+        keys.addAll(clientLinks.keys)
+        keys.forEach { key ->
+            if (!addrAllowedByPolicy(key)) {
+                val fp = fingerprintByAddr[key]
+                android.util.Log.i(TAG, "dropping non-allowlisted mesh link $key fp=${fp?.take(8) ?: "unknown"}")
+                dropClientLink(key)
+            }
+        }
     }
 
     private fun disconnectAddr(addr: String) {
-        cleanupServer(addr)
-        cleanupClient(addr)
+        // Accepts a plain address or a client link key — tear down the whole
+        // physical connection either way (per-app disconnect isn't a thing:
+        // there is one ACL to the device).
+        cleanupServer(addrOf(addr))
+        cleanupClient(addrOf(addr))
     }
 
     private fun cleanupServer(addr: String) {
@@ -559,7 +583,23 @@ object MeshGatt {
 
     // ── GATT client (central) ──
 
+    // One remote device can expose SEVERAL instances of the mesh service: on a
+    // Mac, Sonar.app and the bitchat iOS-wrapper app share one BLE controller
+    // and both register the same service UUID in the shared GATT database. Two
+    // apps on one controller can NEVER hear each other over BLE (a radio does
+    // not receive its own transmissions), so unless we talk to every instance,
+    // whichever app registered second is unreachable by anyone. Per-peer client
+    // state is therefore keyed by "address#serviceInstanceId" (a *link key*),
+    // while connection-level state (the BluetoothGatt, dial bookkeeping, write
+    // serialization) stays keyed by the plain address. Server-role state keeps
+    // plain addresses — an inbound central's writes carry no instance identity.
+    private fun clientKey(addr: String, ch: BluetoothGattCharacteristic): String = "$addr#${ch.service.instanceId}"
+
+    /** The connection address of either a plain address or a client link key. */
+    private fun addrOf(key: String): String = key.substringBefore('#')
+
     private val clientGatt = ConcurrentHashMap<String, BluetoothGatt>()
+    /** Mesh characteristic per client link key ("addr#instanceId"). */
     private val clientChar = ConcurrentHashMap<String, BluetoothGattCharacteristic>()
     /** Dials that haven't produced an announce yet (still "probing"). */
     private val clientPending = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
@@ -654,42 +694,54 @@ object MeshGatt {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            val svc = gatt.getService(SERVICE)
-            val ch = svc?.getCharacteristic(CHAR)
-            android.util.Log.i(TAG, "client ${gatt.device.address}: servicesDiscovered status=$status svc=${svc != null} char=${ch != null}")
-            if (ch == null) return
+            // A peer can expose SEVERAL instances of the mesh service: on a Mac,
+            // Sonar.app and the bitchat iOS-wrapper app share one controller and
+            // both register the same service UUID in the shared GATT database.
+            // Talk to EVERY instance — each is a distinct peer app.
             val addr = gatt.device.address
-            clientChar[addr] = ch
-            // Subscribe on the MAIN thread (like connectGatt) — GATT ops issued
-            // from the discovery callback thread can silently fail to queue.
+            val chars = gatt.services.filter { it.uuid == SERVICE }.mapNotNull { it.getCharacteristic(CHAR) }
+            android.util.Log.i(
+                TAG,
+                "client $addr: servicesDiscovered status=$status " +
+                    "instances=${chars.size} ids=${chars.map { it.service.instanceId }}",
+            )
+            if (chars.isEmpty()) return
+            // Enqueue everything on the MAIN thread (like connectGatt) — GATT ops
+            // issued from the discovery callback thread can silently fail to queue.
+            // All CCC subscriptions and the per-instance announce writes go through
+            // the one-outstanding-op-per-connection queue, so instances can't
+            // clobber each other's in-flight operations.
             handler.post {
-                gatt.setCharacteristicNotification(ch, true)
-                val d = ch.getDescriptor(CCC)
-                if (d == null) {
-                    // No CCC on the peer — can't receive notifies, but we can still
-                    // WRITE our announce to its server. Send it directly.
-                    android.util.Log.i(TAG, "client $addr: no CCC descriptor → write announce only")
-                    announceBytes()?.let { writePacket(gatt, ch, it) }
-                    return@post
+                for (ch in chars) {
+                    val key = clientKey(addr, ch)
+                    clientChar[key] = ch
+                    gatt.setCharacteristicNotification(ch, true)
+                    val d = ch.getDescriptor(CCC)
+                    if (d == null) {
+                        // No CCC on this instance — can't receive notifies, but we
+                        // can still WRITE our announce to its server.
+                        android.util.Log.i(TAG, "client $key: no CCC descriptor → write announce only")
+                        announceBytes()?.let { writePacket(gatt, ch, it) }
+                    } else {
+                        subscribeChar(gatt, d)
+                    }
                 }
-                val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                val rc = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(d, enable)
-                } else {
-                    @Suppress("DEPRECATION") run { d.value = enable; if (gatt.writeDescriptor(d)) 0 else -1 }
-                }
-                android.util.Log.i(TAG, "client $addr: writeDescriptor(subscribe) rc=$rc")
             }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            // Notifications enabled → send our announce, then (deferred, so the
-            // back-to-back GATT writes don't collide) our 0x53.
-            val ch = clientChar[gatt.device.address] ?: return
+            // A queued CCC write completed → free the op slot, then, now that
+            // notifications are enabled on THIS instance, send it our announce and
+            // (queued behind it) our 0x53.
+            val addr = gatt.device.address
+            clientWriting.remove(addr)
+            val ch = descriptor.characteristic
+            val key = clientKey(addr, ch)
             val ann = announceBytes()
-            android.util.Log.i(TAG, "client ${gatt.device.address}: notify enabled (status=$status) → send announce (${ann?.size}B)")
+            android.util.Log.i(TAG, "client $key: notify enabled (status=$status) → send announce (${ann?.size}B)")
             ann?.let { writePacket(gatt, ch, it) }
             sonarBytes()?.let { p -> handler.postDelayed({ writePacket(gatt, ch, p) }, 150) }
+            pumpClientWrites(addr)
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, status: Int) {
@@ -702,18 +754,26 @@ object MeshGatt {
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-            handlePacket(gatt.device.address, value, fromServer = false, gatt = gatt)
+            handlePacket(clientKey(gatt.device.address, ch), value, fromServer = false, gatt = gatt)
         }
 
         @Deprecated("compat")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION") handlePacket(gatt.device.address, ch.value ?: return, fromServer = false, gatt = gatt)
+            @Suppress("DEPRECATION")
+            handlePacket(clientKey(gatt.device.address, ch), ch.value ?: return, fromServer = false, gatt = gatt)
         }
     }
 
     private fun cleanupClient(addr: String) {
         lastClientRxMs.remove(addr)
-        clientLinks.remove(addr); clientChar.remove(addr); peerIdByAddr.remove(addr); fingerprintByAddr.remove(addr)
+        // Client link state is keyed "addr#instanceId" — drop every instance link
+        // riding this connection. Plain-address entries in the shared peer maps
+        // belong to the SERVER role and stay (cleanupServer owns those).
+        val prefix = "$addr#"
+        clientLinks.keys.removeAll { it.startsWith(prefix) }
+        clientChar.keys.removeAll { it.startsWith(prefix) }
+        peerIdByAddr.keys.removeAll { it.startsWith(prefix) }
+        fingerprintByAddr.keys.removeAll { it.startsWith(prefix) }
         clientPending.remove(addr); clientConnected.remove(addr)
         clientWriteQueue.remove(addr); clientWriting.remove(addr)
         clientGatt.remove(addr)?.let { runCatching { it.disconnect(); it.close() } }
@@ -721,11 +781,14 @@ object MeshGatt {
 
     // ── Receive: route every characteristic value (one padded packet) by type ──
 
+    /** [addr] is the plain address on the server path and a client LINK KEY
+     *  ("addr#instanceId") on the client path — all client-side link state is
+     *  keyed that way so several peer apps behind one BLE address stay distinct. */
     private fun handlePacket(
         addr: String, value: ByteArray, fromServer: Boolean,
         device: BluetoothDevice? = null, gatt: BluetoothGatt? = null,
     ) {
-        if (fromServer) lastServerRxMs[addr] = nowMonotonic() else lastClientRxMs[addr] = nowMonotonic()
+        if (fromServer) lastServerRxMs[addr] = nowMonotonic() else lastClientRxMs[addrOf(addr)] = nowMonotonic()
         val info = runCatching { meshDecodePacket(value) }.getOrNull()
         if (info == null) {
             android.util.Log.i(TAG, "rx undecodable value (${value.size}B) from $addr")
@@ -754,7 +817,12 @@ object MeshGatt {
                 }
                 if (!peerAllowedByPolicy(fp)) {
                     android.util.Log.i(TAG, "dropping non-allowlisted $route announce from $addr fp=${fp.take(8)}")
-                    if (route == MeshAnnounceRoute.Direct) disconnectAddr(addr)
+                    if (route == MeshAnnounceRoute.Direct) {
+                        // A client link key drops only ITS instance link — an
+                        // allowed sibling app on the same controller keeps the
+                        // connection (a full disconnect would churn-loop it).
+                        if (!fromServer) dropClientLink(addr) else disconnectAddr(addr)
+                    }
                     return
                 }
                 if (route == MeshAnnounceRoute.Direct) {
@@ -763,7 +831,7 @@ object MeshGatt {
                     // must never replace the neighbour used for Noise routing.
                     peerIdByAddr[addr] = ann.senderIdHex
                     if (fp.isNotEmpty()) fingerprintByAddr[addr] = fp
-                    clientPending.remove(addr) // a real peer answered — keep this link
+                    clientPending.remove(addrOf(addr)) // a real peer answered — keep this link
                 }
                 onAnnounce.forEach { it(addr, ann, fp) }
                 takePendingSonar(senderKey)?.let { pendingPacket ->
@@ -900,7 +968,7 @@ object MeshGatt {
                 }
             }
         } catch (_: Throwable) {
-            if (fromServer) serverLinks.remove(addr) else cleanupClient(addr)
+            if (fromServer) serverLinks.remove(addr) else cleanupClient(addrOf(addr))
         }
     }
 
@@ -923,7 +991,7 @@ object MeshGatt {
     private fun handleEncrypted(addr: String, ciphertext: ByteArray, fromServer: Boolean) {
         val fp = fingerprintByAddr[addr]
         if (knownOnlyPeerAllowlist != null && (fp == null || !peerAllowedByPolicy(fp))) {
-            disconnectAddr(addr)
+            if (!fromServer) dropClientLink(addr) else disconnectAddr(addr)
             return
         }
         // Prefer this connection's own session; fall back to the peer's session on
@@ -979,7 +1047,7 @@ object MeshGatt {
         // by peer identity, not the rotating peerID/address (issue #12).
         val fp = fingerprintByAddr[addr] ?: peerIdByAddr[addr] ?: addr
         if (!peerAllowedByPolicy(fp)) {
-            disconnectAddr(addr)
+            if (addr.contains('#')) dropClientLink(addr) else disconnectAddr(addr)
             return
         }
         android.util.Log.i(TAG, "✅ Noise link ESTABLISHED with $addr (peerId=${peerIdByAddr[addr]} fp=${fp.take(8)}…)")
@@ -1055,10 +1123,11 @@ object MeshGatt {
         false
     }
 
-    /** Send an encrypted DM to an established, writable peer route. */
+    /** Send an encrypted DM to an established, writable peer route.
+     *  [peerAddress] is a client link key or a plain server address. */
     fun sendText(peerAddress: String, messageId: String, text: String): Boolean = runCatching {
         val client = clientLinks[peerAddress]?.takeIf { it.established }
-        val gatt = clientGatt[peerAddress]
+        val gatt = clientGatt[addrOf(peerAddress)]
         val ch = clientChar[peerAddress]
         if (client != null && gatt != null && ch != null) {
             return@runCatching writePacketMaybeFragmented(
@@ -1087,7 +1156,7 @@ object MeshGatt {
     private val pendingSends = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<Pair<String, String>>>()
 
     private fun canSendOnAddr(addr: String): Boolean =
-        (clientLinks[addr]?.established == true && clientGatt[addr] != null && clientChar[addr] != null) ||
+        (clientLinks[addr]?.established == true && clientGatt[addrOf(addr)] != null && clientChar[addr] != null) ||
             (serverLinks[addr]?.established == true && serverDevices[addr] != null)
 
     /** The BLE address with an established, writable Noise route to [fingerprint].
@@ -1132,7 +1201,7 @@ object MeshGatt {
 
     private fun sendFile(peerAddress: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = runCatching {
         val packet = fileTransferPacket(peerAddress, bytes, filename, mimeType) ?: return@runCatching false
-        val gatt = clientGatt[peerAddress]
+        val gatt = clientGatt[addrOf(peerAddress)]
         val ch = clientChar[peerAddress]
         if (gatt != null && ch != null) {
             return@runCatching writePacketMaybeFragmented(peerAddress, packet, TYPE_FILE_TRANSFER) { writePacket(gatt, ch, it) }
@@ -1179,9 +1248,9 @@ object MeshGatt {
         val packet = meshBuildPublicMessage(ed25519SeedHex, myPeerIdHex, text, DEFAULT_TTL, ts)
         seenBroadcastIds.add("$myPeerIdHex-$ts") // skip our own echo if it loops back
         var peers = 0
-        clientGatt.forEach { (addr, gatt) ->
-            if (!addrAllowedByPolicy(addr)) return@forEach
-            clientChar[addr]?.let { ch -> writePacket(gatt, ch, packet); peers++ }
+        clientChar.forEach { (key, ch) ->
+            if (!addrAllowedByPolicy(key)) return@forEach
+            clientGatt[addrOf(key)]?.let { gatt -> writePacket(gatt, ch, packet); peers++ }
         }
         serverDevices.forEach { (addr, device) ->
             if (!addrAllowedByPolicy(addr)) return@forEach
@@ -1198,18 +1267,23 @@ object MeshGatt {
     /** Flood a received broadcast packet onward (TTL gossip), so messages cross
      *  the mesh past our direct neighbours. TTL lives at header byte 2 and is NOT
      *  part of the signature (it's signed as 0), so decrementing it is safe.
-     *  [fromAddr] is excluded so we don't echo it straight back. */
+     *  [fromAddr] (a client link key or server address) is excluded so we don't
+     *  echo it straight back. A SIBLING instance link on the same address is a
+     *  different app and DOES get the relay — two apps sharing one controller
+     *  can't hear each other over the air, so we are their only bridge. */
     private fun relayPacket(packet: ByteArray, fromAddr: String) {
         if (packet.size < 3) return
         val ttl = packet[2].toInt() and 0xFF
         if (ttl <= 1) return // would reach 0 — drop
         val relayed = packet.copyOf()
         relayed[2] = (ttl - 1).toByte()
-        clientGatt.forEach { (addr, gatt) ->
-            if (addr != fromAddr && addrAllowedByPolicy(addr)) clientChar[addr]?.let { ch -> writePacket(gatt, ch, relayed) }
+        clientChar.forEach { (key, ch) ->
+            if (key != fromAddr && addrAllowedByPolicy(key)) {
+                clientGatt[addrOf(key)]?.let { gatt -> writePacket(gatt, ch, relayed) }
+            }
         }
         serverDevices.forEach { (addr, device) ->
-            if (addr != fromAddr && addrAllowedByPolicy(addr)) notify(device, relayed)
+            if (addr != addrOf(fromAddr) && addrAllowedByPolicy(addr)) notify(device, relayed)
         }
     }
 
@@ -1224,41 +1298,69 @@ object MeshGatt {
             System.currentTimeMillis().toULong(),
             payload,
         )
-        clientGatt[peerId]?.let { gatt -> clientChar[peerId]?.let { ch -> writePacket(gatt, ch, packet); return@runCatching true } }
+        clientGatt[addrOf(peerId)]?.let { gatt -> clientChar[peerId]?.let { ch -> writePacket(gatt, ch, packet); return@runCatching true } }
         serverDevices[peerId]?.let { device -> notify(device, packet); return@runCatching true }
         false
     }.getOrDefault(false)
 
     // ── Characteristic I/O: one padded packet per value, NO length prefix ──
 
-    // Per-address FIFO of pending characteristic writes. Android allows only ONE
-    // outstanding writeCharacteristic per connection — the next must wait for
-    // onCharacteristicWrite — so issuing announce + Noise m1 + 0x53 back-to-back
-    // silently DROPPED the middle write (the handshake m1), and the Noise DM never
+    // Per-connection FIFO of pending GATT operations. Android allows only ONE
+    // outstanding GATT op per connection — the next must wait for its completion
+    // callback — so issuing announce + Noise m1 + 0x53 back-to-back silently
+    // DROPPED the middle write (the handshake m1), and the Noise DM never
     // established. Serialize: enqueue, issue one at a time, drain on completion.
-    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
+    // Descriptor writes (CCC subscriptions) share the same hardware slot as
+    // characteristic writes, so with several service instances per connection
+    // they must ride the same queue — each op carries its own target.
+    private sealed interface GattOp {
+        class WriteChar(val ch: BluetoothGattCharacteristic, val bytes: ByteArray) : GattOp
+        class WriteDesc(val desc: BluetoothGattDescriptor) : GattOp
+    }
+
+    private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<GattOp>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
-        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
+        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
+            .add(GattOp.WriteChar(ch, packet))
         pumpClientWrites(gatt.device.address)
     }
 
-    /** Issue the next queued write for [addr] iff none is in flight. */
+    /** Queue a CCC-enable write (completion arrives in onDescriptorWrite). */
+    private fun subscribeChar(gatt: BluetoothGatt, d: BluetoothGattDescriptor) {
+        clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
+            .add(GattOp.WriteDesc(d))
+        pumpClientWrites(gatt.device.address)
+    }
+
+    /** Issue the next queued op for [addr] iff none is in flight. */
     @Synchronized
     private fun pumpClientWrites(addr: String) {
         if (clientWriting.contains(addr)) return
         val q = clientWriteQueue[addr] ?: return
         val next = q.poll() ?: return
         val gatt = clientGatt[addr] ?: return
-        val ch = clientChar[addr] ?: return
         clientWriting.add(addr)
-        if (!issueWrite(gatt, ch, next)) {
-            // The write wasn't accepted ⇒ onCharacteristicWrite won't fire; don't
+        val accepted = when (next) {
+            is GattOp.WriteChar -> issueWrite(gatt, next.ch, next.bytes)
+            is GattOp.WriteDesc -> issueDescWrite(gatt, next.desc)
+        }
+        if (!accepted) {
+            // The op wasn't accepted ⇒ its completion callback won't fire; don't
             // stall the queue — drop it and move on.
-            android.util.Log.w(TAG, "write not accepted for $addr — skipping")
+            android.util.Log.w(TAG, "gatt op not accepted for $addr — skipping")
             clientWriting.remove(addr)
             pumpClientWrites(addr)
+        }
+    }
+
+    private fun issueDescWrite(gatt: BluetoothGatt, d: BluetoothGattDescriptor): Boolean {
+        val enable = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+        return if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(d, enable) == android.bluetooth.BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION") run { d.value = enable; gatt.writeDescriptor(d) }
         }
     }
 
