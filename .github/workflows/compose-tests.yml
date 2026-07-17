@@ -84,8 +84,10 @@ jobs:
       - name: Update Rust toolchain
         run: rustup update stable && rustup default stable
 
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version 4.1.2 --locked
+      - name: Install Android Rust tools
+        run: |
+          cargo install cargo-ndk --version 4.1.2 --locked
+          cargo install uniffi --version 0.31.1 --features cli --locked
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

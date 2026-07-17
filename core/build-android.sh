@@ -102,7 +102,14 @@ fi
 # --- Generate the Kotlin bindings (library mode, reads metadata from a .so) ---
 echo "Generating Kotlin bindings..."
 SONAR_BINDINGS_ABI="${SONAR_BINDINGS_ABI:-arm64-v8a}"
-cargo run -p "$CRATE" --features cli --bin uniffi-bindgen -- generate \
+if command -v uniffi-bindgen >/dev/null 2>&1; then
+  BINDGEN=(uniffi-bindgen)
+else
+  # Local fallback. CI installs the standalone binary so binding generation
+  # does not rebuild and link the full Sonar dependency graph for the host.
+  BINDGEN=(cargo run -p "$CRATE" --features cli --bin uniffi-bindgen --)
+fi
+"${BINDGEN[@]}" generate \
   --library "$JNILIBS/$SONAR_BINDINGS_ABI/$LIB" \
   --language kotlin --out-dir "$KOTLIN_DIR"
 
