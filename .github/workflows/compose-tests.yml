@@ -116,6 +116,9 @@ jobs:
           api-level: 35
           arch: x86_64
           profile: pixel_6
+          # Pixel 6 defaults to a 7+ GiB userdata partition, larger than the
+          # free space left on a hosted runner after the NDK and system image.
+          disk-size: 2048M
           script: >-
             ./gradlew :composeApp:connectedDebugAndroidTest
             -Psonar.androidDebugAbi=x86_64
