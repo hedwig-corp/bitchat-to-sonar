@@ -347,6 +347,9 @@ object MeshGatt {
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
         }
+    }
+
+    private fun dispatchEvents(out: MeshEngineOutput) {
         for (event in out.events) when (event) {
             is MeshEngineEvent.PeerAnnounced -> {
                 android.util.Log.i(
@@ -375,7 +378,7 @@ object MeshGatt {
                 android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
                 val pm = MeshPublicMessage(
                     content = event.content,
-                    senderIdHex = event.fingerprint,
+                    senderIdHex = event.senderIdHex,
                     timestampMs = event.timestampMs.toULong(),
                 )
                 onBroadcast.forEach { it(event.fingerprint, pm) }
