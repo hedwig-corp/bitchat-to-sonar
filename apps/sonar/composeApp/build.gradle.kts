@@ -109,6 +109,15 @@ val buildAndroidRustCore = tasks.register<Exec>("buildAndroidRustCore") {
     inputs.dir(repoRootDir.resolve("core/sonar-core/src"))
     inputs.dir(repoRootDir.resolve("core/sonar-ffi/src"))
     inputs.dir(repoRootDir.resolve("core/vendor/nostr-blossom/src"))
+    inputs.property(
+        "sonarAbis",
+        providers.environmentVariable("SONAR_ABIS")
+            .orElse("-t arm64-v8a -t armeabi-v7a -t x86_64"),
+    )
+    inputs.property(
+        "sonarBindingsAbi",
+        providers.environmentVariable("SONAR_BINDINGS_ABI").orElse("arm64-v8a"),
+    )
     outputs.file(androidBindingsFile)
     outputs.dir(androidJniLibsDir)
 
