@@ -202,10 +202,6 @@ object MeshGatt {
             transact { engine.onTick(now) }
             if (tickArmed) handler.postDelayed(this, TICK_MS)
         }
-
-        /** Re-read the clock so rx that landed since the decision spares the link. */
-        private fun stillStale(lastRx: Long?): Boolean =
-            lastRx != null && nowMonotonic() - lastRx >= LINK_STALE_MS
     }
 
     fun startServer() {
@@ -351,16 +347,42 @@ object MeshGatt {
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
         }
-        // Client links: policy per instance link (several peer apps can share
-        // one address); dropClientLink closes the connection once empty.
-        val keys = HashSet<String>()
-        keys.addAll(clientChar.keys)
-        keys.addAll(clientLinks.keys)
-        keys.forEach { key ->
-            if (!addrAllowedByPolicy(key)) {
-                val fp = fingerprintByAddr[key]
-                android.util.Log.i(TAG, "dropping non-allowlisted mesh link $key fp=${fp?.take(8) ?: "unknown"}")
-                dropClientLink(key)
+        for (event in out.events) when (event) {
+            is MeshEngineEvent.PeerAnnounced -> {
+                android.util.Log.i(
+                    TAG,
+                    "ANNOUNCE '${event.nickname}' peerId=${event.peerIdHex} fp=${event.fingerprint.take(8)}… direct=${event.direct}",
+                )
+                val info = MeshAnnounceInfo(
+                    nickname = event.nickname,
+                    noisePublicKeyHex = "",
+                    signingPublicKeyHex = "",
+                    senderIdHex = event.peerIdHex,
+                )
+                onAnnounce.forEach { it(event.peerIdHex, info, event.fingerprint) }
+            }
+            is MeshEngineEvent.SonarPayload ->
+                onSonar.forEach { it(event.fingerprint, event.payload) }
+            is MeshEngineEvent.TextReceived ->
+                onText.forEach { it(event.fingerprint, event.messageId, event.content) }
+            is MeshEngineEvent.FileReceived -> {
+                val bytes = event.content
+                val mime = normalizedMime(event.mimeType, bytes) ?: continue
+                val name = safeFileName(event.fileName, mime, event.timestampMs)
+                onFile.forEach { it(event.fingerprint, "${event.transferKey}-file", name, mime, bytes) }
+            }
+            is MeshEngineEvent.BroadcastReceived -> {
+                android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
+                val pm = MeshPublicMessage(
+                    content = event.content,
+                    senderIdHex = event.fingerprint,
+                    timestampMs = event.timestampMs.toULong(),
+                )
+                onBroadcast.forEach { it(event.fingerprint, pm) }
+            }
+            is MeshEngineEvent.LinkEstablished -> {
+                android.util.Log.i(TAG, "✅ Noise link ESTABLISHED fp=${event.fingerprint.take(8)}…")
+                onLink.forEach { it(event.fingerprint) }
             }
         }
     }
