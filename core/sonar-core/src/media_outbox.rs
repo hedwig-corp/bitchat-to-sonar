@@ -10,9 +10,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -32,6 +33,8 @@ const MANIFEST_KEY_SALT: &[u8] = b"sonar-media-outbox-key-v1";
 const MANIFEST_KEY_INFO: &[u8] = b"encrypted upload manifest";
 const MANIFEST_AAD: &[u8] = b"sonar-media-outbox-manifest-v1";
 const SOURCE_AAD_PREFIX: &[u8] = b"sonar-media-outbox-source-v1";
+const COMPLETION_TOMBSTONE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_COMPLETION_TOMBSTONES: usize = 500;
 
 type SharedMediaOutboxEntry = (Weak<Mutex<MediaOutbox>>, [u8; 32]);
 static SHARED_MEDIA_OUTBOXES: LazyLock<Mutex<HashMap<PathBuf, SharedMediaOutboxEntry>>> =
@@ -61,6 +64,11 @@ pub(crate) struct MediaUploadJob {
     /// and retries cleanup instead of creating a second MLS message.
     #[serde(default)]
     pub completed_message_id: Option<String>,
+    /// Completion tombstones bridge detached recovery to an in-process host
+    /// retry. Host retry identities are process-local, so retaining them past a
+    /// bounded restart window only grows the encrypted manifest forever.
+    #[serde(default)]
+    pub completed_at_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -215,11 +223,21 @@ impl MediaOutbox {
         } else {
             HashMap::new()
         };
+        let mut outbox = Self {
+            dir: Some(dir.clone()),
+            key: Some(key),
+            jobs,
+        };
+        if outbox.prune_completed_tombstones(unix_now_secs(), None) {
+            outbox.save()?;
+        }
+
         // A crash after the manifest checkpoint/removal but before blob cleanup
         // can leave harmless ciphertext behind. Reconcile it on every open so
         // repeated failures cannot consume unbounded application storage.
         if dir.exists() {
-            let referenced: std::collections::HashSet<_> = jobs
+            let referenced: std::collections::HashSet<_> = outbox
+                .jobs
                 .values()
                 .filter(|job| job.completed_message_id.is_none())
                 .flat_map(|job| {
@@ -246,11 +264,7 @@ impl MediaOutbox {
                 }
             }
         }
-        Ok(Self {
-            dir: Some(dir),
-            key: Some(key),
-            jobs,
-        })
+        Ok(outbox)
     }
 
     pub fn disabled() -> Self {
@@ -380,6 +394,7 @@ impl MediaOutbox {
                 sources,
                 items: Vec::with_capacity(expected_items),
                 completed_message_id: None,
+                completed_at_secs: None,
             },
         );
         if let Err(error) = self.save() {
@@ -572,16 +587,17 @@ impl MediaOutbox {
         request_id: &str,
         message_id: String,
     ) -> Result<()> {
-        let job = self
-            .jobs
-            .get_mut(request_id)
-            .ok_or_else(|| Error::Storage("media upload job is missing".into()))?;
-        let previous = job.completed_message_id.replace(message_id);
+        if !self.jobs.contains_key(request_id) {
+            return Err(Error::Storage("media upload job is missing".into()));
+        }
+        let previous_jobs = self.jobs.clone();
+        let now_secs = unix_now_secs();
+        let job = self.jobs.get_mut(request_id).expect("job checked above");
+        job.completed_message_id = Some(message_id);
+        job.completed_at_secs = Some(now_secs);
+        self.prune_completed_tombstones(now_secs, Some(request_id));
         if let Err(error) = self.save() {
-            self.jobs
-                .get_mut(request_id)
-                .expect("job checked above")
-                .completed_message_id = previous;
+            self.jobs = previous_jobs;
             return Err(error);
         }
         // The small manifest tombstone must survive until an explicit host
@@ -598,6 +614,35 @@ impl MediaOutbox {
             }
         }
         Ok(())
+    }
+
+    fn prune_completed_tombstones(&mut self, now_secs: u64, preserve_id: Option<&str>) -> bool {
+        let before = self.jobs.len();
+        self.jobs.retain(|_, job| {
+            let Some(_) = job.completed_message_id else {
+                return true;
+            };
+            let completed_at = job.completed_at_secs.unwrap_or(job.created_at_secs);
+            now_secs.saturating_sub(completed_at) <= COMPLETION_TOMBSTONE_TTL_SECS
+        });
+
+        let mut completed: Vec<_> = self
+            .jobs
+            .values()
+            .filter(|job| job.completed_message_id.is_some())
+            .map(|job| {
+                (
+                    preserve_id == Some(job.request_id.as_str()),
+                    job.completed_at_secs.unwrap_or(job.created_at_secs),
+                    job.request_id.clone(),
+                )
+            })
+            .collect();
+        completed.sort_by(|left, right| right.cmp(left));
+        for (_, _, request_id) in completed.into_iter().skip(MAX_COMPLETION_TOMBSTONES) {
+            self.jobs.remove(&request_id);
+        }
+        self.jobs.len() != before
     }
 
     pub fn remove(&mut self, request_id: &str) -> Result<()> {
@@ -647,7 +692,7 @@ impl MediaOutbox {
         let tmp = dir.join(MANIFEST_TMP_FILE);
         let manifest = dir.join(MANIFEST_FILE);
         write_private_file(&tmp, &encrypted)?;
-        fs::rename(&tmp, &manifest).map_err(|error| {
+        atomic_replace_file(&tmp, &manifest).map_err(|error| {
             Error::Storage(format!(
                 "replace media outbox manifest {}: {error}",
                 manifest.display()
@@ -662,6 +707,50 @@ impl MediaOutbox {
                     dir.display()
                 ))
             })?;
+        Ok(())
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn atomic_replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from = from
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let to = to
+        .as_os_str()
+        .encode_wide()
+        .chain(iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
@@ -893,11 +982,80 @@ mod tests {
             Some("https://blossom.example/a")
         );
         assert_eq!(job.completed_message_id.as_deref(), Some("message-id"));
+        assert!(job.completed_at_secs.is_some());
         assert!(reloaded.load_upload("request", 1).is_err());
         assert!(reloaded.load_source("request", 1).is_err());
         assert!(!source_file.exists());
         let manifest = fs::read(media_outbox_dir_for_db(&db).join(MANIFEST_FILE)).unwrap();
         assert!(!String::from_utf8_lossy(&manifest).contains("caption"));
+    }
+
+    #[test]
+    fn manifest_replacement_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("manifest.enc");
+        let replacement = dir.path().join("manifest.enc.tmp");
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&replacement, b"new").unwrap();
+
+        atomic_replace_file(&replacement, &destination).unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"new");
+        assert!(!replacement.exists());
+    }
+
+    #[test]
+    fn completed_tombstones_are_bounded_by_age_and_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let key = [19_u8; 32];
+        let now = unix_now_secs();
+        let mut outbox = MediaOutbox::open(&db, key).unwrap();
+        for index in 0..=MAX_COMPLETION_TOMBSTONES {
+            let request_id = format!("completed-{index}");
+            outbox.jobs.insert(
+                request_id.clone(),
+                MediaUploadJob {
+                    request_id,
+                    group_id_hex: "group".into(),
+                    caption: String::new(),
+                    server_url: String::new(),
+                    created_at_secs: now,
+                    expected_items: 0,
+                    sources: Vec::new(),
+                    items: Vec::new(),
+                    completed_message_id: Some(format!("message-{index}")),
+                    completed_at_secs: Some(now.saturating_sub(index as u64)),
+                },
+            );
+        }
+        outbox.jobs.insert(
+            "expired".into(),
+            MediaUploadJob {
+                request_id: "expired".into(),
+                group_id_hex: "group".into(),
+                caption: String::new(),
+                server_url: String::new(),
+                created_at_secs: now,
+                expected_items: 0,
+                sources: Vec::new(),
+                items: Vec::new(),
+                completed_message_id: Some("expired-message".into()),
+                completed_at_secs: Some(now.saturating_sub(COMPLETION_TOMBSTONE_TTL_SECS + 1)),
+            },
+        );
+        outbox.save().unwrap();
+
+        let reloaded = MediaOutbox::open(&db, key).unwrap();
+        assert_eq!(
+            reloaded
+                .jobs
+                .values()
+                .filter(|job| job.completed_message_id.is_some())
+                .count(),
+            MAX_COMPLETION_TOMBSTONES
+        );
+        assert!(!reloaded.contains("expired"));
     }
 
     #[test]
