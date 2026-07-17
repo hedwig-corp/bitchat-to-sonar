@@ -259,6 +259,33 @@ invalidation for verified peer/profile changes.
   change-only, event bursts conflated, and native snapshot reads off-main.
 
 ---
+## R-009 — Layout must never steal a pinned transcript tail
+
+**Invariant:** While the reader is at the transcript tail, a layout/content change (keyboard opening, composer growth, window resize, media growth, or an appended message) must keep the newest message visible above the fold; only the user's own scroll may unpin. In particular, "am I at the bottom" state that the change itself invalidates must not gate the re-pin.
+
+**Breaks as:** Opening the keyboard hides the last screenful of messages behind the IME, or a newly sent bubble remains below the fold until manual scroll. Once the sentinel-based near-bottom flag flips false, later layout changes can become no-ops.
+
+**Why:** Both list stacks are top-anchored: viewport shrink or content growth keeps the first visible row, not the last. Both platforms' live "near bottom" signals are consumed by that same change, so the pinner must carry the previous frame's tail state and separately observe genuine user scrolling. Timers (the #303 iOS fix pinned at now/+0.35s) lose to whatever settles after them.
+
+**Call sites:** iOS `SonarComponents.swift::SNMsgList` (`SNTailPinLatch` + `SNUserScrollObserver` + sentinel/count/viewport events); Compose `App.kt::TranscriptTailPinning` (`TranscriptTailPinner.onFrame`).
+
+**Guarded by:** `SNTailPinLatchTests.shrinkKeepsPinningWhileSentinelIsCovered`
+
+**Also guarded by:** `SNTailPinLatchTests.keyboardFrameChangeCapturesVisibleTailBeforeShrink`, `SNTailPinLatchTests.expandKeepsPinningAfterPhantomKeyboardInsetClears`, `SNTailPinLatchTests.preLayoutKeyboardClampIsNotUserScroll`, `SNTailPinLatchTests.tailRevisionTracksOnlyCountAndLiveEdge`, `SNTailPinLatchTests.tailSnapBurstCoalescesUntilDelivery`, `SNTailPinLatchTests.appendedOutgoingRowAtTailFollows`, `SNTailPinLatchTests.replacedTailAtCapacityStillFollows`, `SNTailPinLatchTests.nonKeyboardLayoutTheftSnapsBack`, `SNTailPinLatchTests.keyboardShowWithoutShrinkDoesNotLeaveStickyPin`, `SNTailPinLatchTests.userScrollAwayIsRespectedAfterTailReturns`, `SNTailPinLatchTests.nonTouchScrollTowardTopCountsAsUserScroll`, `SNTailPinLatchTests.programmaticTailFollowIsNotUserScroll`, `SNTailPinLatchTests.downwardDecelerationAtVisibleTailIsIgnored`, `SNTailPinLatchTests.layoutDrivenUpwardOffsetIsNotUserScroll`, `SNTailPinLatchTests.nonTouchHistoryScrollAfterResizeStillCounts`, `SNTailPinLatchTests.anchoredOpenNeverPins`, `SNTailPinLatchTests.keyboardDismissOvershootIsClampedToContentBounds`, `SNTailPinLatchTests.transcriptOpenUsesBottomAnchorOnlyWhenFullyRead`, `TranscriptTailPinnerTest` and `TranscriptTailPinningUiTest` (Compose, real `LazyListState` wiring).
+
+**Coverage (honest):** The Swift tests pin only the latch decision — a helper the SwiftUI body feeds itself, exactly the shape rule 2 warns about; nothing exercises the `GeometryReader`/`ScrollViewReader` wiring or that `scrollTo` actually lands (and iOS tests do not run in CI). The Compose UI test is the stronger guard. A raced/failed pin on iOS is only caught by eye. The iOS path mirrors Signal-iOS `updateContentInsets` / `DebouncedEventLastOnly(0.01)` / `scrollToBottomOfLoadWindow(animated: false)`: `SNTailPinLatch` + 10 ms coalescer, owned bottom inset (`.never` + `snOwnedTranscriptBottomContentInset` = 0 because the composer is a sibling), and overshoot clamp via `snRestingOffsetOvershootCorrection`. Fully-read opens also use conditional `defaultScrollAnchor(.bottom)` (iOS 17+) plus `scrollTo` last row / `sn-bottom` so SwiftUI does not start at the top; unread opens stay top-anchored. LazyVStack spacers and `contentSize`-derived top insets were tried and rejected. Signal short chats with not-enough content stay at `max(minContentOffsetY, …)` (empty space below messages is normal).
+
+**History:** #283 (Compose) -> #303 (iOS, notification + fixed delays; incomplete) -> this fix (previous-frame pinner + explicit user-scroll observation, Signal `wasScrolledToBottom` shape) -> phantom empty band (viewport expand ignored) -> rejected LazyVStack spacer / `contentSize` top-inset experiments that yanked GIAN / Ocean LCI Alert or opened DMs mid-history -> conditional `defaultScrollAnchor` for fully-read opens only.
+
+**Rejected:**
+- *Fixed-delay double pin after `keyboardWillShow` (#303).* The 0.35s timer races the safe-area animation and anything that settles later (late transport-leg merge, sticker/media decode); one lost race also strands `isNearBottom` at false, disabling every later keyboard open.
+- *Unconditional `defaultScrollAnchor(.bottom)`.* Fights unread-anchor opens. Conditional (fully-read only) is what shipped.
+- *Dynamic top spacer inside LazyVStack.* `contentSize` includes the spacer ⇒ feedback loop yanked chats (GIAN / Ocean LCI Alert).
+- *`contentInset.top = max(0, viewport − contentSize)` from LazyVStack metrics.* `contentSize` under-measures on open ⇒ DMs started away from the last message. Rejected.
+- *`.frame(minHeight:alignment:.bottom)` on LazyVStack.* Ignored by LazyVStack.
+- *Flipping the ScrollView 180°.* Structurally bottom-anchored, but inverts every gesture/accessibility behaviour and would rewrite the whole transcript surface.
+
+**Platform gap:** Compose `LazyColumn` is still top-anchored for short feeds (no `reverseLayout` / fill-height bottom arrangement). Same empty-band class of bug may exist there; follow-up is a Compose short-transcript bottom align that keeps unread-anchor opens intact.
 
 ## Unguarded
 
