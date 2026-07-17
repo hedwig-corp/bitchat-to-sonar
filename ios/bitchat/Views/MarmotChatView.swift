@@ -2283,7 +2283,17 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func stickerData(for ref: MarmotService.MarmotStickerRef) async -> Data? {
+    /// Resolve a received sticker. Never gated on the pack being installed: the
+    /// picker's installed list decides what you can SEND, while anything a peer
+    /// sends must render from the reference alone (pack metadata off the relay,
+    /// bytes off Blossom, both hash-verified).
+    ///
+    /// `userInitiated` marks an explicit tap on the failed placeholder, which
+    /// always retries even a ref previously judged unresolvable.
+    func stickerData(
+        for ref: MarmotService.MarmotStickerRef,
+        userInitiated: Bool = false
+    ) async -> Data? {
         let generation = stickerCacheGeneration
         let refKey = Self.stickerRefMemoryKey(
             packCoordinate: ref.packCoordinate,
@@ -2305,8 +2315,13 @@ final class MarmotChatModel: ObservableObject {
         }
         guard stickerCacheGeneration == generation else { return nil }
         // A ref the latest pack has already disowned must not re-drive relay
-        // work on every bubble mount, retry tick, and tap.
-        guard !unresolvableStickerRefKeySet.contains(refKey) else { return nil }
+        // work on every bubble mount and retry tick — but a human tap is
+        // bounded by the human, so it always gets a fresh attempt.
+        if userInitiated {
+            forgetUnresolvableStickerRef(refKey)
+        } else if unresolvableStickerRefKeySet.contains(refKey) {
+            return nil
+        }
         guard let parts = Self.stickerPackParts(ref.packCoordinate),
               let pack = await fetchStickerPack(
                   authorPubkeyHex: parts.author,
@@ -2339,9 +2354,12 @@ final class MarmotChatModel: ObservableObject {
             ) else { return nil }
             sticker = matching(refreshed)
             if sticker == nil {
-                // Refetched metadata still disowns the ref: remember that, so
-                // this is the last eviction+refetch this ref ever costs.
-                if stickerCacheGeneration == generation {
+                // Only trust "not in pack" when we actually reached a relay.
+                // The core falls back to stale validated-local metadata when the
+                // fetch fails, so negative-caching an offline answer would keep
+                // a perfectly good sticker black for the rest of the session —
+                // exactly the stale-metadata failure this PR exists to fix.
+                if stickerCacheGeneration == generation, service.isRelayConnected() {
                     rememberUnresolvableStickerRef(refKey)
                 }
                 return nil
@@ -2458,6 +2476,11 @@ final class MarmotChatModel: ObservableObject {
         let normalized = snNormalizeStickerPackCoordinate(coordinate)
         stickerPacksByCoordinate.removeValue(forKey: normalized)
         stickerPackLRU.removeAll { $0 == normalized }
+    }
+
+    private func forgetUnresolvableStickerRef(_ refKey: String) {
+        guard unresolvableStickerRefKeySet.remove(refKey) != nil else { return }
+        unresolvableStickerRefKeys.removeAll { $0 == refKey }
     }
 
     private func rememberUnresolvableStickerRef(_ refKey: String) {

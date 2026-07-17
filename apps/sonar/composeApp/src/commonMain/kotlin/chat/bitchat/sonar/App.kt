@@ -2232,7 +2232,10 @@ private fun StickerBubble(
         // the core's receive-time prefetch may land moments later.
         var attempt = 0
         while (true) {
-            imageBytes = state.stickerImage(ref)
+            // retryToken > 0 means the user tapped the failed placeholder: that
+            // overrides a cached "unresolvable" verdict, which may have been
+            // recorded off stale pack metadata.
+            imageBytes = state.stickerImage(ref, userInitiated = retryToken > 0)
             if (imageBytes != null) {
                 failed = false
                 return@LaunchedEffect
