@@ -2315,7 +2315,7 @@ impl SonarClient {
             resume_watermark,
             storage_empty,
         )));
-        let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
+        let outbox_state = OutboxState::load_shared(outbox_state_path);
         let client = Self {
             engine,
             nostr,

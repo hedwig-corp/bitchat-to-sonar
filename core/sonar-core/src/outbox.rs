@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ use crate::{Error, Result};
 pub(crate) const OUTBOX_STATE_FILE_SUFFIX: &str = ".sonar-outbox.json";
 const OUTBOX_STATE_VERSION: u32 = 1;
 const OUTBOX_RETRY_ATTEMPT_LIMIT: u32 = 20;
+static SHARED_OUTBOX_STATES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<OutboxState>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct OutboxStateDisk {
@@ -50,6 +53,31 @@ pub(crate) struct OutboxState {
 }
 
 impl OutboxState {
+    /// Local-only and relay-backed nodes overlap briefly during local-first
+    /// startup. They must mutate one snapshot under one lock or the last stale
+    /// writer can truncate a send created by the other node.
+    pub fn load_shared(path: Option<PathBuf>) -> Arc<Mutex<Self>> {
+        let Some(path) = path else {
+            return Arc::new(Mutex::new(Self::load(None)));
+        };
+        let registry_key = fs::canonicalize(&path).unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+                .unwrap_or_else(|| path.clone())
+        });
+        let mut registry = SHARED_OUTBOX_STATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, state| state.strong_count() > 0);
+        if let Some(state) = registry.get(&registry_key).and_then(Weak::upgrade) {
+            return state;
+        }
+        let state = Arc::new(Mutex::new(Self::load(Some(path))));
+        registry.insert(registry_key, Arc::downgrade(&state));
+        state
+    }
+
     pub fn load(path: Option<PathBuf>) -> Self {
         let disk = path
             .as_ref()
@@ -359,6 +387,30 @@ mod tests {
         stale.reload_from_disk();
         assert_eq!(
             stale.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn overlapping_nodes_share_one_outbox_snapshot_and_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let local = OutboxState::load_shared(Some(path.clone()));
+        local
+            .lock()
+            .unwrap()
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("local send");
+        let relay = OutboxState::load_shared(Some(path));
+        assert!(Arc::ptr_eq(&local, &relay));
+        assert_eq!(
+            relay.lock().unwrap().status_for_message("message"),
             Some(DeliveryState::Pending)
         );
     }
