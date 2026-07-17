@@ -44,12 +44,11 @@ actual object MeshRadio {
     private val lastSeen = ConcurrentHashMap<String, Long>()
     @Volatile private var scanning = false
     @Volatile private var radioRequested = false
-    @Volatile private var radioUsable = false
     @Volatile private var discoveryMode: BleDiscoveryMode = BleDiscoveryMode.Normal
     private var scanner: BluetoothLeScanner? = null
     private var advertiser: BluetoothLeAdvertiser? = null
     private val knownPeerIds = ConcurrentHashMap.newKeySet<String>()
-    private val lifecycleLock = Any()
+    private val routeGate = BleRadioRouteGate()
     private var adapterReceiverRegistered = false
 
     // ── Scan watchdog ──
@@ -107,18 +106,18 @@ actual object MeshRadio {
         // conversation across peerID + BLE-address rotation (issue #12).
         // Buffer incoming Noise DMs (the listener fires on a BLE callback thread).
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
-            if (!radioUsable) return@addMessageListener
+            if (!routeGate.isUsable) return@addMessageListener
             if (!isKnownPeer(fingerprint)) return@addMessageListener
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
-            if (!radioUsable) return@addFileListener
+            if (!routeGate.isUsable) return@addFileListener
             if (!isKnownPeer(fingerprint)) return@addFileListener
             meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { senderFingerprint, pm ->
-            if (!radioUsable) return@addBroadcastListener
+            if (!routeGate.isUsable) return@addBroadcastListener
             if (!isKnownPeer(senderFingerprint)) return@addBroadcastListener
             meshBroadcastInbox.add(MeshBroadcastIn(senderFingerprint, pm.content, (pm.timestampMs / 1000u).toLong()))
         }
@@ -145,7 +144,9 @@ actual object MeshRadio {
         }
         // Keep a peer fresh while its encrypted link is (re)established.
         MeshGatt.addLinkListener { fingerprint ->
-            if (radioUsable) announcedSeen[fingerprint] = System.currentTimeMillis()
+            routeGate.publishIfUsable {
+                announcedSeen[fingerprint] = System.currentTimeMillis()
+            }
         }
     }
 
@@ -215,13 +216,13 @@ actual object MeshRadio {
     }
 
     actual fun start() {
-        synchronized(lifecycleLock) { startLocked() }
+        routeGate.withLifecycleLock { startLocked() }
     }
 
     private fun startLocked() {
         radioRequested = true
         if (!registerAdapterReceiverLocked()) {
-            radioUsable = false
+            routeGate.retire {}
             return
         }
         val isAvailable = available()
@@ -231,7 +232,7 @@ actual object MeshRadio {
             return
         }
         if (!isAvailable) {
-            radioUsable = false
+            routeGate.retire {}
             android.util.Log.i(TAG, "start skipped: scanning=false available=false")
             return
         }
@@ -242,7 +243,7 @@ actual object MeshRadio {
         applyMeshGattPolicy()
         val a = adapter() ?: return
         scanning = true
-        radioUsable = true
+        routeGate.activate()
         try {
             scanner = a.bluetoothLeScanner
             startScanInternal()
@@ -261,7 +262,7 @@ actual object MeshRadio {
     }
 
     actual fun stop() {
-        synchronized(lifecycleLock) { stopLocked() }
+        routeGate.withLifecycleLock { stopLocked() }
     }
 
     private fun stopLocked() {
@@ -354,7 +355,7 @@ actual object MeshRadio {
      *  Restarts stay spaced to remain under Android's scan-start throttle. */
     private val scanWatchdog = object : Runnable {
         override fun run() {
-            if (!scanning || !radioUsable) return
+            if (!scanning || !routeGate.isUsable) return
             val now = SystemClock.elapsedRealtime()
             val hasUsableLink = announcedPeers.keys.any { MeshGatt.hasLink(it) }
             val restartReason = bleScanRestartReason(
@@ -387,7 +388,7 @@ actual object MeshRadio {
         announcedSeen.isNotEmpty() || announcedPeers.keys.any { MeshGatt.hasLink(it) }
 
     actual fun peers(): List<MeshPeer> {
-        if (!radioUsable) return emptyList()
+        if (!routeGate.isUsable) return emptyList()
         val now = System.currentTimeMillis()
         // `seen` (raw scan results) is kept only to drive auto-dial — it is NOT
         // shown. BLE MAC rotation turns one device into a stream of addresses;
@@ -415,15 +416,15 @@ actual object MeshRadio {
     actual fun setMeshNickname(nick: String) { MeshGatt.updateNickname(nick) }
 
     actual fun sonarPeers(): Map<String, ByteArray> =
-        if (radioUsable) sonarProfiles.filterKeys { isKnownPeer(it) } else emptyMap()
+        if (routeGate.isUsable) sonarProfiles.filterKeys { isKnownPeer(it) } else emptyMap()
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
-        radioUsable && MeshGatt.sendTextToPeer(peerId, messageId, text)
+        routeGate.isUsable && MeshGatt.sendTextToPeer(peerId, messageId, text)
     actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
-        radioUsable && MeshGatt.sendTextToPeerNow(peerId, messageId, text)
+        routeGate.isUsable && MeshGatt.sendTextToPeerNow(peerId, messageId, text)
 
     actual fun hasMeshLink(peerId: String): Boolean =
-        meshRouteAvailable(radioUsable, MeshGatt.hasLink(peerId))
+        meshRouteAvailable(routeGate.isUsable, MeshGatt.hasLink(peerId))
 
     actual fun localPeerIdHex(): String = MeshGatt.nodeId().toHexLower()
 
@@ -437,7 +438,7 @@ actual object MeshRadio {
     }
 
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
-        radioUsable && MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+        routeGate.isUsable && MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()
@@ -450,7 +451,7 @@ actual object MeshRadio {
 
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
-    actual fun sendMeshBroadcast(text: String): Boolean = radioUsable && MeshGatt.broadcastPublic(text)
+    actual fun sendMeshBroadcast(text: String): Boolean = routeGate.isUsable && MeshGatt.broadcastPublic(text)
 
     actual fun drainMeshBroadcast(): List<MeshBroadcastIn> {
         val out = ArrayList<MeshBroadcastIn>()
@@ -461,11 +462,11 @@ actual object MeshRadio {
         return out
     }
 
-    actual fun connectedMeshPeerCount(): Int = if (radioUsable) MeshGatt.connectedPeerCount() else 0
+    actual fun connectedMeshPeerCount(): Int = if (routeGate.isUsable) MeshGatt.connectedPeerCount() else 0
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            if (!scanning || !radioUsable) return
+            if (!scanning || !routeGate.isUsable) return
             scanResultCount++
             lastScanCallbackMs = SystemClock.elapsedRealtime()
             val id = result.device.address
@@ -499,7 +500,7 @@ actual object MeshRadio {
                     runCatching { MeshGatt.connect(result.device) }
                 } else {
                     handler.postDelayed({
-                        if (scanning && radioUsable) runCatching { MeshGatt.connect(result.device) }
+                        if (scanning && routeGate.isUsable) runCatching { MeshGatt.connect(result.device) }
                     }, FALLBACK_DIAL_MS)
                 }
             } else if (!MeshGatt.isLinkedAddr(id)) {
@@ -515,7 +516,7 @@ actual object MeshRadio {
         }
 
         override fun onScanFailed(errorCode: Int) {
-            if (!scanning || !radioUsable) return
+            if (!scanning || !routeGate.isUsable) return
             android.util.Log.e(TAG, "scan failed: $errorCode")
         }
     }

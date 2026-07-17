@@ -89,6 +89,37 @@ internal fun bleRadioLifecycleAction(
 internal fun meshRouteAvailable(radioUsable: Boolean, gattLinked: Boolean): Boolean =
     radioUsable && gattLinked
 
+/** Serializes live-route publication with radio teardown.
+ *
+ * A BLE callback may already be in flight when the adapter-off broadcast is
+ * delivered. Checking a volatile flag and then publishing is not sufficient:
+ * teardown can clear the maps between those two operations and the callback can
+ * repopulate stale reachability afterward. Callers publish through
+ * [publishIfUsable] and retire/clear through [retire] so one operation always
+ * completes before the other. */
+internal class BleRadioRouteGate {
+    private val lifecycleLock = Any()
+
+    @Volatile
+    var isUsable: Boolean = false
+        private set
+
+    fun <T> withLifecycleLock(block: () -> T): T = synchronized(lifecycleLock, block)
+
+    fun activate() {
+        synchronized(lifecycleLock) { isUsable = true }
+    }
+
+    fun <T> retire(clearLiveState: () -> T): T = synchronized(lifecycleLock) {
+        isUsable = false
+        clearLiveState()
+    }
+
+    fun <T> publishIfUsable(publish: () -> T): T? = synchronized(lifecycleLock) {
+        if (isUsable) publish() else null
+    }
+}
+
 internal enum class BleScanRestartReason(val logValue: String) {
     NoCallbacks("no_callbacks"),
     RepeatingKnownWithoutUsableLink("no_new_address_no_link"),

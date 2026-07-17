@@ -184,7 +184,7 @@ roughly halves it. The ranking is stable across all three.)
 
 **Guarded by:** `BLEServiceCoreTests.bluetoothPoweredOff_stopsRoutingOverMesh`, `BLEServiceCoreTests.bluetoothUnauthorized_stopsRoutingOverMesh`, `BLEServiceCoreTests.bluetoothResetting_stopsRoutingOverMesh`, `BLEServiceCoreTests.announceAfterRadioOffDoesNotResurrectMeshRoute`
 
-**Also guarded by:** `BluetoothAdapterLifecycleTest.adapterTurningOffSuspendsRadioAndDemotesRoute`, `BluetoothAdapterLifecycleTest.adapterOffSuspendsEvenWhenRadioWasNotRequested`, `BluetoothAdapterLifecycleTest.adapterOnResumesOnlyARequestedRadio`, `BluetoothAdapterLifecycleTest.meshRouteRequiresBothUsableAdapterAndLiveGattLink`
+**Also guarded by:** `BluetoothAdapterLifecycleTest.adapterTurningOffSuspendsRadioAndDemotesRoute`, `BluetoothAdapterLifecycleTest.adapterOffSuspendsEvenWhenRadioWasNotRequested`, `BluetoothAdapterLifecycleTest.adapterOnResumesOnlyARequestedRadio`, `BluetoothAdapterLifecycleTest.meshRouteRequiresBothUsableAdapterAndLiveGattLink`, `BleRadioRouteGateTest.adapterTeardownCannotRaceLateAnnouncePublication`
 
 **Coverage (honest):** All four drive the **central** state machine through the DEBUG seam `_test_handleCentralState`, which calls `handleCentralState(_:central:)` with a `nil` manager. So they pin the demote logic and the announce gate (`meshRadioAvailable`), but **not**:
 - the real `centralManagerDidUpdateState` delegate callback — the seam bypasses CoreBluetooth entirely, and `CBManagerState` cannot be forced on a live manager;
@@ -192,7 +192,7 @@ roughly halves it. The ranking is stable across all three.)
 - the real race the gate exists for: the tests deliver the late announce *after* the invalidation deterministically, rather than exercising the actual `messageQueue`/`bleQueue` interleaving;
 - the CoreBluetooth-side teardown calls (`stopScan`, `cancelPeripheralConnection`, `stopAdvertising`), since `central` is `nil` in tests.
 
-The Compose tests run the pure transition and route-gating decisions used by the Android receiver, but do not inject a real framework broadcast or Bluetooth stack. Device verification is still required to prove OEM callback ordering and successful scan/advertise recovery after `STATE_ON`.
+The Compose tests run the pure transition and route-gating decisions used by the Android receiver and deterministically force an in-flight announce/teardown interleaving, but do not inject a real framework broadcast or Bluetooth stack. Device verification is still required to prove OEM callback ordering and successful scan/advertise recovery after `STATE_ON`.
 
 **History:** #302 fixed the Apple path; this change closes the Android Compose parity gap.
 
