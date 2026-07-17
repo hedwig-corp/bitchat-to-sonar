@@ -146,15 +146,15 @@ object MeshGatt {
     fun shouldDial(peerNodeId: ByteArray): Boolean = engine.shouldDialFirst(peerNodeId)
 
     fun setKnownOnlyPeerAllowlist(allowedFingerprints: Set<String>?) {
-        execute(engine.setAllowlist(allowedFingerprints?.toList()))
+        transact { engine.setAllowlist(allowedFingerprints?.toList()) }
     }
 
     fun updateNickname(value: String) {
-        execute(engine.setNickname(value.trim(), nowMs()))
+        transact { engine.setNickname(value.trim(), nowMs()) }
     }
 
     fun updateSonarPayload(payload: ByteArray?) {
-        execute(engine.setSonarPayload(payload?.copyOf(), nowMs()))
+        transact { engine.setSonarPayload(payload?.copyOf(), nowMs()) }
     }
 
     // ── Lifecycle ──
@@ -165,6 +165,9 @@ object MeshGatt {
         override fun run() {
             if (!tickArmed) return
             val now = nowMs()
+            // Wire timestamps are wall-clock while deadlines are monotonic;
+            // keep the engine's offset fresh (±one tick of NTP drift is fine).
+            engine.setWallClock(now, System.currentTimeMillis())
             // Un-stick a lost GATT-op completion: the same stack that loses
             // disconnect callbacks can accept a write/CCC op and never call
             // back, freezing that connection's op queue (and any sibling
@@ -178,7 +181,24 @@ object MeshGatt {
                     pumpClientWrites(addr)
                 }
             }
-            execute(engine.onTick(now))
+            // Same recovery for the server notify slot: a lost
+            // onNotificationSent would otherwise freeze that central forever.
+            for (addr in serverNotifying) {
+                val since = notifyInFlightSinceMs[addr] ?: continue
+                if (now - since >= OP_STUCK_MS) {
+                    android.util.Log.w(TAG, "server notify stuck ${now - since}ms on $addr — unblocking queue")
+                    notifyInFlightSinceMs.remove(addr)
+                    serverNotifying.remove(addr)
+                    pumpServerNotify(addr)
+                }
+            }
+            // Bound the scan-fed device cache; keep entries with live links.
+            if (deviceByAddr.size > 256) {
+                deviceByAddr.keys.removeAll {
+                    !gattByAddr.containsKey(it) && !serverDevices.containsKey(it)
+                }
+            }
+            transact { engine.onTick(now) }
             if (tickArmed) handler.postDelayed(this, TICK_MS)
         }
     }
@@ -187,6 +207,7 @@ object MeshGatt {
         // Arm on the handler thread: start()/stop() are called off the main
         // looper; (dis)arming serialized on the tick's own looper avoids two
         // ticks rescheduling each other forever.
+        engine.setWallClock(nowMs(), System.currentTimeMillis())
         handler.post {
             if (tickArmed) return@post
             tickArmed = true
@@ -224,7 +245,7 @@ object MeshGatt {
         // A stuck in-flight flag surviving stop() would permanently block the
         // same address's queue after the next start().
         clientWriteQueue.clear(); clientWriting.clear(); opInFlightSinceMs.clear()
-        serverNotifyQueue.clear(); serverNotifying.clear()
+        serverNotifyQueue.clear(); serverNotifying.clear(); notifyInFlightSinceMs.clear()
     }
 
     // ── Dialing ──
@@ -232,7 +253,7 @@ object MeshGatt {
     /** Ask the engine to dial a discovered peer (it owns dedup/backoff/cap). */
     fun connect(device: BluetoothDevice) {
         deviceByAddr[device.address] = device
-        execute(engine.onDialRequest(device.address, nowMs()))
+        transact { engine.onDialRequest(device.address, nowMs()) }
     }
 
     fun isLinkedAddr(addr: String): Boolean = engine.isLinkedConn(addr)
@@ -243,44 +264,62 @@ object MeshGatt {
 
     // ── App-facing sends (engine decides routes; we execute) ──
 
-    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
-        val out = engine.sendText(fingerprint, messageId, text, nowMs()) ?: return false
-        execute(out)
-        return true
-    }
+    // Sends run inside transact: the Noise encrypt (nonce assignment) and the
+    // write-queue enqueue must be one atomic step, or two threads' ciphertexts
+    // can invert their nonce order on the wire.
+
+    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean =
+        transact { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
 
     /** Immediate send for real-time controls. Never queues. */
-    fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
-        val out = engine.sendTextNow(fingerprint, messageId, text, nowMs()) ?: return false
-        execute(out)
-        return true
-    }
+    fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean =
+        transact { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
 
-    /** Send a private file transfer to a live peer route (never queued). */
+    /** Send a private file transfer to a live peer route (never queued).
+     *  Mesh file message ids are derived on the receive side, so [messageId]
+     *  is accepted for interface parity only. */
     fun sendFileToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return false
-        val ts = System.currentTimeMillis()
         val mime = normalizedMime(mimeType, bytes) ?: return false
-        val safeName = safeFileName(filename, mime, ts)
-        val out = engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) ?: return false
-        val _unused = messageId // ids for mesh files are derived on the receive side
-        execute(out)
-        return true
+        val safeName = safeFileName(filename, mime, System.currentTimeMillis())
+        return transact { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
     }
 
     /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected
      *  mesh peer. Returns false if no peer is connected. */
     fun broadcastPublic(text: String): Boolean {
-        val out = engine.broadcast(text, nowMs()) ?: return false
-        val peers = out.commands.size
-        execute(out)
-        android.util.Log.i(TAG, "broadcast '${text.take(40)}' to $peers peer(s)")
+        val out = transact { engine.broadcast(text, nowMs()) } ?: return false
+        android.util.Log.i(TAG, "broadcast '${text.take(40)}' to ${out.commands.size} peer(s)")
         return true
     }
 
     // ── Command execution + event dispatch ──
 
+    private val txLock = Any()
+
+    /** Run one engine transition and dispatch its output. The lock spans the
+     *  transition AND the command enqueue: engine transitions already
+     *  serialize on the FFI mutex, but without covering the enqueue two
+     *  threads' Noise ciphertexts could invert their nonce order between
+     *  encryption and the write queue (transport nonces must arrive in
+     *  sequence). Events fire outside the lock. Reentrant (`synchronized`) so
+     *  command handlers may run nested transitions (dial failure paths). */
+    private fun transact(block: () -> MeshEngineOutput?): MeshEngineOutput? {
+        val out: MeshEngineOutput?
+        synchronized(txLock) {
+            out = block()
+            out?.let { executeCommands(it) }
+        }
+        out?.let { dispatchEvents(it) }
+        return out
+    }
+
     private fun execute(out: MeshEngineOutput) {
+        synchronized(txLock) { executeCommands(out) }
+        dispatchEvents(out)
+    }
+
+    private fun executeCommands(out: MeshEngineOutput) {
         for (cmd in out.commands) when (cmd) {
             is MeshEngineCommand.Dial -> dial(cmd.conn)
             is MeshEngineCommand.Disconnect -> disconnectClient(cmd.conn)
@@ -302,6 +341,9 @@ object MeshGatt {
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
         }
+    }
+
+    private fun dispatchEvents(out: MeshEngineOutput) {
         for (event in out.events) when (event) {
             is MeshEngineEvent.PeerAnnounced -> {
                 android.util.Log.i(
@@ -330,7 +372,7 @@ object MeshGatt {
                 android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
                 val pm = MeshPublicMessage(
                     content = event.content,
-                    senderIdHex = event.fingerprint,
+                    senderIdHex = event.senderIdHex,
                     timestampMs = event.timestampMs.toULong(),
                 )
                 onBroadcast.forEach { it(event.fingerprint, pm) }
@@ -346,7 +388,7 @@ object MeshGatt {
     private fun dial(conn: String) {
         val device = deviceByAddr[conn] ?: run {
             android.util.Log.w(TAG, "dial $conn: no cached device")
-            execute(engine.onClientConnectFailed(conn))
+            transact { engine.onClientConnectFailed(conn) }
             return
         }
         // connectGatt MUST run on the main thread — calling it from a binder
@@ -357,7 +399,7 @@ object MeshGatt {
                 device.connectGatt(ctx, false, clientCallback, BluetoothDevice.TRANSPORT_LE)
             }.getOrNull()
             if (gatt == null) {
-                execute(engine.onClientConnectFailed(conn))
+                transact { engine.onClientConnectFailed(conn) }
                 return@post
             }
             gattByAddr[conn] = gatt
@@ -365,9 +407,9 @@ object MeshGatt {
         // Fail fast when a rotated-away address hangs with no callback, and
         // when a connection never produces an announce. The engine re-checks
         // the state at each deadline; these only schedule the checks.
-        handler.postDelayed({ execute(engine.onDialDeadline(conn, nowMs())) }, CONNECT_ESTABLISH_MS)
+        handler.postDelayed({ transact { engine.onDialDeadline(conn, nowMs()) } }, CONNECT_ESTABLISH_MS)
         handler.postDelayed(
-            { execute(engine.onDialDeadline(conn, nowMs())) },
+            { transact { engine.onDialDeadline(conn, nowMs()) } },
             CONNECT_ESTABLISH_MS + ANNOUNCE_TIMEOUT_MS,
         )
     }
@@ -385,7 +427,7 @@ object MeshGatt {
     @SuppressLint("MissingPermission")
     private fun cancelServer(conn: String) {
         serverDevices.remove(conn)?.let { device -> runCatching { server?.cancelConnection(device) } }
-        serverNotifyQueue.remove(conn); serverNotifying.remove(conn)
+        serverNotifyQueue.remove(conn); serverNotifying.remove(conn); notifyInFlightSinceMs.remove(conn)
     }
 
     @SuppressLint("MissingPermission")
@@ -398,7 +440,7 @@ object MeshGatt {
             // No CCC on this instance — we can't receive its notifies, but can
             // still write our announce to its server.
             android.util.Log.i(TAG, "client $conn#$instance: no CCC descriptor → write announce only")
-            execute(engine.onSubscribeResult(conn, instance, false, nowMs()))
+            transact { engine.onSubscribeResult(conn, instance, false, nowMs()) }
         } else {
             subscribeChar(gatt, d)
         }
@@ -413,15 +455,21 @@ object MeshGatt {
             android.util.Log.i(TAG, "client $addr: state=$newState status=$status")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 gattByAddr[addr] = gatt
-                execute(engine.onClientConnected(addr, nowMs()))
+                transact { engine.onClientConnected(addr, nowMs()) }
                 gatt.requestMtu(517)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 if (status != 0) gatt.close()
+                // A late callback from an old, replaced GATT for this address
+                // must not tear down a freshly-dialed connection.
+                if (gattByAddr[addr] != null && gattByAddr[addr] !== gatt) {
+                    runCatching { gatt.close() }
+                    return
+                }
                 disconnectClient(addr)
-                execute(
+                transact {
                     if (status != 0) engine.onClientConnectFailed(addr)
                     else engine.onClientDisconnected(addr)
-                )
+                }
             }
         }
 
@@ -462,8 +510,12 @@ object MeshGatt {
             opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
             val instance = descriptor.characteristic.service.instanceId
-            android.util.Log.i(TAG, "client $addr#$instance: notify enabled (status=$status)")
-            execute(engine.onSubscribeResult(addr, instance, true, nowMs()))
+            val ok = status == BluetoothGatt.GATT_SUCCESS
+            android.util.Log.i(TAG, "client $addr#$instance: notify enabled=$ok (status=$status)")
+            // A failed CCC write means no notifications: the engine must not
+            // treat the link as subscribed (it would be a silent one-way link
+            // until the stale cull).
+            transact { engine.onSubscribeResult(addr, instance, ok, nowMs()) }
             pumpClientWrites(addr)
         }
 
@@ -478,13 +530,13 @@ object MeshGatt {
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
-            execute(engine.onClientRx(gatt.device.address, ch.service.instanceId, value, nowMs()))
+            transact { engine.onClientRx(gatt.device.address, ch.service.instanceId, value, nowMs()) }
         }
 
         @Deprecated("compat")
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION")
-            execute(engine.onClientRx(gatt.device.address, ch.service.instanceId, ch.value ?: return, nowMs()))
+            @Suppress("DEPRECATION") val value = ch.value ?: return
+            transact { engine.onClientRx(gatt.device.address, ch.service.instanceId, value, nowMs()) }
         }
     }
 
@@ -495,16 +547,17 @@ object MeshGatt {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 serverDevices[device.address] = device
                 deviceByAddr[device.address] = device
-                execute(engine.onServerConnected(device.address, nowMs()))
+                transact { engine.onServerConnected(device.address, nowMs()) }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 serverDevices.remove(device.address)
                 serverNotifyQueue.remove(device.address); serverNotifying.remove(device.address)
-                execute(engine.onServerDisconnected(device.address))
+                transact { engine.onServerDisconnected(device.address) }
             }
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
             // Slot free → drain the next queued notify (one outstanding at a time).
+            notifyInFlightSinceMs.remove(device.address)
             serverNotifying.remove(device.address)
             pumpServerNotify(device.address)
         }
@@ -516,7 +569,7 @@ object MeshGatt {
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             android.util.Log.i(TAG, "server ${device.address}: central subscribed → discovery burst")
             serverDevices[device.address] = device
-            execute(engine.onServerSubscribed(device.address, nowMs()))
+            transact { engine.onServerSubscribed(device.address, nowMs()) }
         }
 
         override fun onCharacteristicWriteRequest(
@@ -524,7 +577,7 @@ object MeshGatt {
             preparedWrite: Boolean, responseNeeded: Boolean, offset: Int, value: ByteArray,
         ) {
             if (responseNeeded) server?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
-            execute(engine.onServerRx(device.address, value, nowMs()))
+            transact { engine.onServerRx(device.address, value, nowMs()) }
         }
     }
 
@@ -606,6 +659,8 @@ object MeshGatt {
     // writes (the next notify must wait for onNotificationSent).
     private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
     private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    /** When the in-flight notify was issued, for the tick's stuck recovery. */
+    private val notifyInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
         serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
@@ -621,7 +676,9 @@ object MeshGatt {
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return
         serverNotifying.add(addr)
+        notifyInFlightSinceMs[addr] = nowMs()
         if (!issueNotify(s, device, ch, next)) {
+            notifyInFlightSinceMs.remove(addr)
             serverNotifying.remove(addr)
             pumpServerNotify(addr)
         }

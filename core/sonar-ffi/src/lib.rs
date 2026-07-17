@@ -2484,6 +2484,7 @@ pub enum MeshEngineEvent {
     },
     BroadcastReceived {
         fingerprint: String,
+        sender_id_hex: String,
         content: String,
         timestamp_ms: i64,
     },
@@ -2584,10 +2585,12 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                 },
                 mesh_engine::AppEvent::BroadcastReceived {
                     fingerprint,
+                    sender_id_hex,
                     content,
                     timestamp_ms,
                 } => MeshEngineEvent::BroadcastReceived {
                     fingerprint,
+                    sender_id_hex,
                     content,
                     timestamp_ms: timestamp_ms as i64,
                 },
@@ -2730,6 +2733,12 @@ impl MeshLinkEngine {
 
     pub fn on_tick(&self, now_ms: i64) -> MeshEngineOutput {
         engine_output(self.lock().on_tick(ms(now_ms)))
+    }
+
+    /// Sync the wall clock: wire timestamps are wall-clock ms while every
+    /// deadline uses the monotonic `now_ms`. Call at start and on each tick.
+    pub fn set_wall_clock(&self, now_ms: i64, wall_ms: i64) {
+        self.lock().set_wall_clock(ms(now_ms), ms(wall_ms));
     }
 
     /// None = the peer is rejected by the known-only policy. Queues when no

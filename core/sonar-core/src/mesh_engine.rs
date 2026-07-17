@@ -62,6 +62,12 @@ pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
 const SEEN_CAP: usize = 1024;
+const MAX_PENDING_SENDS_PER_PEER: usize = 64;
+/// Soft cap on the identity maps (signing key / fingerprint per sender id):
+/// sender ids rotate and can be attacker-minted, so an unbounded map is a
+/// slow leak. Clearing wholesale is safe — entries repopulate from the next
+/// verified announce.
+const IDENTITY_MAP_CAP: usize = 4096;
 /// Server discovery burst: the first notification pair is easy to lose during
 /// role setup, so announce three times with these delays after a subscribe.
 const DISCOVERY_BURST_DELAYS_MS: [u64; 3] = [0, 350, 1_200];
@@ -122,6 +128,9 @@ pub enum AppEvent {
     },
     BroadcastReceived {
         fingerprint: String,
+        /// The 8-byte packet sender id (hex) — distinct from the fingerprint
+        /// fallback so listeners get honest wire metadata.
+        sender_id_hex: String,
         content: String,
         timestamp_ms: u64,
     },
@@ -218,6 +227,15 @@ pub struct Engine {
 
     last_heartbeat_ms: u64,
     last_tick_ms: u64,
+    /// Wire timestamps are WALL-clock milliseconds (bitchat protocol), while
+    /// every deadline/liveness decision uses the monotonic `now_ms` — a wall
+    /// clock would cull links on an NTP jump, and a monotonic clock on the
+    /// wire would hand peers uptime-scale timestamps. The driver syncs this
+    /// offset (wall − monotonic) at start and on every tick.
+    wall_minus_mono_ms: i64,
+    /// Monotonic per-send counter mixed into fragment ids so two fragmented
+    /// sends in the same millisecond cannot collide.
+    fragment_seq: u64,
 }
 
 impl Engine {
@@ -260,11 +278,25 @@ impl Engine {
             reassembler: mesh::fragment::Reassembler::new(),
             last_heartbeat_ms: 0,
             last_tick_ms: 0,
+            wall_minus_mono_ms: 0,
+            fragment_seq: 0,
         })
     }
 
     pub fn my_peer_id_hex(&self) -> &str {
         &self.my_peer_id_hex
+    }
+
+    /// Sync the wall clock (driver-supplied, at start and each tick). Wire
+    /// timestamps are accurate to within one tick of NTP drift, which is all
+    /// the protocol needs (peers stamp their own packets).
+    pub fn set_wall_clock(&mut self, now_ms: u64, wall_ms: u64) {
+        self.wall_minus_mono_ms = wall_ms as i64 - now_ms as i64;
+    }
+
+    /// The wall-clock time to stamp into a wire packet built "now".
+    fn wall(&self, now_ms: u64) -> u64 {
+        (now_ms as i64 + self.wall_minus_mono_ms).max(0) as u64
     }
 
     /// Dialer election between two node-id-advertising Sonar-Androids: the
@@ -636,10 +668,13 @@ impl Engine {
         }
         let mut out = Output::default();
         if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
-            self.pending_sends
-                .entry(fingerprint.to_string())
-                .or_default()
-                .push((message_id.to_string(), text.to_string()));
+            let q = self.pending_sends.entry(fingerprint.to_string()).or_default();
+            // Bound the queue: a peer that never comes back must not grow it
+            // forever. Oldest messages drop first (they'd be the stalest).
+            if q.len() >= MAX_PENDING_SENDS_PER_PEER {
+                q.remove(0);
+            }
+            q.push((message_id.to_string(), text.to_string()));
         }
         Some(out)
     }
@@ -687,7 +722,7 @@ impl Engine {
             content: content.to_vec(),
         }
         .encode()?;
-        let mut packet = mesh::Packet::new(msg_type::FILE_TRANSFER, DEFAULT_TTL, now_ms, self.my_peer_id);
+        let mut packet = mesh::Packet::new(msg_type::FILE_TRANSFER, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.recipient_id = Some(peer_id);
         packet.payload = payload;
         if packet.payload.len() > MAX_V1_FILE_PAYLOAD_BYTES {
@@ -705,14 +740,15 @@ impl Engine {
     /// PUBLIC broadcast (the BLE "Mesh" channel) to every connected peer app.
     /// Returns None when nothing is connected.
     pub fn broadcast(&mut self, text: &str, now_ms: u64) -> Option<Output> {
-        let mut packet = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, now_ms, self.my_peer_id);
+        let mut packet = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.payload = text.as_bytes().to_vec();
         if !mesh::sign_packet(&mut packet, &self.signer) {
             return None;
         }
         let bytes = packet.encode()?;
-        // Skip our own echo if it loops back through a relay.
-        self.remember_broadcast(format!("{}-{}", self.my_peer_id_hex, now_ms));
+        // Skip our own echo if it loops back through a relay. The key must use
+        // the SAME timestamp the packet carries on the wire.
+        self.remember_broadcast(format!("{}-{}", self.my_peer_id_hex, packet.timestamp));
         let mut out = Output::default();
         let mut peers = 0;
         let link_ids: Vec<LinkId> = self
@@ -855,7 +891,7 @@ impl Engine {
             direct_neighbors: None,
         };
         let mut packet =
-            mesh::Packet::new(msg_type::ANNOUNCE, DEFAULT_TTL, now_ms, self.my_peer_id);
+            mesh::Packet::new(msg_type::ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.payload = announce.encode()?;
         if !mesh::sign_packet(&mut packet, &self.signer) {
             return None;
@@ -868,7 +904,7 @@ impl Engine {
         // Signed with the same Ed25519 key as the announce — iOS rejects an
         // unsigned 0x53 as unverified.
         let mut packet =
-            mesh::Packet::new(msg_type::SONAR_ANNOUNCE, DEFAULT_TTL, now_ms, self.my_peer_id);
+            mesh::Packet::new(msg_type::SONAR_ANNOUNCE, DEFAULT_TTL, self.wall(now_ms), self.my_peer_id);
         packet.payload = payload;
         if !mesh::sign_packet(&mut packet, &self.signer) {
             return None;
@@ -1002,7 +1038,7 @@ impl Engine {
             return false;
         };
         let packet =
-            mesh::encrypted_packet(self.my_peer_id, peer_id, DEFAULT_TTL, now_ms, ciphertext);
+            mesh::encrypted_packet(self.my_peer_id, peer_id, DEFAULT_TTL, self.wall(now_ms), ciphertext);
         let Some(bytes) = packet.encode() else {
             return false;
         };
@@ -1049,7 +1085,7 @@ impl Engine {
                 let mut p = mesh::Packet::new(
                     msg_type::FRAGMENT,
                     DEFAULT_TTL,
-                    now_ms,
+                    self.wall(now_ms),
                     self.my_peer_id,
                 );
                 p.recipient_id = recipient;
@@ -1077,13 +1113,14 @@ impl Engine {
     }
 
     /// Deterministic enough for fragment correlation; uniqueness comes from
-    /// the (sender, id) reassembly key plus the time+counter mix.
+    /// the (sender, id) reassembly key plus a strictly monotonic sequence —
+    /// two fragmented sends in the same millisecond must not collide.
     fn random_fragment_id(&mut self, now_ms: u64) -> [u8; 8] {
+        self.fragment_seq += 1;
         let mut h = Sha256::new();
         h.update(self.my_peer_id);
         h.update(now_ms.to_be_bytes());
-        h.update((self.seen_broadcasts.len() as u64).to_be_bytes());
-        h.update((self.links.len() as u64).to_be_bytes());
+        h.update(self.fragment_seq.to_be_bytes());
         let d = h.finalize();
         let mut id = [0u8; 8];
         id.copy_from_slice(&d[..8]);
@@ -1191,6 +1228,10 @@ impl Engine {
             Some(existing) if !existing.eq_ignore_ascii_case(&signing_hex) => return,
             Some(_) => {}
             None => {
+                if self.signing_key_by_peer.len() >= IDENTITY_MAP_CAP {
+                    self.signing_key_by_peer.clear();
+                    self.fingerprint_by_peer.clear();
+                }
                 self.signing_key_by_peer
                     .insert(sender_key.clone(), signing_hex.clone());
             }
@@ -1270,7 +1311,7 @@ impl Engine {
                                 self.my_peer_id,
                                 peer_id,
                                 DEFAULT_TTL,
-                                now_ms,
+                                self.wall(now_ms),
                                 m1,
                             );
                             if let Some(b) = p.encode() {
@@ -1313,6 +1354,7 @@ impl Engine {
         }
         out.events.push(AppEvent::BroadcastReceived {
             fingerprint: fp,
+            sender_id_hex: sender_hex.clone(),
             content,
             timestamp_ms: packet.timestamp,
         });
@@ -1415,7 +1457,7 @@ impl Engine {
                         self.my_peer_id,
                         peer,
                         DEFAULT_TTL,
-                        now_ms,
+                        self.wall(now_ms),
                         m2,
                     );
                     if let Some(b) = p.encode() {
@@ -1456,7 +1498,7 @@ impl Engine {
                         self.my_peer_id,
                         peer,
                         DEFAULT_TTL,
-                        now_ms,
+                        self.wall(now_ms),
                         m3,
                     );
                     if let Some(b) = p.encode() {
