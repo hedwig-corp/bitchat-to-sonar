@@ -2,7 +2,7 @@
 //!
 //! Every platform used to re-implement the same orchestration around the mesh
 //! protocol — announce/identity handling, dial policy, per-instance links,
-//! liveness, Noise session lifecycle, pending sends, relay — and every bug had
+//! liveness, Noise session lifecycle, fail-fast sends, relay — and every bug had
 //! to be found and fixed once per platform (see PR #291: zombie links, the
 //! multi-service-instance lottery, write-queue races). This module owns that
 //! machine once, deterministically:
@@ -62,7 +62,6 @@ pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
 const SEEN_CAP: usize = 1024;
-const MAX_PENDING_SENDS_PER_PEER: usize = 64;
 /// Minimum spacing between instance re-discoveries on one connection.
 const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
 /// Soft cap on the identity maps (signing key / fingerprint per sender id):
@@ -227,8 +226,6 @@ pub struct Engine {
     fingerprint_by_peer: HashMap<String, String>,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
-    /// DMs queued for a peer with no live link, flushed on (re)establish.
-    pending_sends: HashMap<String, Vec<(String, String)>>,
     seen_broadcasts: HashSet<String>,
     seen_files: HashSet<String>,
     reassembler: mesh::fragment::Reassembler,
@@ -282,7 +279,6 @@ impl Engine {
             signing_key_by_peer: HashMap::new(),
             fingerprint_by_peer: HashMap::new(),
             pending_sonar: HashMap::new(),
-            pending_sends: HashMap::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
             reassembler: mesh::fragment::Reassembler::new(),
@@ -668,9 +664,9 @@ impl Engine {
 
     // ── App-facing sends ──
 
-    /// Send a DM by stable fingerprint. Sends over a live Noise route, else
-    /// QUEUES it (mesh links are intermittent; the flush happens on
-    /// re-establish). Returns None when policy rejects the peer.
+    /// Send a DM by stable fingerprint over a live Noise route. The engine must
+    /// never hide plaintext for a later reconnect: the app-owned outbox needs
+    /// an honest `None` so it can preserve ordering and choose another route.
     pub fn send_text(
         &mut self,
         fingerprint: &str,
@@ -683,13 +679,7 @@ impl Engine {
         }
         let mut out = Output::default();
         if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
-            let q = self.pending_sends.entry(fingerprint.to_string()).or_default();
-            // Bound the queue: a peer that never comes back must not grow it
-            // forever. Oldest messages drop first (they'd be the stalest).
-            if q.len() >= MAX_PENDING_SENDS_PER_PEER {
-                q.remove(0);
-            }
-            q.push((message_id.to_string(), text.to_string()));
+            return None;
         }
         Some(out)
     }
@@ -867,7 +857,6 @@ impl Engine {
         self.signing_key_by_peer.clear();
         self.fingerprint_by_peer.clear();
         self.pending_sonar.clear();
-        self.pending_sends.clear();
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();
@@ -1484,7 +1473,7 @@ impl Engine {
                     s.bind.peer_id_hex = Some(sender_hex.clone());
                 }
                 if hs.is_finished() {
-                    self.finish_noise_server(&conn, out, now_ms);
+                    self.finish_noise_server(&conn, out);
                 } else {
                     let m2 = match hs.write_message() {
                         Ok(m) => m,
@@ -1557,13 +1546,13 @@ impl Engine {
                     Some(NoiseState::Handshake { hs, .. }) if hs.is_finished()
                 );
                 if finished {
-                    self.finish_noise_client(&id, out, now_ms);
+                    self.finish_noise_client(&id, out);
                 }
             }
         }
     }
 
-    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output, now_ms: u64) {
+    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output) {
         let Some(l) = self.links.get_mut(id) else {
             return;
         };
@@ -1579,13 +1568,13 @@ impl Engine {
                     .clone()
                     .or_else(|| l.bind.peer_id_hex.clone())
                     .unwrap_or_else(|| id.conn.clone());
-                self.link_established(&fp, out, now_ms);
+                self.link_established(&fp, out);
             }
             Err(_) => l.noise = None,
         }
     }
 
-    fn finish_noise_server(&mut self, conn: &str, out: &mut Output, now_ms: u64) {
+    fn finish_noise_server(&mut self, conn: &str, out: &mut Output) {
         let Some(s) = self.server_conns.get_mut(conn) else {
             return;
         };
@@ -1603,34 +1592,19 @@ impl Engine {
                     .clone()
                     .or_else(|| s.bind.peer_id_hex.clone())
                     .unwrap_or_else(|| conn.to_string());
-                self.link_established(&fp, out, now_ms);
+                self.link_established(&fp, out);
             }
             Err(_) => s.noise = None,
         }
     }
 
-    fn link_established(&mut self, fingerprint: &str, out: &mut Output, now_ms: u64) {
+    fn link_established(&mut self, fingerprint: &str, out: &mut Output) {
         if !self.fp_allowed(fingerprint) {
             return;
         }
         out.events.push(AppEvent::LinkEstablished {
             fingerprint: fingerprint.to_string(),
         });
-        // Flush DMs queued while there was no live link.
-        let queued = self.pending_sends.remove(fingerprint).unwrap_or_default();
-        let mut requeue: Vec<(String, String)> = Vec::new();
-        for (mid, text) in queued {
-            let mut o = Output::default();
-            if self.try_send_text(fingerprint, &mid, &text, now_ms, &mut o) {
-                out.merge(o);
-            } else {
-                requeue.push((mid, text));
-            }
-        }
-        if !requeue.is_empty() {
-            self.pending_sends
-                .insert(fingerprint.to_string(), requeue);
-        }
     }
 
     fn handle_encrypted(&mut self, origin: Origin, packet: &mesh::Packet, out: &mut Output) {
@@ -2161,19 +2135,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_send_flushes_on_establish() {
+    fn send_text_without_live_route_fails_instead_of_hiding_plaintext() {
         let mut a = engine(1, "pixel");
-        let mut b = engine(9, "peer");
+        let b = engine(9, "peer");
         let fp = fp_of(&b);
-        let out = a.send_text(&fp, "mid-q", "queued", 500).expect("queued ok");
-        assert!(out.commands.is_empty(), "no link yet: must queue");
-        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
-        // The establish pump already flushed; B must have received the DM.
-        // Re-drive: establish() asserted establishment; verify B got the text
-        // by checking A's queue drained and the route exists.
-        assert!(a.has_link(&fp));
-        assert!(a.pending_sends.get(&fp).is_none(), "queue must drain");
-        let _ = link;
+        assert!(
+            a.send_text(&fp, "mid-q", "must stay in app outbox", 500).is_none(),
+            "a missing live route must be visible to the app router"
+        );
     }
 
     #[test]

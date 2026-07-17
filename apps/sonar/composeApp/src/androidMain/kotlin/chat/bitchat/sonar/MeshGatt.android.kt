@@ -31,7 +31,7 @@ import uniffi.sonar_ffi.noiseGenerateKeypair
  * Android BLE **driver** for the Rust mesh link engine.
  *
  * The link state machine — announce/identity handling, dial policy,
- * per-instance links, liveness, Noise session lifecycle, pending sends,
+ * per-instance links, liveness, Noise session lifecycle, fail-fast sends,
  * relay — lives in `sonar_core::mesh_engine` (one implementation for every
  * platform; see docs/brainstorms/2026-07-17-mesh-link-engine-rust-core.md).
  * This object only translates GATT callbacks into engine events, executes the
@@ -122,6 +122,33 @@ object MeshGatt {
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
     private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
+    private val onSendFailure = java.util.concurrent.CopyOnWriteArrayList<(MeshSendFailure) -> Unit>()
+    private val onMediaSendFailure = java.util.concurrent.CopyOnWriteArrayList<(MeshMediaSendFailure) -> Unit>()
+
+    private sealed interface OutboundDelivery {
+        val attemptId: Long
+        val peerId: String
+        val messageId: String
+        val tsSecs: Long
+    }
+
+    private data class TextDelivery(
+        override val attemptId: Long,
+        override val peerId: String,
+        override val messageId: String,
+        val text: String,
+        override val tsSecs: Long,
+    ) : OutboundDelivery
+
+    private data class MediaDelivery(
+        override val attemptId: Long,
+        override val peerId: String,
+        override val messageId: String,
+        val bytes: ByteArray,
+        val filename: String,
+        val mimeType: String,
+        override val tsSecs: Long,
+    ) : OutboundDelivery
 
     fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
@@ -130,6 +157,8 @@ object MeshGatt {
     fun addAnnounceListener(cb: (bleAddr: String, info: MeshAnnounceInfo, fingerprint: String) -> Unit) { onAnnounce.add(cb) }
     fun addLinkListener(cb: (fingerprint: String) -> Unit) { onLink.add(cb) }
     fun addBroadcastListener(cb: (senderFingerprint: String, message: MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
+    fun addSendFailureListener(cb: (MeshSendFailure) -> Unit) { onSendFailure.add(cb) }
+    fun addMediaSendFailureListener(cb: (MeshMediaSendFailure) -> Unit) { onMediaSendFailure.add(cb) }
     /** Incoming private file transfers. `fingerprint` is the sender's stable
      *  fingerprint, matching [addMessageListener]. */
     fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray) -> Unit) {
@@ -173,24 +202,30 @@ object MeshGatt {
             // disconnect callbacks can accept a write/CCC op and never call
             // back, freezing that connection's op queue (and any sibling
             // instance still waiting to subscribe).
-            for (addr in clientWriting) {
+            for (addr in clientWriting.toList()) {
                 val since = opInFlightSinceMs[addr] ?: continue
                 if (now - since >= OP_STUCK_MS) {
-                    android.util.Log.w(TAG, "gatt op stuck ${now - since}ms on $addr — unblocking queue")
-                    opInFlightSinceMs.remove(addr)
-                    clientWriting.remove(addr)
-                    pumpClientWrites(addr)
+                    val delivery = clientInFlight[addr]?.delivery
+                    android.util.Log.w(TAG, "gatt op stuck ${now - since}ms on $addr — resetting route")
+                    if (delivery != null) failClientRoute(addr, delivery)
+                    else {
+                        disconnectClient(addr)
+                        scheduleClientEngineDisconnect(addr)
+                    }
                 }
             }
             // Same recovery for the server notify slot: a lost
             // onNotificationSent would otherwise freeze that central forever.
-            for (addr in serverNotifying) {
+            for (addr in serverNotifying.toList()) {
                 val since = notifyInFlightSinceMs[addr] ?: continue
                 if (now - since >= OP_STUCK_MS) {
-                    android.util.Log.w(TAG, "server notify stuck ${now - since}ms on $addr — unblocking queue")
-                    notifyInFlightSinceMs.remove(addr)
-                    serverNotifying.remove(addr)
-                    pumpServerNotify(addr)
+                    val delivery = serverInFlight[addr]?.delivery
+                    android.util.Log.w(TAG, "server notify stuck ${now - since}ms on $addr — resetting route")
+                    if (delivery != null) failServerRoute(addr, delivery)
+                    else {
+                        cancelServer(addr)
+                        scheduleServerEngineDisconnect(addr)
+                    }
                 }
             }
             // Bound the scan-fed device cache; keep entries with live links.
@@ -239,9 +274,12 @@ object MeshGatt {
         tickArmed = false
         handler.removeCallbacks(tick)
         engine.reset()
+        (gattByAddr.keys + clientWriteQueue.keys + clientInFlight.keys).toSet()
+            .forEach(::disconnectClient)
+        (serverDevices.keys + serverNotifyQueue.keys + serverInFlight.keys).toSet()
+            .forEach(::cancelServer)
         try { server?.close() } catch (_: Throwable) {}
         server = null; characteristic = null
-        gattByAddr.values.forEach { runCatching { it.disconnect(); it.close() } }
         gattByAddr.clear(); charByKey.clear(); serverDevices.clear(); deviceByAddr.clear()
         // A stuck in-flight flag surviving stop() would permanently block the
         // same address's queue after the next start().
@@ -269,12 +307,28 @@ object MeshGatt {
     // write-queue enqueue must be one atomic step, or two threads' ciphertexts
     // can invert their nonce order on the wire.
 
-    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean =
-        transact { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
+    fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
+        val delivery = TextDelivery(
+            nextDeliveryAttempt.incrementAndGet(),
+            fingerprint,
+            messageId,
+            text,
+            System.currentTimeMillis() / 1000,
+        )
+        return transact(delivery) { engine.sendText(fingerprint, messageId, text, nowMs()) } != null
+    }
 
     /** Immediate send for real-time controls. Never queues. */
-    fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean =
-        transact { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
+    fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
+        val delivery = TextDelivery(
+            nextDeliveryAttempt.incrementAndGet(),
+            fingerprint,
+            messageId,
+            text,
+            System.currentTimeMillis() / 1000,
+        )
+        return transact(delivery) { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
+    }
 
     /** Send a private file transfer to a live peer route (never queued).
      *  Mesh file message ids are derived on the receive side, so [messageId]
@@ -283,7 +337,16 @@ object MeshGatt {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return false
         val mime = normalizedMime(mimeType, bytes) ?: return false
         val safeName = safeFileName(filename, mime, System.currentTimeMillis())
-        return transact { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
+        val delivery = MediaDelivery(
+            nextDeliveryAttempt.incrementAndGet(),
+            fingerprint,
+            messageId,
+            bytes.copyOf(),
+            filename,
+            mime,
+            System.currentTimeMillis() / 1000,
+        )
+        return transact(delivery) { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
     }
 
     /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected
@@ -305,22 +368,20 @@ object MeshGatt {
      *  encryption and the write queue (transport nonces must arrive in
      *  sequence). Events fire outside the lock. Reentrant (`synchronized`) so
      *  command handlers may run nested transitions (dial failure paths). */
-    private fun transact(block: () -> MeshEngineOutput?): MeshEngineOutput? {
+    private fun transact(
+        delivery: OutboundDelivery? = null,
+        block: () -> MeshEngineOutput?,
+    ): MeshEngineOutput? {
         val out: MeshEngineOutput?
         synchronized(txLock) {
             out = block()
-            out?.let { executeCommands(it) }
+            out?.let { executeCommands(it, delivery) }
         }
         out?.let { dispatchEvents(it) }
         return out
     }
 
-    private fun execute(out: MeshEngineOutput) {
-        synchronized(txLock) { executeCommands(out) }
-        dispatchEvents(out)
-    }
-
-    private fun executeCommands(out: MeshEngineOutput) {
+    private fun executeCommands(out: MeshEngineOutput, delivery: OutboundDelivery? = null) {
         for (cmd in out.commands) when (cmd) {
             is MeshEngineCommand.Dial -> dial(cmd.conn)
             is MeshEngineCommand.Disconnect -> disconnectClient(cmd.conn)
@@ -333,16 +394,24 @@ object MeshGatt {
             is MeshEngineCommand.Subscribe -> subscribe(cmd.conn, cmd.instance)
             is MeshEngineCommand.WriteLink -> {
                 val run = Runnable {
-                    val gatt = gattByAddr[cmd.conn] ?: return@Runnable
-                    val ch = charByKey["${cmd.conn}#${cmd.instance}"] ?: return@Runnable
-                    writePacket(gatt, ch, cmd.bytes)
+                    val gatt = gattByAddr[cmd.conn]
+                    val ch = charByKey["${cmd.conn}#${cmd.instance}"]
+                    if (gatt == null || ch == null) {
+                        delivery?.let { failClientRoute(cmd.conn, it) }
+                        return@Runnable
+                    }
+                    writePacket(gatt, ch, cmd.bytes, delivery)
                 }
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
             is MeshEngineCommand.NotifyConn -> {
                 val run = Runnable {
-                    val device = serverDevices[cmd.conn] ?: return@Runnable
-                    notify(device, cmd.bytes)
+                    val device = serverDevices[cmd.conn]
+                    if (device == null) {
+                        delivery?.let { failServerRoute(cmd.conn, it) }
+                        return@Runnable
+                    }
+                    notify(device, cmd.bytes, delivery)
                 }
                 if (cmd.afterMs > 0) handler.postDelayed(run, cmd.afterMs) else run.run()
             }
@@ -434,17 +503,62 @@ object MeshGatt {
     /** Client-role teardown only: a server leg the same peer holds toward us
      *  is a separate route and must survive. */
     @SuppressLint("MissingPermission")
+    @Synchronized
     private fun disconnectClient(conn: String) {
+        val failed = ArrayList<OutboundDelivery>()
+        clientInFlight.remove(conn)?.delivery?.let(failed::add)
+        clientWriteQueue.remove(conn)?.let { queue ->
+            while (true) {
+                val op = queue.poll() ?: break
+                op.delivery?.let(failed::add)
+            }
+        }
         gattByAddr.remove(conn)?.let { runCatching { it.disconnect(); it.close() } }
         charByKey.keys.removeAll { it.startsWith("$conn#") }
-        clientWriteQueue.remove(conn); clientWriting.remove(conn); opInFlightSinceMs.remove(conn)
+        clientWriting.remove(conn); opInFlightSinceMs.remove(conn)
+        reportSendFailures(failed)
     }
 
     /** Server-role teardown only: an outbound client GATT stays untouched. */
     @SuppressLint("MissingPermission")
+    @Synchronized
     private fun cancelServer(conn: String) {
+        val failed = ArrayList<OutboundDelivery>()
+        serverInFlight.remove(conn)?.delivery?.let(failed::add)
+        serverNotifyQueue.remove(conn)?.let { queue ->
+            while (true) {
+                val op = queue.poll() ?: break
+                op.delivery?.let(failed::add)
+            }
+        }
         serverDevices.remove(conn)?.let { device -> runCatching { server?.cancelConnection(device) } }
-        serverNotifyQueue.remove(conn); serverNotifying.remove(conn); notifyInFlightSinceMs.remove(conn)
+        serverNotifying.remove(conn); notifyInFlightSinceMs.remove(conn)
+        reportSendFailures(failed)
+    }
+
+    private fun failClientRoute(conn: String, extra: OutboundDelivery) {
+        // Queue the engine transition before exposing the failure to the app.
+        // Otherwise the outbox can immediately select the same stale route.
+        scheduleClientEngineDisconnect(conn)
+        reportSendFailures(listOf(extra))
+        disconnectClient(conn)
+    }
+
+    private fun failServerRoute(conn: String, extra: OutboundDelivery) {
+        scheduleServerEngineDisconnect(conn)
+        reportSendFailures(listOf(extra))
+        cancelServer(conn)
+    }
+
+    /** Never call back into the engine while a GATT queue monitor is held: an
+     * app send holds [txLock] while entering that queue, so the reverse order
+     * would deadlock a callback against a concurrent send. */
+    private fun scheduleClientEngineDisconnect(conn: String) {
+        handler.post { transact { engine.onClientDisconnected(conn) } }
+    }
+
+    private fun scheduleServerEngineDisconnect(conn: String) {
+        handler.post { transact { engine.onServerDisconnected(conn) } }
     }
 
     @SuppressLint("MissingPermission")
@@ -512,18 +626,19 @@ object MeshGatt {
                 for (ch in chars) {
                     charByKey["$addr#${ch.service.instanceId}"] = ch
                 }
-                execute(
+                transact {
                     engine.onInstancesDiscovered(
                         addr,
                         chars.map { it.service.instanceId },
                         nowMs(),
                     )
-                )
+                }
             }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
             val addr = gatt.device.address
+            clientInFlight.remove(addr)
             opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
             val instance = descriptor.characteristic.service.instanceId
@@ -541,9 +656,19 @@ object MeshGatt {
             // the next queued op (one outstanding op at a time is the hard
             // limit that was dropping handshake m1s).
             val addr = gatt.device.address
+            val completed = clientInFlight.remove(addr)
             opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
-            pumpClientWrites(addr)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                val delivery = completed?.delivery
+                if (delivery != null) failClientRoute(addr, delivery)
+                else {
+                    disconnectClient(addr)
+                    scheduleClientEngineDisconnect(addr)
+                }
+            } else {
+                pumpClientWrites(addr)
+            }
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, value: ByteArray) {
@@ -569,17 +694,26 @@ object MeshGatt {
                 deviceByAddr[device.address] = device
                 transact { engine.onServerConnected(device.address, nowMs()) }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                serverDevices.remove(device.address)
-                serverNotifyQueue.remove(device.address); serverNotifying.remove(device.address)
+                cancelServer(device.address)
                 transact { engine.onServerDisconnected(device.address) }
             }
         }
 
         override fun onNotificationSent(device: BluetoothDevice, status: Int) {
             // Slot free → drain the next queued notify (one outstanding at a time).
+            val completed = serverInFlight.remove(device.address)
             notifyInFlightSinceMs.remove(device.address)
             serverNotifying.remove(device.address)
-            pumpServerNotify(device.address)
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                val delivery = completed?.delivery
+                if (delivery != null) failServerRoute(device.address, delivery)
+                else {
+                    cancelServer(device.address)
+                    scheduleServerEngineDisconnect(device.address)
+                }
+            } else {
+                pumpServerNotify(device.address)
+            }
         }
 
         override fun onDescriptorWriteRequest(
@@ -609,18 +743,31 @@ object MeshGatt {
     // completion callback — and CCC descriptor writes share the hardware slot
     // with characteristic writes, so both ride the same queue.
     private sealed interface GattOp {
-        class WriteChar(val ch: BluetoothGattCharacteristic, val bytes: ByteArray) : GattOp
-        class WriteDesc(val desc: BluetoothGattDescriptor) : GattOp
+        val delivery: OutboundDelivery?
+        class WriteChar(
+            val ch: BluetoothGattCharacteristic,
+            val bytes: ByteArray,
+            override val delivery: OutboundDelivery? = null,
+        ) : GattOp
+        class WriteDesc(val desc: BluetoothGattDescriptor) : GattOp {
+            override val delivery: OutboundDelivery? get() = null
+        }
     }
 
     private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<GattOp>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val clientInFlight = ConcurrentHashMap<String, GattOp>()
     /** When the in-flight op was issued, for the tick's stuck-op recovery. */
     private val opInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
-    private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
+    private fun writePacket(
+        gatt: BluetoothGatt,
+        ch: BluetoothGattCharacteristic,
+        packet: ByteArray,
+        delivery: OutboundDelivery? = null,
+    ) {
         clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
-            .add(GattOp.WriteChar(ch, packet))
+            .add(GattOp.WriteChar(ch, packet, delivery))
         pumpClientWrites(gatt.device.address)
     }
 
@@ -637,8 +784,17 @@ object MeshGatt {
         if (clientWriting.contains(addr)) return
         val q = clientWriteQueue[addr] ?: return
         val next = q.poll() ?: return
-        val gatt = gattByAddr[addr] ?: return
+        val gatt = gattByAddr[addr] ?: run {
+            val delivery = next.delivery
+            if (delivery != null) failClientRoute(addr, delivery)
+            else {
+                disconnectClient(addr)
+                scheduleClientEngineDisconnect(addr)
+            }
+            return
+        }
         clientWriting.add(addr)
+        clientInFlight[addr] = next
         opInFlightSinceMs[addr] = nowMs()
         val accepted = when (next) {
             is GattOp.WriteChar -> issueWrite(gatt, next.ch, next.bytes)
@@ -648,9 +804,15 @@ object MeshGatt {
             // The op wasn't accepted ⇒ its completion callback won't fire;
             // don't stall the queue — drop it and move on.
             android.util.Log.w(TAG, "gatt op not accepted for $addr — skipping")
+            clientInFlight.remove(addr)
             opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
-            pumpClientWrites(addr)
+            val delivery = next.delivery
+            if (delivery != null) failClientRoute(addr, delivery)
+            else {
+                disconnectClient(addr)
+                scheduleClientEngineDisconnect(addr)
+            }
         }
     }
 
@@ -678,13 +840,16 @@ object MeshGatt {
 
     // Server notify queue — same one-outstanding-at-a-time rule as client
     // writes (the next notify must wait for onNotificationSent).
-    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<ByteArray>>()
+    private data class NotifyOp(val bytes: ByteArray, val delivery: OutboundDelivery? = null)
+    private val serverNotifyQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<NotifyOp>>()
     private val serverNotifying = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val serverInFlight = ConcurrentHashMap<String, NotifyOp>()
     /** When the in-flight notify was issued, for the tick's stuck recovery. */
     private val notifyInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
-    private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
+    private fun notify(device: BluetoothDevice, packet: ByteArray, delivery: OutboundDelivery? = null) {
+        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
+            .add(NotifyOp(packet, delivery))
         pumpServerNotify(device.address)
     }
 
@@ -693,15 +858,65 @@ object MeshGatt {
         if (serverNotifying.contains(addr)) return
         val q = serverNotifyQueue[addr] ?: return
         val next = q.poll() ?: return
-        val s = server ?: return
-        val ch = characteristic ?: return
-        val device = serverDevices[addr] ?: return
+        val s = server ?: run { resetMissingServerRoute(addr, next.delivery); return }
+        val ch = characteristic ?: run { resetMissingServerRoute(addr, next.delivery); return }
+        val device = serverDevices[addr] ?: run { resetMissingServerRoute(addr, next.delivery); return }
         serverNotifying.add(addr)
+        serverInFlight[addr] = next
         notifyInFlightSinceMs[addr] = nowMs()
-        if (!issueNotify(s, device, ch, next)) {
+        if (!issueNotify(s, device, ch, next.bytes)) {
+            serverInFlight.remove(addr)
             notifyInFlightSinceMs.remove(addr)
             serverNotifying.remove(addr)
-            pumpServerNotify(addr)
+            resetMissingServerRoute(addr, next.delivery)
+        }
+    }
+
+    private fun resetMissingServerRoute(addr: String, delivery: OutboundDelivery?) {
+        if (delivery != null) failServerRoute(addr, delivery)
+        else {
+            cancelServer(addr)
+            scheduleServerEngineDisconnect(addr)
+        }
+    }
+
+    private val nextDeliveryAttempt = java.util.concurrent.atomic.AtomicLong()
+    private val reportedDeliveryAttempts = ConcurrentHashMap<Long, Long>()
+
+    private fun reportSendFailures(deliveries: List<OutboundDelivery>) {
+        val now = System.currentTimeMillis()
+        if (reportedDeliveryAttempts.size > 512) {
+            reportedDeliveryAttempts.forEach { (attemptId, reportedAt) ->
+                if (now - reportedAt > 5 * 60_000L) {
+                    reportedDeliveryAttempts.remove(attemptId, reportedAt)
+                }
+            }
+        }
+        deliveries.distinctBy { it.attemptId }.forEach { delivery ->
+            if (reportedDeliveryAttempts.putIfAbsent(delivery.attemptId, now) != null) return@forEach
+            handler.post {
+                when (delivery) {
+                    is TextDelivery -> onSendFailure.forEach { listener ->
+                        runCatching {
+                            listener(MeshSendFailure(delivery.peerId, delivery.messageId, delivery.text, delivery.tsSecs))
+                        }
+                    }
+                    is MediaDelivery -> onMediaSendFailure.forEach { listener ->
+                        runCatching {
+                            listener(
+                                MeshMediaSendFailure(
+                                    delivery.peerId,
+                                    delivery.messageId,
+                                    delivery.bytes.copyOf(),
+                                    delivery.filename,
+                                    delivery.mimeType,
+                                    delivery.tsSecs,
+                                )
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 

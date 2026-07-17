@@ -20,7 +20,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *
  * Replies (m2, encrypted DMs) go back out through the bridge's notify path. The
  * phone, not the desktop, initiates the handshake, so the desktop only ever plays
- * the responder; outbound DMs queue until that link forms.
+ * the responder. Outbound DMs fail fast until that link forms; the shared app
+ * outbox owns retry and transport fallback.
  *
  * Scope: a single connected phone (bluster doesn't attribute writes to a specific
  * central, and notify reaches all subscribers) — enough for desktop↔phone DMs.
@@ -44,7 +45,6 @@ object MeshLink {
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
-    private val pending = ConcurrentHashMap<String, ConcurrentLinkedQueue<Pair<String, String>>>()
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -165,7 +165,6 @@ object MeshLink {
             if (s.noise.isFinished()) {
                 s.noise.intoSession(); s.established = true
                 sonarLog("MeshLink", "Noise link ESTABLISHED with ${nameByFp[fp] ?: fp.take(8)}")
-                flushPending(fp)
             } else {
                 val m2 = s.noise.writeMessage()
                 BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_HANDSHAKE.toUByte(), senderPeerId, m2))
@@ -191,13 +190,7 @@ object MeshLink {
     fun hasLink(fp: String): Boolean = sessions[fp]?.established == true
 
     fun sendDm(fp: String, messageId: String, text: String): Boolean {
-        val s = sessions[fp]?.takeIf { it.established }
-        if (s == null) {
-            // No live link yet — the phone initiates the handshake, so queue and
-            // deliver on establish (mirrors Android's pending-send behavior).
-            pending.getOrPut(fp) { ConcurrentLinkedQueue() }.add(messageId to text)
-            return true
-        }
+        val s = sessions[fp]?.takeIf { it.established } ?: return false
         return encryptAndSend(fp, s, messageId, text)
     }
 
@@ -216,15 +209,6 @@ object MeshLink {
                 sonarLog("MeshLink", "TX DM to ${nameByFp[fp] ?: fp.take(8)} (${text.length} chars)")
                 true
             }.getOrDefault(false)
-        }
-    }
-
-    private fun flushPending(fp: String) {
-        val q = pending[fp] ?: return
-        val s = sessions[fp]?.takeIf { it.established } ?: return
-        while (true) {
-            val (mid, text) = q.poll() ?: break
-            encryptAndSend(fp, s, mid, text)
         }
     }
 
@@ -259,7 +243,7 @@ object MeshLink {
 
     fun wipe() {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
-        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); pending.clear()
+        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear()
         notifyPeerUpdate()
     }
 }

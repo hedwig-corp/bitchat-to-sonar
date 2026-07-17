@@ -2763,7 +2763,7 @@ fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {
 // ── BLE mesh link engine ─────────────────────────────────────────────────────
 //
 // The platform-neutral link state machine (announce/identity, dial policy,
-// per-instance links, liveness, Noise lifecycle, pending sends, relay) lives
+// per-instance links, liveness, Noise lifecycle, fail-fast sends, relay) lives
 // in `sonar_core::mesh_engine`. Platform drivers feed it radio events and
 // execute the returned commands; timestamps are MONOTONIC milliseconds
 // supplied by the driver (the engine reads no clocks).

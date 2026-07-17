@@ -91,6 +91,9 @@ actual object MeshRadio {
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
     /** Incoming private mesh file transfers, buffered until the app drains them. */
     private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
+    /** Locally accepted sends that later failed at the Android GATT boundary. */
+    private val meshSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshSendFailure>()
+    private val meshMediaSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaSendFailure>()
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
     private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
 
@@ -107,6 +110,8 @@ actual object MeshRadio {
             if (!isKnownPeer(fingerprint)) return@addFileListener
             meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
         }
+        MeshGatt.addSendFailureListener { meshSendFailureInbox.add(it) }
+        MeshGatt.addMediaSendFailureListener { meshMediaSendFailureInbox.add(it) }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { senderFingerprint, pm ->
             if (!isKnownPeer(senderFingerprint)) return@addBroadcastListener
@@ -368,6 +373,11 @@ actual object MeshRadio {
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
         MeshGatt.sendTextToPeer(peerId, messageId, text)
+    actual fun drainMeshSendFailures(): List<MeshSendFailure> {
+        val out = ArrayList<MeshSendFailure>()
+        while (true) out.add(meshSendFailureInbox.poll() ?: break)
+        return out
+    }
     actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
         MeshGatt.sendTextToPeerNow(peerId, messageId, text)
 
@@ -386,6 +396,11 @@ actual object MeshRadio {
 
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
         MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+    actual fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure> {
+        val out = ArrayList<MeshMediaSendFailure>()
+        while (true) out.add(meshMediaSendFailureInbox.poll() ?: break)
+        return out
+    }
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()

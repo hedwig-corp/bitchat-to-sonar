@@ -20,6 +20,17 @@ class SonarOutboxTest {
     }
 
     @Test
+    fun enqueueingSameDeliveryAttemptTwiceIsIdempotent() {
+        val outbox = SonarOutbox(maxPerPeer = 3, ttlSecs = 100)
+
+        outbox.enqueue("peer-1", "retry me", "same-id", timestampSecs = 1)
+        val duplicate = outbox.enqueue("peer-1", "retry me", "same-id", timestampSecs = 1)
+
+        assertEquals(1, duplicate.depth)
+        assertEquals(listOf("same-id"), outbox.snapshot("peer-1").map { it.messageId })
+    }
+
+    @Test
     fun failureKeepsFailedAndLaterUnexpiredMessagesQueued() {
         val outbox = SonarOutbox(maxPerPeer = 10, ttlSecs = 100)
         outbox.enqueue("peer-1", "expired-before-failure", "id-1", timestampSecs = 50)
