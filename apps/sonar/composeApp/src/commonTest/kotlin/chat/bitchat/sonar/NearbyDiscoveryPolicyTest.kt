@@ -72,6 +72,26 @@ class NearbyDiscoveryPolicyTest {
         queue.cancel()
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun refreshWorkerSurvivesTransientFailures() = runTest {
+        var refreshCount = 0
+        val queue = ConflatedRefreshQueue(this) {
+            refreshCount++
+            if (refreshCount == 1) error("transient radio failure")
+        }
+
+        queue.request()
+        runCurrent()
+        assertEquals(1, refreshCount)
+
+        queue.request()
+        runCurrent()
+        assertEquals(2, refreshCount)
+
+        queue.cancel()
+    }
+
     @Test
     fun verifiedBitchatPeerIsVisibleBeforeSonarCapabilitiesArrive() {
         val whitewholf = MeshPeer(
@@ -146,6 +166,32 @@ class NearbyDiscoveryPolicyTest {
         runCurrent()
         assertEquals(listOf("whitewholf"), publishedMeshPeers.map { it.name })
         assertEquals(listOf("payer"), publishedUnifyPeers)
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun nearbyMeshRefreshRecoversAfterInterveningEmptyPublish() = runTest {
+        // Simulates push/housekeeping writing empty between poll ticks so a
+        // job-local lastMeshPeers==A cache would wrongly suppress republishing A.
+        val radioMeshPeers = mutableListOf(MeshPeer("mesh:a", "A", -50))
+        var publishedMeshPeers = emptyList<MeshPeer>()
+        val refreshJob = launchNearbyPeerRefresh(
+            intervalMs = 100,
+            readMeshPeers = { radioMeshPeers.toList() },
+            publishMeshPeers = { publishedMeshPeers = it },
+            readUnifyPeers = { emptyList<String>() },
+            publishUnifyPeers = {},
+        )
+
+        runCurrent()
+        assertEquals(listOf("A"), publishedMeshPeers.map { it.name })
+
+        publishedMeshPeers = emptyList() // intervening writer cleared Radar
+        advanceTimeBy(100)
+        runCurrent()
+        assertEquals(listOf("A"), publishedMeshPeers.map { it.name })
+
+        refreshJob.cancelAndJoin()
     }
 
     @Test
