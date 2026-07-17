@@ -522,10 +522,12 @@ private const val STICKER_IMAGE_MEMORY_ENTRY_LIMIT = 100
  *  the first sticker render often races the relay connection on cold start. */
 private const val STICKER_PACK_RELAY_WAIT_MS = 10_000L
 
-/** Session key under which a sticker reference was authorized against the
- *  validated pack (core disk cache or a fresh relay pack match). Memory-first
- *  lookups are gated on this so the sha-keyed byte LRU never serves a ref that
- *  was not verified this session. */
+/** Cap on remembered unresolvable refs. A peer can mint refs freely, so the
+ *  negative cache that protects the relay must itself be bounded. */
+private const val STICKER_UNRESOLVABLE_REF_LIMIT = 256
+
+/** Stable identity of a sticker reference. Only the hash is case-normalized:
+ *  identifier and shortcode are case-sensitive per the pack model. */
 internal fun stickerRefMemoryKey(
     packCoordinate: String,
     shortcode: String,
@@ -5240,9 +5242,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var nextMediaDownloadGeneration = 0L
     private val stickerPackCache = linkedMapOf<String, SonarStickerPack>()
     private val stickerImageCache = linkedMapOf<String, ByteArray>()
-    /** Sticker references already authorized against validated pack metadata
-     *  this session; only these may be served memory-first by full reference. */
-    private val authorizedStickerRefKeys = mutableSetOf<String>()
+    /** Refs the latest relay-refreshed pack does not contain. Bounded; entries
+     *  stop a removed/bogus ref from re-driving eviction + relay refetch on
+     *  every bubble mount, retry tick, and tap. */
+    private val unresolvableStickerRefKeys = linkedSetOf<String>()
     private var stickerImageMemoryBytes = 0
     private var stickerBenchmarkRecording = false
     /** Last locally-authoritative installed set. Generic pack metadata also
@@ -5892,20 +5895,20 @@ class SonarAppState(private val scope: CoroutineScope) {
     suspend fun stickerImage(ref: SonarStickerRef): ByteArray? {
         val generation = stickerCacheGeneration
         val refKey = stickerRefMemoryKey(ref.packCoordinate, ref.shortcode, ref.plaintextSha256)
-        // Memory-first for refs this session already authorized: skips the
-        // FFI disk read + validated-pack parse on every transcript recompose.
-        if (refKey in authorizedStickerRefKeys) {
-            stickerImageFromMemory(ref.plaintextSha256)?.let { return it }
-        }
+        // The core is the sole authority on whether the LATEST validated pack
+        // still authorizes this exact ref, so every ref lookup asks it. There is
+        // deliberately no host-side memory shortcut here: the byte LRU is keyed
+        // by sha alone and cannot answer "does the current pack still contain
+        // this sticker", which is what the core's validated read enforces.
         when (val cached = cachedStickerImage(ref, generation)) {
-            is CachedStickerImageResult.Hit -> {
-                authorizedStickerRefKeys += refKey
-                return cached.bytes
-            }
+            is CachedStickerImageResult.Hit -> return cached.bytes
             CachedStickerImageResult.Invalidated -> return null
             CachedStickerImageResult.Miss -> Unit
         }
         if (stickerCacheGeneration != generation) return null
+        // A ref the latest pack has already disowned must not re-drive relay
+        // work on every bubble mount, retry tick, and tap.
+        if (refKey in unresolvableStickerRefKeys) return null
         val (author, identifier) = ref.packAddressParts() ?: return null
         val pack = stickerPack(
             authorPubkeyHex = author,
@@ -5925,17 +5928,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 identifier = identifier,
                 expectedGeneration = generation,
             ) ?: return null
-            refreshed.stickerMatching(ref) ?: return null
+            refreshed.stickerMatching(ref) ?: run {
+                // Refetched metadata still disowns the ref: remember that, so
+                // this is the last eviction+refetch this ref ever costs.
+                if (stickerCacheGeneration == generation) {
+                    rememberUnresolvableStickerRef(refKey)
+                }
+                return null
+            }
         }
-        val bytes = stickerImage(
+        return stickerImage(
             url = sticker.url,
             expectedSha256 = ref.plaintextSha256,
             expectedGeneration = generation,
         )
-        if (bytes != null && stickerCacheGeneration == generation) {
-            authorizedStickerRefKeys += refKey
-        }
-        return bytes
     }
 
     /** Run one representative device cache ladder through the production host
@@ -6102,10 +6108,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         stickerImageMemoryBytes = 0
     }
 
+    private fun rememberUnresolvableStickerRef(refKey: String) {
+        while (unresolvableStickerRefKeys.size >= STICKER_UNRESOLVABLE_REF_LIMIT) {
+            val oldest = unresolvableStickerRefKeys.firstOrNull() ?: break
+            unresolvableStickerRefKeys.remove(oldest)
+        }
+        unresolvableStickerRefKeys += refKey
+    }
+
     private fun clearStickerCaches() {
         stickerCacheGeneration++
         stickerPackCache.clear()
-        authorizedStickerRefKeys.clear()
+        unresolvableStickerRefKeys.clear()
         clearStickerImageMemoryCache()
         installedPackCoordinates.clear()
     }

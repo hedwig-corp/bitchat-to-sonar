@@ -28,6 +28,12 @@ class StickerSendEchoTest {
         )
     }
 
+    // NOTE: these two pin helpers the test feeds itself. The behaviour that
+    // actually broke — evict+refetch of a stale pack, and not re-driving it for
+    // a disowned ref — lives in SonarAppState.stickerImage(ref), which needs a
+    // real SonarCore to exercise. See the `Unguarded` note in the PR: the Rust
+    // side pins its real call sites (claim_sticker_refs_for_prefetch,
+    // cancel_on_wiped_session); the hosts do not yet have an injectable core.
     @Test fun stickerRefMemoryKeyNormalizesAuthorCaseAndHashCase() {
         val key = stickerRefMemoryKey(
             packCoordinate = "30031:ABCDEF1234:MyPack",
