@@ -123,7 +123,7 @@ Slice-5 verification against current code:
 | Blocked-contact unblock affordance | unblock row + gated actions | toast + unblock path `SonarContactProfileScreen.kt:172-174` | PARITY | — | Closed in PR #168 batch 2; open follow-up: iOS Marmot transcript re-filter on block (pre-existing) |
 | Reactions / share-location rows | hidden | "coming soon" toasts `App.kt:562-563` | PARITY | — | Both defer; acceptable |
 | Delivery status copy shared helper | `stateText()` | `SonarDeliveryText.kt` + tests | PARITY | — | Except partial-delivery label (§1) |
-| Media pipelines (image, voice, GIF, file), viewer, share/save | full | full (`App.kt:1632-2072`, `MediaViewer`) | PARITY | — | BLE 0x22 + MIP-04 both surfaces; hardware smoke pending |
+| Media pipelines (image, voice, GIF, file), viewer, share/save | full | full on Android (`App.kt:1632-2072`, `MediaViewer`); Compose Desktop BLE send unsupported | PLATFORM-GAP | M | BLE 0x22 + MIP-04 on iOS/Android; native macOS shares Apple BLE media. Compose Desktop `sendMeshMedia` returns false; add desktop file framing/reassembly and receipt coverage. |
 | Media caption field in model | `MarmotService.swift:121` `MarmotMedia.caption` | `SonarCore.kt` `SonarMedia.caption` + codec field 15 | PARITY | — | Closed in PR #168 batch 2 (model only, no UI yet — by design) |
 | Multi-item media model | single picker | `List<SonarMedia>` | PARITY | — | Compose structurally ahead |
 | Cleanup on exit paths | `onDisappear` chains | `cleanupPreviewTempFiles()` `App.kt:2333,2344` | PARITY | — | |

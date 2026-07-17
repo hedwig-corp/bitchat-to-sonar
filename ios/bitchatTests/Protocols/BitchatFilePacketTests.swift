@@ -9,6 +9,7 @@ final class BitchatFilePacketTests: XCTestCase {
             fileName: "sample.jpg",
             fileSize: UInt64(content.count),
             mimeType: "image/jpeg",
+            messageID: "media-message-1",
             content: content
         )
 
@@ -22,6 +23,7 @@ final class BitchatFilePacketTests: XCTestCase {
         XCTAssertEqual(decoded.fileName, packet.fileName)
         XCTAssertEqual(decoded.fileSize, packet.fileSize)
         XCTAssertEqual(decoded.mimeType, packet.mimeType)
+        XCTAssertEqual(decoded.messageID, packet.messageID)
         XCTAssertEqual(decoded.content, packet.content)
     }
 
@@ -43,5 +45,17 @@ final class BitchatFilePacketTests: XCTestCase {
 
         XCTAssertEqual(decoded.fileSize, UInt64(content.count))
         XCTAssertEqual(decoded.content, content)
+    }
+
+    func testEncodeRejectsExplicitEmptyMessageID() {
+        let packet = BitchatFilePacket(
+            fileName: "sample.jpg",
+            fileSize: 1,
+            mimeType: "image/jpeg",
+            messageID: "",
+            content: Data([0x01])
+        )
+
+        XCTAssertNil(packet.encode())
     }
 }

@@ -91,6 +91,7 @@ actual object MeshRadio {
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
     /** Incoming private mesh file transfers, buffered until the app drains them. */
     private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
+    private val meshDeliveryInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDeliveryReceipt>()
     /** Locally accepted sends that later failed at the Android GATT boundary. */
     private val meshSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshSendFailure>()
     private val meshMediaSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaSendFailure>()
@@ -105,6 +106,11 @@ actual object MeshRadio {
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
             if (!isKnownPeer(fingerprint)) return@addMessageListener
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
+        }
+        MeshGatt.addDeliveryListener { fingerprint, messageId ->
+            if (isKnownPeer(fingerprint)) {
+                meshDeliveryInbox.add(MeshDeliveryReceipt(fingerprint, messageId))
+            }
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
             if (!isKnownPeer(fingerprint)) return@addFileListener
@@ -240,6 +246,7 @@ actual object MeshRadio {
         // handed to the app are then cancelled with this intentional shutdown.
         meshSendFailureInbox.clear()
         meshMediaSendFailureInbox.clear()
+        meshDeliveryInbox.clear()
         seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
         notifyPeerUpdate()
     }
@@ -395,6 +402,13 @@ actual object MeshRadio {
             val dm = meshDmInbox.poll() ?: break
             if (isKnownPeer(dm.peerId)) out.add(dm)
         }
+        return out
+    }
+    actual fun sendMeshDeliveryAck(peerId: String, messageId: String): Boolean =
+        MeshGatt.sendDeliveryAck(peerId, messageId)
+    actual fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt> {
+        val out = ArrayList<MeshDeliveryReceipt>()
+        while (true) out.add(meshDeliveryInbox.poll() ?: break)
         return out
     }
 

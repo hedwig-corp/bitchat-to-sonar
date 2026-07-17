@@ -97,6 +97,9 @@ extension ChatViewModel {
         
         // Send via appropriate transport (BLE if connected/reachable, else Nostr when possible)
         if isConnected || isReachable || (isMutualFavorite && hasNostrKey) {
+            #if DEBUG
+            appendBleDebugReport("send text message=\(messageID) peer=\(peerID.id)")
+            #endif
             messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
             // Optimistically mark as sent for both transports; delivery/read will update subsequently
             if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
@@ -277,6 +280,10 @@ extension ChatViewModel {
     
     func handleDelivered(_ payload: NoisePayload, senderPubkey: String, convKey: PeerID) {
         guard let messageID = String(data: payload.data, encoding: .utf8) else { return }
+
+        #if DEBUG
+        appendBleDebugReport("delivered message=\(messageID) peer=\(convKey.id)")
+        #endif
         
         if let idx = privateChats[convKey]?.firstIndex(where: { $0.id == messageID }) {
             privateChats[convKey]?[idx].deliveryStatus = .delivered(to: displayNameForNostrPubkey(senderPubkey), at: Date())
@@ -369,6 +376,7 @@ extension ChatViewModel {
             fileName: outgoing.url.lastPathComponent,
             fileSize: UInt64(data.count),
             mimeType: "audio/mp4",
+            messageID: messageID,
             content: data
         )
 
@@ -424,17 +432,21 @@ extension ChatViewModel {
                     try? FileManager.default.removeItem(at: outputURL)
                     return
                 }
-                let packet = BitchatFilePacket(
-                    fileName: outputURL.lastPathComponent,
-                    fileSize: UInt64(data.count),
-                    mimeType: "image/jpeg",
-                    content: data
-                )
-                guard packet.encode() != nil else { throw MediaSendError.encodingFailed }
                 await MainActor.run {
                     let message = self.enqueueMediaMessage(content: "[image] \(outputURL.lastPathComponent)", targetPeer: targetPeer)
                     let messageID = message.id
                     let transferId = self.makeTransferID(messageID: messageID)
+                    let packet = BitchatFilePacket(
+                        fileName: outputURL.lastPathComponent,
+                        fileSize: UInt64(data.count),
+                        mimeType: "image/jpeg",
+                        messageID: messageID,
+                        content: data
+                    )
+                    guard packet.encode() != nil else {
+                        self.handleMediaSendFailure(messageID: messageID, reason: "Failed to encode image")
+                        return
+                    }
                     self.registerTransfer(transferId: transferId, messageID: messageID)
                     if let peerID = targetPeer {
                         if !self.meshService.sendFilePrivate(packet, to: peerID, transferId: transferId) {
@@ -494,6 +506,7 @@ extension ChatViewModel {
             fileName: savedURL.lastPathComponent,
             fileSize: UInt64(data.count),
             mimeType: mimeType.mimeString,
+            messageID: messageID,
             content: data
         )
 
@@ -662,8 +675,35 @@ extension ChatViewModel {
         let key = deduplicationService.normalizedContentKey(message.content)
         deduplicationService.recordContentKey(key, timestamp: timestamp)
         objectWillChange.send()
+        #if DEBUG
+        if let peerID = targetPeer {
+            appendBleDebugReport("send media message=\(message.id) peer=\(peerID.id) marker=\(content.prefix(16))")
+        }
+        #endif
         return message
     }
+
+    #if DEBUG
+    /// Correlated, pullable evidence for physical-device BLE runs. Keeping this
+    /// in the debug build avoids depending on a live unified-log stream.
+    private func appendBleDebugReport(_ line: String) {
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return }
+        let url = base.appendingPathComponent("sonar-debug.txt")
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+    #endif
 
     @MainActor
     func registerTransfer(transferId: String, messageID: String) {

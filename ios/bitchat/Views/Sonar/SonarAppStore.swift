@@ -1775,14 +1775,14 @@ final class SonarAppStore: ObservableObject {
         // time to connect + handshake). Logs the target peerID + text so the
         // send/receive can be confirmed from device logs without UI automation.
         if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
-            scheduleDebugMeshDM(text)
+            scheduleDebugMeshDM(text, peerPrefix: defaults.string(forKey: "sonar.debug.meshPeer"))
         }
         // `-sonar.debug.sendMeshImage 1`: send a generated test JPEG to the first
         // connected/reachable mesh peer ~12s after launch over the bitchat file
         // transfer path (type 0x22). Verifies Sonar→stock-bitchat BLE media interop
         // without UI automation (the phone must be unlocked + Sonar foreground).
         if onboarded, let flag = defaults.string(forKey: "sonar.debug.sendMeshImage"), !flag.isEmpty {
-            scheduleDebugMeshImage()
+            scheduleDebugMeshImage(peerPrefix: defaults.string(forKey: "sonar.debug.meshPeer"))
         }
         // `-sonar.debug.sendMarmot "<text>"`: force the White Noise (Marmot) path
         // to the first discovered Sonar peer ~25s after launch (after 0x53
@@ -1883,15 +1883,26 @@ final class SonarAppStore: ObservableObject {
     #endif
 
     #if DEBUG
-    private func scheduleDebugMeshDM(_ text: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+    private func scheduleDebugMeshDM(_ text: String, peerPrefix: String?, attempt: Int = 0) {
+        let trimmedPeerPrefix = peerPrefix?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedPeerPrefix = trimmedPeerPrefix?.isEmpty == false ? trimmedPeerPrefix : nil
+        let delay: Double = attempt == 0 ? 12 : 6
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             let my = self.chatViewModel.meshService.myPeerID
-            let target = self.chatViewModel.allPeers.first {
-                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            let target = self.chatViewModel.allPeers.first { peer in
+                let prefixMatches = normalizedPeerPrefix.map { prefix in
+                    peer.peerID.id.lowercased().hasPrefix(prefix)
+                } ?? true
+                return peer.peerID != my && prefixMatches && (peer.isConnected || peer.isReachable)
             }
             guard let peer = target else {
+                if attempt < 8 {
+                    self.scheduleDebugMeshDM(text, peerPrefix: peerPrefix, attempt: attempt + 1)
+                    return
+                }
                 SecureLogger.warning("🧪 debug.sendMeshDM: no connected peer to send to", category: .session)
+                self.writeDebugReport("sendMeshDM gave up — no matching connected/reachable peer")
                 return
             }
             SecureLogger.warning("🧪 debug.sendMeshDM: sending '\(text)' to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
@@ -1900,17 +1911,22 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func scheduleDebugMeshImage(attempt: Int = 0) {
+    private func scheduleDebugMeshImage(peerPrefix: String?, attempt: Int = 0) {
+        let trimmedPeerPrefix = peerPrefix?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedPeerPrefix = trimmedPeerPrefix?.isEmpty == false ? trimmedPeerPrefix : nil
         let delay: Double = attempt == 0 ? 12 : 6
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             let my = self.chatViewModel.meshService.myPeerID
-            let target = self.chatViewModel.allPeers.first {
-                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            let target = self.chatViewModel.allPeers.first { peer in
+                let prefixMatches = normalizedPeerPrefix.map { prefix in
+                    peer.peerID.id.lowercased().hasPrefix(prefix)
+                } ?? true
+                return peer.peerID != my && prefixMatches && (peer.isConnected || peer.isReachable)
             }
             guard let peer = target else {
                 if attempt < 8 {
-                    self.scheduleDebugMeshImage(attempt: attempt + 1)
+                    self.scheduleDebugMeshImage(peerPrefix: peerPrefix, attempt: attempt + 1)
                 } else {
                     SecureLogger.warning("🧪 debug.sendMeshImage: no connected peer to send to", category: .session)
                     self.writeDebugReport("sendMeshImage gave up — no connected/reachable peer")

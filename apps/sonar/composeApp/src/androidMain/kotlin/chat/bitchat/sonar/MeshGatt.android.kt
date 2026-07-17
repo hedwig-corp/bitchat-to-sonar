@@ -117,6 +117,7 @@ object MeshGatt {
     // Listeners (fired from BLE callback threads → concurrent lists). The
     // String identity is the peer's stable FINGERPRINT.
     private val onText = java.util.concurrent.CopyOnWriteArrayList<(String, String, String) -> Unit>()
+    private val onDelivery = java.util.concurrent.CopyOnWriteArrayList<(String, String) -> Unit>()
     private val onSonar = java.util.concurrent.CopyOnWriteArrayList<(String, ByteArray) -> Unit>()
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
@@ -154,6 +155,7 @@ object MeshGatt {
     ) : OutboundDelivery
 
     fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
+    fun addDeliveryListener(cb: (fingerprint: String, messageId: String) -> Unit) { onDelivery.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
     /** Fired when a peer's signed announce is received + verified. The third arg
      *  is the peer's stable fingerprint (SHA256 of its noise static pubkey). */
@@ -303,6 +305,7 @@ object MeshGatt {
         // A stuck in-flight flag surviving stop() would permanently block the
         // same address's queue after the next start().
         clientWriteQueue.clear(); clientInFlight.clear(); clientWriting.clear(); opInFlightSinceMs.clear()
+        serviceDiscoveryInFlight.clear(); initialDiscoveryRequested.clear()
         serverNotifyQueue.clear(); serverInFlight.clear(); serverNotifying.clear(); notifyInFlightSinceMs.clear()
     }
 
@@ -349,22 +352,30 @@ object MeshGatt {
         ) { engine.sendTextNow(fingerprint, messageId, text, nowMs()) } != null
     }
 
-    /** Send a private file transfer to a live peer route (never queued).
-     *  Mesh file message ids are derived on the receive side, so [messageId]
-     *  is accepted for interface parity only. */
+    /** Send a private file transfer to a live peer route (never queued). */
     fun sendFileToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean {
         if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return false
         val mime = normalizedMime(mimeType, bytes) ?: return false
         val safeName = safeFileName(filename, mime, System.currentTimeMillis())
-        return transactDelivery(
+        val out = transactDelivery(
             delivery = { generation ->
                 MediaDelivery(
                     nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId,
                     bytes.copyOf(), filename, mime, System.currentTimeMillis() / 1000,
                 )
             },
-        ) { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
+        ) { engine.sendFile(fingerprint, messageId, bytes, safeName, mime, nowMs()) }
+        if (BuildConfig.DEBUG && out != null) {
+            android.util.Log.i(
+                TAG,
+                "media enqueue peer=${fingerprint.take(8)} message=${messageId.take(24)} bytes=${bytes.size} ops=${out.commands.size}",
+            )
+        }
+        return out != null
     }
+
+    fun sendDeliveryAck(fingerprint: String, messageId: String): Boolean =
+        transact { engine.sendDeliveryAck(fingerprint, messageId, nowMs()) } != null
 
     /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected
      *  mesh peer. Returns false if no peer is connected. */
@@ -425,8 +436,7 @@ object MeshGatt {
             is MeshEngineCommand.CancelServer -> cancelServer(cmd.conn)
             is MeshEngineCommand.RefreshInstances -> {
                 android.util.Log.i(TAG, "re-discovering services on ${cmd.conn}")
-                @SuppressLint("MissingPermission")
-                gattByAddr[cmd.conn]?.discoverServices()
+                gattByAddr[cmd.conn]?.let(::discoverServicesOnce)
             }
             is MeshEngineCommand.Subscribe -> subscribe(cmd.conn, cmd.instance)
             is MeshEngineCommand.WriteLink -> {
@@ -498,11 +508,21 @@ object MeshGatt {
                 onSonar.forEach { it(event.fingerprint, event.payload) }
             is MeshEngineEvent.TextReceived ->
                 onText.forEach { it(event.fingerprint, event.messageId, event.content) }
+            is MeshEngineEvent.DeliveryReceived -> {
+                if (BuildConfig.DEBUG) {
+                    android.util.Log.i(
+                        TAG,
+                        "delivery receipt peer=${event.fingerprint.take(8)} message=${event.messageId.take(24)}",
+                    )
+                }
+                onDelivery.forEach { it(event.fingerprint, event.messageId) }
+            }
             is MeshEngineEvent.FileReceived -> {
                 val bytes = event.content
                 val mime = normalizedMime(event.mimeType, bytes) ?: continue
                 val name = safeFileName(event.fileName, mime, event.timestampMs)
-                onFile.forEach { it(event.fingerprint, "${event.transferKey}-file", name, mime, bytes) }
+                val messageId = event.messageId ?: "${event.transferKey}-file"
+                onFile.forEach { it(event.fingerprint, messageId, name, mime, bytes) }
             }
             is MeshEngineEvent.BroadcastReceived -> {
                 android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
@@ -564,6 +584,7 @@ object MeshGatt {
             }
         }
         gattByAddr.remove(conn)?.let { runCatching { it.disconnect(); it.close() } }
+        serviceDiscoveryInFlight.remove(conn); initialDiscoveryRequested.remove(conn)
         charByKey.keys.removeAll { it.startsWith("$conn#") }
         clientWriting.remove(conn); opInFlightSinceMs.remove(conn)
         reportSendFailures(failed)
@@ -635,6 +656,10 @@ object MeshGatt {
             val addr = gatt.device.address
             android.util.Log.i(TAG, "client $addr: state=$newState status=$status")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                if (gattByAddr[addr] !== gatt) {
+                    serviceDiscoveryInFlight.remove(addr)
+                    initialDiscoveryRequested.remove(addr)
+                }
                 gattByAddr[addr] = gatt
                 transact { engine.onClientConnected(addr, nowMs()) }
                 gatt.requestMtu(517)
@@ -656,8 +681,14 @@ object MeshGatt {
 
         @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            android.util.Log.i(TAG, "client ${gatt.device.address}: mtu=$mtu status=$status → discoverServices")
-            gatt.discoverServices()
+            val addr = gatt.device.address
+            if (gattByAddr[addr] !== gatt || !initialDiscoveryRequested.add(addr)) {
+                android.util.Log.i(TAG, "client $addr: duplicate/stale mtu callback ignored")
+            } else if (discoverServicesOnce(gatt)) {
+                android.util.Log.i(TAG, "client $addr: mtu=$mtu status=$status → discoverServices")
+            } else {
+                initialDiscoveryRequested.remove(addr)
+            }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -665,6 +696,14 @@ object MeshGatt {
             // running Sonar.app + the bitchat iOS-wrapper registers it twice in
             // the shared GATT database). Every instance is a distinct peer app.
             val addr = gatt.device.address
+            if (gattByAddr[addr] !== gatt || !serviceDiscoveryInFlight.remove(addr)) {
+                android.util.Log.i(TAG, "client $addr: duplicate/stale services callback ignored")
+                return
+            }
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                android.util.Log.w(TAG, "client $addr: services discovery failed status=$status")
+                return
+            }
             val chars = gatt.services.filter { it.uuid == SERVICE }.mapNotNull { it.getCharacteristic(CHAR) }
             android.util.Log.i(
                 TAG,
@@ -717,6 +756,12 @@ object MeshGatt {
                     scheduleClientEngineDisconnect(addr)
                 }
             } else {
+                if (BuildConfig.DEBUG && completed?.delivery is MediaDelivery) {
+                    android.util.Log.i(
+                        TAG,
+                        "media fragment wrote addr=$addr bytes=${(completed as GattOp.WriteChar).bytes.size} queued=${clientWriteQueue[addr]?.size ?: 0}",
+                    )
+                }
                 pumpClientWrites(addr)
             }
         }
@@ -807,6 +852,11 @@ object MeshGatt {
     private val clientWriteQueue = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<GattOp>>()
     private val clientWriting = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val clientInFlight = ConcurrentHashMap<String, GattOp>()
+    /** Android may deliver duplicate MTU callbacks. Service discovery must be
+     * single-flight or every CCC descriptor is enqueued twice, and the second
+     * subscription commonly fails with GATT status 1 on multi-instance peers. */
+    private val serviceDiscoveryInFlight = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val initialDiscoveryRequested = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     /** When the in-flight op was issued, for the tick's stuck-op recovery. */
     private val opInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
@@ -826,6 +876,16 @@ object MeshGatt {
         clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
             .add(GattOp.WriteDesc(d))
         pumpClientWrites(gatt.device.address)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun discoverServicesOnce(gatt: BluetoothGatt): Boolean {
+        val addr = gatt.device.address
+        if (gattByAddr[addr] !== gatt || !serviceDiscoveryInFlight.add(addr)) return false
+        if (gatt.discoverServices()) return true
+        serviceDiscoveryInFlight.remove(addr)
+        android.util.Log.w(TAG, "client $addr: discoverServices was not accepted")
+        return false
     }
 
     /** Issue the next queued op for [addr] iff none is in flight. */

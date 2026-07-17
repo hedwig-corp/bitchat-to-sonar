@@ -1322,6 +1322,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  invalidation, don't busy-poll). */
     private val housekeepingTrigger = Channel<Unit>(Channel.CONFLATED)
     private val refreshMutex = Mutex()
+    private val meshPersistenceMutex = Mutex()
     /** Match Apple's sendChain: preserve composer order across text, sticker,
      * control, receipt, and queued Marmot sends without serializing downloads. */
     private val marmotSendMutex = Mutex()
@@ -7777,7 +7778,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         val media = meshMediaFor(mediaUrl, mime, filename, data)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
-        val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
+        val msg = SonarMsg(
+            mid,
+            npub,
+            "",
+            mine = true,
+            tsSecs = MeshRadio.nowSecs(),
+            media = listOf(media),
+            state = "Sent",
+        )
         meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
         persistMesh(routePeerId)
         scope.launch { refreshOpenDm(canonicalMeshPeerId(routePeerId)) }
@@ -7788,10 +7797,34 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Write-through a peer's BLE-mesh transcript so it survives an app restart
      *  (parity with the iOS MessageStore). Marmot/White Noise legs are NOT written
      *  here — they already persist in the encrypted SQLCipher DB. */
-    private fun persistMesh(peerId: String) {
-        val msgs = meshChats[peerId].orEmpty()
+    private fun persistMesh(
+        peerId: String,
+        deliveredMessageIds: List<String> = emptyList(),
+        mediaFiles: List<Pair<String, ByteArray>> = emptyList(),
+    ) {
         updateBleDiscoveryPolicy()
-        scope.launch { MessageStore.saveMeshDm(peerId, msgs) }
+        scope.launch {
+            meshPersistenceMutex.withLock {
+                val latestMessages = meshChats[peerId].orEmpty()
+                val mediaSaved = mediaFiles.all { (url, bytes) -> MessageStore.saveMeshMedia(url, bytes) }
+                val transcriptSaved = MessageStore.saveMeshDm(peerId, latestMessages)
+                if (!mediaSaved || !transcriptSaved) {
+                    sonarLog(
+                        "MeshDelivery",
+                        "local persistence failed peer=${peerId.take(10)} media=$mediaSaved transcript=$transcriptSaved",
+                    )
+                    return@withLock
+                }
+                deliveredMessageIds.forEach { messageId ->
+                    if (!MeshRadio.sendMeshDeliveryAck(peerId, messageId)) {
+                        sonarLog(
+                            "MeshDelivery",
+                            "ack route unavailable peer=${peerId.take(10)} message=${messageId.take(12)}",
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private fun shouldUseMarmotRoute(peerId: String, npubRaw: ByteArray): Boolean {
@@ -9312,9 +9345,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         val incoming = MeshRadio.drainMeshDm()
         if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
+        val deliveredByPeer = mutableMapOf<String, MutableList<String>>()
         for (m in incoming) {
             if (isMeshContactBlocked(m.peerId)) continue
-            if (handleFavoriteControl(m.peerId, m.text)) continue
+            if (handleFavoriteControl(m.peerId, m.text)) {
+                MeshRadio.sendMeshDeliveryAck(m.peerId, m.messageId)
+                continue
+            }
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
@@ -9326,6 +9363,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val chatId = meshChatId(m.peerId)
             if (stickerRef == null && SonarCore.callParseControl(m.text) != null) {
                 processCallLines(chatId, listOf(msg))
+                MeshRadio.sendMeshDeliveryAck(m.peerId, msg.id)
                 continue
             }
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
@@ -9354,7 +9392,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 messageId = msg.id,
             )
         }
-        touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
+        touched.forEach { persistMesh(it, deliveredByPeer[it].orEmpty()) }
         refreshMeshDmRows()
         // Refresh the open conversation (merged mesh + White Noise) if it's one we
         // just appended to.
@@ -9362,6 +9400,42 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isMeshChat(sc.id)) {
                 val pid = meshPeerId(sc.id)
                 if (meshAliasGroupWasTouched(meshPeerAliases(pid), touched)) scope.launch { refreshOpenDm(pid) }
+            }
+        }
+        return true
+    }
+
+    /** Apply encrypted recipient receipts to optimistic BLE rows. */
+    private fun drainMeshDeliveryReceipts(): Boolean {
+        val receipts = MeshRadio.drainMeshDeliveryReceipts()
+        if (receipts.isEmpty()) return false
+        val touched = mutableSetOf<String>()
+        for (receipt in receipts) {
+            for (alias in meshPeerAliases(receipt.peerId)) {
+                val before = meshChats[alias].orEmpty()
+                var changed = false
+                val after = before.map { message ->
+                    if (message.mine && message.id == receipt.messageId && message.state != "Delivered") {
+                        changed = true
+                        message.copy(state = "Delivered")
+                    } else {
+                        message
+                    }
+                }
+                if (changed) {
+                    meshChats[alias] = after
+                    touched += alias
+                }
+            }
+        }
+        touched.forEach(::persistMesh)
+        if (touched.isNotEmpty()) {
+            refreshMeshDmRows()
+            (screen as? Screen.Chat)?.let { open ->
+                val peerId = open.id.takeIf(::isMeshChat)?.let(::meshPeerId)
+                if (peerId != null && meshAliasGroupWasTouched(meshPeerAliases(peerId), touched)) {
+                    scope.launch { refreshOpenDm(peerId) }
+                }
             }
         }
         return true
@@ -9546,6 +9620,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         val incoming = MeshRadio.drainMeshMedia()
         if (incoming.isEmpty()) return false
         val touched = mutableSetOf<String>()
+        val deliveredByPeer = mutableMapOf<String, MutableList<String>>()
+        val mediaByPeer = mutableMapOf<String, MutableList<Pair<String, ByteArray>>>()
         for (m in incoming) {
             if (isMeshContactBlocked(m.peerId)) continue
             val id = m.messageId.ifBlank { randomMeshId() }
@@ -9553,10 +9629,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
             val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes
-            scope.launch { MessageStore.saveMeshMedia(mediaUrl, m.bytes) }
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             touched += m.peerId
+            deliveredByPeer.getOrPut(m.peerId) { mutableListOf() }.add(id)
+            mediaByPeer.getOrPut(m.peerId) { mutableListOf() }.add(mediaUrl to m.bytes)
             notifyIncoming(
                 meshChatId(m.peerId),
                 meshPeerName(m.peerId),
@@ -9566,7 +9643,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
         }
         if (touched.isEmpty()) return false
-        touched.forEach { persistMesh(it) }
+        touched.forEach { peerId ->
+            persistMesh(peerId, deliveredByPeer[peerId].orEmpty(), mediaByPeer[peerId].orEmpty())
+        }
         refreshMeshDmRows()
         (screen as? Screen.Chat)?.let { sc ->
             if (isMeshChat(sc.id)) {
@@ -10245,7 +10324,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // off to 1s; any drain hit or in-range peer snaps back to 150ms.
             var lastActivityMs = 0L
             while (true) {
-                val drained = drainMeshDms() or drainMeshSendFailures() or
+                val drained = drainMeshDms() or drainMeshDeliveryReceipts() or drainMeshSendFailures() or
                     drainMeshMediaSendFailures() or drainMeshMedia() or drainMeshBroadcasts()
                 val nowMs = SonarClock.nowMillis()
                 // hasActivePeer() is a cheap link/announce probe — unlike

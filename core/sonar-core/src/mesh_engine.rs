@@ -57,7 +57,12 @@ pub const HEARTBEAT_MS: u64 = 30_000;
 /// the monotonic clock ran on — re-seed instead of culling for our downtime.
 pub const SWEEP_RESUME_GAP_MS: u64 = TICK_MS * 3;
 pub const MAX_SINGLE_GATT_PACKET_BYTES: usize = 480;
-pub const FRAGMENT_CHUNK_SIZE: usize = 350;
+/// Keeps the encoded/padded fragment packet in bitchat's 256-byte bucket.
+/// Pixel 10 reports a 517-byte MTU to an iPhone but iOS can acknowledge a
+/// 512-byte characteristic write without delivering it to didReceiveWrite;
+/// the 256-byte frame is delivered reliably. 160 bytes still fits a full
+/// 1 MiB transfer below fragment::MAX_FRAGMENTS (6,554 < 8,192).
+pub const FRAGMENT_CHUNK_SIZE: usize = 160;
 pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
@@ -125,9 +130,14 @@ pub enum AppEvent {
         message_id: String,
         content: String,
     },
+    DeliveryReceived {
+        fingerprint: String,
+        message_id: String,
+    },
     FileReceived {
         fingerprint: String,
         transfer_key: String,
+        message_id: Option<String>,
         file_name: Option<String>,
         mime_type: Option<String>,
         content: Vec<u8>,
@@ -709,12 +719,17 @@ impl Engine {
     pub fn send_file(
         &mut self,
         fingerprint: &str,
+        message_id: &str,
         content: &[u8],
         file_name: &str,
         mime_type: &str,
         now_ms: u64,
     ) -> Option<Output> {
-        if !self.fp_allowed(fingerprint) || content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
+        if !self.fp_allowed(fingerprint)
+            || message_id.is_empty()
+            || content.is_empty()
+            || content.len() > MAX_FILE_TRANSFER_BYTES
+        {
             return None;
         }
         let route = self.sendable_route(fingerprint)?;
@@ -724,6 +739,7 @@ impl Engine {
             file_name: Some(file_name.to_string()),
             file_size: Some(content.len() as u64),
             mime_type: Some(mime_type.to_string()),
+            message_id: Some(message_id.to_string()),
             content: content.to_vec(),
         }
         .encode()?;
@@ -739,6 +755,35 @@ impl Engine {
         let bytes = packet.encode()?;
         let mut out = self.discovery_to_route(&route, now_ms);
         self.write_maybe_fragmented(&route, bytes, msg_type::FILE_TRANSFER, now_ms, &mut out);
+        Some(out)
+    }
+
+    /// Confirm that a decoded private text or file was accepted by the
+    /// recipient application. This uses bitchat's existing encrypted
+    /// `delivered` payload, so receipts expose no message metadata over BLE.
+    pub fn send_delivery_ack(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint) {
+            return None;
+        }
+        let route = self.sendable_route(fingerprint)?;
+        let peer_id = parse_id8(&self.route_peer_id(&route)?)?;
+        let plain = mesh::encode_delivered_plaintext(message_id)?;
+        let ciphertext = self.encrypt_on_route(&route, &plain)?;
+        let packet = mesh::encrypted_packet(
+            self.my_peer_id,
+            peer_id,
+            DEFAULT_TTL,
+            self.wall(now_ms),
+            ciphertext,
+        );
+        let bytes = packet.encode()?;
+        let mut out = Output::default();
+        self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, &mut out);
         Some(out)
     }
 
@@ -1643,13 +1688,6 @@ impl Engine {
         let Some((t, rest)) = mesh::split_noise_plaintext(&plain) else {
             return;
         };
-        if t != noise_payload::PRIVATE_MESSAGE {
-            // read receipts / delivered acks are surfaced at a later stage.
-            return;
-        }
-        let Some(pm) = mesh::PrivateMessage::decode(rest) else {
-            return;
-        };
         let id_fp = fp
             .or_else(|| match &origin {
                 Origin::Client(id) => self
@@ -1665,11 +1703,31 @@ impl Engine {
                 Origin::Client(id) => id.conn.clone(),
                 Origin::Server(conn) => conn.clone(),
             });
-        out.events.push(AppEvent::TextReceived {
-            fingerprint: id_fp,
-            message_id: pm.message_id,
-            content: pm.content,
-        });
+        match t {
+            noise_payload::PRIVATE_MESSAGE => {
+                let Some(pm) = mesh::PrivateMessage::decode(rest) else {
+                    return;
+                };
+                out.events.push(AppEvent::TextReceived {
+                    fingerprint: id_fp,
+                    message_id: pm.message_id,
+                    content: pm.content,
+                });
+            }
+            noise_payload::DELIVERED => {
+                let Ok(message_id) = String::from_utf8(rest.to_vec()) else {
+                    return;
+                };
+                if message_id.is_empty() {
+                    return;
+                }
+                out.events.push(AppEvent::DeliveryReceived {
+                    fingerprint: id_fp,
+                    message_id,
+                });
+            }
+            _ => {}
+        }
     }
 
     fn decrypt_on_origin(&mut self, origin: &Origin, ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -1765,6 +1823,7 @@ impl Engine {
         out.events.push(AppEvent::FileReceived {
             fingerprint: fp,
             transfer_key,
+            message_id: file.message_id,
             file_name: file.file_name,
             mime_type: file.mime_type,
             content: file.content,
@@ -1934,6 +1993,72 @@ mod tests {
             "B must receive the DM, got {got:?}"
         );
         let _ = link;
+    }
+
+    #[test]
+    fn recipient_delivery_receipt_round_trips_for_text_and_media() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let text_ack = b
+            .send_delivery_ack(&fp_of(&a), "text-mid", 2_000)
+            .expect("receipt route");
+        let mut a_events = Vec::new();
+        for command in text_ack.commands {
+            if let Command::NotifyConn { bytes, .. } = command {
+                a_events.extend(a.on_client_rx(&link.conn, link.instance, &bytes, 2_000).events);
+            }
+        }
+        assert!(a_events.iter().any(|event| matches!(
+            event,
+            AppEvent::DeliveryReceived { message_id, .. } if message_id == "text-mid"
+        )));
+
+        let media = vec![0x42; 4_096];
+        let send = a
+            .send_file(
+                &fp_of(&b),
+                "media-mid",
+                &media,
+                "photo.jpg",
+                "image/jpeg",
+                3_000,
+            )
+            .expect("media route");
+        assert!(send.commands.iter().all(|command| match command {
+            Command::WriteLink { bytes, .. } | Command::NotifyConn { bytes, .. } => {
+                bytes.len() <= 256
+            }
+            _ => true,
+        }));
+        let mut b_events = Vec::new();
+        for command in send.commands {
+            if let Command::WriteLink { bytes, .. } = command {
+                b_events.extend(b.on_server_rx("droid", &bytes, 3_000).events);
+            }
+        }
+        assert!(b_events.iter().any(|event| matches!(
+            event,
+            AppEvent::FileReceived { message_id, content, .. }
+                if message_id.as_deref() == Some("media-mid") && content == &media
+        )));
+
+        let media_ack = b
+            .send_delivery_ack(&fp_of(&a), "media-mid", 3_100)
+            .expect("media receipt route");
+        let mut receipt_events = Vec::new();
+        for command in media_ack.commands {
+            if let Command::NotifyConn { bytes, .. } = command {
+                receipt_events.extend(
+                    a.on_client_rx(&link.conn, link.instance, &bytes, 3_100).events,
+                );
+            }
+        }
+        assert!(receipt_events.iter().any(|event| matches!(
+            event,
+            AppEvent::DeliveryReceived { message_id, .. } if message_id == "media-mid"
+        )));
     }
 
     #[test]

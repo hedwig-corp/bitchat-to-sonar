@@ -23,6 +23,7 @@ fn file_packet_encodes_byte_for_byte_like_bitchat() {
         file_name: Some("a.txt".to_string()),
         file_size: None, // → resolved to content.len()
         mime_type: Some("text/plain".to_string()),
+        message_id: None,
         content: b"hi".to_vec(),
     };
     // TLV order: fileName(0x01,u16 len) | fileSize(0x02,u16=4,u32) |
@@ -51,6 +52,7 @@ fn file_packet_round_trip_preserves_fields() {
         file_name: Some("sample.jpg".to_string()),
         file_size: Some(content.len() as u64),
         mime_type: Some("image/jpeg".to_string()),
+        message_id: Some("media-mid-1".to_string()),
         content: content.clone(),
     };
     let encoded = packet.encode().expect("encode");
@@ -58,6 +60,7 @@ fn file_packet_round_trip_preserves_fields() {
     assert_eq!(decoded.file_name.as_deref(), Some("sample.jpg"));
     assert_eq!(decoded.file_size, Some(content.len() as u64));
     assert_eq!(decoded.mime_type.as_deref(), Some("image/jpeg"));
+    assert_eq!(decoded.message_id.as_deref(), Some("media-mid-1"));
     assert_eq!(decoded.content, content);
 }
 
@@ -70,6 +73,7 @@ fn v2_file_transfer_packet_decodes_like_ios() {
         file_name: Some("photo.jpg".to_string()),
         file_size: None,
         mime_type: Some("image/jpeg".to_string()),
+        message_id: None,
         content: vec![1, 2, 3, 4, 5],
     }
     .encode()
@@ -118,6 +122,7 @@ fn signed_v2_file_transfer_packet_encodes_and_verifies() {
         file_name: Some("large.jpg".to_string()),
         file_size: None,
         mime_type: Some("image/jpeg".to_string()),
+        message_id: None,
         content: content.clone(),
     }
     .encode()
@@ -185,6 +190,7 @@ fn file_size_defaults_to_content_len_when_absent() {
         file_name: None,
         file_size: None,
         mime_type: None,
+        message_id: None,
         content: content.clone(),
     };
     let decoded = FilePacket::decode(&packet.encode().unwrap()).expect("decode");
@@ -217,6 +223,7 @@ fn large_file_packet_fragments_and_reassembles() {
         file_name: Some("big.bin".to_string()),
         file_size: Some(content.len() as u64),
         mime_type: Some("application/octet-stream".to_string()),
+        message_id: None,
         content,
     };
     let encoded = packet.encode().expect("encode"); // > 65535 → must fragment
@@ -299,6 +306,7 @@ fn file_survives_noise_and_fragmentation_over_the_mesh() {
         file_name: Some("photo.jpg".to_string()),
         file_size: Some(image.len() as u64),
         mime_type: Some("image/jpeg".to_string()),
+        message_id: None,
         content: image.clone(),
     };
     let plain = packet.encode().unwrap();

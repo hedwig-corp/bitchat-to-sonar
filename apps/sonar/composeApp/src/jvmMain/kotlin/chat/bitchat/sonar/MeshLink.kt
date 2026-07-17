@@ -45,6 +45,7 @@ object MeshLink {
     private val sonarByPeerId = ConcurrentHashMap<String, ByteArray>() // peerId -> 0x53 payload
     private val sonarSeenAt = ConcurrentHashMap<String, Long>()        // peerId -> last 0x53 ms (for TTL)
     private val rxDms = ConcurrentLinkedQueue<MeshDmIn>()
+    private val rxDeliveries = ConcurrentLinkedQueue<MeshDeliveryReceipt>()
 
     /** Our encoded SonarAnnounce (npub + caps) to broadcast as a signed 0x53, so
      *  phones treat us as a full Sonar peer and continue our chat over White Noise
@@ -178,9 +179,15 @@ object MeshLink {
         synchronized(s) {
             runCatching {
                 val plain = s.noise.decrypt(ciphertext)
-                meshDecodePrivateMessage(plain)?.let { pm ->
-                    sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
-                    rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
+                when (plain.firstOrNull()?.toInt()?.and(0xff)) {
+                    0x01 -> meshDecodePrivateMessage(plain)?.let { pm ->
+                        sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
+                        rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
+                    }
+                    0x03 -> plain.copyOfRange(1, plain.size).decodeToString().takeIf(String::isNotEmpty)?.let { messageId ->
+                        sonarLog("MeshLink", "RX delivery receipt from ${nameByFp[fp] ?: fp.take(8)} id=${messageId.take(12)}")
+                        rxDeliveries.add(MeshDeliveryReceipt(fp, messageId))
+                    }
                 }
             }
         }
@@ -199,6 +206,20 @@ object MeshLink {
         return encryptAndSend(fp, s, messageId, text)
     }
 
+    fun sendDeliveryAck(fp: String, messageId: String): Boolean {
+        if (messageId.isEmpty()) return false
+        val s = sessions[fp]?.takeIf { it.established } ?: return false
+        val peerId = peerIdByFp[fp] ?: return false
+        return synchronized(s) {
+            runCatching {
+                val plain = byteArrayOf(0x03) + messageId.encodeToByteArray()
+                val ct = s.noise.encrypt(plain)
+                BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
+                true
+            }.getOrDefault(false)
+        }
+    }
+
     private fun encryptAndSend(fp: String, s: Session, messageId: String, text: String): Boolean {
         val peerId = peerIdByFp[fp] ?: return false
         return synchronized(s) {
@@ -215,6 +236,12 @@ object MeshLink {
     fun drainDms(): List<MeshDmIn> {
         val out = ArrayList<MeshDmIn>()
         while (true) out.add(rxDms.poll() ?: break)
+        return out
+    }
+
+    fun drainDeliveryReceipts(): List<MeshDeliveryReceipt> {
+        val out = ArrayList<MeshDeliveryReceipt>()
+        while (true) out.add(rxDeliveries.poll() ?: break)
         return out
     }
 
@@ -243,7 +270,7 @@ object MeshLink {
 
     fun wipe() {
         sessions.clear(); fpByPeerId.clear(); peerIdByFp.clear()
-        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear()
+        nameByFp.clear(); seenByFp.clear(); sonarByPeerId.clear(); sonarSeenAt.clear(); rxDms.clear(); rxDeliveries.clear()
         notifyPeerUpdate()
     }
 }

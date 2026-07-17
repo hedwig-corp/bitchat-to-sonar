@@ -13,6 +13,9 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
  *  conversation across rotation. Drained by the app into the mesh-chat store. */
 data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long)
 
+/** An encrypted recipient receipt for a private text or media message. */
+data class MeshDeliveryReceipt(val peerId: String, val messageId: String)
+
 /** A mesh DM accepted synchronously whose Android GATT write later failed.
  * The app removes its optimistic BLE echo and retries the original plaintext
  * through the router-owned outbox. */
@@ -276,6 +279,10 @@ expect object MeshRadio {
     fun localPeerIdHex(): String
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
+    /** Confirm an incoming private message only after the app has persisted it. */
+    fun sendMeshDeliveryAck(peerId: String, messageId: String): Boolean
+    /** Pull (and clear) recipient receipts received since the last call. */
+    fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt>
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean

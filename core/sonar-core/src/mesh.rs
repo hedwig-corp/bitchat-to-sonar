@@ -701,6 +701,19 @@ pub fn encode_private_message_plaintext(msg: &PrivateMessage) -> Option<Vec<u8>>
     Some(out)
 }
 
+/// Build the encrypted inner payload used to confirm that a private text or
+/// media message reached the recipient application. The message id is UTF-8,
+/// matching bitchat's existing `sendDeliveryAck` wire format.
+pub fn encode_delivered_plaintext(message_id: &str) -> Option<Vec<u8>> {
+    if message_id.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(1 + message_id.len());
+    out.push(noise_payload::DELIVERED);
+    out.extend_from_slice(message_id.as_bytes());
+    Some(out)
+}
+
 pub const BITCHAT_NIP17_PREFIX: &str = "bitchat1:";
 const MAX_EMBEDDED_BITCHAT_PACKET_BYTES: usize = 2 * 1024 * 1024;
 
@@ -939,6 +952,9 @@ pub mod file_packet {
     const T_FILE_SIZE: u8 = 0x02;
     const T_MIME_TYPE: u8 = 0x03;
     const T_CONTENT: u8 = 0x04;
+    /// Optional Sonar extension. Stock bitchat decoders skip unknown TLVs, so
+    /// adding the sender's chat message id remains wire-compatible.
+    const T_MESSAGE_ID: u8 = 0x05;
 
     /// A decoded file transfer payload.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -946,6 +962,7 @@ pub mod file_packet {
         pub file_name: Option<String>,
         pub file_size: Option<u64>,
         pub mime_type: Option<String>,
+        pub message_id: Option<String>,
         pub content: Vec<u8>,
     }
 
@@ -981,6 +998,15 @@ pub mod file_packet {
                     out.extend_from_slice(mb);
                 }
             }
+            if let Some(message_id) = &self.message_id {
+                let id = message_id.as_bytes();
+                if id.is_empty() || id.len() > u16::MAX as usize {
+                    return None;
+                }
+                out.push(T_MESSAGE_ID);
+                out.extend_from_slice(&(id.len() as u16).to_be_bytes());
+                out.extend_from_slice(id);
+            }
             out.push(T_CONTENT);
             out.extend_from_slice(&(self.content.len() as u32).to_be_bytes());
             out.extend_from_slice(&self.content);
@@ -995,6 +1021,7 @@ pub mod file_packet {
             let mut file_name = None;
             let mut file_size: Option<u64> = None;
             let mut mime_type = None;
+            let mut message_id = None;
             let mut content: Vec<u8> = Vec::new();
 
             // Read a big-endian length of `bytes` width, advancing `cur`.
@@ -1052,6 +1079,13 @@ pub mod file_packet {
                         }
                     }
                     T_MIME_TYPE => mime_type = String::from_utf8(value.to_vec()).ok(),
+                    T_MESSAGE_ID => {
+                        let decoded = String::from_utf8(value.to_vec()).ok()?;
+                        if decoded.is_empty() {
+                            return None;
+                        }
+                        message_id = Some(decoded);
+                    }
                     T_CONTENT => {
                         if content.len() + value.len() > MAX_PAYLOAD_BYTES {
                             return None;
@@ -1069,6 +1103,7 @@ pub mod file_packet {
                 file_name,
                 file_size: Some(file_size.unwrap_or(content.len() as u64)),
                 mime_type,
+                message_id,
                 content,
             })
         }

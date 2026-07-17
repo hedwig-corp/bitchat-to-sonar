@@ -1405,6 +1405,9 @@ final class BLEService: NSObject {
 
         guard accepted else {
             SecureLogger.warning("🚫 Dropping file transfer from unverified or unknown peer \(peerID.id.prefix(8))…", category: .security)
+            #if DEBUG
+            appendBleDebugReport("file rejected peer=\(peerID.id) reason=unverified")
+            #endif
             return
         }
 
@@ -1424,6 +1427,9 @@ final class BLEService: NSObject {
 
         guard let filePacket = BitchatFilePacket.decode(packet.payload) else {
             SecureLogger.error("❌ Failed to decode file transfer payload", category: .session)
+            #if DEBUG
+            appendBleDebugReport("file rejected peer=\(peerID.id) reason=file-packet-decode bytes=\(packet.payload.count)")
+            #endif
             return
         }
 
@@ -1487,6 +1493,7 @@ final class BLEService: NSObject {
 
         let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
         let message = BitchatMessage(
+            id: filePacket.messageID,
             sender: senderNickname,
             content: marker,
             timestamp: ts,
@@ -1499,8 +1506,23 @@ final class BLEService: NSObject {
 
         SecureLogger.debug("📁 Stored incoming media from \(peerID.id.prefix(8))… -> \(destination.lastPathComponent)", category: .session)
 
+        #if DEBUG
+        appendBleDebugReport(
+            "file stored peer=\(peerID.id) message=\(filePacket.messageID ?? "none") bytes=\(filePacket.content.count) name=\(destination.lastPathComponent)"
+        )
+        #endif
+
         notifyUI { [weak self] in
             self?.delegate?.didReceiveMessage(message)
+        }
+        // A media send is delivered only after the complete fragment train was
+        // decoded, validated, and persisted locally. Older senders omit the
+        // optional message id and simply retain the legacy no-receipt behavior.
+        if isPrivateMessage, let messageID = filePacket.messageID {
+            sendDeliveryAck(for: messageID, to: peerID)
+            #if DEBUG
+            appendBleDebugReport("file ack message=\(messageID) peer=\(peerID.id)")
+            #endif
         }
     }
     
@@ -2965,6 +2987,11 @@ extension BLEService: CBPeripheralManagerDelegate {
                 let peekType = combined[1]
                 if peekType != MessageType.announce.rawValue {
                     SecureLogger.debug("📥 Accumulated write from central \(centralUUID): size=\(combined.count) (+\(appendedBytes)) bytes (type=\(peekType)), offsets=\(offsets)", category: .session)
+                    #if DEBUG
+                    appendBleDebugReport(
+                        "raw write central=\(centralUUID) size=\(combined.count) appended=\(appendedBytes) type=\(peekType) offsets=\(offsets)"
+                    )
+                    #endif
                 }
             }
 
@@ -2972,6 +2999,12 @@ extension BLEService: CBPeripheralManagerDelegate {
             if let packet = BinaryProtocol.decode(combined) {
                 // Clear buffer on success
                 pendingWriteBuffers.removeValue(forKey: centralUUID)
+
+                #if DEBUG
+                if packet.type != MessageType.announce.rawValue {
+                    appendBleDebugReport("raw decoded central=\(centralUUID) type=\(packet.type) bytes=\(combined.count)")
+                }
+                #endif
 
                 let claimedSenderID = PeerID(hexData: packet.senderID)
 
@@ -3025,6 +3058,9 @@ extension BLEService: CBPeripheralManagerDelegate {
                     handleReceivedPacket(packet, from: claimedSenderID)
                 }
             } else {
+                #if DEBUG
+                appendBleDebugReport("raw pending central=\(centralUUID) bytes=\(combined.count) appended=\(appendedBytes)")
+                #endif
                 // If buffer grows suspiciously large, reset to avoid memory leak
                 if combined.count > TransportConfig.blePendingWriteBufferCapBytes { // cap for safety
                     pendingWriteBuffers.removeValue(forKey: centralUUID)
@@ -4023,6 +4059,14 @@ extension BLEService {
         let originalType = packet.payload[12]
         let fragmentData = packet.payload.suffix(from: 13)
 
+        #if DEBUG
+        if index == 0 {
+            appendBleDebugReport(
+                "fragment start id=\(String(format: "%016llx", fragU64)) sender=\(peerID.id) total=\(total) type=\(originalType)"
+            )
+        }
+        #endif
+
         // Sanity checks - add reasonable upper bound on total to prevent DoS
         guard total > 0 && total <= 10000 && index >= 0 && index < total else { return }
 
@@ -4095,6 +4139,12 @@ extension BLEService {
         // Heavy work outside lock: reassemble and decode
         guard shouldReassemble, let fragments = fragmentsToReassemble else { return }
 
+        #if DEBUG
+        appendBleDebugReport(
+            "fragment complete id=\(String(format: "%016llx", fragU64)) sender=\(peerID.id) total=\(total)"
+        )
+        #endif
+
         var reassembled = Data()
         for i in 0..<total {
             if let fragment = fragments[i] {
@@ -4108,6 +4158,9 @@ extension BLEService {
             // Reassembled packet validation
             let innerSender = PeerID(hexData: originalPacket.senderID)
             if !validatePacket(originalPacket, from: innerSender) {
+                #if DEBUG
+                appendBleDebugReport("fragment rejected id=\(String(format: "%016llx", fragU64)) reason=validation")
+                #endif
                 // Cleanup below
             } else {
                 SecureLogger.debug("✅ Reassembled packet id=\(String(format: "%016llx", fragU64)) type=\(originalPacket.type) bytes=\(reassembled.count)", category: .session)
@@ -4116,6 +4169,9 @@ extension BLEService {
             }
         } else {
             SecureLogger.error("❌ Failed to decode reassembled packet (type=\(originalType), total=\(total))", category: .session)
+            #if DEBUG
+            appendBleDebugReport("fragment rejected id=\(String(format: "%016llx", fragU64)) reason=decode")
+            #endif
         }
 
         // Critical section: Cleanup completed assembly
@@ -5191,4 +5247,31 @@ extension BLEService {
         }
         dynamicRSSIThreshold = threshold
     }
+
+    #if DEBUG
+    private static let bleDebugReportLock = NSLock()
+
+    /// Pullable physical-device trace for fragment and file persistence events.
+    /// This intentionally bypasses unified logging, which is not always
+    /// available over a paired wireless CoreDevice tunnel.
+    private func appendBleDebugReport(_ line: String) {
+        Self.bleDebugReportLock.lock()
+        defer { Self.bleDebugReportLock.unlock() }
+        guard let base = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ) else { return }
+        let url = base.appendingPathComponent("sonar-debug.txt")
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+    #endif
 }
