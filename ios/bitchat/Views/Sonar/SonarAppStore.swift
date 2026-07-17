@@ -21,6 +21,7 @@ import AVFoundation
 import Combine
 import CryptoKit
 import Foundation
+import ImageIO
 import SonarCore
 import SwiftUI
 #if canImport(UIKit)
@@ -399,6 +400,10 @@ struct SNMediaItem: Equatable {
     /// For BLE-mesh media (bitchat file transfer): the local file path on disk.
     /// When set, the bytes are loaded locally instead of downloaded from Blossom.
     var localPath: String? = nil
+    /// Stored attachment dimensions (MIP-04 metadata). Signal pre-sizes media
+    /// cells from these so the decoded image never reflows the transcript.
+    var width: UInt32? = nil
+    var height: UInt32? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
     var isGif: Bool {
         mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
@@ -1743,6 +1748,7 @@ final class SonarAppStore: ObservableObject {
 
     private func clearAccountBoundLocalStateForRestore() {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         chatViewModel.clearAllConversations()
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -4955,7 +4961,14 @@ final class SonarAppStore: ObservableObject {
     /// Map a Marmot message's attachments into UI items carrying the group id.
     static func mediaItems(_ m: MarmotService.MarmotMessage, groupId: String) -> [SNMediaItem] {
         m.media.map {
-            SNMediaItem(url: $0.url, mime: $0.mimeType, filename: $0.filename, groupId: groupId)
+            SNMediaItem(
+                url: $0.url,
+                mime: $0.mimeType,
+                filename: $0.filename,
+                groupId: groupId,
+                width: $0.width,
+                height: $0.height
+            )
         }
     }
 
@@ -5547,6 +5560,31 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendImage(from: tmp) { try? FileManager.default.removeItem(at: tmp) }
     }
 
+    /// Header-only image dimensions for a local file (no pixel decode), cached
+    /// by path. Signal derives attachment dimensions at ingestion and sizes
+    /// media cells ONLY from stored values (Signal-Android attachments table
+    /// width/height → ThumbnailView; Signal-iOS TSAttachmentStream
+    /// imageSizePixels → CVMediaAlbumView). Marmot media gets this from MIP-04
+    /// metadata; BLE file transfers carry none, so derive it here where the
+    /// bytes live — otherwise the bubble reserves the fixed skeleton box and
+    /// grows on decode, shifting the transcript.
+    private static var meshImageBoundsCache: [String: (UInt32, UInt32)] = [:]
+
+    private func meshImageBounds(atPath path: String) -> (UInt32, UInt32)? {
+        if let cached = Self.meshImageBoundsCache[path] { return cached }
+        let url = URL(fileURLWithPath: path) as CFURL
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(url, options),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, options) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int,
+              w > 0, h > 0
+        else { return nil }
+        let bounds = (UInt32(w), UInt32(h))
+        Self.meshImageBoundsCache[path] = bounds
+        return bounds
+    }
+
     /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
     /// item with the local on-disk path, if the file exists.
     private func meshMediaItem(_ content: String) -> SNMediaItem? {
@@ -5566,7 +5604,16 @@ final class SonarAppStore: ObservableObject {
         for dir in k.dirs {
             let path = filesDir.appendingPathComponent(dir).appendingPathComponent(safe).path
             if FileManager.default.fileExists(atPath: path) {
-                return SNMediaItem(url: "", mime: k.mime, filename: safe, groupId: "", localPath: path)
+                let bounds = k.mime.hasPrefix("image/") ? meshImageBounds(atPath: path) : nil
+                return SNMediaItem(
+                    url: "",
+                    mime: k.mime,
+                    filename: safe,
+                    groupId: "",
+                    localPath: path,
+                    width: bounds?.0,
+                    height: bounds?.1
+                )
             }
         }
         return nil
@@ -5824,6 +5871,52 @@ final class SonarAppStore: ObservableObject {
             for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
         else { return }
         try? FileManager.default.removeItem(at: base.appendingPathComponent("media-cache", isDirectory: true))
+    }
+
+    /// Unread count per DM route captured when navigation pushed the chat.
+    /// Consumed by the transcript to anchor at the first unread row with a
+    /// divider (Signal-style); cleared when the route pops.
+    @Published var unreadCountAtOpenByDM: [String: UInt64] = [:]
+
+    /// Capture the DM's unread count at navigation time — BEFORE `openedDM`
+    /// zeroes the core counter — so the transcript can anchor at the first
+    /// unread row with a divider (Signal-style) instead of force-pinning the
+    /// tail. The published `unreadByGroup` map lags a cold launch, so a map
+    /// miss falls back to reading the core conversation index directly; that
+    /// read races openedDM's read-marking, but read-marking only runs after
+    /// the local hydrate completes, so the summaries read lands first — and a
+    /// lost race just degrades to today's open-at-tail behavior.
+    func captureUnreadAtOpen(_ id: String) {
+        unreadCountAtOpenByDM[id] = nil
+        let groupId = marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else { return }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
+        if cached > 0 {
+            unreadCountAtOpenByDM[id] = cached
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            let unread = await self.marmot.unreadCount(forGroups: ids)
+            if unread > 0 { self.unreadCountAtOpenByDM[id] = unread }
+        }
+    }
+
+    /// Newest known message date across the DM's folded groups, from the
+    /// core conversation index. The transcript must not freeze its unread
+    /// divider before the visible rows have caught up to this — hydration can
+    /// publish one leg before the folded White Noise groups merge in, and the
+    /// rows still missing are exactly the unread ones.
+    func expectedNewestMessageDate(_ id: String) -> Date? {
+        let groupId = marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else { return nil }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
     }
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
@@ -6505,6 +6598,11 @@ final class SonarAppStore: ObservableObject {
         if case .dm(let id) = route, currentDMId != id {
             cleanupPreviewTempFiles()
         }
+        if case .dm(let id) = route {
+            // Capture at navigation time — the screen's own onAppear would
+            // lose the race against its child list's onAppear.
+            captureUnreadAtOpen(id)
+        }
         #if os(iOS)
         if case .call = route { return }
         #endif
@@ -6513,6 +6611,9 @@ final class SonarAppStore: ObservableObject {
 
     func pop() {
         cleanupPreviewTempFiles()
+        // The unread divider lives while its chat is on the stack; leaving the
+        // chat retires it so a later reopen (already marked read) starts clean.
+        if case .dm(let id)? = path.last { unreadCountAtOpenByDM[id] = nil }
         if !path.isEmpty { path.removeLast() }
     }
 
@@ -7017,6 +7118,7 @@ final class SonarAppStore: ObservableObject {
     /// onboarding. Contrast with `wipe()`, which destroys everything.
     func eraseAllChats() {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
         // White Noise / Marmot groups: wipe the encrypted DB then reconnect
@@ -7074,6 +7176,7 @@ final class SonarAppStore: ObservableObject {
 
     private func performWipe() async {
         path = []
+        unreadCountAtOpenByDM.removeAll()
         // The Breez node must release its SQLite store before wallet files are
         // deleted. Await this before revealing onboarding so a fast re-onboard
         // cannot race a still-running destructive wallet task.

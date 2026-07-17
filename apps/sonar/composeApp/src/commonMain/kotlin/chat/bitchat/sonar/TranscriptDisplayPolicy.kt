@@ -147,6 +147,28 @@ internal fun boundedTranscriptRows(
 internal fun mergeAllTranscriptRows(source: List<SonarMsg>): List<SonarMsg> =
     mergeTranscriptRows(emptyList(), source, retainedRows = source.size)
 
+/**
+ * Index of the oldest unread row: the [unreadCount]-th non-mine message counted
+ * from the tail of [rows]. The core conversation index increments unread_count
+ * only for incoming messages, so own sends interleave without consuming budget.
+ * Non-message rows (call records) are skipped. When more messages are unread
+ * than the loaded window holds, the anchor clamps to the oldest loaded incoming
+ * row. Returns -1 when nothing is unread or no incoming row is loaded.
+ */
+internal fun firstUnreadTranscriptIndex(rows: List<Any?>, unreadCount: Long): Int {
+    if (unreadCount <= 0L) return -1
+    var remaining = unreadCount
+    var anchor = -1
+    for (index in rows.indices.reversed()) {
+        val message = rows[index] as? SonarMsg ?: continue
+        if (message.mine) continue
+        anchor = index
+        remaining -= 1L
+        if (remaining == 0L) break
+    }
+    return anchor
+}
+
 /** Pick one globally adjacent older page after independently paged sources are merged. */
 internal fun nearestOlderTranscriptPage(
     source: List<SonarMsg>,

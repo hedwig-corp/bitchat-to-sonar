@@ -757,7 +757,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             stack = listOf(Screen.Home)
             chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
             clearChatSnapshot()
-            cancelAllMediaDownloads(); MediaCache.wipe()
+            cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
             onboarded = false; nick = ""; npub = ""; started = false
@@ -816,7 +816,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
-            cancelAllMediaDownloads(); MediaCache.wipe()
+            cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
             notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
@@ -942,6 +942,98 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
+
+    /** Unread count per chat captured at open time — BEFORE opening zeroes the
+     *  core unread counter — so the transcript can anchor at the first unread
+     *  row with a divider (Signal-style) instead of force-pinning the tail.
+     *  The entry lives while the chat is on the nav stack. */
+    var openChatUnread by mutableStateOf<Map<String, Long>>(emptyMap())
+        private set
+
+    /** Frozen unread-anchor row ID per chat. Once the transcript resolves the
+     *  divider row, revisits of the same open (back from a pushed profile
+     *  screen) reuse it instead of recounting against a feed that has since
+     *  grown — new arrivals were already marked read and must not drift it. */
+    var openChatUnreadAnchor by mutableStateOf<Map<String, String>>(emptyMap())
+
+    /**
+     * Capture the chat's unread count before opening clears it.
+     *
+     * [unreadByChat] is keyed by Marmot group id hex, so the sources MUST be
+     * resolved through [transcriptGroupIds] — a mesh route's chat id
+     * ("mesh:<peerId>") is not a group id, and looking it up directly always
+     * read 0, leaving radar/BLE-folded conversations with no divider while
+     * plain Marmot chats got one. That resolver is also what the read-marking
+     * paths use, so capture and clear always cover the same groups.
+     */
+    private fun captureOpenChatUnread(chatId: String) {
+        val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
+        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatUnread = if (unreadAtOpen > 0L) {
+            openChatUnread + (chatId to unreadAtOpen)
+        } else {
+            openChatUnread - chatId
+        }
+    }
+
+    /** Give up on a pending unread divider for this open: the transcript is
+     *  fully hydrated but no anchor row is placeable (e.g. every unread event
+     *  is a filtered control line). Clears the pending state so tail
+     *  following resumes. */
+    fun retireOpenChatUnread(chatId: String) {
+        openChatUnread = openChatUnread - chatId
+        openChatUnreadAnchor = openChatUnreadAnchor - chatId
+    }
+
+    /** Account wipe/erase: per-open transcript state must not outlive the
+     *  chats it is keyed by. */
+    private fun clearOpenChatTransientState() {
+        openChatUnread = emptyMap()
+        openChatUnreadAnchor = emptyMap()
+        hydratedTranscripts = emptySet()
+    }
+
+    /**
+     * Chats whose async local hydrate has published for the CURRENT open.
+     *
+     * Opening paints synchronously from partial local state (a mesh chat shows
+     * only its BLE window; the White Noise leg merges a beat later), so until
+     * this flips the visible feed can still gain rows — including OLDER ones,
+     * which shift every index and move the tail. Position changes in that
+     * window are hydration, not new messages: they must be applied instantly,
+     * never animated, or the transcript visibly scrolls on every open.
+     */
+    var hydratedTranscripts by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    fun isTranscriptHydrated(chatId: String): Boolean = chatId in hydratedTranscripts
+
+    private fun markTranscriptHydrated(chatId: String) {
+        if (chatId in hydratedTranscripts) return
+        hydratedTranscripts = hydratedTranscripts + chatId
+    }
+
+    private fun clearTranscriptHydrated(chatId: String) {
+        if (chatId !in hydratedTranscripts) return
+        hydratedTranscripts = hydratedTranscripts - chatId
+    }
+
+    /**
+     * Cached White Noise rows to seed a mesh chat's synchronous first paint,
+     * so it lands on the true tail instead of the BLE tail (see [openDm]).
+     *
+     * Synthetic chat-list placeholders are stripped: only the newest
+     * [LOCAL_SUMMARY_CHAT_LIMIT] chats carry real rows here, and a placeholder's
+     * id can never dedupe against the real row the async page brings, so
+     * seeding one renders a permanent duplicate bubble. A chat without real
+     * cached rows simply gets no seed and settles via the catch-up gate.
+     */
+    private fun meshWhiteNoiseSeed(chatId: String): List<SonarMsg> =
+        transcriptGroupIds(chatId).flatMap { groupId ->
+            chatSnapshotMessagesByChat[groupId].orEmpty()
+                .withoutSyntheticSummaryRows()
+                .map { it.copy(viaInternet = true) }
+        }
 
     // ── Mocked voice/video call log (in-memory only) ──
     /** Call records per chat id, merged into that DM's transcript by timestamp. */
@@ -2820,7 +2912,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
-                cancelAllMediaDownloads(); MediaCache.wipe()
+                cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++
                 notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
@@ -3375,6 +3467,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             // ── LOCAL-FIRST PAINT (Signal/iOS parity): hydrate disk state and
             // open the encrypted database without any relay dependency.
             meshChats.putAll(MessageStore.loadAllMeshDms())
+            // Legacy-media repair reads image files back from disk; that must
+            // not sit between disk hydrate and core start on the local-first
+            // paint path (Signal-Comparable Performance Rule). Run it beside
+            // the startup sequence, not inside it.
+            scope.launch { backfillMeshMediaBounds() }
             loadLinks()
             loadMeshNames()
             seedVerifiedChatIds()
@@ -3595,6 +3692,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val readChatIds = directMarmotChatIds(chat.id)
+        captureOpenChatUnread(chat.id)
+        clearTranscriptHydrated(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
         // Local-first paint (Signal-Comparable Performance Rule): show the
         // cached snapshot synchronously so the transcript never opens empty;
@@ -3630,6 +3729,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 messages = visibleFresh
                 processPayLines(chat.id, visibleFresh)
             }
+            // Both publishes above replace the snapshot first paint: hydration,
+            // not new messages. Later feed changes may animate.
+            if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
         }
     }
 
@@ -3642,13 +3744,29 @@ class SonarAppState(private val scope: CoroutineScope) {
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         push(Screen.Chat(id, name, pay))
+        captureOpenChatUnread(id)
+        clearTranscriptHydrated(id)
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
+        // Complete local-first paint (Signal-Comparable Performance Rule): a
+        // mesh chat folds a BLE leg and a White Noise leg. Painting only the
+        // BLE window here would land the transcript on the BLE tail and then
+        // visibly jump when the async White Noise merge appends its (newer)
+        // rows — the exact open-scroll a pure Marmot chat never shows, because
+        // its snapshot is already complete. Seed the White Noise leg from the
+        // same cached conversation snapshot the chat-list preview uses so the
+        // first frame already holds the newest rows; the async refresh below
+        // then replaces it with the full DB read.
+        val wnSnapshot = meshWhiteNoiseSeed(id)
         messages = visibleMessagesForChat(
             id,
-            refreshConversationRows(refreshMeshTranscriptWindow(canonicalPeerId), id, generation),
+            refreshConversationRows(
+                refreshMeshTranscriptWindow(canonicalPeerId) + wnSnapshot,
+                id,
+                generation,
+            ),
         ) // bounded local-first mesh view
         processPayLines(id, messages)
         scope.launch {
@@ -3657,6 +3775,64 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Reconcile the open transcript after chat-list refresh may discover
             // the peer's Marmot group mapping.
             refreshOpenDm(canonicalPeerId)
+            // Every publish above is hydration of a partial first paint (the BLE
+            // window merging with the White Noise leg), so the transcript must
+            // absorb them instantly. Only now do later feed changes mean real
+            // new messages, which may animate.
+            if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+        }
+    }
+
+    /**
+     * Build a BLE-mesh [SonarMedia], deriving image dimensions from the bytes.
+     *
+     * Marmot media carries width/height as MIP-04 metadata, so its bubbles
+     * reserve their final box before decode (Signal pre-sizing) and the
+     * transcript never reflows. Mesh media has no metadata, so without this the
+     * bubble reserves the fixed 216x150dp skeleton and visibly grows — and
+     * shifts everything below it — the moment the image decodes. The header
+     * read is cheap (no pixel buffer) and happens once, off the render path,
+     * while we still hold the bytes.
+     */
+    private fun meshMediaFor(url: String, mime: String, filename: String, bytes: ByteArray): SonarMedia {
+        val bounds = if (mime.startsWith("image/")) decodeImageBounds(bytes) else null
+        return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null)
+    }
+
+    /**
+     * One-time migration: mesh image media persisted before [meshMediaFor]
+     * derived dimensions has null width/height, so its bubbles still reserve the
+     * skeleton box and grow on decode. Recover the dimensions from the stored
+     * bytes on the IO path at startup and rewrite the affected transcripts.
+     */
+    private suspend fun backfillMeshMediaBounds() {
+        val repaired = mutableListOf<String>()
+        for ((peerId, msgs) in meshChats.entries.toList()) {
+            var changed = false
+            val patched = msgs.map { msg ->
+                if (msg.media.isEmpty()) return@map msg
+                val media = msg.media.map { m ->
+                    val needsBounds = m.mimeType.startsWith("image/") &&
+                        (m.width == null || m.height == null) &&
+                        m.url.startsWith(MESH_MEDIA_URL_PREFIX)
+                    if (!needsBounds) return@map m
+                    val bytes = mediaCache[m.url] ?: MessageStore.loadMeshMedia(m.url) ?: return@map m
+                    val bounds = decodeImageBounds(bytes) ?: return@map m
+                    changed = true
+                    m.copy(width = bounds.first, height = bounds.second)
+                }
+                if (changed) msg.copy(media = media) else msg
+            }
+            if (changed) {
+                meshChats[peerId] = patched
+                repaired += peerId
+            }
+        }
+        for (peerId in repaired) {
+            MessageStore.saveMeshDm(peerId, meshChats[peerId].orEmpty())
+        }
+        if (repaired.isNotEmpty()) {
+            sonarLog("SonarMedia", "backfilled mesh image bounds for ${repaired.size} peer transcript(s)")
         }
     }
 
@@ -3667,13 +3843,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Recreate bounded transcript state when Back reveals an earlier chat in the stack. */
     private fun restoreTranscriptSession(chat: Screen.Chat) {
         val generation = beginTranscriptSession(chat.id)
+        clearTranscriptHydrated(chat.id)
         if (isMeshChat(chat.id)) {
             val peerId = meshPeerId(chat.id)
+            // Seed the White Noise leg from the cached snapshot so the restored
+            // paint is already complete (see openDm) — otherwise back-revealing
+            // a mesh chat repeats the BLE-tail-then-jump on every navigation.
+            val wnSnapshot = meshWhiteNoiseSeed(chat.id)
             messages = visibleMessagesForChat(
                 chat.id,
-                refreshConversationRows(refreshMeshTranscriptWindow(peerId), chat.id, generation),
+                refreshConversationRows(
+                    refreshMeshTranscriptWindow(peerId) + wnSnapshot,
+                    chat.id,
+                    generation,
+                ),
             )
-            scope.launch { refreshOpenDm(peerId) }
+            scope.launch {
+                refreshOpenDm(peerId)
+                if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
+            }
             return
         }
         if (pendingMarmotNpub(chat.id) != null || isPendingMarmotGroup(chat.id)) {
@@ -3698,6 +3886,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             )
             if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
             setCurrentVisibleMessages(chat.id, local, processCalls = true)
+            markTranscriptHydrated(chat.id)
         }
     }
 
@@ -3713,7 +3902,14 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun back() {
         cleanupPreviewTempFiles()
+        val popped = stack.lastOrNull()
         if (stack.size > 1) stack = stack.dropLast(1)
+        // The unread divider lives while its chat is on the stack; leaving the
+        // chat retires it so a later reopen (already marked read) starts clean.
+        (popped as? Screen.Chat)?.let {
+            openChatUnread = openChatUnread - it.id
+            openChatUnreadAnchor = openChatUnreadAnchor - it.id
+        }
         restoreRevealedChatOrClear()
         scope.launch { refreshChats() }
     }
@@ -3728,6 +3924,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             endTranscriptSession()
             stack = listOf(Screen.Home)
             messages = emptyList()
+            openChatUnread = emptyMap()
+            openChatUnreadAnchor = emptyMap()
         }
     }
 
@@ -6158,7 +6356,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Not connected over Bluetooth yet — stay close and try again"
             return false
         }
-        val media = SonarMedia(mediaUrl, mime, filename, null, null, null)
+        val media = meshMediaFor(mediaUrl, mime, filename, data)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
@@ -7518,7 +7716,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val id = m.messageId.ifBlank { randomMeshId() }
             if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
-            val media = SonarMedia(mediaUrl, m.mimeType, m.filename, null, null, null)
+            val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes
             scope.launch { MessageStore.saveMeshMedia(mediaUrl, m.bytes) }
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))

@@ -192,6 +192,34 @@ class HomeMessageRowsTest {
     }
 
     @Test
+    fun syntheticSummaryRowsAreStrippedBeforeSeedingATranscript() {
+        // A synthetic chat-list placeholder carries no event id, so it can never
+        // dedupe against the real row a bounded page later brings — seeding one
+        // into a transcript renders a duplicate bubble forever. Only chats
+        // inside LOCAL_SUMMARY_CHAT_LIMIT get real rows, so any chat below it
+        // would hit this.
+        val summary = SonarConversationSummary("chat", "", "hello", "peer", 42L, true, 7L, 0L)
+        val hydration = hydrateLocalConversationRows(
+            activeChatIds = setOf("chat"),
+            existingMessagesByChat = emptyMap(),
+            existingLatestByChat = emptyMap(),
+            summaries = listOf(summary),
+            pages = emptyList(),
+        )
+        val cached = hydration.messagesByChat.getValue("chat")
+
+        assertEquals(1, cached.size)
+        assertTrue(cached.single().id.startsWith(SYNTHETIC_SUMMARY_ID_PREFIX))
+        assertTrue(cached.withoutSyntheticSummaryRows().isEmpty())
+    }
+
+    @Test
+    fun realPageRowsSurviveSyntheticStripping() {
+        val real = SonarMsg("event-1", "peer", "hello", false, 42L, viaInternet = true)
+        assertEquals(listOf(real), listOf(real).withoutSyntheticSummaryRows())
+    }
+
+    @Test
     fun matchingRealPageRowIsNotReplacedBySyntheticSummary() {
         val pageRow = SonarMsg("real-message", "peer", "same", false, 42L, viaInternet = true)
         val summary = SonarConversationSummary("chat", "", "same", "peer", 42L, false, 3L, 0L)

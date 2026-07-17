@@ -547,4 +547,55 @@ class TranscriptDisplayPolicyTest {
         assertTrue(plan.visibleEchoes.isEmpty())
         assertEquals(listOf(canonical), plan.admittedCanonical)
     }
+
+    // ── firstUnreadTranscriptIndex (Signal-style unread anchoring) ──
+
+    @Test
+    fun firstUnreadIndexCountsOnlyIncomingFromTail() {
+        val rows = listOf(
+            message("a", 1),                 // incoming, read
+            message("b", 2, mine = true),    // own send, ignored
+            message("c", 3),                 // incoming, unread (oldest)
+            message("d", 4, mine = true),    // own send interleaved, ignored
+            message("e", 5),                 // incoming, unread
+        )
+        assertEquals(2, firstUnreadTranscriptIndex(rows, 2))
+    }
+
+    @Test
+    fun firstUnreadIndexIsMinusOneWhenNothingUnread() {
+        val rows = listOf(message("a", 1), message("b", 2))
+        assertEquals(-1, firstUnreadTranscriptIndex(rows, 0))
+        assertEquals(-1, firstUnreadTranscriptIndex(emptyList(), 3))
+    }
+
+    @Test
+    fun firstUnreadIndexClampsToOldestLoadedIncomingRow() {
+        // More unread than the bounded window holds: anchor at the oldest
+        // loaded incoming row instead of walking off the page.
+        val rows = listOf(
+            message("mine", 1, mine = true),
+            message("a", 2),
+            message("b", 3),
+        )
+        assertEquals(1, firstUnreadTranscriptIndex(rows, 99))
+    }
+
+    @Test
+    fun firstUnreadIndexSkipsNonMessageRows() {
+        // Call records merge into the transcript feed but never consume
+        // unread budget (the core index counts messages only).
+        val rows = listOf<Any?>(
+            message("a", 1),
+            "call-record-placeholder",
+            message("b", 3),
+        )
+        assertEquals(0, firstUnreadTranscriptIndex(rows, 2))
+    }
+
+    @Test
+    fun firstUnreadIndexOnlyMineRowsHasNoAnchor() {
+        val rows = listOf(message("a", 1, mine = true), message("b", 2, mine = true))
+        assertEquals(-1, firstUnreadTranscriptIndex(rows, 2))
+    }
 }

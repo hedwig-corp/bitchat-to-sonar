@@ -83,6 +83,18 @@ expect fun MediaImage(
 expect fun decodeImageBitmap(bytes: ByteArray): ImageBitmap?
 
 /**
+ * Read an image's pixel dimensions from its header, WITHOUT decoding pixels.
+ *
+ * Marmot media carries width/height as MIP-04 metadata, which lets a transcript
+ * bubble reserve its final box before the bytes decode (Signal pre-sizing). BLE
+ * mesh media has no such metadata, so the sender/receiver derives it here at the
+ * moment it still holds the bytes — otherwise the bubble reserves the fixed
+ * skeleton box and visibly grows when the image decodes. Returns null when the
+ * bytes are not a decodable image.
+ */
+expect fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>?
+
+/**
  * Extract a poster frame from a local video file for the pre-send preview
  * (null when the platform has no video decoder — callers show a generic video
  * tile instead). Runs a media decode: call from a background dispatcher only.

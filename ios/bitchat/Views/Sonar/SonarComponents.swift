@@ -10,6 +10,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import Combine
 import SwiftUI
 import WebKit
 import QuickLook
@@ -718,6 +719,15 @@ struct SNMsgList: View {
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
     var loadNewest: (() async -> Void)? = nil
+    /// Unread count captured at open time (before read-marking zeroed the core
+    /// counter). Non-zero opens the transcript anchored at the first unread
+    /// row with a divider, Signal-style, instead of pinning the tail.
+    var unreadCountAtOpen: UInt64 = 0
+    /// Newest known message date across the chat's folded sources. The unread
+    /// anchor may only be resolved once the visible rows have caught up to
+    /// this — hydration can publish one transport leg before the folded White
+    /// Noise groups merge in, and the missing rows are exactly the unread ones.
+    var expectedNewestDate: Date? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -727,6 +737,49 @@ struct SNMsgList: View {
     @State private var isLoadingOlder = false
     @State private var isLoadingNewest = false
     @State private var expandedMessageIDs: Set<String> = []
+    /// Frozen ID of the oldest unread row: live incoming messages (already
+    /// marked read on open) must not drift the divider down the transcript.
+    @State private var unreadAnchorId: String?
+    /// True when a caught-up feed could not place a divider (e.g. every unread
+    /// event is a call/pay control row). Ends the pending-anchor state so tail
+    /// following is not suppressed for the rest of the open.
+    @State private var unreadAnchorAbandoned = false
+
+    /// True once the visible rows have caught up with the newest message the
+    /// core index knows across the chat's folded sources. A mesh chat paints
+    /// the BLE window before the White Noise leg merges async, so before this
+    /// is true the feed is missing its newest (and unread) rows.
+    private var feedCaughtUp: Bool {
+        guard let expected = expectedNewestDate else { return true }
+        guard let newest = msgs.compactMap(\.sortDate).max() else { return false }
+        return newest >= expected
+    }
+
+    /// The [unreadCountAtOpen]-th non-mine message from the tail — core
+    /// unread_count increments only for incoming messages, so own sends
+    /// interleave without consuming budget. Re-resolves only when the frozen
+    /// row leaves the loaded window (e.g. replaced by a fresh local page).
+    private func resolveUnreadAnchor() {
+        guard unreadCountAtOpen > 0 else { return }
+        if let current = unreadAnchorId, msgs.contains(where: { $0.id == current }) { return }
+        // Wait for the rows to catch up with the newest known message before
+        // counting from the tail; freezing against a partially merged feed
+        // would anchor the divider on the wrong row.
+        if let expected = expectedNewestDate,
+           let newest = msgs.compactMap(\.sortDate).max(),
+           newest < expected {
+            return
+        }
+        var remaining = unreadCountAtOpen
+        var anchor: String? = nil
+        for m in msgs.reversed() where !m.mine && m.call == nil {
+            anchor = m.id
+            remaining -= 1
+            if remaining == 0 { break }
+        }
+        unreadAnchorId = anchor
+        if anchor == nil { unreadAnchorAbandoned = true }
+    }
 
     var body: some View {
         GeometryReader { geo in
@@ -742,6 +795,10 @@ struct SNMsgList: View {
                             .foregroundColor(SonarTheme.text3)
                             .padding(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                         ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
+                            // Signal-style unread marker above the oldest unread row.
+                            if m.id == unreadAnchorId {
+                                SNUnreadDivider().id("sn-unread")
+                            }
                             Group {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
@@ -799,7 +856,11 @@ struct SNMsgList: View {
                             }
                             }
                             .onAppear {
-                                guard i == 0, hasLeftBottom, let loadOlder, !isLoadingOlder else { return }
+                                // An unread-anchored open starts in history without
+                                // ever having visited the bottom sentinel; older
+                                // pages must still load when the reader scrolls up.
+                                guard i == 0, hasLeftBottom || unreadAnchorId != nil,
+                                      let loadOlder, !isLoadingOlder else { return }
                                 let preserveID = m.id
                                 isLoadingOlder = true
                                 Task { @MainActor in
@@ -829,17 +890,111 @@ struct SNMsgList: View {
                     }
                     .padding(EdgeInsets(top: 6, leading: 14, bottom: 10, trailing: 14))
                 }
-                .onAppear { proxy.scrollTo("sn-bottom", anchor: .bottom) }
+                .onAppear {
+                    // Signal parity: an unread chat opens at the first unread
+                    // row (divider at the top of the viewport); a fully-read
+                    // chat opens pinned at the newest message.
+                    resolveUnreadAnchor()
+                    if unreadAnchorId != nil {
+                        isNearBottom = false
+                        // The divider enters the hierarchy on the render pass
+                        // that applies the state set above; scroll after it.
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("sn-unread", anchor: .top)
+                        }
+                    } else {
+                        proxy.scrollTo("sn-bottom", anchor: .bottom)
+                    }
+                }
+                .onChange(of: unreadCountAtOpen) { _ in
+                    // A cold launch captures the unread count asynchronously
+                    // (core index read); anchor when it lands, unless the
+                    // divider already resolved.
+                    guard unreadAnchorId == nil, unreadCountAtOpen > 0 else { return }
+                    resolveUnreadAnchor()
+                    guard unreadAnchorId != nil else { return }
+                    isNearBottom = false
+                    DispatchQueue.main.async {
+                        proxy.scrollTo("sn-unread", anchor: .top)
+                    }
+                }
                 .onChange(of: msgs.count) { _ in
+                    let hadAnchor = unreadAnchorId != nil
+                    resolveUnreadAnchor()
+                    if !hadAnchor, unreadAnchorId != nil {
+                        // A late-merged transport leg just made the divider
+                        // resolvable: it owns this scroll, not the tail.
+                        isNearBottom = false
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("sn-unread", anchor: .top)
+                        }
+                        return
+                    }
+                    // While the divider is still pending, don't follow merged
+                    // rows to the bottom — the anchor scroll would lose the
+                    // race. An abandoned anchor is no longer pending.
+                    if unreadCountAtOpen > 0, unreadAnchorId == nil, !unreadAnchorAbandoned { return }
                     guard isNearBottom else { return }
-                    if reduceMotion {
+                    // A mesh chat paints the BLE window before the White Noise
+                    // leg merges async; following that merge with an ANIMATED
+                    // scroll is the visible jump users see on open (a pure
+                    // Marmot chat never does it — its first page already holds
+                    // the newest rows). Re-pin instantly until the rows catch
+                    // up with the newest known message; animate only genuinely
+                    // new post-settle messages.
+                    if reduceMotion || !feedCaughtUp {
                         proxy.scrollTo("sn-bottom", anchor: .bottom)
                     } else {
                         withAnimation { proxy.scrollTo("sn-bottom", anchor: .bottom) }
                     }
                 }
+                #if canImport(UIKit)
+                // The keyboard shrinking the viewport must not hide the newest
+                // messages when the reader is at the tail (Signal keeps the
+                // transcript pinned under the composer). Matches the Android
+                // TranscriptTailPinner IME behavior. Pin twice: once as the
+                // keyboard starts and once after its ~0.25s animation settles —
+                // a single immediate scroll lands on pre-shrink viewport
+                // metrics and still leaves the tail behind the keyboard.
+                .onReceive(NotificationCenter.default.publisher(
+                    for: UIResponder.keyboardWillShowNotification
+                )) { _ in
+                    guard isNearBottom else { return }
+                    let pin = {
+                        if reduceMotion {
+                            proxy.scrollTo("sn-bottom", anchor: .bottom)
+                        } else {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo("sn-bottom", anchor: .bottom)
+                            }
+                        }
+                    }
+                    DispatchQueue.main.async(execute: pin)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: pin)
+                }
+                #endif
             }
         }
+    }
+}
+
+/// Signal-style unread marker: hairlines around a centered label, anchored
+/// above the oldest unread row captured at chat-open time.
+struct SNUnreadDivider: View {
+    var body: some View {
+        HStack(spacing: 10) {
+            Rectangle()
+                .fill(SonarTheme.text3.opacity(0.25))
+                .frame(height: 1)
+            Text(verbatim: "Unread messages")
+                .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
+                .foregroundColor(SonarTheme.text2)
+                .fixedSize()
+            Rectangle()
+                .fill(SonarTheme.text3.opacity(0.25))
+                .frame(height: 1)
+        }
+        .padding(.vertical, 8)
     }
 }
 
@@ -925,6 +1080,23 @@ private func snFittedMediaSize(_ size: CGSize, maxWidth: CGFloat, maxHeight: CGF
     }
     let scale = min(maxWidth / size.width, maxHeight / size.height)
     return CGSize(width: max(1, size.width * scale), height: max(1, size.height * scale))
+}
+
+/// Signal pre-sizes media cells from stored attachment dimensions (Signal-Android
+/// ThumbnailView measures from DB width/height; Signal-iOS CVMediaAlbumView from
+/// sourceMediaSizePixels) so the decoded image never reflows the transcript.
+/// Reserve the exact box the decoded image will occupy; dimension-less media
+/// keeps the legacy fixed skeleton box.
+private func snReservedMediaSize(_ item: SNMediaItem, maxWidth: CGFloat) -> CGSize {
+    if item.isGif { return CGSize(width: maxWidth, height: 220) }
+    guard let w = item.width, let h = item.height, w > 0, h > 0 else {
+        return CGSize(width: maxWidth * 0.62, height: 150)
+    }
+    return snFittedMediaSize(
+        CGSize(width: CGFloat(w), height: CGFloat(h)),
+        maxWidth: maxWidth,
+        maxHeight: 300
+    )
 }
 
 private extension Data {
@@ -1295,9 +1467,10 @@ struct SNMediaBubble: View {
             } else if bytes != nil {
                 fileChip(for: item)
             } else {
+                let reserved = snReservedMediaSize(item, maxWidth: maxBubbleWidth)
                 RoundedRectangle(cornerRadius: 18)
                     .fill(SonarTheme.surface2)
-                    .frame(width: maxBubbleWidth * 0.62, height: 150)
+                    .frame(width: reserved.width, height: reserved.height)
                     .overlay {
                         if failed {
                             VStack(spacing: 8) {

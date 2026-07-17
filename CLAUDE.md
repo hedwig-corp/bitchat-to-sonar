@@ -22,6 +22,12 @@ local send in one chat must not advance another chat past missing peer messages.
 
 ## Signal-Style Conversation Design Notes
 
+Before touching conversation, transcript, or unread code, read
+[`docs/CHAT-TYPES.md`](docs/CHAT-TYPES.md): Sonar has two structurally different
+chat kinds (pure White Noise/Marmot vs mesh-folded), with different id models
+and staged hydration. Code that assumes one kind silently breaks the other —
+always test both.
+
 Signal treats the local database as the chat state. Network receive/send/sync paths write into local storage first, then the chat list and transcript UI react to local database invalidation. Android pages local conversation rows from `ThreadTable` through `ConversationListDataSource` with a small paging window; iOS builds chat-list render state from local thread IDs through `CLVLoader` and caches row view models/content. Sonar conversation work should follow that model: maintain core-owned local conversation summaries ordered by latest message, hydrate visible chat rows from bounded local pages, open transcripts from bounded local message windows, and run relay sync only as a background database updater.
 
 ## XChat-Style Chat Startup Rule
