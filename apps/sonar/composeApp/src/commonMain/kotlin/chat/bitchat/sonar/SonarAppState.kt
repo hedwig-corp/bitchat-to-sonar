@@ -69,7 +69,7 @@ data class StickerBenchmarkRequest(
 // profile TTLs). Foreground idle CPU is set by the heartbeat cadence.
 private const val HEARTBEAT_FG_MS = 30_000L
 private const val HEARTBEAT_BG_MS = 60_000L
-/** Visible-Radar cadence for publishing payment-only BLE scan results to UI. */
+/** Visible-Radar cadence for publishing BLE mesh + payment scan results to UI. */
 private const val NEARBY_PEER_REFRESH_MS = 1_000L
 /** Relay `sync()` cadence (was every ~60 s on the old 4 s tick). */
 private const val SYNC_INTERVAL_MS = 60_000L
@@ -96,13 +96,32 @@ internal fun shouldScanForNearbyPayments(
     isDiscoveryRestricted: Boolean,
 ): Boolean = isNearbyVisible && isForeground && isOnboarded && !isDiscoveryRestricted
 
-internal fun <T> CoroutineScope.launchNearbyPeerRefresh(
+internal fun shouldRefreshNearbyPeers(
+    isNearbyVisible: Boolean,
+    isForeground: Boolean,
+    isOnboarded: Boolean,
+): Boolean = isNearbyVisible && isForeground && isOnboarded
+
+internal fun <M, U> CoroutineScope.launchNearbyPeerRefresh(
     intervalMs: Long = NEARBY_PEER_REFRESH_MS,
-    readPeers: () -> List<T>,
-    publishPeers: (List<T>) -> Unit,
+    readMeshPeers: () -> List<M>,
+    publishMeshPeers: (List<M>) -> Unit,
+    readUnifyPeers: () -> List<U>,
+    publishUnifyPeers: (List<U>) -> Unit,
 ): Job = launch {
+    var lastMeshPeers: List<M>? = null
+    var lastUnifyPeers: List<U>? = null
     while (isActive) {
-        publishPeers(readPeers())
+        val meshPeers = readMeshPeers().toList()
+        if (meshPeers != lastMeshPeers) {
+            lastMeshPeers = meshPeers
+            publishMeshPeers(meshPeers)
+        }
+        val unifyPeers = readUnifyPeers().toList()
+        if (unifyPeers != lastUnifyPeers) {
+            lastUnifyPeers = unifyPeers
+            publishUnifyPeers(unifyPeers)
+        }
         delay(intervalMs)
     }
 }
@@ -1523,8 +1542,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         bumpHoldInputs()
     }
 
-    private fun updateMeshPeersFromRadio(nowMs: Long = SonarClock.nowMillis()) {
-        val rawPeers = MeshRadio.peers()
+    private fun updateMeshPeersFromRadio(
+        rawPeers: List<MeshPeer> = MeshRadio.peers(),
+        nowMs: Long = SonarClock.nowMillis(),
+    ) {
         val previousPeerIds = rawMeshPeerIds
         rawMeshPeerIds = rawPeers.map { meshPeerId(it.id) }.toSet()
         meshPeerFirstSeenMs.keys.retainAll(rawMeshPeerIds + meshChats.keys + linkByFp.keys)
@@ -2559,7 +2580,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Cached amountless BOLT12 offer we advertise as the Unify receiver. */
     private var unifyOffer: String? = null
 
-    /** Keep the payment-only scan and its bounded visible-Radar refresh aligned
+    /** Keep the payment-only scan and bounded visible-Radar peer refresh aligned
      *  with navigation, foreground, onboarding, and discovery restrictions. */
     private fun updateNearbyScanning() {
         val shouldScan = shouldScanForNearbyPayments(
@@ -2568,19 +2589,29 @@ class SonarAppState(private val scope: CoroutineScope) {
             isOnboarded = onboarded,
             isDiscoveryRestricted = bleDiscoveryRestricted,
         )
-        if (!shouldScan) {
-            nearbyPeerRefreshJob?.cancel()
-            nearbyPeerRefreshJob = null
+        if (shouldScan) {
+            UnifyRadio.startScanning()
+        } else {
             UnifyRadio.stopScanning()
             unifyPeers = emptyList()
-        } else {
-            UnifyRadio.startScanning()
-            if (nearbyPeerRefreshJob?.isActive != true) {
-                nearbyPeerRefreshJob = scope.launchNearbyPeerRefresh(
-                    readPeers = UnifyRadio::peers,
-                    publishPeers = { unifyPeers = it },
-                )
-            }
+        }
+        val shouldRefresh = shouldRefreshNearbyPeers(
+            isNearbyVisible = isNearbyVisible,
+            isForeground = foreground,
+            isOnboarded = onboarded,
+        )
+        if (!shouldRefresh) {
+            nearbyPeerRefreshJob?.cancel()
+            nearbyPeerRefreshJob = null
+        } else if (nearbyPeerRefreshJob?.isActive != true) {
+            nearbyPeerRefreshJob = scope.launchNearbyPeerRefresh(
+                readMeshPeers = MeshRadio::peers,
+                publishMeshPeers = { updateMeshPeersFromRadio(rawPeers = it) },
+                readUnifyPeers = {
+                    if (bleDiscoveryRestricted) emptyList() else UnifyRadio.peers()
+                },
+                publishUnifyPeers = { unifyPeers = it },
+            )
         }
     }
 

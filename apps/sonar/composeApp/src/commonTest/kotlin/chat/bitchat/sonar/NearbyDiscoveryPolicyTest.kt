@@ -21,30 +21,47 @@ class NearbyDiscoveryPolicyTest {
         assertFalse(shouldScanForNearbyPayments(true, true, true, true))
     }
 
+    @Test
+    fun nearbyMeshRefreshContinuesForKnownPeersWhenOpenDiscoveryIsRestricted() {
+        assertTrue(shouldRefreshNearbyPeers(true, true, true))
+        assertFalse(shouldRefreshNearbyPeers(false, true, true))
+        assertFalse(shouldRefreshNearbyPeers(true, false, true))
+        assertFalse(shouldRefreshNearbyPeers(true, true, false))
+    }
+
     @OptIn(ExperimentalCoroutinesApi::class)
     @Test
-    fun nearbyRefreshPublishesPeersWithoutWaitingForHousekeepingHeartbeat() = runTest {
-        val radioPeers = mutableListOf<String>()
-        var publishedPeers = emptyList<String>()
+    fun nearbyRefreshPublishesMeshAndUnifyPeersWithoutWaitingForHousekeepingHeartbeat() = runTest {
+        val radioMeshPeers = mutableListOf<MeshPeer>()
+        val radioUnifyPeers = mutableListOf<String>()
+        var publishedMeshPeers = emptyList<MeshPeer>()
+        var publishedUnifyPeers = emptyList<String>()
         val refreshJob = launchNearbyPeerRefresh(
             intervalMs = 100,
-            readPeers = { radioPeers.toList() },
-            publishPeers = { publishedPeers = it },
+            readMeshPeers = { radioMeshPeers.toList() },
+            publishMeshPeers = { publishedMeshPeers = it },
+            readUnifyPeers = { radioUnifyPeers.toList() },
+            publishUnifyPeers = { publishedUnifyPeers = it },
         )
 
         runCurrent()
-        assertTrue(publishedPeers.isEmpty())
+        assertTrue(publishedMeshPeers.isEmpty())
+        assertTrue(publishedUnifyPeers.isEmpty())
 
-        radioPeers += "payer"
+        radioMeshPeers += MeshPeer("mesh:whitewholf-fingerprint", "whitewholf", -50)
+        radioUnifyPeers += "payer"
         advanceTimeBy(100)
         runCurrent()
-        assertEquals(listOf("payer"), publishedPeers)
+        assertEquals(listOf("whitewholf"), publishedMeshPeers.map { it.name })
+        assertEquals(listOf("payer"), publishedUnifyPeers)
 
         refreshJob.cancelAndJoin()
-        radioPeers += "late payer"
+        radioMeshPeers += MeshPeer("mesh:late-fingerprint", "late peer", -60)
+        radioUnifyPeers += "late payer"
         advanceTimeBy(100)
         runCurrent()
-        assertEquals(listOf("payer"), publishedPeers)
+        assertEquals(listOf("whitewholf"), publishedMeshPeers.map { it.name })
+        assertEquals(listOf("payer"), publishedUnifyPeers)
     }
 
     @Test
