@@ -429,6 +429,12 @@ data class AlbumUpload(
  * cross-platform-testable slice that interops with the iOS app via the same
  * protocol + relays. BLE mesh / geohash come later (issue #6).
  */
+internal fun mediaOutboxHandoffRequired(
+    usedNode: Any,
+    currentNode: Any,
+    relayConnected: Boolean,
+): Boolean = relayConnected && usedNode !== currentNode
+
 expect object SonarCore {
     /** Ensure an identity exists and open the encrypted local database without
      *  waiting for relay connectivity. Returns our npub. Safe to call repeatedly. */
