@@ -37,6 +37,7 @@ use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
+use crate::media::MediaRole;
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
@@ -3592,8 +3593,51 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
+        self.send_media_multi_with_role(group_id, items, caption, server_url, MediaRole::Standard)
+            .await
+    }
+
+    /// Send one short circular video note. The encrypted attachment stays a
+    /// regular MP4; a versioned role tag inside the MLS rumor selects Sonar's
+    /// circular presentation without breaking White Noise clients.
+    pub async fn send_video_note(
+        &self,
+        group_id: &GroupId,
+        data: Vec<u8>,
+        filename: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        self.send_media_multi_with_role(
+            group_id,
+            vec![MediaUpload {
+                data,
+                filename: filename.to_string(),
+                mime: "video/mp4".to_string(),
+            }],
+            "",
+            server_url,
+            MediaRole::VideoNote,
+        )
+        .await
+    }
+
+    async fn send_media_multi_with_role(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+        role: MediaRole,
+    ) -> Result<()> {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
+        }
+        if role == MediaRole::VideoNote
+            && (items.len() != 1 || items[0].mime.split(';').next() != Some("video/mp4"))
+        {
+            return Err(Error::Media(
+                "video notes require exactly one video/mp4 attachment".into(),
+            ));
         }
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
@@ -3636,8 +3680,16 @@ impl SonarClient {
         // could have stranded a false-Sent row.
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
-            self.engine
-                .create_and_process_media_event_multi(group_id, &refs, caption)?
+            match role {
+                MediaRole::Standard => self
+                    .engine
+                    .create_and_process_media_event_multi(group_id, &refs, caption)?,
+                MediaRole::VideoNote => {
+                    let (upload, url) = refs[0];
+                    self.engine
+                        .create_and_process_video_note_event(group_id, upload, url)?
+                }
+            }
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -5933,6 +5985,7 @@ mod tests {
             width: None,
             height: None,
             duration_ms: None,
+            role: MediaRole::Standard,
         };
         let msg = |content: &str, media: Vec<crate::marmot::MediaRef>| ChatMessage {
             id: test_event_id(9),
@@ -6711,6 +6764,36 @@ mod tests {
             .expect("bob has a media message");
         assert_eq!(bob_msg.media[0].url, url);
         assert_eq!(bob_msg.media[0].mime_type, "audio/mp4");
+        assert_eq!(bob_msg.media[0].role, MediaRole::Standard);
+
+        // A video note adds only Sonar's encrypted presentation tag. The same
+        // MP4 imeta still decrypts normally and older clients can ignore the
+        // unknown tag without losing the attachment.
+        let video_url = "https://blossom.test/video-note";
+        let video_upload = alice
+            .encrypt_media(&group_id, b"fake-mp4", "video/mp4", "note.mp4")
+            .expect("alice encrypts video note");
+        let (video_event, alice_video) = alice
+            .create_and_process_video_note_event(&group_id, &video_upload, video_url)
+            .expect("alice creates video note");
+        let Incoming::Message(alice_video) = alice_video else {
+            panic!("video note should produce a local message");
+        };
+        assert_eq!(alice_video.media[0].role, MediaRole::VideoNote);
+        assert!(matches!(
+            bob.process_incoming(&video_event)
+                .await
+                .expect("bob receives video note"),
+            Incoming::Message(_)
+        ));
+        let bob_video = bob
+            .messages(&bob_group_id)
+            .expect("bob messages")
+            .into_iter()
+            .find(|m| m.media.iter().any(|media| media.url == video_url))
+            .expect("bob has video note");
+        assert_eq!(bob_video.media[0].mime_type, "video/mp4");
+        assert_eq!(bob_video.media[0].role, MediaRole::VideoNote);
 
         // The "downloaded" ciphertext decrypts back to the original bytes for
         // BOTH sender and receiver, keyed off the locally stored imeta.

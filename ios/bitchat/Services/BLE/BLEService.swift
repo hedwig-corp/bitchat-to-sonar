@@ -1437,6 +1437,7 @@ final class BLEService: NSObject {
         // BCH-01-002: Enforce storage quota before saving
         enforceIncomingFilesQuota(reservingBytes: filePacket.content.count)
 
+        let isVideoNote = filePacket.mediaRole == .videoNote && mime == .mp4Video
         let fallbackExt = mime.defaultExtension
         let subdirectory: String
         switch mime.category {
@@ -1444,6 +1445,10 @@ final class BLEService: NSObject {
             subdirectory = "voicenotes/incoming"
         case .image:
             subdirectory = "images/incoming"
+        case .video:
+            subdirectory = isVideoNote
+                ? "videonotes/incoming"
+                : "files/incoming"
         case .file:
             subdirectory = "files/incoming"
         }
@@ -1460,13 +1465,17 @@ final class BLEService: NSObject {
 
         let marker: String
         let fileName = destination.lastPathComponent
-        switch mime.category {
-        case .audio:
-            marker = "[voice] \(fileName)"
-        case .image:
-            marker = "[image] \(fileName)"
-        case .file:
-            marker = "[file] \(fileName)"
+        if isVideoNote {
+            marker = "[video-note] \(fileName)"
+        } else {
+            switch mime.category {
+            case .audio:
+                marker = "[voice] \(fileName)"
+            case .image:
+                marker = "[image] \(fileName)"
+            case .video, .file:
+                marker = "[file] \(fileName)"
+            }
         }
 
         let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID

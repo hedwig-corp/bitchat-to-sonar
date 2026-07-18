@@ -132,6 +132,8 @@ data class SonarRecentTranscriptPage(
 
 /** A reference to an encrypted media attachment. [url] is the Blossom URL of the
  *  CIPHERTEXT; call [SonarCore.fetchMedia] to download + decrypt. */
+enum class MediaRole { Standard, VideoNote }
+
 data class SonarMedia(
     val url: String,
     val mimeType: String,
@@ -142,11 +144,15 @@ data class SonarMedia(
     /** Optional user caption attached to the media (Signal-first checklist:
      *  the data model carries captions even before the UI exposes them). */
     val caption: String? = null,
+    /** Presentation metadata only. The encrypted payload remains an ordinary
+     *  MP4 so clients that do not understand this field still show a video. */
+    val role: MediaRole = MediaRole.Standard,
 ) {
     val isImage: Boolean get() = mimeType.startsWith("image/")
     val isGif: Boolean get() =
         mimeType.equals("image/gif", ignoreCase = true) ||
             filename.endsWith(".gif", ignoreCase = true)
+    val isVideoNote: Boolean get() = role == MediaRole.VideoNote
 }
 
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity
@@ -508,6 +514,14 @@ expect object SonarCore {
         filename: String,
         mime: String,
         caption: String,
+        serverUrl: String = "",
+    )
+
+    /** Send a standard H.264/AAC MP4 with Sonar's circular video-note role. */
+    suspend fun sendVideoNote(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
         serverUrl: String = "",
     )
 

@@ -33,6 +33,7 @@ enum MimeType: CaseIterable, Hashable {
     case wav
     case xWav
     case ogg
+    case mp4Video
     case pdf
     case octetStream
 
@@ -48,6 +49,7 @@ enum MimeType: CaseIterable, Hashable {
         case .mp3, .mpeg:   .mp3
         case .wav, .xWav:   .wav
         case .ogg:          .ogg
+        case .mp4Video:     .mpeg4Movie
         case .pdf:          .pdf
         case .octetStream:  .data
         }
@@ -59,6 +61,8 @@ enum MimeType: CaseIterable, Hashable {
             return .image
         case .aac, .m4a, .mp4Audio, .mpeg, .mp3, .wav, .xWav, .ogg:
             return .audio
+        case .mp4Video:
+            return .video
         case .pdf, .octetStream:
             return .file
         }
@@ -79,6 +83,7 @@ enum MimeType: CaseIterable, Hashable {
         case .wav:          "audio/wav"
         case .xWav:         "audio/x-wav"
         case .ogg:          "audio/ogg"
+        case .mp4Video:     "video/mp4"
         case .pdf:          "application/pdf"
         case .octetStream:  "application/octet-stream"
         }
@@ -94,6 +99,7 @@ enum MimeType: CaseIterable, Hashable {
         case .mpeg, .mp3:           "mp3"
         case .wav, .xWav:           "wav"
         case .ogg:                  "ogg"
+        case .mp4Video:             "mp4"
         case .pdf:                  "pdf"
         case .octetStream:          "bin"
         }
@@ -103,6 +109,7 @@ enum MimeType: CaseIterable, Hashable {
         .jpeg, .jpg, .png, .gif, .webp,
         .mp4Audio, .m4a, .aac, .mpeg, .mp3,
         .wav, .xWav, .ogg,
+        .mp4Video,
         .pdf, .octetStream
     ]
 
@@ -139,6 +146,10 @@ enum MimeType: CaseIterable, Hashable {
             // AVAudioRecorder output varies by platform - be lenient
             // Security: size already capped + sandboxed execution
             return data.count > 100
+
+        case .mp4Video:
+            return data.count >= 12 &&
+                data[4] == 0x66 && data[5] == 0x74 && data[6] == 0x79 && data[7] == 0x70
 
         case .mpeg, .mp3:
             if data.count >= 3 && data[0] == 0x49 && data[1] == 0x44 && data[2] == 0x33 {
@@ -190,6 +201,6 @@ enum MimeType: CaseIterable, Hashable {
 
 extension MimeType {
     enum Category: String {
-        case audio, image, file
+        case audio, image, video, file
     }
 }

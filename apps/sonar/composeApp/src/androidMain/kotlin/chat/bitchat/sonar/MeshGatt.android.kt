@@ -24,6 +24,7 @@ import uniffi.sonar_ffi.MeshEngineEvent
 import uniffi.sonar_ffi.MeshEngineOutput
 import uniffi.sonar_ffi.MeshLinkEngine
 import uniffi.sonar_ffi.MeshPublicMessage
+import uniffi.sonar_ffi.MediaRoleInfo
 import uniffi.sonar_ffi.NoiseKeypairHex
 import uniffi.sonar_ffi.noiseGenerateKeypair
 
@@ -121,7 +122,7 @@ object MeshGatt {
     private val onAnnounce = java.util.concurrent.CopyOnWriteArrayList<(String, MeshAnnounceInfo, String) -> Unit>()
     private val onLink = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
     private val onBroadcast = java.util.concurrent.CopyOnWriteArrayList<(String, MeshPublicMessage) -> Unit>()
-    private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray) -> Unit>()
+    private val onFile = java.util.concurrent.CopyOnWriteArrayList<(String, String, String, String, ByteArray, MediaRole) -> Unit>()
 
     fun addMessageListener(cb: (fingerprint: String, messageId: String, text: String) -> Unit) { onText.add(cb) }
     fun addSonarListener(cb: (fingerprint: String, payload: ByteArray) -> Unit) { onSonar.add(cb) }
@@ -132,7 +133,7 @@ object MeshGatt {
     fun addBroadcastListener(cb: (senderFingerprint: String, message: MeshPublicMessage) -> Unit) { onBroadcast.add(cb) }
     /** Incoming private file transfers. `fingerprint` is the sender's stable
      *  fingerprint, matching [addMessageListener]. */
-    fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray) -> Unit) {
+    fun addFileListener(cb: (fingerprint: String, messageId: String, filename: String, mime: String, bytes: ByteArray, role: MediaRole) -> Unit) {
         onFile.add(cb)
     }
 
@@ -286,6 +287,13 @@ object MeshGatt {
         return transact { engine.sendFile(fingerprint, bytes, safeName, mime, nowMs()) } != null
     }
 
+    fun sendVideoNoteToPeer(fingerprint: String, messageId: String, bytes: ByteArray, filename: String): Boolean {
+        if (bytes.isEmpty() || bytes.size > MAX_FILE_TRANSFER_BYTES) return false
+        if (normalizedMime("video/mp4", bytes) != "video/mp4") return false
+        val safeName = safeFileName(filename, "video/mp4", System.currentTimeMillis())
+        return transact { engine.sendVideoNote(fingerprint, bytes, safeName, nowMs()) } != null
+    }
+
     /** Broadcast a PUBLIC message (the BLE "Mesh" channel) to every connected
      *  mesh peer. Returns false if no peer is connected. */
     fun broadcastPublic(text: String): Boolean {
@@ -383,7 +391,11 @@ object MeshGatt {
                 val bytes = event.content
                 val mime = normalizedMime(event.mimeType, bytes) ?: continue
                 val name = safeFileName(event.fileName, mime, event.timestampMs)
-                onFile.forEach { it(event.fingerprint, "${event.transferKey}-file", name, mime, bytes) }
+                val role = when (event.role) {
+                    MediaRoleInfo.VIDEO_NOTE -> if (mime == "video/mp4") MediaRole.VideoNote else MediaRole.Standard
+                    MediaRoleInfo.STANDARD -> MediaRole.Standard
+                }
+                onFile.forEach { it(event.fingerprint, "${event.transferKey}-file", name, mime, bytes, role) }
             }
             is MeshEngineEvent.BroadcastReceived -> {
                 android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
@@ -753,6 +765,7 @@ private fun allowedMimes(): Set<String> = setOf(
     "image/jpeg", "image/jpg", "image/png", "image/gif", "image/webp",
     "audio/mp4", "audio/m4a", "audio/aac", "audio/mpeg", "audio/mp3",
     "audio/wav", "audio/x-wav", "audio/ogg",
+    "video/mp4",
     "application/pdf", "application/octet-stream",
 )
 
@@ -764,6 +777,7 @@ private fun sniffMime(bytes: ByteArray): String? = when {
     mimeMatches("audio/mpeg", bytes) -> "audio/mpeg"
     mimeMatches("audio/wav", bytes) -> "audio/wav"
     mimeMatches("audio/ogg", bytes) -> "audio/ogg"
+    mimeMatches("video/mp4", bytes) -> "video/mp4"
     mimeMatches("application/pdf", bytes) -> "application/pdf"
     else -> null
 }
@@ -789,6 +803,7 @@ private fun mimeMatches(mime: String, bytes: ByteArray): Boolean {
             b(0) == 0x52 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x46 &&
             b(8) == 0x57 && b(9) == 0x41 && b(10) == 0x56 && b(11) == 0x45
         "audio/ogg" -> bytes.size >= 4 && b(0) == 0x4F && b(1) == 0x67 && b(2) == 0x67 && b(3) == 0x53
+        "video/mp4" -> bytes.size >= 12 && b(4) == 0x66 && b(5) == 0x74 && b(6) == 0x79 && b(7) == 0x70
         "application/pdf" -> bytes.size >= 4 && b(0) == 0x25 && b(1) == 0x50 && b(2) == 0x44 && b(3) == 0x46
         "application/octet-stream" -> true
         else -> false
@@ -804,6 +819,7 @@ private fun defaultExtension(mime: String): String = when (mime) {
     "audio/mpeg", "audio/mp3" -> "mp3"
     "audio/wav", "audio/x-wav" -> "wav"
     "audio/ogg" -> "ogg"
+    "video/mp4" -> "mp4"
     "application/pdf" -> "pdf"
     else -> "bin"
 }

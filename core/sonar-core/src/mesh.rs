@@ -927,6 +927,7 @@ pub mod fragment {
 /// exchange images / voice notes / files over Bluetooth.
 pub mod file_packet {
     use super::fragment::Fragment;
+    use crate::media::MediaRole;
 
     /// Max content size (bitchat `FileTransferLimits.maxPayloadBytes` = 1 MiB).
     pub const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -939,6 +940,9 @@ pub mod file_packet {
     const T_FILE_SIZE: u8 = 0x02;
     const T_MIME_TYPE: u8 = 0x03;
     const T_CONTENT: u8 = 0x04;
+    /// Optional Sonar presentation metadata. Stock bitchat and older Sonar
+    /// decoders skip unknown TLVs and still receive the ordinary MP4/file.
+    const T_MEDIA_ROLE: u8 = 0x05;
 
     /// A decoded file transfer payload.
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -946,6 +950,7 @@ pub mod file_packet {
         pub file_name: Option<String>,
         pub file_size: Option<u64>,
         pub mime_type: Option<String>,
+        pub media_role: Option<MediaRole>,
         pub content: Vec<u8>,
     }
 
@@ -981,6 +986,12 @@ pub mod file_packet {
                     out.extend_from_slice(mb);
                 }
             }
+            if let Some(role) = self.media_role.and_then(MediaRole::wire_value) {
+                let rb = role.as_bytes();
+                out.push(T_MEDIA_ROLE);
+                out.extend_from_slice(&(rb.len() as u16).to_be_bytes());
+                out.extend_from_slice(rb);
+            }
             out.push(T_CONTENT);
             out.extend_from_slice(&(self.content.len() as u32).to_be_bytes());
             out.extend_from_slice(&self.content);
@@ -995,6 +1006,7 @@ pub mod file_packet {
             let mut file_name = None;
             let mut file_size: Option<u64> = None;
             let mut mime_type = None;
+            let mut media_role = None;
             let mut content: Vec<u8> = Vec::new();
 
             // Read a big-endian length of `bytes` width, advancing `cur`.
@@ -1052,6 +1064,12 @@ pub mod file_packet {
                         }
                     }
                     T_MIME_TYPE => mime_type = String::from_utf8(value.to_vec()).ok(),
+                    T_MEDIA_ROLE => {
+                        media_role = std::str::from_utf8(value)
+                            .ok()
+                            .map(MediaRole::from_wire_value)
+                            .filter(|role| *role != MediaRole::Standard);
+                    }
                     T_CONTENT => {
                         if content.len() + value.len() > MAX_PAYLOAD_BYTES {
                             return None;
@@ -1065,10 +1083,19 @@ pub mod file_packet {
             if content.is_empty() || content.len() > MAX_PAYLOAD_BYTES {
                 return None;
             }
+            let is_video_mp4 = mime_type
+                .as_deref()
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .is_some_and(|value| value.eq_ignore_ascii_case("video/mp4"));
+            if !is_video_mp4 {
+                media_role = None;
+            }
             Some(FilePacket {
                 file_name,
                 file_size: Some(file_size.unwrap_or(content.len() as u64)),
                 mime_type,
+                media_role,
                 content,
             })
         }

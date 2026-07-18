@@ -200,6 +200,15 @@ actual object SonarCore {
         requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
     }
 
+    actual suspend fun sendVideoNote(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendVideoNote(chatId, data, filename, serverUrl)
+    }
+
     actual suspend fun sendMediaMulti(
         chatId: String,
         items: List<AlbumUpload>,
@@ -391,6 +400,10 @@ actual object SonarCore {
                 width = m.width?.toInt(),
                 height = m.height?.toInt(),
                 durationMs = m.durationMs?.toLong(),
+                role = when (m.role) {
+                    uniffi.sonar_ffi.MediaRoleInfo.VIDEO_NOTE -> MediaRole.VideoNote
+                    uniffi.sonar_ffi.MediaRoleInfo.STANDARD -> MediaRole.Standard
+                },
             )
         },
         state = deliveryState.toUiState(mine),

@@ -488,6 +488,55 @@ extension ChatViewModel {
         }
     }
 
+    /// Send a Sonar video note over the bitchat file-transfer envelope. Stock
+    /// clients can ignore the optional role TLV and still receive a normal MP4.
+    @MainActor
+    func sendVideoNote(data: Data, filename: String) -> Bool {
+        guard canSendMediaInCurrentContext,
+              FileTransferLimits.isValidPayload(data.count),
+              MimeType.mp4Video.matches(data: data),
+              let base = try? applicationFilesDirectory()
+        else { return false }
+
+        let directory = base.appendingPathComponent("videonotes/outgoing", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let rawName = (filename as NSString).lastPathComponent
+            let safeName = rawName.isEmpty ? "video-note-\(UUID().uuidString).mp4" : rawName
+            let savedURL = directory.appendingPathComponent("\(UUID().uuidString)-\(safeName)")
+            try data.write(to: savedURL, options: [.atomic, .completeFileProtection])
+
+            let targetPeer = selectedPrivateChatPeer
+            let message = enqueueMediaMessage(
+                content: "[video-note] \(savedURL.lastPathComponent)",
+                targetPeer: targetPeer
+            )
+            let transferId = makeTransferID(messageID: message.id)
+            let packet = BitchatFilePacket(
+                fileName: savedURL.lastPathComponent,
+                fileSize: UInt64(data.count),
+                mimeType: "video/mp4",
+                mediaRole: .videoNote,
+                content: data
+            )
+            guard packet.encode() != nil else {
+                try? FileManager.default.removeItem(at: savedURL)
+                handleMediaSendFailure(messageID: message.id, reason: "Failed to encode video note")
+                return false
+            }
+            registerTransfer(transferId: transferId, messageID: message.id)
+            if let targetPeer {
+                meshService.sendFilePrivate(packet, to: targetPeer, transferId: transferId)
+            } else {
+                meshService.sendFileBroadcast(packet, transferId: transferId)
+            }
+            return true
+        } catch {
+            SecureLogger.error("Video note preparation failed: \(error)", category: .session)
+            return false
+        }
+    }
+
     private func saveOutgoingFile(data: Data, filename: String, mime: MimeType) -> URL? {
         do {
             let base = try applicationFilesDirectory()
@@ -549,6 +598,8 @@ extension ChatViewModel {
             return "voicenotes/outgoing"
         case .image:
             return "images/outgoing"
+        case .video:
+            return "files/outgoing"
         case .file:
             return "files/outgoing"
         }
@@ -560,6 +611,8 @@ extension ChatViewModel {
             return "[voice]"
         case .image:
             return "[image]"
+        case .video:
+            return "[file]"
         case .file:
             return "[file]"
         }
@@ -662,9 +715,10 @@ extension ChatViewModel {
 
     func cleanupLocalFile(forMessage message: BitchatMessage) {
         // Check both outgoing and incoming directories for thorough cleanup
-        let prefixes = ["[voice] ", "[image] ", "[file] "]
+        let prefixes = ["[voice] ", "[image] ", "[file] ", "[video-note] "]
         let subdirs = ["voicenotes/outgoing", "voicenotes/incoming",
                        "images/outgoing", "images/incoming",
+                       "videonotes/outgoing", "videonotes/incoming",
                        "files/outgoing", "files/incoming"]
 
         guard let prefix = prefixes.first(where: { message.content.hasPrefix($0) }) else { return }

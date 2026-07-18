@@ -6,6 +6,7 @@
 //! Bluetooth. The byte-vector test is the canonical interop anchor: Sonar must
 //! produce the identical bytes bitchat's Swift encoder produces.
 
+use sonar_core::media::MediaRole;
 use sonar_core::mesh::file_packet::{fragment, FilePacket};
 use sonar_core::mesh::fragment::{Fragment, Reassembler};
 use sonar_core::mesh::{
@@ -23,6 +24,7 @@ fn file_packet_encodes_byte_for_byte_like_bitchat() {
         file_name: Some("a.txt".to_string()),
         file_size: None, // → resolved to content.len()
         mime_type: Some("text/plain".to_string()),
+        media_role: None,
         content: b"hi".to_vec(),
     };
     // TLV order: fileName(0x01,u16 len) | fileSize(0x02,u16=4,u32) |
@@ -51,6 +53,7 @@ fn file_packet_round_trip_preserves_fields() {
         file_name: Some("sample.jpg".to_string()),
         file_size: Some(content.len() as u64),
         mime_type: Some("image/jpeg".to_string()),
+        media_role: None,
         content: content.clone(),
     };
     let encoded = packet.encode().expect("encode");
@@ -59,6 +62,46 @@ fn file_packet_round_trip_preserves_fields() {
     assert_eq!(decoded.file_size, Some(content.len() as u64));
     assert_eq!(decoded.mime_type.as_deref(), Some("image/jpeg"));
     assert_eq!(decoded.content, content);
+}
+
+#[test]
+fn video_note_role_round_trips_as_optional_forward_compatible_tlv() {
+    let packet = FilePacket {
+        file_name: Some("note.mp4".to_string()),
+        file_size: Some(8),
+        mime_type: Some("video/mp4".to_string()),
+        media_role: Some(MediaRole::VideoNote),
+        content: b"fake-mp4".to_vec(),
+    };
+    let encoded = packet.encode().expect("encode video note");
+    let decoded = FilePacket::decode(&encoded).expect("decode video note");
+    assert_eq!(decoded, packet);
+
+    // An unknown future role must not hide the otherwise valid attachment.
+    let role_tlv = [
+        0x05, 0x00, 0x0a, b'v', b'i', b'd', b'e', b'o', b'_', b'n', b'o', b't', b'e',
+    ];
+    let role_offset = encoded
+        .windows(role_tlv.len())
+        .position(|window| window == role_tlv)
+        .expect("media role TLV");
+    let mut unknown = encoded.clone();
+    let replacement = [0x05, 0x00, 0x06, b'f', b'u', b't', b'u', b'r', b'e'];
+    unknown.splice(role_offset..role_offset + role_tlv.len(), replacement);
+    let decoded_unknown = FilePacket::decode(&unknown).expect("decode unknown role");
+    assert_eq!(decoded_unknown.media_role, None);
+    assert_eq!(decoded_unknown.content, b"fake-mp4");
+
+    let mismatched = FilePacket {
+        mime_type: Some("image/jpeg".to_string()),
+        media_role: Some(MediaRole::VideoNote),
+        ..packet
+    };
+    let decoded_mismatched =
+        FilePacket::decode(&mismatched.encode().expect("encode mismatched role"))
+            .expect("decode mismatched role");
+    assert_eq!(decoded_mismatched.media_role, None);
+    assert_eq!(decoded_mismatched.content, b"fake-mp4");
 }
 
 /// iOS sends file-transfer packets as protocol v2 so payload length is u32
@@ -70,6 +113,7 @@ fn v2_file_transfer_packet_decodes_like_ios() {
         file_name: Some("photo.jpg".to_string()),
         file_size: None,
         mime_type: Some("image/jpeg".to_string()),
+        media_role: None,
         content: vec![1, 2, 3, 4, 5],
     }
     .encode()
@@ -118,6 +162,7 @@ fn signed_v2_file_transfer_packet_encodes_and_verifies() {
         file_name: Some("large.jpg".to_string()),
         file_size: None,
         mime_type: Some("image/jpeg".to_string()),
+        media_role: None,
         content: content.clone(),
     }
     .encode()
@@ -185,6 +230,7 @@ fn file_size_defaults_to_content_len_when_absent() {
         file_name: None,
         file_size: None,
         mime_type: None,
+        media_role: None,
         content: content.clone(),
     };
     let decoded = FilePacket::decode(&packet.encode().unwrap()).expect("decode");
@@ -217,6 +263,7 @@ fn large_file_packet_fragments_and_reassembles() {
         file_name: Some("big.bin".to_string()),
         file_size: Some(content.len() as u64),
         mime_type: Some("application/octet-stream".to_string()),
+        media_role: None,
         content,
     };
     let encoded = packet.encode().expect("encode"); // > 65535 → must fragment
@@ -299,6 +346,7 @@ fn file_survives_noise_and_fragmentation_over_the_mesh() {
         file_name: Some("photo.jpg".to_string()),
         file_size: Some(image.len() as u64),
         mime_type: Some("image/jpeg".to_string()),
+        media_role: None,
         content: image.clone(),
     };
     let plain = packet.encode().unwrap();

@@ -168,6 +168,24 @@ final class MarmotService: @unchecked Sendable {
 
     /// A reference to an encrypted media attachment. `url` is the Blossom URL of
     /// the CIPHERTEXT; call `fetchMedia(groupId:url:)` to download + decrypt.
+    enum MarmotMediaRole: Sendable, Equatable, Codable {
+        case videoNote
+        case unknown(String)
+
+        init(from decoder: Decoder) throws {
+            let value = try decoder.singleValueContainer().decode(String.self)
+            self = value == "videoNote" ? .videoNote : .unknown(value)
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            switch self {
+            case .videoNote: try container.encode("videoNote")
+            case .unknown(let value): try container.encode(value)
+            }
+        }
+    }
+
     struct MarmotMedia: Sendable, Equatable, Codable {
         let url: String
         let mimeType: String
@@ -180,6 +198,9 @@ final class MarmotService: @unchecked Sendable {
         /// Synthesized Codable decodes optionals with decodeIfPresent, so
         /// payloads written before this field existed decode with nil.
         var caption: String? = nil
+        /// Optional for backward-compatible decoding of locally cached rows.
+        /// Nil is the ordinary attachment presentation.
+        var role: MarmotMediaRole? = nil
         var isImage: Bool { mimeType.hasPrefix("image/") }
         var isVideo: Bool { mimeType.hasPrefix("video/") }
         var isAudio: Bool { mimeType.hasPrefix("audio/") }
@@ -728,6 +749,23 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Send a standard MP4 with Sonar's encrypted video-note presentation tag.
+    func sendVideoNote(
+        groupId: String,
+        data: Data,
+        filename: String,
+        serverUrl: String = ""
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendVideoNote(
+                groupIdHex: groupId,
+                data: data,
+                filename: filename,
+                serverUrl: serverUrl
+            )
+        }
+    }
+
     /// One attachment of an album send (one message, N attachments).
     struct MediaAlbumItem: Sendable {
         let data: Data
@@ -987,7 +1025,8 @@ final class MarmotService: @unchecked Sendable {
                     filename: $0.filename,
                     width: $0.width,
                     height: $0.height,
-                    durationMs: $0.durationMs
+                    durationMs: $0.durationMs,
+                    role: $0.role == .videoNote ? .videoNote : nil
                 )
             },
             stickerRef: message.stickerRef.map {

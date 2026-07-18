@@ -6,6 +6,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -73,6 +74,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
@@ -1069,18 +1072,51 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         }
         if (items.isNotEmpty()) state.stageMediaPreviews(screen.id, items)
     }
-    // Voice-note recorder (hold the mic to record; drag left to cancel).
+    // Telegram-style mic/video note recorder: tap toggles the mode; hold records.
     val recorder = remember { VoiceRecorder() }
+    val videoRecorder = remember { VideoNoteRecorder() }
+    var videoMode by remember { mutableStateOf(false) }
     var recording by remember { mutableStateOf(false) }
+    var recLocked by remember { mutableStateOf(false) }
     var recElapsed by remember { mutableStateOf(0) }
     var recLevel by remember { mutableStateOf(0f) }
     var recDragX by remember { mutableStateOf(0f) }
     val recScope = rememberCoroutineScope()
-    LaunchedEffect(recording) {
+    DisposableEffect(screen.id) {
+        onDispose {
+            recorder.cancel()
+            videoRecorder.cancel()
+        }
+    }
+    fun finishActiveRecording(send: Boolean) {
+        val wasVideo = videoMode
+        recScope.launch {
+            if (!send) {
+                if (wasVideo) videoRecorder.cancel() else recorder.cancel()
+            } else if (wasVideo) {
+                videoRecorder.finish()?.let { state.sendVideoNote(screen.id, it) }
+            } else {
+                recorder.finish()?.let { state.sendVoiceNote(screen.id, it) }
+            }
+            recording = false
+            recLocked = false
+            recDragX = 0f
+        }
+    }
+    LaunchedEffect(recording, videoMode) {
         while (recording) {
-            recElapsed = recorder.elapsed(); recLevel = recorder.level()
+            recElapsed = if (videoMode) videoRecorder.elapsed() else recorder.elapsed()
+            recLevel = if (videoMode) 0.22f else recorder.level()
+            val videoLimit = if (screen.id.startsWith("mesh:")) 30 else 60
+            if (videoMode && recElapsed >= videoLimit) {
+                finishActiveRecording(send = true)
+                break
+            }
             kotlinx.coroutines.delay(80)
         }
+    }
+    LaunchedEffect(state.appForeground) {
+        if (!state.appForeground && recording) finishActiveRecording(send = false)
     }
     // Radar "Send sats" opens the chat with pay=true → jump straight to the sheet.
     fun openPaySheetOrRetry() {
@@ -1575,6 +1611,25 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 onStickerPacksLoaded = { stickerPacks = it },
                 onClose = { emojiTray = false }
             )
+            if (videoMode) {
+                Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                    VideoNoteCameraPreview(
+                        recorder = videoRecorder,
+                        modifier = Modifier
+                            .size(if (recording) 176.dp else 112.dp)
+                            .clip(CircleShape)
+                            .border(if (recording) 3.dp else 2.dp, s.accent.copy(alpha = 0.7f), CircleShape),
+                    )
+                    if (!recording) {
+                        Box(
+                            Modifier.align(Alignment.BottomCenter).padding(bottom = 8.dp)
+                                .size(34.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.55f))
+                                .clickable { videoRecorder.flipCamera() },
+                            contentAlignment = Alignment.Center,
+                        ) { SNIcon(SNIconName.CameraFlip, 17.dp, Color.White, weight = 2f) }
+                    }
+                }
+            }
             // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
             // (text field↔recording pill) swap; the mic Box on the right MUST stay
             // mounted while recording, or Compose cancels its hold-to-record gesture
@@ -1589,7 +1644,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     // voice-trash: slide-left-far OR tap the trash to discard.
                     Box(
                         Modifier.size(36.dp).clip(CircleShape).background(s.surface2)
-                            .clickable { recorder.cancel(); recording = false; recDragX = 0f },
+                            .clickable { finishActiveRecording(send = false) },
                         contentAlignment = Alignment.Center
                     ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
                     Spacer(Modifier.width(8.dp))
@@ -1667,8 +1722,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 }
                 Spacer(Modifier.width(8.dp))
                 if (draft.isEmpty() && state.canSendMedia(screen.id)) {
-                    // Hold-to-record mic (design: bc-sendbtn mic). Drag left past the
-                    // threshold to cancel; release to send. STAYS mounted across the
+                    // Tap toggles mic/video. Hold records; drag left cancels; swipe
+                    // up locks hands-free recording. STAYS mounted across the
                     // recording toggle (draft is empty + canSendMedia is unchanged), so
                     // the gesture coroutine below survives — this is load-bearing.
                     val micBg = if (recording) (if (transport == "internet") s.netFill else s.accentFill) else s.surface2
@@ -1681,29 +1736,64 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 // release so finish()/cancel() can never race ahead of start().
                                 awaitEachGesture {
                                     val down = awaitFirstDown(requireUnconsumed = false)
-                                    recDragX = 0f; recElapsed = 0; recording = true
+                                    val wasLocked = recLocked
+                                    recDragX = 0f; recElapsed = 0
                                     var startedOk = false
-                                    val startJob = recScope.launch { startedOk = recorder.start() }
+                                    var longPressStarted = false
+                                    var pressActive = true
+                                    val selectedVideo = videoMode
+                                    val startJob = recScope.launch {
+                                        if (wasLocked) return@launch
+                                        kotlinx.coroutines.delay(180)
+                                        if (!pressActive) return@launch
+                                        longPressStarted = true
+                                        recording = true
+                                        recLocked = false
+                                        startedOk = if (selectedVideo) videoRecorder.start() else recorder.start()
+                                    }
                                     var dx = 0f
+                                    var dy = 0f
                                     var pressed = true
                                     while (pressed) {
                                         val ev = awaitPointerEvent()
                                         val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
                                         dx += ch.positionChange().x; recDragX = dx
+                                        dy += ch.positionChange().y
+                                        if (dy < -160f) recLocked = true
                                         if (!ch.pressed) pressed = false
                                     }
+                                    pressActive = false
                                     val cancel = dx < -240f
                                     recScope.launch {
                                         startJob.join()
-                                        if (!startedOk) state.toast = "Allow microphone access to record voice notes."
-                                        else if (cancel) recorder.cancel()
-                                        else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
-                                        recording = false; recDragX = 0f
+                                        when {
+                                            wasLocked -> finishActiveRecording(send = true)
+                                            !longPressStarted -> videoMode = !videoMode
+                                            !startedOk -> {
+                                                if (selectedVideo) videoRecorder.cancel() else recorder.cancel()
+                                                state.toast = if (selectedVideo) {
+                                                    "Allow camera and microphone access to record video notes."
+                                                } else {
+                                                    "Allow microphone access to record voice notes."
+                                                }
+                                                recording = false
+                                                recLocked = false
+                                            }
+                                            cancel -> finishActiveRecording(send = false)
+                                            !recLocked -> finishActiveRecording(send = true)
+                                        }
                                     }
                                 }
                             },
                         contentAlignment = Alignment.Center
-                    ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
+                    ) {
+                        SNIcon(
+                            if (recLocked) SNIconName.Send else if (videoMode) SNIconName.Videocam else SNIconName.Mic,
+                            18.dp,
+                            micFg,
+                            weight = 2f,
+                        )
+                    }
                 } else {
                     val sendEnabled = draft.isNotBlank()
                     val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
@@ -2777,6 +2867,8 @@ private fun MediaBubble(
                 maxBubbleWidth = maxBubbleWidth,
                 onOpen = { idx -> onOpenAlbum(m.media, idx) },
             )
+        } else if (media.isVideoNote) {
+            VideoNoteBubble(media, state, chatId)
         } else if (media.isImage) {
             val transfer = state.mediaTransferState(media)
             androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
@@ -2885,6 +2977,82 @@ private fun MediaBubble(
             ) { Text(m.content, color = capFg, fontSize = 15.5.sp, lineHeight = 21.7.sp) }
         }
         if (showState) MessageStatusFooter(m, mesh, onRetry)
+    }
+}
+
+/** Circular muted autoplay backed only by the private local cache. Downloading
+ * and playback are both bounded to the visible row; chat first paint never
+ * waits for the MP4 or instantiates a player for off-screen notes. */
+@Composable
+private fun VideoNoteBubble(media: SonarMedia, state: SonarAppState, chatId: String) {
+    val s = sonar
+    val transfer = state.mediaTransferState(media)
+    val muted = state.audibleVideoNoteUrl != media.url
+    var progress by remember(media.url) { mutableStateOf(0f) }
+    LaunchedEffect(media.url, chatId) {
+        state.prepareMedia(chatId, media, autoDownload = true)
+    }
+    DisposableEffect(media.url) {
+        onDispose { state.releaseVideoNoteAudio(media.url) }
+    }
+    Box(
+        Modifier.size(208.dp).clip(CircleShape).background(s.surface2)
+            .border(1.dp, Color.Black.copy(alpha = 0.08f), CircleShape)
+            .clickable {
+                when (transfer.phase) {
+                    MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                        state.requestMediaDownload(chatId, media)
+                    MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                    MediaTransferPhase.Available -> state.toggleVideoNoteAudio(media.url)
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        val path = transfer.localPath
+        if (transfer.phase == MediaTransferPhase.Available && path != null) {
+            InlineVideoNotePlayer(
+                path = path,
+                muted = muted,
+                onProgress = { progress = it },
+                modifier = Modifier.fillMaxSize(),
+            )
+            Canvas(Modifier.fillMaxSize().padding(1.dp)) {
+                drawArc(
+                    color = s.accent,
+                    startAngle = -90f,
+                    sweepAngle = progress * 360f,
+                    useCenter = false,
+                    style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round),
+                )
+            }
+            Box(
+                Modifier.size(30.dp).clip(CircleShape).background(Color.Black.copy(alpha = 0.52f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                SNIcon(
+                    if (muted) SNIconName.MicOff else SNIconName.Speaker,
+                    14.dp,
+                    Color.White,
+                    weight = 2f,
+                )
+            }
+        } else {
+            when (transfer.phase) {
+                MediaTransferPhase.NotDownloaded -> Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Text("↓", color = s.accent, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                    Text("Video note", color = s.text2, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+                MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 34.dp)
+                MediaTransferPhase.Failed -> Text("Retry video note", color = s.danger, fontSize = 12.sp)
+                MediaTransferPhase.Available -> androidx.compose.material3.CircularProgressIndicator(
+                    color = s.accent,
+                    strokeWidth = 2.dp,
+                )
+            }
+        }
     }
 }
 

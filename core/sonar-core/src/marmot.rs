@@ -28,6 +28,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
+use crate::media::MediaRole;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
 use crate::{Error, Result};
 
@@ -38,6 +39,12 @@ pub const CHAT_RUMOR_KIND: u16 = 9;
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
 pub const KEY_PACKAGE_KIND: u16 = 30443;
+
+/// Versioned, E2E-encrypted presentation tag carried inside a kind-9 rumor.
+/// The MIP-04 `imeta` remains untouched so clients that ignore this tag still
+/// receive an ordinary playable attachment.
+const MEDIA_ROLE_TAG_KIND: &str = "sonar-media";
+const MEDIA_ROLE_TAG_VERSION: &str = "1";
 
 /// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
 pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
@@ -94,6 +101,7 @@ pub struct MediaRef {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
+    pub role: MediaRole,
 }
 
 /// Local delivery state for a transcript row. Network/relay work updates this
@@ -132,6 +140,7 @@ impl From<&MediaReference> for MediaRef {
             width,
             height,
             duration_ms: r.duration_ms,
+            role: MediaRole::Standard,
         }
     }
 }
@@ -679,7 +688,7 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        self.create_media_event_multi_inner(group_id, uploads, caption)
+        self.create_media_event_multi_inner(group_id, uploads, caption, MediaRole::Standard)
     }
 
     /// Media variant of [`Self::create_and_process_text_message`]: create and
@@ -694,7 +703,28 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
+        let event =
+            self.create_media_event_multi_inner(group_id, uploads, caption, MediaRole::Standard)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    /// Create and locally process a single circular video note. The underlying
+    /// attachment remains a normal MIP-04 video; only the encrypted role tag is
+    /// Sonar-specific.
+    pub fn create_and_process_video_note_event(
+        &self,
+        group_id: &GroupId,
+        upload: &EncryptedMediaUpload,
+        url: &str,
+    ) -> Result<(Event, Incoming)> {
+        let _mls = self.mls_write();
+        let event = self.create_media_event_multi_inner(
+            group_id,
+            &[(upload, url)],
+            "",
+            MediaRole::VideoNote,
+        )?;
         let incoming = self.process_group_message(&event)?;
         Ok((event, incoming))
     }
@@ -705,6 +735,7 @@ impl MarmotEngine {
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
+        role: MediaRole,
     ) -> Result<Event> {
         let event = dispatch!(&self.storage, |mdk| {
             // One imeta tag per attachment, in send order. A fresh media_manager
@@ -715,6 +746,12 @@ impl MarmotEngine {
                     .media_manager(group_id.clone())
                     .create_imeta_tag(upload, url);
                 imetas.push(tag);
+            }
+            if let Some(value) = role.wire_value() {
+                imetas.push(Tag::custom(
+                    TagKind::Custom(MEDIA_ROLE_TAG_KIND.into()),
+                    [MEDIA_ROLE_TAG_VERSION, value],
+                ));
             }
             let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption)
                 .tags(imetas)
@@ -753,14 +790,34 @@ impl MarmotEngine {
 
     /// Parse the `imeta` tags on a message into display-ready [`MediaRef`]s.
     fn parse_media_refs(&self, group_id: &GroupId, tags: &Tags) -> Vec<MediaRef> {
-        dispatch!(&self.storage, |mdk| {
+        let role = tags
+            .iter()
+            .find(|tag| tag.kind() == TagKind::Custom(MEDIA_ROLE_TAG_KIND.into()))
+            .and_then(|tag| {
+                let values = tag.as_slice();
+                match values {
+                    [_, version, value] if version == MEDIA_ROLE_TAG_VERSION => {
+                        Some(MediaRole::from_wire_value(value))
+                    }
+                    _ => None,
+                }
+            })
+            .unwrap_or_default();
+        let mut media: Vec<MediaRef> = dispatch!(&self.storage, |mdk| {
             let mgr = mdk.media_manager(group_id.clone());
             tags.iter()
                 .filter(|t| t.kind() == TagKind::Custom("imeta".into()))
                 .filter_map(|t| mgr.parse_imeta_tag(t).ok())
                 .map(|r| MediaRef::from(&r))
                 .collect()
-        })
+        });
+        if role == MediaRole::VideoNote
+            && media.len() == 1
+            && media[0].mime_type.split(';').next() == Some("video/mp4")
+        {
+            media[0].role = MediaRole::VideoNote;
+        }
+        media
     }
 
     /// Process any incoming Marmot-relevant event:

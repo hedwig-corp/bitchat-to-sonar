@@ -647,6 +647,11 @@ public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
      */
     func sendTextNow(fingerprint: String, messageId: String, text: String, nowMs: Int64)  -> MeshEngineOutput?
 
+    /**
+     * None = no live route / oversized (never queues).
+     */
+    func sendVideoNote(fingerprint: String, content: Data, fileName: String, nowMs: Int64)  -> MeshEngineOutput?
+
     func setAllowlist(allowed: [String]?)  -> MeshEngineOutput
 
     func setNickname(nickname: String, nowMs: Int64)  -> MeshEngineOutput
@@ -958,6 +963,21 @@ open func sendTextNow(fingerprint: String, messageId: String, text: String, nowM
         FfiConverterString.lower(fingerprint),
         FfiConverterString.lower(messageId),
         FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * None = no live route / oversized (never queues).
+     */
+open func sendVideoNote(fingerprint: String, content: Data, fileName: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_video_note(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterData.lower(content),
+        FfiConverterString.lower(fileName),
         FfiConverterInt64.lower(nowMs),$0
     )
 })
@@ -1767,6 +1787,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Encrypt + publish a text message to the group.
      */
     func sendText(groupIdHex: String, text: String) throws
+
+    /**
+     * Encrypt + upload one standards-compatible MP4, then publish it with the
+     * encrypted Sonar video-note presentation role.
+     */
+    func sendVideoNote(groupIdHex: String, data: Data, filename: String, serverUrl: String) throws
 
     func setConversationChangeListener(listener: ConversationChangeListener)
 
@@ -2747,6 +2773,21 @@ open func sendText(groupIdHex: String, text: String)throws   {try rustCallWithEr
             self.uniffiCloneHandle(),
         FfiConverterString.lower(groupIdHex),
         FfiConverterString.lower(text),$0
+    )
+}
+}
+
+    /**
+     * Encrypt + upload one standards-compatible MP4, then publish it with the
+     * encrypted Sonar video-note presentation role.
+     */
+open func sendVideoNote(groupIdHex: String, data: Data, filename: String, serverUrl: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_video_note(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterData.lower(data),
+        FfiConverterString.lower(filename),
+        FfiConverterString.lower(serverUrl),$0
     )
 }
 }
@@ -3740,16 +3781,18 @@ public struct MediaInfo: Equatable, Hashable {
     public var width: UInt32?
     public var height: UInt32?
     public var durationMs: UInt64?
+    public var role: MediaRoleInfo
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(url: String, mimeType: String, filename: String, width: UInt32?, height: UInt32?, durationMs: UInt64?) {
+    public init(url: String, mimeType: String, filename: String, width: UInt32?, height: UInt32?, durationMs: UInt64?, role: MediaRoleInfo) {
         self.url = url
         self.mimeType = mimeType
         self.filename = filename
         self.width = width
         self.height = height
         self.durationMs = durationMs
+        self.role = role
     }
 
 
@@ -3773,7 +3816,8 @@ public struct FfiConverterTypeMediaInfo: FfiConverterRustBuffer {
                 filename: FfiConverterString.read(from: &buf),
                 width: FfiConverterOptionUInt32.read(from: &buf),
                 height: FfiConverterOptionUInt32.read(from: &buf),
-                durationMs: FfiConverterOptionUInt64.read(from: &buf)
+                durationMs: FfiConverterOptionUInt64.read(from: &buf),
+                role: FfiConverterTypeMediaRoleInfo.read(from: &buf)
         )
     }
 
@@ -3784,6 +3828,7 @@ public struct FfiConverterTypeMediaInfo: FfiConverterRustBuffer {
         FfiConverterOptionUInt32.write(value.width, into: &buf)
         FfiConverterOptionUInt32.write(value.height, into: &buf)
         FfiConverterOptionUInt64.write(value.durationMs, into: &buf)
+        FfiConverterTypeMediaRoleInfo.write(value.role, into: &buf)
     }
 }
 
@@ -3993,14 +4038,16 @@ public struct MeshFileInfo: Equatable, Hashable {
     public var fileName: String?
     public var fileSize: UInt64?
     public var mimeType: String?
+    public var role: MediaRoleInfo
     public var content: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fileName: String?, fileSize: UInt64?, mimeType: String?, content: Data) {
+    public init(fileName: String?, fileSize: UInt64?, mimeType: String?, role: MediaRoleInfo, content: Data) {
         self.fileName = fileName
         self.fileSize = fileSize
         self.mimeType = mimeType
+        self.role = role
         self.content = content
     }
 
@@ -4023,6 +4070,7 @@ public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
                 fileName: FfiConverterOptionString.read(from: &buf),
                 fileSize: FfiConverterOptionUInt64.read(from: &buf),
                 mimeType: FfiConverterOptionString.read(from: &buf),
+                role: FfiConverterTypeMediaRoleInfo.read(from: &buf),
                 content: FfiConverterData.read(from: &buf)
         )
     }
@@ -4031,6 +4079,7 @@ public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.fileName, into: &buf)
         FfiConverterOptionUInt64.write(value.fileSize, into: &buf)
         FfiConverterOptionString.write(value.mimeType, into: &buf)
+        FfiConverterTypeMediaRoleInfo.write(value.role, into: &buf)
         FfiConverterData.write(value.content, into: &buf)
     }
 }
@@ -5609,6 +5658,359 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
             FfiConverterString.write(transferKey, into: &buf)
             FfiConverterOptionString.write(fileName, into: &buf)
             FfiConverterOptionString.write(mimeType, into: &buf)
+            FfiConverterData.write(content, into: &buf)
+            FfiConverterInt64.write(timestampMs, into: &buf)
+
+
+        case let .broadcastReceived(fingerprint,senderIdHex,content,timestampMs):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(senderIdHex, into: &buf)
+            FfiConverterString.write(content, into: &buf)
+            FfiConverterInt64.write(timestampMs, into: &buf)
+
+
+        case let .linkEstablished(fingerprint):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(fingerprint, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineEvent_lift(_ buf: RustBuffer) throws -> MeshEngineEvent {
+    return try FfiConverterTypeMeshEngineEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineEvent_lower(_ value: MeshEngineEvent) -> RustBuffer {
+    return FfiConverterTypeMeshEngineEvent.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Host-facing attachment presentation role. The encrypted payload remains a
+ * normal media file; this only selects Sonar's transcript treatment.
+ */
+
+public enum MediaRoleInfo: Equatable, Hashable {
+
+    case standard
+    case videoNote
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MediaRoleInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMediaRoleInfo: FfiConverterRustBuffer {
+    typealias SwiftType = MediaRoleInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaRoleInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .standard
+
+        case 2: return .videoNote
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MediaRoleInfo, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .standard:
+            writeInt(&buf, Int32(1))
+
+
+        case .videoNote:
+            writeInt(&buf, Int32(2))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaRoleInfo_lift(_ buf: RustBuffer) throws -> MediaRoleInfo {
+    return try FfiConverterTypeMediaRoleInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMediaRoleInfo_lower(_ value: MediaRoleInfo) -> RustBuffer {
+    return FfiConverterTypeMediaRoleInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MeshEngineCommand: Equatable, Hashable {
+
+    /**
+     * Open a GATT connection to `conn` (an opaque connection handle: Android
+     * passes the address of the scanned device, iOS a peripheral UUID).
+     */
+    case dial(conn: String
+    )
+    /**
+     * Tear down the CLIENT connection (close the outbound GATT). Must not
+     * touch a server-role leg the same peer holds toward us.
+     */
+    case disconnect(conn: String
+    )
+    /**
+     * Cancel the SERVER-role connection from an inbound central. Must not
+     * touch a client GATT we hold toward the same address.
+     */
+    case cancelServer(conn: String
+    )
+    /**
+     * Re-run service discovery on an existing client connection (a lost
+     * instance link has no other recovery while the connection lives).
+     */
+    case refreshInstances(conn: String
+    )
+    /**
+     * Enable notifications on the mesh characteristic of service `instance`.
+     */
+    case subscribe(conn: String, instance: Int32
+    )
+    /**
+     * Write one packet value to a client link, `after_ms` from now.
+     */
+    case writeLink(conn: String, instance: Int32, bytes: Data, afterMs: Int64
+    )
+    /**
+     * Notify one packet value to a subscribed central, `after_ms` from now.
+     */
+    case notifyConn(conn: String, bytes: Data, afterMs: Int64
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MeshEngineCommand: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshEngineCommand: FfiConverterRustBuffer {
+    typealias SwiftType = MeshEngineCommand
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshEngineCommand {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .dial(conn: try FfiConverterString.read(from: &buf)
+        )
+
+        case 2: return .disconnect(conn: try FfiConverterString.read(from: &buf)
+        )
+
+        case 3: return .cancelServer(conn: try FfiConverterString.read(from: &buf)
+        )
+
+        case 4: return .refreshInstances(conn: try FfiConverterString.read(from: &buf)
+        )
+
+        case 5: return .subscribe(conn: try FfiConverterString.read(from: &buf), instance: try FfiConverterInt32.read(from: &buf)
+        )
+
+        case 6: return .writeLink(conn: try FfiConverterString.read(from: &buf), instance: try FfiConverterInt32.read(from: &buf), bytes: try FfiConverterData.read(from: &buf), afterMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 7: return .notifyConn(conn: try FfiConverterString.read(from: &buf), bytes: try FfiConverterData.read(from: &buf), afterMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MeshEngineCommand, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case let .dial(conn):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(conn, into: &buf)
+
+
+        case let .disconnect(conn):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(conn, into: &buf)
+
+
+        case let .cancelServer(conn):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(conn, into: &buf)
+
+
+        case let .refreshInstances(conn):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(conn, into: &buf)
+
+
+        case let .subscribe(conn,instance):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterInt32.write(instance, into: &buf)
+
+
+        case let .writeLink(conn,instance,bytes,afterMs):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterInt32.write(instance, into: &buf)
+            FfiConverterData.write(bytes, into: &buf)
+            FfiConverterInt64.write(afterMs, into: &buf)
+
+
+        case let .notifyConn(conn,bytes,afterMs):
+            writeInt(&buf, Int32(7))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterData.write(bytes, into: &buf)
+            FfiConverterInt64.write(afterMs, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineCommand_lift(_ buf: RustBuffer) throws -> MeshEngineCommand {
+    return try FfiConverterTypeMeshEngineCommand.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineCommand_lower(_ value: MeshEngineCommand) -> RustBuffer {
+    return FfiConverterTypeMeshEngineCommand.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MeshEngineEvent: Equatable, Hashable {
+
+    case peerAnnounced(fingerprint: String, nickname: String, peerIdHex: String, direct: Bool
+    )
+    case sonarPayload(fingerprint: String, payload: Data
+    )
+    case textReceived(fingerprint: String, messageId: String, content: String
+    )
+    case fileReceived(fingerprint: String, transferKey: String, fileName: String?, mimeType: String?, role: MediaRoleInfo, content: Data, timestampMs: Int64
+    )
+    case broadcastReceived(fingerprint: String, senderIdHex: String, content: String, timestampMs: Int64
+    )
+    case linkEstablished(fingerprint: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MeshEngineEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = MeshEngineEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshEngineEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .peerAnnounced(fingerprint: try FfiConverterString.read(from: &buf), nickname: try FfiConverterString.read(from: &buf), peerIdHex: try FfiConverterString.read(from: &buf), direct: try FfiConverterBool.read(from: &buf)
+        )
+
+        case 2: return .sonarPayload(fingerprint: try FfiConverterString.read(from: &buf), payload: try FfiConverterData.read(from: &buf)
+        )
+
+        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf)
+        )
+
+        case 4: return .fileReceived(fingerprint: try FfiConverterString.read(from: &buf), transferKey: try FfiConverterString.read(from: &buf), fileName: try FfiConverterOptionString.read(from: &buf), mimeType: try FfiConverterOptionString.read(from: &buf), role: try FfiConverterTypeMediaRoleInfo.read(from: &buf), content: try FfiConverterData.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 5: return .broadcastReceived(fingerprint: try FfiConverterString.read(from: &buf), senderIdHex: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 6: return .linkEstablished(fingerprint: try FfiConverterString.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MeshEngineEvent, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case let .peerAnnounced(fingerprint,nickname,peerIdHex,direct):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(nickname, into: &buf)
+            FfiConverterString.write(peerIdHex, into: &buf)
+            FfiConverterBool.write(direct, into: &buf)
+
+
+        case let .sonarPayload(fingerprint,payload):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterData.write(payload, into: &buf)
+
+
+        case let .textReceived(fingerprint,messageId,content):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(messageId, into: &buf)
+            FfiConverterString.write(content, into: &buf)
+
+
+        case let .fileReceived(fingerprint,transferKey,fileName,mimeType,role,content,timestampMs):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(transferKey, into: &buf)
+            FfiConverterOptionString.write(fileName, into: &buf)
+            FfiConverterOptionString.write(mimeType, into: &buf)
+            FfiConverterTypeMediaRoleInfo.write(role, into: &buf)
             FfiConverterData.write(content, into: &buf)
             FfiConverterInt64.write(timestampMs, into: &buf)
 
@@ -7671,6 +8073,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_now() != 30800) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_video_note() != 1916) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_allowlist() != 36838) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7897,6 +8302,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_text() != 23173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_video_note() != 44985) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {

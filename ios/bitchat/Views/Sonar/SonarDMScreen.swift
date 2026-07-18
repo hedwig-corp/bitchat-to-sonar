@@ -144,7 +144,8 @@ struct SonarDMScreenContent: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: store.canSendMedia(peerId),
-            onVoice: { store.sendVoiceNote(peerId, url: $0) }
+            onVoice: { store.sendVoiceNote(peerId, url: $0) },
+            onVideoNote: { store.sendVideoNote(peerId, url: $0) }
         )
     }
 

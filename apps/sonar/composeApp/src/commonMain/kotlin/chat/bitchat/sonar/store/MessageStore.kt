@@ -86,7 +86,10 @@ object MessageCodec {
                     // Field 15 (append-only versioning, like field 14 for
                     // viaInternet): optional media caption. Old decoders
                     // ignore trailing fields; old envelopes lack it.
-                    hexEnc(media?.caption.orEmpty())
+                    hexEnc(media?.caption.orEmpty()) + "\t" +
+                    // Field 16: optional presentation role. Unknown/absent
+                    // values remain ordinary attachments for forward safety.
+                    hexEnc(if (media?.role == chat.bitchat.sonar.MediaRole.VideoNote) "video_note" else "")
             } else base
         }
 
@@ -108,6 +111,11 @@ object MessageCodec {
                         durationMs = f[13].toLongOrNull(),
                         // Field 15: caption — tolerate old envelopes without it.
                         caption = f.getOrNull(15)?.takeIf { it.isNotEmpty() },
+                        role = if (f.getOrNull(16) == "video_note") {
+                            chat.bitchat.sonar.MediaRole.VideoNote
+                        } else {
+                            chat.bitchat.sonar.MediaRole.Standard
+                        },
                     )
                 )
             } else emptyList()
