@@ -82,7 +82,7 @@
     <string name="content_accessibility_voice_pause">Pause voice message</string>
     <string name="content_accessibility_voice_play">Play voice message</string>
     <string name="content_accessibility_voice_playback">Voice message playback failed</string>
-    <string name="content_accessibility_voice_retry_download">Retry downloading voice message</string>
+    <string name="content_accessibility_voice_retry">Retry downloading voice message</string>
     <string name="content_accessibility_voice_seek">Seek voice message</string>
     <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_accessibility_voice_unheard">Unheard voice message</string>

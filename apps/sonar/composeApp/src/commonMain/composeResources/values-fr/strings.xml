@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">basculer le favori pour #%1$s</string>
     <string name="content_accessibility_toggle_favorite">tape deux fois pour basculer le statut favori</string>
     <string name="content_accessibility_view_fingerprint">tape pour voir l'empreinte de chiffrement</string>
+    <string name="content_accessibility_voice_download">Télécharger le message vocal</string>
+    <string name="content_accessibility_voice_downloading">Téléchargement du message vocal</string>
     <string name="content_accessibility_voice_pause">Mettre en pause le message vocal</string>
     <string name="content_accessibility_voice_play">Lire le message vocal</string>
     <string name="content_accessibility_voice_playback">Échec de la lecture du message vocal</string>
+    <string name="content_accessibility_voice_retry">Réessayer le téléchargement du message vocal</string>
     <string name="content_accessibility_voice_seek">Déplacer dans le message vocal</string>
     <string name="content_accessibility_voice_speed">Changer la vitesse de lecture</string>
+    <string name="content_accessibility_voice_unheard">Message vocal non écouté</string>
     <string name="content_actions_block">bloquer</string>
     <string name="content_actions_direct_message">message direct</string>
     <string name="content_actions_hug">câlin</string>

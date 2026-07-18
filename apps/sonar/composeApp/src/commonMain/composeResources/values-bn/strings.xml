@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s-এর জন্য বুকমার্ক টগল করুন</string>
     <string name="content_accessibility_toggle_favorite">প্রিয় অবস্থা বদলাতে দুইবার ট্যাপ করুন</string>
     <string name="content_accessibility_view_fingerprint">এনক্রিপশন ফিঙ্গারপ্রিন্ট দেখতে ট্যাপ করুন</string>
+    <string name="content_accessibility_voice_download">Download voice message</string>
+    <string name="content_accessibility_voice_downloading">Downloading voice message</string>
     <string name="content_accessibility_voice_pause">Pause voice message</string>
     <string name="content_accessibility_voice_play">Play voice message</string>
     <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_retry">Retry downloading voice message</string>
     <string name="content_accessibility_voice_seek">Seek voice message</string>
     <string name="content_accessibility_voice_speed">Change playback speed</string>
+    <string name="content_accessibility_voice_unheard">Unheard voice message</string>
     <string name="content_actions_block">ব্লক করুন</string>
     <string name="content_actions_direct_message">ডিরেক্ট মেসেজ</string>
     <string name="content_actions_hug">আলিঙ্গন</string>

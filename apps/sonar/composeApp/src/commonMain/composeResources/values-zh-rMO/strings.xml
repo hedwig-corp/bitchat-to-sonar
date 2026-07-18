@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">切換 #%1$s 的書簽</string>
     <string name="content_accessibility_toggle_favorite">雙擊切換收藏狀態</string>
     <string name="content_accessibility_view_fingerprint">輕點查看加密指紋</string>
+    <string name="content_accessibility_voice_download">下載語音訊息</string>
+    <string name="content_accessibility_voice_downloading">正在下載語音訊息</string>
     <string name="content_accessibility_voice_pause">暫停語音訊息</string>
     <string name="content_accessibility_voice_play">播放語音訊息</string>
     <string name="content_accessibility_voice_playback">語音訊息播放失敗</string>
+    <string name="content_accessibility_voice_retry">重試下載語音訊息</string>
     <string name="content_accessibility_voice_seek">拖曳語音訊息進度</string>
     <string name="content_accessibility_voice_speed">變更播放速度</string>
+    <string name="content_accessibility_voice_unheard">未收聽的語音訊息</string>
     <string name="content_actions_block">屏蔽</string>
     <string name="content_actions_direct_message">私信</string>
     <string name="content_actions_hug">擁抱</string>

@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">alternar o marcador de #%1$s</string>
     <string name="content_accessibility_toggle_favorite">toca duas vezes para alternar o estado de favorito</string>
     <string name="content_accessibility_view_fingerprint">toca para ver a impressão de encriptação</string>
+    <string name="content_accessibility_voice_download">Transferir mensagem de voz</string>
+    <string name="content_accessibility_voice_downloading">A transferir mensagem de voz</string>
     <string name="content_accessibility_voice_pause">Pausar mensagem de voz</string>
     <string name="content_accessibility_voice_play">Reproduzir mensagem de voz</string>
     <string name="content_accessibility_voice_playback">Falha na reprodução da mensagem de voz</string>
+    <string name="content_accessibility_voice_retry">Tentar novamente transferir a mensagem de voz</string>
     <string name="content_accessibility_voice_seek">Buscar na mensagem de voz</string>
     <string name="content_accessibility_voice_speed">Alterar velocidade de reprodução</string>
+    <string name="content_accessibility_voice_unheard">Mensagem de voz não ouvida</string>
     <string name="content_actions_block">bloquear</string>
     <string name="content_actions_direct_message">mensagem direta</string>
     <string name="content_actions_hug">abraçar</string>

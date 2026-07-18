@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">สลับบุ๊กมาร์กสำหรับ #%1$s</string>
     <string name="content_accessibility_toggle_favorite">แตะสองครั้งเพื่อสลับสถานะรายการโปรด</string>
     <string name="content_accessibility_view_fingerprint">แตะเพื่อดูลายนิ้วมือการเข้ารหัส</string>
+    <string name="content_accessibility_voice_download">Download voice message</string>
+    <string name="content_accessibility_voice_downloading">Downloading voice message</string>
     <string name="content_accessibility_voice_pause">Pause voice message</string>
     <string name="content_accessibility_voice_play">Play voice message</string>
     <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_retry">Retry downloading voice message</string>
     <string name="content_accessibility_voice_seek">Seek voice message</string>
     <string name="content_accessibility_voice_speed">Change playback speed</string>
+    <string name="content_accessibility_voice_unheard">Unheard voice message</string>
     <string name="content_actions_block">บล็อก</string>
     <string name="content_actions_direct_message">ส่งข้อความส่วนตัว</string>
     <string name="content_actions_hug">กอด</string>

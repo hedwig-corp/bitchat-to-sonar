@@ -113,7 +113,7 @@ import chat.bitchat.sonar.resources.content_accessibility_voice_download
 import chat.bitchat.sonar.resources.content_accessibility_voice_downloading
 import chat.bitchat.sonar.resources.content_accessibility_voice_pause
 import chat.bitchat.sonar.resources.content_accessibility_voice_play
-import chat.bitchat.sonar.resources.content_accessibility_voice_retry_download
+import chat.bitchat.sonar.resources.content_accessibility_voice_retry
 import chat.bitchat.sonar.resources.content_accessibility_voice_speed
 import chat.bitchat.sonar.resources.content_accessibility_voice_unheard
 import chat.bitchat.sonar.resources.sonar_icon
@@ -4044,7 +4044,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val speedA11y = stringResource(Res.string.content_accessibility_voice_speed)
     val downloadA11y = stringResource(Res.string.content_accessibility_voice_download)
     val downloadingA11y = stringResource(Res.string.content_accessibility_voice_downloading)
-    val retryDownloadA11y = stringResource(Res.string.content_accessibility_voice_retry_download)
+    val retryDownloadA11y = stringResource(Res.string.content_accessibility_voice_retry)
     val unheardA11y = stringResource(Res.string.content_accessibility_voice_unheard)
     val tail = 5.dp
     // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs

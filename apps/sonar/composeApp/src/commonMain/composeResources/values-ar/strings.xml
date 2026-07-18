@@ -61,11 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">تبديل الإشارة لـ #%1$s</string>
     <string name="content_accessibility_toggle_favorite">اضغط مرتين لتبديل حالة المفضلة</string>
     <string name="content_accessibility_view_fingerprint">اضغط لمشاهدة بصمة التشفير</string>
+    <string name="content_accessibility_voice_download">تنزيل الرسالة الصوتية</string>
+    <string name="content_accessibility_voice_downloading">جارٍ تنزيل الرسالة الصوتية</string>
     <string name="content_accessibility_voice_pause">إيقاف رسالة صوتية مؤقتاً</string>
     <string name="content_accessibility_voice_play">تشغيل رسالة صوتية</string>
     <string name="content_accessibility_voice_playback">فشل تشغيل الرسالة الصوتية</string>
+    <string name="content_accessibility_voice_retry">إعادة محاولة تنزيل الرسالة الصوتية</string>
     <string name="content_accessibility_voice_seek">التنقل في الرسالة الصوتية</string>
     <string name="content_accessibility_voice_speed">تغيير سرعة التشغيل</string>
+    <string name="content_accessibility_voice_unheard">رسالة صوتية غير مستمعة</string>
     <string name="content_actions_block">حظر</string>
     <string name="content_actions_direct_message">رسالة مباشرة</string>
     <string name="content_actions_hug">عناق</string>
