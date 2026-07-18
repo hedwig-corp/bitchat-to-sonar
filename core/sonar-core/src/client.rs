@@ -3948,6 +3948,55 @@ impl SonarClient {
         self.retry_outbox().await;
     }
 
+    /// Repair the cross-sidecar handoff before any relay retry can compact it.
+    ///
+    /// A crash can land after the relay outbox entry is durable but before the
+    /// media manifest records its canonical message id. Publishing that relay
+    /// entry first would let an ACK delete the only remaining request-to-message
+    /// mapping, so media recovery could recreate the MLS message. Checkpoint the
+    /// mapping synchronously and suppress only handoffs whose manifest write
+    /// still fails; ordinary text and already-checkpointed sends remain retryable.
+    fn checkpoint_media_handoffs_before_retry(&self) -> HashSet<String> {
+        let pending_request_ids = {
+            let media_outbox = self.media_outbox.lock().unwrap();
+            media_outbox
+                .job_ids()
+                .into_iter()
+                .filter(|request_id| {
+                    media_outbox
+                        .job(request_id)
+                        .is_some_and(|job| job.completed_message_id.is_none())
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut blocked_message_ids = HashSet::new();
+        for request_id in pending_request_ids {
+            let Some(message_id) = self
+                .outbox_state
+                .lock()
+                .unwrap()
+                .message_id_for_media_request(&request_id)
+            else {
+                continue;
+            };
+            if let Err(error) = self
+                .media_outbox
+                .lock()
+                .unwrap()
+                .checkpoint_completed_message(&request_id, message_id.clone())
+            {
+                tracing::warn!(
+                    %error,
+                    %request_id,
+                    %message_id,
+                    "media handoff checkpoint failed; deferring relay retry"
+                );
+                blocked_message_ids.insert(message_id);
+            }
+        }
+        blocked_message_ids
+    }
+
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
     /// or advances MLS state; it only republishes the original wrapper event.
@@ -3969,6 +4018,7 @@ impl SonarClient {
         if self.relays.is_empty() {
             return;
         }
+        let blocked_media_messages = self.checkpoint_media_handoffs_before_retry();
         let active_group_ids = match self.engine.groups() {
             Ok(groups) => groups
                 .into_iter()
@@ -3990,6 +4040,9 @@ impl SonarClient {
             }
         };
         for (message_id_hex, group_id_hex, event) in retryable {
+            if blocked_media_messages.contains(&message_id_hex) {
+                continue;
+            }
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
@@ -7037,6 +7090,70 @@ mod tests {
             "a third queued job must wait before allocating preparation ciphertext"
         );
         drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn relay_retry_checkpoints_media_handoff_before_compaction() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        *client.media_outbox.lock().unwrap() = MediaOutbox::open(&db, [7_u8; 32]).unwrap();
+        let request_id = "crash-between-sidecars";
+        client
+            .media_outbox
+            .lock()
+            .unwrap()
+            .begin_job_with_sources(
+                request_id.into(),
+                "010203".into(),
+                String::new(),
+                String::new(),
+                1,
+                &[(b"video".as_slice(), "video/mp4", "clip.mp4")],
+            )
+            .unwrap();
+        client
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_pending_media(
+                "010203".into(),
+                "canonical-message".into(),
+                "wrapper-event".into(),
+                "{}".into(),
+                1,
+                request_id.into(),
+            )
+            .unwrap();
+        assert!(
+            client
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .unwrap()
+                .completed_message_id
+                .is_none(),
+            "fixture must model a crash after the relay sidecar write"
+        );
+
+        let blocked = client.checkpoint_media_handoffs_before_retry();
+
+        assert!(blocked.is_empty());
+        assert_eq!(
+            client
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .unwrap()
+                .completed_message_id
+                .as_deref(),
+            Some("canonical-message"),
+            "relay retry must not observe the handoff until the media tombstone is durable"
+        );
     }
 
     #[tokio::test]
