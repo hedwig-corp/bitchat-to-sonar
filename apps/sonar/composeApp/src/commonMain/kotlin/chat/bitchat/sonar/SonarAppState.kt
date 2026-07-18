@@ -4846,16 +4846,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Couldn't save the secure route. Try again."
                 continue
             }
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
-                .onSuccess {
-                    runCatching { SonarCore.completePreRouteMessage(send.echoId) }
+            val sent = runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            if (sent.isSuccess) {
+                if (completeAcceptedPreRouteMessage(send.echoId)) {
                     clearSendEcho(chatId, send.echoId)
-                }
-                .onFailure {
-                    queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                } else {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
                 }
+            } else {
+                queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                failSendEcho(chatId, send.echoId)
+                toast = "send failed: ${sent.exceptionOrNull()?.message}"
+            }
         }
     }
 
@@ -5031,16 +5033,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "Couldn't save the secure route. Try again."
                 continue
             }
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
-                .onSuccess {
-                    runCatching { SonarCore.completePreRouteMessage(send.echoId) }
+            val sent = runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            if (sent.isSuccess) {
+                if (completeAcceptedPreRouteMessage(send.echoId)) {
                     clearSendEcho(chatId, send.echoId)
-                }
-                .onFailure {
-                    queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                } else {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
                 }
+            } else {
+                queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                failSendEcho(chatId, send.echoId)
+                toast = "send failed: ${sent.exceptionOrNull()?.message}"
+            }
         }
     }
 
@@ -5611,7 +5615,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             scope.launch {
                 try {
                     sendQueuedMarmotContent(groupId, content)
-                    runCatching { SonarCore.completePreRouteMessage(echoId) }
+                    if (!completeAcceptedPreRouteMessage(echoId)) {
+                        failSendEcho(chatId, echoId)
+                        return@launch
+                    }
                     val generation = transcriptGeneration
                     val published = if (isMeshChat(chatId)) {
                         marmotMessagesForPeer(meshPeerId(chatId), chatId, generation)
@@ -7443,6 +7450,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         }.isSuccess
     }
 
+    /** Only retire a retry echo after the accepted send and its pre-route
+     * journal cleanup are both durable. */
+    private suspend fun completeAcceptedPreRouteMessage(id: String): Boolean =
+        runCatching { SonarCore.completePreRouteMessage(id) }
+            .onFailure { toast = "Message was saved locally, but retry cleanup failed." }
+            .isSuccess
+
     private suspend fun discardPreRouteMessages(routeKeys: Set<String>) {
         if (routeKeys.isEmpty()) return
         for (record in SonarCore.preRouteMessages()) {
@@ -7452,7 +7466,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun restoredPreRouteEcho(chatId: String, record: SonarPreRouteMessage) {
+    private fun restoredPreRouteEcho(
+        chatId: String,
+        record: SonarPreRouteMessage,
+        state: String = "Sending",
+    ) {
         if (pendingSendEchoes[chatId].orEmpty().any { it.id == record.id }) return
         val echo = privateDmMessage(
             id = record.id,
@@ -7461,7 +7479,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             mine = true,
             tsSecs = record.createdAtSecs,
             viaInternet = true,
-            state = "Sending",
+            state = state,
         )
         pendingSendEchoes.getOrPut(chatId) { mutableListOf() }.add(echo)
         previouslyPublishedMessageIdsByEcho[record.id] = emptySet()
@@ -7519,8 +7537,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val chatId = record.routeContext.takeIf { it.isNotBlank() }
                         ?.takeUnless { it.startsWith(PENDING_MARMOT_CHAT_PREFIX) || it.startsWith(PENDING_MARMOT_GROUP_PREFIX) }
                         ?: record.routeId
-                    restoredPreRouteEcho(chatId, record)
-                    queueResolvedMarmotSend(record.routeId, record.id, record.content, chatId)
+                    // The normal local outbox may already own this send and
+                    // only journal cleanup may have failed. Never auto-replay
+                    // a fresh MLS message id after restart; let the user decide
+                    // whether to retry the surfaced uncertain delivery.
+                    restoredPreRouteEcho(chatId, record, state = "Couldn't send")
                 }
             }
         }
@@ -7724,9 +7745,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                         pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(send)
                         continue
                     }
-                    runCatching { sendQueuedMarmotContent(group.id, send.text) }
-                        .onSuccess { runCatching { SonarCore.completePreRouteMessage(send.id) } }
-                        .onFailure { queueResolvedMarmotSend(group.id, send.id, send.text, send.chatId) }
+                    val sent = runCatching { sendQueuedMarmotContent(group.id, send.text) }
+                    if (sent.isSuccess) {
+                        completeAcceptedPreRouteMessage(send.id)
+                    } else {
+                        queueResolvedMarmotSend(group.id, send.id, send.text, send.chatId)
+                    }
                 }
             }
         }
@@ -7744,15 +7768,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             resolvedMarmotSends.remove(groupId)
             scope.launch {
                 for (send in sends) {
-                    runCatching { sendQueuedMarmotContent(groupId, send.text) }
-                        .onSuccess {
-                            runCatching { SonarCore.completePreRouteMessage(send.id) }
+                    val sent = runCatching { sendQueuedMarmotContent(groupId, send.text) }
+                    if (sent.isSuccess) {
+                        if (completeAcceptedPreRouteMessage(send.id)) {
                             send.chatId?.let { clearSendEcho(it, send.id) }
-                        }
-                        .onFailure {
-                            queueResolvedMarmotSend(groupId, send.id, send.text, send.chatId)
+                        } else {
                             send.chatId?.let { failSendEcho(it, send.id) }
                         }
+                    } else {
+                        queueResolvedMarmotSend(groupId, send.id, send.text, send.chatId)
+                        send.chatId?.let { failSendEcho(it, send.id) }
+                    }
                 }
             }
         }

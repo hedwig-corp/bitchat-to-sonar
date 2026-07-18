@@ -519,19 +519,16 @@ final class MarmotService: @unchecked Sendable {
         return current?.preRouteMessages() ?? []
     }
 
-    func completePreRouteMessage(id: String) {
-        nodeLock.lock()
-        let current = node
-        nodeLock.unlock()
-        try? current?.completePreRouteMessage(id: id)
+    func completePreRouteMessage(id: String) async throws {
+        try await run { service in
+            try service.requireNode().completePreRouteMessage(id: id)
+        }
     }
 
-    func resolvePreRouteMessage(id: String, groupId: String) throws {
-        nodeLock.lock()
-        let current = node
-        nodeLock.unlock()
-        guard let current else { throw ServiceError.notConnected }
-        try current.resolvePreRouteMessage(id: id, groupId: groupId)
+    func resolvePreRouteMessage(id: String, groupId: String) async throws {
+        try await run { service in
+            try service.requireNode().resolvePreRouteMessage(id: id, groupId: groupId)
+        }
     }
 
     func discardPreRouteGroupOperation(operationId: String) async throws {

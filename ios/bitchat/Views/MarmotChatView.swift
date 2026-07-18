@@ -494,12 +494,12 @@ final class MarmotChatModel: ObservableObject {
         service.preRouteMessages()
     }
 
-    func completePreRouteMessage(id: String) {
-        service.completePreRouteMessage(id: id)
+    func completePreRouteMessage(id: String) async throws {
+        try await service.completePreRouteMessage(id: id)
     }
 
-    func resolvePreRouteMessage(id: String, groupId: String) throws {
-        try service.resolvePreRouteMessage(id: id, groupId: groupId)
+    func resolvePreRouteMessage(id: String, groupId: String) async throws {
+        try await service.resolvePreRouteMessage(id: id, groupId: groupId)
     }
 
     func clearPreRouteMessages() {

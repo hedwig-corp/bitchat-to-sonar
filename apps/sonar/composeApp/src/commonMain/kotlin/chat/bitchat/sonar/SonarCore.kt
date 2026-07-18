@@ -632,10 +632,10 @@ expect object SonarCore {
     suspend fun preRouteMessages(): List<SonarPreRouteMessage>
 
     /** Remove only after the normal core send has accepted the message. */
-    fun completePreRouteMessage(id: String)
+    suspend fun completePreRouteMessage(id: String)
 
     /** Checkpoint the concrete MLS group selected before replay. */
-    fun resolvePreRouteMessage(id: String, groupId: String)
+    suspend fun resolvePreRouteMessage(id: String, groupId: String)
 
     /** Delete a durable group setup, including any local marker group and the
      *  operation checkpoint that would otherwise replay after restart. */

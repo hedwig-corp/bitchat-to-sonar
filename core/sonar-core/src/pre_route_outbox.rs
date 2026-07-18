@@ -214,23 +214,39 @@ impl PreRouteOutbox {
                 ))
             };
         }
-        if self.entries.len() >= MAX_ENTRIES {
-            return Err(Error::InvalidInput("pre-route outbox is full".into()));
-        }
-        let route_depth = self
+        let route_entries = self
             .entries
             .iter()
+            .enumerate()
             .filter(|entry| {
-                entry.route_kind == message.route_kind && entry.route_id == message.route_id
-            })
-            .count();
-        if route_depth >= MAX_ENTRIES_PER_ROUTE {
-            return Err(Error::InvalidInput("pre-route outbox route is full".into()));
+                entry.1.route_kind == message.route_kind && entry.1.route_id == message.route_id
+            });
+        let route_depth = route_entries.clone().count();
+        // Hosts mirror the same per-route FIFO. Evict the oldest journal row
+        // atomically with the replacement so their post-enqueue in-memory
+        // eviction cannot be blocked by the durable cap first.
+        let evicted = if route_depth >= MAX_ENTRIES_PER_ROUTE {
+            let index = route_entries
+                .map(|(index, _)| index)
+                .next()
+                .expect("a full route has an oldest entry");
+            Some((index, self.entries.remove(index)))
+        } else {
+            None
+        };
+        if self.entries.len() >= MAX_ENTRIES {
+            if let Some((index, evicted)) = evicted {
+                self.entries.insert(index, evicted);
+            }
+            return Err(Error::InvalidInput("pre-route outbox is full".into()));
         }
 
         self.entries.push(message);
         if let Err(error) = self.save() {
             self.entries.pop();
+            if let Some((index, evicted)) = evicted {
+                self.entries.insert(index, evicted);
+            }
             return Err(error);
         }
         Ok(())
@@ -777,6 +793,26 @@ mod tests {
         changed.content = "different".into();
         assert!(outbox.enqueue(changed).is_err());
         assert_eq!(outbox.messages().len(), 1);
+    }
+
+    #[test]
+    fn enqueue_atomically_evicts_oldest_entry_at_route_capacity() {
+        let mut outbox = PreRouteOutbox::open(None, None).expect("open");
+        for index in 0..MAX_ENTRIES_PER_ROUTE {
+            outbox
+                .enqueue(message(&format!("message-{index}")))
+                .expect("fill route");
+        }
+
+        outbox
+            .enqueue(message("replacement"))
+            .expect("replace oldest route entry");
+
+        let messages = outbox.messages();
+        assert_eq!(messages.len(), MAX_ENTRIES_PER_ROUTE);
+        assert_eq!(messages.first().unwrap().id, "message-1");
+        assert_eq!(messages.last().unwrap().id, "replacement");
+        assert!(!messages.iter().any(|entry| entry.id == "message-0"));
     }
 
     #[test]

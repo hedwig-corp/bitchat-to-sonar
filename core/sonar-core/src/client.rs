@@ -2358,9 +2358,9 @@ impl SonarClient {
     }
 
     /// Resume the only safe states for an existing durable group operation.
-    /// MDK merges an initial creation commit inside `create_group`, before it
-    /// returns the Welcomes, so the creator route itself is already usable.
-    /// Recovery is about proving whether every recipient observed that route:
+    /// MDK leaves the initial creation commit pending until every Welcome has
+    /// been published. Recovery is about proving whether every recipient
+    /// observed that route before merging the creator's pending commit:
     /// an intent-only checkpoint means publication never began and recreation
     /// is safe; a full checkpoint is republished by stable event id; no
     /// checkpoint means the operation completed and cleaned up before restart.
@@ -2563,6 +2563,11 @@ impl SonarClient {
             self.publish_marmot_event(&event, "group welcome recovery")
                 .await?;
         }
+        // Match the non-idempotent creation path: only advance the creator's
+        // MLS epoch after every stable Welcome has reached a relay. The full
+        // checkpoint remains durable until both this merge and cleanup finish,
+        // so a crash can safely republish the same signed event ids.
+        self.engine.merge_pending_commit(&group_id)?;
         self.finalize_group_creation(group_id.clone()).await;
         if let Err(err) = self
             .pre_route_outbox
@@ -7820,11 +7825,15 @@ mod tests {
             .await
             .unwrap();
         let recovered = restarted
-            .start_group_idempotent(members, "Recovery group", operation_id)
+            .start_group_idempotent(members.clone(), "Recovery group", operation_id)
             .await
             .unwrap();
 
         assert_eq!(recovered, group_id);
+        let recovered_members = restarted.engine.members(&group_id).unwrap();
+        assert!(members
+            .iter()
+            .all(|member| recovered_members.contains(member)));
         restarted
             .engine
             .create_text_message(&group_id, "usable after recovery")

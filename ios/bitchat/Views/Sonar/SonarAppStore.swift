@@ -1246,7 +1246,9 @@ final class SonarAppStore: ObservableObject {
                 }
             },
             complete: { messageID in
-                marmot.completePreRouteMessage(id: messageID)
+                Task {
+                    try? await marmot.completePreRouteMessage(id: messageID)
+                }
             }
         )
 
@@ -4596,11 +4598,31 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// A successful core send is already owned by the normal local transcript
+    /// and relay outbox. Do not clear its retry echo until the pre-route record
+    /// is durably removed as well; otherwise restart could replay the plaintext
+    /// through a fresh MLS message id.
+    private func completeAcceptedPreRouteMessage(id: String) async -> Bool {
+        do {
+            try await marmot.completePreRouteMessage(id: id)
+            return true
+        } catch {
+            showToast("Message was saved locally, but retry cleanup failed.")
+            return false
+        }
+    }
+
     private func discardPreRouteMessages(matching routeKeys: Set<String>) {
         guard !routeKeys.isEmpty else { return }
-        for record in marmot.preRouteMessages()
-        where routeKeys.contains(record.routeId) || routeKeys.contains(record.routeContext) {
-            marmot.completePreRouteMessage(id: record.id)
+        let ids = marmot.preRouteMessages().compactMap { record in
+            routeKeys.contains(record.routeId) || routeKeys.contains(record.routeContext)
+                ? record.id
+                : nil
+        }
+        Task {
+            for id in ids {
+                try? await marmot.completePreRouteMessage(id: id)
+            }
         }
     }
 
@@ -4697,15 +4719,15 @@ final class SonarAppStore: ObservableObject {
                 let realId = Self.marmotIDPrefix + record.routeId
                 if pendingMarmotMessagesByChat[realId, default: []].contains(where: { $0.id == record.id }) == false {
                     pendingMarmotMessagesByChat[realId, default: []].append(
-                        pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
+                        failedPendingMessage(
+                            pendingMarmotEcho(text: record.content, id: record.id, createdAt: createdAt)
+                        )
                     )
                 }
-                queueResolvedMarmotSend(
-                    groupId: record.routeId,
-                    id: record.id,
-                    text: record.content,
-                    chatId: realId
-                )
+                // A resolved checkpoint may represent a send that the normal
+                // local outbox already accepted before journal cleanup failed.
+                // Surface it as retryable instead of auto-replaying a second
+                // MLS message with a new id after restart.
             default:
                 break
             }
@@ -4821,8 +4843,11 @@ final class SonarAppStore: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if await self.sendQueuedMarmotContent(content, to: groupId) {
-                    self.marmot.completePreRouteMessage(id: message.id)
-                    self.removePendingMarmotMessage(message.id)
+                    if await self.completeAcceptedPreRouteMessage(id: message.id) {
+                        self.removePendingMarmotMessage(message.id)
+                    } else {
+                        self.restoreFailedPendingMarmotMessage(source.message, preferredKey: source.key)
+                    }
                 } else {
                     self.queueResolvedMarmotSend(
                         groupId: groupId,
@@ -5287,7 +5312,7 @@ final class SonarAppStore: ObservableObject {
                     members: pending.members,
                     operationId: pendingId
                 )
-                finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
+                await finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
                 showToast("Couldn't create group: \(error.localizedDescription)")
@@ -5311,7 +5336,7 @@ final class SonarAppStore: ObservableObject {
                     inviteId: inviteId,
                     expectedGroupId: expectedGroupId
                 )
-                finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
+                await finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
                 showToast("Couldn't accept invite: \(error.localizedDescription)")
@@ -5321,12 +5346,16 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSetupTasks[pendingId] = setupTask
     }
 
-    private func finishPendingMarmotGroup(pendingId: String, groupId: String, setupToken: UUID? = nil) {
+    private func finishPendingMarmotGroup(pendingId: String, groupId: String, setupToken: UUID? = nil) async {
         guard isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else { return }
         if setupToken == nil {
             cancelPendingMarmotGroupSetup(pendingId: pendingId)
         }
-        marmot.completePreRouteMessage(id: pendingGroupOperationSentinelId(pendingId))
+        do {
+            try await marmot.completePreRouteMessage(id: pendingGroupOperationSentinelId(pendingId))
+        } catch {
+            showToast("Group is ready, but setup cleanup will be retried.")
+        }
         pendingMarmotGroups[pendingId] = nil
         let realId = Self.marmotIDPrefix + groupId
         pendingMarmotRouteReplacement = SNMarmotRouteReplacement(pendingId: pendingId, realId: realId)
@@ -5410,7 +5439,7 @@ final class SonarAppStore: ObservableObject {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
                 do {
-                    try marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
+                    try await marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
                 } catch {
                     pendingDirectMarmotSends[npub, default: []].append(item)
                     pendingMarmotMessagesByChat[realId, default: []].append(failedPendingMessage(echo))
@@ -5431,8 +5460,10 @@ final class SonarAppStore: ObservableObject {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
                     )
-                } else {
-                    marmot.completePreRouteMessage(id: item.messageId)
+                } else if !(await completeAcceptedPreRouteMessage(id: item.messageId)) {
+                    pendingMarmotMessagesByChat[realId, default: []].append(
+                        failedPendingMessage(echo)
+                    )
                 }
             }
         }
@@ -5454,7 +5485,7 @@ final class SonarAppStore: ObservableObject {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
                 do {
-                    try marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
+                    try await marmot.resolvePreRouteMessage(id: item.messageId, groupId: groupId)
                 } catch {
                     pendingMarmotGroupSends[pendingId, default: []].append(item)
                     pendingMarmotMessagesByChat[realId, default: []].append(failedPendingMessage(echo))
@@ -5475,8 +5506,10 @@ final class SonarAppStore: ObservableObject {
                     pendingMarmotMessagesByChat[realId, default: []].append(
                         failedPendingMessage(echo)
                     )
-                } else {
-                    marmot.completePreRouteMessage(id: item.messageId)
+                } else if !(await completeAcceptedPreRouteMessage(id: item.messageId)) {
+                    pendingMarmotMessagesByChat[realId, default: []].append(
+                        failedPendingMessage(echo)
+                    )
                 }
             }
         }
@@ -5503,13 +5536,13 @@ final class SonarAppStore: ObservableObject {
                 guard let self else { return }
                 for send in sends {
                     do {
-                        try self.marmot.resolvePreRouteMessage(id: send.id, groupId: group.id)
+                        try await self.marmot.resolvePreRouteMessage(id: send.id, groupId: group.id)
                     } catch {
                         self.pendingMarmotSends[npub, default: []].append(send)
                         continue
                     }
                     if await self.sendQueuedMarmotContent(send.text, to: group.id) {
-                        self.marmot.completePreRouteMessage(id: send.id)
+                        _ = await self.completeAcceptedPreRouteMessage(id: send.id)
                     } else {
                         self.queueResolvedMarmotSend(
                             groupId: group.id,
@@ -5541,9 +5574,15 @@ final class SonarAppStore: ObservableObject {
                 guard let self else { return }
                 for send in sends {
                     if await self.sendQueuedMarmotContent(send.text, to: groupId) {
-                        self.marmot.completePreRouteMessage(id: send.id)
-                        if let chatId = send.chatId {
-                            self.pendingMarmotMessagesByChat[chatId]?.removeAll { $0.id == send.id }
+                        if await self.completeAcceptedPreRouteMessage(id: send.id) {
+                            if let chatId = send.chatId {
+                                self.pendingMarmotMessagesByChat[chatId]?.removeAll { $0.id == send.id }
+                            }
+                        } else if let chatId = send.chatId,
+                                  let index = self.pendingMarmotMessagesByChat[chatId]?.firstIndex(where: { $0.id == send.id }) {
+                            self.pendingMarmotMessagesByChat[chatId]?[index] = self.failedPendingMessage(
+                                self.pendingMarmotMessagesByChat[chatId]![index]
+                            )
                         }
                     } else {
                         self.queueResolvedMarmotSend(

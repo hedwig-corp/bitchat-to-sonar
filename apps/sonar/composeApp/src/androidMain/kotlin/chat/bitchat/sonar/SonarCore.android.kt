@@ -563,11 +563,11 @@ actual object SonarCore {
         }
     }
 
-    actual fun completePreRouteMessage(id: String) {
+    actual suspend fun completePreRouteMessage(id: String) = withContext(Dispatchers.IO) {
         requireNode().completePreRouteMessage(id)
     }
 
-    actual fun resolvePreRouteMessage(id: String, groupId: String) {
+    actual suspend fun resolvePreRouteMessage(id: String, groupId: String) = withContext(Dispatchers.IO) {
         requireNode().resolvePreRouteMessage(id, groupId)
     }
 
