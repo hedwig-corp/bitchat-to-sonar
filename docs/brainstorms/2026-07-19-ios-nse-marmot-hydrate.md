@@ -83,3 +83,10 @@
 ## Sequencing
 
 Ship as stacked PRs if needed: **P0 → P1 → P2+P3 → P4**. Do not land App Group move without wipe coverage and migration tests.
+
+## Android parity note
+
+Android already hydrates on push via `SonarPushProcessingService` → `syncForce()`
+into the local DB before/with the notification. This iOS change closes the
+force-quit gap to that shape. No Android behavior change in this PR.
+
