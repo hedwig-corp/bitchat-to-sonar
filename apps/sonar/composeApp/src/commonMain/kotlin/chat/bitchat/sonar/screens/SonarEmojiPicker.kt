@@ -48,6 +48,7 @@ import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Opening the emoji/sticker tray must dismiss the soft keyboard on IME
@@ -106,6 +107,9 @@ internal fun mergeRefreshedStickerPacks(
 }
 
 private enum class PickerTab { Emoji, Gif, Sticker }
+
+/** Overall sticker-tab refresh budget (installed list + pack metadata). */
+private const val STICKER_TAB_LOAD_TIMEOUT_MS = 30_000L
 
 private val frequentEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
 
@@ -472,37 +476,43 @@ private fun ColumnScope.StickerTabContent(
         if (hadCachedPacks) {
             loading = false
         }
-        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
-        if (coordinates == null) {
-            if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+        // Bound the whole refresh so a stuck relay/lock cannot leave the tab
+        // on "Loading stickers…" forever (each pack fetch is already ~10s).
+        val finished = withTimeoutOrNull(STICKER_TAB_LOAD_TIMEOUT_MS) {
+            val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
+            if (coordinates == null) {
+                if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+                    error = "Failed to load sticker packs"
+                }
+                return@withTimeoutOrNull
+            }
+            val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
+            if (filteredCachedPacks != packs) {
+                packs = filteredCachedPacks
+                onStickerPacksLoaded(filteredCachedPacks)
+            }
+            val loaded = mutableListOf<SonarStickerPack>()
+            for (coord in coordinates) {
+                val parts = coord.split(":", limit = 3)
+                if (parts.size != 3) continue
+                loadStickerPack(parts[1], parts[2], emptyList())
+                    ?.takeIf { it.stickers.isNotEmpty() }
+                    ?.let { loaded += it }
+            }
+            val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
+            if (merged.isNotEmpty()) {
+                packs = merged
+                onStickerPacksLoaded(merged)
+                error = null
+            } else if (coordinates.isEmpty()) {
+                packs = emptyList()
+                onStickerPacksLoaded(emptyList())
+                error = null
+            } else if (packs.isEmpty()) {
                 error = "Failed to load sticker packs"
             }
-            loading = false
-            return@LaunchedEffect
         }
-        val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
-        if (filteredCachedPacks != packs) {
-            packs = filteredCachedPacks
-            onStickerPacksLoaded(filteredCachedPacks)
-        }
-        val loaded = mutableListOf<SonarStickerPack>()
-        for (coord in coordinates) {
-            val parts = coord.split(":", limit = 3)
-            if (parts.size != 3) continue
-            loadStickerPack(parts[1], parts[2], emptyList())
-                ?.takeIf { it.stickers.isNotEmpty() }
-                ?.let { loaded += it }
-        }
-        val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
-        if (merged.isNotEmpty()) {
-            packs = merged
-            onStickerPacksLoaded(merged)
-            error = null
-        } else if (coordinates.isEmpty()) {
-            packs = emptyList()
-            onStickerPacksLoaded(emptyList())
-            error = null
-        } else if (packs.isEmpty()) {
+        if (finished == null && packs.isEmpty() && error == null) {
             error = "Failed to load sticker packs"
         }
         loading = false
