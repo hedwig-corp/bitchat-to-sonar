@@ -435,6 +435,11 @@ final class SNTranscriptCollectionViewController<Composer: View>: UIViewControll
 
         composerHost.view.translatesAutoresizingMaskIntoConstraints = false
         composerHost.view.backgroundColor = .clear
+        // Tray open/close changes composer intrinsic height; without this the
+        // hosting view does not reliably report the new size to Auto Layout.
+        if #available(iOS 16.0, *) {
+            composerHost.sizingOptions = .intrinsicContentSize
+        }
         // keyboardLayoutGuide already places the bar above the home indicator /
         // IME; hosting-controller safe-area padding would add a second band.
         if #available(iOS 16.4, *) {

@@ -17,6 +17,38 @@ import UIKit
 import AppKit
 #endif
 
+/// Opening the emoji/sticker tray must dismiss the soft keyboard on IME
+/// platforms. Phase 3 pins the composer to `keyboardLayoutGuide`, so leaving
+/// the IME up stacks the 320pt tray on top of the keyboard, inflates the owned
+/// bottom inset, and freezes the chat UI.
+///
+/// Hardware-keyboard surfaces (macOS) pass `usesSoftKeyboard: false` so opening
+/// the tray does not steal composer focus — pick-and-continue-typing stays.
+func snShouldDismissKeyboardWhenOpeningEmojiTray(
+    openingTray: Bool,
+    usesSoftKeyboard: Bool
+) -> Bool {
+    openingTray && usesSoftKeyboard
+}
+
+/// Focusing the message field while the tray is open closes the tray on soft-
+/// keyboard platforms so the IME and custom picker never own bottom chrome
+/// together. No-op on hardware-keyboard platforms (`usesSoftKeyboard: false`).
+func snShouldCloseEmojiTrayOnComposerFocus(
+    composerFocused: Bool,
+    trayOpen: Bool,
+    usesSoftKeyboard: Bool
+) -> Bool {
+    composerFocused && trayOpen && usesSoftKeyboard
+}
+
+/// Tray-internal search may summon the soft keyboard (Signal-style filter).
+/// Shrink the fixed tray height so tray + IME do not consume the whole
+/// viewport the way a full 320pt tray + keyboard did when freezing the chat.
+func snEmojiTrayHeight(searchFocused: Bool) -> CGFloat {
+    searchFocused ? 200 : 320
+}
+
 func snShouldPreserveCachedStickerPacks(
     hadCachedPacks: Bool,
     installedCoordinates: [String]?
@@ -76,6 +108,7 @@ struct SonarEmojiPickerView: View {
     @State private var tab = 0
     @State private var search = ""
     @State private var category = 0
+    @FocusState private var searchFocused: Bool
 
     private let tabs = ["Emoji", "GIF", "Sticker"]
 
@@ -86,6 +119,7 @@ struct SonarEmojiPickerView: View {
                 ForEach(Array(tabs.enumerated()), id: \.offset) { i, label in
                     Button {
                         tab = i
+                        searchFocused = false
                     } label: {
                         Text(verbatim: label)
                             .font(SonarTheme.uiFont(size: 14, weight: i == tab ? .bold : .regular))
@@ -127,7 +161,7 @@ struct SonarEmojiPickerView: View {
             )
             }
         }
-        .frame(height: 320)
+        .frame(height: snEmojiTrayHeight(searchFocused: searchFocused))
         .background(SonarTheme.bg)
     }
 
@@ -155,6 +189,7 @@ struct SonarEmojiPickerView: View {
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 14))
                     .foregroundColor(SonarTheme.text)
+                    .focused($searchFocused)
                     #if os(iOS)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()

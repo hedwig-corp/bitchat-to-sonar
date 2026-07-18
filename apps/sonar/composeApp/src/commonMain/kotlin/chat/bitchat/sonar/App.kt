@@ -84,7 +84,10 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
@@ -103,6 +106,8 @@ import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
+import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
+import chat.bitchat.sonar.screens.shouldDismissKeyboardWhenOpeningEmojiTray
 import chat.bitchat.sonar.ui.authorColor
 import chat.bitchat.sonar.ui.bcHue
 import chat.bitchat.sonar.ui.SNDot
@@ -1542,149 +1547,183 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     @Composable
     fun ChatBottomChrome() {
-        if (draft.startsWith("/")) SlashHints(draft) { draft = it }
-        if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
-            onEmoji = { draft += it },
-            onGif = { item ->
-                emojiTray = false
-                state.sendGifItem(screen.id, item)
-            },
-            onSticker = { sticker, packCoordinate ->
-                emojiTray = false
-                state.sendStickerItem(screen.id, sticker, packCoordinate)
-            },
-            loadStickerPack = { author, identifier, relays ->
-                state.stickerPack(author, identifier, relays)
-            },
-            loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
-            fetchInstalledPacks = { state.fetchInstalledPacks() },
-            initialStickerPacks = stickerPacks,
-            onStickerPacksLoaded = { stickerPacks = it },
-            onClose = { emojiTray = false }
-        )
-        // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
-        // (text field↔recording pill) swap; the mic Box on the right MUST stay
-        // mounted while recording, or Compose cancels its hold-to-record gesture
-        // (the @RestrictsSuspension pointer coroutine dies with its layout node)
-        // and the finger-release is never seen — the note never sends.
-        // bc-composer (theme.css): plus 36 · field min-h 36/r 19/p 7×14 · send 34.
-        Row(
-            Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
-            verticalAlignment = Alignment.Bottom
-        ) {
-            if (recording) {
-                // voice-trash: slide-left-far OR tap the trash to discard.
-                Box(
-                    Modifier.size(36.dp).clip(CircleShape).background(s.surface2)
-                        .clickable { recorder.cancel(); recording = false; recDragX = 0f },
-                    contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
+        val keyboardController = LocalSoftwareKeyboardController.current
+        val focusManager = LocalFocusManager.current
+        // Phase-2 hosts bottomContent in a Box (overlay sibling). Multiple root
+        // children would stack at top-start and overlap — tray tabs under the
+        // composer, "Loading stickers…" frozen in the crushed remainder, IME
+        // still visible. One Column root keeps tray + composer vertically stacked
+        // in both the legacy Column shell and the Phase-2 Box host.
+        Column(Modifier.fillMaxWidth()) {
+            if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+            if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
+                onEmoji = { draft += it },
+                onGif = { item ->
+                    emojiTray = false
+                    state.sendGifItem(screen.id, item)
+                },
+                onSticker = { sticker, packCoordinate ->
+                    emojiTray = false
+                    state.sendStickerItem(screen.id, sticker, packCoordinate)
+                },
+                loadStickerPack = { author, identifier, relays ->
+                    state.stickerPack(author, identifier, relays)
+                },
+                loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
+                fetchInstalledPacks = { state.fetchInstalledPacks() },
+                initialStickerPacks = stickerPacks,
+                onStickerPacksLoaded = { stickerPacks = it },
+                onClose = { emojiTray = false }
+            )
+            // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
+            // (text field↔recording pill) swap; the mic Box on the right MUST stay
+            // mounted while recording, or Compose cancels its hold-to-record gesture
+            // (the @RestrictsSuspension pointer coroutine dies with its layout node)
+            // and the finger-release is never seen — the note never sends.
+            // bc-composer (theme.css): plus 36 · field min-h 36/r 19/p 7×14 · send 34.
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 10.dp),
+                verticalAlignment = Alignment.Bottom
+            ) {
+                if (recording) {
+                    // voice-trash: slide-left-far OR tap the trash to discard.
+                    Box(
+                        Modifier.size(36.dp).clip(CircleShape).background(s.surface2)
+                            .clickable { recorder.cancel(); recording = false; recDragX = 0f },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Trash, 19.dp, s.danger, weight = 2f) }
+                    Spacer(Modifier.width(8.dp))
+                    RecordingPill(recElapsed, recLevel, recDragX, Modifier.weight(1f))
+                } else {
+                    // bc-plusbtn: "Add to your message" sheet (bitcoin / location / verify / reactions)
+                    Box(
+                        Modifier.size(36.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Plus, 19.dp, s.text2, weight = 2.1f) }
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier.weight(1f).clip(RoundedCornerShape(19.dp)).background(s.surface2)
+                            .heightIn(min = 36.dp)
+                            .padding(horizontal = 14.dp, vertical = 7.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (draft.isEmpty()) Text(
+                            "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
+                            color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
+                        )
+                        MessageComposerTextField(
+                            value = draft, onValueChange = { draft = it },
+                            textStyle = TextStyle(color = s.text, fontSize = 16.sp),
+                            cursorBrush = SolidColor(s.accent),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { focusState ->
+                                    if (
+                                        shouldCloseEmojiTrayOnComposerFocus(
+                                            composerFocused = focusState.isFocused,
+                                            trayOpen = emojiTray,
+                                            // Desktop Enter-sends ⇒ hardware keyboard; do not
+                                            // auto-close the tray when the field is focused.
+                                            usesSoftKeyboard = !messageComposerEnterSends,
+                                        )
+                                    ) {
+                                        emojiTray = false
+                                    }
+                                },
+                            onSend = {
+                                if (draft.isBlank()) return@MessageComposerTextField
+                                val d = draft; draft = ""
+                                emojiTray = false
+                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                                    state.send(screen.id, d)
+                                }
+                            },
+                        )
+                    }
+                }
+                if (!recording) {
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
+                            .clickable {
+                                val opening = !emojiTray
+                                val usesSoftKeyboard = !messageComposerEnterSends
+                                if (
+                                    shouldDismissKeyboardWhenOpeningEmojiTray(
+                                        openingTray = opening,
+                                        usesSoftKeyboard = usesSoftKeyboard,
+                                    )
+                                ) {
+                                    focusManager.clearFocus(force = true)
+                                    keyboardController?.hide()
+                                }
+                                if (opening) {
+                                    stickerPacks = state.cachedStickerPacks()
+                                }
+                                emojiTray = opening
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Smile, 18.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
+                }
                 Spacer(Modifier.width(8.dp))
-                RecordingPill(recElapsed, recLevel, recDragX, Modifier.weight(1f))
-            } else {
-                // bc-plusbtn: "Add to your message" sheet (bitcoin / location / verify / reactions)
-                Box(
-                    Modifier.size(36.dp).clip(CircleShape).background(s.surface2).clickable { addSheet = true },
-                    contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Plus, 19.dp, s.text2, weight = 2.1f) }
-                Spacer(Modifier.width(8.dp))
-                Box(
-                    Modifier.weight(1f).clip(RoundedCornerShape(19.dp)).background(s.surface2)
-                        .heightIn(min = 36.dp)
-                        .padding(horizontal = 14.dp, vertical = 7.dp),
-                    contentAlignment = Alignment.CenterStart
-                ) {
-                    if (draft.isEmpty()) Text(
-                        "Message $peerName" + (if (sendOverMesh) "" else " · via internet"),
-                        color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
-                    )
-                    MessageComposerTextField(
-                        value = draft, onValueChange = { draft = it },
-                        textStyle = TextStyle(color = s.text, fontSize = 16.sp),
-                        cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth(),
-                        onSend = {
-                            if (draft.isBlank()) return@MessageComposerTextField
-                            val d = draft; draft = ""
-                            emojiTray = false
-                            if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                                state.send(screen.id, d)
-                            }
-                        },
-                    )
+                if (draft.isEmpty() && state.canSendMedia(screen.id)) {
+                    // Hold-to-record mic (design: bc-sendbtn mic). Drag left past the
+                    // threshold to cancel; release to send. STAYS mounted across the
+                    // recording toggle (draft is empty + canSendMedia is unchanged), so
+                    // the gesture coroutine below survives — this is load-bearing.
+                    val micBg = if (recording) (if (transport == "internet") s.netFill else s.accentFill) else s.surface2
+                    val micFg = if (recording) (if (transport == "internet") s.onNet else s.onAccent) else s.text2
+                    Box(
+                        Modifier.size(34.dp).clip(CircleShape).background(micBg)
+                            .pointerInput(screen.id) {
+                                // The pointer scope is @RestrictsSuspension, so the recorder
+                                // lifecycle runs in recScope: launch start() at down, join it on
+                                // release so finish()/cancel() can never race ahead of start().
+                                awaitEachGesture {
+                                    val down = awaitFirstDown(requireUnconsumed = false)
+                                    recDragX = 0f; recElapsed = 0; recording = true
+                                    var startedOk = false
+                                    val startJob = recScope.launch { startedOk = recorder.start() }
+                                    var dx = 0f
+                                    var pressed = true
+                                    while (pressed) {
+                                        val ev = awaitPointerEvent()
+                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
+                                        dx += ch.positionChange().x; recDragX = dx
+                                        if (!ch.pressed) pressed = false
+                                    }
+                                    val cancel = dx < -240f
+                                    recScope.launch {
+                                        startJob.join()
+                                        if (!startedOk) state.toast = "Allow microphone access to record voice notes."
+                                        else if (cancel) recorder.cancel()
+                                        else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
+                                        recording = false; recDragX = 0f
+                                    }
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
+                } else {
+                    val sendEnabled = draft.isNotBlank()
+                    val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
+                    val sendFg = if (!sendEnabled) s.text3 else if (sendOverMesh) s.onAccent else s.onNet
+                    // bc-sendbtn: 34dp circle, send glyph 17/w2.3, cyan over mesh /
+                    // indigo over internet when armed.
+                    Box(
+                        Modifier.size(34.dp).clip(CircleShape).background(sendBg)
+                            .clickable(enabled = sendEnabled) {
+                                val d = draft; draft = ""
+                                emojiTray = false
+                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                                    state.send(screen.id, d)
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Send, 17.dp, sendFg, weight = 2.3f) }
                 }
             }
-            if (!recording) {
-                Spacer(Modifier.width(8.dp))
-                Box(
-                    Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
-                        .clickable {
-                            if (!emojiTray) {
-                                stickerPacks = state.cachedStickerPacks()
-                            }
-                            emojiTray = !emojiTray
-                        },
-                    contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Smile, 18.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }
-            }
-            Spacer(Modifier.width(8.dp))
-            if (draft.isEmpty() && state.canSendMedia(screen.id)) {
-                // Hold-to-record mic (design: bc-sendbtn mic). Drag left past the
-                // threshold to cancel; release to send. STAYS mounted across the
-                // recording toggle (draft is empty + canSendMedia is unchanged), so
-                // the gesture coroutine below survives — this is load-bearing.
-                val micBg = if (recording) (if (transport == "internet") s.netFill else s.accentFill) else s.surface2
-                val micFg = if (recording) (if (transport == "internet") s.onNet else s.onAccent) else s.text2
-                Box(
-                    Modifier.size(34.dp).clip(CircleShape).background(micBg)
-                        .pointerInput(screen.id) {
-                            // The pointer scope is @RestrictsSuspension, so the recorder
-                            // lifecycle runs in recScope: launch start() at down, join it on
-                            // release so finish()/cancel() can never race ahead of start().
-                            awaitEachGesture {
-                                val down = awaitFirstDown(requireUnconsumed = false)
-                                recDragX = 0f; recElapsed = 0; recording = true
-                                var startedOk = false
-                                val startJob = recScope.launch { startedOk = recorder.start() }
-                                var dx = 0f
-                                var pressed = true
-                                while (pressed) {
-                                    val ev = awaitPointerEvent()
-                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
-                                    dx += ch.positionChange().x; recDragX = dx
-                                    if (!ch.pressed) pressed = false
-                                }
-                                val cancel = dx < -240f
-                                recScope.launch {
-                                    startJob.join()
-                                    if (!startedOk) state.toast = "Allow microphone access to record voice notes."
-                                    else if (cancel) recorder.cancel()
-                                    else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
-                                    recording = false; recDragX = 0f
-                                }
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
-            } else {
-                val sendEnabled = draft.isNotBlank()
-                val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
-                val sendFg = if (!sendEnabled) s.text3 else if (sendOverMesh) s.onAccent else s.onNet
-                // bc-sendbtn: 34dp circle, send glyph 17/w2.3, cyan over mesh /
-                // indigo over internet when armed.
-                Box(
-                    Modifier.size(34.dp).clip(CircleShape).background(sendBg)
-                        .clickable(enabled = sendEnabled) {
-                            val d = draft; draft = ""
-                            emojiTray = false
-                            if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                                state.send(screen.id, d)
-                            }
-                        },
-                    contentAlignment = Alignment.Center
-                ) { SNIcon(SNIconName.Send, 17.dp, sendFg, weight = 2.3f) }
-            }
-        }
+        } // Column — single root for Phase-2 Box host
     }
 
     Box(

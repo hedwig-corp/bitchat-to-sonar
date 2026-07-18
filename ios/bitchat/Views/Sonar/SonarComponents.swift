@@ -3801,6 +3801,7 @@ struct SNComposer: View {
     @State private var text = ""
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
+    @FocusState private var composerFocused: Bool
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
     @State private var recording = false
@@ -3812,6 +3813,41 @@ struct SNComposer: View {
 
     private var slash: Bool { text.hasPrefix("/") }
     private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
+    /// keyboard occupying the transcript — do not steal hardware-keyboard focus.
+    private var usesSoftKeyboard: Bool {
+        #if os(iOS)
+        true
+        #else
+        false
+        #endif
+    }
+
+    private func dismissKeyboardForEmojiTray() {
+        #if os(iOS)
+        composerFocused = false
+        UIApplication.shared.sendAction(
+            #selector(UIResponder.resignFirstResponder),
+            to: nil,
+            from: nil,
+            for: nil
+        )
+        #endif
+    }
+
+    private func toggleEmojiTray() {
+        let opening = !showEmojiTray
+        if snShouldDismissKeyboardWhenOpeningEmojiTray(
+            openingTray: opening,
+            usesSoftKeyboard: usesSoftKeyboard
+        ) {
+            dismissKeyboardForEmojiTray()
+        }
+        if opening {
+            stickerPacks = cachedStickerPacks()
+        }
+        showEmojiTray = opening
+    }
 
     private func send() {
         let tx = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3930,17 +3966,23 @@ struct SNComposer: View {
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 16))
                     .foregroundColor(SonarTheme.text)
-                    .accessibilityIdentifier("sonar-message-composer")
-                Button {
-                    if !showEmojiTray {
-                        stickerPacks = cachedStickerPacks()
+                    .focused($composerFocused)
+                    .onChange(of: composerFocused) { focused in
+                        if snShouldCloseEmojiTrayOnComposerFocus(
+                            composerFocused: focused,
+                            trayOpen: showEmojiTray,
+                            usesSoftKeyboard: usesSoftKeyboard
+                        ) {
+                            showEmojiTray = false
+                        }
                     }
-                    showEmojiTray.toggle()
-                } label: {
+                    .accessibilityIdentifier("sonar-message-composer")
+                Button(action: toggleEmojiTray) {
                     SNIcon(name: .smile, size: 19, weight: 2)
                         .foregroundColor(showEmojiTray ? SonarTheme.accent : SonarTheme.text3)
                 }
                 .buttonStyle(SNScaleStyle(scale: 0.94))
+                .accessibilityIdentifier("sonar-emoji-tray-toggle")
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 14)

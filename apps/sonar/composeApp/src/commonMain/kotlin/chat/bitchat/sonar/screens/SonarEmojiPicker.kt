@@ -32,6 +32,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -47,6 +48,36 @@ import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.withTimeoutOrNull
+
+/**
+ * Opening the emoji/sticker tray must dismiss the soft keyboard on IME
+ * platforms. Leaving the IME up stacks tray height on `imePadding` chrome and
+ * freezes/janks the chat (same failure mode as iOS `keyboardLayoutGuide`).
+ *
+ * Hardware-keyboard surfaces (JVM desktop) pass [usesSoftKeyboard] = false so
+ * opening the tray does not clear composer focus — pick-and-continue stays.
+ */
+internal fun shouldDismissKeyboardWhenOpeningEmojiTray(
+    openingTray: Boolean,
+    usesSoftKeyboard: Boolean,
+): Boolean = openingTray && usesSoftKeyboard
+
+/**
+ * Focusing the message field while the tray is open closes the tray on soft-
+ * keyboard platforms. No-op when [usesSoftKeyboard] is false (desktop).
+ */
+internal fun shouldCloseEmojiTrayOnComposerFocus(
+    composerFocused: Boolean,
+    trayOpen: Boolean,
+    usesSoftKeyboard: Boolean,
+): Boolean = composerFocused && trayOpen && usesSoftKeyboard
+
+/**
+ * Tray-internal search may summon the soft keyboard. Shrink the fixed tray
+ * height so tray + IME do not consume the whole viewport (the freeze geometry).
+ */
+internal fun emojiTrayHeightDp(searchFocused: Boolean): Int = if (searchFocused) 200 else 320
 
 internal fun shouldPreserveCachedStickerPacks(
     hadCachedPacks: Boolean,
@@ -76,6 +107,9 @@ internal fun mergeRefreshedStickerPacks(
 }
 
 private enum class PickerTab { Emoji, Gif, Sticker }
+
+/** Overall sticker-tab refresh budget (installed list + pack metadata). */
+private const val STICKER_TAB_LOAD_TIMEOUT_MS = 30_000L
 
 private val frequentEmojis = listOf("👍", "❤️", "😂", "🔥", "🙏", "👏", "🎉", "👀", "💯", "⚡")
 
@@ -165,11 +199,12 @@ fun SonarEmojiPicker(
 ) {
     val s = sonar
     var tab by remember { mutableStateOf(PickerTab.Emoji) }
+    var searchFocused by remember { mutableStateOf(false) }
 
     Column(
         Modifier
             .fillMaxWidth()
-            .height(320.dp)
+            .height(emojiTrayHeightDp(searchFocused).dp)
             .clip(RoundedCornerShape(topStart = 18.dp, topEnd = 18.dp))
             .background(s.surface)
     ) {
@@ -190,14 +225,28 @@ fun SonarEmojiPicker(
             Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            PickerTabPill(SNIconName.Smile, tab == PickerTab.Emoji) { tab = PickerTab.Emoji }
-            PickerTabPill(SNIconName.Gif, tab == PickerTab.Gif) { tab = PickerTab.Gif }
-            PickerTabPill(SNIconName.Sticker, tab == PickerTab.Sticker) { tab = PickerTab.Sticker }
+            PickerTabPill(SNIconName.Smile, tab == PickerTab.Emoji) {
+                searchFocused = false
+                tab = PickerTab.Emoji
+            }
+            PickerTabPill(SNIconName.Gif, tab == PickerTab.Gif) {
+                searchFocused = false
+                tab = PickerTab.Gif
+            }
+            PickerTabPill(SNIconName.Sticker, tab == PickerTab.Sticker) {
+                searchFocused = false
+                tab = PickerTab.Sticker
+            }
         }
 
         when (tab) {
-            PickerTab.Emoji -> EmojiTabContent(onEmoji)
-            PickerTab.Gif -> GifTabContent()
+            PickerTab.Emoji -> EmojiTabContent(
+                onEmoji = onEmoji,
+                onSearchFocusChange = { searchFocused = it },
+            )
+            PickerTab.Gif -> GifTabContent(
+                onSearchFocusChange = { searchFocused = it },
+            )
             PickerTab.Sticker -> StickerTabContent(
                 onSticker,
                 loadStickerPack,
@@ -227,12 +276,20 @@ private fun PickerTabPill(icon: SNIconName, selected: Boolean, onClick: () -> Un
 }
 
 @Composable
-private fun ColumnScope.EmojiTabContent(onEmoji: (String) -> Unit) {
+private fun ColumnScope.EmojiTabContent(
+    onEmoji: (String) -> Unit,
+    onSearchFocusChange: (Boolean) -> Unit,
+) {
     val s = sonar
     var search by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf(0) }
 
-    SearchField(search, "Search emoji") { search = it }
+    SearchField(
+        value = search,
+        placeholder = "Search emoji",
+        onValueChange = { search = it },
+        onFocusChange = onSearchFocusChange,
+    )
 
     if (search.isBlank()) {
         Row(
@@ -327,11 +384,18 @@ private fun CategoryLabel(name: String, selected: Boolean, onClick: () -> Unit) 
 }
 
 @Composable
-private fun ColumnScope.GifTabContent() {
+private fun ColumnScope.GifTabContent(
+    onSearchFocusChange: (Boolean) -> Unit,
+) {
     val s = sonar
     var search by remember { mutableStateOf("") }
 
-    SearchField(search, "Search GIFs") { search = it }
+    SearchField(
+        value = search,
+        placeholder = "Search GIFs",
+        onValueChange = { search = it },
+        onFocusChange = onSearchFocusChange,
+    )
 
     SNSectionLabel("Trending")
 
@@ -412,37 +476,43 @@ private fun ColumnScope.StickerTabContent(
         if (hadCachedPacks) {
             loading = false
         }
-        val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
-        if (coordinates == null) {
-            if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+        // Bound the whole refresh so a stuck relay/lock cannot leave the tab
+        // on "Loading stickers…" forever (each pack fetch is already ~10s).
+        val finished = withTimeoutOrNull(STICKER_TAB_LOAD_TIMEOUT_MS) {
+            val coordinates = try { fetchInstalledPacks() } catch (_: Throwable) { null }
+            if (coordinates == null) {
+                if (!shouldPreserveCachedStickerPacks(hadCachedPacks, coordinates)) {
+                    error = "Failed to load sticker packs"
+                }
+                return@withTimeoutOrNull
+            }
+            val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
+            if (filteredCachedPacks != packs) {
+                packs = filteredCachedPacks
+                onStickerPacksLoaded(filteredCachedPacks)
+            }
+            val loaded = mutableListOf<SonarStickerPack>()
+            for (coord in coordinates) {
+                val parts = coord.split(":", limit = 3)
+                if (parts.size != 3) continue
+                loadStickerPack(parts[1], parts[2], emptyList())
+                    ?.takeIf { it.stickers.isNotEmpty() }
+                    ?.let { loaded += it }
+            }
+            val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
+            if (merged.isNotEmpty()) {
+                packs = merged
+                onStickerPacksLoaded(merged)
+                error = null
+            } else if (coordinates.isEmpty()) {
+                packs = emptyList()
+                onStickerPacksLoaded(emptyList())
+                error = null
+            } else if (packs.isEmpty()) {
                 error = "Failed to load sticker packs"
             }
-            loading = false
-            return@LaunchedEffect
         }
-        val filteredCachedPacks = filterCachedStickerPacksByInstalledCoordinates(packs, coordinates)
-        if (filteredCachedPacks != packs) {
-            packs = filteredCachedPacks
-            onStickerPacksLoaded(filteredCachedPacks)
-        }
-        val loaded = mutableListOf<SonarStickerPack>()
-        for (coord in coordinates) {
-            val parts = coord.split(":", limit = 3)
-            if (parts.size != 3) continue
-            loadStickerPack(parts[1], parts[2], emptyList())
-                ?.takeIf { it.stickers.isNotEmpty() }
-                ?.let { loaded += it }
-        }
-        val merged = mergeRefreshedStickerPacks(filteredCachedPacks, loaded, coordinates)
-        if (merged.isNotEmpty()) {
-            packs = merged
-            onStickerPacksLoaded(merged)
-            error = null
-        } else if (coordinates.isEmpty()) {
-            packs = emptyList()
-            onStickerPacksLoaded(emptyList())
-            error = null
-        } else if (packs.isEmpty()) {
+        if (finished == null && packs.isEmpty() && error == null) {
             error = "Failed to load sticker packs"
         }
         loading = false
@@ -537,7 +607,12 @@ private fun StickerCell(
 }
 
 @Composable
-private fun SearchField(value: String, placeholder: String, onValueChange: (String) -> Unit) {
+private fun SearchField(
+    value: String,
+    placeholder: String,
+    onValueChange: (String) -> Unit,
+    onFocusChange: (Boolean) -> Unit = {},
+) {
     val s = sonar
     Box(
         Modifier
@@ -560,7 +635,10 @@ private fun SearchField(value: String, placeholder: String, onValueChange: (Stri
             textStyle = TextStyle(color = s.text, fontSize = 15.sp),
             cursorBrush = androidx.compose.ui.graphics.SolidColor(s.accent),
             singleLine = true,
-            modifier = Modifier.fillMaxWidth().padding(start = 23.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 23.dp)
+                .onFocusChanged { onFocusChange(it.isFocused) },
         )
     }
 }
