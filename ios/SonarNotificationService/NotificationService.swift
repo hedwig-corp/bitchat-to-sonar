@@ -2,25 +2,20 @@
 // NotificationService.swift
 // SonarNotificationService
 //
-// Breez Notification Plugin entry point — wakes the Breez SDK in this extension
-// process (even when the Sonar app is backgrounded or force-quit) to answer
-// offline BOLT12 invoice requests and swap updates. This is what lets a payer
-// pay this device's BOLT12 offer while Sonar isn't running.
-//
-// The base class `SDKNotificationService` (from BreezSDKLiquid) does the work:
-// it parses the push, connects the SDK with the ConnectRequest we return below,
-// runs the matching task (e.g. InvoiceRequestTask), and posts a notification.
-// On success the invoice-request task is silent — the user-facing notice arrives
-// as the Sonar ⚡PAY message on the Transponder channel.
-//
-// Creds + working dir are shared by SonarWallet via the App Group; keep the keys
-// and the working-dir layout in sync with SonarWalletKit/Sources/SonarWallet.swift.
+// Dual-path Notification Service Extension (White Noise / Signal shape):
+//   - Transponder (Marmot): open App Group chat DB, bounded frozen-cursor
+//     catch-up, decorate the banner from local decrypted state.
+//   - Breez NDS: wake the Breez SDK for offline BOLT12 / swap handling.
+// Never initialize both SDKs in one wake (memory budget).
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
 //
 
 import BreezSDKLiquid
+import Foundation
+import Security
+import SonarCore
 import UserNotifications
 import os
 
@@ -29,10 +24,30 @@ class NotificationService: SDKNotificationService {
     private static let appGroupId = "group.sh.hedwig.sonar"
     private static let notificationsEnabledKey = "sonar.notifications.enabled"
     private static let showNamesKey = "sonar.notifications.showNames"
+    private static let showPreviewKey = "sonar.notifications.showPreview"
+    private static let nsecKeychainKey = "identity_marmot-nsec"
+    private static let dbKeychainKey = "identity_marmot-db-key"
+    private static let keychainService = "sh.hedwig.sonar"
+    private static let marmotConversationPrefix = "marmot:"
+    private static let conversationIdKey = "sonarConversationId"
+    /// White Noise uses ~8s; leave headroom for decorate + avatar-free finish.
+    private static let marmotWakeWaitMs: UInt64 = 8_000
+    private static let maxAdditionalPresentations = 3
+    private static let defaultRelayUrls = [
+        "wss://relay.damus.io",
+        "wss://nos.lol",
+        "wss://relay.primal.net",
+        "wss://relay.kaleidoswap.com",
+        "wss://nostr.relay.hedwig.sh",
+    ]
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
     private static let notificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
     )
+
+    private var contentHandler: ((UNNotificationContent) -> Void)?
+    private var bestAttemptContent: UNMutableNotificationContent?
+    private var hydrateTask: Task<Void, Never>?
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -41,16 +56,20 @@ class NotificationService: SDKNotificationService {
         if Self.isTransponderPush(request.content.userInfo) {
             os_log("NSE: handling Transponder Marmot push",
                    log: Self.log, type: .info)
+            self.contentHandler = contentHandler
             let content = Self.mutableContent(for: request)
+            bestAttemptContent = content
             guard Self.transponderNotificationsEnabled() else {
                 os_log("NSE: suppressing Transponder notification by user preference",
                        log: Self.log, type: .info)
                 Self.suppressTransponderNotification(content)
-                contentHandler(content)
+                finish(with: content)
                 return
             }
             Self.configureTransponderNotification(content)
-            contentHandler(content)
+            hydrateTask = Task { [weak self] in
+                await self?.hydrateMarmotAndDecorate()
+            }
             return
         }
 
@@ -61,6 +80,192 @@ class NotificationService: SDKNotificationService {
         #endif
         super.didReceive(request, withContentHandler: contentHandler)
     }
+
+    override func serviceExtensionTimeWillExpire() {
+        hydrateTask?.cancel()
+        if let content = bestAttemptContent {
+            Self.configureTransponderNotification(content)
+            finish(with: content)
+        }
+        super.serviceExtensionTimeWillExpire()
+    }
+
+    // MARK: - Marmot hydrate (Transponder)
+
+    private func hydrateMarmotAndDecorate() async {
+        guard let content = bestAttemptContent else {
+            finish(with: UNMutableNotificationContent())
+            return
+        }
+        do {
+            let notifications = try await Task.detached(priority: .userInitiated) {
+                try Self.collectMarmotNotificationsAfterWake()
+            }.value
+            guard !Task.isCancelled else {
+                finish(with: content)
+                return
+            }
+            if notifications.isEmpty {
+                os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
+                       log: Self.log, type: .info)
+                finish(with: content)
+                return
+            }
+            let prefs = Self.notificationPrefs()
+            let primary = notifications[0]
+            Self.apply(
+                notification: primary,
+                to: content,
+                prefs: prefs
+            )
+            let extras = Array(notifications.dropFirst().prefix(Self.maxAdditionalPresentations))
+            for extra in extras {
+                Self.postAdditionalLocalNotification(extra, prefs: prefs)
+            }
+            os_log("NSE: Marmot wake decorated primary + %d additional",
+                   log: Self.log, type: .info, extras.count)
+            finish(with: content)
+        } catch {
+            os_log("NSE: Marmot wake failed — %{public}@ — keeping generic banner",
+                   log: Self.log, type: .error, String(describing: error))
+            finish(with: content)
+        }
+    }
+
+    /// Blocking UniFFI work — always call off the main actor.
+    private static func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
+        guard let nsec = readKeychainString(account: nsecKeychainKey),
+              let dbKeyHex = readKeychainString(account: dbKeychainKey),
+              !nsec.isEmpty,
+              dbKeyHex.count == 64
+        else {
+            throw NSEMarmotError.missingCredentials
+        }
+        let dbURL = try marmotDatabaseURL()
+        let identity = try SonarIdentity.import(nsec: nsec)
+        let node = try SonarNode.connect(
+            identity: identity,
+            relayUrls: defaultRelayUrls,
+            dbPath: dbURL.path,
+            dbKeyHex: dbKeyHex
+        )
+        return try node.collectNotificationsAfterWake(maxWaitMs: marmotWakeWaitMs)
+    }
+
+    private static func marmotDatabaseURL() throws -> URL {
+        guard let group = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) else {
+            throw NSEMarmotError.appGroupUnavailable
+        }
+        let dir = group.appendingPathComponent("sonar-marmot", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let protection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
+        ]
+        try? FileManager.default.setAttributes(protection, ofItemAtPath: dir.path)
+        let db = dir.appendingPathComponent("marmot.sqlite")
+        guard databaseIsBackgroundSafe(dir) else {
+            throw NSEMarmotError.databaseLocked
+        }
+        return db
+    }
+
+    private static func apply(
+        notification: DrainNotificationInfo,
+        to content: UNMutableNotificationContent,
+        prefs: NSENotificationPrefs
+    ) {
+        let groupName = notification.groupName.isEmpty ? nil : notification.groupName
+        let sender = prefs.showNames
+            ? shortLabel(for: notification.senderNpub)
+            : nil
+        let title: String
+        if let groupName, let sender {
+            title = "\(sender) in \(groupName)"
+        } else if let groupName {
+            title = groupName
+        } else if let sender {
+            title = sender
+        } else {
+            title = "New Sonar message"
+        }
+        let body: String
+        if prefs.showPreview, !notification.contentPreview.isEmpty {
+            body = notification.contentPreview
+        } else {
+            body = "Open Sonar to read it."
+        }
+        content.title = title
+        content.body = body
+        content.sound = notificationSound
+        content.categoryIdentifier = "sonar.message"
+        if #available(iOS 15.0, *) {
+            content.interruptionLevel = .active
+        }
+        var userInfo = content.userInfo
+        if !notification.groupIdHex.isEmpty {
+            userInfo[conversationIdKey] = marmotConversationPrefix + notification.groupIdHex
+        }
+        content.userInfo = userInfo
+    }
+
+    private static func postAdditionalLocalNotification(
+        _ notification: DrainNotificationInfo,
+        prefs: NSENotificationPrefs
+    ) {
+        let content = UNMutableNotificationContent()
+        apply(notification: notification, to: content, prefs: prefs)
+        let id = "sonar-nse-\(notification.groupIdHex)-\(UUID().uuidString)"
+        let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
+    }
+
+    private static func shortLabel(for npub: String) -> String {
+        let trimmed = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 16 else { return trimmed }
+        return String(trimmed.prefix(12)) + "…"
+    }
+
+    private func finish(with content: UNNotificationContent) {
+        let handler = contentHandler
+        contentHandler = nil
+        bestAttemptContent = nil
+        hydrateTask = nil
+        handler?(content)
+    }
+
+    // MARK: - Keychain (shared with main app)
+
+    private static func readKeychainString(account: String) -> String? {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        // Prefer the App Group access group (matches KeychainManager), then
+        // try without — never mint a replacement identity from the NSE.
+        for accessGroup in [appGroupId, nil as String?] {
+            var q = query
+            if let accessGroup {
+                q[kSecAttrAccessGroup as String] = accessGroup
+            }
+            var item: CFTypeRef?
+            let status = SecItemCopyMatching(q as CFDictionary, &item)
+            if status == errSecSuccess,
+               let data = item as? Data,
+               let value = String(data: data, encoding: .utf8),
+               !value.isEmpty {
+                return value
+            }
+        }
+        // Also try team-prefixed default access group via empty query (no group).
+        return nil
+    }
+
+    // MARK: - Breez (NDS)
 
     override func getConnectRequest() -> ConnectRequest? {
         guard let defaults = UserDefaults(suiteName: Self.appGroupId),
@@ -87,26 +292,16 @@ class NotificationService: SDKNotificationService {
             .appendingPathComponent("breez-sdk", isDirectory: true)
             .appendingPathComponent(mainnet ? "mainnet" : "testnet", isDirectory: true)
         try? FileManager.default.createDirectory(at: workingDir, withIntermediateDirectories: true)
-        // Pin the Breez SQLite store to .completeUntilFirstUserAuthentication, NOT
-        // .complete: the NSE connects the SDK while the device is locked, so a
-        // .complete store would either SIGBUS on the mmap'd -shm page or get the
-        // process killed with 0xdead10cc for holding a lock on an unavailable file.
-        // Keep in sync with SonarWallet.applyDatabaseProtection (separate target —
-        // can't share the helper). Heals existing files in place; sets the dir
-        // default for files the SDK creates at connect.
-        let dbProtection: [FileAttributeKey: Any] = [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication]
+        let dbProtection: [FileAttributeKey: Any] = [
+            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
+        ]
         try? FileManager.default.setAttributes(dbProtection, ofItemAtPath: workingDir.path)
-        for file in (try? FileManager.default.contentsOfDirectory(at: workingDir, includingPropertiesForKeys: nil)) ?? [] {
+        for file in (try? FileManager.default.contentsOfDirectory(
+            at: workingDir, includingPropertiesForKeys: nil
+        )) ?? [] {
             try? FileManager.default.setAttributes(dbProtection, ofItemAtPath: file.path)
         }
 
-        // The heal above is best-effort: on a locked device the `setAttributes`
-        // calls silently no-op, so a store an older build wrote as `.complete` can
-        // still be protected here. Connecting Breez against a `.complete` WAL store
-        // while locked is exactly what SIGBUSes / 0xdead10ccs. Detect an unhealed
-        // store and DEFER this push rather than crash — the next unlocked foreground
-        // heals the files in the app, and later pushes connect cleanly. (Mirrors
-        // MarmotService.databaseIsBackgroundSafe from #133.)
         guard Self.databaseIsBackgroundSafe(workingDir) else {
             os_log("NSE: Breez store still .complete (locked, pre-heal) — deferring connect to avoid SIGBUS/0xdead10cc",
                    log: Self.log, type: .error)
@@ -116,8 +311,6 @@ class NotificationService: SDKNotificationService {
         do {
             var config = try defaultConfig(network: network, breezApiKey: apiKey)
             config.workingDir = workingDir.path
-            // Keep the extension's work to just the invoice-request / swap-update
-            // handling the push is for; skip the background realtime-sync service.
             config.syncServiceUrl = nil
             return ConnectRequest(config: config, mnemonic: nil, passphrase: nil, seed: seed)
         } catch {
@@ -125,19 +318,6 @@ class NotificationService: SDKNotificationService {
         }
     }
 
-    /// Whether the Breez store is safe to open during locked background work — i.e.
-    /// no file is still a lock-while-locked protection class. A `.complete` /
-    /// `.completeUnlessOpen` WAL store opened while the device is locked SIGBUSes on
-    /// the mmap'd `-shm` page (or 0xdead10ccs on a held lock), so when the in-place
-    /// heal couldn't run (locked wake) we must defer rather than connect.
-    ///
-    /// - A fresh/empty dir is safe: the dir default we just set pins the class on
-    ///   the files the SDK is about to create.
-    /// - A dir we cannot even enumerate is unsafe — that only happens for a
-    ///   `.complete` dir while locked on a real device — so defer.
-    /// - The protection CLASS is file metadata and stays readable while locked, so a
-    ///   pre-migration `.complete` store is still caught here. A nil/absent class
-    ///   means no Data Protection is in force (Simulator) — safe.
     private static func databaseIsBackgroundSafe(_ dir: URL) -> Bool {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else {
@@ -191,32 +371,13 @@ class NotificationService: SDKNotificationService {
     }
 
     private static func configureTransponderNotification(_ content: UNMutableNotificationContent) {
-        // Never trust provider payload copy for user-visible text. Transponder
-        // pushes are plaintext-free wakeups. The NSE has no Marmot DB in the
-        // App Group yet (#146), so names/previews cannot be rendered here —
-        // honor Show names only for the generic title, and let the background
-        // SonarPushProcessor replace this banner with prefs-aware copy once
-        // unread state is available.
-        //
-        // Mark with sonar.nsePlaceholder so the app can remove THIS banner by
-        // identity — never by matching title/body (those strings are also the
-        // router's privacy fallback when Show names + Message preview are off).
-        let showNames = notificationShowNames()
-        content.title = showNames ? "New Sonar message" : "Sonar"
+        content.title = "New Sonar message"
         content.body = "Open Sonar to read it."
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
-        var info = content.userInfo
-        info["sonar.nsePlaceholder"] = true
-        content.userInfo = info
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active
         }
-    }
-
-    private static func notificationShowNames() -> Bool {
-        guard let defaults = UserDefaults(suiteName: appGroupId) else { return true }
-        return defaults.object(forKey: showNamesKey) as? Bool ?? true
     }
 
     private static func mutableContent(for request: UNNotificationRequest) -> UNMutableNotificationContent {
@@ -227,8 +388,16 @@ class NotificationService: SDKNotificationService {
     }
 
     private static func transponderNotificationsEnabled() -> Bool {
-        guard let defaults = UserDefaults(suiteName: Self.appGroupId) else { return true }
+        guard let defaults = UserDefaults(suiteName: appGroupId) else { return true }
         return defaults.object(forKey: notificationsEnabledKey) as? Bool ?? true
+    }
+
+    private static func notificationPrefs() -> NSENotificationPrefs {
+        let defaults = UserDefaults(suiteName: appGroupId)
+        return NSENotificationPrefs(
+            showNames: defaults?.object(forKey: showNamesKey) as? Bool ?? true,
+            showPreview: defaults?.object(forKey: showPreviewKey) as? Bool ?? false
+        )
     }
 
     private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {
@@ -244,9 +413,18 @@ class NotificationService: SDKNotificationService {
     }
 }
 
+private struct NSENotificationPrefs {
+    var showNames: Bool
+    var showPreview: Bool
+}
+
+private enum NSEMarmotError: Error {
+    case missingCredentials
+    case appGroupUnavailable
+    case databaseLocked
+}
+
 #if DEBUG
-/// DEBUG-only: forwards the Breez SDK's internal logs (connect, invoice-request
-/// handling) to os_log so the offline-receive flow is visible during testing.
 final class NSEBreezLogger: BreezSDKLiquid.Logger {
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE-Breez")
     func log(l: LogEntry) {

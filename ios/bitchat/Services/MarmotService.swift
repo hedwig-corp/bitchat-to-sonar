@@ -1117,8 +1117,6 @@ final class MarmotService: @unchecked Sendable {
     /// reopens; wiped by `wipeDatabase()` on panic.
     private static let dbKeychainService = "chat.bitchat.sonar.messages"
     private static let dbKeychainKey = "marmot-db-key"
-    private static let dbDirName = "sonar-marmot"
-    private static let dbFileName = "marmot.sqlite"
 
     #if os(iOS)
     /// Data-Protection class for the SQLite store. Deliberately
@@ -1192,20 +1190,17 @@ final class MarmotService: @unchecked Sendable {
     }
     #endif
 
-    /// Absolute path of the encrypted Marmot database. The parent dir and any
-    /// existing DB files are pinned to `dbFileProtection` so the store stays
-    /// readable during locked background work (see `dbFileProtection`).
+    /// Absolute path of the encrypted Marmot database. On iOS this lives in the
+    /// App Group container (shared with the Notification Service Extension);
+    /// macOS keeps Application Support. Parent dir and existing DB files are
+    /// pinned to `dbFileProtection` so the store stays readable during locked
+    /// background work (see `dbFileProtection`).
     private static func databaseURL() throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true
-        )
-        let dir = base.appendingPathComponent(dbDirName, isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try MarmotAppGroupStore.databaseDirectory()
         #if os(iOS)
         applyDatabaseProtection(to: dir)
         #endif
-        return dir.appendingPathComponent(dbFileName)
+        return dir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
     }
 
     /// (path, 64-char hex key). Generates and persists a fresh key the first time.
@@ -1318,6 +1313,9 @@ final class MarmotService: @unchecked Sendable {
                 service.nodeLock.unlock()
             }
             try wipeMarmotDatabase(dbPath: url.path)
+            // Also drop any leftover pre-App-Group Application Support fork so
+            // a later launch cannot reopen orphaned history after wipe.
+            MarmotAppGroupStore.removeAllStoreFiles()
             guard KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey) else {
                 throw ServiceError.core("failed to delete Marmot database key")
             }

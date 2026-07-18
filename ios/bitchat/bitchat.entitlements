@@ -16,5 +16,10 @@
 	</array>
 	<key>aps-environment</key>
 	<string>$(APS_ENVIRONMENT)</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)sh.hedwig.sonar</string>
+		<string>$(APP_GROUP_ID)</string>
+	</array>
 </dict>
 </plist>

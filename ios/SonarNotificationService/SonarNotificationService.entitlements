@@ -8,5 +8,10 @@
 	<array>
 		<string>$(APP_GROUP_ID)</string>
 	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)sh.hedwig.sonar</string>
+		<string>$(APP_GROUP_ID)</string>
+	</array>
 </dict>
 </plist>

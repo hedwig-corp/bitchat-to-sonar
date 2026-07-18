@@ -20,6 +20,7 @@
 		885BBED78092484A5B069461 /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 4EB6BA1B8464F1EA38F4E286 /* P256K */; };
 		A15C0DE000000000000000A4 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A2 /* SonarCore */; };
 		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
+		A15C0DE000000000000000D1 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000D2 /* SonarCore */; };
 		A15C0DE100000000000000B4 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B2 /* WalletKit */; };
 		A15C0DE100000000000000B5 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B3 /* WalletKit */; };
 		A15C0DE200000000000000C4 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C2 /* TranscriptEngine */; };
@@ -219,6 +220,7 @@
 			files = (
 				62C08C1AD2F542AA138828E4 /* Foundation.framework in Frameworks */,
 				44AA8F6F653CD2B2A28DA1BB /* BreezSDKLiquid in Frameworks */,
+				A15C0DE000000000000000D1 /* SonarCore in Frameworks */,
 			);
 		};
 		A15C0DE200000000000000C8 /* Frameworks */ = {
@@ -336,6 +338,7 @@
 			name = SonarNotificationService;
 			packageProductDependencies = (
 				F758224FFCADDAB1B95B5A73 /* BreezSDKLiquid */,
+				A15C0DE000000000000000D2 /* SonarCore */,
 			);
 			productName = SonarNotificationService;
 			productReference = C771D3214DFE24F42D724BF4 /* SonarNotificationService.appex */;
@@ -1292,6 +1295,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */;
 			productName = BreezSDKLiquid;
+		};
+		A15C0DE000000000000000D2 /* SonarCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */;
+			productName = SonarCore;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -477,6 +477,7 @@ pub struct ResolvedHandleInfo {
 #[derive(uniffi::Record)]
 pub struct DrainNotificationInfo {
     pub sender_npub: String,
+    pub group_id_hex: String,
     pub group_name: String,
     pub content_preview: String,
 }
@@ -1099,6 +1100,35 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Freeze durable sync-watermark advances (White Noise NSE
+    /// `cursorPersistence: .frozen`). Push-wake catch-up still decrypts into
+    /// the store; the next durable session re-fetches any missed gap.
+    pub fn set_sync_watermark_frozen(&self, frozen: bool) {
+        self.client.set_sync_watermark_frozen(frozen);
+    }
+
+    /// Notification Service Extension / push-wake entry point: bounded
+    /// `sync_force` under a frozen watermark, then drain notifications for
+    /// local banner decoration. Partial progress still returns drained rows.
+    pub fn collect_notifications_after_wake(
+        &self,
+        max_wait_ms: u64,
+    ) -> FfiResult<Vec<DrainNotificationInfo>> {
+        let wait = std::time::Duration::from_millis(max_wait_ms.max(1));
+        let notifications = self
+            .runtime
+            .block_on(self.client.collect_notifications_after_wake(wait))?;
+        Ok(notifications
+            .into_iter()
+            .map(|n| DrainNotificationInfo {
+                sender_npub: n.sender_pubkey,
+                group_id_hex: n.group_id_hex,
+                group_name: n.group_name,
+                content_preview: n.content_preview,
+            })
+            .collect())
+    }
+
     /// Point-in-time JSON snapshot of relay/sync state for the Diagnostics
     /// screen and the exported debug bundle: per-relay connection status, the
     /// sync watermark, live-subscription state, and per-group catch-up floors.
@@ -1165,6 +1195,7 @@ impl SonarNode {
             .into_iter()
             .map(|n| DrainNotificationInfo {
                 sender_npub: n.sender_pubkey,
+                group_id_hex: n.group_id_hex,
                 group_name: n.group_name,
                 content_preview: n.content_preview,
             })

@@ -1356,6 +1356,9 @@ impl RelayFetchOutcome {
 #[derive(Clone, Debug)]
 pub struct DrainNotification {
     pub sender_pubkey: String,
+    /// MLS group id hex — hosts use this for notification tap handoff
+    /// (`marmot:<hex>` conversation id).
+    pub group_id_hex: String,
     pub group_name: String,
     pub content_preview: String,
 }
@@ -1451,6 +1454,11 @@ pub struct SonarClient {
     /// restart catch-up conservative: a failed event can be replayed later
     /// instead of being skipped by an advanced watermark.
     sync_state: Arc<Mutex<SyncState>>,
+    /// When true (Notification Service Extension push wake), skip durable
+    /// watermark advances. Messages still decrypt into the store; the next
+    /// durable session re-fetches any gap a short wake may have missed.
+    /// Matches White Noise iOS `cursorPersistence: .frozen`.
+    sync_watermark_frozen: AtomicBool,
     /// Durable local delivery metadata for Signal-style outgoing text sends.
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
@@ -2024,6 +2032,7 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             sync_state,
+            sync_watermark_frozen: AtomicBool::new(false),
             outbox_state,
             media_staging,
             media_upload_inflight,
@@ -5348,11 +5357,47 @@ impl SonarClient {
     }
 
     fn advance_sync_watermark(&self, watermark_secs: u64) -> Result<()> {
+        if self.sync_watermark_frozen.load(Ordering::Relaxed) {
+            tracing::debug!(
+                watermark_secs,
+                "sync watermark advance skipped (frozen cursor / push wake)"
+            );
+            return Ok(());
+        }
         {
             let mut state = self.sync_state.lock().unwrap();
             state.advance_watermark(watermark_secs);
         }
         self.save_sync_state()
+    }
+
+    /// Freeze durable sync-watermark advances for the rest of this client
+    /// lifetime (or until cleared). Used by push-wake / NSE catch-up.
+    pub fn set_sync_watermark_frozen(&self, frozen: bool) {
+        self.sync_watermark_frozen.store(frozen, Ordering::Relaxed);
+    }
+
+    /// White Noise–shaped push wake: force gap recovery under a frozen
+    /// watermark, then drain notifications for local banner decoration.
+    /// `max_wait` bounds the sync; drain still runs so partial progress surfaces.
+    pub async fn collect_notifications_after_wake(
+        &self,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<DrainNotification>> {
+        self.set_sync_watermark_frozen(true);
+        match tokio::time::timeout(max_wait, self.sync_force()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(%err, "collect_notifications_after_wake sync_force failed");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    wait_ms = max_wait.as_millis() as u64,
+                    "collect_notifications_after_wake sync_force timed out"
+                );
+            }
+        }
+        self.drain_pending_marmot().await
     }
 
     fn rewind_sync_watermark_for_retry(&self, event_secs: u64) -> Result<()> {
@@ -5702,6 +5747,7 @@ impl SonarClient {
                         };
                         notifications.push(DrainNotification {
                             sender_pubkey: message.sender.to_string(),
+                            group_id_hex: hex::encode(message.group_id.as_slice()),
                             group_name: cached_name.unwrap_or("").to_string(),
                             content_preview: preview,
                         });
@@ -8051,6 +8097,7 @@ mod tests {
     fn test_notification(preview: &str) -> DrainNotification {
         DrainNotification {
             sender_pubkey: "npub-test".to_string(),
+            group_id_hex: "aa".to_string(),
             group_name: "group".to_string(),
             content_preview: preview.to_string(),
         }
@@ -8129,6 +8176,32 @@ mod tests {
         state.rewind_for_retry(900);
 
         assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
+
+    #[tokio::test]
+    async fn frozen_push_wake_does_not_advance_durable_watermark() {
+        let identity = Identity::generate();
+        let client = SonarClient::connect_in_memory(identity, vec![])
+            .await
+            .expect("in-memory client");
+        {
+            let mut state = client.sync_state.lock().unwrap();
+            state.advance_watermark(1_700_000_000);
+        }
+        let before = client.sync_watermark_secs();
+        assert_eq!(before, 1_700_000_000);
+
+        let drained = client
+            .collect_notifications_after_wake(Duration::from_millis(50))
+            .await
+            .expect("wake drain");
+        assert!(drained.is_empty());
+        assert_eq!(
+            client.sync_watermark_secs(),
+            before,
+            "NSE/push wake must not advance the durable sync watermark"
+        );
+        assert!(client.sync_watermark_frozen.load(Ordering::Relaxed));
     }
 
     #[tokio::test]
