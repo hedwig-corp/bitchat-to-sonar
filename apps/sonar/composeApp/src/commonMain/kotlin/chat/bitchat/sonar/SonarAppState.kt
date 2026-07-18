@@ -7655,8 +7655,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Every voice-bubble attachment currently visible in the bounded local
-     *  transcript window for [chatId], oldest first. */
+    /** Every locally-available voice attachment in the bounded open transcript
+     *  window for [chatId], oldest first. Undownloaded rows are excluded so
+     *  Next/autoplay never lands on an empty `localFile`. */
     private fun voiceItemsInOpenWindow(chatId: String): List<VoicePlaybackItem> =
         messages.asSequence()
             .sortedWith(compareBy({ it.tsSecs }, { it.id }))
@@ -7664,7 +7665,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 msg.media.asSequence()
                     .withIndex()
                     .filter { (_, media) -> media.isAudio }
-                    .map { (idx, media) -> voicePlaybackItem(chatId, msg, media, idx) }
+                    .mapNotNull { (idx, media) ->
+                        val transfer = mediaTransfers[media.url]
+                        if (transfer?.phase != MediaTransferPhase.Available) return@mapNotNull null
+                        if (transfer.localPath.isNullOrEmpty()) return@mapNotNull null
+                        voicePlaybackItem(chatId, msg, media, idx)
+                    }
             }
             .toList()
 
@@ -7738,10 +7744,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
     }
 
-    /** Starting to record a new voice note pauses/stops any note currently
-     *  playing before the recorder takes the microphone. */
-    fun stopVoiceForRecording() {
-        voiceControllerIfPresent()?.dispatch(
+    /** Starting to record a new voice note stops any note currently playing
+     *  before the recorder takes the microphone. Suspends until the engine
+     *  has released focus — callers must await this before `recorder.start()`. */
+    suspend fun stopVoiceForRecording() {
+        voiceControllerIfPresent()?.dispatchSync(
             VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Recording)
         )
     }

@@ -1854,10 +1854,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             awaitEachGesture {
                                 val down = awaitFirstDown(requireUnconsumed = false)
                                 recDragX = 0f; recElapsed = 0; recording = true
-                                // Recording takes the mic; any voice note stops first.
-                                state.stopVoiceForRecording()
                                 var startedOk = false
-                                val startJob = recScope.launch { startedOk = recorder.start() }
+                                val startJob = recScope.launch {
+                                    // Await engine release before grabbing the mic.
+                                    state.stopVoiceForRecording()
+                                    startedOk = recorder.start()
+                                }
                                 var dx = 0f
                                 var pressed = true
                                 while (pressed) {

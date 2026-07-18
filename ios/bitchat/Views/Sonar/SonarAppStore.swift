@@ -9091,6 +9091,8 @@ extension SonarAppStore {
         var out: [VoicePlaybackItem] = []
         for message in rows {
             for (index, media) in message.media.enumerated() where media.mime.hasPrefix("audio/") {
+                // Skip undownloaded notes — Next/autoplay must not fail on empty paths.
+                guard mediaTransferState(media).phase == .available else { continue }
                 if let item = voicePlaybackItem(
                     for: message,
                     media: media,
