@@ -2298,12 +2298,9 @@ final class SonarAppStore: ObservableObject {
     private func processIncomingMarmotNotifications() {
         // Push-wake owns banners for the current Transponder sync; emitting
         // here as well double-fires (different identifiers) for the same row.
-        // Still mark drained rows seen so the next invalidation after
-        // endPushWakeNotificationOwnership() does not re-alert them.
-        if marmot.pushWakeOwnsNotifications {
-            markMarmotNotificationMessagesSeen()
-            return
-        }
+        // Do NOT blanket-mark every in-memory message seen — that drops rows
+        // that land via gap recovery after the drain list was returned.
+        if marmot.pushWakeOwnsNotifications { return }
         for group in marmot.groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
@@ -2318,11 +2315,20 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
+                let groupName = group.memberNpubs.count > 2 ? title : nil
+                // Push wake already bannered this content — mark seen, no second banner.
+                let pushKey = MarmotChatModel.pushWakeNotificationKey(
+                    groupName: groupName ?? title,
+                    content: message.content
+                )
+                if marmot.pushWakeNotifiedKeys.contains(pushKey) {
+                    seenMarmotNotificationMessageIDs.insert(message.id)
+                    continue
+                }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
                 guard kind != .call else { continue }
                 let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
-                let groupName = group.memberNpubs.count > 2 ? title : nil
                 sendSonarNotification(
                     kind: kind,
                     idKey: message.id,
@@ -2332,14 +2338,6 @@ final class SonarAppStore: ObservableObject {
                     groupName: groupName,
                     preview: message.content
                 )
-            }
-        }
-    }
-
-    private func markMarmotNotificationMessagesSeen() {
-        for group in marmot.groups {
-            for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
-                seenMarmotNotificationMessageIDs.insert(message.id)
             }
         }
     }

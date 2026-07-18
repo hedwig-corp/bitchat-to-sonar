@@ -287,6 +287,10 @@ final class MarmotChatModel: ObservableObject {
     /// Backed by a refcount so overlapping wakes cannot clear ownership early.
     private(set) var pushWakeOwnsNotifications = false
     private var pushWakeOwnershipCount = 0
+    /// Content keys (`groupName|preview`) the push wake already bannered.
+    /// Live path marks matching rows seen after ownership ends instead of
+    /// blanket-marking every in-memory message (which dropped gap-recovery rows).
+    private(set) var pushWakeNotifiedKeys = Set<String>()
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -1014,11 +1018,22 @@ final class MarmotChatModel: ObservableObject {
     func beginPushWakeNotificationOwnership() {
         pushWakeOwnershipCount += 1
         pushWakeOwnsNotifications = true
+        if pushWakeOwnershipCount == 1 {
+            pushWakeNotifiedKeys = []
+        }
     }
 
     func endPushWakeNotificationOwnership() {
         pushWakeOwnershipCount = max(0, pushWakeOwnershipCount - 1)
         pushWakeOwnsNotifications = pushWakeOwnershipCount > 0
+    }
+
+    static func pushWakeNotificationKey(groupName: String?, content: String) -> String {
+        "\(groupName ?? "")|\(content)"
+    }
+
+    func notePushWakeNotified(groupName: String?, content: String) {
+        pushWakeNotifiedKeys.insert(Self.pushWakeNotificationKey(groupName: groupName, content: content))
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for

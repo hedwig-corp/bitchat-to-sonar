@@ -158,19 +158,23 @@ enum SonarPushProcessor {
             return synced ? .newData : .failed
         }
 
-        let notified: Int
+        // Prefer drain metadata, then also run unread-delta so rows that land
+        // via gap recovery after the returned drain list are not dropped.
+        // Delta skips content already bannered from the drain list.
+        var drainedKeys = Set<String>()
+        var notified = 0
         if !drained.isEmpty {
-            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
-        } else {
-            // Never fan out to every stale unread chat — only conversations
-            // whose unread fingerprint advanced during this wake.
-            notified = await notifyNewlyUnread(
-                before: beforeUnread,
-                baselineHydrated: baselineHydrated,
-                marmot: marmot,
-                prefs: prefs
-            )
+            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs, notifiedKeys: &drainedKeys)
         }
+        // Reload summaries so delta sees gap-recovery advances during name resolve.
+        _ = await marmot.loadLocalSummaries()
+        notified += await notifyNewlyUnread(
+            before: beforeUnread,
+            baselineHydrated: baselineHydrated,
+            marmot: marmot,
+            prefs: prefs,
+            excludingKeys: drainedKeys
+        )
 
         switch (notified > 0, synced) {
         case (true, _):
@@ -186,6 +190,8 @@ enum SonarPushProcessor {
         case (false, false):
             log.warning("Marmot sync timed out with nothing new unread, showing fallback")
             showFallbackNotification(prefs: prefs)
+            // Avoid stacking NSE generic + local fallback generics.
+            removeDeliveredNSEPlaceholderBanners()
             return .failed
         }
     }
@@ -211,7 +217,8 @@ enum SonarPushProcessor {
     private static func notifyDrained(
         _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        notifiedKeys: inout Set<String>
     ) async -> Int {
         var notified = 0
         for notif in drained {
@@ -254,6 +261,12 @@ enum SonarPushProcessor {
                 body: routed.body,
                 identifier: routed.identifier
             )
+            let key = MarmotChatModel.pushWakeNotificationKey(
+                groupName: groupName ?? conversationTitle,
+                content: notif.contentPreview
+            )
+            notifiedKeys.insert(key)
+            marmot.notePushWakeNotified(groupName: groupName ?? conversationTitle, content: notif.contentPreview)
             notified += 1
         }
         return notified
@@ -265,7 +278,8 @@ enum SonarPushProcessor {
         before: [String: SonarPushUnreadDelta.Fingerprint],
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        excludingKeys: Set<String> = []
     ) async -> Int {
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
             SonarPushUnreadDelta.isNewlyAdvanced(
@@ -305,6 +319,11 @@ enum SonarPushProcessor {
                 }
                 return summary.name
             }()
+            let contentKey = MarmotChatModel.pushWakeNotificationKey(
+                groupName: groupName ?? conversationTitle,
+                content: summary.latestContent
+            )
+            if excludingKeys.contains(contentKey) { continue }
 
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: summary.groupIdHex,
@@ -321,6 +340,10 @@ enum SonarPushProcessor {
                 title: routed.title,
                 body: routed.body,
                 identifier: routed.identifier
+            )
+            marmot.notePushWakeNotified(
+                groupName: groupName ?? conversationTitle,
+                content: summary.latestContent
             )
             notified += 1
         }

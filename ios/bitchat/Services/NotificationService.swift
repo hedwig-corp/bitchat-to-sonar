@@ -142,18 +142,23 @@ final class NotificationService {
         // Callers pass the real sender + body; never discard them for a
         // hard-coded privacy fallback. The router applies Show names /
         // Message preview (and the master Notifications toggle).
+        let prefs = SonarNotificationPreferenceStore.loadMerged()
+        var userInfo: [String: Any] = [
+            SonarNotificationKeys.peerID: peerID.id,
+            SonarNotificationKeys.conversationId: peerID.id,
+        ]
+        // Keep sender out of the tap payload when Show names is off.
+        if prefs.showNames {
+            userInfo["senderName"] = sender
+        }
         guard let routed = SonarLocalNotificationRouter.make(
             idKey: peerID.id,
             kind: .message,
             conversationTitle: sender,
             senderName: sender,
             preview: message,
-            prefs: SonarNotificationPreferenceStore.loadMerged(),
-            userInfo: [
-                SonarNotificationKeys.peerID: peerID.id,
-                SonarNotificationKeys.conversationId: peerID.id,
-                "senderName": sender,
-            ]
+            prefs: prefs,
+            userInfo: userInfo
         ) else { return }
 
         // Keep the `private-` prefix — NotificationDelegate routes taps by it.
