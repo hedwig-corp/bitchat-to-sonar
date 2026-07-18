@@ -56,8 +56,10 @@ jobs:
         timeout-minutes: 2
         env:
           # Optional: machine-translate blog overlays after Nostr fetch.
-          # When unset, committed web/src/lib/blog-translations.js is kept.
-          SONAR_BLOG_TRANSLATE_API_KEY: ${{ secrets.SONAR_BLOG_TRANSLATE_API_KEY }}
+          # Never expose the secret to pull_request builds — those run
+          # PR-controlled web/scripts/*.mjs. PRs keep committed overlays;
+          # main/deploy may refresh them when the secret is set.
+          SONAR_BLOG_TRANSLATE_API_KEY: ${{ github.event_name != 'pull_request' && secrets.SONAR_BLOG_TRANSLATE_API_KEY || '' }}
         run: npm run fetch-blog
 
       - name: i18n unit checks

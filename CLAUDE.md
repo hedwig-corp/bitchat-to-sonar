@@ -258,6 +258,13 @@ posts published to Nostr by the blog author key (`BLOG_PUBKEY_HEX` in
 long-form content from the same key never appears — which
 `scripts/blog/publish.sh` adds automatically.
 
+English NIP-23 is the source of truth. Site-only locale overlays
+(`it` / `de` / `es` / `pt` / `fr`) live in `web/src/lib/blog-translations.js`
+and are merged client-side after bake / live fetch. Overlays are keyed by a
+`contentHash` of the English title/excerpt/md — if the English post changes and
+overlays are not refreshed, non-English readers fall back to English rather
+than showing a stale translation.
+
 **Every time you post or update a blog post, run all of these steps** (they are
 the operation that makes a post actually show up on the site):
 
@@ -271,22 +278,34 @@ the operation that makes a post actually show up on the site):
    Or configure the signer once in gitignored `scripts/blog/.env`
    (`SONAR_BLOG_NSEC` or `SONAR_BLOG_BUNKER`; see `scripts/blog/.env.example`).
    nak is invoked via `go run`, so no binary install is needed.
-3. Bake the published posts + author profile into the build:
+3. Bake the published posts + author profile (and refresh locale overlays when
+   the translate secret is available):
    ```sh
-   cd web && npm run fetch-blog   # regenerates web/src/lib/blog-content.js
+   cd web && npm run fetch-blog
+   # regenerates web/src/lib/blog-content.js
+   # and, if SONAR_BLOG_TRANSLATE_API_KEY is set, updates
+   # web/src/lib/blog-translations.js via translate-blog
    ```
    `fetch-blog` is Node-only (global WebSocket, no nak/Go) and best-effort: if
    the relays are unreachable or no marked post is found, it leaves
-   `blog-content.js` untouched and exits 0.
-4. Commit the regenerated `web/src/lib/blog-content.js` together with
-   `docs/blog/<slug>/README.md`. **Never commit `scripts/blog/.env`** (it holds
-   the signer secret and is gitignored).
+   `blog-content.js` untouched and exits 0. Without the translate secret,
+   committed overlays are left as-is (they will not match a changed English
+   post until you re-run with the key or hand-update them).
+4. Commit the regenerated bake files together with
+   `docs/blog/<slug>/README.md`:
+   - `web/src/lib/blog-content.js` (always, when bake succeeded)
+   - `web/src/lib/blog-translations.js` (when overlays changed)
+   **Never commit `scripts/blog/.env`** (signer secret) or put
+   `SONAR_BLOG_TRANSLATE_API_KEY` in client code — keep it in the local env /
+   CI secret for main deploy only (not PR builds).
 
 You do not strictly need to run step 3 by hand for production: the Pages CI
-build runs `npm run fetch-blog` before `npm run build` on every deploy, so the
-live site always re-bakes the latest published posts. Committing `blog-content.js`
-keeps a fresh local/offline fallback and makes `/blog/#<slug>` work in `npm run
-dev` and as the CI fallback when relays are down. The page also refreshes from
-the live feed at runtime. Relay-sourced Markdown is rendered through the shared
+build runs `npm run fetch-blog` before `npm run build` on every deploy to
+`main`, so the live site re-bakes English posts (and overlays when the
+translate secret is configured on that job). Committing `blog-content.js` and
+`blog-translations.js` keeps a fresh local/offline fallback and makes
+`/blog/#<slug>` work in `npm run dev` and as the CI fallback when relays are
+down. The page also refreshes from the live feed at runtime; overlays are
+re-applied by post id. Relay-sourced Markdown is rendered through the shared
 sanitizing renderer (`web/src/lib/markdown.js`); keep its HTML-escaping and href
 scheme allow-list intact when touching that file.
