@@ -1105,7 +1105,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingMarmotGroupSetupTokens: [String: UUID] = [:]
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
-    private var pendingMarmotSends: [String: [String]] = [:]
+    /// Out-of-range mesh→White Noise first sends (npub → queued text + echo id).
+    /// Echo lives in `pendingMarmotMessagesByChat` under the open mesh chat id so
+    /// the bubble paints before `startChat` finishes (Compose `PendingMeshMarmotSend`).
+    private var pendingMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingInviteLinks: [String] = []
     /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
     /// destination onAppear can both fire; only one local hydrate/sync pass per
@@ -4760,7 +4763,7 @@ final class SonarAppStore: ObservableObject {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
-        pendingMarmotSends[npub, default: []].append(encoded)
+        queuePendingMeshMarmotSend(text: encoded, npub: npub)
         marmot.connectIfNeeded()
         marmot.startChat(with: npub)
     }
@@ -4770,9 +4773,31 @@ final class SonarAppStore: ObservableObject {
             marmot.send(text, to: group.id)
             return
         }
-        pendingMarmotSends[npub, default: []].append(text)
+        queuePendingMeshMarmotSend(text: text, npub: npub)
+        showToast("Out of range — continuing over White Noise…")
         marmot.connectIfNeeded()
         marmot.startChat(with: npub)
+    }
+
+    /// Paint a Sending echo on the open mesh conversation immediately, then
+    /// queue the plaintext for [flushPendingMarmotSends] once the WN group lands.
+    private func queuePendingMeshMarmotSend(text: String, npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let chatId = currentDMId ?? sonarPeerKey(forNpub: clean)
+        let messageId: String
+        if let chatId {
+            let message = pendingMarmotEcho(text: text, createdAt: Date())
+            pendingMarmotMessagesByChat[chatId, default: []].append(message)
+            messageId = message.id
+            objectWillChange.send()
+            pendingMarmotSends[clean, default: []].append(
+                SNPendingMarmotSend(chatId: chatId, text: text, messageId: messageId)
+            )
+        } else {
+            pendingMarmotSends[clean, default: []].append(
+                SNPendingMarmotSend(chatId: "", text: text, messageId: "")
+            )
+        }
     }
 
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
@@ -5118,11 +5143,13 @@ final class SonarAppStore: ObservableObject {
 
     private func flushPendingMarmotSends() {
         guard !pendingMarmotSends.isEmpty else { return }
-        for (npub, texts) in pendingMarmotSends {
+        for (npub, sends) in pendingMarmotSends {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for text in texts {
-                if let ref = meshParseStickerContent(content: text) {
+            for send in sends {
+                // Group-side optimistic first, then drop the mesh pending echo so
+                // dmMsgs never has a frame with neither bubble.
+                if let ref = meshParseStickerContent(content: send.text) {
                     marmot.sendSticker(
                         groupId: group.id,
                         packCoordinate: ref.packCoordinate,
@@ -5130,7 +5157,14 @@ final class SonarAppStore: ObservableObject {
                         plaintextSha256: ref.plaintextSha256
                     )
                 } else {
-                    marmot.send(text, to: group.id)
+                    marmot.send(send.text, to: group.id)
+                }
+                if !send.chatId.isEmpty, !send.messageId.isEmpty {
+                    pendingMarmotMessagesByChat[send.chatId]?.removeAll { $0.id == send.messageId }
+                    if pendingMarmotMessagesByChat[send.chatId]?.isEmpty == true {
+                        pendingMarmotMessagesByChat[send.chatId] = nil
+                    }
+                    objectWillChange.send()
                 }
             }
         }

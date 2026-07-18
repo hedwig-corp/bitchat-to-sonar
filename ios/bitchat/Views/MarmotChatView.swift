@@ -3002,6 +3002,12 @@ final class MarmotChatModel: ObservableObject {
         profilesByNpub = [:]
         profileFetches = []
         profileFetchedAt = [:]
+        // Invalidate any in-flight syncForce slot so a post-wipe wake cannot
+        // join the previous identity's FETCH_TIMEOUT park.
+        gapRecoveryGeneration &+= 1
+        gapRecoveryTask = nil
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
         clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)

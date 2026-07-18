@@ -224,6 +224,13 @@ internal suspend fun runMarmotSendWithBestEffortReconciliation(
     }
 }
 
+/**
+ * Mesh→White Noise send echoes must stay on the open mesh transcript until a
+ * folded canonical White Noise row is present. Clearing first made the
+ * "Sending · internet" bubble vanish for seconds while refreshOpenDm caught up.
+ */
+internal fun shouldClearMeshMarmotSendEcho(hasCanonicalRow: Boolean): Boolean = hasCanonicalRow
+
 internal data class SendEchoDisplayPlan(
     val visibleEchoes: List<SonarMsg>,
     val terminalAcceptedEchoIds: Set<String>,
@@ -7144,8 +7151,10 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Texts queued for a Sonar peer (keyed by npub hex) while their White Noise
      *  group is created on the first out-of-range send. Flushed by
-     *  [flushPendingMarmot] once the group appears in [chats]. */
-    private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
+     *  [flushPendingMarmot] once the group appears in [chats]. Each entry keeps
+     *  the mesh chat id + optimistic echo id so the bubble paints immediately
+     *  (same shape as [sendPendingMarmotChat]) instead of waiting on startChat. */
+    private val pendingMarmotSends = mutableMapOf<String, MutableList<PendingMeshMarmotSend>>()
     private val startingMarmotChats = mutableSetOf<String>()
     private val pendingMarmotSetupJobs = mutableMapOf<String, Job>()
     private val pendingMarmotSetupTokens = mutableMapOf<String, Long>()
@@ -7158,6 +7167,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         val name: String,
         val members: List<String>,
         val createdAtSecs: Long,
+    )
+    private data class PendingMeshMarmotSend(
+        val meshChatId: String,
+        val text: String,
+        val echoId: String,
     )
     private data class PendingDirectMarmotSend(
         val pendingChatId: String,
@@ -7247,88 +7261,170 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
      *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
-     *  `sendOverMarmot`). */
+     *  `sendOverMarmot`).
+     *
+     *  Always paint an optimistic echo on the mesh chat id first. Clearing the
+     *  echo before [refreshOpenDm] can merge the White Noise canonical row made
+     *  the bubble vanish for a couple of seconds ("Sending · internet" gap). */
     private fun sendOverMarmot(peerId: String, npubRaw: ByteArray, text: String) {
+        val chatId = meshChatId(peerId)
         val group = marmotGroupForNpub(npubRaw)
         if (group != null) {
-            val chatId = meshChatId(peerId)
             val echo = createSendEcho(chatId, text)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
-                try {
-                    sendMarmotTextOrdered(group.id, text)
-                    clearSendEcho(chatId, echo.id)
-                    processPayLines(group.id, marmotMessagesPage(group.id))
-                    refreshOpenDm(peerId)
-                } catch (e: Throwable) {
-                    failSendEcho(chatId, echo.id)
-                    toast = "send failed: ${e.message}"
-                }
+                runMarmotSendWithBestEffortReconciliation(
+                    send = { sendMarmotTextOrdered(group.id, text) },
+                    onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
+                    reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
+                    onSendFailure = { error ->
+                        failSendEcho(chatId, echo.id)
+                        toast = "send failed: ${error.message}"
+                    },
+                    onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
+                )
             }
             return
         }
+        val echo = createSendEcho(chatId, text)
+        messages = (messages + echo).sortedBy { it.tsSecs }
         val npubHex = npubRaw.toHexLower()
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(text)
+        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            .add(PendingMeshMarmotSend(meshChatId = chatId, text = text, echoId = echo.id))
         toast = "Out of range — continuing over White Noise…"
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
-                if (!awaitRelayConnection()) return@launch
+                if (!awaitRelayConnection()) {
+                    failPendingMeshMarmotSends(npubHex)
+                    return@launch
+                }
                 SonarCore.startChat(npubHex) // start_dm accepts a hex pubkey
-                refreshChats(); flushPendingMarmot(); flushOutbox(peerId); refreshOpenDm(peerId)
-            } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
-            finally { startingMarmotChats.remove(npubHex) }
+                refreshChats()
+                flushPendingMarmot()
+                flushOutbox(peerId)
+                refreshOpenDm(peerId)
+            } catch (e: Throwable) {
+                failPendingMeshMarmotSends(npubHex)
+                toast = "couldn't start secure chat: ${e.message}"
+            } finally {
+                startingMarmotChats.remove(npubHex)
+            }
         }
     }
 
-    /** Flush texts queued for Sonar peers whose White Noise group now exists. */
     private fun sendStickerOverMarmot(
         peerId: String, npubRaw: ByteArray,
         packCoordinate: String, sticker: SonarStickerItem,
     ) {
+        val chatId = meshChatId(peerId)
+        val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
         val group = marmotGroupForNpub(npubRaw)
         if (group != null) {
-            val chatId = meshChatId(peerId)
-            val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
             val echo = createSendEcho(chatId, encoded)
             messages = (messages + echo).sortedBy { it.tsSecs }
             scope.launch {
-                runCatching { sendMarmotStickerOrdered(group.id, packCoordinate, sticker.shortcode, sticker.sha256) }
-                    .onSuccess {
-                        clearSendEcho(chatId, echo.id)
-                        refreshOpenDm(peerId)
-                    }
-                    .onFailure {
+                runMarmotSendWithBestEffortReconciliation(
+                    send = {
+                        sendMarmotStickerOrdered(group.id, packCoordinate, sticker.shortcode, sticker.sha256)
+                    },
+                    onSendAccepted = { markSendEchoAccepted(chatId, echo.id) },
+                    reconcile = { reconcileMeshMarmotSendEcho(peerId, chatId, echo) },
+                    onSendFailure = { error ->
                         failSendEcho(chatId, echo.id)
-                        toast = "send failed: ${it.message}"
-                    }
+                        toast = "send failed: ${error.message}"
+                    },
+                    onReconciliationFailure = { markSendEchoAccepted(chatId, echo.id) },
+                )
             }
             return
         }
+        val echo = createSendEcho(chatId, encoded)
+        messages = (messages + echo).sortedBy { it.tsSecs }
         val npubHex = npubRaw.toHexLower()
-        val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(encoded)
+        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            .add(PendingMeshMarmotSend(meshChatId = chatId, text = encoded, echoId = echo.id))
         toast = "Out of range — continuing over White Noise…"
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
-                if (!awaitRelayConnection()) return@launch
+                if (!awaitRelayConnection()) {
+                    failPendingMeshMarmotSends(npubHex)
+                    return@launch
+                }
                 SonarCore.startChat(npubHex)
-                refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
-            } catch (e: Throwable) { toast = "couldn't start secure chat: ${e.message}" }
-            finally { startingMarmotChats.remove(npubHex) }
+                refreshChats()
+                flushPendingMarmot()
+                refreshOpenDm(peerId)
+            } catch (e: Throwable) {
+                failPendingMeshMarmotSends(npubHex)
+                toast = "couldn't start secure chat: ${e.message}"
+            } finally {
+                startingMarmotChats.remove(npubHex)
+            }
         }
+    }
+
+    private fun failPendingMeshMarmotSends(npubHex: String) {
+        val pending = pendingMarmotSends.remove(npubHex).orEmpty()
+        for (send in pending) {
+            failSendEcho(send.meshChatId, send.echoId)
+        }
+    }
+
+    private suspend fun reconcileMeshMarmotSendEcho(
+        peerId: String,
+        chatId: String,
+        echo: SonarMsg,
+    ) {
+        val refreshGeneration = transcriptGeneration
+        val published = mergePendingMediaUploads(
+            chatId,
+            marmotMessagesForPeer(peerId, chatId, refreshGeneration),
+        )
+        val hasCanonicalRow = reserveSuccessfulEchoCanonicalRows(chatId, echo, published)
+        if (!hasCanonicalRow) {
+            markSendEchoAccepted(chatId, echo.id)
+        }
+        refreshOpenDm(peerId)
+        if (shouldClearMeshMarmotSendEcho(hasCanonicalRow)) {
+            clearSendEcho(chatId, echo.id)
+            refreshOpenDm(peerId)
+        }
+        processPayLines(chatId, messages)
     }
 
     private fun flushPendingMarmot() {
         if (pendingMarmotSends.isEmpty()) return
-        for ((npubHex, texts) in pendingMarmotSends.toMap()) {
+        for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
             scope.launch {
-                for (tx in texts) {
-                    runCatching { sendQueuedMarmotContent(group.id, tx) }
+                for (send in sends) {
+                    val peerId = meshPeerId(send.meshChatId)
+                    val echo = pendingSendEchoes[send.meshChatId]
+                        ?.firstOrNull { it.id == send.echoId }
+                    runMarmotSendWithBestEffortReconciliation(
+                        send = { sendQueuedMarmotContent(group.id, send.text) },
+                        onSendAccepted = {
+                            if (echo != null) markSendEchoAccepted(send.meshChatId, echo.id)
+                        },
+                        reconcile = {
+                            if (echo != null) {
+                                reconcileMeshMarmotSendEcho(peerId, send.meshChatId, echo)
+                            } else {
+                                refreshOpenDm(peerId)
+                            }
+                        },
+                        onSendFailure = { error ->
+                            if (echo != null) failSendEcho(send.meshChatId, echo.id)
+                            toast = "send failed: ${error.message}"
+                        },
+                        onReconciliationFailure = {
+                            if (echo != null) markSendEchoAccepted(send.meshChatId, echo.id)
+                        },
+                    )
                 }
             }
         }
