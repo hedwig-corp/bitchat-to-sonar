@@ -29,6 +29,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -56,6 +58,7 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfile) {
     val s = sonar
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
     var showVerify by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
@@ -258,7 +261,15 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     value = shortKey(peerNpub),
                     valueMono = true,
                     trail = SNTrail.None
-                ) {}
+                ) {
+                    // Parity with iOS SonarContactProfileScreen.copyKey: copy the
+                    // full peer npub (not the truncated display value).
+                    val key = peerNpub?.takeIf { it.isNotBlank() }
+                    if (key != null) {
+                        clipboard.setText(AnnotatedString(key))
+                        state.toast = "Public key copied"
+                    }
+                }
                 SNSettingsRow(
                     icon = SNIconName.Lock,
                     label = "Key fingerprint",
