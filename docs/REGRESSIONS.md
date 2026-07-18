@@ -376,6 +376,32 @@ the send echo was cleared before the canonical row merged.
 
 ---
 
+## R-013 — A tapped chat push must catch up before the visit ends
+
+**Invariant:** Opening the app from a Transponder/Marmot chat notification must kick a forced gap-recovery sync (and prefer the open chat's catch-up) so the notified message lands in the local transcript during that foreground visit. Per-group historical catch-up must not starve under live traffic, and distant floors must not share one widened `#h` scan.
+
+**Breaks as:** User sees "New Sonar message", opens the chat, and finds nothing — the banner came from the NSE/generic wake path while the local DB still lacks the row. Or the message appears minutes later (or never) because catch-up advances only on idle wake cycles / one group per pass.
+
+**Call sites:**
+- Core: `client.rs` (`should_fetch_group_messages_on_sync`, batched catch-up / `plan_catchup_buckets`, preferred-group gate)
+- iOS: `NotificationDelegate.didReceive` → `MarmotChatModel.refreshAfterForeground()`; scenePhase also routes through the same single-flight refresh
+- Compose: `SonarAppState.setForeground` / `requestImmediateSync` → `forcedCatchupSync` (Android notification taps already enter via `setForeground(true)`)
+
+**Guarded by:** `client.rs::forced_sync_fetches_group_messages_even_when_live`, `client.rs::catchup_batch_leads_with_preferred_and_respects_cap`, `client.rs::catchup_buckets_isolate_distant_floors`, `client.rs::catchup_gate_one_shot_preferred_bypass`
+
+**Also guarded by:** `client.rs::forced_sync_notifications_surface_through_drain`, `client.rs::catchup_bucket_since_applies_lookback_exactly_once`, `client.rs::catchup_buckets_zero_floor_isolated_and_capped`, `client.rs::catchup_gate_rejects_concurrent_pass`, `client.rs::catchup_gate_empty_pass_does_not_throttle_next`, `client.rs::prefer_catchup_promotes_active_group`
+
+**Not guarded:** the iOS tap → `refreshAfterForeground` wiring and the Compose `forcedCatchupSync` / "catching up…" chip. Both need a constructible store (see Unguarded). Real-device APNs validation remains #262.
+
+**History:** #166 (foreground/push relay sync) → #252 (forced sync skipped the live batched `#h` fetch — primary invisible-on-open bug) → #254/#255 (catch-up starvation + push-tap kick + catching-up chip; consolidated here onto current main). Related floor starvation is R-005.
+
+**Rejected:**
+- *Waiting only on `scenePhase` / socket-connected "Online".* iOS cold-launch taps can miss the refresh, and "Online" lied while catch-up had not run.
+- *Unbounded full-history fetch on every wake.* Violates the Signal-Comparable Performance Rule; the batched/bucketed catch-up keeps per-pass work bounded.
+
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
