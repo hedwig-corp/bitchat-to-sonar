@@ -48,6 +48,19 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.sonar
 
+/**
+ * Opening the emoji/sticker tray must dismiss the soft keyboard. Leaving the
+ * IME up stacks tray height on `imePadding` chrome and freezes/janks the chat
+ * (same failure mode as the iOS Phase 3 keyboardLayoutGuide stack).
+ */
+internal fun shouldDismissKeyboardWhenOpeningEmojiTray(openingTray: Boolean): Boolean = openingTray
+
+/** Focusing the message field while the tray is open closes the tray. */
+internal fun shouldCloseEmojiTrayOnComposerFocus(
+    composerFocused: Boolean,
+    trayOpen: Boolean,
+): Boolean = composerFocused && trayOpen
+
 internal fun shouldPreserveCachedStickerPacks(
     hadCachedPacks: Boolean,
     installedCoordinates: List<String>?,

@@ -84,7 +84,10 @@ import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
@@ -103,6 +106,8 @@ import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
+import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
+import chat.bitchat.sonar.screens.shouldDismissKeyboardWhenOpeningEmojiTray
 import chat.bitchat.sonar.ui.authorColor
 import chat.bitchat.sonar.ui.bcHue
 import chat.bitchat.sonar.ui.SNDot
@@ -1542,6 +1547,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
 
     @Composable
     fun ChatBottomChrome() {
+        val keyboardController = LocalSoftwareKeyboardController.current
+        val focusManager = LocalFocusManager.current
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
         if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
             onEmoji = { draft += it },
@@ -1602,7 +1609,18 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         value = draft, onValueChange = { draft = it },
                         textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                         cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .onFocusChanged { focusState ->
+                                if (
+                                    shouldCloseEmojiTrayOnComposerFocus(
+                                        composerFocused = focusState.isFocused,
+                                        trayOpen = emojiTray,
+                                    )
+                                ) {
+                                    emojiTray = false
+                                }
+                            },
                         onSend = {
                             if (draft.isBlank()) return@MessageComposerTextField
                             val d = draft; draft = ""
@@ -1619,10 +1637,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 Box(
                     Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
                         .clickable {
-                            if (!emojiTray) {
+                            val opening = !emojiTray
+                            if (shouldDismissKeyboardWhenOpeningEmojiTray(opening)) {
+                                focusManager.clearFocus(force = true)
+                                keyboardController?.hide()
                                 stickerPacks = state.cachedStickerPacks()
                             }
-                            emojiTray = !emojiTray
+                            emojiTray = opening
                         },
                     contentAlignment = Alignment.Center
                 ) { SNIcon(SNIconName.Smile, 18.dp, if (emojiTray) s.accent else s.text2, weight = 2f) }

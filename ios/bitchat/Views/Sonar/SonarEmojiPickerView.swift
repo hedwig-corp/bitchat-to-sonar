@@ -17,6 +17,20 @@ import UIKit
 import AppKit
 #endif
 
+/// Opening the emoji/sticker tray must dismiss the system keyboard. Phase 3
+/// pins the composer to `keyboardLayoutGuide`, so leaving the IME up stacks the
+/// 320pt tray on top of the keyboard, inflates the owned bottom inset, and
+/// freezes the chat UI (touches stop responding while both chrome layers fight).
+func snShouldDismissKeyboardWhenOpeningEmojiTray(openingTray: Bool) -> Bool {
+    openingTray
+}
+
+/// Focusing the message field while the tray is open closes the tray so the
+/// IME and custom picker never own the bottom chrome at the same time.
+func snShouldCloseEmojiTrayOnComposerFocus(composerFocused: Bool, trayOpen: Bool) -> Bool {
+    composerFocused && trayOpen
+}
+
 func snShouldPreserveCachedStickerPacks(
     hadCachedPacks: Bool,
     installedCoordinates: [String]?
