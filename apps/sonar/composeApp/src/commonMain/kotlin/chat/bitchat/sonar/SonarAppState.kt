@@ -7636,10 +7636,15 @@ class SonarAppState(private val scope: CoroutineScope) {
         voiceQueueSnapshot = logicalConversationId to voiceItemsInOpenWindow(logicalConversationId)
         // Probe disk-cached voice notes that bubbles have not prepared yet so
         // Next/autoplay survives app restart / offscreen rows (MediaCache
-        // exists() is suspend — never call it on the UI path).
+        // exists() is suspend — never call it on the UI path). Only refresh
+        // while this chat is still the open transcript — otherwise `messages`
+        // belongs to another chat and would wipe the originating snapshot.
         scope.launch {
+            if (activeTranscriptChatId != logicalConversationId) return@launch
             warmVoiceTransfersInOpenWindow()
-            if (voiceQueueSnapshot?.first == logicalConversationId) {
+            if (voiceQueueSnapshot?.first == logicalConversationId &&
+                activeTranscriptChatId == logicalConversationId
+            ) {
                 voiceQueueSnapshot =
                     logicalConversationId to voiceItemsInOpenWindow(logicalConversationId)
             }
