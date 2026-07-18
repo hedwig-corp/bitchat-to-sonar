@@ -2296,6 +2296,9 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func processIncomingMarmotNotifications() {
+        // Push-wake owns banners for the current Transponder sync; emitting
+        // here as well double-fires (different identifiers) for the same row.
+        if marmot.pushWakeOwnsNotifications { return }
         for group in marmot.groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)

@@ -282,6 +282,9 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var initialLocalHomeReady = false
     /// Unread message counts per Marmot group, keyed by group ID hex.
     @Published var unreadByGroup: [String: UInt64] = [:]
+    /// While true, SonarAppStore must not emit process-alive Marmot banners —
+    /// `SonarPushProcessor` owns lock-screen copy for the current push wake.
+    private(set) var pushWakeOwnsNotifications = false
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -1004,6 +1007,14 @@ final class MarmotChatModel: ObservableObject {
     /// Local-first: never blocks paint/send. Empty/nil clears preference.
     func preferCatchupGroup(_ groupId: String?) async {
         await service.preferCatchupGroup(groupId)
+    }
+
+    func beginPushWakeNotificationOwnership() {
+        pushWakeOwnsNotifications = true
+    }
+
+    func endPushWakeNotificationOwnership() {
+        pushWakeOwnsNotifications = false
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for

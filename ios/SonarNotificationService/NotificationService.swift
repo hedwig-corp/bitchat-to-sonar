@@ -197,11 +197,18 @@ class NotificationService: SDKNotificationService {
         // honor Show names only for the generic title, and let the background
         // SonarPushProcessor replace this banner with prefs-aware copy once
         // unread state is available.
+        //
+        // Mark with sonar.nsePlaceholder so the app can remove THIS banner by
+        // identity — never by matching title/body (those strings are also the
+        // router's privacy fallback when Show names + Message preview are off).
         let showNames = notificationShowNames()
         content.title = showNames ? "New Sonar message" : "Sonar"
         content.body = "Open Sonar to read it."
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
+        var info = content.userInfo
+        info["sonar.nsePlaceholder"] = true
+        content.userInfo = info
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active
         }

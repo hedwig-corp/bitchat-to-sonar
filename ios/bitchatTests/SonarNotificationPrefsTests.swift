@@ -13,6 +13,7 @@
 
 import Foundation
 import Testing
+import UserNotifications
 @testable import Sonar
 
 struct SonarNotificationPrefsTests {
@@ -123,4 +124,39 @@ struct SonarNotificationPrefsTests {
         )
         #expect(routed == nil)
     }
+
+    #if os(iOS)
+    @Test("NSE placeholder detection ignores router privacy-fallback copy")
+    func nsePlaceholderMatchesIdentityNotCopy() {
+        // Router privacy fallback (names off, preview off) uses the same
+        // title/body as the NSE placeholder — cleanup must not key on those.
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: true,
+            showNames: false,
+            showPreview: false,
+            showPaymentAmount: true
+        )
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "peer-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            senderName: "Alice",
+            preview: "secret hello",
+            prefs: prefs
+        )
+        #expect(routed?.title == "New Sonar message")
+        #expect(routed?.body == "Open Sonar to read it.")
+
+        let plain = UNMutableNotificationContent()
+        plain.title = routed!.title
+        plain.body = routed!.body
+        #expect(SonarPushProcessor.isNSEPlaceholder(plain) == false)
+
+        let nse = UNMutableNotificationContent()
+        nse.title = "Sonar"
+        nse.body = "Open Sonar to read it."
+        nse.userInfo = [SonarPushProcessor.nsePlaceholderUserInfoKey: true]
+        #expect(SonarPushProcessor.isNSEPlaceholder(nse) == true)
+    }
+    #endif
 }

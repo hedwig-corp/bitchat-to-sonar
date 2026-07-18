@@ -9,8 +9,8 @@
 // This runs from the AppDelegate's didReceiveRemoteNotification handler
 // inside the 30-second background execution window iOS provides. The NSE
 // may already have posted a generic banner for killed-app wakes; this path
-// replaces that with prefs-aware copy whenever local unread state is ready
-// (Android SonarPushProcessingService parity).
+// replaces that with prefs-aware copy whenever newly drained (or newly
+// changed unread) local state is ready.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -27,6 +27,11 @@ import SonarCore
 private struct SonarPushTimeoutError: Error {}
 
 enum SonarPushProcessor {
+
+    /// userInfo key set by the NSE on Transponder placeholders. Cleanup must
+    /// match this identity — never title/body (those strings are also the
+    /// router's privacy fallback when Show names + Message preview are off).
+    static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
 
     private static let log = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "sh.hedwig.sonar",
@@ -73,16 +78,24 @@ enum SonarPushProcessor {
         }
 
         Task {
+            // Own push-wake banners so SonarAppStore's live message sink does
+            // not also fire for the same drained rows (duplicate lock-screen
+            // banners with different identifiers).
+            marmot.beginPushWakeNotificationOwnership()
+            defer { marmot.endPushWakeNotificationOwnership() }
+
+            let beforeUnread = unreadFingerprint(marmot: marmot)
+            var drained: [DrainNotificationInfo] = []
             var synced = false
             do {
-                _ = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
+                drained = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
                     await marmot.refresh()
                 }
                 synced = true
             } catch {
                 log.warning("Marmot sync from push failed or timed out: \(error)")
                 // Partial drain often already wrote the pushed row; load local
-                // summaries so we can still render titled notifications.
+                // summaries so a delta check can still render titled copy.
                 await marmot.loadLocalSummaries()
             }
 
@@ -92,35 +105,122 @@ enum SonarPushProcessor {
                 return
             }
 
-            let notified = await notifyUnreadConversations(marmot: marmot, prefs: prefs)
+            let notified: Int
+            if !drained.isEmpty {
+                notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
+            } else {
+                // Never fan out to every stale unread chat — only conversations
+                // whose unread fingerprint advanced during this wake.
+                notified = await notifyNewlyUnread(
+                    before: beforeUnread,
+                    marmot: marmot,
+                    prefs: prefs
+                )
+            }
+
             switch (notified > 0, synced) {
             case (true, _):
                 log.info("Marmot wakeup: notified for \(notified) conversation(s) (synced=\(synced))")
-                removeDeliveredGenericMessageBanners()
+                removeDeliveredNSEPlaceholderBanners()
                 completionHandler(.newData)
             case (false, true):
-                log.info("Marmot sync completed from push, no unread messages")
+                log.info("Marmot sync completed from push, no new unread messages")
                 completionHandler(.newData)
             case (false, false):
-                log.warning("Marmot sync timed out with nothing unread, showing fallback")
+                log.warning("Marmot sync timed out with nothing new unread, showing fallback")
                 showFallbackNotification(prefs: prefs)
                 completionHandler(.failed)
             }
         }
     }
 
-    /// Render titled notifications for every unread conversation from local
-    /// storage. Returns how many conversations were notified.
+    /// Fingerprint unread conversations so a wake can detect *new* activity
+    /// without re-alerting every leftover unread thread.
     @MainActor
-    private static func notifyUnreadConversations(
+    private static func unreadFingerprint(
+        marmot: MarmotChatModel
+    ) -> [String: (unread: UInt64, latestAt: Date, content: String)] {
+        var out: [String: (unread: UInt64, latestAt: Date, content: String)] = [:]
+        for summary in marmot.conversationSummariesByGroup.values where summary.unreadCount > 0 {
+            out[summary.groupIdHex] = (
+                unread: summary.unreadCount,
+                latestAt: summary.latestAt,
+                content: summary.latestContent
+            )
+        }
+        return out
+    }
+
+    @MainActor
+    private static func notifyDrained(
+        _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
         prefs: SonarLocalNotificationPrefs
     ) async -> Int {
-        let unread = marmot.conversationSummariesByGroup.values.filter { $0.unreadCount > 0 }
-        if unread.isEmpty { return 0 }
+        var notified = 0
+        for notif in drained {
+            let kind: SonarLocalNotificationKind = {
+                switch sonarNotificationClassifyContent(content: notif.contentPreview) {
+                case .call: return .call
+                case .payment: return .payment
+                default: return .message
+                }
+            }()
+            if kind == .call { continue }
+
+            let senderName: String?
+            if prefs.showNames, !notif.senderNpub.isEmpty {
+                senderName = await marmot.resolveSenderName(npub: notif.senderNpub)
+            } else {
+                senderName = nil
+            }
+            let groupName = notif.groupName.isEmpty ? nil : notif.groupName
+            let conversationTitle = groupName ?? senderName
+            // Stable-ish id so a retrying wake replaces rather than stacking.
+            let idKey = [
+                notif.senderNpub,
+                notif.groupName,
+                notif.contentPreview,
+            ].joined(separator: "|")
+
+            guard let routed = SonarLocalNotificationRouter.make(
+                idKey: idKey,
+                kind: kind,
+                conversationTitle: conversationTitle,
+                senderName: senderName,
+                groupName: groupName,
+                preview: notif.contentPreview.isEmpty ? nil : notif.contentPreview,
+                prefs: prefs
+            ) else { continue }
+
+            NotificationService.shared.sendLocalNotification(
+                title: routed.title,
+                body: routed.body,
+                identifier: routed.identifier
+            )
+            notified += 1
+        }
+        return notified
+    }
+
+    /// Notify only unread conversations that advanced during this wake.
+    @MainActor
+    private static func notifyNewlyUnread(
+        before: [String: (unread: UInt64, latestAt: Date, content: String)],
+        marmot: MarmotChatModel,
+        prefs: SonarLocalNotificationPrefs
+    ) async -> Int {
+        let after = marmot.conversationSummariesByGroup.values.filter { summary in
+            guard summary.unreadCount > 0 else { return false }
+            guard let prior = before[summary.groupIdHex] else { return true }
+            return summary.unreadCount > prior.unread
+                || summary.latestAt > prior.latestAt
+                || summary.latestContent != prior.content
+        }
+        if after.isEmpty { return 0 }
 
         var notified = 0
-        for summary in unread {
+        for summary in after {
             let kind: SonarLocalNotificationKind = {
                 switch sonarNotificationClassifyContent(content: summary.latestContent) {
                 case .call: return .call
@@ -138,8 +238,6 @@ enum SonarPushProcessor {
             }
             let conversationTitle = summary.name.isEmpty ? senderName : summary.name
             let groupName: String? = {
-                // Only label as a group when the conversation name is distinct
-                // from the sender (direct chats often reuse the peer name).
                 guard let senderName, !summary.name.isEmpty, summary.name != senderName else {
                     return nil
                 }
@@ -211,16 +309,21 @@ enum SonarPushProcessor {
         )
     }
 
-    /// Drop the NSE's plaintext-free placeholder once we have real local copy,
-    /// so the lock screen shows the prefs-aware title/body instead of both.
-    private static func removeDeliveredGenericMessageBanners() {
+    /// Drop NSE Transponder placeholders once we have real local copy.
+    /// Matches `sonar.nsePlaceholder` only — never user-visible title/body.
+    static func isNSEPlaceholder(_ content: UNNotificationContent) -> Bool {
+        if let flag = content.userInfo[nsePlaceholderUserInfoKey] as? Bool { return flag }
+        if let flag = content.userInfo[nsePlaceholderUserInfoKey] as? NSNumber {
+            return flag.boolValue
+        }
+        return false
+    }
+
+    private static func removeDeliveredNSEPlaceholderBanners() {
         let center = UNUserNotificationCenter.current()
         center.getDeliveredNotifications { notes in
             let ids = notes.compactMap { note -> String? in
-                let content = note.request.content
-                guard content.title == "New Sonar message",
-                      content.body == "Open Sonar to read it."
-                else { return nil }
+                guard isNSEPlaceholder(note.request.content) else { return nil }
                 return note.request.identifier
             }
             guard !ids.isEmpty else { return }
