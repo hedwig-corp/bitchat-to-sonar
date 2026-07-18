@@ -4889,6 +4889,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Delete a 1:1 Marmot chat locally, or leave a multi-member Marmot group. */
     fun deleteMarmotChat(chatId: String) {
+        stopVoiceForDeletedConversation(chatId)
         if (isPendingMarmotGroup(chatId)) {
             toast = "Group is still setting up."
             return
@@ -4928,6 +4929,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Delete ONE BLE-mesh private conversation locally (in-memory + on-disk). */
     fun deleteMeshDm(peerId: String) {
+        stopVoiceForDeletedConversation(meshChatId(canonicalMeshPeerId(peerId)))
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val aliases = meshPeerAliases(canonicalPeerId)
         val chatId = meshChatId(canonicalPeerId)
@@ -7479,21 +7481,39 @@ class SonarAppState(private val scope: CoroutineScope) {
     // Engine is created first; host callbacks go through [voiceControllerRef]
     // so controller ↔ engine lazy init cannot deadlock.
     @Volatile private var voiceControllerRef: VoiceMessagePlaybackController? = null
-    private val voiceControllerLazy = lazy(LazyThreadSafetyMode.NONE) {
-        VoiceMessagePlaybackController(
-            engine = voicePlaybackEngine,
+    private val voiceListenedStore = AppVoicePlaybackListenedStore()
+
+    /** Process-scoped get-or-create so Android Activity recreation rebinds UI
+     *  to the same controller MediaSession is already driving. */
+    private fun ensureVoiceController(): VoiceMessagePlaybackController {
+        AppVoicePlaybackSession.controller?.let { existing ->
+            if (voiceControllerRef !== existing) {
+                voiceControllerRef = existing
+                existing.onStateChanged = { s -> voicePlayback = s }
+                voicePlayback = existing.state
+            }
+            return existing
+        }
+        return VoiceMessagePlaybackController(
+            engine = newVoicePlaybackEngine(),
             rateStore = AppVoicePlaybackRateStore(),
             queue = AppVoicePlaybackQueue(),
-            listenedStore = AppVoicePlaybackListenedStore(),
+            listenedStore = voiceListenedStore,
             dispatcher = Dispatchers.Default,
         ).also { controller ->
             voiceControllerRef = controller
+            AppVoicePlaybackSession.controller = controller
             controller.onStateChanged = { s -> voicePlayback = s }
         }
     }
-    private val voiceController: VoiceMessagePlaybackController by voiceControllerLazy
 
-    private val voicePlaybackEngine: VoicePlaybackEngine by lazy(LazyThreadSafetyMode.NONE) {
+    private val voiceController: VoiceMessagePlaybackController
+        get() = ensureVoiceController()
+
+    private fun voiceControllerIfPresent(): VoiceMessagePlaybackController? =
+        AppVoicePlaybackSession.controller ?: voiceControllerRef
+
+    private fun newVoicePlaybackEngine(): VoicePlaybackEngine =
         createVoicePlaybackEngine(object : VoicePlaybackEngineHost {
             override fun onEnded(generation: Long) {
                 voiceControllerRef?.onEngineEnded(generation)
@@ -7542,7 +7562,6 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
         })
-    }
 
     /** Observable mirror of [VoiceMessagePlaybackController.state]; `AudioBubble`
      *  reads this instead of owning any player. */
@@ -7690,6 +7709,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         rememberVoiceQueueSnapshot(item.logicalConversationId)
         voiceController.dispatch(VoicePlaybackCommand.Play(item))
     }
+    /** Ordered play+seek for waveform taps on a non-current note. */
+    fun playVoiceAt(item: VoicePlaybackItem, positionMs: Long) {
+        rememberVoiceQueueSnapshot(item.logicalConversationId)
+        voiceController.dispatch(VoicePlaybackCommand.PlayAt(item, positionMs))
+    }
     fun pauseVoice() = voiceController.dispatch(VoicePlaybackCommand.Pause)
     fun resumeVoice() = voiceController.dispatch(VoicePlaybackCommand.Resume)
     fun seekVoice(positionMs: Long) = voiceController.dispatch(VoicePlaybackCommand.Seek(positionMs))
@@ -7701,27 +7725,48 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  outgoing call is placed, an incoming call starts ringing, and when a
      *  call is accepted. */
     private fun stopVoiceForCall() {
-        if (voiceControllerLazy.isInitialized()) {
-            voiceController.dispatch(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call))
-        }
+        voiceControllerIfPresent()?.dispatch(
+            VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call)
+        )
     }
 
     /** Starting to record a new voice note pauses/stops any note currently
      *  playing before the recorder takes the microphone. */
     fun stopVoiceForRecording() {
-        if (voiceControllerLazy.isInitialized()) {
-            voiceController.dispatch(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Recording))
-        }
+        voiceControllerIfPresent()?.dispatch(
+            VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Recording)
+        )
     }
 
     /** Invalidate the active session before local media is wiped (account
      *  wipe, erase-all-chats, or account switch) — engine release must
      *  happen before [MediaCache.wipe] can delete the file it has open, so
      *  this suspends until the stop has actually applied. */
-    private suspend fun stopVoiceForWipe() {
-        if (voiceControllerLazy.isInitialized()) {
-            voiceController.dispatchSync(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Wipe))
+    private fun stopVoiceForDeletedConversation(logicalConversationId: String) {
+        val controller = voiceControllerIfPresent()
+        val active = controller?.state?.item
+        if (active != null &&
+            (active.logicalConversationId == logicalConversationId ||
+                active.sourceConversationId == logicalConversationId)
+        ) {
+            controller.dispatch(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Deleted))
         }
+        voiceListenedStore.clearConversation(logicalConversationId)
+        if (voiceQueueSnapshot?.first == logicalConversationId) {
+            voiceQueueSnapshot = null
+        }
+    }
+
+    private suspend fun stopVoiceForWipe() {
+        voiceControllerIfPresent()?.let { controller ->
+            controller.dispatchSync(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Wipe))
+            controller.close()
+        }
+        voiceListenedStore.clearAll()
+        voiceQueueSnapshot = null
+        AppVoicePlaybackSession.controller = null
+        voiceControllerRef = null
+        voicePlayback = VoicePlaybackState()
     }
 
     /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live

@@ -79,6 +79,8 @@ data class VoicePlaybackState(
 
 sealed interface VoicePlaybackCommand {
     data class Play(val item: VoicePlaybackItem) : VoicePlaybackCommand
+    /** Play [item] then seek — one ordered reducer step so Seek cannot race ahead of Play. */
+    data class PlayAt(val item: VoicePlaybackItem, val positionMs: Long) : VoicePlaybackCommand
     data object Pause : VoicePlaybackCommand
     data object Resume : VoicePlaybackCommand
     data class Seek(val positionMs: Long) : VoicePlaybackCommand
@@ -193,6 +195,14 @@ object VoicePlaybackRates {
 
     fun normalize(rate: Float): Float =
         ALL.minByOrNull { kotlin.math.abs(it - rate) } ?: 1.0f
+}
+
+/**
+ * Process-scoped holder so Android Activity/`remember` recreation rebinds to
+ * the same controller+engine instead of orphaning MediaSession audio.
+ */
+object AppVoicePlaybackSession {
+    @Volatile var controller: VoiceMessagePlaybackController? = null
 }
 
 /**
@@ -410,6 +420,10 @@ class VoiceMessagePlaybackController(
     private suspend fun applyCommand(command: VoicePlaybackCommand) {
         when (command) {
             is VoicePlaybackCommand.Play -> startItem(command.item, autoplay = false)
+            is VoicePlaybackCommand.PlayAt -> {
+                startItem(command.item, autoplay = false)
+                seek(command.positionMs)
+            }
             VoicePlaybackCommand.Pause -> pauseUser()
             VoicePlaybackCommand.Resume -> resumeUser()
             is VoicePlaybackCommand.Seek -> seek(command.positionMs)

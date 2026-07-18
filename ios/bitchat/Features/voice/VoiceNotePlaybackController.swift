@@ -227,10 +227,16 @@ final class AVAudioPlayerVoicePlaybackEngine: NSObject, VoicePlaybackEngine, AVA
     #if os(iOS)
     private static func activateSession() throws {
         let session = AVAudioSession.sharedInstance()
-        // `.playback` (not `.playAndRecord`) — a voice note is playback-only.
-        // `.mixWithOthers` lets it duck instead of fighting for the session;
-        // calls/recording preempt it explicitly via the controller's stop().
-        try session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers])
+        // `.playAndRecord` is required for `overrideOutputAudioPort(.none)` to
+        // reach the receiver on proximity-near; `.playback` always stays on the
+        // loudspeaker path. `.defaultToSpeaker` keeps away-from-ear playback on
+        // the speaker until proximity flips the route. Calls/recording still
+        // preempt via the controller's `stop(reason:)`.
+        try session.setCategory(
+            .playAndRecord,
+            mode: .spokenAudio,
+            options: [.defaultToSpeaker, .allowBluetooth, .mixWithOthers]
+        )
         try session.setActive(true)
     }
 

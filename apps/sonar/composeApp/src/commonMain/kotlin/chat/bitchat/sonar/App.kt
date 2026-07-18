@@ -4111,8 +4111,9 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
             seekable = transfer.phase == MediaTransferPhase.Available,
             onSeek = { fraction ->
                 val dur = durationMs.takeIf { it > 0L } ?: return@VoiceWaveform
-                if (!isCurrent) state.playVoice(item)
-                state.seekVoice((dur * fraction).toLong())
+                val positionMs = (dur * fraction).toLong()
+                if (!isCurrent) state.playVoiceAt(item, positionMs)
+                else state.seekVoice(positionMs)
             },
             modifier = Modifier.width(124.dp).height(26.dp),
         )
