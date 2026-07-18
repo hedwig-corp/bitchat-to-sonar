@@ -293,7 +293,7 @@ invalidation for verified peer/profile changes.
 
 ## R-010 — nsec restore must not wipe durable kind-0 `nip05`
 
-**Invariant:** After nsec restore (or lost local nick/handle prefs), the app must fetch own kind-0 before any opportunistic republish; it must never publish blank/stale metadata, never mint `anonXXXX` over a cleared nick, never reclaim a non-Sonar `nip05` at the registrar, and never emit kind-0 when remote `nip05` cannot be preserved in the core sidecar.
+**Invariant:** After nsec restore (or lost local nick/handle prefs), the app must fetch own kind-0 before any opportunistic republish; it must never publish blank/stale metadata, never mint `anonXXXX` over a cleared nick, never reclaim a non-Sonar `nip05` at the registrar, never emit kind-0 when remote `nip05` cannot be preserved in the core sidecar, and never override a name/`nip05` already present on remote kind-0 with a divergent local value.
 
 **Breaks as:** Profile shows blank/"you" after restore; relaunch invents `anon####` and replaces the durable relay profile; external `alice@example.com` becomes `alice@sonarprivacy.xyz` (or is omitted) on the next connect-path publish.
 
@@ -303,7 +303,7 @@ invalidation for verified peer/profile changes.
 
 **Guarded by:** `OwnProfileHydrationTest.externalNip05MustNotReclaimOrPublish`
 
-**Also guarded by:** `OwnProfileHydrationTest.restoreWithBlankLocalStateAdoptsKind0NameAndHandle`, `OwnProfileHydrationTest.blankLocalWithoutRemoteMustNotPublish`, `OwnProfileHydrationTest.renameMustNotPublishWhenHandlePrefLacksCoreSidecar`, `OwnProfileHydrationTest.needsRelayFetchOnlyWhenRestoreSymptomsPresent`, `OwnProfileHydrationTests.externalNip05MustNotReclaimOrPublish`, `OwnProfileHydrationTests.restoreClearedNicknameMustNotMintAnonymousOnRelaunch`
+**Also guarded by:** `OwnProfileHydrationTest.restoreWithBlankLocalStateAdoptsKind0NameAndHandle`, `OwnProfileHydrationTest.blankLocalWithoutRemoteMustNotPublish`, `OwnProfileHydrationTest.remoteKind0NameAndNip05WinOverDivergentLocal`, `OwnProfileHydrationTest.renameMustNotPublishWhenHandlePrefLacksCoreSidecar`, `OwnProfileHydrationTest.needsRelayFetchOnlyWhenRestoreSymptomsPresent`, `OwnProfileHydrationTests.externalNip05MustNotReclaimOrPublish`, `OwnProfileHydrationTests.remoteKind0NameAndNip05WinOverDivergentLocal`, `OwnProfileHydrationTests.restoreClearedNicknameMustNotMintAnonymousOnRelaunch`
 
 **History:** #342 hydrate-before-publish → still wiped via `$relayConnected` / anon mint / external reclaim → tightened publish gate + empty-nick sentinel + Sonar-domain reclaim.
 

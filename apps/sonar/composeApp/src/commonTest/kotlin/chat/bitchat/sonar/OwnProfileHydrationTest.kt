@@ -47,22 +47,23 @@ class OwnProfileHydrationTest {
     }
 
     @Test
-    fun existingLocalNicknameIsNotOverwrittenByRemote() {
+    fun remoteKind0NameAndNip05WinOverDivergentLocal() {
         val plan = planOwnProfileHydration(
             localNickname = "local-nick",
-            localBip353 = "",
+            localBip353 = "stale@other.com",
             localClaimedHandle = null,
             remote = remote,
             handleDomain = domain,
         )
-        assertNull(plan.nicknameToAdopt)
+        // Remote values are already taken on relays — never keep divergent local.
+        assertEquals("Alice", plan.nicknameToAdopt)
         assertEquals("alice@sonarprivacy.xyz", plan.nip05ToAdopt)
         assertEquals("alice", plan.handleLocalToClaim)
         assertTrue(plan.shouldPublishNickname)
     }
 
     @Test
-    fun alreadyClaimedHandleSkipsReclaimAndPrefMirror() {
+    fun matchingLocalNeedsNoAdoption() {
         val plan = planOwnProfileHydration(
             localNickname = "Alice",
             localBip353 = "alice@sonarprivacy.xyz",

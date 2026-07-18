@@ -27,12 +27,24 @@ enum OwnProfileHydration {
         let nip05 = remoteNip05?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let remoteNip05Valid = (nip05?.contains("@") == true) ? nip05 : nil
-        let adoptNick = nick.isEmpty ? name.flatMap { $0.isEmpty ? nil : $0 } : nil
+        let remoteNameValid = name.flatMap { $0.isEmpty ? nil : $0 }
+        let localBip = localBip353.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Durable kind-0 on relays wins. If a name is already set remotely, use
+        // it and never keep/publish a divergent local nick over it.
+        let adoptNick: String?
+        if let remoteNameValid,
+           nick.caseInsensitiveCompare(remoteNameValid) != .orderedSame {
+            adoptNick = remoteNameValid
+        } else {
+            adoptNick = nil
+        }
         let claimed = localClaimedHandle?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let claimedValid = (claimed?.isEmpty == false) ? claimed : nil
+        // Same for nip05: remote address is already taken on the replaceable event.
         let adoptNip05: String?
-        if let remoteNip05Valid, localBip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let remoteNip05Valid,
+           localBip.caseInsensitiveCompare(remoteNip05Valid) != .orderedSame {
             adoptNip05 = remoteNip05Valid
         } else {
             adoptNip05 = nil
@@ -52,7 +64,10 @@ enum OwnProfileHydration {
         } else {
             handleLocal = nil
         }
-        let effectiveNick = (adoptNick ?? nick).trimmingCharacters(in: .whitespacesAndNewlines)
+        // After adoption, effective publish name is always the remote one when
+        // present — never the stale local nick that would clobber kind-0.
+        let effectiveNick = (remoteNameValid ?? adoptNick ?? nick)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         // Callers must still wait for claim success before emit when reclaiming.
         let nip05SafeToPublish: Bool = {
             guard let remoteNip05Valid else { return true }

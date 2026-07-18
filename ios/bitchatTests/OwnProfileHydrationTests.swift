@@ -37,23 +37,24 @@ struct OwnProfileHydrationTests {
     }
 
     @Test
-    func existingLocalNicknameIsNotOverwrittenByRemote() {
+    func remoteKind0NameAndNip05WinOverDivergentLocal() {
         let plan = OwnProfileHydration.plan(
             localNickname: "local-nick",
-            localBip353: "",
+            localBip353: "stale@other.com",
             localClaimedHandle: nil,
             remoteName: "Alice",
             remoteNip05: "alice@sonarprivacy.xyz",
             handleDomain: domain
         )
-        #expect(plan.nicknameToAdopt == nil)
+        // Remote values are already taken on relays — never keep divergent local.
+        #expect(plan.nicknameToAdopt == "Alice")
         #expect(plan.nip05ToAdopt == "alice@sonarprivacy.xyz")
         #expect(plan.handleLocalToClaim == "alice")
         #expect(plan.shouldPublishNickname)
     }
 
     @Test
-    func alreadyClaimedHandleSkipsReclaimAndPrefMirror() {
+    func matchingLocalNeedsNoAdoption() {
         let plan = OwnProfileHydration.plan(
             localNickname: "Alice",
             localBip353: "alice@sonarprivacy.xyz",

@@ -13,9 +13,15 @@ package chat.bitchat.sonar
  * handle that cannot be re-seeded there must never trigger a republish.
  */
 data class OwnProfileHydrationPlan(
-    /** Non-null when the local nickname should be replaced by the remote name. */
+    /**
+     * Non-null when local nickname must be replaced by the remote kind-0 name.
+     * Remote is authoritative whenever present — never keep a divergent local.
+     */
     val nicknameToAdopt: String?,
-    /** Non-null when prefs should mirror the remote `nip05` address. */
+    /**
+     * Non-null when prefs must mirror the remote `nip05`. Remote is
+     * authoritative whenever present — never keep a divergent local pref.
+     */
     val nip05ToAdopt: String?,
     /**
      * Local part to re-claim at the Sonar registrar so the core sidecar is seeded
@@ -43,13 +49,13 @@ fun planOwnProfileHydration(
         ?.trim()
         ?.takeIf { it.isNotBlank() && '@' in it }
     val nick = localNickname.trim()
-    val adoptNick = if (nick.isEmpty()) remoteName else null
+    val localBip = localBip353.trim()
+    // Durable kind-0 on relays wins. If a name is already set remotely, use it
+    // and never keep/publish a divergent local nick over it.
+    val adoptNick = remoteName?.takeIf { !it.equals(nick, ignoreCase = true) }
     val claimed = localClaimedHandle?.trim()?.takeIf { it.isNotBlank() }
-    val adoptNip05 = when {
-        remoteNip05 == null -> null
-        localBip353.isNotBlank() -> null
-        else -> remoteNip05
-    }
+    // Same for nip05: remote address is already taken on the replaceable event.
+    val adoptNip05 = remoteNip05?.takeIf { !it.equals(localBip, ignoreCase = true) }
     val isSonarNip05 = remoteNip05 != null &&
         remoteNip05.substringAfter('@').equals(domain, ignoreCase = true)
     val handleLocal = when {
@@ -58,7 +64,9 @@ fun planOwnProfileHydration(
         !isSonarNip05 -> null
         else -> remoteNip05.substringBefore('@').trim().takeIf { it.isNotBlank() }
     }
-    val effectiveNick = (adoptNick ?: nick).trim()
+    // After adoption, the effective publish name is always the remote one when
+    // present — never the stale local nick that would clobber kind-0.
+    val effectiveNick = (remoteName ?: adoptNick ?: nick).trim()
     // Sidecar-backed publish can preserve nip05 only when absent, already
     // claimed to the same address, or reclaimable at the Sonar registrar.
     // Callers must still wait for claim success (`handleSeeded`) before emit.
