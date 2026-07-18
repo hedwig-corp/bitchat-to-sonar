@@ -21,6 +21,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -52,13 +53,22 @@ private class AndroidVoicePlaybackEngine(
     private var focusRequest: AudioFocusRequest? = null
     private var noisyRegistered = false
     private var serviceStarted = false
+    /** Suppress `onIsPlayingChanged(false)` → `onExternalPaused` while we are
+     *  already delivering a system/transient pause — otherwise the external
+     *  Pause command races and clears the auto-resume path. */
+    private val suppressExternalPause = AtomicBoolean(false)
+
+    private fun pauseFromSystemAndNotify(notify: () -> Unit) {
+        suppressExternalPause.set(true)
+        runOnMain { synchronized(lock) { player?.pause() } }
+        notify()
+    }
 
     private val noisyReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
             val gen = generation.get()
-            runOnMain { synchronized(lock) { player?.pause() } }
-            host.onSystemPaused(gen)
+            pauseFromSystemAndNotify { host.onSystemPaused(gen) }
         }
     }
 
@@ -67,17 +77,18 @@ private class AndroidVoicePlaybackEngine(
         when (change) {
             // Permanent loss (another app took media) — pause, no auto-resume.
             AudioManager.AUDIOFOCUS_LOSS -> {
-                runOnMain { synchronized(lock) { player?.pause() } }
-                host.onSystemPaused(gen)
+                pauseFromSystemAndNotify { host.onSystemPaused(gen) }
             }
             // Transient duck/interrupt (notification, nav prompt) — pause and
             // allow auto-resume when focus returns, matching Signal.
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                runOnMain { synchronized(lock) { player?.pause() } }
-                host.onTransientInterruptionBegan(gen)
+                pauseFromSystemAndNotify { host.onTransientInterruptionBegan(gen) }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> Unit
-            AudioManager.AUDIOFOCUS_GAIN -> host.onTransientInterruptionEnded(gen)
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                host.onTransientInterruptionEnded(gen)
+                suppressExternalPause.set(false)
+            }
         }
     }
 
@@ -115,10 +126,12 @@ private class AndroidVoicePlaybackEngine(
                         // controller state (see SonarAppState wiring).
                         val gen = this@AndroidVoicePlaybackEngine.generation.get()
                         if (!isPlaying) {
+                            if (suppressExternalPause.get()) return
                             val reason = synchronized(lock) { player?.playbackState }
                             if (reason == Player.STATE_ENDED || reason == Player.STATE_IDLE) return
                             host.onExternalPaused(gen)
                         } else {
+                            suppressExternalPause.set(false)
                             host.onExternalResumed(gen)
                         }
                     }
@@ -137,6 +150,7 @@ private class AndroidVoicePlaybackEngine(
     }
 
     override fun play() {
+        suppressExternalPause.set(false)
         runOnMain { synchronized(lock) { runCatching { player?.play() } } }
     }
 
