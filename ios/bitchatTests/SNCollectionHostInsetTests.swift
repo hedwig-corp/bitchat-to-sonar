@@ -132,5 +132,30 @@ struct SNCollectionHostInsetTests {
         )
         #expect(abs(owned - (336 + 76)) < 0.5)
     }
+
+    /// Pins the Phase 3 floating-composer contract: UIKit `keyboardLayoutGuide`
+    /// alone owns IME geometry. If SwiftUI also keyboard-avoids the representable,
+    /// the composer sits roughly one keyboard height above the IME.
+    @Test
+    func floatingComposerGapRequiresSingleKeyboardOwner() {
+        #expect(
+            snCollectionHostFloatingComposerGap(
+                keyboardOcclusionHeight: 336,
+                swiftUIKeyboardAvoidanceActive: true
+            ) == 336
+        )
+        #expect(
+            snCollectionHostFloatingComposerGap(
+                keyboardOcclusionHeight: 336,
+                swiftUIKeyboardAvoidanceActive: false
+            ) == 0
+        )
+        #expect(
+            snCollectionHostFloatingComposerGap(
+                keyboardOcclusionHeight: 0,
+                swiftUIKeyboardAvoidanceActive: true
+            ) == 0
+        )
+    }
 }
 #endif

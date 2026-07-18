@@ -49,7 +49,7 @@ Do **not** mix reverse coordinates with chronological pinners. Short-feed choice
 | `ConversationCollectionView` + `ConversationViewLayout` | Full-height UIKit list; sticky dates; continuity |
 | `CVLoadCoordinator` / `MessageLoader` / `CVRenderState` | Bounded window; immutable pre-measured items |
 | `updateContentInsets` | Own top/bottom inset; wasAtBottom → pin or lockstep |
-| `keyboardLayoutGuide` on toolbar | Composer rides IME; collection frame unchanged |
+| `keyboardLayoutGuide` on toolbar | Composer rides IME; collection frame unchanged; host must not also take SwiftUI keyboard safe-area |
 | `DebouncedEventLastOnly(0.01)` | Coalesce inset thrash |
 | `scrollToInitialPosition` / `CVScrollAction` | Open policy |
 | `ScrollContinuity` / `lastKnownDistanceFromBottom` | Pagination without jump |
