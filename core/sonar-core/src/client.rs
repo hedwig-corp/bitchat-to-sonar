@@ -117,9 +117,10 @@ const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PARTIAL_PREFIX: &str = ".sonar-download-";
 const MEDIA_DOWNLOAD_PARTIAL_SUFFIX: &str = ".part";
 const MEDIA_DOWNLOAD_PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-/// Public/sticker downloads are small enough to retain a total deadline. Size
-/// it for the same constrained-link floor as uploads, but cap hostile trickle
-/// responses so they cannot occupy foreground or prefetch permits forever.
+/// Encrypted attachment and public/sticker downloads retain an overall
+/// size-scaled deadline in addition to the HTTP client's idle-read timeout.
+/// Size it for the same constrained-link floor as uploads, but cap hostile
+/// trickle responses so they cannot occupy download permits forever.
 const PUBLIC_DOWNLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
 const PUBLIC_DOWNLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(15 * 60);
 const PUBLIC_DOWNLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
@@ -1128,7 +1129,13 @@ async fn http_get_with_retries(
     url: &str,
     observer: Option<&dyn MediaDownloadObserver>,
 ) -> Result<Vec<u8>> {
-    http_get_with_retries_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
+    let deadline = media_download_total_timeout(MAX_MEDIA_DOWNLOAD_BYTES);
+    tokio::time::timeout(
+        deadline,
+        http_get_with_retries_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer),
+    )
+    .await
+    .map_err(|_| media_download_deadline_error(deadline))?
 }
 
 async fn http_get_public_with_retries_limit(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
@@ -4014,6 +4021,18 @@ impl SonarClient {
         blocked_message_ids
     }
 
+    fn checkpoint_media_handoff_before_manual_retry(&self, message_id_hex: &str) -> Result<()> {
+        if self
+            .checkpoint_media_handoffs_before_retry()
+            .contains(message_id_hex)
+        {
+            return Err(Error::Storage(
+                "media retry checkpoint is temporarily unavailable".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
     /// or advances MLS state; it only republishes the original wrapper event.
@@ -4021,6 +4040,12 @@ impl SonarClient {
         if self.relays.is_empty() {
             return Err(Error::NoRelayConnected);
         }
+        // A manual retry can ACK and compact the relay outbox just as quickly
+        // as an automatic retry. Repair the cross-sidecar media handoff before
+        // changing the failed row to pending so a failed manifest write leaves
+        // the exact user-visible row retryable instead of creating a duplicate
+        // MLS media message after restart.
+        self.checkpoint_media_handoff_before_manual_retry(message_id_hex)?;
         let (group_id_hex, event) = self
             .outbox_state
             .lock()
@@ -4705,13 +4730,18 @@ impl SonarClient {
         resume_path: &Path,
         observer: &dyn MediaDownloadObserver,
     ) -> Result<u64> {
-        let ciphertext = http_get_to_resume_file_with_retries(
-            url,
-            resume_path,
-            MAX_MEDIA_DOWNLOAD_BYTES,
-            Some(observer),
+        let deadline = media_download_total_timeout(MAX_MEDIA_DOWNLOAD_BYTES);
+        let ciphertext = tokio::time::timeout(
+            deadline,
+            http_get_to_resume_file_with_retries(
+                url,
+                resume_path,
+                MAX_MEDIA_DOWNLOAD_BYTES,
+                Some(observer),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| media_download_deadline_error(deadline))??;
         if observer.is_cancelled() {
             return Err(Error::MediaDownloadCancelled);
         }
@@ -6743,10 +6773,21 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 }
 
 fn public_download_timeout(max_bytes: usize) -> Duration {
+    media_download_total_timeout(max_bytes)
+}
+
+fn media_download_total_timeout(max_bytes: usize) -> Duration {
     let transfer_secs = (max_bytes as u64).div_ceil(PUBLIC_DOWNLOAD_MIN_THROUGHPUT_BYTES_PER_SEC);
     PUBLIC_DOWNLOAD_TIMEOUT_BASE
         .saturating_add(Duration::from_secs(transfer_secs))
         .min(PUBLIC_DOWNLOAD_TIMEOUT_MAX)
+}
+
+fn media_download_deadline_error(deadline: Duration) -> Error {
+    Error::Http(format!(
+        "media download exceeded {}s total deadline",
+        deadline.as_secs()
+    ))
 }
 
 fn retryable_blossom_upload_error(error: &nostr_blossom::error::Error) -> bool {
@@ -7178,6 +7219,70 @@ mod tests {
                 .as_deref(),
             Some("canonical-message"),
             "relay retry must not observe the handoff until the media tombstone is durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_retry_checkpoints_media_handoff_before_publish() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        *client.media_outbox.lock().unwrap() = MediaOutbox::open(&db, [17_u8; 32]).unwrap();
+        let request_id = "manual-crash-between-sidecars";
+        let message_id = "manual-canonical-message";
+        client
+            .media_outbox
+            .lock()
+            .unwrap()
+            .begin_job_with_sources(
+                request_id.into(),
+                "010203".into(),
+                String::new(),
+                String::new(),
+                1,
+                &[(b"video".as_slice(), "video/mp4", "clip.mp4")],
+            )
+            .unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "encrypted media wrapper")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        client
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_pending_media(
+                "010203".into(),
+                message_id.into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+                request_id.into(),
+            )
+            .unwrap();
+        client
+            .outbox_state
+            .lock()
+            .unwrap()
+            .mark_failed_by_message_id(message_id, "offline".into(), 2)
+            .unwrap();
+
+        client
+            .checkpoint_media_handoff_before_manual_retry(message_id)
+            .unwrap();
+
+        assert_eq!(
+            client
+                .media_outbox
+                .lock()
+                .unwrap()
+                .job(request_id)
+                .unwrap()
+                .completed_message_id
+                .as_deref(),
+            Some(message_id),
+            "manual retry must checkpoint the handoff before relay publication"
         );
     }
 
@@ -7666,6 +7771,22 @@ mod tests {
             public_download_timeout(usize::MAX),
             PUBLIC_DOWNLOAD_TIMEOUT_MAX
         );
+    }
+
+    #[test]
+    fn private_media_download_total_timeout_is_bounded_and_scarce_link_aware() {
+        assert_eq!(
+            media_download_total_timeout(MAX_MEDIA_DOWNLOAD_BYTES),
+            Duration::from_secs(60 + 801)
+        );
+        assert_eq!(
+            media_download_total_timeout(usize::MAX),
+            PUBLIC_DOWNLOAD_TIMEOUT_MAX
+        );
+        assert!(matches!(
+            media_download_deadline_error(Duration::from_secs(861)),
+            Error::Http(message) if message.contains("861s total deadline")
+        ));
     }
 
     #[test]
