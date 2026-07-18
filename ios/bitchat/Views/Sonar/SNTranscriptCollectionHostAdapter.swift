@@ -217,6 +217,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             expectedNewestDate: expectedNewestDate,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
+            transcriptBackgroundColor: UIColor(SonarTheme.bg),
             composer: composer
         )
     }
