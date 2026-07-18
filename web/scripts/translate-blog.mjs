@@ -10,12 +10,12 @@
 // Skips a locale when the stored contentHash still matches the English body.
 // Best-effort: never exits non-zero.
 
-import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SONAR_BLOG } from '../src/lib/blog-content.js';
 import { estimateReadTime } from '../src/lib/blog-data.js';
+import { blogContentHash } from '../src/lib/blog-hash.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, '../src/lib/blog-translations.js');
@@ -28,15 +28,6 @@ const BASE_URL = (process.env.SONAR_BLOG_TRANSLATE_BASE_URL || 'https://api.open
 );
 const MODEL = process.env.SONAR_BLOG_TRANSLATE_MODEL || 'gpt-4o-mini';
 
-/**
- * @param {string} title
- * @param {string} excerpt
- * @param {string} md
- */
-function contentHash(title, excerpt, md) {
-	return createHash('sha256').update(`${title}\n${excerpt}\n${md}`).digest('hex').slice(0, 16);
-}
-
 /** @returns {Record<string, Record<string, object>>} */
 function loadExisting() {
 	if (!existsSync(OUT)) return {};
@@ -45,9 +36,13 @@ function loadExisting() {
 		const marker = 'export const BLOG_TRANSLATIONS = ';
 		const idx = src.indexOf(marker);
 		if (idx < 0) return {};
-		// Evaluate the object literal safely via Function (file is ours).
-		const body = src.slice(idx + marker.length).replace(/;\s*$/, '');
-		return Function(`"use strict"; return (${body})`)();
+		// JSON only — never Function()/eval. The generator emits JSON.stringify
+		// output; accepting arbitrary JS would let a PR-poisoned overlays file
+		// RCE the bake runner (and exfiltrate SONAR_BLOG_TRANSLATE_API_KEY).
+		const body = src.slice(idx + marker.length).replace(/;\s*$/, '').trim();
+		const parsed = JSON.parse(body);
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+		return /** @type {Record<string, Record<string, object>>} */ (parsed);
 	} catch {
 		return {};
 	}
@@ -150,7 +145,7 @@ async function main() {
 	let wrote = 0;
 
 	for (const post of posts) {
-		const hash = contentHash(post.title, post.excerpt, post.md);
+		const hash = blogContentHash(post.title, post.excerpt, post.md);
 		if (!next[post.id]) next[post.id] = {};
 		for (const locale of LOCALES) {
 			const prev = next[post.id][locale];
