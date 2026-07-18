@@ -25,4 +25,11 @@ class NoteToSelfTest {
         assertTrue(isNoteToSelfChatId("deadbeef", "deadbeef"))
         assertFalse(isNoteToSelfChatId("other", "deadbeef"))
     }
+
+    @Test
+    fun isNoteToSelfChat_ignoresTitleHeuristic() {
+        val lookalike = SonarChat(id = "other", name = NOTE_TO_SELF_TITLE, members = listOf("npub1me"))
+        assertFalse(isNoteToSelfChat(lookalike, noteToSelfGroupId = "deadbeef"))
+        assertTrue(isNoteToSelfChat(lookalike.copy(id = "deadbeef"), noteToSelfGroupId = "deadbeef"))
+    }
 }
