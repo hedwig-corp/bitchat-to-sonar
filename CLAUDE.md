@@ -111,6 +111,30 @@ surface (`ios/` and `apps/sonar/`):
 Any change that can violate these invariants is a blocking correctness bug and
 must be fixed before merge.
 
+## Never Uninstall Device Apps Rule
+
+Do **not** uninstall, delete, or wipe the Sonar app on personal/physical test
+devices (`adb uninstall`, `pm uninstall`, Xcode "Delete App", erase-install,
+or any equivalent) to work around install failures, storage pressure, signing
+mismatches, or stale builds.
+
+Uninstalling clears the on-device Marmot/`nsec` account key, wallet restore
+material, and encrypted chat database — the same class of damage forbidden by
+the Account Key Durability Rule. Users have lost account keys this way.
+
+When installing or updating a Debug/Release build on a connected device:
+
+1. Prefer in-place replace only: `./gradlew :composeApp:installDebug`,
+   `adb install -r`, or an Xcode/devicectl install over the existing app.
+2. If install fails (`INSTALL_FAILED_INSUFFICIENT_STORAGE`, signature mismatch,
+   version downgrade, etc.), **stop and report** the error. Ask the user how to
+   proceed. Do not uninstall to make the install succeed.
+3. Freeing storage or fixing signing must not remove the Sonar package/app. If
+   space is needed, ask the user to free it; never delete Sonar for them.
+4. Emulators, CI harnesses, and explicitly disposable benchmark profiles are
+   exempt only when the user (or the bench script contract) clearly marks that
+   target as wipe-ok — never assume a named personal device is wipe-ok.
+
 ## Push Notifications Build Requirement (Firebase / GoogleService-Info.plist)
 
 Offline wallet/payment wakeups (the Breez NDS push path) require the Firebase
