@@ -73,6 +73,21 @@ func snCollectionHostOwnedBottomContentInset(
     max(0, collectionBoundsHeight - composerMinYInViewport)
 }
 
+/// Gap between the composer bottom and the keyboard top when both SwiftUI
+/// keyboard avoidance and UIKit `keyboardLayoutGuide` own the same host.
+/// Non-zero is the floating-composer band after the Phase 3 cutover: SwiftUI
+/// shrinks the representable above the IME, then the guide lifts the composer
+/// by roughly another keyboard height inside that already-shrunk frame.
+/// Production opts out via `.ignoresSafeArea(.keyboard)` on the representable
+/// so only UIKit owns IME geometry (`swiftUIKeyboardAvoidanceActive == false`).
+func snCollectionHostFloatingComposerGap(
+    keyboardOcclusionHeight: CGFloat,
+    swiftUIKeyboardAvoidanceActive: Bool
+) -> CGFloat {
+    guard keyboardOcclusionHeight > 0, swiftUIKeyboardAvoidanceActive else { return 0 }
+    return keyboardOcclusionHeight
+}
+
 /// Legacy helper kept for tests that pass chrome metrics without a live frame.
 func snCollectionHostOwnedBottomContentInset(barHeight: CGFloat, safeAreaBottom: CGFloat) -> CGFloat {
     max(0, barHeight)
@@ -200,6 +215,10 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
 
     var body: some View {
         #if os(iOS)
+        // UIKit owns IME via keyboardLayoutGuide. If SwiftUI also keyboard-avoids
+        // this representable, the composer floats ~one keyboard height above the
+        // IME (snCollectionHostFloatingComposerGap). Kill-switch SNMsgList keeps
+        // the sibling-composer path and still wants SwiftUI avoidance.
         SNTranscriptCollectionRepresentable(
             msgs: msgs,
             showAuthors: showAuthors,
@@ -217,6 +236,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             expectedNewestDate: expectedNewestDate,
             composer: composer
         )
+        .ignoresSafeArea(.keyboard, edges: .bottom)
         #else
         SNTranscriptCollectionSwiftUIHost(
             msgs: msgs,
@@ -336,7 +356,12 @@ private final class SNComposerRootStore<Composer: View>: ObservableObject {
 
 private struct SNComposerRootView<Composer: View>: View {
     @ObservedObject var store: SNComposerRootStore<Composer>
-    var body: some View { store.composer }
+    var body: some View {
+        // The UIKit container is already placed by keyboardLayoutGuide above the
+        // home indicator / IME. Suppress hosting safe-area bottom padding here
+        // so iOS 16.0–16.3 (no `safeAreaRegions`) cannot add a second band.
+        store.composer.ignoresSafeArea(.container, edges: .bottom)
+    }
 }
 
 private struct SNTranscriptCollectionRepresentable<Composer: View>: UIViewControllerRepresentable {
@@ -501,11 +526,18 @@ final class SNTranscriptCollectionViewController<Composer: View>: UIViewControll
 
         composerHost.view.translatesAutoresizingMaskIntoConstraints = false
         composerHost.view.backgroundColor = .clear
+        // keyboardLayoutGuide already places the bar above the home indicator /
+        // IME; hosting-controller safe-area padding would add a second band.
+        if #available(iOS 16.4, *) {
+            composerHost.safeAreaRegions = []
+        }
         addChild(composerHost)
         composerContainer.addSubview(composerHost.view)
         composerHost.didMove(toParent: self)
 
-        // Composer rides IME via keyboardLayoutGuide (iOS 15+).
+        // Composer rides IME via keyboardLayoutGuide (iOS 15+). Requires the
+        // SwiftUI representable to `.ignoresSafeArea(.keyboard)` — see
+        // snCollectionHostFloatingComposerGap.
         let bottomToKeyboard = composerContainer.bottomAnchor.constraint(
             equalTo: view.keyboardLayoutGuide.topAnchor
         )
