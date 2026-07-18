@@ -98,9 +98,12 @@ if (fm.read) tags.push(['read', fm.read]);
 if (String(fm.feature).toLowerCase() === 'true') tags.push(['t', 'featured']);
 tags.push(['client', 'sonar-blog']);
 
+// Use wall-clock created_at so re-publishes replace older addressable events
+// on relays (NIP-33: higher created_at wins for the same d-tag). Display date
+// stays on the published_at tag (see formatBlogDate / blog-nostr.js).
 const event = {
 	kind: 30023,
-	created_at: publishedAt,
+	created_at: Math.floor(Date.now() / 1000),
 	tags,
 	content: 'placeholder-replaced-by-nak'
 };
