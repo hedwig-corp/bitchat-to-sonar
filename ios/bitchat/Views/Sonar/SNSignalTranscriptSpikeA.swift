@@ -14,6 +14,7 @@
 //
 
 import SwiftUI
+import TranscriptEngine
 #if os(iOS)
 import UIKit
 #endif

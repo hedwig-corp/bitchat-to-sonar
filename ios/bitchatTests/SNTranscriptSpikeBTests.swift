@@ -6,6 +6,7 @@
 //
 
 import Testing
+import TranscriptEngine
 @testable import Sonar
 
 struct SNTranscriptSpikeBTests {

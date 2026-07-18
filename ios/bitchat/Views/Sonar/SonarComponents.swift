@@ -13,6 +13,7 @@
 import Combine
 import ImageIO
 import SwiftUI
+import TranscriptEngine
 import WebKit
 import QuickLook
 import SonarCore
@@ -219,40 +220,6 @@ struct SNSectionLabel: View {
 }
 
 // MARK: - Transcript day chip (Signal / Compose bc-datechip)
-
-/// Whether to insert a day chip before [current] given the previous row's date.
-func snTranscriptShowsDayChip(previous: Date?, current: Date?, calendar: Calendar = .current) -> Bool {
-    guard let current else { return false }
-    guard let previous else { return true }
-    return !calendar.isDate(previous, inSameDayAs: current)
-}
-
-/// Today / Yesterday / weekday / `d MMM` — matches Compose `dayLabel`.
-/// Today/Yesterday derive from `now` (not the wall clock) so labels are
-/// deterministic under test and consistent with the day-delta branch.
-func snTranscriptDayLabel(for date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
-    let start = calendar.startOfDay(for: date)
-    let todayStart = calendar.startOfDay(for: now)
-    let days = calendar.dateComponents([.day], from: start, to: todayStart).day ?? Int.max
-    if days == 0 { return "Today" }
-    if days == 1 { return "Yesterday" }
-    if days > 0, days < 7 {
-        return snTranscriptWeekdayFormatter.string(from: date)
-    }
-    return snTranscriptShortDateFormatter.string(from: date)
-}
-
-private let snTranscriptWeekdayFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "EEE"
-    return f
-}()
-
-private let snTranscriptShortDateFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "d MMM"
-    return f
-}()
 
 /// Centered day marker in the transcript (bc-datechip).
 struct SNDateChip: View {

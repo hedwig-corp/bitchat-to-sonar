@@ -1,5 +1,8 @@
 package chat.bitchat.sonar
 
+import chat.hedwig.transcript.TranscriptOpenAction
+import chat.hedwig.transcript.TranscriptScrollDecision
+import chat.hedwig.transcript.TranscriptScrollPolicy
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -80,7 +83,7 @@ class TranscriptPhase2HostTest {
         )
         assertEquals(
             TranscriptTailPin.None,
-            TranscriptScrollPolicy.toLegacyPin(TranscriptScrollDecision.Lockstep),
+            transcriptDecisionToLegacyPin(TranscriptScrollDecision.Lockstep),
         )
     }
 

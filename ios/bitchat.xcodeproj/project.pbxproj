@@ -22,6 +22,10 @@
 		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
 		A15C0DE100000000000000B4 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B2 /* WalletKit */; };
 		A15C0DE100000000000000B5 /* WalletKit in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE100000000000000B3 /* WalletKit */; };
+		A15C0DE200000000000000C4 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C2 /* TranscriptEngine */; };
+		A15C0DE200000000000000C5 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C3 /* TranscriptEngine */; };
+		A15C0DE200000000000000C6 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C7 /* TranscriptEngine */; };
+		A15C0DE200000000000000CA /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C9 /* TranscriptEngine */; };
 		A6E3E5702E77036A0032EA8A /* BitLogger in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3E56F2E77036A0032EA8A /* BitLogger */; };
 		A6E3E5722E7703760032EA8A /* BitLogger in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3E5712E7703760032EA8A /* BitLogger */; };
 		A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA7E2E7706720032EA8A /* Tor */; };
@@ -195,6 +199,7 @@
 				A6E3EA812E7706A80032EA8A /* Tor in Frameworks */,
 				A15C0DE000000000000000A5 /* SonarCore in Frameworks */,
 				A15C0DE100000000000000B5 /* WalletKit in Frameworks */,
+				A15C0DE200000000000000C5 /* TranscriptEngine in Frameworks */,
 			);
 		};
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
@@ -205,6 +210,7 @@
 				A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */,
 				A15C0DE000000000000000A4 /* SonarCore in Frameworks */,
 				A15C0DE100000000000000B4 /* WalletKit in Frameworks */,
+				A15C0DE200000000000000C4 /* TranscriptEngine in Frameworks */,
 				C023033AECF95641458DD2F7 /* FirebaseMessaging in Frameworks */,
 			);
 		};
@@ -213,6 +219,18 @@
 			files = (
 				62C08C1AD2F542AA138828E4 /* Foundation.framework in Frameworks */,
 				44AA8F6F653CD2B2A28DA1BB /* BreezSDKLiquid in Frameworks */,
+			);
+		};
+		A15C0DE200000000000000C8 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+				A15C0DE200000000000000C6 /* TranscriptEngine in Frameworks */,
+			);
+		};
+		A15C0DE200000000000000CB /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+				A15C0DE200000000000000CA /* TranscriptEngine in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -299,6 +317,7 @@
 				A6E3EA802E7706A80032EA8A /* Tor */,
 				A15C0DE000000000000000A3 /* SonarCore */,
 				A15C0DE100000000000000B3 /* WalletKit */,
+				A15C0DE200000000000000C3 /* TranscriptEngine */,
 			);
 			productName = bitchat_macOS;
 			productReference = 8F3A7C058C2C8E1A06C8CF8B /* Sonar.app */;
@@ -328,6 +347,7 @@
 			buildPhases = (
 				5C22AA7B9ACC5A861445C769 /* Sources */,
 				C5E027A42ECCDFD700BD6012 /* Resources */,
+				A15C0DE200000000000000CB /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -338,6 +358,9 @@
 				A6E32D412E762EAE0032EA8A /* bitchatTests */,
 			);
 			name = bitchatTests_macOS;
+			packageProductDependencies = (
+				A15C0DE200000000000000C9 /* TranscriptEngine */,
+			);
 			productName = bitchatTests_macOS;
 			productReference = 03C57F452B55FD0FD8F51421 /* bitchatTests_macOS.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -361,6 +384,7 @@
 			buildPhases = (
 				865C8403EF02C089369A9FCB /* Sources */,
 				C5E027A72ECCDFE200BD6012 /* Resources */,
+				A15C0DE200000000000000C8 /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -371,6 +395,9 @@
 				A6E32D412E762EAE0032EA8A /* bitchatTests */,
 			);
 			name = bitchatTests_iOS;
+			packageProductDependencies = (
+				A15C0DE200000000000000C7 /* TranscriptEngine */,
+			);
 			productName = bitchatTests_iOS;
 			productReference = C0DB1DE27F0AAB5092663E8E /* bitchatTests_iOS.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -402,6 +429,7 @@
 				A6E3EA7E2E7706720032EA8A /* Tor */,
 				A15C0DE000000000000000A2 /* SonarCore */,
 				A15C0DE100000000000000B2 /* WalletKit */,
+				A15C0DE200000000000000C2 /* TranscriptEngine */,
 				D890FFFCA89747657296AB29 /* FirebaseMessaging */,
 			);
 			productName = bitchat_iOS;
@@ -446,6 +474,7 @@
 				A6E3EA7D2E7706720032EA8A /* XCLocalSwiftPackageReference "localPackages/Arti" */,
 				A15C0DE000000000000000A1 /* XCLocalSwiftPackageReference "localPackages/SonarCore" */,
 				A15C0DE100000000000000B1 /* XCLocalSwiftPackageReference "localPackages/SonarWalletKit" */,
+				A15C0DE200000000000000C1 /* XCLocalSwiftPackageReference "localPackages/TranscriptEngine" */,
 				FCE6EED212F8EC310C71459F /* XCRemoteSwiftPackageReference "breez-sdk-liquid-swift" */,
 				418698187D457440F125E654 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */,
 			);
@@ -1154,6 +1183,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/SonarWalletKit;
 		};
+		A15C0DE200000000000000C1 /* XCLocalSwiftPackageReference "localPackages/TranscriptEngine" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = localPackages/TranscriptEngine;
+		};
 		A6E3E56E2E77036A0032EA8A /* XCLocalSwiftPackageReference "localPackages/BitLogger" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = localPackages/BitLogger;
@@ -1212,6 +1245,22 @@
 		A15C0DE100000000000000B3 /* WalletKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = WalletKit;
+		};
+		A15C0DE200000000000000C2 /* TranscriptEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TranscriptEngine;
+		};
+		A15C0DE200000000000000C3 /* TranscriptEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TranscriptEngine;
+		};
+		A15C0DE200000000000000C7 /* TranscriptEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TranscriptEngine;
+		};
+		A15C0DE200000000000000C9 /* TranscriptEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TranscriptEngine;
 		};
 		A6E3E56F2E77036A0032EA8A /* BitLogger */ = {
 			isa = XCSwiftPackageProductDependency;

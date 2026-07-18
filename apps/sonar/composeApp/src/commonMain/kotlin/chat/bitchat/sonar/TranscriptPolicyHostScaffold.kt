@@ -2,7 +2,6 @@ package chat.bitchat.sonar
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,7 +14,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -32,7 +30,6 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,21 +41,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInParent
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.ui.sonar
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
+import chat.hedwig.transcript.TranscriptOpenAction
+import chat.hedwig.transcript.TranscriptScrollPolicy
+import chat.hedwig.transcript.TranscriptContinuityToken
+import chat.hedwig.transcript.compose.TranscriptHostScaffold
+import chat.hedwig.transcript.compose.TranscriptHostScrollEffects
+import chat.hedwig.transcript.compose.anchorTranscriptTail
+import chat.hedwig.transcript.compose.transcriptLockstepScrollDelta
+import chat.hedwig.transcript.compose.transcriptOpenIndex
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
@@ -109,26 +108,12 @@ internal fun transcriptPhase2OpenIndex(
     unreadAnchorIndex: Int,
     itemCount: Int,
     jumpIndex: Int = -1,
-): Int {
-    if (itemCount <= 0) return 0
-    return when (openAction) {
-        TranscriptOpenAction.LiveEdge -> itemCount - 1
-        // Pending unread: -1 so callers do not treat missing anchor as top/tail.
-        TranscriptOpenAction.UnreadDivider ->
-            unreadAnchorIndex.takeIf { it >= 0 } ?: -1
-        is TranscriptOpenAction.Jump ->
-            jumpIndex.takeIf { it >= 0 } ?: unreadAnchorIndex.takeIf { it >= 0 } ?: (itemCount - 1)
-    }
-}
+): Int = transcriptOpenIndex(openAction, unreadAnchorIndex, itemCount, jumpIndex)
 
 /** Pure Lockstep delta: offset += Δ (Signal inset follow). */
-internal fun transcriptPhase2LockstepScrollDelta(insetDeltaPx: Int): Int = insetDeltaPx
+internal fun transcriptPhase2LockstepScrollDelta(insetDeltaPx: Int): Int =
+    transcriptLockstepScrollDelta(insetDeltaPx)
 
-/**
- * Full-height list under an overlaid composer. [listContent] receives the owned
- * bottom inset for LazyColumn `contentPadding.bottom`. Applies Pin + Lockstep
- * via [TranscriptPhase2ScrollEffects] (not the production Lockstep→None adapter).
- */
 @Composable
 internal fun TranscriptPhase2HostScaffold(
     listState: LazyListState,
@@ -138,166 +123,27 @@ internal fun TranscriptPhase2HostScaffold(
     modifier: Modifier = Modifier,
     listContent: @Composable BoxScope.(bottomInset: Dp) -> Unit,
     bottomContent: @Composable () -> Unit,
-) {
-    var bottomChromePx by remember { mutableIntStateOf(0) }
-    val density = LocalDensity.current
-    val bottomInset = with(density) {
-        if (bottomChromePx > 0) bottomChromePx.toDp() else 56.dp
-    }
+) = TranscriptHostScaffold(
+    listState = listState,
+    listKey = listKey,
+    isPrepending = isPrepending,
+    suppressPin = suppressPin,
+    modifier = modifier,
+    listContent = listContent,
+    bottomContent = bottomContent,
+)
 
-    Box(modifier.fillMaxSize()) {
-        listContent(bottomInset)
-        Box(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .imePadding()
-                .onGloballyPositioned { coords ->
-                    val parentH = coords.parentLayoutCoordinates?.size?.height
-                        ?: return@onGloballyPositioned
-                    val chrome = (parentH - coords.positionInParent().y).roundToInt().coerceAtLeast(0)
-                    if (chrome != bottomChromePx) bottomChromePx = chrome
-                },
-        ) {
-            bottomContent()
-        }
-    }
-
-    TranscriptPhase2ScrollEffects(
-        listState = listState,
-        key = listKey,
-        isPrepending = isPrepending,
-        suppressPin = suppressPin,
-    )
-}
-
-/**
- * Flagged-host scroll effects: layout-frame Pin (append / IME steal at tail) plus
- * real Lockstep on owned afterContentPadding Δ via [TranscriptScrollPolicy.decideInsetChange].
- *
- * Production [TranscriptTailPinning] still maps Lockstep→None; this path does not.
- */
 @Composable
 internal fun TranscriptPhase2ScrollEffects(
     listState: LazyListState,
     key: Any? = null,
     isPrepending: () -> Boolean = { false },
     suppressPin: () -> Boolean = { false },
-) {
-    val prependingFn by rememberUpdatedState(isPrepending)
-    val suppressFn by rememberUpdatedState(suppressPin)
-
-    // Layout-frame pin (same semantics as TranscriptTailPinSession / R-009).
-    LaunchedEffect(key, listState) {
-        val session = TranscriptTailPinSession()
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()
-            val pad = info.afterContentPadding
-            val tailFullyVisible = last != null &&
-                last.index == info.totalItemsCount - 1 &&
-                last.offset + last.size <= info.viewportEndOffset - pad
-            TranscriptTailFrame(
-                itemCount = info.totalItemsCount,
-                viewportHeight = info.viewportSize.height,
-                tailFullyVisible = tailFullyVisible,
-                scrolling = listState.isScrollInProgress,
-                prepending = prependingFn() || suppressFn(),
-                afterContentPadding = pad,
-            )
-        }.distinctUntilChanged().collect { frame ->
-            val decision = session.onLayoutFrame(
-                itemCount = frame.itemCount,
-                tailFullyVisible = frame.tailFullyVisible,
-                scrolling = frame.scrolling,
-                prepending = frame.prepending,
-            )
-            if (decision !is TranscriptScrollDecision.Pin) return@collect
-            withFrameNanos { }
-            listState.anchorTranscriptTail(
-                frame.itemCount - 1,
-                animate = decision.animate,
-            )
-        }
-    }
-
-    // Chrome / IME owned-pad Δ → Pin | Lockstep | Ignore (coalesced 10 ms, last-only).
-    // Capture wasAtTail *before* the pad change; apply Lockstep as scrollBy(Δ).
-    LaunchedEffect(key, listState) {
-        var prevPad = -1
-        var prevWasAtTail = true
-        var pendingDelta = 0
-        var captureWasAtTail = true
-        var coalesceJob: Job? = null
-        snapshotFlow {
-            val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull()
-            val pad = info.afterContentPadding
-            val atTail = last != null &&
-                info.totalItemsCount > 0 &&
-                last.index == info.totalItemsCount - 1 &&
-                last.offset + last.size <= info.viewportEndOffset - pad
-            InsetPadFrame(
-                afterContentPadding = pad,
-                wasAtTail = atTail,
-                scrolling = listState.isScrollInProgress,
-                itemCount = info.totalItemsCount,
-            )
-        }.distinctUntilChanged().collect { frame ->
-            if (prevPad < 0) {
-                prevPad = frame.afterContentPadding
-                prevWasAtTail = frame.wasAtTail
-                return@collect
-            }
-            val delta = frame.afterContentPadding - prevPad
-            prevPad = frame.afterContentPadding
-            if (delta != 0 && !prependingFn() && !suppressFn()) {
-                if (pendingDelta == 0) captureWasAtTail = prevWasAtTail
-                pendingDelta += delta
-                if (coalesceJob == null) {
-                    coalesceJob = launch {
-                        delay(TranscriptScrollPolicy.INSET_COALESCE_MS)
-                        val applyDelta = pendingDelta
-                        pendingDelta = 0
-                        coalesceJob = null
-                        val scrollingNow = listState.isScrollInProgress
-                        val count = listState.layoutInfo.totalItemsCount
-                        val decision = TranscriptScrollPolicy.decideInsetChange(
-                            wasAtTail = captureWasAtTail,
-                            userScrolling = scrollingNow,
-                            prepending = prependingFn(),
-                        )
-                        when (decision) {
-                            is TranscriptScrollDecision.Pin -> {
-                                withFrameNanos { }
-                                if (count > 0) {
-                                    listState.anchorTranscriptTail(count - 1, animate = false)
-                                }
-                            }
-                            TranscriptScrollDecision.Lockstep -> {
-                                val scrollDelta = transcriptPhase2LockstepScrollDelta(applyDelta)
-                                if (scrollDelta != 0) {
-                                    withFrameNanos { }
-                                    listState.scrollBy(scrollDelta.toFloat())
-                                }
-                            }
-                            TranscriptScrollDecision.Ignore -> Unit
-                        }
-                    }
-                }
-            }
-            // Refresh latch only when pad is stable (or after we recorded capture).
-            if (delta == 0 || pendingDelta == 0) {
-                prevWasAtTail = frame.wasAtTail
-            }
-        }
-    }
-}
-
-private data class InsetPadFrame(
-    val afterContentPadding: Int,
-    val wasAtTail: Boolean,
-    val scrolling: Boolean,
-    val itemCount: Int,
+) = TranscriptHostScrollEffects(
+    listState = listState,
+    key = key,
+    isPrepending = isPrepending,
+    suppressPin = suppressPin,
 )
 
 private data class Phase2DemoRow(

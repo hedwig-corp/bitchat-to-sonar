@@ -12,6 +12,9 @@ on:
       - main
     paths:
       - 'apps/sonar/**'
+      - 'packages/transcript-engine-policy/**'
+      - 'packages/transcript-engine-compose/**'
+      - 'packages/transcript-engine/**'
       - 'core/**'
       - '.github/workflows/compose-tests.yml'
   pull_request:
@@ -19,6 +22,9 @@ on:
       - main
     paths:
       - 'apps/sonar/**'
+      - 'packages/transcript-engine-policy/**'
+      - 'packages/transcript-engine-compose/**'
+      - 'packages/transcript-engine/**'
       - 'core/**'
       - '.github/workflows/compose-tests.yml'
 
@@ -60,7 +66,14 @@ jobs:
         # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
         # compile on current stable Rust; BLE is optional at runtime and the
         # tests don't need a radio.
-        run: xvfb-run -a ./gradlew :composeApp:jvmTest --console=plain
+        # Also compile/test extracted transcript-engine modules so package-only
+        # PRs cannot skip the new policy/host check surfaces.
+        run: >
+          xvfb-run -a ./gradlew
+          :transcript-engine-policy:check
+          :transcript-engine-compose:compileKotlinJvm
+          :composeApp:jvmTest
+          --console=plain
         working-directory: apps/sonar
         env:
           SONAR_SKIP_BLE: '1'

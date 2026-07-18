@@ -8,6 +8,8 @@ Related: R-009, PR #310, keyboard / chat-open benches in [`PERFORMANCE.md`](PERF
 
 **Goal:** extract how Signal manages the chat transcript and make Sonar’s open / keyboard / scroll / pagination **as performant**, not clone Signal chrome.
 
+Shared policy and Compose host live in **`packages/transcript-engine-*`** (KMP) and **`ios/localPackages/TranscriptEngine`** (SPM). See [`packages/transcript-engine/README.md`](../packages/transcript-engine/README.md).
+
 ---
 
 ## Shared DNA (adopt on both apps)

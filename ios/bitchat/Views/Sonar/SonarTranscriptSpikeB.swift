@@ -14,6 +14,7 @@
 //
 
 import SwiftUI
+import TranscriptEngine
 #if canImport(UIKit)
 import UIKit
 #endif

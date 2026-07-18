@@ -50,6 +50,7 @@ multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotl
 compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 compose = { id = "org.jetbrains.compose", version.ref = "compose" }
 android-application = { id = "com.android.application", version.ref = "agp" }
+android-library = { id = "com.android.library", version.ref = "agp" }
 # :baselineprofile applies com.android.test / kotlin.android by raw id (no
 # version) — they are already on the classpath via :composeApp's plugins.
 baselineprofile = { id = "androidx.baselineprofile", version.ref = "androidx-baselineprofile" }
