@@ -59,6 +59,9 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     var expectedNewestDate: Date?
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
+    /// Host / collection / composer chrome background. Defaults to system; apps
+    /// with branded transcript chrome (Sonar `SonarTheme.bg`) pass their color.
+    var transcriptBackgroundColor: UIColor
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -69,6 +72,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         expectedNewestDate: Date? = nil,
         loadOlder: (() async -> Bool)? = nil,
         loadNewest: (() async -> Void)? = nil,
+        transcriptBackgroundColor: UIColor = .systemBackground,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -78,17 +82,26 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.expectedNewestDate = expectedNewestDate
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
+        self.transcriptBackgroundColor = transcriptBackgroundColor
         self.composer = composer
     }
 
     public func makeUIViewController(context: Context) -> TranscriptCollectionHostViewController<Composer> {
-        let vc = TranscriptCollectionHostViewController(composer: composer, callbacks: callbacks, heightKey: heightKey)
+        let vc = TranscriptCollectionHostViewController(
+            composer: composer,
+            callbacks: callbacks,
+            heightKey: heightKey,
+            transcriptBackgroundColor: transcriptBackgroundColor
+        )
         vc.apply(
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             loadOlder: loadOlder,
-            loadNewest: loadNewest
+            loadNewest: loadNewest,
+            callbacks: callbacks,
+            heightKey: heightKey,
+            transcriptBackgroundColor: transcriptBackgroundColor
         )
         return vc
     }
@@ -103,7 +116,10 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             loadOlder: loadOlder,
-            loadNewest: loadNewest
+            loadNewest: loadNewest,
+            callbacks: callbacks,
+            heightKey: heightKey,
+            transcriptBackgroundColor: transcriptBackgroundColor
         )
     }
 }
@@ -135,8 +151,9 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
     private var dataSource:
         UICollectionViewDiffableDataSource<TranscriptDaySection, TranscriptDayRow>?
 
-    private let callbacks: TranscriptCollectionHostCallbacks
-    private let heightKeyForItem: (TranscriptDayRow) -> String
+    private var callbacks: TranscriptCollectionHostCallbacks
+    private var heightKeyForItem: (TranscriptDayRow) -> String
+    private var transcriptBackgroundColor: UIColor
 
     private var entries: [TranscriptHostEntry] = []
     private var loadOlder: (() async -> Bool)?
@@ -166,7 +183,8 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
     public init(
         composer: () -> Composer,
         callbacks: TranscriptCollectionHostCallbacks,
-        heightKey: @escaping (TranscriptDayRow) -> String
+        heightKey: @escaping (TranscriptDayRow) -> String,
+        transcriptBackgroundColor: UIColor = .systemBackground
     ) {
         let layout = UICollectionViewFlowLayout()
         layout.scrollDirection = .vertical
@@ -182,6 +200,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         composerHost = UIHostingController(rootView: TranscriptComposerRootView(store: store))
         self.callbacks = callbacks
         heightKeyForItem = heightKey
+        self.transcriptBackgroundColor = transcriptBackgroundColor
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -189,15 +208,20 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         composerStore.composer = composer
     }
 
+    private func applyTranscriptBackground() {
+        view.backgroundColor = transcriptBackgroundColor
+        collectionView.backgroundColor = transcriptBackgroundColor
+        composerContainer.backgroundColor = transcriptBackgroundColor
+    }
+
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
     public override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemBackground
+        applyTranscriptBackground()
 
         collectionView.translatesAutoresizingMaskIntoConstraints = false
-        collectionView.backgroundColor = .systemBackground
         collectionView.keyboardDismissMode = .interactive
         collectionView.contentInsetAdjustmentBehavior = .never
         collectionView.alwaysBounceVertical = true
@@ -205,7 +229,6 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         view.addSubview(collectionView)
 
         composerContainer.translatesAutoresizingMaskIntoConstraints = false
-        composerContainer.backgroundColor = .systemBackground
         view.addSubview(composerContainer)
 
         composerHost.view.translatesAutoresizingMaskIntoConstraints = false
@@ -274,8 +297,17 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
         loadOlder: (() async -> Bool)?,
-        loadNewest: (() async -> Void)?
+        loadNewest: (() async -> Void)?,
+        callbacks: TranscriptCollectionHostCallbacks? = nil,
+        heightKey: ((TranscriptDayRow) -> String)? = nil,
+        transcriptBackgroundColor: UIColor? = nil
     ) {
+        if let callbacks { self.callbacks = callbacks }
+        if let heightKey { heightKeyForItem = heightKey }
+        if let transcriptBackgroundColor {
+            self.transcriptBackgroundColor = transcriptBackgroundColor
+            if isViewLoaded { applyTranscriptBackground() }
+        }
         let previousRevision = TranscriptTailRevision(
             itemCount: self.entries.count,
             tailID: self.entries.last?.id
