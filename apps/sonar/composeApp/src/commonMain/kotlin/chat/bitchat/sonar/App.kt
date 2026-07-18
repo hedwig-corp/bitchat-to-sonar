@@ -109,9 +109,13 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.content_accessibility_voice_download
+import chat.bitchat.sonar.resources.content_accessibility_voice_downloading
 import chat.bitchat.sonar.resources.content_accessibility_voice_pause
 import chat.bitchat.sonar.resources.content_accessibility_voice_play
+import chat.bitchat.sonar.resources.content_accessibility_voice_retry_download
 import chat.bitchat.sonar.resources.content_accessibility_voice_speed
+import chat.bitchat.sonar.resources.content_accessibility_voice_unheard
 import chat.bitchat.sonar.resources.sonar_icon
 import org.jetbrains.compose.resources.stringResource
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
@@ -4038,6 +4042,10 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val playA11y = stringResource(Res.string.content_accessibility_voice_play)
     val pauseA11y = stringResource(Res.string.content_accessibility_voice_pause)
     val speedA11y = stringResource(Res.string.content_accessibility_voice_speed)
+    val downloadA11y = stringResource(Res.string.content_accessibility_voice_download)
+    val downloadingA11y = stringResource(Res.string.content_accessibility_voice_downloading)
+    val retryDownloadA11y = stringResource(Res.string.content_accessibility_voice_retry_download)
+    val unheardA11y = stringResource(Res.string.content_accessibility_voice_unheard)
     val tail = 5.dp
     // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs
     // the surface bubble; radius 18 with the tail corner; padding 11/15/11/11.
@@ -4111,7 +4119,10 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         if (!listened && !m.mine) {
             Spacer(Modifier.width(6.dp))
             // Unheard indicator (Signal parity) — clears once this note starts playing.
-            Box(Modifier.size(6.dp).clip(CircleShape).background(if (net) s.onNet else s.accent))
+            Box(
+                Modifier.size(6.dp).clip(CircleShape).background(if (net) s.onNet else s.accent)
+                    .semantics { contentDescription = unheardA11y }
+            )
         }
         if (durText.isNotEmpty()) {
             Spacer(Modifier.width(8.dp))

@@ -77,11 +77,15 @@
     <string name="content_accessibility_toggle_bookmark">toggle bookmark for #%1$s</string>
     <string name="content_accessibility_toggle_favorite">double tap to toggle favorite status</string>
     <string name="content_accessibility_view_fingerprint">tap to view encryption fingerprint</string>
+    <string name="content_accessibility_voice_download">Download voice message</string>
+    <string name="content_accessibility_voice_downloading">Downloading voice message</string>
     <string name="content_accessibility_voice_pause">Pause voice message</string>
     <string name="content_accessibility_voice_play">Play voice message</string>
     <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_retry_download">Retry downloading voice message</string>
     <string name="content_accessibility_voice_seek">Seek voice message</string>
     <string name="content_accessibility_voice_speed">Change playback speed</string>
+    <string name="content_accessibility_voice_unheard">Unheard voice message</string>
     <string name="content_actions_block">block</string>
     <string name="content_actions_direct_message">direct message</string>
     <string name="content_actions_hug">hug</string>
