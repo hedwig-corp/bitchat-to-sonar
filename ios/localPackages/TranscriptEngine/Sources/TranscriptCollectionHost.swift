@@ -305,8 +305,15 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         heightKey: ((TranscriptDayRow) -> String)? = nil,
         transcriptBackgroundColor: UIColor? = nil
     ) {
-        if let callbacks { self.callbacks = callbacks }
-        if let heightKey { heightKeyForItem = heightKey }
+        var renderHooksChanged = false
+        if let callbacks {
+            self.callbacks = callbacks
+            renderHooksChanged = true
+        }
+        if let heightKey {
+            heightKeyForItem = heightKey
+            renderHooksChanged = true
+        }
         if let transcriptBackgroundColor {
             self.transcriptBackgroundColor = transcriptBackgroundColor
             if isViewLoaded { applyTranscriptBackground() }
@@ -325,7 +332,12 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         let hadAnchor = unreadAnchorId != nil
         resolveUnreadAnchor()
         guard isViewLoaded, dataSource != nil else { return }
-        applySnapshot()
+        if renderHooksChanged {
+            // New closures may change theme / value-semantic lookups / sizing
+            // without height-key churn — force visible rows + cache refresh.
+            heightCache.removeAll()
+        }
+        applySnapshot(forceReconfigureAll: renderHooksChanged)
 
         let revision = TranscriptTailRevision(itemCount: entries.count, tailID: entries.last?.id)
         if !didInitialScroll {
@@ -410,7 +422,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         }
     }
 
-    public func collectionView(
+    func collectionView(
         _ collectionView: UICollectionView,
         layout collectionViewLayout: UICollectionViewLayout,
         sizeForItemAt indexPath: IndexPath
@@ -423,7 +435,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         return CGSize(width: width, height: itemHeight(for: item, width: width))
     }
 
-    public func collectionView(
+    func collectionView(
         _ collectionView: UICollectionView,
         layout collectionViewLayout: UICollectionViewLayout,
         referenceSizeForHeaderInSection section: Int
@@ -441,7 +453,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         return CGSize(width: width, height: height)
     }
 
-    private func applySnapshot() {
+    private func applySnapshot(forceReconfigureAll: Bool = false) {
         guard let dataSource else { return }
         let sections = transcriptDaySections(
             entries: entries.map { ($0.id, $0.date) },
@@ -458,7 +470,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             for item in rows {
                 let key = heightKeyForItem(item)
                 newHeightKeys[item] = key
-                if let old = appliedHeightKeys[item], old != key {
+                if forceReconfigureAll || appliedHeightKeys[item] != key {
                     reconfigure.append(item)
                 }
             }
@@ -466,11 +478,32 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if !reconfigure.isEmpty {
             snapshot.reconfigureItems(reconfigure)
         }
-        let layoutChanged = newHeightKeys != appliedHeightKeys
+        let layoutChanged = forceReconfigureAll || newHeightKeys != appliedHeightKeys
         appliedHeightKeys = newHeightKeys
         dataSource.apply(snapshot, animatingDifferences: false)
+        if forceReconfigureAll {
+            reconfigureVisibleHeaders()
+        }
         if layoutChanged {
             flowLayout.invalidateLayout()
+        }
+    }
+
+    /// Diffable `reconfigureItems` only refreshes cells — sticky day headers need
+    /// an explicit pass when render callbacks change without section identity churn.
+    private func reconfigureVisibleHeaders() {
+        let kind = UICollectionView.elementKindSectionHeader
+        for indexPath in collectionView.indexPathsForVisibleSupplementaryElements(ofKind: kind) {
+            guard let header = collectionView.supplementaryView(
+                forElementKind: kind,
+                at: indexPath
+            ) as? UICollectionViewCell,
+                  let section = dataSource?.sectionIdentifier(for: indexPath.section),
+                  !section.label.isEmpty
+            else { continue }
+            if let configureHeader = callbacks.configureHeader {
+                configureHeader(collectionView, header, indexPath, section.label)
+            }
         }
     }
 
@@ -774,12 +807,12 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
 
     // MARK: Scroll delegate
 
-    public func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+    func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         needsLiveEdgeOpen = false
         recordUserScroll(isNearBottom: isScrolledToBottom())
     }
 
-    public func scrollViewDidScroll(_ scrollView: UIScrollView) {
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
         let near = isScrolledToBottom()
         if near {
             isUserScrolling = false
