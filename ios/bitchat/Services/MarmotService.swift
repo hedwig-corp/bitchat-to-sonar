@@ -308,6 +308,17 @@ final class MarmotService: @unchecked Sendable {
     /// mutation, never for a relay quorum fetch.
     private let drainQueue = DispatchQueue(label: "chat.bitchat.marmot-drain", qos: .userInitiated)
 
+    /// Long-running media encryption/uploads use leased node snapshots on a
+    /// concurrent lane. They must not occupy `workQueue`: relay reconnect
+    /// installs the relay-backed node there, and a scarce-link upload can run
+    /// for minutes while the durable core outbox waits for that installation.
+    /// The shared core bounds media concurrency and serializes MLS mutation.
+    private let mediaQueue = DispatchQueue(
+        label: "chat.bitchat.marmot-media-send",
+        qos: .utility,
+        attributes: .concurrent
+    )
+
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
     /// they are safe to run in parallel with each other (and alongside writes
@@ -714,18 +725,22 @@ final class MarmotService: @unchecked Sendable {
         filename: String,
         mime: String,
         caption: String,
-        serverUrl: String = ""
+        serverUrl: String = "",
+        requestId: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMedia(
+        let usedNode = try await mediaLane { node in
+            try node.sendMediaRetryable(
                 groupIdHex: groupId,
                 data: data,
                 filename: filename,
                 mime: mime,
                 caption: caption,
-                serverUrl: serverUrl
+                serverUrl: serverUrl,
+                requestId: requestId
             )
+            return node
         }
+        await handOffMediaOutboxIfNodeChanged(from: usedNode)
     }
 
     /// One attachment of an album send (one message, N attachments).
@@ -743,18 +758,22 @@ final class MarmotService: @unchecked Sendable {
         groupId: String,
         items: [MediaAlbumItem],
         caption: String,
-        serverUrl: String = ""
+        serverUrl: String = "",
+        requestId: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMediaMulti(
+        let usedNode = try await mediaLane { node in
+            try node.sendMediaMultiRetryable(
                 groupIdHex: groupId,
                 items: items.map {
                     MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
                 },
                 caption: caption,
-                serverUrl: serverUrl
+                serverUrl: serverUrl,
+                requestId: requestId
             )
+            return node
         }
+        await handOffMediaOutboxIfNodeChanged(from: usedNode)
     }
 
     /// Send a sticker message to the group.
@@ -1469,6 +1488,46 @@ final class MarmotService: @unchecked Sendable {
     /// `workQueue` with blocking `syncForce` (see `drainQueue` doc).
     private func drainLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: drainQueue, body)
+    }
+
+    /// Media work is lifecycle-leased like reads/sends but runs independently
+    /// from relay node installation on `workQueue`.
+    private func mediaLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: mediaQueue, body)
+    }
+
+    static func mediaOutboxHandoffRequired(
+        usedNodeIdentifier: ObjectIdentifier,
+        currentNodeIdentifier: ObjectIdentifier
+    ) -> Bool {
+        usedNodeIdentifier != currentNodeIdentifier
+    }
+
+    /// A local-only node may finish a scarce-link upload after `connect()` has
+    /// already installed and scanned its relay-backed replacement. Republish
+    /// the shared durable outbox immediately instead of waiting for a later
+    /// reconnect/subscription pass. Failure is best-effort because the row is
+    /// durable and the normal reconnect path will retry it again.
+    private func handOffMediaOutboxIfNodeChanged(from usedNode: SonarNode) async {
+        do {
+            // Keep this off workQueue: an in-flight relay drain may occupy that
+            // lane for its bounded fetch timeout after the media is already
+            // durable. retryOutbox() owns its core synchronization and returns
+            // after scheduling the relay publish.
+            try await leasedNodeOperation(on: mediaQueue, requireRelay: true) { currentNode in
+                guard Self.mediaOutboxHandoffRequired(
+                    usedNodeIdentifier: ObjectIdentifier(usedNode),
+                    currentNodeIdentifier: ObjectIdentifier(currentNode)
+                ) else { return }
+                try currentNode.retryOutbox()
+            }
+        } catch ServiceError.notConnected {
+            // A later relay connection scans the shared durable outbox.
+        } catch ServiceError.cancelled {
+            // Account replacement/wipe owns the lifecycle from here.
+        } catch {
+            // The durable row remains pending for ensureSubscriptions/reconnect.
+        }
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {

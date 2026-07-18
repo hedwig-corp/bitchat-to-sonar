@@ -5302,6 +5302,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "hkdf",
+ "httpdate",
  "iroh",
  "iroh-roq",
  "libsqlite3-sys",

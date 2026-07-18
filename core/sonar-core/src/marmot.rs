@@ -34,6 +34,7 @@ use crate::{Error, Result};
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
 /// MDK examples: NIP-C7-style chat message).
 pub const CHAT_RUMOR_KIND: u16 = 9;
+const MEDIA_REQUEST_TAG: &str = "sonar-media-request";
 
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
@@ -645,10 +646,32 @@ impl MarmotEngine {
         mime: &str,
         filename: &str,
     ) -> Result<EncryptedMediaUpload> {
-        dispatch!(&self.storage, |mdk| mdk
+        self.encrypt_media_for_epoch(group_id, data, mime, filename, None)
+            .map(|(_, upload)| upload)
+    }
+
+    /// Encrypt media while atomically recording/checking the MLS epoch whose
+    /// exporter secret produced the ciphertext. A durable upload can be delayed
+    /// across membership changes, so callers must never publish old-epoch
+    /// ciphertext in a new-epoch message.
+    pub fn encrypt_media_for_epoch(
+        &self,
+        group_id: &GroupId,
+        data: &[u8],
+        mime: &str,
+        filename: &str,
+        expected_epoch: Option<u64>,
+    ) -> Result<(u64, EncryptedMediaUpload)> {
+        let _mls = self.mls_write();
+        let epoch = self.group_epoch(group_id)?;
+        if expected_epoch.is_some_and(|expected| expected != epoch) {
+            return Err(Error::MediaEpochChanged);
+        }
+        let upload = dispatch!(&self.storage, |mdk| mdk
             .media_manager(group_id.clone())
             .encrypt_for_upload(data, mime, filename)
-            .map_err(|e| Error::Media(e.to_string())))
+            .map_err(|e| Error::Media(e.to_string())))?;
+        Ok((epoch, upload))
     }
 
     /// Build a signed kind-445 media message: a kind-9 rumor carrying `caption`
@@ -679,7 +702,7 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        self.create_media_event_multi_inner(group_id, uploads, caption)
+        self.create_media_event_multi_inner(group_id, uploads, caption, None)
     }
 
     /// Media variant of [`Self::create_and_process_text_message`]: create and
@@ -694,7 +717,59 @@ impl MarmotEngine {
             return Err(Error::Media("no media uploads for message".into()));
         }
         let _mls = self.mls_write();
-        let event = self.create_media_event_multi_inner(group_id, uploads, caption)?;
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption, None)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    /// Epoch-checked variant used by durable uploads. The check, event
+    /// encryption, and local processing share one MLS guard, closing the race
+    /// where a membership commit lands immediately before message creation.
+    pub fn create_and_process_media_event_multi_at_epoch(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+        expected_epoch: u64,
+    ) -> Result<(Event, Incoming)> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        if self.group_epoch(group_id)? != expected_epoch {
+            return Err(Error::MediaEpochChanged);
+        }
+        let event = self.create_media_event_multi_inner(group_id, uploads, caption, None)?;
+        let incoming = self.process_group_message(&event)?;
+        Ok((event, incoming))
+    }
+
+    /// Durable media sends use a stable, encrypted request tag and creation
+    /// timestamp. If recovery has to recreate the wrapper after a crash, MDK
+    /// stores the same inner rumor id instead of appending a duplicate row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_and_process_media_event_multi_for_request_at_epoch(
+        &self,
+        group_id: &GroupId,
+        uploads: &[(&EncryptedMediaUpload, &str)],
+        caption: &str,
+        expected_epoch: u64,
+        request_id: &str,
+        created_at_secs: u64,
+    ) -> Result<(Event, Incoming)> {
+        if uploads.is_empty() {
+            return Err(Error::Media("no media uploads for message".into()));
+        }
+        let _mls = self.mls_write();
+        if self.group_epoch(group_id)? != expected_epoch {
+            return Err(Error::MediaEpochChanged);
+        }
+        let event = self.create_media_event_multi_inner(
+            group_id,
+            uploads,
+            caption,
+            Some((request_id, created_at_secs)),
+        )?;
         let incoming = self.process_group_message(&event)?;
         Ok((event, incoming))
     }
@@ -705,6 +780,7 @@ impl MarmotEngine {
         group_id: &GroupId,
         uploads: &[(&EncryptedMediaUpload, &str)],
         caption: &str,
+        durable_identity: Option<(&str, u64)>,
     ) -> Result<Event> {
         let event = dispatch!(&self.storage, |mdk| {
             // One imeta tag per attachment, in send order. A fresh media_manager
@@ -716,9 +792,15 @@ impl MarmotEngine {
                     .create_imeta_tag(upload, url);
                 imetas.push(tag);
             }
-            let rumor = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption)
-                .tags(imetas)
-                .build(self.identity.public_key());
+            let mut builder = EventBuilder::new(Kind::Custom(CHAT_RUMOR_KIND), caption);
+            if let Some((request_id, created_at_secs)) = durable_identity {
+                imetas.push(Tag::custom(
+                    TagKind::custom(MEDIA_REQUEST_TAG),
+                    [request_id],
+                ));
+                builder = builder.custom_created_at(Timestamp::from(created_at_secs));
+            }
+            let rumor = builder.tags(imetas).build(self.identity.public_key());
             mdk.create_message(group_id, rumor, None)
         })?;
         Ok(event)
@@ -837,6 +919,14 @@ impl MarmotEngine {
             .into_iter()
             .filter(|g| g.state == group_types::GroupState::Active)
             .collect())
+    }
+
+    pub fn group_epoch(&self, group_id: &GroupId) -> Result<u64> {
+        self.groups()?
+            .into_iter()
+            .find(|group| group.mls_group_id == *group_id)
+            .map(|group| group.epoch)
+            .ok_or_else(|| Error::Media("media group is no longer available".into()))
     }
 
     /// Pending multi-member welcomes waiting for user acceptance.

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use nostr::{Event, JsonUtil};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ use crate::{Error, Result};
 pub(crate) const OUTBOX_STATE_FILE_SUFFIX: &str = ".sonar-outbox.json";
 const OUTBOX_STATE_VERSION: u32 = 1;
 const OUTBOX_RETRY_ATTEMPT_LIMIT: u32 = 20;
+static SHARED_OUTBOX_STATES: LazyLock<Mutex<HashMap<PathBuf, Weak<Mutex<OutboxState>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct OutboxStateDisk {
@@ -35,6 +38,11 @@ pub(crate) struct OutboxEntry {
     pub attempts: u32,
     pub state: DeliveryState,
     pub last_error: Option<String>,
+    /// Stable encrypted-media upload request handed off to this relay event.
+    /// Recovery uses it to avoid rebuilding an MLS message when the upload
+    /// journal's final cleanup/checkpoint was interrupted.
+    #[serde(default)]
+    pub media_request_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -45,6 +53,31 @@ pub(crate) struct OutboxState {
 }
 
 impl OutboxState {
+    /// Local-only and relay-backed nodes overlap briefly during local-first
+    /// startup. They must mutate one snapshot under one lock or the last stale
+    /// writer can truncate a send created by the other node.
+    pub fn load_shared(path: Option<PathBuf>) -> Arc<Mutex<Self>> {
+        let Some(path) = path else {
+            return Arc::new(Mutex::new(Self::load(None)));
+        };
+        let registry_key = fs::canonicalize(&path).unwrap_or_else(|_| {
+            path.parent()
+                .and_then(|parent| fs::canonicalize(parent).ok())
+                .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+                .unwrap_or_else(|| path.clone())
+        });
+        let mut registry = SHARED_OUTBOX_STATES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.retain(|_, state| state.strong_count() > 0);
+        if let Some(state) = registry.get(&registry_key).and_then(Weak::upgrade) {
+            return state;
+        }
+        let state = Arc::new(Mutex::new(Self::load(Some(path))));
+        registry.insert(registry_key, Arc::downgrade(&state));
+        state
+    }
+
     pub fn load(path: Option<PathBuf>) -> Self {
         let disk = path
             .as_ref()
@@ -81,6 +114,44 @@ impl OutboxState {
         event_json: String,
         now_secs: u64,
     ) -> Result<()> {
+        self.mark_pending_inner(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            None,
+        )
+    }
+
+    pub fn mark_pending_media(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+        media_request_id: String,
+    ) -> Result<()> {
+        self.mark_pending_inner(
+            group_id_hex,
+            message_id_hex,
+            wrapper_event_id_hex,
+            event_json,
+            now_secs,
+            Some(media_request_id),
+        )
+    }
+
+    fn mark_pending_inner(
+        &mut self,
+        group_id_hex: String,
+        message_id_hex: String,
+        wrapper_event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+        media_request_id: Option<String>,
+    ) -> Result<()> {
         let entry = OutboxEntry {
             group_id_hex,
             message_id_hex: message_id_hex.clone(),
@@ -91,10 +162,28 @@ impl OutboxState {
             attempts: 0,
             state: DeliveryState::Pending,
             last_error: None,
+            media_request_id,
         };
-        self.entries.insert(message_id_hex, entry);
+        let was_dirty = self.dirty;
+        let previous = self.entries.insert(message_id_hex.clone(), entry);
         self.dirty = true;
-        self.save_if_dirty()
+        if let Err(error) = self.save_if_dirty() {
+            if let Some(previous) = previous {
+                self.entries.insert(message_id_hex, previous);
+            } else {
+                self.entries.remove(&message_id_hex);
+            }
+            self.dirty = was_dirty;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn message_id_for_media_request(&self, request_id: &str) -> Option<String> {
+        self.entries
+            .values()
+            .find(|entry| entry.media_request_id.as_deref() == Some(request_id))
+            .map(|entry| entry.message_id_hex.clone())
     }
 
     pub fn mark_sent_by_message_id(&mut self, message_id_hex: &str, _now_secs: u64) -> Result<()> {
@@ -168,10 +257,14 @@ impl OutboxState {
     /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
     /// `group_id_hex` is the MLS id hosts use for conversation refresh (not
     /// the Nostr `#h` / `nostr_group_id`).
+    /// `excluded_message_ids` are not mutated: a failed media row must remain
+    /// visibly failed when its prerequisite durable handoff cannot be
+    /// checkpointed yet.
     pub fn retryable_events(
         &mut self,
         now_secs: u64,
         active_group_ids: &HashSet<String>,
+        excluded_message_ids: &HashSet<String>,
     ) -> Result<Vec<(String, String, Event)>> {
         let mut out = Vec::new();
         let before = self.entries.len();
@@ -181,6 +274,9 @@ impl OutboxState {
             self.dirty = true;
         }
         for entry in self.entries.values_mut() {
+            if excluded_message_ids.contains(&entry.message_id_hex) {
+                continue;
+            }
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
             }
@@ -303,6 +399,55 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_nodes_share_one_outbox_snapshot_and_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let local = OutboxState::load_shared(Some(path.clone()));
+        local
+            .lock()
+            .unwrap()
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("local send");
+        let relay = OutboxState::load_shared(Some(path));
+        assert!(Arc::ptr_eq(&local, &relay));
+        assert_eq!(
+            relay.lock().unwrap().status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn media_handoff_identity_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox
+            .mark_pending_media(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+                "media-request".into(),
+            )
+            .expect("mark media pending");
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded
+                .message_id_for_media_request("media-request")
+                .as_deref(),
+            Some("message")
+        );
+    }
+
+    #[test]
     fn remove_group_entries_drops_pending_sends_for_deleted_chat() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("outbox.json");
@@ -356,7 +501,7 @@ mod tests {
 
         let active_group_ids = HashSet::new();
         let events = outbox
-            .retryable_events(2, &active_group_ids)
+            .retryable_events(2, &active_group_ids, &HashSet::new())
             .expect("retryable events");
         assert!(events.is_empty());
 
@@ -402,7 +547,7 @@ mod tests {
             .mark_failed_by_message_id("message", "still offline".into(), 4)
             .expect("mark failed after retry");
         let retryable = outbox
-            .retryable_events(5, &HashSet::from(["group".to_string()]))
+            .retryable_events(5, &HashSet::from(["group".to_string()]), &HashSet::new())
             .expect("automatic retry budget was reset");
         assert_eq!(retryable.len(), 1);
 
@@ -410,6 +555,43 @@ mod tests {
         assert_eq!(
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn excluded_retry_preserves_failed_delivery_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "blocked-media-message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+            )
+            .expect("mark pending");
+        outbox
+            .mark_failed_by_message_id("blocked-media-message", "checkpoint failed".into(), 2)
+            .expect("mark failed");
+
+        let retryable = outbox
+            .retryable_events(
+                3,
+                &HashSet::from(["group".to_string()]),
+                &HashSet::from(["blocked-media-message".to_string()]),
+            )
+            .expect("select retryable events");
+
+        assert!(retryable.is_empty());
+        assert_eq!(
+            OutboxState::load(Some(path)).status_for_message("blocked-media-message"),
+            Some(DeliveryState::Failed)
         );
     }
 }

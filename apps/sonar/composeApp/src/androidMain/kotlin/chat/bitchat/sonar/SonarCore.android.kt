@@ -190,8 +190,11 @@ actual object SonarCore {
         mime: String,
         caption: String,
         serverUrl: String,
+        requestId: String,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
+        val usedNode = requireNode()
+        usedNode.sendMediaRetryable(chatId, data, filename, mime, caption, serverUrl, requestId)
+        handOffMediaOutboxIfNodeChanged(usedNode)
     }
 
     actual suspend fun sendMediaMulti(
@@ -199,13 +202,17 @@ actual object SonarCore {
         items: List<AlbumUpload>,
         caption: String,
         serverUrl: String,
+        requestId: String,
     ) = withContext(Dispatchers.IO) {
-        requireNode().sendMediaMulti(
+        val usedNode = requireNode()
+        usedNode.sendMediaMultiRetryable(
             chatId,
             items.map { uniffi.sonar_ffi.MediaUploadItem(it.bytes, it.filename, it.mime) },
             caption,
             serverUrl,
+            requestId,
         )
+        handOffMediaOutboxIfNodeChanged(usedNode)
     }
 
     actual suspend fun sendSticker(
@@ -905,6 +912,22 @@ actual object SonarCore {
 
     private fun requireNode(): SonarNode =
         node ?: error("SonarCore not started — call start() first")
+
+    /**
+     * A scarce-link upload can finish on the local-only node after
+     * [connectRelays] already scanned and installed its replacement. Serialize
+     * the identity check with node installation and immediately hand the shared
+     * durable outbox to the current relay-backed node.
+     */
+    private suspend fun handOffMediaOutboxIfNodeChanged(usedNode: SonarNode) {
+        lock.withLock {
+            val currentNode = node ?: return@withLock
+            if (!mediaOutboxHandoffRequired(usedNode, currentNode, relayConnected)) {
+                return@withLock
+            }
+            runCatching { currentNode.retryOutbox() }
+        }
+    }
 
     /** Release the UniFFI/Rust owner before deleting or replacing its SQLite store. */
     private fun closeNode() {

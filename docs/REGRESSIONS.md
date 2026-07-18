@@ -314,6 +314,51 @@ invalidation for verified peer/profile changes.
 
 **Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
+
+## R-011 — Media uploads survive a scarce or intermittent connection
+
+**Invariant:** A Blossom upload retries idempotent transient transport failures, 408/425/429 responses, and 5xx responses with bounded exponential backoff; permanent client/auth/content errors fail immediately. All attempts share one overall size-scaled deadline that must admit a progressing 25 MiB upload at roughly 32 KiB/s. Before lengthy MIP-04 preparation or network I/O, the shared core atomically journals every locally encrypted source; recovery can finish missing ciphertext checkpoints from those sources, and completed album-item URLs are checkpointed atomically on every supported desktop filesystem, including replace-existing semantics on Windows. The host's stable optimistic-row id makes retry reuse that exact job while a separate user send remains distinct. The final local-message/relay-outbox handoff is checkpointed before upload-job cleanup, and the stable encrypted request tag makes wrapper recreation idempotent if a crash lands immediately before that checkpoint. A detached success retains a small completion tombstone (while deleting its large payload files) until the failed host row explicitly retries, so that retry acknowledges the canonical message instead of publishing a duplicate; tombstones expire after seven days and are capped at 500 because host retry identities do not survive a later process restart. Per-request single-flight locking prevents duplicate retry work without allowing one stalled upload to block unrelated sends; overlapping local-only and relay-backed nodes share the same manifest snapshot, request gates, and global two-job scheduler. The scheduler is acquired before source validation/journaling, memory-heavy MIP-04 preparation, and network work, so bursts never create more than two extra encrypted source copies at once. When any host replaces a local-only node during an upload, completion immediately hands the shared durable relay outbox to the current relay-backed node. If MLS membership advances while the upload is delayed, the core re-encrypts from the protected source and clears stale URL checkpoints before publishing, so the ciphertext and media message always use the same group epoch.
+
+**Breaks as:** A photo, video, album, or voice note flips to "Couldn't send" after one brief connection drop, loses its retry bytes after process death, re-uploads completed album items, or a progressing video is killed only because the uplink is slower than 100 KiB/s.
+
+**Call sites:** shared core `client.rs::blossom_upload`; iOS `MarmotChatView.swift::sendMedia` / `sendMediaAlbum`; Compose `SonarAppState.kt::sendMediaAttachment` / `sendImageAlbum` / `sendVoiceNote`
+
+**Guarded by:** `client.rs::blossom_upload_retries_transient_failure`
+
+**Also guarded by:** `client.rs::blossom_upload_timeout_scales_with_payload`, `client.rs::blossom_upload_retry_classifier_rejects_permanent_statuses`, `client.rs::blossom_retry_after_accepts_seconds_and_http_date`, `media_outbox.rs::persists_encrypted_jobs_and_completed_item_urls`, `media_outbox.rs::request_ids_cannot_escape_the_media_outbox_directory`, `media_outbox.rs::manifest_replacement_overwrites_an_existing_file`, `media_outbox.rs::completed_tombstones_are_bounded_by_age_and_count`, `media_outbox.rs::source_journal_survives_before_first_ciphertext_checkpoint`, `media_outbox.rs::nodes_for_one_database_share_the_media_manifest_and_lock`, `media_outbox.rs::removal_deletes_ciphertext_blobs`, `media_outbox.rs::epoch_replacement_preserves_source_and_clears_uploaded_url`, `media_outbox.rs::group_removal_only_deletes_matching_jobs`, `outbox.rs::media_handoff_identity_survives_restart`, `outbox.rs::overlapping_nodes_share_one_outbox_snapshot_and_lock`, `outbox.rs::excluded_retry_preserves_failed_delivery_state`, `client.rs::relay_retry_checkpoints_media_handoff_before_compaction`, `client.rs::manual_retry_checkpoints_media_handoff_before_publish`, `client.rs::durable_media_source_recovery_and_completion_tombstone_are_idempotent`, `client.rs::media_upload_host_request_id_distinguishes_intentional_duplicate_sends`, `client.rs::media_upload_gates_only_serialize_the_same_request`, `client.rs::media_upload_scheduler_bounds_preparation_and_network_together`, `client.rs::media_upload_scheduler_gates_source_journaling`, `SonarConversationRegressionSmokeTests.mediaCompletionHandsSharedOutboxToReplacementNode`, `MediaOutboxHandoffTest.replacementRequiresImmediateRetryOnlyAfterRelayInstall`, `client.rs::media_roundtrip_decrypts_for_sender_and_peer`
+
+**History:** #287 bounded a permanently stalled PUT at 60s -> #293 scaled the deadline for video but assumed at least 100 KiB/s -> #317 adds transient retry/backoff, a constrained-cellular deadline, and process-durable encrypted upload checkpoints for both apps.
+
+**Rejected:**
+- *Separate retry loops in Swift and Kotlin.* They drift, re-run encryption/album work, and cannot distinguish Blossom's permanent statuses as precisely as the shared transport layer.
+- *Retrying every failure.* Authentication, invalid request, unsupported content, and over-limit failures are deterministic; retrying them wastes data and battery.
+
+**Protocol limit:** Blossom BUD-02 defines only a whole-blob PUT. The interrupted *current item* therefore restarts from byte zero; there is no interoperable `Content-Range` upload extension to use. The durable journal still survives process death and reuses every already-completed item URL, so an album resumes at its first incomplete item.
+
+**Partly guarded:** The journal's encrypted persistence, item-URL checkpoint, cleanup, and stable request identity are pinned independently. Apple media uploads use a lifecycle-leased media lane so slow network work cannot serialize relay-node installation behind it; a host decision seam pins the required relay-outbox handoff when the leased node was replaced. The full queue topology remains review-guarded because `MarmotService` is not constructible in tests. No automated test kills and relaunches a native app in the middle of a real Blossom PUT; that remains device-level coverage.
+
+---
+
+## R-009 — Media downloads progress on constrained links and resume partial ciphertext
+
+**Invariant:** A progressing media response has a 60-second **idle-read** deadline plus a size-scaled total deadline, rather than the old fixed 60-second total-transfer deadline. A maximum-size encrypted attachment gets about 14 minutes at the constrained-link floor, but a trickle server cannot retain one of the four download permits forever. File-backed attachment downloads persist a content-addressed ciphertext partial and retry/relaunch with BUD-01 `Range`; a valid `206 Content-Range` appends at the exact prior offset, while a server that ignores Range and returns `200` safely truncates and restarts. Inactive partials are capped just below 100 MiB and expire after seven days, and pruning never deletes an active writer; aggregate partial storage is therefore capped at 200 MiB. MIP-04 authentication still runs before plaintext is promoted into the host cache. Public and sticker downloads use the same bounded scaling rule: a 5 MiB sticker gets 220 seconds at the constrained-link floor.
+
+**Breaks as:** A large video always fails on a usable low-bandwidth link, and tapping retry repeatedly downloads the same prefix until the UI eventually says the media is unavailable.
+
+**Call sites:** shared core `client.rs::fetch_media_to_file`; iOS `SonarAppStore.swift::requestMediaDownload`; Compose `SonarAppState.kt::requestMediaDownload`
+
+**Guarded by:** `client.rs::media_download_resumes_from_partial_file_after_disconnect`
+
+**Also guarded by:** `client.rs::media_download_restarts_when_server_ignores_range`, `client.rs::media_download_rejects_inconsistent_content_range`, `client.rs::media_download_honors_cancellation_before_network_io`, `client.rs::media_download_partial_pruning_bounds_storage_and_expires_old_files`, `client.rs::media_download_partial_registration_rejects_a_second_writer_and_releases_on_drop`, `client.rs::private_media_download_total_timeout_is_bounded_and_scarce_link_aware`, `client.rs::public_download_timeout_is_bounded_and_scarce_link_aware`
+
+**History:** #317 replaces the total request timeout with an idle-read timeout and adds BUD-01 Range recovery shared by Apple and Compose.
+
+**Rejected:**
+- *Raising the fixed total timeout.* Any finite total still rejects a sufficiently slow but progressing link and makes every retry restart from byte zero.
+- *Trusting a partial response without validating `Content-Range`.* A wrong offset corrupts the ciphertext and only fails later as a misleading MIP-04 authentication error.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

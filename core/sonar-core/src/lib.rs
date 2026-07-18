@@ -13,6 +13,7 @@ pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;
+mod media_outbox;
 pub mod mesh;
 pub mod mesh_engine;
 pub mod noise;

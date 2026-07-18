@@ -5286,12 +5286,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 if (uploads.size == 1) {
                     val upload = uploads.single()
-                    SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                    SonarCore.sendMedia(
+                        groupId,
+                        upload.data,
+                        upload.filename,
+                        upload.mime,
+                        upload.message.content,
+                        requestId = pendingId,
+                    )
                 } else {
                     SonarCore.sendMediaMulti(
                         groupId,
                         uploads.map { AlbumUpload(it.data, it.filename, it.mime) },
                         uploads.first().message.content,
+                        requestId = pendingId,
                     )
                 }
                 markPendingMediaCompleted(chatId, pendingId)
@@ -6049,7 +6057,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
             try {
-                SonarCore.sendMedia(groupId, data, filename, mime, "")
+                SonarCore.sendMedia(groupId, data, filename, mime, "", requestId = pendingId)
                 markPendingMediaCompleted(chatId, pendingId)
                 // Refresh the open conversation so the sent image shows.
                 (screen as? Screen.Chat)?.let { sc ->
@@ -6161,6 +6169,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     groupId,
                     items.map { AlbumUpload(it.bytes, it.filename, it.mime) },
                     "",
+                    requestId = pendingId,
                 )
                 markPendingMediaCompleted(chatId, pendingId)
                 // Refresh the open conversation so the sent album shows.
@@ -6268,7 +6277,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
             try {
-                SonarCore.sendMedia(groupId, bytes, filename, mime, "")
+                SonarCore.sendMedia(groupId, bytes, filename, mime, "", requestId = pendingId)
                 markPendingMediaCompleted(chatId, pendingId)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {

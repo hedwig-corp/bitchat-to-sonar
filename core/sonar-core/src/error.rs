@@ -48,6 +48,9 @@ pub enum Error {
     #[error("encrypted media error: {0}")]
     Media(String),
 
+    #[error("media group epoch changed during upload")]
+    MediaEpochChanged,
+
     #[error("media too large: {bytes} bytes (max {max})")]
     MediaTooLarge { bytes: u64, max: u64 },
 
