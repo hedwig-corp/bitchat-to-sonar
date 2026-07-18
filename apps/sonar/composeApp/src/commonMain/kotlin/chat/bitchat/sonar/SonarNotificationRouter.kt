@@ -58,7 +58,17 @@ internal suspend fun resolvePushSenderName(
     return shortNpubLabel(npub)
 }
 
+internal sealed interface SonarDeltaNotificationAction {
+    data class Post(val notification: SonarNotification) : SonarDeltaNotificationAction
+    data class Cancel(val notificationId: Int) : SonarDeltaNotificationAction
+    /** Policy handled the durable row without producing platform UI. */
+    data object Acknowledge : SonarDeltaNotificationAction
+    data object None : SonarDeltaNotificationAction
+}
+
 object SonarNotificationRouter {
+    private const val MAX_INCOMING_CALL_AGE_SECS = 60L
+
     fun classifyContent(
         content: String,
         isCallControl: (String) -> Boolean = { false },
@@ -100,12 +110,86 @@ object SonarNotificationRouter {
             ?: renderLocal(input)
             ?: return null
         return SonarNotification(
-            id = idKey.hashCode(),
+            id = notificationId(idKey),
             title = envelope.title,
             body = envelope.body,
             kind = envelope.kind,
         )
     }
+
+    internal fun notificationId(idKey: String): Int = idKey.hashCode()
+
+    /** Route one core-authenticated incoming delta. The native lane never emits
+     * own messages, so only a parsed, fresh peer Offer can produce call UX. */
+    internal fun actionForDelta(
+        delta: SonarDrainNotification,
+        notificationsAllowed: Boolean,
+        prefs: SonarNotificationPrefs,
+        nowSecs: Long,
+        senderAllowed: Boolean = true,
+        parseCallControl: (String) -> SonarCallControl? = { null },
+    ): SonarDeltaNotificationAction {
+        if (!senderAllowed) return SonarDeltaNotificationAction.Acknowledge
+        when (val control = parseCallControl(delta.contentPreview)) {
+            is SonarCallControl.Offer -> {
+                val callNotificationId = notificationId(callNotificationKey(delta.groupId, control.callId))
+                val ageSecs = nowSecs - control.unixSecs
+                if (ageSecs !in -MAX_INCOMING_CALL_AGE_SECS..MAX_INCOMING_CALL_AGE_SECS ||
+                    !notificationsAllowed || !prefs.enabled
+                ) return SonarDeltaNotificationAction.Cancel(callNotificationId)
+                return build(
+                    idKey = callNotificationKey(delta.groupId, control.callId),
+                    kind = SonarNotificationKind.Call,
+                    conversationTitle = delta.groupName.ifBlank { null },
+                    senderName = delta.senderNpub.takeIf(String::isNotBlank)?.let(::shortNpubLabel),
+                    groupName = delta.groupName.ifBlank { null },
+                    preview = null,
+                    prefs = prefs,
+                )?.let(SonarDeltaNotificationAction::Post)
+                    ?: SonarDeltaNotificationAction.Cancel(callNotificationId)
+            }
+
+            is SonarCallControl.Answer,
+            is SonarCallControl.Cancel,
+            is SonarCallControl.End -> {
+                val ageSecs = nowSecs - delta.createdAtSecs
+                if (ageSecs !in -MAX_INCOMING_CALL_AGE_SECS..MAX_INCOMING_CALL_AGE_SECS) {
+                    // The old terminal must not dismiss a newer call, but it is
+                    // still a terminal policy decision. ACK it so replay cannot
+                    // pin the encrypted journal or fallback generation.
+                    return SonarDeltaNotificationAction.Acknowledge
+                }
+                return SonarDeltaNotificationAction.Cancel(
+                    notificationId(callNotificationKey(delta.groupId, control.callId)),
+                )
+            }
+
+            null -> Unit
+        }
+
+        if (!notificationsAllowed || !prefs.enabled) {
+            // This wake was intentionally suppressed by durable user/OS
+            // policy. ACK it explicitly; retaining it would surface a stale
+            // backlog if notifications are enabled again later.
+            return SonarDeltaNotificationAction.Acknowledge
+        }
+        val kind = classifyContent(delta.contentPreview)
+            .takeUnless { it == SonarNotificationKind.Call }
+            ?: SonarNotificationKind.Message
+        return build(
+            idKey = delta.messageId,
+            kind = kind,
+            conversationTitle = delta.groupName.ifBlank { null },
+            senderName = delta.senderNpub.takeIf(String::isNotBlank)?.let(::shortNpubLabel),
+            groupName = delta.groupName.ifBlank { null },
+            preview = delta.contentPreview,
+            unreadCount = 1,
+            prefs = prefs,
+        )?.let(SonarDeltaNotificationAction::Post) ?: SonarDeltaNotificationAction.None
+    }
+
+    internal fun callNotificationKey(groupId: String, callId: String): String =
+        "call-$groupId-$callId"
 
     private fun classifyContentLocal(
         content: String,

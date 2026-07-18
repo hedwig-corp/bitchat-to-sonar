@@ -207,6 +207,7 @@ kotlin {
         }
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
+            implementation(libs.androidx.work.runtime)
             implementation(libs.coroutines.android)
             // Android-supported WebSocket transport for relay diagnostics.
             implementation(libs.okhttp.client)

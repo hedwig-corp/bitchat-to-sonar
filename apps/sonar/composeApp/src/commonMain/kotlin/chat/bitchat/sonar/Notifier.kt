@@ -13,15 +13,23 @@ enum class SonarNotificationSound {
 expect object Notifier {
     fun ensureChannel()
     fun canNotify(): Boolean
+    /** Returns true only when the platform notification was actually posted. */
     fun notify(
         id: Int,
         title: String,
         body: String,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
         conversationId: String? = null,
-    )
+    ): Boolean
     /** Dismiss delivered notifications that belong to any of [conversationIds]. */
     fun clearConversations(conversationIds: Collection<String>)
+    /** Returns after the cancellation request has been accepted by the platform. */
+    fun cancel(id: Int): Boolean
+    /** Android has one process-wide Marmot notification owner. */
+    val ownsMarmotNotifications: Boolean
+    /** Settle the encrypted core outbox after foreground UI rendering, or
+     * surface it through the OS while the app is backgrounded. */
+    suspend fun settlePendingMarmotNotifications(appIsForeground: Boolean)
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()

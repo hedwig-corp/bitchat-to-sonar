@@ -360,9 +360,25 @@ pub struct ResolvedHandleInfo {
 /// fire rich local notifications (sender name + preview).
 #[derive(uniffi::Record)]
 pub struct DrainNotificationInfo {
+    pub message_id: String,
+    pub group_id: String,
+    pub created_at_secs: u64,
     pub sender_npub: String,
     pub group_name: String,
     pub content_preview: String,
+}
+
+/// Native-bounded result for a push-notification recovery wake. Precise
+/// notifications may be present even when `completed` is false; the host should
+/// render those immediately and defer the remaining catch-up.
+#[derive(uniffi::Record)]
+pub struct NotificationSyncResultInfo {
+    pub notifications: Vec<DrainNotificationInfo>,
+    pub completed: bool,
+    pub timed_out: bool,
+    pub truncated: bool,
+    pub processed_events: u64,
+    pub elapsed_ms: u64,
 }
 
 #[derive(uniffi::Enum)]
@@ -504,7 +520,7 @@ pub fn sonar_render_notification(
 #[derive(uniffi::Object)]
 pub struct SonarNode {
     runtime: tokio::runtime::Runtime,
-    client: SonarClient,
+    client: Arc<SonarClient>,
     /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
     /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
     #[cfg(feature = "calls-audio")]
@@ -552,7 +568,7 @@ impl SonarNode {
         ))?;
         Ok(Arc::new(Self {
             runtime,
-            client,
+            client: Arc::new(client),
             #[cfg(feature = "calls-audio")]
             call: Mutex::new(None),
         }))
@@ -960,6 +976,35 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Notification-only recovery with a deadline enforced by Rust, below the
+    /// blocking UniFFI boundary. Unlike `sync_force`, this never runs bootstrap
+    /// history, group repair, outbox, token-sharing, or subscription phases.
+    pub fn sync_notifications(&self, deadline_ms: u64) -> FfiResult<NotificationSyncResultInfo> {
+        let result = self.runtime.block_on(
+            Arc::clone(&self.client)
+                .sync_notifications(std::time::Duration::from_millis(deadline_ms)),
+        )?;
+        Ok(NotificationSyncResultInfo {
+            notifications: result
+                .notifications
+                .into_iter()
+                .map(|notification| DrainNotificationInfo {
+                    message_id: notification.message_id,
+                    group_id: notification.group_id,
+                    created_at_secs: notification.created_at_secs,
+                    sender_npub: notification.sender_pubkey,
+                    group_name: notification.group_name,
+                    content_preview: notification.content_preview,
+                })
+                .collect(),
+            completed: result.completed,
+            timed_out: result.timed_out,
+            truncated: result.truncated,
+            processed_events: result.processed_events,
+            elapsed_ms: result.elapsed_ms,
+        })
+    }
+
     /// Point-in-time JSON snapshot of relay/sync state for the Diagnostics
     /// screen and the exported debug bundle: per-relay connection status, the
     /// sync watermark, live-subscription state, and per-group catch-up floors.
@@ -1022,14 +1067,21 @@ impl SonarNode {
     /// MUST run on the host's serialized engine queue.
     pub fn drain_pending_marmot(&self) -> FfiResult<Vec<DrainNotificationInfo>> {
         let notifications = self.runtime.block_on(self.client.drain_pending_marmot())?;
-        Ok(notifications
-            .into_iter()
-            .map(|n| DrainNotificationInfo {
-                sender_npub: n.sender_pubkey,
-                group_name: n.group_name,
-                content_preview: n.content_preview,
-            })
-            .collect())
+        Ok(drain_notification_info(notifications))
+    }
+
+    /// Non-destructive peek of durable notification obligations. Rows remain
+    /// across process death until the host confirms its platform action worked.
+    pub fn pending_notifications(&self) -> FfiResult<Vec<DrainNotificationInfo>> {
+        Ok(drain_notification_info(
+            self.client.pending_notifications()?,
+        ))
+    }
+
+    /// Acknowledge only stable message ids whose OS notification post (or call
+    /// cancellation action) completed successfully.
+    pub fn ack_notifications(&self, message_ids: Vec<String>) -> FfiResult<u64> {
+        Ok(self.client.ack_notifications(&message_ids)? as u64)
     }
 
     /// All groups this identity belongs to.
@@ -2466,6 +2518,22 @@ fn notification_envelope_info(
         body: envelope.body,
         payment_sats: envelope.payment_sats,
     }
+}
+
+fn drain_notification_info(
+    notifications: Vec<sonar_core::client::DrainNotification>,
+) -> Vec<DrainNotificationInfo> {
+    notifications
+        .into_iter()
+        .map(|notification| DrainNotificationInfo {
+            message_id: notification.message_id,
+            group_id: notification.group_id,
+            created_at_secs: notification.created_at_secs,
+            sender_npub: notification.sender_pubkey,
+            group_name: notification.group_name,
+            content_preview: notification.content_preview,
+        })
+        .collect()
 }
 
 fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {

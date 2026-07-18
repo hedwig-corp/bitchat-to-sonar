@@ -139,8 +139,8 @@ protocol SecureIdentityStateManagerProtocol {
 /// All identity data is stored encrypted in the device Keychain for security.
 final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     private let keychain: KeychainManagerProtocol
-    private let cacheKey = "bitchat.identityCache.v2"
-    private let encryptionKeyName = "identityCacheEncryptionKey"
+    private static let cacheKey = "bitchat.identityCache.v2"
+    private static let encryptionKeyName = "identityCacheEncryptionKey"
     
     // In-memory state
     private var ephemeralSessions: [PeerID: EphemeralIdentity] = [:]
@@ -157,6 +157,21 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     
     // Encryption key
     private let encryptionKey: SymmetricKey
+
+    /// Read the canonical encrypted headless policy without constructing a
+    /// second mutable manager (whose deinit save could overwrite live UI
+    /// changes). Notification recovery uses this on cold/background launches.
+    static func persistedBlockedNostrPubkeys(
+        keychain: KeychainManagerProtocol = KeychainManager()
+    ) -> Set<String> {
+        guard let keyData = keychain.getIdentityKey(forKey: encryptionKeyName),
+              let encrypted = keychain.getIdentityKey(forKey: cacheKey),
+              let box = try? AES.GCM.SealedBox(combined: encrypted),
+              let clear = try? AES.GCM.open(box, using: SymmetricKey(data: keyData)),
+              let cache = try? JSONDecoder().decode(IdentityCache.self, from: clear)
+        else { return [] }
+        return Set(cache.blockedNostrPubkeys.map { $0.lowercased() })
+    }
     
     init(_ keychain: KeychainManagerProtocol) {
         self.keychain = keychain
@@ -165,7 +180,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
         let loadedKey: SymmetricKey
         
         // Try to load from keychain
-        if let keyData = keychain.getIdentityKey(forKey: encryptionKeyName) {
+        if let keyData = keychain.getIdentityKey(forKey: Self.encryptionKeyName) {
             loadedKey = SymmetricKey(data: keyData)
             SecureLogger.logKeyOperation(.load, keyType: "identity cache encryption key", success: true)
         }
@@ -174,7 +189,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
             loadedKey = SymmetricKey(size: .bits256)
             let keyData = loadedKey.withUnsafeBytes { Data($0) }
             // Save to keychain
-            let saved = keychain.saveIdentityKey(keyData, forKey: encryptionKeyName)
+            let saved = keychain.saveIdentityKey(keyData, forKey: Self.encryptionKeyName)
             SecureLogger.logKeyOperation(.generate, keyType: "identity cache encryption key", success: saved)
         }
         
@@ -191,7 +206,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     // MARK: - Secure Loading/Saving
     
     private func loadIdentityCache() {
-        guard let encryptedData = keychain.getIdentityKey(forKey: cacheKey) else {
+        guard let encryptedData = keychain.getIdentityKey(forKey: Self.cacheKey) else {
             // No existing cache, start fresh
             return
         }
@@ -249,7 +264,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
             SecureLogger.error(error, context: "Failed to encode identity cache", category: .security)
             return
         }
-        let saved = keychain.saveIdentityKey(blob, forKey: cacheKey)
+        let saved = keychain.saveIdentityKey(blob, forKey: Self.cacheKey)
         if saved {
             SecureLogger.debug("Identity cache saved to keychain", category: .security)
         }
@@ -466,13 +481,17 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
     
     func setNostrBlocked(_ pubkeyHexLowercased: String, isBlocked: Bool) {
         let key = pubkeyHexLowercased.lowercased()
-        queue.async(flags: .barrier) {
+        // This security policy is consumed by cold/headless notification
+        // recovery. The user action is rare; make it durable before returning
+        // so immediate backgrounding or process death cannot expose one more
+        // notification from the blocked sender.
+        queue.sync(flags: .barrier) {
             if isBlocked {
                 self.cache.blockedNostrPubkeys.insert(key)
             } else {
                 self.cache.blockedNostrPubkeys.remove(key)
             }
-            self.saveIdentityCache()
+            self.encryptAndWriteCache()
         }
     }
     
@@ -515,7 +534,7 @@ final class SecureIdentityStateManager: SecureIdentityStateManagerProtocol {
             self.cryptographicIdentities.removeAll()
             
             // Delete from keychain
-            let deleted = self.keychain.deleteIdentityKey(forKey: self.cacheKey)
+            let deleted = self.keychain.deleteIdentityKey(forKey: Self.cacheKey)
             SecureLogger.logKeyOperation(.delete, keyType: "identity cache", success: deleted)
         }
     }

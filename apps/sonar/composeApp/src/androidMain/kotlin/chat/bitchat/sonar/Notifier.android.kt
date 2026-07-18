@@ -63,6 +63,7 @@ actual object Notifier {
                 soundResourceId = R.raw.sonar_ble_notification,
             )
         }
+        chat.bitchat.sonar.push.SonarNotificationWorkScheduler.ensureAdmittedWork(ctx)
     }
 
     private fun ensureChannel(
@@ -92,11 +93,23 @@ actual object Notifier {
         )
     }
 
-    actual fun canNotify(): Boolean {
+    actual fun canNotify(): Boolean = canNotify(SonarNotificationSound.Default)
+
+    private fun canNotify(sound: SonarNotificationSound): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            return ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+            if (ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
                 PackageManager.PERMISSION_GRANTED
+            ) return false
         }
+        val nm = manager()
+        if (!nm.areNotificationsEnabled()) return false
+        val channel = when (sound) {
+            SonarNotificationSound.Default -> MESSAGE_CHANNEL
+            SonarNotificationSound.Ble -> BLE_CHANNEL
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            nm.getNotificationChannel(channel)?.importance == NotificationManager.IMPORTANCE_NONE
+        ) return false
         return true
     }
 
@@ -126,8 +139,8 @@ actual object Notifier {
         body: String,
         sound: SonarNotificationSound,
         conversationId: String?,
-    ) {
-        if (!canNotify()) return
+    ): Boolean {
+        if (!canNotify(sound)) return false
         val open = Intent(ctx, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
@@ -153,6 +166,37 @@ actual object Notifier {
             .setContentIntent(pi)
             .build()
         manager().notify(id, n)
+        return true
+    }
+
+    actual fun cancel(id: Int): Boolean {
+        manager().cancel(id)
+        return true
+    }
+
+    actual val ownsMarmotNotifications: Boolean = true
+
+    actual suspend fun settlePendingMarmotNotifications(appIsForeground: Boolean) {
+        if (appIsForeground) {
+            // This call is made only after SonarAppState has repainted its
+            // local database snapshot. That foreground UI delivery is the
+            // successful host action, so no later background wake should alert
+            // for the same rows.
+            val messageIds = SonarCore.pendingNotifications().map { it.messageId }
+            if (messageIds.isNotEmpty() && SonarCore.ackNotifications(messageIds) > 0) {
+                val state = chat.bitchat.sonar.push.SonarNotificationAdmission.current(ctx)
+                val ownerId = chat.bitchat.sonar.push.SonarPushPrefs.accountOwnerId()
+                if (ownerId != null && state.belongsTo(ownerId)) {
+                    chat.bitchat.sonar.push.SonarNotificationAdmission.markSurfaced(
+                        ctx,
+                        ownerId,
+                        state.generation,
+                    )
+                }
+            }
+        } else {
+            chat.bitchat.sonar.push.SonarNotificationRecovery.surfacePending(ctx)
+        }
     }
 
     actual fun clearConversations(conversationIds: Collection<String>) {

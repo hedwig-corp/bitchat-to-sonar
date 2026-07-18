@@ -27,9 +27,10 @@ use sonar_stickers::{
     STICKER_PACK_KIND, USER_STICKER_PACKS_KIND,
 };
 
+use crate::call::signaling::CallControl;
 use crate::conversation_index::{
     index_db_path_for_db, wipe_index_for_db, ConversationChangeListener, ConversationIndex,
-    ConversationSummary,
+    ConversationSummary, NotificationGroupCandidate, PendingNotification,
 };
 use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
@@ -37,7 +38,7 @@ use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
-use crate::outbox::{outbox_state_path_for_db, OutboxState};
+use crate::outbox::{outbox_state_path_for_db, MembershipOutboxEntry, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
@@ -779,6 +780,31 @@ fn retryable_media_http_error(error: &Error) -> bool {
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Push-wake recovery is deliberately smaller than a normal forced sync. The
+/// host-provided deadline is clamped here, in the native layer, so a stale or
+/// buggy shell cannot turn an OS notification wake into minutes of relay work.
+const NOTIFICATION_SYNC_MIN_DEADLINE: Duration = Duration::from_millis(250);
+const NOTIFICATION_SYNC_MAX_DEADLINE: Duration = Duration::from_secs(15);
+/// A push wake may decrypt only this many already-watermarked kind-445 events.
+/// A full-history/bootstrap scan belongs to foreground/durable catch-up.
+const NOTIFICATION_SYNC_EVENT_LIMIT: usize = 128;
+/// Same-second bursts cannot be paged by event id with a Nostr Filter. Grow the
+/// timestamp page across wakes up to a bounded ceiling; if even this saturates,
+/// keep the continuation incomplete rather than skipping or claiming success.
+const NOTIFICATION_SYNC_MAX_EVENT_LIMIT: usize = 4_096;
+/// Reconcile only bounded recent local windows after a crash between MDK's
+/// message commit and the encrypted notification journal transaction.
+const NOTIFICATION_RECONCILE_GROUP_LIMIT: usize = 64;
+const NOTIFICATION_RECONCILE_MESSAGE_LIMIT: usize = 64;
+/// Notification relay filters and crash reconciliation share one bounded,
+/// keyset-paged group window. A complete pass advances the global watermark;
+/// intermediate pages persist their cursor and frozen target across wakes.
+const NOTIFICATION_GROUP_LIMIT: usize = 64;
+/// Opening live subscriptions is opportunistic during construction. Explicit
+/// notification recovery does not depend on them, so never let subscription
+/// setup consume the OS wake window.
+const MARMOT_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Extra lookback applied ONLY to the gift-wrap (welcome) `.since` filter.
 /// NIP-59 deliberately backdates a gift wrap's `created_at` (up to ~2 days, we
 /// use a comfortable margin) to defeat timing analysis, so a tight watermark
@@ -863,6 +889,101 @@ fn should_fetch_group_messages_on_sync(is_live: bool, force: bool, since_secs: u
         return true;
     }
     force && since_secs > 0
+}
+
+fn notification_sync_deadline(requested: Duration) -> Duration {
+    requested.clamp(
+        NOTIFICATION_SYNC_MIN_DEADLINE,
+        NOTIFICATION_SYNC_MAX_DEADLINE,
+    )
+}
+
+fn notification_events_truncated(event_count: usize, page_limit: usize) -> bool {
+    event_count > page_limit
+}
+
+fn notification_page_requires_continuation(since_secs: u64, truncated: bool) -> bool {
+    // A first-run notification wake samples only the newest bounded page and
+    // establishes its watermark. Older history belongs to foreground catch-up;
+    // walking it here can never converge under mobile background retry caps.
+    since_secs > 0 && truncated
+}
+
+fn next_notification_page_limit(
+    page_limit: usize,
+    filter_until_secs: u64,
+    boundary_secs: u64,
+) -> usize {
+    if boundary_secs == filter_until_secs {
+        page_limit
+            .saturating_mul(2)
+            .min(NOTIFICATION_SYNC_MAX_EVENT_LIMIT)
+    } else {
+        NOTIFICATION_SYNC_EVENT_LIMIT
+    }
+}
+
+fn notification_page_complete(
+    relay_set_complete: bool,
+    timed_out: bool,
+    truncated: bool,
+    retryable_failures: usize,
+) -> bool {
+    relay_set_complete && !timed_out && !truncated && retryable_failures == 0
+}
+
+fn notification_snapshot_target(saved_target_secs: Option<u64>, now_secs: u64) -> u64 {
+    saved_target_secs.unwrap_or(now_secs)
+}
+
+async fn notification_phase_until<T>(
+    deadline: tokio::time::Instant,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    tokio::time::timeout(remaining, future).await.ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MembershipPublicationMode {
+    Immediate,
+    DeferAfterPersistence,
+}
+
+#[derive(Clone, Debug)]
+struct NotificationGroup {
+    mls_group_id: GroupId,
+    nostr_group_id_hex: String,
+    name: String,
+}
+
+#[derive(Debug)]
+struct NotificationGroupWindow {
+    groups: Vec<NotificationGroup>,
+    /// Cursor for the next bounded page. `None` means this page completed the
+    /// full catalog pass and the frozen notification target may advance.
+    next_cursor: Option<String>,
+}
+
+/// Notification recovery only owns the durable local safe point. Once the
+/// exact evolution event is in the membership outbox, relay publication moves
+/// to the normal retry lane so a non-responsive relay cannot hold an OS wake.
+async fn membership_publication_for_mode<F>(
+    mode: MembershipPublicationMode,
+    _persisted: bool,
+    publication: F,
+) -> Option<Result<()>>
+where
+    F: Future<Output = Result<()>>,
+{
+    if mode == MembershipPublicationMode::DeferAfterPersistence {
+        None
+    } else {
+        Some(publication.await)
+    }
 }
 
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
@@ -1028,6 +1149,21 @@ impl LiveEventDeduper {
 struct SyncStateDisk {
     version: u32,
     watermark_secs: u64,
+    /// Inclusive upper bound for an unfinished notification-recovery page.
+    /// Optional so v1 sidecars written before this field remain readable.
+    #[serde(default)]
+    notification_until_secs: Option<u64>,
+    /// Watermark ceiling captured when the overflow walk began. Without this,
+    /// a later wake could advance past newer events that arrived mid-walk.
+    #[serde(default)]
+    notification_target_secs: Option<u64>,
+    /// Persisted expansion for a timestamp containing more than one base page.
+    #[serde(default)]
+    notification_page_limit: Option<usize>,
+    /// Last MLS group id completed in the current bounded notification pass.
+    /// Keyset paging resumes strictly after this id; optional for v1 sidecars.
+    #[serde(default)]
+    notification_group_cursor: Option<String>,
     processed_event_ids: Vec<String>,
 }
 
@@ -1070,6 +1206,10 @@ pub struct GroupFloorSnapshot {
 struct SyncState {
     path: Option<PathBuf>,
     watermark_secs: u64,
+    notification_until_secs: Option<u64>,
+    notification_target_secs: Option<u64>,
+    notification_page_limit: usize,
+    notification_group_cursor: Option<String>,
     processed_event_ids: HashSet<String>,
     processed_event_order: VecDeque<String>,
     dirty: bool,
@@ -1087,18 +1227,53 @@ impl SyncState {
             .and_then(|bytes| serde_json::from_slice::<SyncStateDisk>(&bytes).ok())
             .filter(|state| state.version == SYNC_STATE_VERSION);
 
-        let (disk_watermark, processed_event_ids) = disk
-            .map(|state| (state.watermark_secs, state.processed_event_ids))
-            .unwrap_or((0, Vec::new()));
+        let (
+            disk_watermark,
+            notification_until_secs,
+            notification_target_secs,
+            notification_page_limit,
+            notification_group_cursor,
+            processed_event_ids,
+        ) = disk
+            .map(|state| {
+                (
+                    state.watermark_secs,
+                    state.notification_until_secs,
+                    state.notification_target_secs,
+                    state.notification_page_limit,
+                    state.notification_group_cursor,
+                    state.processed_event_ids,
+                )
+            })
+            .unwrap_or((0, None, None, None, None, Vec::new()));
         let watermark_secs = conservative_watermark(disk_watermark, fallback_watermark_secs);
 
-        Self::new(path, watermark_secs, processed_event_ids)
+        let mut state = Self::new(path, watermark_secs, processed_event_ids);
+        if notification_until_secs.is_some()
+            || notification_target_secs.is_some()
+            || notification_group_cursor.is_some()
+        {
+            state.notification_until_secs = notification_until_secs;
+            state.notification_target_secs = notification_target_secs;
+            state.notification_group_cursor = notification_group_cursor;
+            state.notification_page_limit = notification_page_limit
+                .unwrap_or(NOTIFICATION_SYNC_EVENT_LIMIT)
+                .clamp(
+                    NOTIFICATION_SYNC_EVENT_LIMIT,
+                    NOTIFICATION_SYNC_MAX_EVENT_LIMIT,
+                );
+        }
+        state
     }
 
     fn new(path: Option<PathBuf>, watermark_secs: u64, processed_event_ids: Vec<String>) -> Self {
         let mut state = Self {
             path,
             watermark_secs,
+            notification_until_secs: None,
+            notification_target_secs: None,
+            notification_page_limit: NOTIFICATION_SYNC_EVENT_LIMIT,
+            notification_group_cursor: None,
             processed_event_ids: HashSet::new(),
             processed_event_order: VecDeque::new(),
             dirty: false,
@@ -1112,6 +1287,46 @@ impl SyncState {
 
     fn watermark_secs(&self) -> u64 {
         self.watermark_secs
+    }
+
+    fn notification_page(&self) -> (Option<u64>, Option<u64>, usize) {
+        (
+            self.notification_until_secs,
+            self.notification_target_secs,
+            self.notification_page_limit,
+        )
+    }
+
+    fn notification_group_cursor(&self) -> Option<String> {
+        self.notification_group_cursor.clone()
+    }
+
+    fn set_notification_group_cursor(&mut self, cursor: Option<String>) {
+        if self.notification_group_cursor != cursor {
+            self.notification_group_cursor = cursor;
+            self.dirty = true;
+        }
+    }
+
+    fn set_notification_page(
+        &mut self,
+        until_secs: Option<u64>,
+        target_secs: Option<u64>,
+        page_limit: usize,
+    ) {
+        let page_limit = page_limit.clamp(
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+            NOTIFICATION_SYNC_MAX_EVENT_LIMIT,
+        );
+        if self.notification_until_secs != until_secs
+            || self.notification_target_secs != target_secs
+            || self.notification_page_limit != page_limit
+        {
+            self.notification_until_secs = until_secs;
+            self.notification_target_secs = target_secs;
+            self.notification_page_limit = page_limit;
+            self.dirty = true;
+        }
     }
 
     fn has_processed(&self, event_id: &str) -> bool {
@@ -1179,14 +1394,28 @@ impl SyncState {
         let disk = SyncStateDisk {
             version: SYNC_STATE_VERSION,
             watermark_secs: self.watermark_secs,
+            notification_until_secs: self.notification_until_secs,
+            notification_target_secs: self.notification_target_secs,
+            notification_page_limit: Some(self.notification_page_limit),
+            notification_group_cursor: self.notification_group_cursor.clone(),
             processed_event_ids: self.processed_event_order.iter().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&disk)?;
         let tmp = sync_state_tmp_path(path);
         fs::write(&tmp, bytes)
             .map_err(|e| Error::Storage(format!("write sync state {}: {e}", tmp.display())))?;
+        fs::File::open(&tmp)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| Error::Storage(format!("sync sync state {}: {e}", tmp.display())))?;
         fs::rename(&tmp, path)
             .map_err(|e| Error::Storage(format!("replace sync state {}: {e}", path.display())))?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| {
+                    Error::Storage(format!("sync sync-state dir {}: {e}", parent.display()))
+                })?;
+        }
         self.dirty = false;
         Ok(())
     }
@@ -1243,15 +1472,44 @@ impl RelayFetchOutcome {
     fn completed_quorum(&self) -> bool {
         self.completed_relays >= relay_fetch_quorum(self.total_relays)
     }
+
+    fn completed_all(&self) -> bool {
+        self.total_relays > 0 && self.completed_relays == self.total_relays
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelayFetchCompletion {
+    Quorum,
+    All,
 }
 
 /// Info about an incoming message discovered during drain, used by hosts to
 /// fire rich local notifications (sender name + preview).
 #[derive(Clone, Debug)]
 pub struct DrainNotification {
+    pub message_id: String,
+    pub group_id: String,
+    pub created_at_secs: u64,
     pub sender_pubkey: String,
     pub group_name: String,
     pub content_preview: String,
+}
+
+/// Result of the notification-only recovery lane.
+///
+/// `completed` means every configured relay answered and every event in the capped
+/// window was handled without retryable work. A false value asks the host to
+/// schedule normal foreground/durable catch-up; it does not discard the
+/// precise notifications already returned here.
+#[derive(Clone, Debug, Default)]
+pub struct NotificationSyncResult {
+    pub notifications: Vec<DrainNotification>,
+    pub completed: bool,
+    pub timed_out: bool,
+    pub truncated: bool,
+    pub processed_events: u64,
+    pub elapsed_ms: u64,
 }
 
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
@@ -1369,6 +1627,10 @@ pub struct SonarClient {
     /// relay publish. (Incoming membership commits from OTHERS are inherently
     /// racy with sends across the network and are not gated.)
     membership_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Single-flight owner for notification recovery. The native call remains
+    /// joined to this guard through its last MLS/SQLite transaction; hosts can
+    /// therefore join the blocking call before account replacement or wipe.
+    notification_sync_gate: Arc<tokio::sync::Mutex<()>>,
     /// How many times the live pending buffer dropped its oldest half.
     buffer_drops_total: Arc<AtomicUsize>,
     /// True after the real-session Marmot live tail is opened. Local group
@@ -1428,13 +1690,8 @@ pub struct SonarClient {
     sticker_ref_prefetch_inflight: StickerRefPrefetchInflight,
     /// This device's own push registration (set after `register_push_token`).
     own_push_registration: Arc<Mutex<Option<crate::push::OwnPushRegistration>>>,
-    /// Incoming-message notifications produced by the forced-sync gap-recovery
-    /// fetch in `sync_inner`. A push-wake host calls `sync_force()` then
-    /// `drain_pending_marmot()`; the recovered messages are stored by the sync
-    /// call, so their notifications are parked here and returned by the drain so
-    /// the host still surfaces a precise local notification. Deduped by event id
-    /// through the shared processed-ID set, so a message delivered by both the
-    /// sync fetch and the live buffer notifies at most once.
+    /// Volatile fallback used only by in-memory/test clients. Persistent clients
+    /// park notification obligations in the encrypted conversation index.
     pending_sync_notifications: Arc<Mutex<Vec<DrainNotification>>>,
     /// The claimed human-readable handle (`name@domain`), if any. Loaded from
     /// its sidecar at connect and merged as `nip05` into every kind-0 publish
@@ -1615,6 +1872,7 @@ impl SonarClient {
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
+        let notification_sync_gate = Arc::new(tokio::sync::Mutex::new(()));
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
@@ -1891,6 +2149,7 @@ impl SonarClient {
             marmot_notify,
             send_inflight,
             membership_gate,
+            notification_sync_gate,
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
@@ -1925,8 +2184,17 @@ impl SonarClient {
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
         // the e2e tests remain deterministic and network-shaped.
         if allow_geo_relays {
-            if let Err(err) = client.subscribe_marmot().await {
-                tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
+            match tokio::time::timeout(MARMOT_SUBSCRIBE_TIMEOUT, client.subscribe_marmot()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::debug!(%err, "marmot live subscribe failed (sync() still covers it)");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = MARMOT_SUBSCRIBE_TIMEOUT.as_millis() as u64,
+                        "marmot live subscribe timed out (explicit sync still covers it)"
+                    );
+                }
             }
             tracing::info!(
                 elapsed_ms = boot_start.elapsed().as_millis() as u64,
@@ -3520,7 +3788,7 @@ impl SonarClient {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(%err, "failed to load retryable outbox events");
-                    return;
+                    Vec::new()
                 }
             }
         };
@@ -3529,6 +3797,82 @@ impl SonarClient {
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
         }
+        self.retry_membership_outbox(&active_group_ids).await;
+    }
+
+    async fn retry_membership_outbox(&self, active_group_ids: &HashSet<String>) {
+        let updates = {
+            let mut outbox = self.outbox_state.lock().unwrap();
+            match outbox.retryable_membership_updates(active_group_ids) {
+                Ok(updates) => updates,
+                Err(err) => {
+                    tracing::error!(%err, "failed to load deferred membership updates");
+                    return;
+                }
+            }
+        };
+        for update in updates {
+            if let Err(err) = self.attempt_deferred_membership_update(update).await {
+                tracing::warn!(%err, "deferred membership update retry failed");
+            }
+        }
+    }
+
+    /// Publish and merge an auto-commit that was durably recorded before the
+    /// incoming proposal was acknowledged. The exact event is safe to publish
+    /// repeatedly. `base_epoch` makes merge recovery deterministic across the
+    /// two crash windows (after publish, and after merge).
+    async fn attempt_deferred_membership_update(&self, entry: MembershipOutboxEntry) -> Result<()> {
+        let evolution_event_id_hex = entry.evolution_event_id_hex.clone();
+        let result = async {
+            let group_bytes = hex::decode(&entry.group_id_hex)
+                .map_err(|err| Error::Storage(format!("membership group id decode: {err}")))?;
+            let group_id = GroupId::from_slice(&group_bytes);
+            let event = Event::from_json(&entry.event_json)
+                .map_err(|err| Error::Storage(format!("membership event decode: {err}")))?;
+            if event.id.to_hex() != entry.evolution_event_id_hex {
+                return Err(Error::Storage(
+                    "membership outbox event id mismatch".into(),
+                ));
+            }
+
+            // Exclude sends until the staged commit is either merged or left
+            // durably pending for the next retry.
+            let _epoch = self.membership_gate.write().await;
+            self.publish_marmot_event(&event, "deferred membership update")
+                .await?;
+            let current_epoch = self.engine.group_epoch(&group_id)?;
+            if current_epoch == entry.base_epoch {
+                self.engine.merge_pending_commit(&group_id)?;
+            } else if current_epoch < entry.base_epoch {
+                return Err(Error::Storage(format!(
+                    "membership epoch regressed from {} to {current_epoch}",
+                    entry.base_epoch
+                )));
+            }
+
+            self.outbox_state
+                .lock()
+                .unwrap()
+                .mark_membership_complete(&evolution_event_id_hex)?;
+            self.notify_conversation_changed(&entry.group_id_hex);
+            if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
+                tracing::debug!(%err, "marmot live resubscribe failed after deferred membership update");
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = &result {
+            if let Err(save_err) = self.outbox_state.lock().unwrap().mark_membership_failed(
+                &evolution_event_id_hex,
+                err.to_string(),
+                Timestamp::now().as_secs(),
+            ) {
+                tracing::error!(%save_err, %err, "failed to persist deferred membership retry error");
+            }
+        }
+        result
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
@@ -3803,6 +4147,283 @@ impl SonarClient {
         self.sync_inner(true).await
     }
 
+    /// Recover precise incoming-message notifications inside a native deadline.
+    ///
+    /// This is intentionally NOT `sync_force()` with a timeout. It only fetches
+    /// an established, overlapping watermark window for the user's current MLS
+    /// groups, caps the relay result, and processes one event at a time. It does
+    /// not run welcome/full-history backfills, unrelated-group repair, outbox
+    /// publication, push-token sharing, or subscription maintenance. Each
+    /// completed event's notification is parked immediately, so timeout and
+    /// retry remain partial-progress-safe and idempotent.
+    pub async fn sync_notifications(
+        self: Arc<Self>,
+        requested_deadline: Duration,
+    ) -> Result<NotificationSyncResult> {
+        let budget = notification_sync_deadline(requested_deadline);
+        let started_at = Instant::now();
+        let deadline = tokio::time::Instant::now() + budget;
+
+        let gate = match notification_phase_until(
+            deadline,
+            Arc::clone(&self.notification_sync_gate).lock_owned(),
+        )
+        .await
+        {
+            Some(gate) => gate,
+            None => {
+                return Ok(NotificationSyncResult {
+                    notifications: self.pending_notifications()?,
+                    timed_out: true,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    ..NotificationSyncResult::default()
+                });
+            }
+        };
+
+        // Do not detach a native worker at the deadline. Every network phase is
+        // bounded below, and event processing checks the deadline between
+        // atomic MLS/SQLite commits. Returning only after the current commit
+        // reaches a safe point lets the host's lifecycle write-lock genuinely
+        // join recovery before deleting or replacing the account database.
+        let _gate = gate;
+        let mut result = self
+            .sync_notifications_inner(budget, started_at, deadline)
+            .await?;
+        result.notifications = self.pending_notifications()?;
+        result.elapsed_ms = started_at.elapsed().as_millis() as u64;
+        Ok(result)
+    }
+
+    async fn sync_notifications_inner(
+        &self,
+        budget: Duration,
+        started_at: Instant,
+        deadline: tokio::time::Instant,
+    ) -> Result<NotificationSyncResult> {
+        let since_secs = self.sync_watermark_secs();
+        let sync_started_secs = Timestamp::now().as_secs();
+        let (_, saved_target_secs, _) = self.notification_sync_page();
+        let notification_target_secs =
+            notification_snapshot_target(saved_target_secs, sync_started_secs);
+        let group_window = match self.notification_group_window(deadline)? {
+            Some(window) => window,
+            None => {
+                return Ok(NotificationSyncResult {
+                    notifications: Vec::new(),
+                    timed_out: true,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    ..NotificationSyncResult::default()
+                });
+            }
+        };
+        if since_secs > 0 {
+            let (_, reconciliation_completed) = self.reconcile_notification_journal(
+                &group_window.groups,
+                since_secs.saturating_sub(SYNC_OVERLAP_SECS),
+                notification_target_secs,
+                deadline,
+            )?;
+            if !reconciliation_completed {
+                return Ok(NotificationSyncResult {
+                    notifications: Vec::new(),
+                    timed_out: true,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    ..NotificationSyncResult::default()
+                });
+            }
+        }
+        let group_ids: Vec<String> = group_window
+            .groups
+            .iter()
+            .map(|group| group.nostr_group_id_hex.clone())
+            .collect();
+        if group_ids.is_empty() || self.relays.is_empty() {
+            if group_ids.is_empty() && group_window.next_cursor.is_some() {
+                // This bounded page contained only stale index rows. Advance
+                // the keyset cursor, but never claim the whole cycle complete.
+                self.complete_notification_group_window(
+                    group_window.next_cursor,
+                    notification_target_secs,
+                )?;
+            }
+            // No known group can be queried yet. Hosts bound the number of
+            // durable retries; foreground welcome/bootstrap processing remains
+            // responsible for creating the first group.
+            return Ok(NotificationSyncResult {
+                notifications: Vec::new(),
+                elapsed_ms: started_at.elapsed().as_millis() as u64,
+                ..NotificationSyncResult::default()
+            });
+        }
+
+        let (saved_until_secs, saved_target_secs, page_limit) = self.notification_sync_page();
+        let notification_target_secs =
+            notification_snapshot_target(saved_target_secs, sync_started_secs);
+        let filter_until_secs = saved_until_secs.unwrap_or(notification_target_secs);
+        // Persist the frozen snapshot before the first relay/MLS await. A crash
+        // after MDK stages an auto-commit but before its outbox row is written
+        // must refetch the same source proposal instead of letting newer events
+        // displace it from a fresh latest-N window.
+        self.checkpoint_notification_sync(filter_until_secs, notification_target_secs, page_limit)?;
+        let mut filter = Filter::new()
+            .kind(Kind::MlsGroupMessage)
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_ids)
+            // LIMIT+1 distinguishes an exact full page from real overflow.
+            .limit(page_limit + 1)
+            // Inclusive on purpose. A crash after processing but before saving
+            // the next cursor may replay the boundary event, which durable
+            // processed IDs make harmless; subtracting one would skip peers
+            // whose events share that timestamp. The target is frozen across
+            // continuation wakes so newer arrivals are never skipped.
+            .until(Timestamp::from_secs(filter_until_secs));
+        if since_secs > 0 {
+            filter = filter.since(Timestamp::from_secs(
+                since_secs.saturating_sub(SYNC_OVERLAP_SECS),
+            ));
+        }
+
+        let fetch = notification_phase_until(
+            deadline,
+            self.fetch_marmot_events_from_relay_quorum(
+                filter,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                "notification group message sync",
+                RelayFetchCompletion::All,
+            ),
+        )
+        .await;
+
+        let outcome = match fetch {
+            None => {
+                self.save_sync_state()?;
+                return Ok(NotificationSyncResult {
+                    notifications: Vec::new(),
+                    timed_out: true,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    ..NotificationSyncResult::default()
+                });
+            }
+            Some(Err(err)) => {
+                tracing::debug!(%err, "notification relay fetch incomplete");
+                self.save_sync_state()?;
+                return Ok(NotificationSyncResult {
+                    notifications: Vec::new(),
+                    timed_out: tokio::time::Instant::now() >= deadline,
+                    elapsed_ms: started_at.elapsed().as_millis() as u64,
+                    ..NotificationSyncResult::default()
+                });
+            }
+            Some(Ok(outcome)) => outcome,
+        };
+
+        let relay_set_complete = outcome.completed_all();
+        let mut events = sort_marmot_events(outcome.events);
+        let page_overflow = notification_events_truncated(events.len(), page_limit);
+        let truncated = notification_page_requires_continuation(since_secs, page_overflow);
+        if page_overflow {
+            // Relay filters return the newest matches. Keep the newest bounded
+            // page and checkpoint its oldest timestamp only after every event
+            // in the page commits locally.
+            let keep_from = events.len() - page_limit;
+            events.drain(..keep_from);
+        }
+        let next_until_secs = events.first().map(|event| event.created_at.as_secs());
+        let mut process_report = MarmotProcessReport::default();
+        let mut timed_out = false;
+        let notification_group_names = group_window
+            .groups
+            .iter()
+            .map(|group| (group.mls_group_id.as_slice().to_vec(), group.name.clone()))
+            .collect::<HashMap<_, _>>();
+
+        for event in events {
+            if tokio::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            // One event per call makes notification publication atomic at the
+            // recovery boundary: a completed message is queued before the next
+            // await/deadline check. Proposal auto-commits first enter the
+            // durable membership outbox; relay publication is left to the
+            // normal retry lane so it cannot outlive this public deadline.
+            let (report, notifications) = self
+                .process_marmot_events(
+                    [event],
+                    "notification group message",
+                    Some(if since_secs == 0 {
+                        sync_started_secs.saturating_sub(SYNC_OVERLAP_SECS)
+                    } else {
+                        since_secs.saturating_sub(SYNC_OVERLAP_SECS)
+                    }),
+                    MembershipPublicationMode::DeferAfterPersistence,
+                    Some(&notification_group_names),
+                )
+                .await;
+            process_report.absorb(report);
+            if !notifications.is_empty() {
+                self.queue_sync_notifications(notifications);
+            }
+        }
+
+        // A single local MLS/SQLite event is deliberately never cancelled
+        // mid-commit. If that final bounded slice crosses the deadline, report
+        // timeout and keep the watermark conservative even though there is no
+        // further network phase to await.
+        timed_out |= tokio::time::Instant::now() >= deadline;
+
+        let page_committed =
+            relay_set_complete && !timed_out && process_report.retryable_failures == 0;
+        let page_complete = notification_page_complete(
+            relay_set_complete,
+            timed_out,
+            truncated,
+            process_report.retryable_failures,
+        );
+        let completed = if page_complete {
+            self.complete_notification_group_window(
+                group_window.next_cursor,
+                notification_target_secs,
+            )?
+        } else if page_committed && truncated {
+            if let Some(until_secs) = next_until_secs {
+                let next_page_limit =
+                    next_notification_page_limit(page_limit, filter_until_secs, until_secs);
+                self.checkpoint_notification_sync(
+                    until_secs,
+                    notification_target_secs,
+                    next_page_limit,
+                )?;
+            } else {
+                self.save_sync_state()?;
+            }
+            false
+        } else {
+            self.save_or_rewind_without_advancing_watermark(process_report)?;
+            false
+        };
+
+        let result = NotificationSyncResult {
+            notifications: Vec::new(),
+            completed,
+            timed_out,
+            truncated,
+            processed_events: process_report.processed as u64,
+            elapsed_ms: started_at.elapsed().as_millis() as u64,
+        };
+        tracing::info!(
+            completed = result.completed,
+            timed_out = result.timed_out,
+            truncated = result.truncated,
+            processed_events = result.processed_events,
+            notifications = result.notifications.len(),
+            elapsed_ms = result.elapsed_ms,
+            budget_ms = budget.as_millis() as u64,
+            "notification sync complete"
+        );
+        Ok(result)
+    }
+
     async fn sync_inner(&self, force: bool) -> Result<()> {
         // Watermark from the previous successful sync (0 on the first poll of a
         // session → an unbounded backfill, bounded only by the `#p`/`#h` scope).
@@ -3852,12 +4473,25 @@ impl SonarClient {
         // built from `self.relays`, so conformant peers publish welcomes there.
         let ids_before = self.current_group_ids()?;
         let wraps = self
-            .fetch_marmot_events_from_relay_quorum(wraps, FETCH_TIMEOUT, "gift wrap sync")
+            .fetch_marmot_events_from_relay_quorum(
+                wraps,
+                FETCH_TIMEOUT,
+                "gift wrap sync",
+                RelayFetchCompletion::Quorum,
+            )
             .await?;
         if !wraps.completed_quorum() {
             process_report.record_retryable(started);
         }
-        let (wrap_report, _) = self.process_marmot_events(wraps.events, "gift wrap").await;
+        let (wrap_report, _) = self
+            .process_marmot_events(
+                wraps.events,
+                "gift wrap",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
+            .await;
         process_report.absorb(wrap_report);
 
         // A welcome processed during sync can add group(s). Backfill all new
@@ -3924,13 +4558,24 @@ impl SonarClient {
                 ));
             }
             let events = self
-                .fetch_marmot_events_from_relay_quorum(filter, FETCH_TIMEOUT, "group message sync")
+                .fetch_marmot_events_from_relay_quorum(
+                    filter,
+                    FETCH_TIMEOUT,
+                    "group message sync",
+                    RelayFetchCompletion::Quorum,
+                )
                 .await?;
             if !events.completed_quorum() {
                 process_report.record_retryable(started);
             }
             let (msg_report, msg_notifications) = self
-                .process_marmot_events(events.events, "group message")
+                .process_marmot_events(
+                    events.events,
+                    "group message",
+                    (since_secs > 0).then_some(since_secs.saturating_sub(SYNC_OVERLAP_SECS)),
+                    MembershipPublicationMode::Immediate,
+                    None,
+                )
                 .await;
             process_report.absorb(msg_report);
             // Route this fetch's incoming-message notifications to the drain
@@ -4332,9 +4977,99 @@ impl SonarClient {
         self.sync_state.lock().unwrap().save_if_dirty()
     }
 
+    fn notification_sync_page(&self) -> (Option<u64>, Option<u64>, usize) {
+        self.sync_state.lock().unwrap().notification_page()
+    }
+
+    fn notification_group_cursor(&self) -> Option<String> {
+        self.sync_state.lock().unwrap().notification_group_cursor()
+    }
+
+    /// Resolve one bounded keyset page from the encrypted conversation index.
+    /// Every MDK lookup is one-group-only and preceded by a deadline check.
+    /// The LIMIT+1 row is consumed only as a continuation signal.
+    fn notification_group_window(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<NotificationGroupWindow>> {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        let Some(ref index) = self.conversation_index else {
+            return Ok(Some(NotificationGroupWindow {
+                groups: Vec::new(),
+                next_cursor: None,
+            }));
+        };
+        let cursor = self.notification_group_cursor();
+        let rows = index
+            .lock()
+            .unwrap()
+            .notification_group_candidates_after(cursor.as_deref(), NOTIFICATION_GROUP_LIMIT + 1)?;
+        let has_more = rows.len() > NOTIFICATION_GROUP_LIMIT;
+        let selected_rows = rows.into_iter().take(NOTIFICATION_GROUP_LIMIT);
+        let mut groups = Vec::with_capacity(NOTIFICATION_GROUP_LIMIT);
+        let mut page_cursor = cursor;
+        for NotificationGroupCandidate { group_id_hex, name } in selected_rows {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            page_cursor = Some(group_id_hex.clone());
+            let group_bytes = hex::decode(&group_id_hex)
+                .map_err(|err| Error::Storage(format!("notification group id decode: {err}")))?;
+            let group_id = GroupId::from_slice(&group_bytes);
+            let Some(group) = self.engine.group(&group_id)? else {
+                continue;
+            };
+            groups.push(NotificationGroup {
+                mls_group_id: group.mls_group_id,
+                nostr_group_id_hex: hex::encode(group.nostr_group_id),
+                name: if name.is_empty() { group.name } else { name },
+            });
+        }
+        Ok(Some(NotificationGroupWindow {
+            groups,
+            next_cursor: has_more.then_some(page_cursor).flatten(),
+        }))
+    }
+
+    fn checkpoint_notification_sync(
+        &self,
+        until_secs: u64,
+        target_secs: u64,
+        page_limit: usize,
+    ) -> Result<()> {
+        {
+            let mut state = self.sync_state.lock().unwrap();
+            state.set_notification_page(Some(until_secs), Some(target_secs), page_limit);
+        }
+        self.save_sync_state()
+    }
+
+    fn complete_notification_group_window(
+        &self,
+        next_cursor: Option<String>,
+        target_secs: u64,
+    ) -> Result<bool> {
+        if let Some(cursor) = next_cursor {
+            {
+                let mut state = self.sync_state.lock().unwrap();
+                state.set_notification_group_cursor(Some(cursor));
+                state.set_notification_page(None, Some(target_secs), NOTIFICATION_SYNC_EVENT_LIMIT);
+            }
+            self.save_sync_state()?;
+            Ok(false)
+        } else {
+            self.advance_sync_watermark(target_secs)?;
+            Ok(true)
+        }
+    }
+
     fn advance_sync_watermark(&self, watermark_secs: u64) -> Result<()> {
         {
             let mut state = self.sync_state.lock().unwrap();
+            state.set_notification_page(None, None, NOTIFICATION_SYNC_EVENT_LIMIT);
+            state.set_notification_group_cursor(None);
             state.advance_watermark(watermark_secs);
         }
         self.save_sync_state()
@@ -4364,6 +5099,7 @@ impl SonarClient {
         filter: Filter,
         timeout: Duration,
         context: &'static str,
+        completion: RelayFetchCompletion,
     ) -> Result<RelayFetchOutcome> {
         let total_relays = self.relays.len();
         if total_relays == 0 {
@@ -4375,6 +5111,10 @@ impl SonarClient {
         }
 
         let quorum = relay_fetch_quorum(total_relays);
+        let required_completions = match completion {
+            RelayFetchCompletion::Quorum => quorum,
+            RelayFetchCompletion::All => total_relays,
+        };
         let mut tasks = tokio::task::JoinSet::new();
         for relay in self.relays.clone() {
             let nostr = self.nostr.clone();
@@ -4393,7 +5133,9 @@ impl SonarClient {
         let mut seen = HashSet::new();
         let mut last_error: Option<String> = None;
 
-        while completed_relays < quorum && completed_relays + failed_relays < total_relays {
+        while completed_relays < required_completions
+            && completed_relays + failed_relays < total_relays
+        {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 break;
@@ -4413,6 +5155,7 @@ impl SonarClient {
                         relay,
                         accepted,
                         completed_relays,
+                        required_completions,
                         quorum,
                         total_relays,
                         context,
@@ -4464,6 +5207,7 @@ impl SonarClient {
                 failed_relays,
                 total_relays,
                 quorum,
+                required_completions,
                 context,
                 "relay fetch returned before all relays completed"
             );
@@ -4533,18 +5277,27 @@ impl SonarClient {
         &self,
         events: impl IntoIterator<Item = Event>,
         context: &'static str,
+        notification_floor_secs: Option<u64>,
+        membership_publication: MembershipPublicationMode,
+        bounded_group_names: Option<&HashMap<Vec<u8>, String>>,
     ) -> (MarmotProcessReport, Vec<DrainNotification>) {
         let mut report = MarmotProcessReport::default();
         let mut notifications: Vec<DrainNotification> = Vec::new();
         let mut changed_groups: HashSet<String> = HashSet::new();
         let mut sticker_refs: Vec<StickerRef> = Vec::new();
-        let group_names: HashMap<Vec<u8>, String> = self
-            .engine
-            .groups()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
-            .collect();
+        let all_group_names;
+        let group_names = if let Some(names) = bounded_group_names {
+            names
+        } else {
+            all_group_names = self
+                .engine
+                .groups()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|g| (g.mls_group_id.as_slice().to_vec(), g.name))
+                .collect::<HashMap<_, _>>();
+            &all_group_names
+        };
         for event in sort_marmot_events(events) {
             if self.is_sync_event_processed(&event.id) {
                 report.record_processed();
@@ -4632,29 +5385,77 @@ impl SonarClient {
                     report.record_processed();
                 }
                 Ok(Incoming::GroupProposal(update)) => {
-                    // Capture the group id before `update` is moved: a merged
-                    // proposal changes local membership, which the conversation
-                    // listener must see (same silent-miss class as welcomes).
+                    // MDK has already staged a local commit and marked the
+                    // incoming proposal processed. Persist the exact encrypted
+                    // evolution event before any relay await; otherwise a
+                    // notification deadline or process death can strand the
+                    // pending commit forever with no way to recreate it.
                     let proposal_group_hex = hex::encode(update.group_id.as_slice());
-                    // Auto-committing a peer proposal is a membership change
-                    // like any other: exclude sends until publish+merge done.
-                    let _epoch = self.membership_gate.write().await;
-                    match self.publish_membership_update(update).await {
-                        Ok(()) => {
+                    let evolution_event_id_hex = update.evolution_event.id.to_hex();
+                    let persistence = if update.requires_commit_merge && update.welcomes.is_empty()
+                    {
+                        self.outbox_state.lock().unwrap().mark_membership_pending(
+                            proposal_group_hex.clone(),
+                            &update.evolution_event,
+                            update.base_epoch,
+                            Timestamp::now().as_secs(),
+                        )
+                    } else {
+                        Err(Error::Storage(
+                            "incoming proposal produced unsupported membership payload".into(),
+                        ))
+                    };
+                    let persisted = persistence.is_ok();
+                    let deferred = self
+                        .outbox_state
+                        .lock()
+                        .unwrap()
+                        .membership_update(&evolution_event_id_hex);
+                    let publication = match deferred {
+                        Some(deferred) => {
+                            membership_publication_for_mode(
+                                membership_publication,
+                                persisted,
+                                self.attempt_deferred_membership_update(deferred),
+                            )
+                            .await
+                        }
+                        None => Some(Err(Error::Storage(
+                            "deferred membership update disappeared before publish".into(),
+                        ))),
+                    };
+
+                    // A persisted obligation is sufficient to acknowledge the
+                    // source proposal even if the relay is currently down. If
+                    // persistence itself failed, only a completed publish+merge
+                    // is safe; otherwise keep the global cursor conservative.
+                    let published = publication.as_ref().is_some_and(Result::is_ok);
+                    if persisted || published {
+                        if published {
                             changed_groups.insert(proposal_group_hex);
-                            self.mark_sync_event_processed(&event.id);
-                            report.record_processed();
                         }
-                        Err(err) => {
-                            tracing::debug!(
-                                %err,
-                                event_id = %event.id,
-                                event_created_at = event.created_at.as_secs(),
-                                context,
-                                "marmot auto-commit publish failed; leaving sync cursor behind it"
-                            );
-                            report.record_retryable(event.created_at.as_secs());
-                        }
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                    } else {
+                        let persistence_error = persistence
+                            .as_ref()
+                            .err()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "not persisted".into());
+                        let publication_error = publication
+                            .as_ref()
+                            .and_then(|result| result.as_ref().err())
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "deferred by notification policy".into());
+                        tracing::error!(
+                            %persistence_error,
+                            %publication_error,
+                            event_id = %event.id,
+                            event_created_at = event.created_at.as_secs(),
+                            context,
+                            "marmot auto-commit could not be persisted or completed"
+                        );
+                        report.record_retryable(event.created_at.as_secs());
                     }
                 }
                 Ok(Incoming::JoinRequest(request)) => {
@@ -4673,23 +5474,49 @@ impl SonarClient {
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
                         .map(|s| s.as_str());
-                    self.upsert_index_for_message(message, cached_name);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
-                        let preview = if message.content.len() > 100 {
-                            let mut end = 100;
-                            while !message.content.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            format!("{}…", &message.content[..end])
-                        } else {
-                            message.content.clone()
-                        };
-                        notifications.push(DrainNotification {
+                        let notification = DrainNotification {
+                            message_id: message.id.to_hex(),
+                            group_id: hex::encode(message.group_id.as_slice()),
+                            created_at_secs: message.created_at.as_secs(),
                             sender_pubkey: message.sender.to_string(),
                             group_name: cached_name.unwrap_or("").to_string(),
-                            content_preview: preview,
-                        });
+                            // Preserve a complete, already-validated call
+                            // control line. Real iroh NodeAddr offers exceed
+                            // the ordinary 100-byte preview cap; truncating one
+                            // turns a call into a misleading text alert.
+                            content_preview: notification_preview(&message.content),
+                        };
+                        let eligible = notification_floor_secs
+                            .is_none_or(|floor| message.created_at.as_secs() >= floor);
+                        if eligible {
+                            let persistence = if notification_floor_secs.is_some() {
+                                self.persist_incoming_message_notification(
+                                    message,
+                                    cached_name,
+                                    &notification,
+                                )
+                            } else {
+                                self.upsert_index_for_message(message, cached_name);
+                                Ok(())
+                            };
+                            if let Err(err) = persistence {
+                                tracing::error!(
+                                    %err,
+                                    message_id = %notification.message_id,
+                                    context,
+                                    "incoming notification obligation did not persist"
+                                );
+                                report.record_retryable(event.created_at.as_secs());
+                                continue;
+                            }
+                            notifications.push(notification);
+                        } else {
+                            self.upsert_index_for_message(message, cached_name);
+                        }
+                    } else {
+                        self.upsert_index_for_message(message, cached_name);
                     }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
@@ -4706,6 +5533,9 @@ impl SonarClient {
                     if let Incoming::GroupUpdated(group_id)
                     | Incoming::GroupInvitePending(group_id) = &incoming
                     {
+                        if let Ok(Some(group)) = self.engine.group(group_id) {
+                            self.ensure_index_for_group(group_id, &group.name);
+                        }
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
                     self.mark_sync_event_processed(&event.id);
@@ -4780,11 +5610,22 @@ impl SonarClient {
             filter = filter.since(Timestamp::from_secs(secs.saturating_sub(SYNC_OVERLAP_SECS)));
         }
         let events = self
-            .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
+            .fetch_marmot_events_from_relay_quorum(
+                filter,
+                BACKFILL_TIMEOUT,
+                context,
+                RelayFetchCompletion::Quorum,
+            )
             .await?;
         let partial = !events.completed_quorum();
         let (mut report, _) = self
-            .process_marmot_events(events.events, "backfilled group message")
+            .process_marmot_events(
+                events.events,
+                "backfilled group message",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         if partial {
             report.record_retryable(Timestamp::now().as_secs());
@@ -4810,14 +5651,161 @@ impl SonarClient {
         .is_ok()
     }
 
-    /// Park incoming-message notifications produced by the forced-sync
-    /// gap-recovery fetch, bounded with a half-drop so a host that stops draining
-    /// cannot grow this unboundedly (see `SYNC_NOTIFICATION_CAP`).
-    fn queue_sync_notifications(&self, notifications: Vec<DrainNotification>) {
-        let mut queue = self.pending_sync_notifications.lock().unwrap();
-        for n in notifications {
-            push_live_buffer(&mut queue, n, SYNC_NOTIFICATION_CAP);
+    fn persist_notification(&self, notification: &DrainNotification) -> Result<()> {
+        if let Some(ref index) = self.conversation_index {
+            return index
+                .lock()
+                .unwrap()
+                .enqueue_notification(&PendingNotification {
+                    message_id: notification.message_id.clone(),
+                    group_id: notification.group_id.clone(),
+                    created_at_secs: notification.created_at_secs,
+                    sender_pubkey: notification.sender_pubkey.clone(),
+                    group_name: notification.group_name.clone(),
+                    content_preview: notification.content_preview.clone(),
+                });
         }
+        let mut queue = self.pending_sync_notifications.lock().unwrap();
+        if queue
+            .iter()
+            .all(|item| item.message_id != notification.message_id)
+        {
+            push_live_buffer(&mut queue, notification.clone(), SYNC_NOTIFICATION_CAP);
+        }
+        Ok(())
+    }
+
+    fn persist_incoming_message_notification(
+        &self,
+        message: &ChatMessage,
+        group_name: Option<&str>,
+        notification: &DrainNotification,
+    ) -> Result<()> {
+        let Some(ref index) = self.conversation_index else {
+            return self.persist_notification(notification);
+        };
+        index
+            .lock()
+            .unwrap()
+            .record_incoming_message_and_notification(
+                &PendingNotification {
+                    message_id: notification.message_id.clone(),
+                    group_id: notification.group_id.clone(),
+                    created_at_secs: notification.created_at_secs,
+                    sender_pubkey: notification.sender_pubkey.clone(),
+                    group_name: group_name.unwrap_or("").to_string(),
+                    content_preview: notification.content_preview.clone(),
+                },
+                &index_preview(message),
+                message.mine,
+            )?;
+        Ok(())
+    }
+
+    /// Heal the only unavoidable cross-database boundary: MDK may commit a
+    /// decrypted message immediately before process death, while the separate
+    /// encrypted conversation index has not yet committed its notification
+    /// journal row. Re-scan one hard-bounded, rotating local window inside the
+    /// frozen wake interval. Stable-id ACK tombstones make this replay
+    /// idempotent, while the rotation prevents large accounts from always
+    /// favoring the same groups across independent wakes.
+    fn reconcile_notification_journal(
+        &self,
+        groups: &[NotificationGroup],
+        floor_secs: u64,
+        until_secs: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<(usize, bool)> {
+        let Some(ref index) = self.conversation_index else {
+            return Ok((0, true));
+        };
+        let mut inserted = 0usize;
+        for group in groups.iter().take(NOTIFICATION_RECONCILE_GROUP_LIMIT) {
+            if tokio::time::Instant::now() >= deadline {
+                return Ok((inserted, false));
+            }
+            let group_id = hex::encode(group.mls_group_id.as_slice());
+            let messages = self.engine.messages_page(
+                &group.mls_group_id,
+                NOTIFICATION_RECONCILE_MESSAGE_LIMIT,
+                0,
+            )?;
+            for message in messages {
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok((inserted, false));
+                }
+                let created_at_secs = message.created_at.as_secs();
+                if message.mine || created_at_secs < floor_secs || created_at_secs > until_secs {
+                    continue;
+                }
+                let notification = PendingNotification {
+                    message_id: message.id.to_hex(),
+                    group_id: group_id.clone(),
+                    created_at_secs,
+                    sender_pubkey: message.sender.to_string(),
+                    group_name: group.name.clone(),
+                    content_preview: notification_preview(&message.content),
+                };
+                if index
+                    .lock()
+                    .unwrap()
+                    .record_incoming_message_and_notification(
+                        &notification,
+                        &index_preview(&message),
+                        false,
+                    )?
+                {
+                    inserted += 1;
+                }
+            }
+        }
+        if inserted > 0 {
+            tracing::info!(inserted, "reconciled committed notification obligations");
+        }
+        Ok((inserted, true))
+    }
+
+    /// Compatibility helper for callers that already receive the just-processed
+    /// delta. Persistent clients upsert by stable id; in-memory clients retain a
+    /// bounded non-destructive queue.
+    fn queue_sync_notifications(&self, notifications: Vec<DrainNotification>) {
+        for notification in notifications {
+            if let Err(err) = self.persist_notification(&notification) {
+                tracing::error!(%err, "failed to persist notification obligation");
+            }
+        }
+    }
+
+    /// Non-destructive notification peek. `ack_notifications` hides rows while
+    /// retaining bounded replay-suppression tombstones.
+    pub fn pending_notifications(&self) -> Result<Vec<DrainNotification>> {
+        if let Some(ref index) = self.conversation_index {
+            return index.lock().unwrap().pending_notifications().map(|rows| {
+                rows.into_iter()
+                    .map(|row| DrainNotification {
+                        message_id: row.message_id,
+                        group_id: row.group_id,
+                        created_at_secs: row.created_at_secs,
+                        sender_pubkey: row.sender_pubkey,
+                        group_name: row.group_name,
+                        content_preview: row.content_preview,
+                    })
+                    .collect()
+            });
+        }
+        Ok(self.pending_sync_notifications.lock().unwrap().clone())
+    }
+
+    /// Remove only notifications whose corresponding platform action completed.
+    pub fn ack_notifications(&self, message_ids: &[String]) -> Result<usize> {
+        if let Some(ref index) = self.conversation_index {
+            return index.lock().unwrap().acknowledge_notifications(message_ids);
+        }
+        let ids: HashSet<&str> = message_ids.iter().map(String::as_str).collect();
+        let mut queue = self.pending_sync_notifications.lock().unwrap();
+        let before = queue.len();
+        queue.retain(|notification| !ids.contains(notification.message_id.as_str()));
+        Ok(before - queue.len())
     }
 
     /// Process every buffered live Marmot event through the MLS engine, then
@@ -4828,15 +5816,11 @@ impl SonarClient {
         // Notifications parked by the forced-sync gap-recovery fetch. Returned
         // alongside any live-buffered drains so a push-wake host that ran
         // sync_force() before draining still surfaces the recovered message.
-        let mut notifications: Vec<DrainNotification> = {
-            let mut queue = self.pending_sync_notifications.lock().unwrap();
-            std::mem::take(&mut *queue)
-        };
         let mut events: Vec<Event> = {
             let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
             let mut groups = self.pending_marmot_groups.lock().unwrap();
             if giftwraps.is_empty() && groups.is_empty() {
-                return Ok(notifications);
+                return self.pending_notifications();
             }
             let mut out = std::mem::take(&mut *giftwraps);
             out.append(&mut *groups);
@@ -4845,9 +5829,15 @@ impl SonarClient {
         sort_marmot_events_in_place(&mut events);
         let ids_before = self.current_group_ids()?;
         let (mut process_report, live_notifications) = self
-            .process_marmot_events(events, "live marmot event")
+            .process_marmot_events(
+                events,
+                "live marmot event",
+                Some(0),
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
-        notifications.extend(live_notifications);
+        self.queue_sync_notifications(live_notifications);
         // A welcome may have joined new group(s): backfill each one's history
         // (predates the watermark + the since-now sub) and widen the live sub.
         let new_ids: Vec<String> = self
@@ -4878,7 +5868,7 @@ impl SonarClient {
         } else {
             self.save_sync_state()?;
         }
-        Ok(notifications)
+        self.pending_notifications()
     }
 
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {
@@ -5041,11 +6031,11 @@ impl SonarClient {
     }
 
     fn resolve_group_name(&self, group_id: &GroupId) -> Option<String> {
-        self.engine.groups().ok().and_then(|gs| {
-            gs.into_iter()
-                .find(|g| g.mls_group_id == *group_id)
-                .map(|g| g.name)
-        })
+        self.engine
+            .group(group_id)
+            .ok()
+            .flatten()
+            .map(|group| group.name)
     }
 
     fn remove_index_for_group(&self, group_id: &GroupId) {
@@ -5662,6 +6652,20 @@ fn index_preview(message: &ChatMessage) -> String {
     }
 }
 
+fn notification_preview(content: &str) -> String {
+    if CallControl::parse(content).is_some() {
+        return content.to_string();
+    }
+    if content.len() <= 100 {
+        return content.to_string();
+    }
+    let mut end = 100;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &content[..end])
+}
+
 /// Read the value of a single-letter tag (e.g. `g`=geohash, `n`=nickname).
 fn tag_value(event: &Event, letter: Alphabet) -> Option<String> {
     event
@@ -6001,6 +7005,25 @@ mod tests {
             "doc.pdf"
         );
         assert_eq!(index_preview(&msg("", vec![])), "");
+    }
+
+    #[test]
+    fn notification_preview_preserves_real_long_call_offer_metadata() {
+        let node_addr = "a".repeat(420);
+        let offer = CallControl::Offer {
+            call_id: "call-123".into(),
+            media: crate::call::signaling::CallMediaKind::Video,
+            node_addr_b64: node_addr,
+            unix_secs: 1_700_000_000,
+        }
+        .encode();
+        assert!(offer.len() > 100);
+        assert_eq!(notification_preview(&offer), offer);
+        assert!(CallControl::parse(&notification_preview(&offer)).is_some());
+
+        let ordinary = "x".repeat(200);
+        assert_eq!(notification_preview(&ordinary).len(), 103);
+        assert!(notification_preview(&ordinary).ends_with('…'));
     }
 
     #[test]
@@ -6956,8 +7979,228 @@ mod tests {
         assert!(should_fetch_group_messages_on_sync(false, false, 0));
     }
 
+    #[test]
+    fn notification_deadline_is_clamped_in_native_core() {
+        assert_eq!(
+            notification_sync_deadline(Duration::ZERO),
+            NOTIFICATION_SYNC_MIN_DEADLINE
+        );
+        assert_eq!(
+            notification_sync_deadline(Duration::from_secs(12)),
+            Duration::from_secs(12)
+        );
+        assert_eq!(
+            notification_sync_deadline(Duration::from_secs(60)),
+            NOTIFICATION_SYNC_MAX_DEADLINE
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_production_group_source_keyset_pages_a_huge_catalog() {
+        let index = Arc::new(Mutex::new(ConversationIndex::open_in_memory().unwrap()));
+        for value in 0..10_000u64 {
+            index
+                .lock()
+                .unwrap()
+                .ensure_group(&format!("{value:064x}"), "group")
+                .unwrap();
+        }
+        let identity = Identity::generate();
+        let client = SonarClient::with_engine(
+            identity.clone(),
+            Vec::new(),
+            MarmotEngine::in_memory(identity),
+            false,
+            None,
+            None,
+            None,
+            None,
+            StickerCache::disabled(),
+            Some(index),
+        )
+        .await
+        .expect("client");
+
+        let window = client
+            .notification_group_window(tokio::time::Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .expect("bounded window");
+        // The synthetic rows are intentionally absent from MDK, but the
+        // production source still consumes exactly one 64-row SQL keyset page
+        // and exposes its continuation instead of loading/sorting all 10k.
+        assert!(window.groups.is_empty());
+        assert_eq!(window.next_cursor, Some(format!("{:064x}", 63u64)));
+        client
+            .sync_state
+            .lock()
+            .unwrap()
+            .set_notification_group_cursor(window.next_cursor);
+        let second = client
+            .notification_group_window(tokio::time::Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .expect("second bounded window");
+        assert_eq!(second.next_cursor, Some(format!("{:064x}", 127u64)));
+        assert!(client
+            .notification_group_window(tokio::time::Instant::now())
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn notification_failed_persistence_never_polls_pending_relay_publication() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let non_directory = dir.path().join("not-a-directory");
+        fs::write(&non_directory, b"block create_dir_all").expect("blocker file");
+        let outbox_path = non_directory.join("outbox.json");
+        let event = signed_event(&Keys::generate(), 1, "encrypted evolution event");
+        let event_id = event.id.to_hex();
+        let mut outbox = OutboxState::load(Some(outbox_path));
+        assert!(outbox
+            .mark_membership_pending("group".into(), &event, 7, 11)
+            .is_err());
+        assert!(
+            outbox.membership_update(&event_id).is_none(),
+            "failed durable save must roll back its process-local publishable entry"
+        );
+
+        for persisted in [true, false] {
+            let deferred = membership_publication_for_mode(
+                MembershipPublicationMode::DeferAfterPersistence,
+                persisted,
+                std::future::pending::<Result<()>>(),
+            );
+            let result = tokio::time::timeout(Duration::from_millis(25), deferred)
+                .await
+                .expect("notification proposal lane must never poll relay publication");
+            assert!(result.is_none());
+        }
+    }
+
+    #[test]
+    fn notification_overflow_uses_limit_plus_one_semantics() {
+        assert!(!notification_events_truncated(
+            NOTIFICATION_SYNC_EVENT_LIMIT - 1,
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+        ));
+        assert!(!notification_events_truncated(
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+        ));
+        assert!(notification_events_truncated(
+            NOTIFICATION_SYNC_EVENT_LIMIT + 1,
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+        ));
+    }
+
+    #[test]
+    fn notification_same_second_overflow_expands_but_never_becomes_unbounded() {
+        assert_eq!(
+            next_notification_page_limit(NOTIFICATION_SYNC_EVENT_LIMIT, 77, 77),
+            NOTIFICATION_SYNC_EVENT_LIMIT * 2
+        );
+        assert_eq!(
+            next_notification_page_limit(NOTIFICATION_SYNC_EVENT_LIMIT * 2, 77, 76),
+            NOTIFICATION_SYNC_EVENT_LIMIT,
+            "moving to an older second returns to the small page"
+        );
+        assert_eq!(
+            next_notification_page_limit(NOTIFICATION_SYNC_MAX_EVENT_LIMIT, 77, 77),
+            NOTIFICATION_SYNC_MAX_EVENT_LIMIT,
+            "an unpageable second stays bounded and therefore incomplete"
+        );
+        assert!(notification_events_truncated(
+            NOTIFICATION_SYNC_MAX_EVENT_LIMIT + 1,
+            NOTIFICATION_SYNC_MAX_EVENT_LIMIT,
+        ));
+        assert!(!notification_page_complete(true, false, true, 0));
+    }
+
+    #[test]
+    fn notification_bootstrap_samples_one_bounded_page() {
+        assert!(!notification_page_requires_continuation(0, true));
+        assert!(notification_page_requires_continuation(42, true));
+    }
+
+    #[test]
+    fn notification_cursor_survives_restart_and_is_inclusive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.json");
+        let mut state = SyncState::new(Some(path.clone()), 100, Vec::new());
+        state.set_notification_page(Some(77), Some(99), NOTIFICATION_SYNC_EVENT_LIMIT * 2);
+        state.save_if_dirty().expect("cursor persists");
+
+        let reloaded = SyncState::load(Some(path), 100, false);
+        assert_eq!(
+            reloaded.notification_page(),
+            (Some(77), Some(99), NOTIFICATION_SYNC_EVENT_LIMIT * 2)
+        );
+        // The stored value is used directly as Filter::until; it is never
+        // decremented, so multiple events at second 77 remain recoverable.
+        assert_eq!(reloaded.notification_page().0.unwrap(), 77);
+        assert_eq!(
+            notification_snapshot_target(reloaded.notification_page().1, 120),
+            99,
+            "a later wake must finish the original snapshot before advancing"
+        );
+    }
+
+    #[test]
+    fn notification_group_cursor_keeps_the_frozen_target_across_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sync.json");
+        let mut state = SyncState::new(Some(path.clone()), 100, Vec::new());
+        state.set_notification_page(None, Some(199), NOTIFICATION_SYNC_EVENT_LIMIT);
+        state.set_notification_group_cursor(Some("group-0064".into()));
+        state.save_if_dirty().expect("group cursor persists");
+
+        let reloaded = SyncState::load(Some(path), 100, false);
+        assert_eq!(reloaded.notification_page().0, None);
+        assert_eq!(reloaded.notification_page().1, Some(199));
+        assert_eq!(
+            reloaded.notification_group_cursor().as_deref(),
+            Some("group-0064")
+        );
+    }
+
+    #[test]
+    fn notification_watermark_requires_every_configured_relay() {
+        let partial = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: 2,
+            total_relays: 3,
+        };
+        assert!(partial.completed_quorum());
+        assert!(!partial.completed_all());
+
+        let complete = RelayFetchOutcome {
+            events: Vec::new(),
+            completed_relays: 3,
+            total_relays: 3,
+        };
+        assert!(complete.completed_all());
+    }
+
+    #[tokio::test]
+    async fn notification_network_phase_obeys_native_deadline() {
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+
+        let result = notification_phase_until(deadline, std::future::pending::<()>()).await;
+
+        assert!(result.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "native phase exceeded bound by {:?}",
+            started.elapsed()
+        );
+    }
+
     fn test_notification(preview: &str) -> DrainNotification {
         DrainNotification {
+            message_id: format!("message-{preview}"),
+            group_id: "group-id".to_string(),
+            created_at_secs: 1_700_000_000,
             sender_pubkey: "npub-test".to_string(),
             group_name: "group".to_string(),
             content_preview: preview.to_string(),
@@ -6970,9 +8213,11 @@ mod tests {
         // notifications so a push-wake host (sync_force → drain_pending_marmot)
         // still gets a precise notification even though the message was stored by
         // the sync call and never entered the live buffer.
-        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
-            .await
-            .expect("in-memory client");
+        let client = Arc::new(
+            SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+                .await
+                .expect("in-memory client"),
+        );
         client.queue_sync_notifications(vec![test_notification("hi"), test_notification("there")]);
 
         // Live buffers are empty, so drain returns exactly the parked ones.
@@ -6981,12 +8226,342 @@ mod tests {
         assert_eq!(drained[0].content_preview, "hi");
         assert_eq!(drained[1].content_preview, "there");
 
-        // The queue is consumed: a second drain yields nothing.
+        // Peek is intentionally non-destructive across a host crash/restart.
         let drained_again = client
             .drain_pending_marmot()
             .await
             .expect("second drain succeeds");
-        assert!(drained_again.is_empty());
+        assert_eq!(drained_again.len(), 2);
+
+        client
+            .ack_notifications(&[drained[0].message_id.clone()])
+            .expect("platform ack persists");
+        let after_one_ack = client.pending_notifications().expect("peek after ack");
+        assert_eq!(after_one_ack.len(), 1);
+        assert_eq!(after_one_ack[0].content_preview, "there");
+    }
+
+    #[tokio::test]
+    async fn notification_sync_returns_parked_precise_delta_before_network() {
+        let client = Arc::new(
+            SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+                .await
+                .expect("in-memory client"),
+        );
+        client.queue_sync_notifications(vec![test_notification("already decrypted")]);
+
+        let result = client
+            .sync_notifications(Duration::from_secs(12))
+            .await
+            .expect("notification sync");
+
+        assert_eq!(result.notifications.len(), 1);
+        assert_eq!(
+            result.notifications[0].message_id,
+            "message-already decrypted"
+        );
+        assert!(!result.completed);
+        assert!(!result.timed_out);
+        assert!(
+            result.elapsed_ms < 100,
+            "local delta took {}ms",
+            result.elapsed_ms
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_sync_refuses_unbounded_first_session_fetch() {
+        let client = Arc::new(
+            SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+                .await
+                .expect("in-memory client"),
+        );
+
+        let result = client
+            .sync_notifications(Duration::from_secs(12))
+            .await
+            .expect("notification sync");
+
+        assert!(!result.completed);
+        assert!(!result.timed_out);
+        assert!(result.notifications.is_empty());
+        assert_eq!(result.processed_events, 0);
+    }
+
+    #[tokio::test]
+    async fn notification_reconciliation_recovers_mdk_commit_index_crash_gap() {
+        let alice_identity = Identity::generate();
+        let bob_identity = Identity::generate();
+        let alice_engine = MarmotEngine::in_memory(alice_identity.clone());
+        let bob_engine = MarmotEngine::in_memory(bob_identity);
+        let relay = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let bob_key_package = bob_engine
+            .key_package_event(vec![relay.clone()])
+            .expect("bob key package");
+        let creation = alice_engine
+            .create_group("crash recovery", vec![bob_key_package], vec![relay])
+            .expect("group creation");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob, welcome) = creation.welcomes.into_iter().next().unwrap();
+        let wrapped = alice_engine
+            .gift_wrap_welcome(&bob, welcome)
+            .await
+            .expect("welcome wraps");
+        alice_engine.merge_pending_commit(&group_id).unwrap();
+        bob_engine.process_incoming(&wrapped).await.unwrap();
+
+        let event = bob_engine
+            .create_text_message(&group_id, "committed before crash")
+            .unwrap();
+        alice_engine
+            .process_incoming(&event)
+            .await
+            .expect("MDK commits before index transaction");
+
+        let index = Arc::new(Mutex::new(ConversationIndex::open_in_memory().unwrap()));
+        let client = SonarClient::with_engine(
+            alice_identity,
+            Vec::new(),
+            alice_engine,
+            false,
+            None,
+            None,
+            None,
+            None,
+            StickerCache::disabled(),
+            Some(index),
+        )
+        .await
+        .expect("client around committed MDK state");
+        let active_group = client
+            .engine
+            .group(&group_id)
+            .unwrap()
+            .expect("active group");
+        let notification_groups = vec![NotificationGroup {
+            mls_group_id: active_group.mls_group_id,
+            nostr_group_id_hex: hex::encode(active_group.nostr_group_id),
+            name: active_group.name,
+        }];
+
+        assert_eq!(
+            client
+                .reconcile_notification_journal(
+                    &notification_groups,
+                    0,
+                    u64::MAX,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap(),
+            (1, true)
+        );
+        let pending = client.pending_notifications().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].content_preview, "committed before crash");
+        client
+            .ack_notifications(&[pending[0].message_id.clone()])
+            .unwrap();
+        assert_eq!(
+            client
+                .reconcile_notification_journal(
+                    &notification_groups,
+                    0,
+                    u64::MAX,
+                    tokio::time::Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap(),
+            (0, true),
+            "ACK tombstone prevents replay resurrection"
+        );
+        assert!(client.pending_notifications().unwrap().is_empty());
+        assert_eq!(
+            client
+                .reconcile_notification_journal(
+                    &notification_groups,
+                    0,
+                    u64::MAX,
+                    tokio::time::Instant::now(),
+                )
+                .unwrap(),
+            (0, false),
+            "an exhausted OS budget stops before another local transcript page"
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_proposal_persists_exact_commit_before_relay_retry() {
+        let alice_identity = Identity::generate();
+        let bob_identity = Identity::generate();
+        let alice_engine = MarmotEngine::in_memory(alice_identity.clone());
+        let bob_engine = MarmotEngine::in_memory(bob_identity.clone());
+        let advertised_relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+        let bob_key_package = bob_engine
+            .key_package_event(vec![advertised_relay.clone()])
+            .expect("bob key package");
+        let creation = alice_engine
+            .create_group(
+                "proposal durability",
+                vec![bob_key_package],
+                vec![advertised_relay],
+            )
+            .expect("group creation");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob, welcome) = creation.welcomes.into_iter().next().expect("bob welcome");
+        let wrapped = alice_engine
+            .gift_wrap_welcome(&bob, welcome)
+            .await
+            .expect("welcome wraps");
+        alice_engine
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+        bob_engine
+            .process_incoming(&wrapped)
+            .await
+            .expect("bob accepts direct welcome");
+        let demotion = bob_engine
+            .self_demote(&group_id)
+            .expect("bob stages self-demotion");
+        alice_engine
+            .process_incoming(&demotion.evolution_event)
+            .await
+            .expect("alice applies bob self-demotion");
+        bob_engine
+            .merge_pending_commit(&group_id)
+            .expect("bob merges self-demotion");
+        let leave = bob_engine
+            .leave_group(&group_id)
+            .expect("bob leave proposal");
+        let leave_event = leave.evolution_event;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outbox_path = dir.path().join("outbox.json");
+        let client = SonarClient::with_engine(
+            alice_identity,
+            Vec::new(),
+            alice_engine,
+            false,
+            None,
+            Some(outbox_path.clone()),
+            None,
+            None,
+            StickerCache::disabled(),
+            None,
+        )
+        .await
+        .expect("client");
+        let base_epoch = client.engine.group_epoch(&group_id).expect("base epoch");
+
+        let (report, _) = client
+            .process_marmot_events(
+                [leave_event.clone()],
+                "notification proposal test",
+                None,
+                MembershipPublicationMode::DeferAfterPersistence,
+                None,
+            )
+            .await;
+        let replayed_update = match client
+            .engine
+            .process_incoming(&leave_event)
+            .await
+            .expect("proposal redelivery remains recoverable")
+        {
+            Incoming::GroupProposal(update) => update,
+            other => panic!("expected replayed proposal, got {other:?}"),
+        };
+
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.retryable_failures, 0);
+        assert_eq!(
+            client.engine.group_epoch(&group_id).expect("epoch remains"),
+            base_epoch,
+            "failed relay publish must preserve the staged commit"
+        );
+        let active = HashSet::from([hex::encode(group_id.as_slice())]);
+        let mut reloaded = OutboxState::load(Some(outbox_path));
+        let deferred = reloaded
+            .retryable_membership_updates(&active)
+            .expect("deferred update reloads");
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].base_epoch, base_epoch);
+        assert_eq!(
+            replayed_update.group_id, group_id,
+            "source redelivery regenerates a publishable commit for the same group"
+        );
+        assert_eq!(replayed_update.base_epoch, base_epoch);
+    }
+
+    #[tokio::test]
+    async fn staged_proposal_redelivery_survives_persistent_engine_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("alice.sqlite");
+        let db_key = [42u8; 32];
+        let alice_identity = Identity::generate();
+        let bob_identity = Identity::generate();
+        let alice_engine = MarmotEngine::persistent(alice_identity.clone(), &db_path, db_key)
+            .expect("persistent alice engine");
+        let bob_engine = MarmotEngine::in_memory(bob_identity);
+        let advertised_relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+        let bob_key_package = bob_engine
+            .key_package_event(vec![advertised_relay.clone()])
+            .expect("bob key package");
+        let creation = alice_engine
+            .create_group(
+                "persistent proposal recovery",
+                vec![bob_key_package],
+                vec![advertised_relay],
+            )
+            .expect("group creation");
+        let group_id = creation.group.mls_group_id.clone();
+        let (bob, welcome) = creation.welcomes.into_iter().next().expect("bob welcome");
+        let wrapped = alice_engine
+            .gift_wrap_welcome(&bob, welcome)
+            .await
+            .expect("welcome wraps");
+        alice_engine
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation");
+        bob_engine
+            .process_incoming(&wrapped)
+            .await
+            .expect("bob accepts welcome");
+        let demotion = bob_engine
+            .self_demote(&group_id)
+            .expect("bob stages self-demotion");
+        alice_engine
+            .process_incoming(&demotion.evolution_event)
+            .await
+            .expect("alice applies self-demotion");
+        bob_engine
+            .merge_pending_commit(&group_id)
+            .expect("bob merges self-demotion");
+        let leave_event = bob_engine
+            .leave_group(&group_id)
+            .expect("bob leave proposal")
+            .evolution_event;
+
+        let first = alice_engine
+            .process_incoming(&leave_event)
+            .await
+            .expect("alice stages auto-commit");
+        assert!(matches!(first, Incoming::GroupProposal(_)));
+        let base_epoch = alice_engine.group_epoch(&group_id).expect("base epoch");
+        drop(alice_engine);
+
+        let reopened = MarmotEngine::persistent(alice_identity, &db_path, db_key)
+            .expect("alice engine reopens");
+        let replayed = reopened
+            .process_incoming(&leave_event)
+            .await
+            .expect("source proposal replays after restart");
+        let Incoming::GroupProposal(update) = replayed else {
+            panic!("expected proposal recovery after restart, got {replayed:?}");
+        };
+        assert_eq!(update.group_id, group_id);
+        assert_eq!(update.base_epoch, base_epoch);
+        assert!(update.requires_commit_merge);
+        assert!(update.welcomes.is_empty());
+        assert_eq!(reopened.group_epoch(&group_id).unwrap(), base_epoch);
     }
 
     #[test]
@@ -7020,6 +8595,10 @@ mod tests {
         let disk = SyncStateDisk {
             version: SYNC_STATE_VERSION,
             watermark_secs: 1_000,
+            notification_until_secs: Some(900),
+            notification_target_secs: Some(1_000),
+            notification_page_limit: Some(NOTIFICATION_SYNC_EVENT_LIMIT * 2),
+            notification_group_cursor: Some("group".into()),
             processed_event_ids: vec!["abc".to_string()],
         };
         fs::write(&path, serde_json::to_vec(&disk).expect("json")).expect("write state");
@@ -7027,6 +8606,7 @@ mod tests {
         let state = SyncState::load(Some(path), 0, true);
 
         assert_eq!(state.watermark_secs(), 0);
+        assert_eq!(state.notification_page().0, None);
         assert!(!state.has_processed("abc"));
     }
 
@@ -7076,7 +8656,13 @@ mod tests {
                     .expect("bob accepts invite");
             } else {
                 let (report, _) = charlie
-                    .process_marmot_events([wrapped], "test charlie welcome")
+                    .process_marmot_events(
+                        [wrapped],
+                        "test charlie welcome",
+                        None,
+                        MembershipPublicationMode::Immediate,
+                        None,
+                    )
                     .await;
                 assert_eq!(report.processed, 1);
                 let invite = charlie
@@ -7130,19 +8716,37 @@ mod tests {
             .expect("bob creates message in winning epoch");
 
         let (wrong_commit, _) = charlie
-            .process_marmot_events([alice_update.evolution_event], "test losing commit first")
+            .process_marmot_events(
+                [alice_update.evolution_event],
+                "test losing commit first",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(wrong_commit.processed, 1);
 
         let (first_failure, _) = charlie
-            .process_marmot_events([bob_message.clone()], "test initial message failure")
+            .process_marmot_events(
+                [bob_message.clone()],
+                "test initial message failure",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(first_failure.retryable_failures, 1);
 
         // A duplicate relay delivery reaches MDK's Incoming::Failed branch.
         // Sonar used to add the event to its own durable processed-ID set here.
         let (failed_redelivery, _) = charlie
-            .process_marmot_events([bob_message.clone()], "test failed redelivery")
+            .process_marmot_events(
+                [bob_message.clone()],
+                "test failed redelivery",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(failed_redelivery.processed, 1);
         assert!(
@@ -7151,12 +8755,24 @@ mod tests {
         );
 
         let (winning_commit, _) = charlie
-            .process_marmot_events([bob_update.evolution_event], "test winning commit rollback")
+            .process_marmot_events(
+                [bob_update.evolution_event],
+                "test winning commit rollback",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(winning_commit.processed, 1);
 
         let (recovered, _) = charlie
-            .process_marmot_events([bob_message], "test retry after rollback")
+            .process_marmot_events(
+                [bob_message],
+                "test retry after rollback",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(recovered.processed, 1);
         assert!(
@@ -7257,7 +8873,15 @@ mod tests {
             .await
             .expect("wrap bob welcome");
 
-        let (report, _) = bob.process_marmot_events([wrapped], "test welcome").await;
+        let (report, _) = bob
+            .process_marmot_events(
+                [wrapped],
+                "test welcome",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
+            .await;
         assert_eq!(report.processed, 1);
 
         let bob_groups = bob.engine.groups().expect("bob groups");
@@ -7310,7 +8934,13 @@ mod tests {
             .expect("wrap bob welcome");
 
         let (report, _) = bob
-            .process_marmot_events([wrapped], "test pending invite")
+            .process_marmot_events(
+                [wrapped],
+                "test pending invite",
+                None,
+                MembershipPublicationMode::Immediate,
+                None,
+            )
             .await;
         assert_eq!(report.processed, 1);
 

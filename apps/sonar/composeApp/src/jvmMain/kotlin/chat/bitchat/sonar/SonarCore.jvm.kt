@@ -52,6 +52,7 @@ actual object SonarCore {
     @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
+    @Volatile private var nodeGeneration: Long = 0
 
     private fun marmotDir(): File = DesktopEnv.file("sonar-marmot").apply { mkdirs() }
 
@@ -70,6 +71,7 @@ actual object SonarCore {
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
                 installCoreLogging(diagnosticsVerbose())
                 node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
+                nodeGeneration += 1
                 relayConnected = false
             }
             npub
@@ -91,6 +93,7 @@ actual object SonarCore {
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
             val previousNode = node
             node = connected
+            nodeGeneration += 1
             relayConnected = true
             installConversationListener()
             previousNode?.close()
@@ -507,6 +510,51 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun syncNotifications(deadlineMs: Long): SonarNotificationSyncResult =
+        withContext(Dispatchers.IO) {
+            val result = requireNode().syncNotifications(deadlineMs.coerceAtLeast(1).toULong())
+            SonarNotificationSyncResult(
+                notifications = result.notifications.map {
+                    SonarDrainNotification(
+                        messageId = it.messageId,
+                        groupId = it.groupId,
+                        createdAtSecs = it.createdAtSecs.toLong(),
+                        senderNpub = it.senderNpub,
+                        groupName = it.groupName,
+                        contentPreview = it.contentPreview,
+                    )
+                },
+                completed = result.completed,
+                timedOut = result.timedOut,
+                truncated = result.truncated,
+                processedEvents = result.processedEvents.toLong(),
+                elapsedMs = result.elapsedMs.toLong(),
+            )
+        }
+
+    actual fun notificationSessionGeneration(): Long = nodeGeneration
+
+    actual suspend fun pendingNotifications(): List<SonarDrainNotification> =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext emptyList()
+            n.pendingNotifications().map {
+                SonarDrainNotification(
+                    messageId = it.messageId,
+                    groupId = it.groupId,
+                    createdAtSecs = it.createdAtSecs.toLong(),
+                    senderNpub = it.senderNpub,
+                    groupName = it.groupName,
+                    contentPreview = it.contentPreview,
+                )
+            }
+        }
+
+    actual suspend fun ackNotifications(messageIds: List<String>): Int =
+        withContext(Dispatchers.IO) {
+            if (messageIds.isEmpty()) return@withContext 0
+            node?.ackNotifications(messageIds)?.toInt() ?: 0
+        }
+
     actual suspend fun preferCatchupGroup(mlsGroupIdHex: String?) = withContext(Dispatchers.IO) {
         val value = mlsGroupIdHex?.trim().orEmpty()
         runCatching { node?.preferCatchupGroup(value) }
@@ -746,6 +794,7 @@ actual object SonarCore {
                     .get("nsec")
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
                 closeNode()
+                nodeGeneration += 1
                 val marmotDir = marmotDir()
                 try {
                     wipeMarmotStorage(marmotDir)
@@ -793,6 +842,7 @@ actual object SonarCore {
         lock.withLock {
             stickerOperationLock.write {
                 closeNode()
+                nodeGeneration += 1
                 npub = ""; pubkeyHex = ""
                 // marmotDir() covers the DB + diagnostics logs (sonar-marmot/logs);
                 // the exported diagnostics zips live in a sibling dir, so drop them
@@ -814,6 +864,7 @@ actual object SonarCore {
             lock.withLock {
                 stickerOperationLock.write {
                     closeNode()
+                    nodeGeneration += 1
                     // Delete ONLY the encrypted Marmot DB — keep nsec, DB key,
                     // nickname and prefs. start() reopens a fresh empty DB with the
                     // SAME identity + key.

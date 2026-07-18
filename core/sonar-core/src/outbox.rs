@@ -22,6 +22,10 @@ const OUTBOX_RETRY_ATTEMPT_LIMIT: u32 = 20;
 struct OutboxStateDisk {
     version: u32,
     entries: Vec<OutboxEntry>,
+    /// Auto-commits staged while handling incoming MLS proposals. Optional in
+    /// the v1 schema so existing sidecars remain forward-readable.
+    #[serde(default)]
+    membership_entries: Vec<MembershipOutboxEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,10 +41,23 @@ pub(crate) struct OutboxEntry {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct MembershipOutboxEntry {
+    pub group_id_hex: String,
+    pub evolution_event_id_hex: String,
+    pub event_json: String,
+    pub base_epoch: u64,
+    pub created_at_secs: u64,
+    pub updated_at_secs: u64,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct OutboxState {
     path: Option<PathBuf>,
     entries: HashMap<String, OutboxEntry>,
+    membership_entries: HashMap<String, MembershipOutboxEntry>,
     dirty: bool,
 }
 
@@ -52,19 +69,27 @@ impl OutboxState {
             .and_then(|bytes| serde_json::from_slice::<OutboxStateDisk>(&bytes).ok())
             .filter(|state| state.version == OUTBOX_STATE_VERSION);
 
-        let entries = disk
+        let (entries, membership_entries) = disk
             .map(|state| {
-                state
-                    .entries
-                    .into_iter()
-                    .map(|entry| (entry.message_id_hex.clone(), entry))
-                    .collect()
+                (
+                    state
+                        .entries
+                        .into_iter()
+                        .map(|entry| (entry.message_id_hex.clone(), entry))
+                        .collect(),
+                    state
+                        .membership_entries
+                        .into_iter()
+                        .map(|entry| (entry.evolution_event_id_hex.clone(), entry))
+                        .collect(),
+                )
             })
             .unwrap_or_default();
 
         Self {
             path,
             entries,
+            membership_entries,
             dirty: false,
         }
     }
@@ -108,6 +133,7 @@ impl OutboxState {
         let path = self.path.clone();
         let reloaded = Self::load(path);
         self.entries = reloaded.entries;
+        self.membership_entries = reloaded.membership_entries;
         self.dirty = false;
     }
 
@@ -115,10 +141,102 @@ impl OutboxState {
         let before = self.entries.len();
         self.entries
             .retain(|_, entry| entry.group_id_hex != group_id_hex);
-        if self.entries.len() != before {
+        let membership_before = self.membership_entries.len();
+        self.membership_entries
+            .retain(|_, entry| entry.group_id_hex != group_id_hex);
+        if self.entries.len() != before || self.membership_entries.len() != membership_before {
             self.dirty = true;
         }
         self.save_if_dirty()
+    }
+
+    pub fn mark_membership_pending(
+        &mut self,
+        group_id_hex: String,
+        evolution_event: &Event,
+        base_epoch: u64,
+        now_secs: u64,
+    ) -> Result<()> {
+        let evolution_event_id_hex = evolution_event.id.to_hex();
+        let entry = MembershipOutboxEntry {
+            group_id_hex,
+            evolution_event_id_hex: evolution_event_id_hex.clone(),
+            event_json: evolution_event.as_json(),
+            base_epoch,
+            created_at_secs: now_secs,
+            updated_at_secs: now_secs,
+            attempts: 0,
+            last_error: None,
+        };
+        let previous = self
+            .membership_entries
+            .insert(evolution_event_id_hex.clone(), entry);
+        let was_dirty = self.dirty;
+        self.dirty = true;
+        if let Err(err) = self.save_if_dirty_durable() {
+            // A failed fsync/rename is not a durable safe point. Do not leave a
+            // process-local entry that the immediate retry lane could publish
+            // even though a process death would lose the obligation.
+            if let Some(previous) = previous {
+                self.membership_entries
+                    .insert(evolution_event_id_hex, previous);
+            } else {
+                self.membership_entries.remove(&evolution_event_id_hex);
+            }
+            self.dirty = was_dirty;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn retryable_membership_updates(
+        &mut self,
+        active_group_ids: &HashSet<String>,
+    ) -> Result<Vec<MembershipOutboxEntry>> {
+        let before = self.membership_entries.len();
+        self.membership_entries
+            .retain(|_, entry| active_group_ids.contains(&entry.group_id_hex));
+        if self.membership_entries.len() != before {
+            self.dirty = true;
+        }
+        let mut updates = self
+            .membership_entries
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        updates.sort_by_key(|entry| (entry.created_at_secs, entry.evolution_event_id_hex.clone()));
+        self.save_if_dirty_durable()?;
+        Ok(updates)
+    }
+
+    pub fn membership_update(&self, evolution_event_id_hex: &str) -> Option<MembershipOutboxEntry> {
+        self.membership_entries.get(evolution_event_id_hex).cloned()
+    }
+
+    pub fn mark_membership_failed(
+        &mut self,
+        evolution_event_id_hex: &str,
+        error: String,
+        now_secs: u64,
+    ) -> Result<()> {
+        if let Some(entry) = self.membership_entries.get_mut(evolution_event_id_hex) {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.updated_at_secs = now_secs;
+            entry.last_error = Some(error);
+            self.dirty = true;
+        }
+        self.save_if_dirty_durable()
+    }
+
+    pub fn mark_membership_complete(&mut self, evolution_event_id_hex: &str) -> Result<()> {
+        if self
+            .membership_entries
+            .remove(evolution_event_id_hex)
+            .is_some()
+        {
+            self.dirty = true;
+        }
+        self.save_if_dirty_durable()
     }
 
     pub fn mark_failed_by_message_id(
@@ -204,6 +322,14 @@ impl OutboxState {
     }
 
     fn save_if_dirty(&mut self) -> Result<()> {
+        self.save_if_dirty_inner(false)
+    }
+
+    fn save_if_dirty_durable(&mut self) -> Result<()> {
+        self.save_if_dirty_inner(true)
+    }
+
+    fn save_if_dirty_inner(&mut self, durable: bool) -> Result<()> {
         if !self.dirty {
             return Ok(());
         }
@@ -218,16 +344,34 @@ impl OutboxState {
         }
         let mut entries: Vec<_> = self.entries.values().cloned().collect();
         entries.sort_by_key(|entry| (entry.created_at_secs, entry.message_id_hex.clone()));
+        let mut membership_entries: Vec<_> = self.membership_entries.values().cloned().collect();
+        membership_entries
+            .sort_by_key(|entry| (entry.created_at_secs, entry.evolution_event_id_hex.clone()));
         let disk = OutboxStateDisk {
             version: OUTBOX_STATE_VERSION,
             entries,
+            membership_entries,
         };
         let bytes = serde_json::to_vec(&disk)?;
         let tmp = outbox_state_tmp_path(path);
         fs::write(&tmp, bytes)
             .map_err(|e| Error::Storage(format!("write outbox state {}: {e}", tmp.display())))?;
+        if durable {
+            fs::File::open(&tmp)
+                .and_then(|file| file.sync_all())
+                .map_err(|e| Error::Storage(format!("sync outbox state {}: {e}", tmp.display())))?;
+        }
         fs::rename(&tmp, path)
             .map_err(|e| Error::Storage(format!("replace outbox state {}: {e}", path.display())))?;
+        if durable {
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)
+                    .and_then(|dir| dir.sync_all())
+                    .map_err(|e| {
+                        Error::Storage(format!("sync outbox-state dir {}: {e}", parent.display()))
+                    })?;
+            }
+        }
         self.dirty = false;
         Ok(())
     }
@@ -411,5 +555,39 @@ mod tests {
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
         );
+    }
+
+    #[test]
+    fn deferred_membership_update_survives_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::MlsGroupMessage, "ciphertext")
+            .sign_with_keys(&keys)
+            .expect("event signs");
+        let event_id = event.id.to_hex();
+
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox
+            .mark_membership_pending("group".into(), &event, 7, 11)
+            .expect("membership obligation persists");
+
+        let mut reloaded = OutboxState::load(Some(path));
+        let entry = reloaded
+            .membership_update(&event_id)
+            .expect("membership obligation reloads");
+        assert_eq!(entry.base_epoch, 7);
+        assert_eq!(
+            Event::from_json(&entry.event_json)
+                .expect("event decodes")
+                .id,
+            event.id
+        );
+
+        let active = HashSet::from(["group".to_string()]);
+        let retryable = reloaded
+            .retryable_membership_updates(&active)
+            .expect("membership retry loads");
+        assert_eq!(retryable.len(), 1);
     }
 }

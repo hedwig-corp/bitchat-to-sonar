@@ -112,9 +112,13 @@ enum SonarLocalNotificationRouter {
         return SonarLocalNotification(
             title: envelope.title,
             body: envelope.body,
-            identifier: "sonar-\(identifierSegment(envelope.kind))-\(idKey)",
+            identifier: identifier(idKey: idKey, kind: envelope.kind),
             userInfo: userInfo
         )
+    }
+
+    static func identifier(idKey: String, kind: SonarNotificationKindInfo) -> String {
+        "sonar-\(identifierSegment(kind))-\(idKey)"
     }
 
     private static func identifierSegment(_ kind: SonarNotificationKindInfo) -> String {
@@ -1117,7 +1121,6 @@ final class SonarAppStore: ObservableObject {
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
     private let localNotificationStartedAt = Date()
-    private var seenMarmotNotificationMessageIDs = Set<String>()
     private var seenPrivateChatPaymentNotificationMessageIDs = Set<String>()
     /// Stable mesh peer key -> first sighting time. Conversation rows briefly
     /// hold unresolved peers so 0x53 can fold their transports; Radar always
@@ -1140,7 +1143,7 @@ final class SonarAppStore: ObservableObject {
                 idBridge: idBridge,
                 identityManager: SecureIdentityStateManager(keychain)
             ),
-            marmot: MarmotChatModel(keychain: keychain),
+            marmot: SonarMarmotOwner.shared,
             keychain: keychain,
             idBridge: idBridge,
             wallet: Self.makeWallet()
@@ -1384,7 +1387,17 @@ final class SonarAppStore: ObservableObject {
             .sink { [weak self] _ in
                 guard let self else { return }
                 self.cachePublishedUploadMedia()
-                self.processIncomingMarmotNotifications()
+                Task { @MainActor in
+                    if self.isForeground {
+                        _ = await SonarPushProcessor.acknowledgeForegroundNotifications(
+                            marmot: self.marmot
+                        )
+                    } else {
+                        _ = await SonarPushProcessor.surfacePendingNotifications(
+                            marmot: self.marmot
+                        )
+                    }
+                }
                 self.processIncomingPayLines()
                 self.processIncomingCallLines()
                 self.objectWillChange.send()
@@ -2298,39 +2311,6 @@ final class SonarAppStore: ObservableObject {
             userInfo: notification.userInfo,
             sound: sound
         )
-    }
-
-    private func processIncomingMarmotNotifications() {
-        for group in marmot.groups {
-            let convId = marmotConvId(forGroup: group.id)
-            let title = marmot.title(for: group)
-            for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
-                if message.createdAt <= localNotificationStartedAt {
-                    seenMarmotNotificationMessageIDs.insert(message.id)
-                    continue
-                }
-                // A blocked person must not fire a notification — same rule the
-                // mesh inbound path applies via `isNostrBlocked`.
-                if isMarmotSenderBlocked(message.senderNpub) {
-                    seenMarmotNotificationMessageIDs.insert(message.id)
-                    continue
-                }
-                guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
-                let kind = localNotificationKind(for: message.content)
-                guard kind != .call else { continue }
-                let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
-                let groupName = group.memberNpubs.count > 2 ? title : nil
-                sendSonarNotification(
-                    kind: kind,
-                    idKey: message.id,
-                    conversationId: convId,
-                    conversationTitle: title,
-                    senderName: senderName,
-                    groupName: groupName,
-                    preview: message.content
-                )
-            }
-        }
     }
 
     // MARK: Favorites (out-of-range internet delivery for bitchat peers)

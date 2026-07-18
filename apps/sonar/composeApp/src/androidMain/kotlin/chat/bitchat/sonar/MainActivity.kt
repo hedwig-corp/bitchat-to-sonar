@@ -240,12 +240,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        SonarLifecycle.onForeground?.invoke(true)
+        SonarLifecycle.updateForeground(true)
     }
 
     override fun onPause() {
         super.onPause()
-        SonarLifecycle.onForeground?.invoke(false)
+        SonarLifecycle.updateForeground(false)
     }
 
     override fun onDestroy() {

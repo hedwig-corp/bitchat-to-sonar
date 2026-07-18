@@ -108,6 +108,96 @@ final class NotificationService {
 
         UNUserNotificationCenter.current().add(request)
     }
+
+    /// Returns only after UserNotifications accepts the request, or `true`
+    /// when durable authorization policy suppresses it. Notification outbox
+    /// entries must not be acknowledged on a transient `add` failure, but a
+    /// denied/not-yet-determined policy must not create a stale replay backlog.
+    func postLocalNotification(
+        title: String,
+        body: String,
+        identifier: String,
+        userInfo: [String: Any]? = nil,
+        interruptionLevel: UNNotificationInterruptionLevel = .active,
+        renderLease: SonarNotificationRenderLease? = nil
+    ) async -> Bool {
+        guard !isRunningTests else { return false }
+        let center = UNUserNotificationCenter.current()
+        let authorized = await withCheckedContinuation { continuation in
+            center.getNotificationSettings { settings in
+                let allowed: Bool
+                switch settings.authorizationStatus {
+                case .authorized, .provisional, .ephemeral:
+                    allowed = true
+                case .notDetermined, .denied:
+                    allowed = false
+                @unknown default:
+                    allowed = false
+                }
+                continuation.resume(returning: allowed)
+            }
+        }
+        guard authorized else { return true }
+        guard renderLease?.isCurrent ?? true else { return false }
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.interruptionLevel = interruptionLevel
+        if let userInfo { content.userInfo = userInfo }
+        let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
+        return await withCheckedContinuation { continuation in
+            let cleanup = {
+                center.removePendingNotificationRequests(withIdentifiers: [identifier])
+                center.removeDeliveredNotifications(withIdentifiers: [identifier])
+            }
+            let submit = {
+                center.add(request) { error in
+                    let generationStillCurrent = renderLease?.isCurrent ?? true
+                    if !generationStillCurrent { cleanup() }
+                    renderLease?.finishSubmission()
+                    continuation.resume(
+                        returning: error == nil && generationStillCurrent
+                    )
+                }
+            }
+            if let renderLease {
+                guard renderLease.submitIfCurrent(
+                    cleanupOnInvalidation: cleanup,
+                    submit
+                ) else {
+                    continuation.resume(returning: false)
+                    return
+                }
+            } else {
+                submit()
+            }
+        }
+    }
+
+    func cancelLocalNotification(identifier: String) {
+        guard !isRunningTests else { return }
+        let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        center.removeDeliveredNotifications(withIdentifiers: [identifier])
+    }
+
+    func cancelLocalNotificationAccepted(
+        identifier: String,
+        renderLease: SonarNotificationRenderLease? = nil
+    ) async -> Bool {
+        guard !isRunningTests else { return false }
+        guard let renderLease else {
+            cancelLocalNotification(identifier: identifier)
+            return true
+        }
+        let accepted = renderLease.submitIfCurrent(
+            cleanupOnInvalidation: {},
+            { cancelLocalNotification(identifier: identifier) }
+        )
+        renderLease.finishSubmission()
+        return accepted && renderLease.isCurrent
+    }
     
     func sendMentionNotification(
         from sender: String,

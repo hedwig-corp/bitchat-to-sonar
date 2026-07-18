@@ -59,6 +59,10 @@ pub struct GroupCreation {
 #[derive(Debug)]
 pub struct GroupMembershipUpdate {
     pub group_id: GroupId,
+    /// Group epoch before this locally staged commit. Persisted alongside a
+    /// deferred publication so restart recovery can distinguish "published but
+    /// not yet merged" from "already merged" without guessing from errors.
+    pub base_epoch: u64,
     /// Kind-445 commit/proposal event to publish to the group's relays.
     pub evolution_event: Event,
     /// `(member pubkey, kind-444 rumor)` pairs for newly invited members.
@@ -485,7 +489,13 @@ impl MarmotEngine {
         let member_pubkeys: Vec<PublicKey> = member_key_packages.iter().map(|e| e.pubkey).collect();
         let result = dispatch!(&self.storage, |mdk| mdk
             .add_members(group_id, &member_key_packages))?;
-        Ok(Self::to_membership_update(result, member_pubkeys, true))
+        let base_epoch = self.group_epoch(&result.mls_group_id)?;
+        Ok(Self::to_membership_update(
+            result,
+            member_pubkeys,
+            true,
+            base_epoch,
+        ))
     }
 
     /// Create a remove-members commit for an existing group.
@@ -496,21 +506,39 @@ impl MarmotEngine {
     ) -> Result<GroupMembershipUpdate> {
         let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.remove_members(group_id, members))?;
-        Ok(Self::to_membership_update(result, Vec::new(), true))
+        let base_epoch = self.group_epoch(&result.mls_group_id)?;
+        Ok(Self::to_membership_update(
+            result,
+            Vec::new(),
+            true,
+            base_epoch,
+        ))
     }
 
     /// Create a self-demotion commit. Required before an admin leaves.
     pub fn self_demote(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
         let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.self_demote(group_id))?;
-        Ok(Self::to_membership_update(result, Vec::new(), true))
+        let base_epoch = self.group_epoch(&result.mls_group_id)?;
+        Ok(Self::to_membership_update(
+            result,
+            Vec::new(),
+            true,
+            base_epoch,
+        ))
     }
 
     /// Create a leave proposal for the current member.
     pub fn leave_group(&self, group_id: &GroupId) -> Result<GroupMembershipUpdate> {
         let _mls = self.mls_write();
         let result = dispatch!(&self.storage, |mdk| mdk.leave_group(group_id))?;
-        Ok(Self::to_membership_update(result, Vec::new(), false))
+        let base_epoch = self.group_epoch(&result.mls_group_id)?;
+        Ok(Self::to_membership_update(
+            result,
+            Vec::new(),
+            false,
+            base_epoch,
+        ))
     }
 
     /// Merge a pending local commit after the caller has published it.
@@ -818,9 +846,15 @@ impl MarmotEngine {
             | MessageProcessingResult::PendingProposal { mls_group_id } => {
                 Ok(Incoming::GroupUpdated(mls_group_id))
             }
-            MessageProcessingResult::Proposal(update) => Ok(Incoming::GroupProposal(
-                Self::to_membership_update(update, Vec::new(), true),
-            )),
+            MessageProcessingResult::Proposal(update) => {
+                let base_epoch = self.group_epoch(&update.mls_group_id)?;
+                Ok(Incoming::GroupProposal(Self::to_membership_update(
+                    update,
+                    Vec::new(),
+                    true,
+                    base_epoch,
+                )))
+            }
             // MDK persists a Failed processing record on the first
             // failure and short-circuits every re-delivery with the
             // same result, so these are terminal for the sync layer.
@@ -837,6 +871,21 @@ impl MarmotEngine {
             .into_iter()
             .filter(|g| g.state == group_types::GroupState::Active)
             .collect())
+    }
+
+    /// Resolve one active group by MLS id without loading MDK's complete group
+    /// catalog. Notification recovery uses this behind a bounded SQL keyset
+    /// page so an OS wake never performs all-group materialization or sorting.
+    pub fn group(&self, group_id: &GroupId) -> Result<Option<group_types::Group>> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?
+            .filter(|group| group.state == group_types::GroupState::Active))
+    }
+
+    /// Current committed epoch for one active or pending group.
+    pub fn group_epoch(&self, group_id: &GroupId) -> Result<u64> {
+        dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?
+            .map(|group| group.epoch)
+            .ok_or_else(|| Error::Storage("group epoch unavailable".into()))
     }
 
     /// Pending multi-member welcomes waiting for user acceptance.
@@ -1262,6 +1311,7 @@ impl MarmotEngine {
         result: UpdateGroupResult,
         member_pubkeys: Vec<PublicKey>,
         requires_commit_merge: bool,
+        base_epoch: u64,
     ) -> GroupMembershipUpdate {
         let welcomes = result
             .welcome_rumors
@@ -1272,6 +1322,7 @@ impl MarmotEngine {
             .collect();
         GroupMembershipUpdate {
             group_id: result.mls_group_id,
+            base_epoch,
             evolution_event: result.evolution_event,
             welcomes,
             requires_commit_merge,

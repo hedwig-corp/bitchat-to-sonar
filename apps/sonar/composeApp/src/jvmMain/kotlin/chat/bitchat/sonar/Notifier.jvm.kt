@@ -75,14 +75,19 @@ actual object Notifier {
         body: String,
         sound: SonarNotificationSound,
         conversationId: String?,
-    ) {
+    ): Boolean {
         if (!conversationId.isNullOrBlank()) {
             lastConversationId.set(conversationId)
         }
-        val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
-        runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
-            .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
-        playNotificationSound(sound)
+        val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return false
+        val posted = runCatching {
+            icon.displayMessage(title, body, TrayIcon.MessageType.INFO)
+            true
+        }.onFailure {
+            sonarLog("Notifier", "Failed to display desktop notification: ${it.message}")
+        }.getOrDefault(false)
+        if (posted) playNotificationSound(sound)
+        return posted
     }
 
     actual fun clearConversations(conversationIds: Collection<String>) {
@@ -135,4 +140,10 @@ actual object Notifier {
             }
         }
     }
+
+    actual fun cancel(id: Int): Boolean = false // AWT has no addressable delivered notification API.
+
+    actual val ownsMarmotNotifications: Boolean = false
+
+    actual suspend fun settlePendingMarmotNotifications(appIsForeground: Boolean) = Unit
 }
