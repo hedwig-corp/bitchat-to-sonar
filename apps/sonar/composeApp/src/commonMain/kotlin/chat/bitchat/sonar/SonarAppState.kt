@@ -1348,6 +1348,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
         // guards on callStarted, so unlike the old iOS path it never re-binds.)
         // iOS parity: video defaults to speaker, voice to earpiece (+ proximity).
+        // Calls always win over voice-note playback.
+        stopVoiceForCall()
         CallAudioRoute.configure(active = true, speakerOn = video, voiceProximity = !video)
         activeCall = ActiveCall(
             callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing,
@@ -1396,6 +1398,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun acceptCall() {
         val c = activeCall ?: return
         activeCall = c.copy(phase = SonarCallState.Connecting)
+        stopVoiceForCall()
         CallAudioRoute.configure(active = true, speakerOn = c.speakerOn, voiceProximity = !c.video)
         scope.launch {
             try {
@@ -1602,6 +1605,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val name = callPeerName(callChatId)
                 // iOS parity (SNActiveCall(speakerOn: video)): video rings on
                 // speaker with the camera armed; voice rings for the earpiece.
+                // A ringing call preempts any voice note already playing.
+                stopVoiceForCall()
                 activeCall = ActiveCall(
                     ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing,
                     speakerOn = ctrl.video, camOn = ctrl.video,
@@ -7439,7 +7444,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         thumb.encoded?.let { MediaThumbnailDiskCache.store(url, it) }
     }
 
-    private fun cancelAllMediaDownloads() {
+    /** Suspends until the voice-playback engine has released any open file
+     *  handle, so callers can safely wipe local media right after this
+     *  returns (every call site is `MediaCache.wipe()` on an account
+     *  wipe/erase/switch path). */
+    private suspend fun cancelAllMediaDownloads() {
         mediaDownloadControls.values.forEach(MediaDownloadControl::cancel)
         mediaDownloadJobs.values.forEach(Job::cancel)
         mediaDownloadControls.clear()
@@ -7447,6 +7456,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaDownloadGenerations.clear()
         mediaTransfers = emptyMap()
         MediaImageMemoryCache.clear()
+        stopVoiceForWipe()
     }
 
     /** Read an already-local attachment for image decode or voice playback.
@@ -7458,6 +7468,260 @@ class SonarAppState(private val scope: CoroutineScope) {
         val bytes = MediaCache.read(path) ?: return null
         if (bytes.size <= 1024 * 1024) mediaCache[media.url] = bytes
         return bytes
+    }
+
+    // ── Voice-note playback (Signal-parity app-scoped session, issue #320) ──
+    // One controller for the whole process lifetime. Rows only ever observe
+    // [voicePlayback] and call the helpers below; disposing a bubble never
+    // stops or mutates this session. Never call [mediaData] for playback —
+    // the engine plays [MediaTransferState.localPath] directly.
+    //
+    // Engine is created first; host callbacks go through [voiceControllerRef]
+    // so controller ↔ engine lazy init cannot deadlock.
+    @Volatile private var voiceControllerRef: VoiceMessagePlaybackController? = null
+    private val voiceControllerLazy = lazy(LazyThreadSafetyMode.NONE) {
+        VoiceMessagePlaybackController(
+            engine = voicePlaybackEngine,
+            rateStore = AppVoicePlaybackRateStore(),
+            queue = AppVoicePlaybackQueue(),
+            listenedStore = AppVoicePlaybackListenedStore(),
+            dispatcher = Dispatchers.Default,
+        ).also { controller ->
+            voiceControllerRef = controller
+            controller.onStateChanged = { s -> voicePlayback = s }
+        }
+    }
+    private val voiceController: VoiceMessagePlaybackController by voiceControllerLazy
+
+    private val voicePlaybackEngine: VoicePlaybackEngine by lazy(LazyThreadSafetyMode.NONE) {
+        createVoicePlaybackEngine(object : VoicePlaybackEngineHost {
+            override fun onEnded(generation: Long) {
+                voiceControllerRef?.onEngineEnded(generation)
+            }
+            override fun onFailed(generation: Long) {
+                voiceControllerRef?.onEngineFailed(generation)
+            }
+            override fun onProgress(generation: Long, positionMs: Long, durationMs: Long) {
+                voiceControllerRef?.onEngineProgress(generation, positionMs, durationMs)
+            }
+            // Guarded on generation: a focus/route callback for an item that has
+            // already been superseded must not touch the newer item's state.
+            override fun onSystemPaused(generation: Long) {
+                // Becoming-noisy / permanent focus loss: pause, no auto-resume.
+                voiceControllerRef?.onSystemPaused(generation)
+            }
+            override fun onSystemResumed(generation: Long) {
+                // Intentionally empty — route-lost never auto-resumes.
+            }
+            override fun onTransientInterruptionBegan(generation: Long) {
+                val controller = voiceControllerRef ?: return
+                if (generation == controller.state.generation) {
+                    controller.onTransientInterruptionBegan()
+                }
+            }
+            override fun onTransientInterruptionEnded(generation: Long) {
+                val controller = voiceControllerRef ?: return
+                if (generation == controller.state.generation) {
+                    controller.onTransientInterruptionEnded()
+                }
+            }
+            override fun onExternalPaused(generation: Long) {
+                val controller = voiceControllerRef ?: return
+                if (generation != controller.state.generation) return
+                // Only mirror when we still believe audio is playing — ignore
+                // echoes of our own Pause / Stop commands.
+                if (controller.state.phase == VoicePlaybackPhase.Playing) {
+                    controller.dispatch(VoicePlaybackCommand.Pause)
+                }
+            }
+            override fun onExternalResumed(generation: Long) {
+                val controller = voiceControllerRef ?: return
+                if (generation != controller.state.generation) return
+                if (controller.state.phase == VoicePlaybackPhase.Paused) {
+                    controller.dispatch(VoicePlaybackCommand.Resume)
+                }
+            }
+        })
+    }
+
+    /** Observable mirror of [VoiceMessagePlaybackController.state]; `AudioBubble`
+     *  reads this instead of owning any player. */
+    var voicePlayback by mutableStateOf(VoicePlaybackState())
+        private set
+
+    private inner class AppVoicePlaybackRateStore : VoicePlaybackRateStore {
+        override fun rateFor(logicalConversationId: String): Float =
+            prefStr("voiceRate.$logicalConversationId", "")
+                .toFloatOrNull()
+                ?.let(VoicePlaybackRates::normalize)
+                ?: 1.0f
+
+        override fun setRate(logicalConversationId: String, rate: Float) {
+            setPrefStr("voiceRate.$logicalConversationId", rate.toString())
+        }
+    }
+
+    /** Bounded local listened-state cache, persisted through the same
+     *  [SonarCore.saveBlob] seam as every other Compose preference. Signal-
+     *  comparable: this is local UX state, not a wire receipt. */
+    private inner class AppVoicePlaybackListenedStore : VoicePlaybackListenedStore {
+        private val maxEntries = 300
+        private val blobKey = "voice.listened"
+        private val keys: LinkedHashSet<String> by lazy(LazyThreadSafetyMode.NONE) {
+            LinkedHashSet(SonarCore.loadBlob(blobKey).lineSequence().filter { it.isNotBlank() }.toList())
+        }
+
+        override fun isListened(key: String): Boolean = key in keys
+
+        override fun markListened(key: String) {
+            if (key.contains('\n') || key in keys) return
+            keys.add(key)
+            while (keys.size > maxEntries) keys.remove(keys.first())
+            persist()
+        }
+
+        override fun clearConversation(logicalConversationId: String) {
+            if (keys.removeAll { it.startsWith("$logicalConversationId|") }) persist()
+        }
+
+        override fun clearAll() {
+            keys.clear()
+            persist()
+        }
+
+        private fun persist() {
+            SonarCore.saveBlob(blobKey, keys.joinToString("\n"))
+        }
+    }
+
+    /** Next/previous come ONLY from the already-published bounded local
+     *  transcript window ([messages]) for the currently open chat — never a
+     *  relay fetch or a full-history scan, and never crossing into another
+     *  logical conversation. */
+    /** Snapshot of the open-window voice queue for the conversation that
+     *  started the current session — keeps next/previous working after the
+     *  user navigates away (Signal: queue stays in the originating chat). */
+    @Volatile private var voiceQueueSnapshot: Pair<String, List<VoicePlaybackItem>>? = null
+
+    private fun rememberVoiceQueueSnapshot(logicalConversationId: String) {
+        voiceQueueSnapshot = logicalConversationId to voiceItemsInOpenWindow(logicalConversationId)
+    }
+
+    private inner class AppVoicePlaybackQueue : VoicePlaybackQueue {
+        override fun next(item: VoicePlaybackItem): VoicePlaybackItem? = neighbor(item, forward = true)
+        override fun previous(item: VoicePlaybackItem): VoicePlaybackItem? = neighbor(item, forward = false)
+
+        private fun neighbor(item: VoicePlaybackItem, forward: Boolean): VoicePlaybackItem? {
+            val ordered = when {
+                activeTranscriptChatId == item.logicalConversationId -> {
+                    val live = voiceItemsInOpenWindow(item.logicalConversationId)
+                    rememberVoiceQueueSnapshot(item.logicalConversationId)
+                    live
+                }
+                voiceQueueSnapshot?.first == item.logicalConversationId ->
+                    voiceQueueSnapshot?.second.orEmpty()
+                else -> return null
+            }
+            val idx = ordered.indexOfFirst { it.key == item.key }
+            if (idx < 0) return null
+            return if (forward) ordered.getOrNull(idx + 1) else ordered.getOrNull(idx - 1)
+        }
+    }
+
+    /** Every voice-bubble attachment currently visible in the bounded local
+     *  transcript window for [chatId], oldest first. */
+    private fun voiceItemsInOpenWindow(chatId: String): List<VoicePlaybackItem> =
+        messages.asSequence()
+            .sortedWith(compareBy({ it.tsSecs }, { it.id }))
+            .flatMap { msg ->
+                msg.media.asSequence()
+                    .withIndex()
+                    .filter { (_, media) -> media.isAudio }
+                    .map { (idx, media) -> voicePlaybackItem(chatId, msg, media, idx) }
+            }
+            .toList()
+
+    /** Build the stable identity for one voice attachment. [chatId] is
+     *  already the canonical/folded UI conversation id — every media helper
+     *  above ([mediaTransferState], [prepareMedia], [mediaData]) resolves the
+     *  exact transport from it internally, so it doubles as both the queue's
+     *  logical scope and the source used for local media here. */
+    fun voicePlaybackItem(chatId: String, msg: SonarMsg, media: SonarMedia, mediaIndex: Int): VoicePlaybackItem {
+        val localPath = mediaTransfers[media.url]?.localPath.orEmpty()
+        return VoicePlaybackItem(
+            logicalConversationId = chatId,
+            sourceConversationId = chatId,
+            messageId = msg.id,
+            attachmentId = voiceAttachmentId(msg.id, mediaIndex, media.filename, media.url),
+            localFile = localPath,
+            durationHintMs = media.durationMs,
+        )
+    }
+
+    /** Bounded (previous, next) within the same logical conversation, for a
+     *  bubble to decide whether to show queue affordances. */
+    fun voiceQueueNeighbors(item: VoicePlaybackItem): Pair<VoicePlaybackItem?, VoicePlaybackItem?> {
+        val queue = AppVoicePlaybackQueue()
+        return queue.previous(item) to queue.next(item)
+    }
+
+    fun isVoiceItemCurrent(item: VoicePlaybackItem): Boolean = voiceController.isCurrent(item)
+    fun isVoiceItemListened(item: VoicePlaybackItem): Boolean = voiceController.listened(item)
+
+    /** Play button semantics: toggles play/pause for THIS item; switches the
+     *  app-wide session to a different item when another one is active. */
+    fun togglePlayVoice(item: VoicePlaybackItem) {
+        val s = voiceController.state
+        when {
+            s.item?.key != item.key -> {
+                rememberVoiceQueueSnapshot(item.logicalConversationId)
+                voiceController.dispatch(VoicePlaybackCommand.Play(item))
+            }
+            s.phase == VoicePlaybackPhase.Playing -> voiceController.dispatch(VoicePlaybackCommand.Pause)
+            s.phase == VoicePlaybackPhase.Paused -> voiceController.dispatch(VoicePlaybackCommand.Resume)
+            else -> {
+                rememberVoiceQueueSnapshot(item.logicalConversationId)
+                voiceController.dispatch(VoicePlaybackCommand.Play(item))
+            }
+        }
+    }
+
+    fun playVoice(item: VoicePlaybackItem) {
+        rememberVoiceQueueSnapshot(item.logicalConversationId)
+        voiceController.dispatch(VoicePlaybackCommand.Play(item))
+    }
+    fun pauseVoice() = voiceController.dispatch(VoicePlaybackCommand.Pause)
+    fun resumeVoice() = voiceController.dispatch(VoicePlaybackCommand.Resume)
+    fun seekVoice(positionMs: Long) = voiceController.dispatch(VoicePlaybackCommand.Seek(positionMs))
+    fun cycleVoiceRate() = voiceController.dispatch(VoicePlaybackCommand.CycleRate)
+    fun nextVoice() = voiceController.dispatch(VoicePlaybackCommand.Next)
+    fun previousVoice() = voiceController.dispatch(VoicePlaybackCommand.Previous)
+
+    /** Calls always win over voice playback (Signal parity). Called before an
+     *  outgoing call is placed, an incoming call starts ringing, and when a
+     *  call is accepted. */
+    private fun stopVoiceForCall() {
+        if (voiceControllerLazy.isInitialized()) {
+            voiceController.dispatch(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call))
+        }
+    }
+
+    /** Starting to record a new voice note pauses/stops any note currently
+     *  playing before the recorder takes the microphone. */
+    fun stopVoiceForRecording() {
+        if (voiceControllerLazy.isInitialized()) {
+            voiceController.dispatch(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Recording))
+        }
+    }
+
+    /** Invalidate the active session before local media is wiped (account
+     *  wipe, erase-all-chats, or account switch) — engine release must
+     *  happen before [MediaCache.wipe] can delete the file it has open, so
+     *  this suspends until the stop has actually applied. */
+    private suspend fun stopVoiceForWipe() {
+        if (voiceControllerLazy.isInitialized()) {
+            voiceController.dispatchSync(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Wipe))
+        }
     }
 
     /** Auto-pick the transport for a radar-peer DM (mirrors iOS `sendDm`): a live

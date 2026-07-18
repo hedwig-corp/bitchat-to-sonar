@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">#%1$sのブックマークを切り替え</string>
     <string name="content_accessibility_toggle_favorite">ダブルタップでお気に入り状態を切り替え</string>
     <string name="content_accessibility_view_fingerprint">暗号フィンガープリントを見る</string>
+    <string name="content_accessibility_voice_pause">音声メッセージを一時停止</string>
+    <string name="content_accessibility_voice_play">音声メッセージを再生</string>
+    <string name="content_accessibility_voice_playback">音声メッセージの再生に失敗しました</string>
+    <string name="content_accessibility_voice_seek">音声メッセージをシーク</string>
+    <string name="content_accessibility_voice_speed">再生速度を変更</string>
     <string name="content_actions_block">ブロック</string>
     <string name="content_actions_direct_message">ダイレクトメッセージ</string>
     <string name="content_actions_hug">ハグ</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">ノート</string>
     <string name="content_payment_cashu">cashuで支払う</string>
     <string name="content_payment_lightning">lightningで支払う</string>
+    <string name="content_voice_listened">再生済み</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">暗号を確立しています</string>
     <string name="encryption_accessibility_failed">暗号に失敗</string>
     <string name="encryption_accessibility_not_encrypted">未暗号</string>

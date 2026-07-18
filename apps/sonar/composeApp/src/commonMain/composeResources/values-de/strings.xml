@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">bookmark für #%1$s umschalten</string>
     <string name="content_accessibility_toggle_favorite">doppelt tippen, um favoritenstatus zu wechseln</string>
     <string name="content_accessibility_view_fingerprint">tippe, um den verschlüsselungs-fingerprint zu sehen</string>
+    <string name="content_accessibility_voice_pause">Sprachnachricht pausieren</string>
+    <string name="content_accessibility_voice_play">Sprachnachricht abspielen</string>
+    <string name="content_accessibility_voice_playback">Wiedergabe der Sprachnachricht fehlgeschlagen</string>
+    <string name="content_accessibility_voice_seek">In Sprachnachricht springen</string>
+    <string name="content_accessibility_voice_speed">Wiedergabegeschwindigkeit ändern</string>
     <string name="content_actions_block">blockieren</string>
     <string name="content_actions_direct_message">direktnachricht</string>
     <string name="content_actions_hug">umarmen</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">notizen</string>
     <string name="content_payment_cashu">per cashu bezahlen</string>
     <string name="content_payment_lightning">per lightning bezahlen</string>
+    <string name="content_voice_listened">Abgespielt</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">verschlüsselung wird aufgebaut</string>
     <string name="encryption_accessibility_failed">verschlüsselung fehlgeschlagen</string>
     <string name="encryption_accessibility_not_encrypted">nicht verschlüsselt</string>

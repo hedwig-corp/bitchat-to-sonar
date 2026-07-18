@@ -2,42 +2,9 @@ package chat.bitchat.sonar
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.os.Build
 import java.io.File
-
-actual object AudioNotePlayer {
-    private var mp: MediaPlayer? = null
-    private var file: File? = null
-    private var onDone: (() -> Unit)? = null
-
-    actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
-        stop() // tears down + notifies any previous note before starting this one
-        val f = File(AppContextHolder.ctx.cacheDir, "play-${System.currentTimeMillis()}.m4a")
-        runCatching {
-            f.writeBytes(bytes)
-            mp = MediaPlayer().apply {
-                setDataSource(f.absolutePath)
-                setOnCompletionListener { stop() }
-                prepare()
-                start()
-            }
-            file = f
-            onDone = onComplete
-        }.onFailure { f.delete(); onComplete() }
-    }
-
-    actual fun stop() {
-        mp?.let { runCatching { it.stop() }; runCatching { it.release() } }
-        mp = null
-        file?.delete()
-        file = null
-        val cb = onDone
-        onDone = null
-        cb?.invoke()
-    }
-}
 
 actual class VoiceRecorder {
     private var rec: MediaRecorder? = null

@@ -98,13 +98,22 @@ import androidx.compose.foundation.text.appendInlineContent
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.withFrameNanos
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.content_accessibility_voice_pause
+import chat.bitchat.sonar.resources.content_accessibility_voice_play
+import chat.bitchat.sonar.resources.content_accessibility_voice_speed
 import chat.bitchat.sonar.resources.sonar_icon
+import org.jetbrains.compose.resources.stringResource
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
 import chat.bitchat.sonar.screens.shouldDismissKeyboardWhenOpeningEmojiTray
@@ -1838,31 +1847,33 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 // The pointer scope is @RestrictsSuspension, so the recorder
                                 // lifecycle runs in recScope: launch start() at down, join it on
                                 // release so finish()/cancel() can never race ahead of start().
-                                awaitEachGesture {
-                                    val down = awaitFirstDown(requireUnconsumed = false)
-                                    recDragX = 0f; recElapsed = 0; recording = true
-                                    var startedOk = false
-                                    val startJob = recScope.launch { startedOk = recorder.start() }
-                                    var dx = 0f
-                                    var pressed = true
-                                    while (pressed) {
-                                        val ev = awaitPointerEvent()
-                                        val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
-                                        dx += ch.positionChange().x; recDragX = dx
-                                        if (!ch.pressed) pressed = false
-                                    }
-                                    val cancel = dx < -240f
-                                    recScope.launch {
-                                        startJob.join()
-                                        if (!startedOk) state.toast = "Allow microphone access to record voice notes."
-                                        else if (cancel) recorder.cancel()
-                                        else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
-                                        recording = false; recDragX = 0f
-                                    }
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                recDragX = 0f; recElapsed = 0; recording = true
+                                // Recording takes the mic; any voice note stops first.
+                                state.stopVoiceForRecording()
+                                var startedOk = false
+                                val startJob = recScope.launch { startedOk = recorder.start() }
+                                var dx = 0f
+                                var pressed = true
+                                while (pressed) {
+                                    val ev = awaitPointerEvent()
+                                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
+                                    dx += ch.positionChange().x; recDragX = dx
+                                    if (!ch.pressed) pressed = false
                                 }
-                            },
-                        contentAlignment = Alignment.Center
-                    ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
+                                val cancel = dx < -240f
+                                recScope.launch {
+                                    startJob.join()
+                                    if (!startedOk) state.toast = "Allow microphone access to record voice notes."
+                                    else if (cancel) recorder.cancel()
+                                    else { val b = recorder.finish(); if (b != null) state.sendVoiceNote(screen.id, b) }
+                                    recording = false; recDragX = 0f
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) { SNIcon(SNIconName.Mic, 18.dp, micFg, weight = 2f) }
                 } else {
                     val sendEnabled = draft.isNotBlank()
                     val sendBg = if (!sendEnabled) s.surface2 else if (sendOverMesh) s.accentFill else s.netFill
@@ -3983,9 +3994,12 @@ private fun GifBadge(modifier: Modifier = Modifier) {
 
 /**
  * Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
- * `MediaWave` + duration). Downloads + decrypts the note on appear, then plays it
- * via [AudioNotePlayer]. Mirrors iOS `SNAudioBubble`. No duration metadata travels
- * with the note, so the static waveform is a deterministic hash of the filename.
+ * `MediaWave` + duration). Signal-parity app-scoped playback (issue #320): the
+ * bubble owns NO player — it only observes [SonarAppState.voicePlayback] and
+ * sends commands to the one app-wide [VoiceMessagePlaybackController]. Row
+ * disposal (scroll offscreen, chat switch) never stops playback. Mirrors iOS
+ * `SNAudioBubble`. No duration metadata travels with the note, so the static
+ * waveform shape is a deterministic hash of the filename.
  */
 @Composable
 private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media: SonarMedia, mesh: Boolean) {
@@ -3998,17 +4012,32 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
         state.prepareMedia(chatId, media, autoDownload = true)
     }
-    val bytes by androidx.compose.runtime.produceState<ByteArray?>(null, media.url, transfer.localPath) {
-        value = if (transfer.phase == MediaTransferPhase.Available) state.mediaData(chatId, media) else null
+    val mediaIndex = remember(m.id, media.url) { m.media.indexOfFirst { it.url == media.url }.coerceAtLeast(0) }
+    // Rebuilt whenever the local path changes (download completes); the item's
+    // `key` stays stable across that because it never encodes the path.
+    val item = remember(chatId, m.id, media.url, transfer.localPath) {
+        state.voicePlaybackItem(chatId, m, media, mediaIndex)
     }
-    var playing by remember { mutableStateOf(false) }
-    // Stop playback if the bubble leaves composition.
-    androidx.compose.runtime.DisposableEffect(media.url) {
-        onDispose { if (playing) AudioNotePlayer.stop() }
+    val playback = state.voicePlayback
+    val isCurrent = playback.item?.key == item.key
+    val phase = if (isCurrent) playback.phase else VoicePlaybackPhase.Idle
+    val playing = phase == VoicePlaybackPhase.Playing || phase == VoicePlaybackPhase.Loading
+    val positionMs = if (isCurrent) playback.positionMs else 0L
+    val durationMs = if (isCurrent && playback.durationMs > 0L) playback.durationMs else (media.durationMs ?: 0L)
+    val progress = if (isCurrent && durationMs > 0L) (positionMs.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f) else 0f
+    // Re-read on every listened-set change so the dot clears the instant this
+    // note starts playing, without polling a store lookup every recomposition.
+    val listened = remember(item.key, playback.listenedKeys) { state.isVoiceItemListened(item) }
+    val durText = remember(durationMs, positionMs, isCurrent, phase) {
+        when {
+            isCurrent && durationMs > 0L -> "${fmtDur((positionMs / 1000).toInt())} / ${fmtDur((durationMs / 1000).toInt())}"
+            durationMs > 0L -> fmtDur((durationMs / 1000).toInt())
+            else -> ""
+        }
     }
-    val durText = remember(media.durationMs) {
-        media.durationMs?.let { fmtDur((it / 1000).toInt()) } ?: ""
-    }
+    val playA11y = stringResource(Res.string.content_accessibility_voice_play)
+    val pauseA11y = stringResource(Res.string.content_accessibility_voice_pause)
+    val speedA11y = stringResource(Res.string.content_accessibility_voice_speed)
     val tail = 5.dp
     // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs
     // the surface bubble; radius 18 with the tail corner; padding 11/15/11/11.
@@ -4066,11 +4095,24 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
             }
         }
         Spacer(Modifier.width(11.dp))
-        MediaWaveStatic(
-            media.filename,
-            color = if (m.mine) Color.White.copy(alpha = 0.6f) else s.accent.copy(alpha = 0.55f),
-            modifier = Modifier.width(124.dp).height(26.dp)
+        VoiceWaveform(
+            seed = media.filename,
+            progress = progress,
+            filledColor = if (m.mine) Color.White.copy(alpha = 0.9f) else s.accent,
+            unfilledColor = if (m.mine) Color.White.copy(alpha = 0.6f) else s.accent.copy(alpha = 0.55f),
+            seekable = transfer.phase == MediaTransferPhase.Available,
+            onSeek = { fraction ->
+                val dur = durationMs.takeIf { it > 0L } ?: return@VoiceWaveform
+                if (!isCurrent) state.playVoice(item)
+                state.seekVoice((dur * fraction).toLong())
+            },
+            modifier = Modifier.width(124.dp).height(26.dp),
         )
+        if (!listened && !m.mine) {
+            Spacer(Modifier.width(6.dp))
+            // Unheard indicator (Signal parity) — clears once this note starts playing.
+            Box(Modifier.size(6.dp).clip(CircleShape).background(if (net) s.onNet else s.accent))
+        }
         if (durText.isNotEmpty()) {
             Spacer(Modifier.width(8.dp))
             Text(
@@ -4078,12 +4120,51 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 color = if (m.mine) onTint.copy(alpha = 0.8f) else s.text2.copy(alpha = 0.8f)
             )
         }
+        if (isCurrent) {
+            Spacer(Modifier.width(6.dp))
+            // Rate chip — cycles 0.5x → 1x → 1.5x → 2x, persisted per conversation.
+            Box(
+                Modifier.clip(RoundedCornerShape(8.dp))
+                    .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
+                    .clickable { state.cycleVoiceRate() }
+                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                    .semantics {
+                        role = Role.Button
+                        contentDescription = "$speedA11y ${fmtRate(playback.rate)}"
+                    },
+            ) {
+                Text(
+                    fmtRate(playback.rate), style = SonarType.mono(10.5, FontWeight.Bold),
+                    color = if (m.mine) Color.White else s.accentDeep,
+                )
+            }
+        }
     }
 }
 
-/** Static waveform (design: `MediaWave`) — deterministic hash bars from a seed. */
+/** "1x" / "1.5x" / "2x" — trims a trailing ".0" so the common rates read short. */
+private fun fmtRate(rate: Float): String {
+    val rounded = (rate * 10f).let { kotlin.math.round(it) } / 10f
+    val text = if (rounded == rounded.toInt().toFloat()) rounded.toInt().toString() else rounded.toString()
+    return "${text}×"
+}
+
+/**
+ * Voice-note waveform (design: `MediaWave`) — deterministic hash bars from a
+ * seed, with an interactive progress fill when [seekable]. Tapping or
+ * dragging anywhere along the bars seeks to that fraction (Signal parity);
+ * a tap while idle also starts playback of this item.
+ */
 @Composable
-private fun MediaWaveStatic(seed: String, color: Color, modifier: Modifier = Modifier) {
+private fun VoiceWaveform(
+    seed: String,
+    progress: Float,
+    filledColor: Color,
+    unfilledColor: Color,
+    seekable: Boolean,
+    onSeek: (Float) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val bars = remember(seed) {
         var h = 2166136261u
         for (b in seed.encodeToByteArray()) { h = (h xor (b.toInt() and 0xFF).toUInt()) * 16777619u }
@@ -4092,9 +4173,43 @@ private fun MediaWaveStatic(seed: String, color: Color, modifier: Modifier = Mod
             0.22f + (v and 15u).toInt() / 15f * 0.78f
         }
     }
-    Row(modifier, verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
-        bars.forEach { v ->
-            Box(Modifier.width(2.dp).fillMaxHeight(v).clip(CircleShape).background(color))
+    var widthPx by remember { mutableStateOf(0f) }
+    Row(
+        modifier
+            .onSizeChanged { widthPx = it.width.toFloat() }
+            .then(
+                if (seekable) {
+                    Modifier.pointerInput(seed) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            if (widthPx > 0f) onSeek((down.position.x / widthPx).coerceIn(0f, 1f))
+                            var pressed = true
+                            while (pressed) {
+                                val ev = awaitPointerEvent()
+                                val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
+                                if (widthPx > 0f) onSeek((ch.position.x / widthPx).coerceIn(0f, 1f))
+                                if (!ch.pressed) pressed = false
+                            }
+                        }
+                    }
+                } else {
+                    Modifier
+                }
+            )
+            // TODO(i18n): move to Localizable.xcstrings once Apple lands the
+            // matching accessibility string, then regenerate Compose strings.
+            .semantics {
+                if (seekable) {
+                    role = Role.Button
+                    contentDescription = "Voice message progress"
+                    progressBarRangeInfo = ProgressBarRangeInfo(progress, 0f..1f)
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        bars.forEachIndexed { i, v ->
+            val filled = seekable && bars.isNotEmpty() && i.toFloat() / bars.size < progress
+            Box(Modifier.width(2.dp).fillMaxHeight(v).clip(CircleShape).background(if (filled) filledColor else unfilledColor))
         }
     }
 }

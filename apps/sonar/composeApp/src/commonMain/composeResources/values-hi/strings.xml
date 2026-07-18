@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s के लिए बुकमार्क टॉगल करें</string>
     <string name="content_accessibility_toggle_favorite">पसंदीदा स्थिति बदलने के लिए डबल टैप करें</string>
     <string name="content_accessibility_view_fingerprint">एन्क्रिप्शन फिंगरप्रिंट देखने के लिए टैप करें</string>
+    <string name="content_accessibility_voice_pause">वॉइस संदेश रोकें</string>
+    <string name="content_accessibility_voice_play">वॉइस संदेश चलाएँ</string>
+    <string name="content_accessibility_voice_playback">वॉइस संदेश चलाने में विफल</string>
+    <string name="content_accessibility_voice_seek">वॉइस संदेश खोजें</string>
+    <string name="content_accessibility_voice_speed">प्लेबैक गति बदलें</string>
     <string name="content_actions_block">ब्लॉक करें</string>
     <string name="content_actions_direct_message">डायरेक्ट संदेश</string>
     <string name="content_actions_hug">गले लगाएँ</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">नोट्स</string>
     <string name="content_payment_cashu">कैशु से भुगतान करें</string>
     <string name="content_payment_lightning">लाइटनिंग से भुगतान करें</string>
+    <string name="content_voice_listened">सुना गया</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">एन्क्रिप्शन स्थापित हो रहा है</string>
     <string name="encryption_accessibility_failed">एन्क्रिप्शन विफल हुआ</string>
     <string name="encryption_accessibility_not_encrypted">एन्क्रिप्ट नहीं</string>

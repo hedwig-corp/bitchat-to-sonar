@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s 북마크 토글</string>
     <string name="content_accessibility_toggle_favorite">두 번 탭하여 즐겨찾기 상태 토글</string>
     <string name="content_accessibility_view_fingerprint">탭하여 암호화 지문 보기</string>
+    <string name="content_accessibility_voice_pause">음성 메시지 일시정지</string>
+    <string name="content_accessibility_voice_play">음성 메시지 재생</string>
+    <string name="content_accessibility_voice_playback">음성 메시지 재생 실패</string>
+    <string name="content_accessibility_voice_seek">음성 메시지 탐색</string>
+    <string name="content_accessibility_voice_speed">재생 속도 변경</string>
     <string name="content_actions_block">차단하기</string>
     <string name="content_actions_direct_message">다이렉트 메시지 보내기</string>
     <string name="content_actions_hug">포옹하기</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">노트</string>
     <string name="content_payment_cashu">cashu로 결제</string>
     <string name="content_payment_lightning">lightning으로 결제</string>
+    <string name="content_voice_listened">재생됨</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">암호화 중</string>
     <string name="encryption_accessibility_failed">암호화 실패</string>
     <string name="encryption_accessibility_not_encrypted">암호화되지 않음</string>

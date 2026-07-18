@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s-এর জন্য বুকমার্ক টগল করুন</string>
     <string name="content_accessibility_toggle_favorite">প্রিয় অবস্থা বদলাতে দুইবার ট্যাপ করুন</string>
     <string name="content_accessibility_view_fingerprint">এনক্রিপশন ফিঙ্গারপ্রিন্ট দেখতে ট্যাপ করুন</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_actions_block">ব্লক করুন</string>
     <string name="content_actions_direct_message">ডিরেক্ট মেসেজ</string>
     <string name="content_actions_hug">আলিঙ্গন</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">নোট</string>
     <string name="content_payment_cashu">ক্যাশু দিয়ে পরিশোধ করুন</string>
     <string name="content_payment_lightning">লাইটনিং দিয়ে পরিশোধ করুন</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">এনক্রিপশন স্থাপিত হচ্ছে</string>
     <string name="encryption_accessibility_failed">এনক্রিপশন ব্যর্থ হয়েছে</string>
     <string name="encryption_accessibility_not_encrypted">এনক্রিপ্ট করা নেই</string>

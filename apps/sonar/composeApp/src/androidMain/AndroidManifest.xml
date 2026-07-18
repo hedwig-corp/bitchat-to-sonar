@@ -8,6 +8,9 @@
     <!-- Push wakeup: foreground service for processing transponder/Breez pushes. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Signal-parity voice-note playback: keeps the ExoPlayer session alive
+         (notification, lock screen, headset buttons) while backgrounded. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- BLE mesh transport (peer discovery + GATT). Android 12+ uses the
@@ -95,6 +98,18 @@
             android:name=".push.SonarPushProcessingService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Signal-parity voice-note playback (issue #320): app-scoped
+             MediaSessionService so playback survives Activity recreation,
+             backgrounding, and screen lock; see VoiceMessagePlaybackService. -->
+        <service
+            android:name=".VoiceMessagePlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
     </application>
 
 </manifest>

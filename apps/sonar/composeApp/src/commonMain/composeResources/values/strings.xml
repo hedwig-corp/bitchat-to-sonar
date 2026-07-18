@@ -77,6 +77,11 @@
     <string name="content_accessibility_toggle_bookmark">toggle bookmark for #%1$s</string>
     <string name="content_accessibility_toggle_favorite">double tap to toggle favorite status</string>
     <string name="content_accessibility_view_fingerprint">tap to view encryption fingerprint</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_actions_block">block</string>
     <string name="content_actions_direct_message">direct message</string>
     <string name="content_actions_hug">hug</string>
@@ -120,6 +125,8 @@
     <string name="content_notes_title">notes</string>
     <string name="content_payment_cashu">pay via cashu</string>
     <string name="content_payment_lightning">pay via lightning</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="continue_">Continue</string>
     <string name="could_not_load_sticker_pack">Could not load sticker pack</string>
     <string name="couldn_t_decode_image">Couldn't decode image</string>

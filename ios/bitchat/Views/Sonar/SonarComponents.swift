@@ -2674,7 +2674,9 @@ struct SNMediaBubble: View {
             }
         } else if let item, item.mime.hasPrefix("audio/") {
             SNAudioBubble(
-                bytes: bytes,
+                message: m,
+                media: item,
+                mediaIndex: 0,
                 seed: item.filename,
                 mine: m.mine,
                 via: m.via ?? .mesh,
@@ -3752,12 +3754,12 @@ struct SNHereCard: View {
     }
 }
 
-/// Audio / voice-note bubble (design: MediaBubble `media-audio` — play button +
-/// `MediaWave` + duration). Plays the decrypted bytes via AVAudioPlayer.
-/// Deviation: the flat play triangle uses an SF Symbol (`play.fill`/`pause.fill`),
-/// the platform idiom for a media transport control.
+/// Audio / voice-note bubble (design: MediaBubble `media-audio`). Observes the
+/// app-scoped `VoiceNotePlaybackController` — row disposal never stops playback.
 struct SNAudioBubble: View {
-    let bytes: Data?
+    let message: SNMessage
+    let media: SNMediaItem
+    let mediaIndex: Int
     let seed: String
     let mine: Bool
     var via: SNVia = .mesh
@@ -3767,9 +3769,52 @@ struct SNAudioBubble: View {
     var onRequest: () -> Void = {}
     var onCancel: () -> Void = {}
 
-    @StateObject private var player = SNAudioPlayer()
+    @ObservedObject private var playback = VoiceNotePlaybackController.shared
 
     private var tint: Color { via == .internet ? SonarTheme.netFill : SonarTheme.accentFill }
+
+    private var playbackItem: VoicePlaybackItem? {
+        guard let localURL = transfer.localURL else { return nil }
+        // Queue/rate scope uses the folded logical id when the store has mapped
+        // this source group; otherwise the exact source id is the scope.
+        let sourceId = media.groupId
+        let logicalId = snLogicalConversationId(forSourceGroupId: sourceId) ?? sourceId
+        return VoicePlaybackItem(
+            logicalConversationId: logicalId,
+            sourceConversationId: sourceId,
+            messageId: message.id,
+            attachmentId: snVoiceAttachmentId(
+                messageId: message.id,
+                mediaIndex: mediaIndex,
+                filename: media.filename,
+                url: media.url
+            ),
+            localFile: localURL,
+            durationHint: media.durationMs.map { TimeInterval($0) / 1000.0 }
+        )
+    }
+
+    private var isCurrent: Bool {
+        guard let playbackItem else { return false }
+        return playback.isCurrent(playbackItem)
+    }
+
+    private var isPlaying: Bool { isCurrent && playback.state.phase == .playing }
+
+    private var durationText: String {
+        let total = isCurrent ? playback.state.duration : TimeInterval(media.durationMs ?? 0) / 1000.0
+        let remaining: TimeInterval = {
+            guard isCurrent, total > 0 else { return total }
+            return max(0, total - playback.state.position)
+        }()
+        return snFmtDur(Int(remaining.rounded()))
+    }
+
+    private var rateLabel: String {
+        let rate = isCurrent ? playback.state.rate : 1.0
+        if abs(rate - 1.0) < 0.01 { return "1×" }
+        return String(format: "%g×", rate)
+    }
 
     var body: some View {
         HStack(spacing: 11) {
@@ -3781,7 +3826,8 @@ struct SNAudioBubble: View {
                 case .downloading:
                     onCancel()
                 case .available:
-                    player.toggle(bytes)
+                    guard let playbackItem else { return }
+                    playback.toggle(playbackItem)
                 }
             } label: {
                 Circle().fill(mine ? tint : SonarTheme.surface)
@@ -3794,14 +3840,41 @@ struct SNAudioBubble: View {
             Text(verbatim: durationText)
                 .font(SonarTheme.monoFont(size: 11.5))
                 .foregroundColor(SonarTheme.text3)
+
+            if transfer.phase == .available {
+                Button {
+                    guard let playbackItem else { return }
+                    if !isCurrent { playback.play(playbackItem) }
+                    playback.cycleRate()
+                } label: {
+                    Text(verbatim: rateLabel)
+                        .font(SonarTheme.monoFont(size: 10.5))
+                        .foregroundColor(SonarTheme.text2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(SonarTheme.surface2))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(String(localized: "content.accessibility.voice_speed"))
+            }
+
+            if let playbackItem, playback.isListened(playbackItem) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundColor(SonarTheme.text3)
+                    .accessibilityLabel(String(localized: "content.voice.listened"))
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         .background(RoundedRectangle(cornerRadius: 18).fill(mine ? tint.opacity(0.15) : SonarTheme.surface2))
+        .accessibilityHint(
+            playback.state.phase == .failed && isCurrent
+                ? String(localized: "content.accessibility.voice_playback_failed")
+                : ""
+        )
+        // Row disposal must never stop the app-scoped session.
     }
-
-    private var isPlaying: Bool { player.playing }
-    private var durationText: String { snFmtDur(Int(player.duration.rounded())) }
 
     @ViewBuilder private var audioControl: some View {
         let color = mine
@@ -3844,9 +3917,27 @@ struct SNAudioBubble: View {
     }
 }
 
+func snVoiceAttachmentId(messageId: String, mediaIndex: Int, filename: String, url: String) -> String {
+    let urlKey = url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "empty-url" : url
+    let nameKey = filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "audio" : filename
+    return "\(messageId)#\(mediaIndex)#\(nameKey)#\(urlKey.hashValue)"
+}
+
+/// Optional fold resolver installed by `SonarAppStore` so bubbles can scope
+/// rate/queue by the canonical UI conversation without owning store state.
+enum SNVoicePlaybackIdentity {
+    @MainActor static var logicalIdForSource: ((String) -> String?)?
+}
+
+@MainActor
+private func snLogicalConversationId(forSourceGroupId sourceId: String) -> String? {
+    SNVoicePlaybackIdentity.logicalIdForSource?(sourceId)
+}
+
 /// Static waveform (design: `MediaWave` — deterministic hash bars).
 struct SNMediaWave: View {
     let seed: String
+    var progress: Double = 0
     private func bars() -> [CGFloat] {
         var h: UInt32 = 2166136261
         for b in seed.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
@@ -3857,9 +3948,13 @@ struct SNMediaWave: View {
     }
     var body: some View {
         GeometryReader { geo in
+            let values = bars()
             HStack(spacing: 2) {
-                ForEach(Array(bars().enumerated()), id: \.offset) { _, v in
-                    Capsule().fill(SonarTheme.text2.opacity(0.5)).frame(width: 2, height: geo.size.height * v)
+                ForEach(Array(values.enumerated()), id: \.offset) { idx, v in
+                    let played = Double(idx) / Double(max(values.count - 1, 1)) <= progress
+                    Capsule()
+                        .fill(SonarTheme.text2.opacity(played ? 0.85 : 0.5))
+                        .frame(width: 2, height: geo.size.height * v)
                 }
             }
             .frame(maxHeight: .infinity, alignment: .center)
@@ -4197,6 +4292,7 @@ struct SNComposer: View {
     }
 
     private func beginVoiceRecording() {
+        VoiceNotePlaybackController.shared.stop(reason: .recording)
         recording = true
         dragX = 0
         voiceError = nil

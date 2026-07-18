@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s için yer işaretini değiştir</string>
     <string name="content_accessibility_toggle_favorite">favori durumunu değiştirmek için çift dokunun</string>
     <string name="content_accessibility_view_fingerprint">şifreleme parmak izini görmek için dokunun</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_actions_block">engelle</string>
     <string name="content_actions_direct_message">doğrudan mesaj</string>
     <string name="content_actions_hug">sarıl</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">notlar</string>
     <string name="content_payment_cashu">cashu ile öde</string>
     <string name="content_payment_lightning">lightning ile öde</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">şifreleme kuruluyor</string>
     <string name="encryption_accessibility_failed">şifreleme başarısız</string>
     <string name="encryption_accessibility_not_encrypted">şifrelenmedi</string>

@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">alternar favorito para #%1$s</string>
     <string name="content_accessibility_toggle_favorite">toque duas vezes para alternar status de favorito</string>
     <string name="content_accessibility_view_fingerprint">toque para ver a impressão de criptografia</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_actions_block">bloquear</string>
     <string name="content_actions_direct_message">mensagem direta</string>
     <string name="content_actions_hug">abraço</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">notas</string>
     <string name="content_payment_cashu">pagar via cashu</string>
     <string name="content_payment_lightning">pagar via lightning</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">estabelecendo criptografia</string>
     <string name="encryption_accessibility_failed">falha na criptografia</string>
     <string name="encryption_accessibility_not_encrypted">não criptografado</string>

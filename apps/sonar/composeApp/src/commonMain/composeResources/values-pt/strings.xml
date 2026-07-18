@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">alternar o marcador de #%1$s</string>
     <string name="content_accessibility_toggle_favorite">toca duas vezes para alternar o estado de favorito</string>
     <string name="content_accessibility_view_fingerprint">toca para ver a impressão de encriptação</string>
+    <string name="content_accessibility_voice_pause">Pausar mensagem de voz</string>
+    <string name="content_accessibility_voice_play">Reproduzir mensagem de voz</string>
+    <string name="content_accessibility_voice_playback">Falha na reprodução da mensagem de voz</string>
+    <string name="content_accessibility_voice_seek">Buscar na mensagem de voz</string>
+    <string name="content_accessibility_voice_speed">Alterar velocidade de reprodução</string>
     <string name="content_actions_block">bloquear</string>
     <string name="content_actions_direct_message">mensagem direta</string>
     <string name="content_actions_hug">abraçar</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">notas</string>
     <string name="content_payment_cashu">pagar com Cashu</string>
     <string name="content_payment_lightning">pagar com Lightning</string>
+    <string name="content_voice_listened">Reproduzido</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">a estabelecer encriptação</string>
     <string name="encryption_accessibility_failed">encriptação falhada</string>
     <string name="encryption_accessibility_not_encrypted">sem encriptação</string>

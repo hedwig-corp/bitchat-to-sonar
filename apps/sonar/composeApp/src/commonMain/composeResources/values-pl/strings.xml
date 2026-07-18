@@ -61,6 +61,11 @@
     <string name="content_accessibility_toggle_bookmark">przełącz zakładkę dla #%1$s</string>
     <string name="content_accessibility_toggle_favorite">stuknij dwukrotnie, aby zmienić stan ulubionych</string>
     <string name="content_accessibility_view_fingerprint">stuknij, by zobaczyć odcisk szyfrowania</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
     <string name="content_actions_block">zablokuj</string>
     <string name="content_actions_direct_message">wiadomość prywatna</string>
     <string name="content_actions_hug">przytul</string>
@@ -104,6 +109,8 @@
     <string name="content_notes_title">notatki</string>
     <string name="content_payment_cashu">zapłać przez Cashu</string>
     <string name="content_payment_lightning">zapłać przez Lightning</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">trwa ustanawianie szyfrowania</string>
     <string name="encryption_accessibility_failed">szyfrowanie nie powiodło się</string>
     <string name="encryption_accessibility_not_encrypted">brak szyfrowania</string>
