@@ -8642,8 +8642,8 @@ final class SonarAppStore: ObservableObject {
     /// Optimistic: hide the row immediately (Compose filters `chats` first), then
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
     func deleteChat(_ id: String) {
-        discardRetainedConversation(id)
         if isPendingSecureChat(id) {
+            discardRetainedConversation(id)
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
             pendingMarmotMessagesByChat[id] = nil
