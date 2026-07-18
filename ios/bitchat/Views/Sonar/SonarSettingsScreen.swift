@@ -108,15 +108,15 @@ struct SonarSettingsScreen: View {
                             icon: .coin, tone: .gold, label: "Balance",
                             sub: walletBalanceSub,
                             value: walletValue,
-                            divider: walletConfigured
+                            divider: walletKeyConfigured
                         ) {
                             if case .ready = store.walletState {
                                 store.push(.walletActivity)
-                            } else if walletConfigured {
+                            } else if walletKeyConfigured {
                                 walletSheet = true
                             }
                         }
-                        if walletConfigured {
+                        if walletKeyConfigured {
                             // Show balance in fiat (default) or bitcoin (sats).
                             SNSettingsRow(
                                 icon: .coin, tone: .gold, label: "Show balance in",
@@ -135,7 +135,7 @@ struct SonarSettingsScreen: View {
                             }
                         }
                     }
-                    if !walletConfigured {
+                    if !walletKeyConfigured {
                         Text("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
                             .font(SonarTheme.uiFont(size: 12))
                             .foregroundColor(SonarTheme.text3)
@@ -280,26 +280,25 @@ struct SonarSettingsScreen: View {
         #endif
     }
 
-    /// Key present (setting up or ready) — not a missing-Breez-key build.
-    private var walletConfigured: Bool {
-        if case .notConfigured = store.walletState { return false }
-        return true
-    }
+    /// Build has a non-empty Breez key — not the same as wallet lifecycle ready.
+    /// `.notConfigured` also covers transient setup failure when the key exists.
+    private var walletKeyConfigured: Bool { SonarBreezBuildConfig.hasAPIKey }
 
     private var walletBalanceSub: String {
-        walletConfigured
+        walletKeyConfigured
             ? "Pays like you message — tap to pay nearby or over the internet"
             : "Lightning wallet unavailable in this build"
     }
 
     /// Real balance when the wallet is ready, in the chosen display unit;
-    /// honest affordance otherwise. Keyless builds say Unavailable (Compose parity),
-    /// not "Set up" — there is nothing the user can configure in-app.
+    /// honest affordance otherwise. Keyless builds say Unavailable (Compose parity).
+    /// Key-present + `.notConfigured` is a transient/setup gap, not a missing key.
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up\u{2026}"
-        case .notConfigured: return "Unavailable"
+        case .notConfigured:
+            return walletKeyConfigured ? "Not ready" : "Unavailable"
         }
     }
 

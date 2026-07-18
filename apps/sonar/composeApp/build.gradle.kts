@@ -441,19 +441,34 @@ dependencies {
 
 // Alpha / Zapstore phone APKs (and future Play AABs) must ship with a Breez key
 // or every restore shows a dead Lightning wallet. Debug may omit the key for CI
-// unit/UI tests. Match packaging tasks only — not intermediate bundleRelease*
-// Classes/Resources helpers.
-tasks.matching {
-    val n = it.name
-    (n.startsWith("assemble") && n.contains("Release", ignoreCase = true)) ||
-        n == "bundleRelease" ||
-        (n.startsWith("bundle") && n.endsWith("Release") &&
-            !n.contains("Classes") && !n.contains("Resources"))
-}.configureEach {
-    doFirst {
+// unit/UI tests.
+//
+// Use a shared prerequisite (not doFirst on assemble*) so packageRelease /
+// installRelease fail *before* writing a keyless APK — assembleRelease's
+// doFirst would otherwise run after packageRelease already produced the file.
+val requireBreezApiKeyForRelease = tasks.register("requireBreezApiKeyForRelease") {
+    group = "verification"
+    description = "Fails when BREEZ_API_KEY is empty (release packaging must ship a live wallet)."
+    doLast {
         check(breezApiKey.isNotEmpty()) {
-            "BREEZ_API_KEY is empty — refusing release assemble/bundle. " +
+            "BREEZ_API_KEY is empty — refusing release packaging. " +
                 "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY."
         }
     }
+}
+
+tasks.matching {
+    val n = it.name
+    // Android phone APK/AAB paths only — not Compose Desktop packageReleaseDeb/Dmg/Msi.
+    n.contains("Release", ignoreCase = true) && (
+        n == "packageRelease" ||
+            n == "packageReleaseUniversalApk" ||
+            n == "packageReleaseBundle" ||
+            n.startsWith("assemble") ||
+            (n.startsWith("install") && !n.startsWith("uninstall")) ||
+            (n.startsWith("bundle") && n.endsWith("Release") &&
+                !n.contains("Classes") && !n.contains("Resources"))
+        )
+}.configureEach {
+    dependsOn(requireBreezApiKeyForRelease)
 }

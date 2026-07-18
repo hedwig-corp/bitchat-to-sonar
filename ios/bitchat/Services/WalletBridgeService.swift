@@ -627,6 +627,8 @@ final class WalletBridgeService: ObservableObject {
 
     /// `BREEZ_API_KEY` from Info.plist (build-setting expanded from
     /// `Configs/Local.xcconfig` / `Release.xcconfig`); nil when unset.
+    /// Prefer `SonarBreezBuildConfig.hasAPIKey` in UI — `.notConfigured` state
+    /// is also used after transient setup failures when a key is present.
     private static func configuredAPIKey() -> String? {
         guard
             let raw = Bundle.main.object(forInfoDictionaryKey: "BREEZ_API_KEY") as? String
