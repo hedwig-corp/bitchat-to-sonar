@@ -4257,6 +4257,14 @@ impl SonarClient {
                     return Ok(());
                 }
             }
+            // Source validation/journaling can briefly hold an additional
+            // plaintext or encrypted copy. Acquire the global scheduler before
+            // either path so a burst of native sends cannot prepare every
+            // large attachment while only the later network PUTs are bounded.
+            let upload_permit = MEDIA_UPLOAD_PERMITS
+                .acquire()
+                .await
+                .map_err(|_| Error::Storage("media upload scheduler is closed".into()))?;
             // If application storage was externally purged/corrupted while the
             // encrypted manifest survived, a user retry still has the original
             // attachment bytes. Rebuild the job instead of repeating the old
@@ -4290,7 +4298,9 @@ impl SonarClient {
                     &sources,
                 )?;
             }
-            let result = self.process_media_upload_job_locked(&request_id).await;
+            let result = self
+                .process_media_upload_job_locked(&request_id, &upload_permit)
+                .await;
             if result.is_ok() {
                 // Only an explicit host call consumes the completion tombstone.
                 // Detached recovery leaves it behind so a failed optimistic row
@@ -4395,10 +4405,19 @@ impl SonarClient {
     async fn process_media_upload_job(&self, request_id: &str) -> Result<()> {
         let upload_gate = self.media_upload_gate(request_id).await;
         let _job = upload_gate.lock().await;
-        self.process_media_upload_job_locked(request_id).await
+        let upload_permit = MEDIA_UPLOAD_PERMITS
+            .acquire()
+            .await
+            .map_err(|_| Error::Storage("media upload scheduler is closed".into()))?;
+        self.process_media_upload_job_locked(request_id, &upload_permit)
+            .await
     }
 
-    async fn process_media_upload_job_locked(&self, request_id: &str) -> Result<()> {
+    async fn process_media_upload_job_locked(
+        &self,
+        request_id: &str,
+        _upload_permit: &tokio::sync::SemaphorePermit<'_>,
+    ) -> Result<()> {
         let initial = self
             .media_outbox
             .lock()
@@ -4420,13 +4439,6 @@ impl SonarClient {
                 .checkpoint_completed_message(request_id, message_id)?;
             return Ok(());
         }
-        // Preparation can briefly hold a plaintext and ciphertext copy. Bound
-        // it together with network work so startup cannot prepare every queued
-        // video concurrently before reaching the upload scheduler.
-        let _network_permit = MEDIA_UPLOAD_PERMITS
-            .acquire()
-            .await
-            .map_err(|_| Error::Storage("media upload scheduler is closed".into()))?;
         self.prepare_media_upload_job(request_id).await?;
         for attempt in 1..=MEDIA_UPLOAD_EPOCH_ATTEMPTS {
             let mut job = self
@@ -7154,6 +7166,65 @@ mod tests {
                 .await
                 .is_err(),
             "a third queued job must wait before allocating preparation ciphertext"
+        );
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn media_upload_scheduler_gates_source_journaling() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let creation = client
+            .engine
+            .create_group(
+                "journal scheduler",
+                vec![bob.key_package_event(relays.clone()).unwrap()],
+                relays,
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        client.engine.merge_pending_commit(&group_id).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        *client.media_outbox.lock().unwrap() = MediaOutbox::open(&db, [29_u8; 32]).unwrap();
+        let upload = MediaUpload {
+            data: b"source-must-wait-for-scheduler".to_vec(),
+            filename: "clip.mp4".into(),
+            mime: "video/mp4".into(),
+        };
+        let host_request_id = "journal-scheduler";
+        let request_id = media_upload_request_id(
+            &group_id,
+            std::slice::from_ref(&upload),
+            "",
+            "",
+            host_request_id,
+        );
+
+        let first = MEDIA_UPLOAD_PERMITS.acquire().await.unwrap();
+        let second = MEDIA_UPLOAD_PERMITS.acquire().await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                client.send_media_multi_with_request_id(
+                    &group_id,
+                    vec![upload],
+                    "",
+                    "",
+                    host_request_id,
+                ),
+            )
+            .await
+            .is_err(),
+            "a fresh send must wait while the upload scheduler is saturated"
+        );
+        assert!(
+            !client.media_outbox.lock().unwrap().contains(&request_id),
+            "source bytes must not be journaled before an upload permit is available"
         );
         drop((first, second));
     }

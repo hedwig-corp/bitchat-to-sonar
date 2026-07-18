@@ -154,6 +154,22 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func mediaCompletionHandsSharedOutboxToReplacementNode() {
+        final class NodeToken {}
+        let localOnlyNode = NodeToken()
+        let relayBackedNode = NodeToken()
+
+        #expect(!MarmotService.mediaOutboxHandoffRequired(
+            usedNodeIdentifier: ObjectIdentifier(localOnlyNode),
+            currentNodeIdentifier: ObjectIdentifier(localOnlyNode)
+        ))
+        #expect(MarmotService.mediaOutboxHandoffRequired(
+            usedNodeIdentifier: ObjectIdentifier(localOnlyNode),
+            currentNodeIdentifier: ObjectIdentifier(relayBackedNode)
+        ))
+    }
+
+    @Test
     func retryIsOnlyOfferedForFailedOutgoingInternetMessages() {
         let failedInternet = SNMessage(
             mine: true,
