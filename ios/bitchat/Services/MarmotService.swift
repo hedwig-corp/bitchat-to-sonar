@@ -292,13 +292,14 @@ final class MarmotService: @unchecked Sendable {
     /// Android: lifecycle serialization only; sync/drain hop independently.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
-    /// Serial send lane for text/sticker sends: they must stay ordered with
-    /// each other, but must never FIFO-queue behind sync relay quorum
-    /// fetches on `workQueue` (each can park it for a 10s timeout — the
-    /// documented 6.6s p95 / 19.3s max send dispatch tail). The core engine
-    /// serializes MLS mutations internally (`MarmotEngine::write_lock`), so a
-    /// send here runs concurrently with an in-flight sync and waits at most
-    /// for one in-flight MLS mutation, never for a relay fetch.
+    /// Serial send lane for text/sticker sends and tiny pre-route journal
+    /// writes: they must stay ordered with each other, but must never FIFO-queue
+    /// behind sync/drain relay quorum fetches on `workQueue` (each can park it
+    /// for a 10s timeout — the documented 6.6s p95 / 19.3s max send dispatch
+    /// tail). The core engine serializes MLS mutations internally
+    /// (`MarmotEngine::write_lock`), so a send here runs concurrently with an
+    /// in-flight sync and waits at most for one in-flight MLS mutation, never
+    /// for a relay fetch.
     private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
 
     /// Serial receive/drain lane (Android `Dispatchers.IO` parity for drain).
@@ -500,8 +501,8 @@ final class MarmotService: @unchecked Sendable {
         content: String,
         createdAtSecs: UInt64
     ) async throws {
-        try await run { service in
-            try service.requireNode().enqueuePreRouteMessage(message: PreRouteMessageInfo(
+        try await sendLane { node in
+            try node.enqueuePreRouteMessage(message: PreRouteMessageInfo(
                 id: id,
                 routeKind: routeKind,
                 routeId: routeId,
@@ -520,14 +521,14 @@ final class MarmotService: @unchecked Sendable {
     }
 
     func completePreRouteMessage(id: String) async throws {
-        try await run { service in
-            try service.requireNode().completePreRouteMessage(id: id)
+        try await sendLane { node in
+            try node.completePreRouteMessage(id: id)
         }
     }
 
     func resolvePreRouteMessage(id: String, groupId: String) async throws {
-        try await run { service in
-            try service.requireNode().resolvePreRouteMessage(id: id, groupId: groupId)
+        try await sendLane { node in
+            try node.resolvePreRouteMessage(id: id, groupId: groupId)
         }
     }
 
@@ -1536,9 +1537,10 @@ final class MarmotService: @unchecked Sendable {
         try await leasedNodeOperation(on: readQueue, body)
     }
 
-    /// Text/sticker sends on the dedicated serial send lane. Same leased node
-    /// snapshot as `readOnly`; MLS-mutation ordering against sync/drain is the
-    /// core engine's `write_lock` responsibility.
+    /// Text/sticker sends and bounded local journal writes on the dedicated
+    /// serial send lane. Same leased node snapshot as `readOnly`;
+    /// MLS-mutation ordering against sync/drain is the core engine's
+    /// `write_lock` responsibility.
     private func sendLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: sendQueue, body)
     }
