@@ -51,6 +51,9 @@ jobs:
       # fails the build.
       - name: Bake blog posts from Nostr
         continue-on-error: true
+        # Relay WebSockets can stall past the per-relay 8s timeout in CI; cap the
+        # whole bake so Pages PRs never sit for job-length on a hung socket.
+        timeout-minutes: 2
         env:
           # Optional: machine-translate blog overlays after Nostr fetch.
           # When unset, committed web/src/lib/blog-translations.js is kept.
