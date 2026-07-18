@@ -271,6 +271,22 @@ final class MarmotChatModel: ObservableObject {
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
+    /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
+    private var foregroundRefreshTask: Task<Void, Never>?
+    /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
+    /// paths share one in-flight task so rapid wakes cannot stack FETCH_TIMEOUT
+    /// parks. The drained notifications are returned to awaiters (push titled
+    /// local notifications) — do not drain again after join or they are lost.
+    private var gapRecoveryTask: Task<[DrainNotificationInfo], Never>?
+    /// Generation for `gapRecoveryTask` so a finishing older task cannot clear
+    /// a newer in-flight recovery.
+    private var gapRecoveryGeneration: UInt64 = 0
+    /// While a push `refresh()` awaits gap recovery, polling drains that win
+    /// the `drainQueue` race park their notification metadata here so
+    /// `SonarPushProcessor` still gets titled local notifications (destructive
+    /// drain is single-consume). Cleared when the waiter collects them.
+    private var pushWakeDrainActive = false
+    private var pushWakeDrainBuffer: [DrainNotificationInfo] = []
     private var relayBusy = false
     #if DEBUG
     /// SONAR_BENCH: one-shot guards for the post-connect "first wake" (T3b) and
@@ -937,21 +953,25 @@ final class MarmotChatModel: ObservableObject {
     /// Re-establish relay subscriptions and catch up on missed events after the
     /// app returns to foreground. iOS tears down TCP connections in background;
     /// nostr-sdk may auto-reconnect the sockets, but the Marmot subscription
-    /// filters can be stale. This forces a resubscribe + a one-shot sync to
-    /// bridge the gap.
+    /// filters can be stale.
     ///
-    /// The socket is usually still down at the foreground transition (and always
-    /// on an open-from-notification-tap), so wait bounded for the reconnect
-    /// instead of skipping: bailing here left the pushed message unfetched until
-    /// some later sync happened to cover it.
+    /// Android parity: paint from the live drain lane immediately; never gate
+    /// the chat list / transcript on `syncForce` (FETCH_TIMEOUT). Gap recovery
+    /// is single-flight in the background; `conversationChanged` + the polling
+    /// drain loop repaint as rows land in local storage.
     func refreshAfterForeground() {
-        Task {
-            guard await ensureConnected() else { return }
-            guard await ensureRelayConnected() else { await loadLocalSummaries() ; return }
-            try? await service.ensureSubscriptions()
-            try? await service.syncForce()
-            try? await service.drainPending()
-            await loadLocalSummaries()
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            guard await self.ensureConnected() else { return }
+            guard await self.ensureRelayConnected() else {
+                await self.loadLocalSummaries()
+                return
+            }
+            try? await self.service.ensureSubscriptions()
+            try? await self.service.drainPending()
+            await self.loadLocalSummaries()
+            _ = self.ensureGapRecovery()
         }
     }
 
@@ -1463,15 +1483,21 @@ final class MarmotChatModel: ObservableObject {
     /// never hides already-persisted conversations. Returns notifications for
     /// incoming messages (empty if nothing new or relay offline).
     ///
-    /// This is the push-wake sync (SonarPushProcessor) and the manual refresh
-    /// gesture. On a push wake the relay socket is almost always torn down, so
-    /// wait bounded for the reconnect inside the wake window instead of bailing
-    /// — otherwise the background window iOS granted for the push is wasted and
-    /// the pushed message is not fetched ("notification arrives, message
-    /// doesn't"). Uses syncForce(): the missed-while-backgrounded gap must be
-    /// fetched deterministically, not race the resubscribe EOSE burst into the
-    /// drain buffer. Android's push service (SonarCore.start()+sync() inside
-    /// the same 25s budget) now behaves this way too.
+    /// Push-wake / manual refresh — Android-shaped receive path.
+    ///
+    /// Root cause of the ~10s banner→UI lag: `drainPending` shared the serial
+    /// `workQueue` with blocking UniFFI `syncForce` (FETCH_TIMEOUT). Android
+    /// never does that — drain and sync hop on independent `Dispatchers.IO`
+    /// threads and the UI repaints from `conversationChanged`.
+    ///
+    /// Production shape:
+    /// 1. Drain + paint on the dedicated receive lane first.
+    /// 2. If the live buffer already delivered: return those notifications for
+    ///    titled push; run single-flight `syncForce` in the background.
+    /// 3. If empty (socket was dead): await that same single-flight and merge
+    ///    its drain with any notifications the polling loop stole on
+    ///    `drainQueue` while `syncForce` was in flight (see
+    ///    `pushWakeDrainBuffer`). Mid-fetch, polling still paints the UI.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1479,15 +1505,81 @@ final class MarmotChatModel: ObservableObject {
             await loadLocalSummaries()
             return []
         }
-        do {
-            try await service.syncForce()
-            self.errorText = nil
-        } catch {
-            self.errorText = Self.describe(error)
-        }
-        let notifications = (try? await service.drainPending()) ?? []
+        let live = (try? await service.drainPending()) ?? []
         await loadLocalSummaries()
-        return notifications
+
+        if !live.isEmpty {
+            _ = ensureGapRecovery()
+            return live
+        }
+
+        // Empty live buffer: collect anything polling drains during syncForce
+        // so titled push notifications are not lost to the UI-only path.
+        beginPushWakeDrainCapture()
+        defer { endPushWakeDrainCapture() }
+        let fromGap = await ensureGapRecovery().value
+        let stolen = takePushWakeDrainBuffer()
+        if stolen.isEmpty { return fromGap }
+        if fromGap.isEmpty { return stolen }
+        return fromGap + stolen
+    }
+
+    private func beginPushWakeDrainCapture() {
+        pushWakeDrainActive = true
+        pushWakeDrainBuffer = []
+    }
+
+    private func endPushWakeDrainCapture() {
+        pushWakeDrainActive = false
+        pushWakeDrainBuffer = []
+    }
+
+    private func takePushWakeDrainBuffer() -> [DrainNotificationInfo] {
+        let buffered = pushWakeDrainBuffer
+        pushWakeDrainBuffer = []
+        return buffered
+    }
+
+    /// Forward drain metadata to an in-flight push `refresh()` waiter. Polling
+    /// and gap recovery both call this so a `drainQueue` race cannot drop
+    /// titled-notification payloads on the floor.
+    private func noteDrainedForPushWake(_ notifications: [DrainNotificationInfo]) {
+        guard pushWakeDrainActive, !notifications.isEmpty else { return }
+        pushWakeDrainBuffer.append(contentsOf: notifications)
+    }
+
+    /// Single-flight forced gap recovery. Shared by push wake and foreground
+    /// resume so concurrent wakes coalesce onto one `syncForce`. Returns the
+    /// notifications drained after `syncForce` so push wake can title them.
+    @discardableResult
+    private func ensureGapRecovery() -> Task<[DrainNotificationInfo], Never> {
+        if let existing = gapRecoveryTask {
+            return existing
+        }
+        gapRecoveryGeneration &+= 1
+        let generation = gapRecoveryGeneration
+        let task = Task<[DrainNotificationInfo], Never> { [weak self] in
+            guard let self else { return [DrainNotificationInfo]() }
+            defer {
+                if self.gapRecoveryGeneration == generation {
+                    self.gapRecoveryTask = nil
+                }
+            }
+            do {
+                try await self.service.syncForce()
+                if Task.isCancelled { return [DrainNotificationInfo]() }
+                self.errorText = nil
+            } catch {
+                if Task.isCancelled { return [DrainNotificationInfo]() }
+                self.errorText = Self.describe(error)
+            }
+            if Task.isCancelled { return [DrainNotificationInfo]() }
+            let notifications = (try? await self.service.drainPending()) ?? [DrainNotificationInfo]()
+            await self.loadLocalSummaries()
+            return notifications
+        }
+        gapRecoveryTask = task
+        return task
     }
 
     func markConversationRead(groupId: String) {
@@ -2637,6 +2729,10 @@ final class MarmotChatModel: ObservableObject {
                 #endif
                 if woke {
                     let notifications = (try? await self.service.drainPending()) ?? []
+                    // If a push refresh is awaiting gap recovery, keep the
+                    // notification metadata for SonarPushProcessor — drain is
+                    // destructive and this path only paints the UI.
+                    self.noteDrainedForPushWake(notifications)
                     #if DEBUG
                     // SONAR_BENCH: first post-connect event burst applied to local
                     // storage (T4) — the cold-start relay sync has produced data.
@@ -2677,6 +2773,11 @@ final class MarmotChatModel: ObservableObject {
         relayConnectTask = nil
         syncTask?.cancel()
         syncTask = nil
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
+        // Do not nil/cancel `gapRecoveryTask` here: UniFFI `syncForce` is not
+        // abortable, and clearing the slot would allow a stacked second fetch.
+        // Wipe paths bump generation explicitly below.
     }
 
     // MARK: - P2P calls (pass-throughs to the call engine in MarmotService)
@@ -2746,6 +2847,7 @@ final class MarmotChatModel: ObservableObject {
     /// in-memory state. Called from the emergency-wipe path.
     func wipeDatabase() {
         stopPolling()
+        invalidateGapRecovery()
         conversationRefreshTask?.cancel()
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
@@ -2766,8 +2868,18 @@ final class MarmotChatModel: ObservableObject {
     /// developer's real application-support directory.
     func prepareForIdentityReplacement(wipeDatabase: () async throws -> Void) async throws {
         stopPolling()
+        invalidateGapRecovery()
         clearIdentityScopedState()
         try await wipeDatabase()
+    }
+
+    /// Drop the single-flight gap-recovery slot on account teardown. Soft-cancel
+    /// only — in-flight UniFFI `syncForce` still finishes on `workQueue`.
+    private func invalidateGapRecovery() {
+        gapRecoveryGeneration &+= 1
+        gapRecoveryTask?.cancel()
+        gapRecoveryTask = nil
+        endPushWakeDrainCapture()
     }
 
     private func clearIdentityScopedState() {
