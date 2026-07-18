@@ -2,7 +2,9 @@
 
 Signal-shaped transcript list engine extracted from Sonar as reusable library modules.
 
-**Shipped surfaces in v1: Compose (KMP) + iOS UIKit.** Sonar is the first production consumer. The libraries own open / scroll / inset policy, Compose host scaffolding, and a generic UIKit collection host; apps supply message identity, row content, composer chrome, and bounded DB paging. AppKit / Mac Catalyst collection-host parity is an explicit tracked gap — macOS Sonar still uses the SwiftUI overlay host documented in `docs/SIGNAL-TRANSCRIPT-PATTERNS.md`.
+**Shipped surfaces in v1: full twin-host engine — Compose (KMP) + iOS UIKit.** Sonar is the first production consumer. The libraries own open / scroll / inset policy, Compose host scaffolding, and a generic UIKit collection host (`TranscriptCollectionHostView`); apps supply message identity, row content, composer chrome, and bounded DB paging.
+
+**Non-goal (not a UIKit asterisk):** AppKit / Mac Catalyst collection-host parity. macOS Sonar still uses the SwiftUI overlay host documented in `docs/SIGNAL-TRANSCRIPT-PATTERNS.md`.
 
 ## Modules
 
@@ -17,10 +19,13 @@ Sonar iOS wraps the UIKit host via `SNTranscriptCollectionHostAdapter.swift` (bu
 
 ## Samples
 
-- `:transcript-engine-sample` — `SampleTranscriptApp` (CI: `compileKotlinJvm`)
-- SPM `SampleChat` target — string rows via `TranscriptCollectionHostView` (`Examples/SampleChat/`)
+- `:transcript-engine-sample` — `SampleTranscriptApp` (CI: `compileKotlinJvm`; LiveEdge + UnreadDivider)
+- SPM `SampleChat` target — string rows via `TranscriptCollectionHostView` (CI: iOS Simulator `xcodebuild build`)
 - Legacy sketches under `samples/` (reference only; prefer the modules above)
 
-Shared open-action contract: `packages/transcript-engine-policy/golden/open-action.json` (loaded by KMP + SPM tests).
+Shared contracts under `packages/transcript-engine-policy/golden/` (CI `diff` vs SPM `Tests/Resources/`):
+
+- `open-action.json` — LiveEdge / UnreadDivider / Jump
+- `inset-follow.json` — Pin / Lockstep / Ignore (R-009)
 
 See [INTEGRATION.md](INTEGRATION.md) for app wiring.

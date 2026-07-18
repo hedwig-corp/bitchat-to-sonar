@@ -68,11 +68,11 @@
 
 ## Success criteria (flip NO-GO → GO for public engine narrative)
 
-- [ ] Third-party-shaped sample apps compile in CI with **zero** `chat.bitchat` / `SNMessage` imports
-- [ ] Sonar production iOS path uses library host via adapter; kill switch still works
-- [ ] R-009 ledger call sites updated; inset + latch tests still cite real paths
-- [ ] Cross-platform OpenAction / insetFollow semantics still mirrored (golden)
-- [ ] README can say “full twin-host engine (Compose + UIKit)” without an asterisk for UIKit
+- [x] Third-party-shaped sample apps compile in CI with **zero** `chat.bitchat` / `SNMessage` imports (`:transcript-engine-sample` + SPM `SampleChat` iOS sim build)
+- [x] Sonar production iOS path uses library host via adapter; kill switch still works
+- [x] R-009 ledger call sites updated; inset + latch tests still cite real paths
+- [x] Cross-platform OpenAction / insetFollow semantics still mirrored (golden + CI `diff`)
+- [x] README can say “full twin-host engine (Compose + UIKit)” without an asterisk for UIKit (Mac AppKit remains a documented non-goal, not an asterisk on UIKit)
 
 ## Non-goals (still later)
 

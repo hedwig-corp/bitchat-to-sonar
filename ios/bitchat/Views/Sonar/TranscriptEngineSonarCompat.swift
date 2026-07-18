@@ -87,10 +87,6 @@ public func snCollectionHostFloatingComposerGap(
     )
 }
 
-public func snCollectionHostOwnedBottomContentInset(barHeight: CGFloat, safeAreaBottom: CGFloat) -> CGFloat {
-    transcriptOwnedBottomContentInset(barHeight: barHeight, safeAreaBottom: safeAreaBottom)
-}
-
 public func snScrollToBottomOfLoadWindowOffsetY(
     boundsHeight: CGFloat,
     contentHeight: CGFloat,

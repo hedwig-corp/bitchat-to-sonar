@@ -66,13 +66,16 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Assert open-action golden copies stay in sync
-        # Canonical: packages/transcript-engine-policy/golden/open-action.json
-        # SPM tests carry a byte-identical copy for Bundle.module loading.
+      - name: Assert transcript-engine golden copies stay in sync
+        # Canonical: packages/transcript-engine-policy/golden/*.json
+        # SPM tests carry byte-identical copies for Bundle.module loading.
         run: |
           diff -u \
             packages/transcript-engine-policy/golden/open-action.json \
             ios/localPackages/TranscriptEngine/Tests/Resources/open-action.json
+          diff -u \
+            packages/transcript-engine-policy/golden/inset-follow.json \
+            ios/localPackages/TranscriptEngine/Tests/Resources/inset-follow.json
 
       - name: Run JVM unit tests (builds desktop Rust core + UniFFI bindings)
         # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
@@ -98,9 +101,52 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: swift test (TranscriptEngine + SampleChat)
+      - name: swift test (macOS — policy / day sections / golden)
         working-directory: ios/localPackages/TranscriptEngine
         run: swift test
+
+      # UIKit host + SampleChat + TranscriptOwnedInsetTests are `#if iOS` —
+      # macOS `swift test` never compiles them. Compile for iphonesimulator, then
+      # run TranscriptEngine-Package tests on a booted iPhone sim (Bugbot P2).
+      - name: xcodebuild build (iOS Simulator — UIKit host + SampleChat)
+        working-directory: ios/localPackages/TranscriptEngine
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -scheme TranscriptEngine \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/TranscriptEngineDerived" \
+            CODE_SIGNING_ALLOWED=NO
+          xcodebuild build \
+            -scheme SampleChat \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/TranscriptEngineDerived" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: xcodebuild test (iOS Simulator — OwnedInset + package tests)
+        working-directory: ios/localPackages/TranscriptEngine
+        run: |
+          set -euo pipefail
+          UDID=$(python3 - <<'PY'
+          import re, subprocess
+          out = subprocess.check_output(["xcrun", "simctl", "list", "devices", "available"], text=True)
+          for line in out.splitlines():
+              if "iPhone" not in line:
+                  continue
+              m = re.search(r"\(([A-F0-9-]{36})\)", line)
+              if m:
+                  print(m.group(1))
+                  break
+          else:
+              raise SystemExit("no available iPhone simulator")
+          PY
+          )
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcodebuild test \
+            -scheme TranscriptEngine-Package \
+            -destination "platform=iOS Simulator,id=$UDID" \
+            -derivedDataPath "$RUNNER_TEMP/TranscriptEngineDerived" \
+            CODE_SIGNING_ALLOWED=NO
 
   android-device-test:
     name: Compose device tests (Android API 35)
