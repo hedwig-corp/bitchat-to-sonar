@@ -51,7 +51,14 @@ jobs:
       # fails the build.
       - name: Bake blog posts from Nostr
         continue-on-error: true
+        env:
+          # Optional: machine-translate blog overlays after Nostr fetch.
+          # When unset, committed web/src/lib/blog-translations.js is kept.
+          SONAR_BLOG_TRANSLATE_API_KEY: ${{ secrets.SONAR_BLOG_TRANSLATE_API_KEY }}
         run: npm run fetch-blog
+
+      - name: i18n unit checks
+        run: npm run test:i18n
 
       - name: Build
         env:

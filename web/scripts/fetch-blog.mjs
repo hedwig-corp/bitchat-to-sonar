@@ -48,6 +48,22 @@ async function main() {
 			? `  author: ${author.name || '(no name)'}${author.picture ? ' + avatar' : ''}`
 			: '  author: no kind-0 profile found'
 	);
+
+	// Site-only locale overlays (AI when SONAR_BLOG_TRANSLATE_API_KEY is set).
+	// Best-effort; never fails the bake.
+	try {
+		const { spawnSync } = await import('node:child_process');
+		const tr = spawnSync(process.execPath, [resolve(HERE, 'translate-blog.mjs')], {
+			cwd: resolve(HERE, '..'),
+			stdio: 'inherit',
+			env: process.env
+		});
+		if (tr.status !== 0) {
+			console.error('fetch-blog: translate-blog exited non-zero — keeping prior overlays.');
+		}
+	} catch (err) {
+		console.error(`fetch-blog: translate step skipped (${err?.message ?? err})`);
+	}
 }
 
 main().catch((err) => {

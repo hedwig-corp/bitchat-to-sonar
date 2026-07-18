@@ -6,6 +6,7 @@
   import { SONAR_DOCS } from '$lib/docs-content.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import { DOWNLOAD_HREF } from '$lib/links.js';
+  import { t } from '$lib/i18n/i18n.svelte.js';
 
   // Reproduced 1:1 from the Claude Design handoff:
   //   design/handoff/project/Sonar Docs.html + design/handoff/project/sonar/docs-content.js
@@ -114,7 +115,7 @@
 </script>
 
 <svelte:head>
-  <title>Sonar Docs — protocol &amp; design</title>
+  <title>{t('docs.title')}</title>
   <meta
     name="description"
     content="Protocol and design documentation for Sonar: BLE + Nostr discovery, the notification envelope, direct Bolt12 payments, BIP-353 addresses, and open sticker packs."
@@ -124,19 +125,19 @@
 <div class="docs">
   <nav>
     <div class="navin">
-      <button class="menubtn" aria-label="Menu" onclick={() => (sidebarOpen = !sidebarOpen)}>
+      <button class="menubtn" aria-label={t('docs.menu')} onclick={() => (sidebarOpen = !sidebarOpen)}>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M4 7h16M4 12h16M4 17h16" />
         </svg>
       </button>
       <a class="wordmark" href="{base}/">
         <SonarMark size={22} />
-        sonar<span class="tag">docs</span>
+        sonar<span class="tag">{t('docs.tag')}</span>
       </a>
       <div class="navsp"></div>
       <div class="navlinks">
-        <a class="btn ghost" href="{base}/">Home</a>
-        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">Get the app</a>
+        <a class="btn ghost" href="{base}/">{t('nav.home')}</a>
+        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">{t('nav.getApp')}</a>
       </div>
     </div>
   </nav>
@@ -149,7 +150,7 @@
           <circle cx="11" cy="11" r="6" />
           <path d="M15.5 15.5 20 20" />
         </svg>
-        <input type="text" placeholder="Search docs…" autocomplete="off" bind:value={query} />
+        <input type="text" placeholder={t('docs.search')} autocomplete="off" bind:value={query} />
       </div>
       <div class="navtree">
         {#each groups as g}
@@ -172,8 +173,8 @@
     <main>
       <article>
         <div class="crumbs">
-          <span>Docs · {groupName}</span>
-          <a class="gh" href={doc.gh} target="_blank" rel="noopener">View on GitHub ↗</a>
+          <span>{t('nav.docs')} · {groupName}</span>
+          <a class="gh" href={doc.gh} target="_blank" rel="noopener">{t('docs.github')}</a>
         </div>
         <div class="md">
           <h1>{h1text}</h1>
@@ -187,24 +188,24 @@
         <div class="docnav">
           {#if prev}
             <a class="prev" href="#{prev.id}">
-              <span class="lbl">← Previous</span><span class="ttl">{prev.title}</span>
+              <span class="lbl">{t('docs.prev')}</span><span class="ttl">{prev.title}</span>
             </a>
           {:else}
             <span></span>
           {/if}
           {#if next}
             <a class="next" href="#{next.id}">
-              <span class="lbl">Next →</span><span class="ttl">{next.title}</span>
+              <span class="lbl">{t('docs.next')}</span><span class="ttl">{next.title}</span>
             </a>
           {/if}
         </div>
       </article>
 
       {#if toc.length > 1}
-        <nav class="toc" aria-label="On this page">
-          <h5>On this page</h5>
-          {#each toc as t}
-            <a class:sub={t.lvl === 3} class:active={activeHeading === t.id} href="#{t.id}">{t.txt}</a>
+        <nav class="toc" aria-label={t('docs.toc')}>
+          <h5>{t('docs.toc')}</h5>
+          {#each toc as entry}
+            <a class:sub={entry.lvl === 3} class:active={activeHeading === entry.id} href="#{entry.id}">{entry.txt}</a>
           {/each}
         </nav>
       {/if}

@@ -7,6 +7,8 @@
   import { fetchAuthorProfile } from '$lib/blog-author.js';
   import { renderMarkdown } from '$lib/markdown.js';
   import { DOWNLOAD_HREF } from '$lib/links.js';
+  import { getLocale, t } from '$lib/i18n/i18n.svelte.js';
+  import { localizePosts } from '$lib/i18n/blog.js';
 
   // Reproduced 1:1 from the Claude Design handoff:
   //   design/handoff/project/Sonar Blog.html + design/handoff/project/sonar/blog-content.js
@@ -15,10 +17,10 @@
   // (web/src/lib/blog-content.js), so the list renders an empty-state card the
   // design does not need — same card/hairline language as the post grid.
 
-  // Posts render from the static list first (instant, offline-safe), then the
-  // live NIP-23 feed replaces them on mount if it delivers anything. Reactive so
-  // the list/article views update once relays answer.
-  let posts = $state(SONAR_BLOG.posts);
+  // English posts from bake / live Nostr; site-only overlays applied per locale.
+  let englishPosts = $state(SONAR_BLOG.posts);
+  const locale = $derived(getLocale());
+  const posts = $derived(localizePosts(englishPosts, locale));
   const feature = $derived(posts.find((p) => p.feature) ?? posts[0] ?? null);
   const rest = $derived(posts.filter((p) => p !== feature));
 
@@ -60,12 +62,19 @@
     return c.toLowerCase();
   }
 
+  /** @param {string} cat */
+  function catLabel(cat) {
+    const key = `blog.cat.${cat}`;
+    const translated = t(key);
+    return translated === key ? cat : translated;
+  }
+
   const post = $derived(posts.find((p) => p.id === currentId) ?? null);
   const artHtml = $derived(post ? renderMarkdown(post.md, { resolveLink }).html : '');
   const more = $derived(post ? posts.filter((p) => p.id !== post.id).slice(0, 2) : []);
 
   // Byline name: profile display name, else the post's author tag.
-  const authorName = $derived(author?.name || post?.author || 'The Sonar team');
+  const authorName = $derived(author?.name || post?.author || t('blog.team'));
   const avatarUrl = $derived(!avatarBroken ? (author?.picture ?? '') : '');
   const authorInitial = $derived((authorName.trim()[0] ?? 'S').toUpperCase());
 
@@ -74,7 +83,7 @@
     if (!id) {
       currentId = '';
       window.scrollTo(0, 0);
-    } else if (posts.some((p) => p.id === id)) {
+    } else if (englishPosts.some((p) => p.id === id) || posts.some((p) => p.id === id)) {
       currentId = id;
       window.scrollTo(0, 0);
     }
@@ -87,13 +96,13 @@
     const onHash = () => syncFromHash();
     window.addEventListener('hashchange', onHash);
 
-    // Live feed: NIP-23 posts win; static posts fill in any id the feed omits.
+    // Live feed: English NIP-23 posts win; overlays re-applied via localizePosts.
     fetchPostsFromNostr()
       .then(({ posts: live, source }) => {
         if (source !== 'nostr' || live.length === 0) return;
         const liveIds = new Set(live.map((p) => p.id));
         const fallback = SONAR_BLOG.posts.filter((p) => !liveIds.has(p.id));
-        posts = [...live, ...fallback];
+        englishPosts = [...live, ...fallback];
         // A hash that named a post only present in the live feed can now resolve.
         syncFromHash();
       })
@@ -118,11 +127,8 @@
 </script>
 
 <svelte:head>
-  <title>Sonar Blog — notes on privacy, policy &amp; the network</title>
-  <meta
-    name="description"
-    content="Why private, decentralized communication matters more every month — and how we're building it. Notes from the people building Sonar."
-  />
+  <title>{t('blog.title')}</title>
+  <meta name="description" content={t('blog.description')} />
 </svelte:head>
 
 <div class="blog">
@@ -130,12 +136,12 @@
     <div class="navin">
       <a class="wordmark" href="{base}/">
         <SonarMark size={22} />
-        sonar<span class="tag">blog</span>
+        sonar<span class="tag">{t('blog.tag')}</span>
       </a>
       <div class="navlinks">
-        <a class="btn ghost" href="{base}/docs">Docs</a>
-        <a class="btn ghost home-link" href="{base}/">Home</a>
-        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">Get the app</a>
+        <a class="btn ghost" href="{base}/docs">{t('nav.docs')}</a>
+        <a class="btn ghost home-link" href="{base}/">{t('nav.home')}</a>
+        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">{t('nav.getApp')}</a>
       </div>
     </div>
   </nav>
@@ -144,18 +150,15 @@
     {#if !post}
       <!-- LIST VIEW -->
       <div class="head">
-        <span class="kicker"><span class="dot"></span>Notes on privacy, policy &amp; the network</span>
-        <h1 class="page">The Sonar blog</h1>
-        <p class="pagesub">
-          Why private, decentralized communication matters more every month — and how we&rsquo;re
-          building it.
-        </p>
+        <span class="kicker"><span class="dot"></span>{t('blog.kicker')}</span>
+        <h1 class="page">{t('blog.h1')}</h1>
+        <p class="pagesub">{t('blog.sub')}</p>
       </div>
 
       {#if feature}
         <a class="feature" href="#{feature.id}">
           <div class="ftext">
-            <span class="cat {catClass(feature.cat)}">{feature.cat}</span>
+            <span class="cat {catClass(feature.cat)}">{catLabel(feature.cat)}</span>
             <h2>{feature.title}</h2>
             <p>{feature.excerpt}</p>
             <div class="meta"><b>{feature.author}</b> · {feature.date} · {feature.read}</div>
@@ -167,7 +170,7 @@
             <a class="post" href="#{p.id}">
               <div class="part"><span class="glyph">{@html glyph(p.cat)}</span></div>
               <div class="pbody">
-                <span class="cat {catClass(p.cat)}">{p.cat}</span>
+                <span class="cat {catClass(p.cat)}">{catLabel(p.cat)}</span>
                 <h3>{p.title}</h3>
                 <p>{p.excerpt}</p>
                 <div class="meta">{p.date} · {p.read}</div>
@@ -178,19 +181,19 @@
       {:else}
         <div class="empty">
           <span class="eglyph">{@html glyph('')}</span>
-          <h2>No posts yet</h2>
+          <h2>{t('blog.empty.h2')}</h2>
           <p>
-            The first post is being written. In the meantime, the
-            <a href="{base}/docs">docs</a> cover how Sonar works under the hood.
+            {t('blog.empty.p')}
+            <a href="{base}/docs">{t('nav.docs')}</a>
           </p>
         </div>
       {/if}
     {:else}
       <!-- ARTICLE VIEW -->
-      <a class="backlink" href="#top" onclick={(e) => { e.preventDefault(); history.replaceState(null, '', '#'); syncFromHash(); }}>← All posts</a>
+      <a class="backlink" href="#top" onclick={(e) => { e.preventDefault(); history.replaceState(null, '', '#'); syncFromHash(); }}>{t('blog.back')}</a>
       <div class="arthead">
         <div class="artmeta">
-          <span class="cat {catClass(post.cat)}">{post.cat}</span>
+          <span class="cat {catClass(post.cat)}">{catLabel(post.cat)}</span>
           <span class="byline">
             <span class="avatar" aria-hidden="true">
               {#if avatarUrl}
@@ -208,21 +211,21 @@
       <div class="md">{@html artHtml}</div>
       <div class="artcta">
         <div class="t">
-          <h4>Private by architecture, not by promise</h4>
-          <p>Sonar is free and open source — no accounts, no servers, no scanning.</p>
+          <h4>{t('blog.cta.h4')}</h4>
+          <p>{t('blog.cta.p')}</p>
         </div>
-        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">Get Sonar</a>
-        <a class="btn ghost" href="{base}/docs">Read the docs</a>
+        <a class="btn primary" href="{base}/{DOWNLOAD_HREF}">{t('blog.cta.get')}</a>
+        <a class="btn ghost" href="{base}/docs">{t('blog.cta.docs')}</a>
       </div>
       {#if more.length}
         <div class="more">
-          <h4>More from the blog</h4>
+          <h4>{t('blog.more')}</h4>
           <div class="grid">
             {#each more as o (o.id)}
               <a class="post" href="#{o.id}">
                 <div class="part"><span class="glyph">{@html glyph(o.cat)}</span></div>
                 <div class="pbody">
-                  <span class="cat {catClass(o.cat)}">{o.cat}</span>
+                  <span class="cat {catClass(o.cat)}">{catLabel(o.cat)}</span>
                   <h3>{o.title}</h3>
                   <p>{o.excerpt}</p>
                   <div class="meta">{o.date}</div>
@@ -241,7 +244,7 @@
         <SonarMark size={18} />
         sonar
       </a>
-      <span>Written by the people building Sonar · <a href="{base}/">sonar.app</a></span>
+      <span>{t('blog.footer')} · <a href="{base}/">sonar.app</a></span>
     </div>
   </footer>
 </div>

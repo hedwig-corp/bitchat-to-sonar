@@ -1,6 +1,7 @@
 <script>
 	import { base } from '$app/paths';
 	import SonarMark from './SonarMark.svelte';
+	import { t } from '$lib/i18n/i18n.svelte.js';
 
 	const statusHref = `${base}/status`;
 </script>
@@ -12,8 +13,8 @@
 			sonar
 		</a>
 		<span class="fine"
-			>Open protocols — Bluetooth mesh + Nostr · <code>npub1w4j8mc7…q4k9dj</code> ·
-			<a href={statusHref}>Status</a></span
+			>{t('footer.protocols')} · <code>npub1w4j8mc7…q4k9dj</code> ·
+			<a href={statusHref}>{t('footer.status')}</a></span
 		>
 	</div>
 </footer>
