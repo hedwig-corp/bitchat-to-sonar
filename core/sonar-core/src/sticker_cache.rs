@@ -17,10 +17,12 @@ pub(crate) const STICKER_CACHE_DIR_SUFFIX: &str = ".sonar-stickers";
 pub(crate) const MAX_STICKER_CACHE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_STICKER_CACHE_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const VALIDATED_PACKS_DIR: &str = "validated-packs";
+const INSTALLED_PACKS_FILE: &str = "installed-packs.json";
 const FAILED_WIPE_TOMBSTONE_SUFFIX: &str = ".wipe-incomplete";
 const FAILED_WIPE_QUARANTINE_SUFFIX: &str = ".wipe-quarantine";
 const MAX_VALIDATED_PACK_BYTES: u64 = 512 * 1024;
 const MAX_VALIDATED_PACK_CACHE_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_INSTALLED_PACKS_BYTES: u64 = 64 * 1024;
 /// Bound install prefetch to the leading window that can fit even when every
 /// sticker is at the per-object maximum. This keeps picker-order stickers warm
 /// instead of downloading the whole pack and evicting its first entries.
@@ -166,9 +168,9 @@ impl StickerCache {
     }
 
     /// Read the latest locally validated definition for a pack. Foreground
-    /// callers use this only after waiting behind an in-flight relay refresh,
-    /// so concurrent views share the first result without turning ordinary
-    /// picker refreshes into permanently stale local-only reads.
+    /// picker/transcript paths paint from this before any relay refresh so a
+    /// warm disk cache never waits on network; refresh still updates the file
+    /// in the background via the shared pack-fetch gate.
     pub(crate) fn read_validated_pack(&self, coordinate: &str) -> Result<Option<StickerPack>> {
         if !self.active {
             return Ok(None);
@@ -181,6 +183,39 @@ impl StickerCache {
             return Ok(None);
         }
         read_validated_pack(root, coordinate)
+    }
+
+    /// Persist the last-known installed pack list (kind 10031) so the sticker
+    /// picker can paint across process restarts without waiting on relays.
+    pub(crate) fn remember_installed_packs(&self, packs: &[PackAddress]) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(false);
+        }
+        write_installed_packs(root, packs)?;
+        Ok(true)
+    }
+
+    /// Read the last-known installed pack list. `None` means never cached;
+    /// `Some([])` means the user had an empty installed set when last synced.
+    pub(crate) fn read_installed_packs(&self) -> Result<Option<Vec<PackAddress>>> {
+        if !self.active {
+            return Ok(None);
+        }
+        let Some(root) = self.root.as_deref() else {
+            return Ok(None);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(None);
+        }
+        read_installed_packs(root)
     }
 
     /// Return verified image bytes only when the latest locally validated pack
@@ -435,6 +470,86 @@ fn cache_file_path(root: &Path, sha256_hex_lower: &str) -> PathBuf {
 fn validated_pack_file_path(root: &Path, coordinate: &str) -> PathBuf {
     root.join(VALIDATED_PACKS_DIR)
         .join(format!("{}.json", sha256_hex(coordinate.as_bytes())))
+}
+
+fn installed_packs_file_path(root: &Path) -> PathBuf {
+    root.join(INSTALLED_PACKS_FILE)
+}
+
+fn write_installed_packs(root: &Path, packs: &[PackAddress]) -> Result<()> {
+    let coordinates: Vec<String> = packs.iter().map(|pack| pack.coordinate()).collect();
+    let bytes = serde_json::to_vec(&coordinates)
+        .map_err(|e| crate::Error::Storage(format!("encode installed packs cache: {e}")))?;
+    if bytes.len() as u64 > MAX_INSTALLED_PACKS_BYTES {
+        return Err(crate::Error::Storage(format!(
+            "installed packs metadata exceeds {MAX_INSTALLED_PACKS_BYTES} byte cache cap"
+        )));
+    }
+    fs::create_dir_all(root).map_err(|e| {
+        crate::Error::Storage(format!(
+            "create sticker cache dir {}: {e}",
+            root.display()
+        ))
+    })?;
+    let path = installed_packs_file_path(root);
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    if let Err(error) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(crate::Error::Storage(format!(
+            "write installed packs cache tmp {}: {error}",
+            tmp.display()
+        )));
+    }
+    if let Err(error) = atomic_replace_file(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(crate::Error::Storage(format!(
+            "commit installed packs cache {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn read_installed_packs(root: &Path) -> Result<Option<Vec<PackAddress>>> {
+    let path = installed_packs_file_path(root);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(crate::Error::Storage(format!(
+                "inspect installed packs cache {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if metadata.len() > MAX_INSTALLED_PACKS_BYTES {
+        let _ = fs::remove_file(&path);
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).map_err(|error| {
+        crate::Error::Storage(format!(
+            "read installed packs cache {}: {error}",
+            path.display()
+        ))
+    })?;
+    let coordinates: Vec<String> = match serde_json::from_slice(&bytes) {
+        Ok(coordinates) => coordinates,
+        Err(_) => {
+            let _ = fs::remove_file(&path);
+            return Ok(None);
+        }
+    };
+    let mut packs = Vec::with_capacity(coordinates.len());
+    for coordinate in coordinates {
+        match PackAddress::parse(&coordinate) {
+            Ok(address) => packs.push(address),
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(packs))
 }
 
 fn write_validated_pack(root: &Path, pack: &StickerPack) -> Result<()> {
@@ -844,6 +959,31 @@ mod tests {
         let fresh = StickerCache::for_db(&db).unwrap();
         let bytes = b"fresh-session";
         assert!(fresh.write(&sha256_hex(bytes), bytes).unwrap());
+    }
+
+    #[test]
+    fn installed_packs_round_trip_distinguishes_missing_from_empty() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = StickerCache::for_db(&db).unwrap();
+        assert!(cache.read_installed_packs().unwrap().is_none());
+
+        assert!(cache.remember_installed_packs(&[]).unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([].as_slice())
+        );
+
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        assert!(cache.remember_installed_packs(&[pack.clone()]).unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([pack].as_slice())
+        );
     }
 
     #[test]

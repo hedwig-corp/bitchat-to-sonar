@@ -2441,9 +2441,8 @@ final class MarmotChatModel: ObservableObject {
             return cached
         }
         do {
-            guard await ensureRelayConnected() else {
-                throw MarmotService.ServiceError.notConnected
-            }
+            // Do not gate on ensureRelayConnected: core is local-first for
+            // validated disk metadata, and a warm cache must not wait on relays.
             let pack = try await service.fetchStickerPack(
                 authorPubkeyHex: authorPubkeyHex,
                 identifier: identifier,

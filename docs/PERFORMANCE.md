@@ -183,18 +183,20 @@ Fresh offset-68/80 download attempts encountered unavailable public image
 responses after pack fetch and were rejected by the completeness checks rather
 than being reported as performance samples.
 
-Pack metadata remains network-bound and variable (229.9 ms–10.02 s in the final
-matched-device run), while the forced validated-local fallback completed in
-1.25 ms on Pixel. The cache itself is not the bottleneck. This change therefore keeps a
-25 MiB/100-entry host LRU on each app
-surface, a verified content-addressed disk cache with a strict 5 MiB per-image
-foreground/prefetch limit, shared per-pack/per-SHA single-flight fetch gates,
-and bounded first-20/four-task install prefetch detached from the UI/FFI path.
-Identity replacement and wipe first stop new sticker work and drain active
+Pack metadata used to remain network-bound and variable (229.9 ms–10.02 s in the
+final matched-device run), while the forced validated-local fallback completed in
+1.25 ms on Pixel. The cache itself was not the bottleneck. Foreground pack and
+installed-list reads are now local-first: validated disk metadata and the last
+kind-10031 list paint immediately, with a coalesced relay refresh behind that
+first frame. Hosts no longer gate the first pack lookup on relay connect when
+disk already has the pack. This change also keeps a 25 MiB/100-entry host LRU on
+each app surface, a verified content-addressed disk cache with a strict 5 MiB
+per-image foreground/prefetch limit, shared per-pack/per-SHA single-flight fetch
+gates, and bounded first-20/four-task install prefetch detached from the UI/FFI
+path. Identity replacement and wipe first stop new sticker work and drain active
 reads on Apple, Android, and desktop before deleting the database/cache. When a
-relay refresh fails, every host now receives the persisted validated pack
-metadata rather than losing an otherwise usable warm cache. Moving refresh fully
-behind the first local paint remains a separate UI lifecycle optimization.
+relay refresh fails, every host still receives the persisted validated pack
+metadata rather than losing an otherwise usable warm cache.
 
 ## Baseline result
 
