@@ -257,10 +257,14 @@ impl OutboxState {
     /// Returns `(message_id_hex, group_id_hex, event)` for each retryable row.
     /// `group_id_hex` is the MLS id hosts use for conversation refresh (not
     /// the Nostr `#h` / `nostr_group_id`).
+    /// `excluded_message_ids` are not mutated: a failed media row must remain
+    /// visibly failed when its prerequisite durable handoff cannot be
+    /// checkpointed yet.
     pub fn retryable_events(
         &mut self,
         now_secs: u64,
         active_group_ids: &HashSet<String>,
+        excluded_message_ids: &HashSet<String>,
     ) -> Result<Vec<(String, String, Event)>> {
         let mut out = Vec::new();
         let before = self.entries.len();
@@ -270,6 +274,9 @@ impl OutboxState {
             self.dirty = true;
         }
         for entry in self.entries.values_mut() {
+            if excluded_message_ids.contains(&entry.message_id_hex) {
+                continue;
+            }
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
             }
@@ -494,7 +501,7 @@ mod tests {
 
         let active_group_ids = HashSet::new();
         let events = outbox
-            .retryable_events(2, &active_group_ids)
+            .retryable_events(2, &active_group_ids, &HashSet::new())
             .expect("retryable events");
         assert!(events.is_empty());
 
@@ -540,7 +547,7 @@ mod tests {
             .mark_failed_by_message_id("message", "still offline".into(), 4)
             .expect("mark failed after retry");
         let retryable = outbox
-            .retryable_events(5, &HashSet::from(["group".to_string()]))
+            .retryable_events(5, &HashSet::from(["group".to_string()]), &HashSet::new())
             .expect("automatic retry budget was reset");
         assert_eq!(retryable.len(), 1);
 
@@ -548,6 +555,43 @@ mod tests {
         assert_eq!(
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn excluded_retry_preserves_failed_delivery_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "blocked-media-message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+            )
+            .expect("mark pending");
+        outbox
+            .mark_failed_by_message_id("blocked-media-message", "checkpoint failed".into(), 2)
+            .expect("mark failed");
+
+        let retryable = outbox
+            .retryable_events(
+                3,
+                &HashSet::from(["group".to_string()]),
+                &HashSet::from(["blocked-media-message".to_string()]),
+            )
+            .expect("select retryable events");
+
+        assert!(retryable.is_empty());
+        assert_eq!(
+            OutboxState::load(Some(path)).status_for_message("blocked-media-message"),
+            Some(DeliveryState::Failed)
         );
     }
 }

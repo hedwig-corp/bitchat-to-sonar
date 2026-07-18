@@ -117,6 +117,12 @@ const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PARTIAL_PREFIX: &str = ".sonar-download-";
 const MEDIA_DOWNLOAD_PARTIAL_SUFFIX: &str = ".part";
 const MEDIA_DOWNLOAD_PARTIAL_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Public/sticker downloads are small enough to retain a total deadline. Size
+/// it for the same constrained-link floor as uploads, but cap hostile trickle
+/// responses so they cannot occupy foreground or prefetch permits forever.
+const PUBLIC_DOWNLOAD_TIMEOUT_BASE: Duration = Duration::from_secs(60);
+const PUBLIC_DOWNLOAD_TIMEOUT_MAX: Duration = Duration::from_secs(15 * 60);
+const PUBLIC_DOWNLOAD_MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 32 * 1024;
 /// Retained, inactive resume prefixes are bounded separately from at most four
 /// active 25 MiB downloads, keeping worst-case partial storage under 200 MiB.
 const MEDIA_DOWNLOAD_PARTIAL_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
@@ -656,7 +662,7 @@ fn parse_content_range(value: &str) -> Option<(u64, u64, Option<u64>)> {
 
 /// Download public bytes from an HTTPS URL (for plaintext sticker images).
 pub async fn http_get_public(url: &str) -> Result<Vec<u8>> {
-    http_get_with_retries(url, None).await
+    http_get_public_with_retries_limit(url, MAX_MEDIA_DOWNLOAD_BYTES).await
 }
 
 #[derive(Clone, Debug)]
@@ -698,7 +704,7 @@ async fn fetch_sticker_image_with_cache(
         return Err(Error::Http("sticker URL must be HTTPS".into()));
     }
     let download_started = Instant::now();
-    let bytes = http_get_with_retries_limit(url, max_download_bytes).await?;
+    let bytes = http_get_public_with_retries_limit(url, max_download_bytes).await?;
     let download_us = download_started.elapsed().as_micros() as u64;
     let verify_started = Instant::now();
     let actual = sha256_hex(&bytes);
@@ -1125,8 +1131,19 @@ async fn http_get_with_retries(
     http_get_with_retries_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
 }
 
-async fn http_get_with_retries_limit(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
-    http_get_with_retries_limit_observer(url, max_bytes, None).await
+async fn http_get_public_with_retries_limit(url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let deadline = public_download_timeout(max_bytes);
+    tokio::time::timeout(
+        deadline,
+        http_get_with_retries_limit_observer(url, max_bytes, None),
+    )
+    .await
+    .map_err(|_| {
+        Error::Http(format!(
+            "public download exceeded {}s total deadline",
+            deadline.as_secs()
+        ))
+    })?
 }
 
 async fn http_get_with_retries_limit_observer(
@@ -4031,7 +4048,11 @@ impl SonarClient {
         };
         let retryable = {
             let mut outbox = self.outbox_state.lock().unwrap();
-            match outbox.retryable_events(Timestamp::now().as_secs(), &active_group_ids) {
+            match outbox.retryable_events(
+                Timestamp::now().as_secs(),
+                &active_group_ids,
+                &blocked_media_messages,
+            ) {
                 Ok(events) => events,
                 Err(err) => {
                     tracing::debug!(%err, "failed to load retryable outbox events");
@@ -4040,9 +4061,6 @@ impl SonarClient {
             }
         };
         for (message_id_hex, group_id_hex, event) in retryable {
-            if blocked_media_messages.contains(&message_id_hex) {
-                continue;
-            }
             // group_id_hex is the MLS id stored at mark_pending — same key hosts use.
             self.notify_conversation_changed(&group_id_hex);
             self.spawn_outbox_publish(message_id_hex, group_id_hex, event);
@@ -6724,6 +6742,13 @@ fn blossom_upload_timeout(len: usize) -> Duration {
     (BLOSSOM_UPLOAD_TIMEOUT + transfer).min(BLOSSOM_UPLOAD_TIMEOUT_MAX)
 }
 
+fn public_download_timeout(max_bytes: usize) -> Duration {
+    let transfer_secs = (max_bytes as u64).div_ceil(PUBLIC_DOWNLOAD_MIN_THROUGHPUT_BYTES_PER_SEC);
+    PUBLIC_DOWNLOAD_TIMEOUT_BASE
+        .saturating_add(Duration::from_secs(transfer_secs))
+        .min(PUBLIC_DOWNLOAD_TIMEOUT_MAX)
+}
+
 fn retryable_blossom_upload_error(error: &nostr_blossom::error::Error) -> bool {
     match error {
         // Connection resets, body I/O, timeouts, and malformed success bodies
@@ -7623,6 +7648,23 @@ mod tests {
         assert_eq!(
             blossom_upload_timeout(usize::MAX),
             Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[test]
+    fn public_download_timeout_is_bounded_and_scarce_link_aware() {
+        assert_eq!(public_download_timeout(0), Duration::from_secs(60));
+        assert_eq!(
+            public_download_timeout(1024 * 1024),
+            Duration::from_secs(60 + 32)
+        );
+        assert_eq!(
+            public_download_timeout(MAX_STICKER_CACHE_BYTES),
+            Duration::from_secs(60 + 160)
+        );
+        assert_eq!(
+            public_download_timeout(usize::MAX),
+            PUBLIC_DOWNLOAD_TIMEOUT_MAX
         );
     }
 
