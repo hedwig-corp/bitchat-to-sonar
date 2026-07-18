@@ -1485,13 +1485,15 @@ final class MarmotChatModel: ObservableObject {
     /// threads and the UI repaints from `conversationChanged`.
     ///
     /// Production shape:
-    /// 1. Drain + paint on the dedicated receive lane first.
-    /// 2. If the live buffer already delivered: return those notifications for
-    ///    titled push; run single-flight `syncForce` in the background.
-    /// 3. If empty (socket was dead): await that same single-flight and use
-    ///    **its** drained notifications (do not drain again — sync-path
-    ///    notifications are consumed once). Mid-fetch, `drainQueue` still lets
-    ///    the polling loop paint the chat UI from live events.
+    /// 1. Drain + paint on the dedicated receive lane first (UI can update
+    ///    via `loadLocalSummaries` / polling while sync still runs).
+    /// 2. Always await single-flight `syncForce` before returning — callers
+    ///    (`SonarPushProcessor`) end the background wake when this returns, so
+    ///    gap recovery must finish inside the granted window even when the live
+    ///    buffer already had events.
+    /// 3. Mid-fetch, `drainQueue` still lets the polling loop paint the chat UI
+    ///    from live events. Foreground resume uses `refreshAfterForeground`,
+    ///    which fire-and-forgets gap recovery instead of blocking first paint.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1502,14 +1504,11 @@ final class MarmotChatModel: ObservableObject {
         let live = (try? await service.drainPending()) ?? []
         await loadLocalSummaries()
 
-        if !live.isEmpty {
-            _ = ensureGapRecovery()
-            return live
-        }
-
-        // Empty live buffer: gap recovery owns syncForce + the one drain that
-        // surfaces parked sync-path notifications for the push processor.
-        return await ensureGapRecovery().value
+        // syncForce drain is a separate buffer fill — live events were already
+        // consumed above and will not reappear in `recovered`.
+        let recovered = await ensureGapRecovery().value
+        if live.isEmpty { return recovered }
+        return live + recovered
     }
 
     /// Single-flight forced gap recovery. Shared by push wake and foreground
