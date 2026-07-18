@@ -120,6 +120,51 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .unwrap_or_else(|_| reqwest::Client::new())
 });
 
+/// Per-request bounds for handle registrar/NIP-05 traffic. Tighter than the
+/// shared client's 60s default: handle claim/resolve is interactive UI work.
+const HANDLE_CLAIM_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDLE_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Dedicated client for handle registrar/NIP-05 traffic with redirects
+/// DISABLED. The NIP-05 host is attacker-controlled (a peer's kind-0 `nip05`
+/// field), and the shared client's default redirect policy would follow up to
+/// 10 hops — including https→http — letting a malicious server bounce the
+/// request at loopback/link-local/metadata targets. A 3xx answer is treated
+/// as a failed lookup instead.
+static HANDLE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        // Never fall back to `Client::new()` — that re-enables redirects and
+        // undoes the SSRF hardening for attacker-controlled NIP-05 hosts.
+        .expect("HANDLE_HTTP_CLIENT: reqwest builder failed")
+});
+
+/// Read a response body with a hard size cap. The NIP-05 host is whatever
+/// domain the user typed, so the body must be treated as attacker-controlled:
+/// stream chunks and stop at the cap instead of trusting Content-Length.
+async fn read_body_capped(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(Error::Http(format!("response too large: {len} bytes")));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| Error::Http(format!("response read: {e}")))?
+    {
+        if body.len() + chunk.len() > max_bytes {
+            return Err(Error::Http("response exceeded size cap".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Download raw bytes for an encrypted media blob by its full imeta URL.
 ///
 /// Hardening (the URL is attacker-controllable — it is whatever the message
@@ -1391,6 +1436,12 @@ pub struct SonarClient {
     /// through the shared processed-ID set, so a message delivered by both the
     /// sync fetch and the live buffer notifies at most once.
     pending_sync_notifications: Arc<Mutex<Vec<DrainNotification>>>,
+    /// The claimed human-readable handle (`name@domain`), if any. Loaded from
+    /// its sidecar at connect and merged as `nip05` into every kind-0 publish
+    /// so a nickname-only republish never clobbers the claimed handle.
+    claimed_handle: Arc<Mutex<Option<String>>>,
+    /// Durable path for the claimed handle (None for in-memory sessions).
+    handle_state_path: Option<PathBuf>,
 }
 
 impl SonarClient {
@@ -1430,6 +1481,11 @@ impl SonarClient {
             index.map(|idx| Arc::new(Mutex::new(idx))),
         )
         .await?;
+        let handle_path = crate::handles::handle_state_path_for_db(db_path);
+        if let Some(address) = crate::handles::load_claimed_address(&handle_path) {
+            *client.claimed_handle.lock().unwrap() = Some(address);
+        }
+        client.handle_state_path = Some(handle_path);
         client.materialize_index_if_empty();
         Ok(client)
     }
@@ -1862,6 +1918,8 @@ impl SonarClient {
             sticker_ref_prefetch_inflight: Arc::new(Mutex::new(HashSet::new())),
             own_push_registration: Arc::new(Mutex::new(None)),
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
+            claimed_handle: Arc::new(Mutex::new(None)),
+            handle_state_path: None,
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -2012,6 +2070,9 @@ impl SonarClient {
         {
             metadata = metadata.picture(url);
         }
+        if let Some(address) = self.claimed_handle.lock().unwrap().clone() {
+            metadata = metadata.nip05(address);
+        }
         self.nostr.set_metadata(&metadata).await?;
         Ok(())
     }
@@ -2036,6 +2097,9 @@ impl SonarClient {
         {
             metadata = metadata.picture(url);
         }
+        if let Some(address) = self.claimed_handle.lock().unwrap().clone() {
+            metadata = metadata.nip05(address);
+        }
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.set_metadata(&metadata).await {
@@ -2056,6 +2120,108 @@ impl SonarClient {
             picture: m.picture,
             nip05: m.nip05,
         }))
+    }
+
+    /// The claimed human-readable handle (`name@domain`), if any. Local read —
+    /// never touches the network.
+    pub fn claimed_handle(&self) -> Option<String> {
+        self.claimed_handle.lock().unwrap().clone()
+    }
+
+    /// Claim (or refresh) a handle at the Sonar handle registrar.
+    ///
+    /// Signs a kind-23353 registration event with the identity key and POSTs
+    /// it to the registrar — handle ownership *is* the account key, so a
+    /// restore from nsec re-claims the same name idempotently. One claim
+    /// registers both resolutions: NIP-05 (chat) always, BIP-353 (payments)
+    /// when `offer` is present. A chat-only claim made before the wallet is
+    /// ready can be refreshed later with the offer.
+    ///
+    /// On success the address is persisted to its sidecar and merged as
+    /// `nip05` into every subsequent kind-0 publish; callers should republish
+    /// the profile afterwards so peers see the handle immediately.
+    pub async fn claim_handle(&self, handle: &str, offer: Option<&str>) -> Result<String> {
+        let parsed =
+            crate::handles::parse_handle_input(handle, crate::handles::DEFAULT_HANDLE_DOMAIN)?;
+        if parsed.domain != crate::handles::DEFAULT_HANDLE_DOMAIN {
+            return Err(Error::InvalidInput(format!(
+                "handles can only be claimed on {}",
+                crate::handles::DEFAULT_HANDLE_DOMAIN
+            )));
+        }
+        let keys = self.engine.identity().keys().clone();
+        let event = crate::handles::build_claim_event(&keys, &parsed, offer)?;
+        let url = format!("{}/v1/register", crate::handles::DEFAULT_REGISTRAR_URL);
+        let resp = HANDLE_HTTP_CLIENT
+            .post(&url)
+            .timeout(HANDLE_CLAIM_TIMEOUT)
+            .json(&event)
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("register POST: {e}")))?;
+        let status = resp.status();
+        let body = read_body_capped(resp, crate::handles::NIP05_MAX_RESPONSE_BYTES).await?;
+        if status == reqwest::StatusCode::CONFLICT {
+            return Err(Error::HandleTaken(parsed.address()));
+        }
+        if !status.is_success() {
+            return Err(Error::Http(format!("register {url} -> HTTP {status}")));
+        }
+        let claim: crate::handles::ClaimResponse = serde_json::from_slice(&body)
+            .map_err(|e| Error::Http(format!("register response parse: {e}")))?;
+        if let Some(path) = &self.handle_state_path {
+            crate::handles::store_claimed_address(path, Some(&claim.address))?;
+        }
+        *self.claimed_handle.lock().unwrap() = Some(claim.address.clone());
+        Ok(claim.address)
+    }
+
+    /// Resolve a handle to its owner's pubkey via NIP-05.
+    ///
+    /// Bare nicknames (`vincenzo`) resolve against the default Sonar domain;
+    /// full addresses (`alice@example.com`) resolve against any NIP-05 host.
+    /// Bounded, user-initiated network work — never called on the startup or
+    /// chat-open path.
+    pub async fn resolve_handle(&self, input: &str) -> Result<crate::handles::ResolvedHandle> {
+        let parsed =
+            crate::handles::parse_handle_input(input, crate::handles::DEFAULT_HANDLE_DOMAIN)?;
+        let url = crate::handles::nip05_url(&parsed);
+        let resp = HANDLE_HTTP_CLIENT
+            .get(&url)
+            .timeout(HANDLE_LOOKUP_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| Error::Http(format!("nip05 GET: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(Error::HandleNotFound(parsed.address()));
+        }
+        if !status.is_success() {
+            return Err(Error::Http(format!("nip05 {url} -> HTTP {status}")));
+        }
+        let body = read_body_capped(resp, crate::handles::NIP05_MAX_RESPONSE_BYTES).await?;
+        let pubkey = crate::handles::parse_nip05_response(&body, &parsed.local)?;
+        Ok(crate::handles::ResolvedHandle {
+            address: parsed.address(),
+            pubkey,
+        })
+    }
+
+    /// True if `address` (a full `name@domain`) currently resolves to
+    /// `expected` via NIP-05. Used to render a verified-handle badge on
+    /// profiles: an unknown handle is `Ok(false)` (unverified), a network
+    /// failure is an error so callers can distinguish "fake" from "offline".
+    pub async fn verify_nip05(&self, address: &str, expected: &PublicKey) -> Result<bool> {
+        if !address.contains('@') {
+            return Err(Error::InvalidInput(
+                "nip05 verification requires a full name@domain address".into(),
+            ));
+        }
+        match self.resolve_handle(address).await {
+            Ok(resolved) => Ok(&resolved.pubkey == expected),
+            Err(Error::HandleNotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Publish Sonar's public, NIP-78-style app descriptor. This is intentionally
@@ -5265,10 +5431,12 @@ impl SonarClient {
         let index_result = wipe_index_for_db(db_path);
         let push_result = wipe_push_token_cache_for_db(db_path);
         let sticker_result = wipe_sticker_cache_for_db(db_path);
+        let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
         db_result?;
         index_result?;
         push_result?;
-        sticker_result
+        sticker_result?;
+        handle_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.

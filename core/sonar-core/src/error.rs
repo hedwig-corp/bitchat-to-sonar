@@ -57,6 +57,12 @@ pub enum Error {
     #[error("http error: {0}")]
     Http(String),
 
+    #[error("handle taken: {0}")]
+    HandleTaken(String),
+
+    #[error("handle not found: {0}")]
+    HandleNotFound(String),
+
     #[error("media download cancelled")]
     MediaDownloadCancelled,
 

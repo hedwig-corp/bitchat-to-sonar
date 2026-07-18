@@ -28,6 +28,11 @@ struct SonarContactProfileScreen: View {
     @State private var toast: String?
     @State private var confirmBlock = false
     @State private var confirmDelete = false
+    /// NIP-05 verification result per handle address (nil entry = unknown /
+    /// offline). Cached for this screen's lifetime; checked in the background
+    /// on appear so paint never waits on the network.
+    @State private var nip05Verified: [String: Bool] = [:]
+    @State private var nip05Checks: Set<String> = []
 
     private var effectiveChatId: String {
         guard peerId.hasPrefix("npub1") else { return peerId }
@@ -76,6 +81,40 @@ struct SonarContactProfileScreen: View {
         return "\(npub.prefix(10))…\(npub.suffix(4))"
     }
 
+    /// The contact's published nip05 handle from their cached kind-0 profile
+    /// (already fetched by `ensureProfile`; local cache read only).
+    private var nip05Address: String? {
+        let npub = resolvedNpub
+        guard !npub.isEmpty else { return nil }
+        let key = SNMarmotProfileCache.canonicalKey(npub)
+        let profile = store.marmot.profilesByNpub[key] ?? store.marmot.profilesByNpub[npub]
+        guard let value = profile?.nip05?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty
+        else { return nil }
+        return value
+    }
+
+    /// "@vincenzo" for the default Sonar domain, full address otherwise.
+    private func handleDisplayText(_ address: String) -> String {
+        let parts = address.split(separator: "@", maxSplits: 1)
+        if parts.count == 2, parts[1].lowercased() == SonarAppStore.handleDomain {
+            return "@\(parts[0])"
+        }
+        return address
+    }
+
+    /// Kick off (at most once per address) the background NIP-05 check. Never
+    /// blocks paint; unverified/offline just renders as plain text.
+    private func verifyHandleIfNeeded() {
+        guard let address = nip05Address else { return }
+        let npub = resolvedNpub
+        guard !npub.isEmpty, nip05Checks.insert(address).inserted else { return }
+        Task { @MainActor in
+            guard let ok = try? await store.marmot.verifyNip05(address: address, npub: npub) else { return }
+            nip05Verified[address] = ok
+        }
+    }
+
     private var sharedGroups: [SNDMRow] {
         let npub = resolvedNpub
         guard !npub.isEmpty else { return [] }
@@ -108,6 +147,25 @@ struct SonarContactProfileScreen: View {
                             .padding(.vertical, 4)
                             .background(Capsule().fill(SonarTheme.surface2))
                             .padding(.top, 6)
+                        if let address = nip05Address {
+                            // Handle badge. checkmark.seal is deliberately NOT
+                            // the shieldCheck used for manual safety-number
+                            // verification — different trust semantics.
+                            HStack(spacing: 5) {
+                                if nip05Verified[address] == true {
+                                    Image(systemName: "checkmark.seal.fill")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundColor(SonarTheme.accentDeep)
+                                        .accessibilityLabel("Handle verified")
+                                }
+                                Text(verbatim: handleDisplayText(address))
+                                    .font(SonarTheme.uiFont(size: 13, weight: .medium))
+                                    .foregroundColor(SonarTheme.text2)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .padding(.top, 6)
+                        }
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.top, 10)
@@ -288,6 +346,17 @@ struct SonarContactProfileScreen: View {
             SNWalletSheetContent(onClose: { walletSheet = false })
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .onAppear {
+            let npub = resolvedNpub
+            if !npub.isEmpty {
+                store.marmot.ensureProfile(npub)
+            }
+            verifyHandleIfNeeded()
+        }
+        .onChange(of: nip05Address) { _ in
+            // The kind-0 profile may arrive after first paint.
+            verifyHandleIfNeeded()
+        }
         .overlay(alignment: .bottom) {
             if let toast {
                 Text(verbatim: toast)

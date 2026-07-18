@@ -1689,6 +1689,8 @@ private struct MacCommandPalette: View {
     @State private var selectedGroupNpubs: Set<String> = []
     @State private var groupEntry = false
     @State private var walletSheet = false
+    @State private var resolvingHandle = false
+    @State private var handleMissQuery: String?
     @FocusState private var focused: Bool
 
     private var walletReady: Bool {
@@ -1737,6 +1739,19 @@ private struct MacCommandPalette: View {
                         ForEach(filteredCommands) { command in
                             MacPaletteRow(icon: command.icon, title: command.title, sub: command.sub) {
                                 choose(command)
+                            }
+                        }
+                        if canStartHandleChatFromQuery {
+                            MacPaletteRow(
+                                icon: .key,
+                                title: resolvingHandle
+                                    ? "Looking up \(trimmedQuery)\u{2026}"
+                                    : "Start secure chat with \(trimmedQuery)",
+                                sub: handleMissQuery == trimmedQuery
+                                    ? "No one found for \(trimmedQuery)"
+                                    : "Encrypted chat over the internet"
+                            ) {
+                                resolveHandleAndStartChat()
                             }
                         }
                         if npubEntry || canStartSecureChatFromQuery {
@@ -1798,6 +1813,9 @@ private struct MacCommandPalette: View {
         .onAppear {
             DispatchQueue.main.async { focused = true }
         }
+        .onChange(of: query) { _ in
+            handleMissQuery = nil
+        }
         .onChange(of: isPresented) { open in
             if !open {
                 npubEntry = false
@@ -1823,6 +1841,16 @@ private struct MacCommandPalette: View {
 
     private var canStartSecureChatFromQuery: Bool {
         trimmedQuery.hasPrefix("npub1")
+    }
+
+    /// Handle action mirror of the mobile search sheet: string gate only —
+    /// resolution happens on activation, never per keystroke.
+    private var canStartHandleChatFromQuery: Bool {
+        // No extra length floor: the registrar accepts one-character handles,
+        // so the search gate must match the claim validator.
+        !canStartSecureChatFromQuery
+            && !trimmedQuery.isEmpty
+            && MarmotService.handleLooksValid(trimmedQuery)
     }
 
     private var secureChatBinding: Binding<String> {
@@ -1911,6 +1939,8 @@ private struct MacCommandPalette: View {
     private func chooseFirstResult() {
         if canStartSecureChatFromQuery {
             startSecureChat(with: trimmedQuery)
+        } else if canStartHandleChatFromQuery {
+            resolveHandleAndStartChat()
         } else if normalizedQuery.isEmpty {
             choose(.radar)
         } else if let command = filteredCommands.first {
@@ -1955,6 +1985,30 @@ private struct MacCommandPalette: View {
         guard npub.hasPrefix("npub1") else { return }
         store.startSecureChat(npub: npub)
         isPresented = false
+    }
+
+    /// Resolve the typed handle over the internet, then reuse the npub path.
+    private func resolveHandleAndStartChat() {
+        guard !resolvingHandle else { return }
+        let handle = trimmedQuery
+        resolvingHandle = true
+        handleMissQuery = nil
+        Task { @MainActor in
+            let npub = await store.resolveHandleForChat(handle)
+            // The user may have edited the query while the lookup was in
+            // flight — a stale result must not open the wrong chat.
+            guard trimmedQuery == handle else {
+                resolvingHandle = false
+                return
+            }
+            resolvingHandle = false
+            if let npub {
+                store.startSecureChat(npub: npub)
+                isPresented = false
+            } else {
+                handleMissQuery = handle
+            }
+        }
     }
 
     private func startGroupFromDraft() {
@@ -2142,7 +2196,6 @@ private struct MacProfilePane: View {
     @EnvironmentObject private var store: SonarAppStore
     @State private var editingName = false
     @State private var draftName = ""
-    @State private var bip353Draft = ""
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
@@ -2174,7 +2227,6 @@ private struct MacProfilePane: View {
         .background(SonarTheme.bg.ignoresSafeArea())
         .onAppear {
             draftName = store.nick
-            bip353Draft = store.bip353
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
             SNWalletSheetContent(onClose: { walletSheet = false })
@@ -2324,29 +2376,8 @@ private struct MacProfilePane: View {
         VStack(spacing: 0) {
             SNSectionLabel("Payments")
             SNSettingsCard {
-                VStack(alignment: .leading, spacing: 9) {
-                    HStack {
-                        Text("Payment address (BIP-353)")
-                            .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                            .foregroundColor(SonarTheme.text)
-                        Spacer(minLength: 0)
-                        SNIcon(name: .coin, size: 18, weight: 2)
-                            .foregroundColor(SonarTheme.goldDeep)
-                    }
-                    TextField("", text: $bip353Draft, prompt: Text("user@domain").foregroundColor(SonarTheme.text3))
-                        .textFieldStyle(.plain)
-                        .font(SonarTheme.monoFont(size: 13))
-                        .foregroundColor(SonarTheme.text)
-                        .onSubmit { store.setBip353(bip353Draft) }
-                        .onChange(of: bip353Draft) { store.setBip353($0) }
-                        .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
-                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
-                    Text("Leave this empty if you do not want to announce a payment address to nearby Sonar peers.")
-                        .font(SonarTheme.uiFont(size: 12))
-                        .foregroundColor(SonarTheme.text3)
-                        .lineSpacing(3)
-                }
-                .padding(16)
+                SonarHandleClaimCard(store: store)
+                    .padding(16)
             }
         }
     }
@@ -2422,7 +2453,6 @@ private struct MacSettingsModal: View {
 
     @State private var editingName = false
     @State private var draftName = ""
-    @State private var bip353Draft = ""
     @State private var connSheet = false
     @State private var wipeAsk = false
     @State private var eraseAsk = false
@@ -2467,7 +2497,6 @@ private struct MacSettingsModal: View {
         }
         .onAppear {
             draftName = store.nick
-            bip353Draft = store.bip353
         }
         .snSheet(isPresented: $connSheet, title: "Connection") {
             SNConnectivitySheetContent(onClose: { connSheet = false })
@@ -2736,20 +2765,8 @@ private struct MacSettingsModal: View {
                 }
             }
             SNSettingsCard {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Payment address (BIP-353)")
-                        .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                        .foregroundColor(SonarTheme.text)
-                    TextField("", text: $bip353Draft, prompt: Text("user@domain").foregroundColor(SonarTheme.text3))
-                        .textFieldStyle(.plain)
-                        .font(SonarTheme.monoFont(size: 13))
-                        .foregroundColor(SonarTheme.text)
-                        .onSubmit { store.setBip353(bip353Draft) }
-                        .onChange(of: bip353Draft) { store.setBip353($0) }
-                        .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
-                        .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(SonarTheme.surface2))
-                }
-                .padding(14)
+                SonarHandleClaimCard(store: store)
+                    .padding(14)
             }
         }
     }

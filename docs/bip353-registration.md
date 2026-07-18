@@ -1,9 +1,18 @@
 # BIP-353 Payment Address Registration
 
+> **Superseded:** the registrar now lives in this repo at
+> [`services/handle-registrar/`](../services/handle-registrar/) and serves the
+> unified handle — BIP-353 payment address **and** NIP-05 chat identity from
+> one kind-23353 claim. Deploy with `scripts/deploy-handle-registrar.sh`; API
+> reference in the service README. The client integration described below is
+> implemented in `core/sonar-core/src/handles.rs` (claim/resolve/verify over
+> FFI). This document is kept for the original design rationale and the
+> DNS/DNSSEC background.
+
 Sonar users can claim a human-readable payment address like
 `alice@sonarprivacy.xyz` that resolves to their BOLT12 offer via DNS.
 
-This uses the existing
+This design started from the existing
 [bip353-registrar](https://github.com/hedwig-corp/bitvault-pay/tree/main/services/bip353-registrar)
 Worker from bitvault-pay, deployed for the `sonarprivacy.xyz` domain.
 

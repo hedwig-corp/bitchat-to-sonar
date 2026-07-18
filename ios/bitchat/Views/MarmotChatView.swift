@@ -1504,6 +1504,27 @@ final class MarmotChatModel: ObservableObject {
         Task { try? await service.publishProfileBackground(name: trimmed) }
     }
 
+    /// Claim a unified handle at the Sonar registrar (blocking network inside
+    /// the core; never call on the render path). Returns the claimed address.
+    func claimHandle(handle: String, offer: String?) async throws -> String {
+        try await service.claimHandle(handle: handle, offer: offer)
+    }
+
+    /// Locally stored claimed handle address (nil when never claimed).
+    func claimedHandle() async -> String? {
+        await service.claimedHandle()
+    }
+
+    /// Resolve a handle (`vincenzo` / `alice@domain`) to its owner via NIP-05.
+    func resolveHandle(_ input: String) async throws -> MarmotService.ResolvedHandle {
+        try await service.resolveHandle(input)
+    }
+
+    /// True if `address` currently NIP-05-resolves to `npub`.
+    func verifyNip05(address: String, npub: String) async throws -> Bool {
+        try await service.verifyNip05(address: address, npub: npub)
+    }
+
     /// Publish the app-level Sonar descriptor. This is separate from kind-0
     /// profile metadata so protocol capability discovery can evolve safely.
     func publishSonarDescriptor(callsEnabled: Bool = true) {

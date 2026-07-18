@@ -219,6 +219,14 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// A unified handle (`vincenzo` / `alice@example.com`) resolved to its
+    /// owner via NIP-05. `address` is the canonical lowercased `name@domain`.
+    struct ResolvedHandle: Sendable, Equatable {
+        let address: String
+        let npub: String
+        let pubkeyHex: String
+    }
+
     /// Public Sonar capability descriptor discovered from a peer's npub.
     /// Contains stable protocol metadata only, never live call addresses.
     struct SonarDescriptor: Sendable, Equatable {
@@ -507,6 +515,48 @@ final class MarmotService: @unchecked Sendable {
                 Profile(name: $0.name, displayName: $0.displayName, about: $0.about, picture: $0.picture, nip05: $0.nip05)
             }
         }
+    }
+
+    /// Pure string gate for handle claim/lookup input. Safe per keystroke —
+    /// no network, no node required. False for npub1/lno1/etc. lookalikes.
+    static func handleLooksValid(_ input: String) -> Bool {
+        SonarCore.handleLooksValid(input: input)
+    }
+
+    /// Claim `handle` at the Sonar registrar (blocking network POST inside the
+    /// core). Returns the claimed address (`name@sonarprivacy.xyz`). On success
+    /// the core persists the handle and merges it as nip05 into every kind-0
+    /// publish — republish the profile afterwards so peers see it immediately.
+    /// A taken handle surfaces as `ServiceError.core("handle taken: ...")`.
+    ///
+    /// Concurrent read lane, NOT `run`: the claim doesn't mutate MLS state
+    /// (registrar POST + sidecar write + in-memory mutex in core), and its
+    /// 15s-capped network wait must never park connect/sync/drain on the
+    /// serial `workQueue`.
+    func claimHandle(handle: String, offer: String?) async throws -> String {
+        try await readOnly { try $0.claimHandle(handle: handle, offer: offer) }
+    }
+
+    /// Locally stored claimed handle address (nil when never claimed). Local
+    /// read only — never touches the network.
+    func claimedHandle() async -> String? {
+        await readOnlyNonThrowing({ $0.claimedHandle() }, default: nil)
+    }
+
+    /// Resolve `vincenzo` (default domain) or `alice@any-domain.com` to its
+    /// owner via NIP-05. Bounded network lookup (~10s) on the concurrent read
+    /// lane, so it never queues behind serialized engine work.
+    func resolveHandle(_ input: String) async throws -> ResolvedHandle {
+        try await readOnly {
+            let info = try $0.resolveHandle(input: input)
+            return ResolvedHandle(address: info.address, npub: info.npub, pubkeyHex: info.pubkeyHex)
+        }
+    }
+
+    /// True if `address` currently NIP-05-resolves to `npub`. Bounded network
+    /// lookup on the concurrent read lane.
+    func verifyNip05(address: String, npub: String) async throws -> Bool {
+        try await readOnly { try $0.verifyNip05(address: address, npub: npub) }
     }
 
     /// Publish the public Sonar descriptor for this app build. Keep the route

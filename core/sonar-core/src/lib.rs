@@ -9,6 +9,7 @@ pub mod client;
 pub mod conversation_index;
 pub mod error;
 pub mod geohash;
+pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;

@@ -37,6 +37,7 @@ import kotlinx.coroutines.launch
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.canonicalProfileKey
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -157,6 +158,29 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                         color = s.text3,
                         style = SonarType.mono(12.0)
                     )
+                }
+                // NIP-05 handle from the peer's kind-0 profile, with a live
+                // verification check (never blocks paint; runs once per screen).
+                val nip05 = peerNpub?.let { state.profilesByNpub[it]?.nip05 }?.takeIf { it.isNotBlank() }
+                if (nip05 != null) {
+                    var nip05Verified by remember(peerNpub, nip05) { mutableStateOf<Boolean?>(null) }
+                    LaunchedEffect(peerNpub, nip05) {
+                        if (peerNpub != null && '@' in nip05) {
+                            nip05Verified = SonarCore.verifyNip05(nip05, peerNpub)
+                        }
+                    }
+                    Spacer(Modifier.height(5.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            if (nip05.endsWith("@${state.handleDomain}")) "@" + nip05.substringBefore('@') else nip05,
+                            color = s.text3,
+                            fontSize = 12.5.sp
+                        )
+                        if (nip05Verified == true) {
+                            Spacer(Modifier.width(4.dp))
+                            SNIcon(SNIconName.Check, 13.dp, s.accent, weight = 2f)
+                        }
+                    }
                 }
             }
 

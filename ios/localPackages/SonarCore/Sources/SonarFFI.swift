@@ -457,6 +457,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -466,6 +482,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     }
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
+    typealias FfiType = Int64
+    typealias SwiftType = Int64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int64, into buf: inout [UInt8]) {
         writeInt(&buf, lower(value))
     }
 }
@@ -552,6 +584,482 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
         writeBytes(&buf, value)
     }
 }
+
+
+
+
+public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
+
+    /**
+     * None = nothing connected.
+     */
+    func broadcast(text: String, nowMs: Int64)  -> MeshEngineOutput?
+
+    func connectedCount()  -> UInt32
+
+    func hasLink(fingerprint: String)  -> Bool
+
+    func isLinkedConn(conn: String)  -> Bool
+
+    func myPeerIdHex()  -> String
+
+    func onClientConnectFailed(conn: String)  -> MeshEngineOutput
+
+    func onClientConnected(conn: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func onClientDisconnected(conn: String)  -> MeshEngineOutput
+
+    func onClientRx(conn: String, instance: Int32, bytes: Data, nowMs: Int64)  -> MeshEngineOutput
+
+    func onDialDeadline(conn: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func onDialRequest(conn: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func onInstancesDiscovered(conn: String, instances: [Int32], nowMs: Int64)  -> MeshEngineOutput
+
+    func onServerConnected(conn: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func onServerDisconnected(conn: String)  -> MeshEngineOutput
+
+    func onServerRx(conn: String, bytes: Data, nowMs: Int64)  -> MeshEngineOutput
+
+    func onServerSubscribed(conn: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func onSubscribeResult(conn: String, instance: Int32, subscribed: Bool, nowMs: Int64)  -> MeshEngineOutput
+
+    func onTick(nowMs: Int64)  -> MeshEngineOutput
+
+    func reset()
+
+    /**
+     * None = no live route / oversized (never queues).
+     */
+    func sendFile(fingerprint: String, content: Data, fileName: String, mimeType: String, nowMs: Int64)  -> MeshEngineOutput?
+
+    /**
+     * None = the peer is rejected by the known-only policy. Queues when no
+     * live route exists (flushed on the next establish).
+     */
+    func sendText(fingerprint: String, messageId: String, text: String, nowMs: Int64)  -> MeshEngineOutput?
+
+    /**
+     * None = no live route right now (never queues).
+     */
+    func sendTextNow(fingerprint: String, messageId: String, text: String, nowMs: Int64)  -> MeshEngineOutput?
+
+    func setAllowlist(allowed: [String]?)  -> MeshEngineOutput
+
+    func setNickname(nickname: String, nowMs: Int64)  -> MeshEngineOutput
+
+    func setSonarPayload(payload: Data?, nowMs: Int64)  -> MeshEngineOutput
+
+    /**
+     * Sync the wall clock: wire timestamps are wall-clock ms while every
+     * deadline uses the monotonic `now_ms`. Call at start and on each tick.
+     */
+    func setWallClock(nowMs: Int64, wallMs: Int64)
+
+    func shouldDialFirst(peerNodeId: Data)  -> Bool
+
+}
+open class MeshLinkEngine: MeshLinkEngineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_meshlinkengine(self.handle, $0) }
+    }
+    /**
+     * `noise_private_hex`/`noise_public_hex` are the account's static Noise
+     * keypair; `ed25519_seed_hex` the announce-signing seed.
+     */
+public convenience init(noisePrivateHex: String, noisePublicHex: String, ed25519SeedHex: String, nickname: String)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_constructor_meshlinkengine_new(
+        FfiConverterString.lower(noisePrivateHex),
+        FfiConverterString.lower(noisePublicHex),
+        FfiConverterString.lower(ed25519SeedHex),
+        FfiConverterString.lower(nickname),$0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_meshlinkengine(handle, $0) }
+    }
+
+
+
+
+    /**
+     * None = nothing connected.
+     */
+open func broadcast(text: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_broadcast(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func connectedCount() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_connected_count(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+open func hasLink(fingerprint: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_has_link(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),$0
+    )
+})
+}
+
+open func isLinkedConn(conn: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_is_linked_conn(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),$0
+    )
+})
+}
+
+open func myPeerIdHex() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_my_peer_id_hex(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+open func onClientConnectFailed(conn: String) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_client_connect_failed(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),$0
+    )
+})
+}
+
+open func onClientConnected(conn: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_client_connected(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onClientDisconnected(conn: String) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_client_disconnected(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),$0
+    )
+})
+}
+
+open func onClientRx(conn: String, instance: Int32, bytes: Data, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_client_rx(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt32.lower(instance),
+        FfiConverterData.lower(bytes),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onDialDeadline(conn: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_dial_deadline(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onDialRequest(conn: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_dial_request(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onInstancesDiscovered(conn: String, instances: [Int32], nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_instances_discovered(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterSequenceInt32.lower(instances),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onServerConnected(conn: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_server_connected(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onServerDisconnected(conn: String) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_server_disconnected(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),$0
+    )
+})
+}
+
+open func onServerRx(conn: String, bytes: Data, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_server_rx(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterData.lower(bytes),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onServerSubscribed(conn: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_server_subscribed(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onSubscribeResult(conn: String, instance: Int32, subscribed: Bool, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_subscribe_result(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(conn),
+        FfiConverterInt32.lower(instance),
+        FfiConverterBool.lower(subscribed),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func onTick(nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_on_tick(
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func reset()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_reset(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * None = no live route / oversized (never queues).
+     */
+open func sendFile(fingerprint: String, content: Data, fileName: String, mimeType: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_file(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterData.lower(content),
+        FfiConverterString.lower(fileName),
+        FfiConverterString.lower(mimeType),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * None = the peer is rejected by the known-only policy. Queues when no
+     * live route exists (flushed on the next establish).
+     */
+open func sendText(fingerprint: String, messageId: String, text: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_text(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * None = no live route right now (never queues).
+     */
+open func sendTextNow(fingerprint: String, messageId: String, text: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_text_now(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
+        FfiConverterString.lower(text),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func setAllowlist(allowed: [String]?) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_set_allowlist(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionSequenceString.lower(allowed),$0
+    )
+})
+}
+
+open func setNickname(nickname: String, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_set_nickname(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(nickname),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+open func setSonarPayload(payload: Data?, nowMs: Int64) -> MeshEngineOutput  {
+    return try!  FfiConverterTypeMeshEngineOutput_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_set_sonar_payload(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionData.lower(payload),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
+    /**
+     * Sync the wall clock: wire timestamps are wall-clock ms while every
+     * deadline uses the monotonic `now_ms`. Call at start and on each tick.
+     */
+open func setWallClock(nowMs: Int64, wallMs: Int64)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_set_wall_clock(
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(nowMs),
+        FfiConverterInt64.lower(wallMs),$0
+    )
+}
+}
+
+open func shouldDialFirst(peerNodeId: Data) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_should_dial_first(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(peerNodeId),$0
+    )
+})
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshLinkEngine: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = MeshLinkEngine
+
+    public static func lift(_ handle: UInt64) throws -> MeshLinkEngine {
+        return MeshLinkEngine(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: MeshLinkEngine) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshLinkEngine {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: MeshLinkEngine, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshLinkEngine_lift(_ handle: UInt64) throws -> MeshLinkEngine {
+    return try FfiConverterTypeMeshLinkEngine.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshLinkEngine_lower(_ value: MeshLinkEngine) -> UInt64 {
+    return FfiConverterTypeMeshLinkEngine.lower(value)
+}
+
+
 
 
 
@@ -915,64 +1423,20 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> Data?
 
     /**
-     * The user accepted an incoming call: we are the dialer. Dials the offerer
-     * and starts media. Blocks on the QUIC connect.
+     * Claim (or refresh) a handle at the Sonar registrar. One claim registers
+     * both resolutions: NIP-05 (chat) always, BIP-353 (payments) when `offer`
+     * is present. Signed with the identity key, so restoring the nsec
+     * re-claims the same name. A taken handle surfaces as an error whose
+     * message starts with "handle taken:". Callers should republish the
+     * kind-0 profile afterwards so peers see the handle immediately.
      */
-    func callAccept(callId: String) throws
+    func claimHandle(handle: String, offer: String?) throws  -> String
 
     /**
-     * Hang up / cancel a call: tears down media + connection, emits `Ended`.
+     * The claimed human-readable handle (`name@domain`), if any. Local read,
+     * safe on any thread — never touches the network.
      */
-    func callHangup(callId: String) throws
-
-    /**
-     * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
-     */
-    func callLocalAddress() throws  -> String
-
-    /**
-     * The offerer received the peer's ANSWER (host-parsed). On accept this pins
-     * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
-     */
-    func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String) throws
-
-    /**
-     * Register an inbound OFFER the host parsed (`call_parse_control`).
-     */
-    func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool) throws
-
-    /**
-     * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
-     * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
-     */
-    func callPlace(callId: String, video: Bool) throws
-
-    /**
-     * Toggle local microphone capture for an active or still-connecting call.
-     * The RTP session keeps sending timed silence frames while muted.
-     */
-    func callSetMuted(callId: String, muted: Bool) throws
-
-    /**
-     * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
-     * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
-     * the host passes nothing and never reimplements the derivation; the NodeId
-     * is stable across launches. Idempotent-ish: a second call rebinds.
-     */
-    func callStart() throws
-
-    /**
-     * Park up to `timeout_secs` for the next call state change. The host loops
-     * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout.
-     *
-     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
-     * we STILL park for the timeout instead of returning instantly — otherwise
-     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
-     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
-     * which also blocks the timeout when there is nothing yet to wait on.
-     */
-    func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
+    func claimedHandle()  -> String?
 
     func clearConversationChangeListener()
 
@@ -1176,6 +1640,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func requestJoinViaLink(inviteToken: String) throws
 
     /**
+     * Resolve a handle to its owner. Bare nicknames (`vincenzo`) resolve on
+     * the default Sonar domain; full addresses (`alice@example.com`) resolve
+     * against any NIP-05 host. Bounded network work — call from a background
+     * context, never on the chat-open or startup path.
+     */
+    func resolveHandle(input: String) throws  -> ResolvedHandleInfo
+
+    /**
      * Retry one failed outgoing message from the durable local outbox. The
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
@@ -1270,6 +1742,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func syncStateSnapshotJson() throws  -> String
 
     func uninstallStickerPack(coordinate: String) throws
+
+    /**
+     * True if `address` (full `name@domain`) currently resolves to `npub` via
+     * NIP-05. `false` covers both "not registered" and "registered to someone
+     * else"; network failures are errors so callers can show "unverified"
+     * instead of "fake" when offline.
+     */
+    func verifyNip05(address: String, npub: String) throws  -> Bool
 
     /**
      * Block until a live Marmot event (welcome or group message) has been pushed
@@ -1434,121 +1914,31 @@ open func cachedStickerImageForRef(packCoordinate: String, shortcode: String, pl
 }
 
     /**
-     * The user accepted an incoming call: we are the dialer. Dials the offerer
-     * and starts media. Blocks on the QUIC connect.
+     * Claim (or refresh) a handle at the Sonar registrar. One claim registers
+     * both resolutions: NIP-05 (chat) always, BIP-353 (payments) when `offer`
+     * is present. Signed with the identity key, so restoring the nsec
+     * re-claims the same name. A taken handle surfaces as an error whose
+     * message starts with "handle taken:". Callers should republish the
+     * kind-0 profile afterwards so peers see the handle immediately.
      */
-open func callAccept(callId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_accept(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),$0
-    )
-}
-}
-
-    /**
-     * Hang up / cancel a call: tears down media + connection, emits `Ended`.
-     */
-open func callHangup(callId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_hangup(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),$0
-    )
-}
-}
-
-    /**
-     * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
-     */
-open func callLocalAddress()throws  -> String  {
+open func claimHandle(handle: String, offer: String?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_local_address(
-            self.uniffiCloneHandle(),$0
+    uniffi_sonar_ffi_fn_method_sonarnode_claim_handle(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(handle),
+        FfiConverterOptionString.lower(offer),$0
     )
 })
 }
 
     /**
-     * The offerer received the peer's ANSWER (host-parsed). On accept this pins
-     * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
+     * The claimed human-readable handle (`name@domain`), if any. Local read,
+     * safe on any thread — never touches the network.
      */
-open func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_on_answer(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterTypeCallAnswerKind_lower(answer),
-        FfiConverterString.lower(remoteAddrB64),$0
-    )
-}
-}
-
-    /**
-     * Register an inbound OFFER the host parsed (`call_parse_control`).
-     */
-open func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_on_incoming_offer(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterString.lower(remoteAddrB64),
-        FfiConverterBool.lower(video),$0
-    )
-}
-}
-
-    /**
-     * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
-     * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
-     */
-open func callPlace(callId: String, video: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_place(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(video),$0
-    )
-}
-}
-
-    /**
-     * Toggle local microphone capture for an active or still-connecting call.
-     * The RTP session keeps sending timed silence frames while muted.
-     */
-open func callSetMuted(callId: String, muted: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_set_muted(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(muted),$0
-    )
-}
-}
-
-    /**
-     * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
-     * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
-     * the host passes nothing and never reimplements the derivation; the NodeId
-     * is stable across launches. Idempotent-ish: a second call rebinds.
-     */
-open func callStart()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_start(
+open func claimedHandle() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_claimed_handle(
             self.uniffiCloneHandle(),$0
-    )
-}
-}
-
-    /**
-     * Park up to `timeout_secs` for the next call state change. The host loops
-     * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout.
-     *
-     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
-     * we STILL park for the timeout instead of returning instantly — otherwise
-     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
-     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
-     * which also blocks the timeout when there is nothing yet to wait on.
-     */
-open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
-    return try!  FfiConverterOptionTypeCallEventInfo.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_wait_event(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt64.lower(timeoutSecs),$0
     )
 })
 }
@@ -2026,6 +2416,21 @@ open func requestJoinViaLink(inviteToken: String)throws   {try rustCallWithError
 }
 
     /**
+     * Resolve a handle to its owner. Bare nicknames (`vincenzo`) resolve on
+     * the default Sonar domain; full addresses (`alice@example.com`) resolve
+     * against any NIP-05 host. Bounded network work — call from a background
+     * context, never on the chat-open or startup path.
+     */
+open func resolveHandle(input: String)throws  -> ResolvedHandleInfo  {
+    return try  FfiConverterTypeResolvedHandleInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_resolve_handle(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(input),$0
+    )
+})
+}
+
+    /**
      * Retry one failed outgoing message from the durable local outbox. The
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
@@ -2243,6 +2648,22 @@ open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithErro
         FfiConverterString.lower(coordinate),$0
     )
 }
+}
+
+    /**
+     * True if `address` (full `name@domain`) currently resolves to `npub` via
+     * NIP-05. `false` covers both "not registered" and "registered to someone
+     * else"; network failures are errors so callers can show "unverified"
+     * instead of "fake" when offline.
+     */
+open func verifyNip05(address: String, npub: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_verify_nip05(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(address),
+        FfiConverterString.lower(npub),$0
+    )
+})
 }
 
     /**
@@ -2539,83 +2960,6 @@ public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
 }
 
 
-
-
-/**
- * A call state change drained by `call_wait_event`.
- */
-public struct CallEventInfo: Equatable, Hashable {
-    public var callId: String
-    public var state: CallStateInfo
-    /**
-     * Connected duration in seconds — only meaningful for `Ended`.
-     */
-    public var durationSecs: UInt64
-    /**
-     * Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
-     */
-    public var reason: String
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(callId: String, state: CallStateInfo,
-        /**
-         * Connected duration in seconds — only meaningful for `Ended`.
-         */durationSecs: UInt64,
-        /**
-         * Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
-         */reason: String) {
-        self.callId = callId
-        self.state = state
-        self.durationSecs = durationSecs
-        self.reason = reason
-    }
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallEventInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallEventInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallEventInfo {
-        return
-            try CallEventInfo(
-                callId: FfiConverterString.read(from: &buf),
-                state: FfiConverterTypeCallStateInfo.read(from: &buf),
-                durationSecs: FfiConverterUInt64.read(from: &buf),
-                reason: FfiConverterString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: CallEventInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.callId, into: &buf)
-        FfiConverterTypeCallStateInfo.write(value.state, into: &buf)
-        FfiConverterUInt64.write(value.durationSecs, into: &buf)
-        FfiConverterString.write(value.reason, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallEventInfo_lift(_ buf: RustBuffer) throws -> CallEventInfo {
-    return try FfiConverterTypeCallEventInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallEventInfo_lower(_ value: CallEventInfo) -> RustBuffer {
-    return FfiConverterTypeCallEventInfo.lower(value)
-}
 
 
 /**
@@ -3330,6 +3674,60 @@ public func FfiConverterTypeMeshAnnounceInfo_lower(_ value: MeshAnnounceInfo) ->
 }
 
 
+public struct MeshEngineOutput: Equatable, Hashable {
+    public var commands: [MeshEngineCommand]
+    public var events: [MeshEngineEvent]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(commands: [MeshEngineCommand], events: [MeshEngineEvent]) {
+        self.commands = commands
+        self.events = events
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MeshEngineOutput: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshEngineOutput: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshEngineOutput {
+        return
+            try MeshEngineOutput(
+                commands: FfiConverterSequenceTypeMeshEngineCommand.read(from: &buf),
+                events: FfiConverterSequenceTypeMeshEngineEvent.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: MeshEngineOutput, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeMeshEngineCommand.write(value.commands, into: &buf)
+        FfiConverterSequenceTypeMeshEngineEvent.write(value.events, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineOutput_lift(_ buf: RustBuffer) throws -> MeshEngineOutput {
+    return try FfiConverterTypeMeshEngineOutput.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineOutput_lower(_ value: MeshEngineOutput) -> RustBuffer {
+    return FfiConverterTypeMeshEngineOutput.lower(value)
+}
+
+
 /**
  * A decoded mesh file transfer (`BitchatFilePacket`, type 0x22). `content` is
  * the raw file bytes (already decrypted for a private transfer).
@@ -3911,6 +4309,68 @@ public func FfiConverterTypeRecentMessagePageInfo_lower(_ value: RecentMessagePa
 
 
 /**
+ * A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
+ * NIP-05. `address` is the canonical lowercased `name@domain` that resolved.
+ */
+public struct ResolvedHandleInfo: Equatable, Hashable {
+    public var address: String
+    public var npub: String
+    public var pubkeyHex: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(address: String, npub: String, pubkeyHex: String) {
+        self.address = address
+        self.npub = npub
+        self.pubkeyHex = pubkeyHex
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ResolvedHandleInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeResolvedHandleInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ResolvedHandleInfo {
+        return
+            try ResolvedHandleInfo(
+                address: FfiConverterString.read(from: &buf),
+                npub: FfiConverterString.read(from: &buf),
+                pubkeyHex: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ResolvedHandleInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.address, into: &buf)
+        FfiConverterString.write(value.npub, into: &buf)
+        FfiConverterString.write(value.pubkeyHex, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResolvedHandleInfo_lift(_ buf: RustBuffer) throws -> ResolvedHandleInfo {
+    return try FfiConverterTypeResolvedHandleInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeResolvedHandleInfo_lower(_ value: ResolvedHandleInfo) -> RustBuffer {
+    return FfiConverterTypeResolvedHandleInfo.lower(value)
+}
+
+
+/**
  * FFI-friendly Sonar app descriptor published as a NIP-78-style kind-30078
  * event. This is public capability metadata only; live call addresses are
  * exchanged inside encrypted ☎CALL signaling.
@@ -4357,97 +4817,47 @@ public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> Rus
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * The answerer's verdict on an incoming offer (mirrors `signaling::AnswerKind`).
- */
 
-public enum CallAnswerKind: Equatable, Hashable {
+public enum MeshEngineCommand: Equatable, Hashable {
 
-    case accept
-    case decline
-    case busy
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallAnswerKind: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallAnswerKind: FfiConverterRustBuffer {
-    typealias SwiftType = CallAnswerKind
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallAnswerKind {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        case 1: return .accept
-
-        case 2: return .decline
-
-        case 3: return .busy
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: CallAnswerKind, into buf: inout [UInt8]) {
-        switch value {
-
-
-        case .accept:
-            writeInt(&buf, Int32(1))
-
-
-        case .decline:
-            writeInt(&buf, Int32(2))
-
-
-        case .busy:
-            writeInt(&buf, Int32(3))
-
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallAnswerKind_lift(_ buf: RustBuffer) throws -> CallAnswerKind {
-    return try FfiConverterTypeCallAnswerKind.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallAnswerKind_lower(_ value: CallAnswerKind) -> RustBuffer {
-    return FfiConverterTypeCallAnswerKind.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * A parsed inbound `☎CALL` control line (the host scan loop feeds raw message
- * content to `call_parse_control` and routes the result to the call engine).
- */
-
-public enum CallControlInfo: Equatable, Hashable {
-
-    case offer(callId: String, video: Bool, nodeAddrB64: String, unixSecs: UInt64
+    /**
+     * Open a GATT connection to `conn` (an opaque connection handle: Android
+     * passes the address of the scanned device, iOS a peripheral UUID).
+     */
+    case dial(conn: String
     )
-    case answer(callId: String, answer: CallAnswerKind, nodeAddrB64: String
+    /**
+     * Tear down the CLIENT connection (close the outbound GATT). Must not
+     * touch a server-role leg the same peer holds toward us.
+     */
+    case disconnect(conn: String
     )
-    case cancel(callId: String
+    /**
+     * Cancel the SERVER-role connection from an inbound central. Must not
+     * touch a client GATT we hold toward the same address.
+     */
+    case cancelServer(conn: String
     )
-    case end(callId: String, reason: String
+    /**
+     * Re-run service discovery on an existing client connection (a lost
+     * instance link has no other recovery while the connection lives).
+     */
+    case refreshInstances(conn: String
+    )
+    /**
+     * Enable notifications on the mesh characteristic of service `instance`.
+     */
+    case subscribe(conn: String, instance: Int32
+    )
+    /**
+     * Write one packet value to a client link, `after_ms` from now.
+     */
+    case writeLink(conn: String, instance: Int32, bytes: Data, afterMs: Int64
+    )
+    /**
+     * Notify one packet value to a subscribed central, `after_ms` from now.
+     */
+    case notifyConn(conn: String, bytes: Data, afterMs: Int64
     )
 
 
@@ -4457,175 +4867,87 @@ public enum CallControlInfo: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension CallControlInfo: Sendable {}
+extension MeshEngineCommand: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeCallControlInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallControlInfo
+public struct FfiConverterTypeMeshEngineCommand: FfiConverterRustBuffer {
+    typealias SwiftType = MeshEngineCommand
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallControlInfo {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshEngineCommand {
         let variant: Int32 = try readInt(&buf)
         switch variant {
 
-        case 1: return .offer(callId: try FfiConverterString.read(from: &buf), video: try FfiConverterBool.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf), unixSecs: try FfiConverterUInt64.read(from: &buf)
+        case 1: return .dial(conn: try FfiConverterString.read(from: &buf)
         )
 
-        case 2: return .answer(callId: try FfiConverterString.read(from: &buf), answer: try FfiConverterTypeCallAnswerKind.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf)
+        case 2: return .disconnect(conn: try FfiConverterString.read(from: &buf)
         )
 
-        case 3: return .cancel(callId: try FfiConverterString.read(from: &buf)
+        case 3: return .cancelServer(conn: try FfiConverterString.read(from: &buf)
         )
 
-        case 4: return .end(callId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
+        case 4: return .refreshInstances(conn: try FfiConverterString.read(from: &buf)
+        )
+
+        case 5: return .subscribe(conn: try FfiConverterString.read(from: &buf), instance: try FfiConverterInt32.read(from: &buf)
+        )
+
+        case 6: return .writeLink(conn: try FfiConverterString.read(from: &buf), instance: try FfiConverterInt32.read(from: &buf), bytes: try FfiConverterData.read(from: &buf), afterMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 7: return .notifyConn(conn: try FfiConverterString.read(from: &buf), bytes: try FfiConverterData.read(from: &buf), afterMs: try FfiConverterInt64.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
-    public static func write(_ value: CallControlInfo, into buf: inout [UInt8]) {
+    public static func write(_ value: MeshEngineCommand, into buf: inout [UInt8]) {
         switch value {
 
 
-        case let .offer(callId,video,nodeAddrB64,unixSecs):
+        case let .dial(conn):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterBool.write(video, into: &buf)
-            FfiConverterString.write(nodeAddrB64, into: &buf)
-            FfiConverterUInt64.write(unixSecs, into: &buf)
+            FfiConverterString.write(conn, into: &buf)
 
 
-        case let .answer(callId,answer,nodeAddrB64):
+        case let .disconnect(conn):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterTypeCallAnswerKind.write(answer, into: &buf)
-            FfiConverterString.write(nodeAddrB64, into: &buf)
+            FfiConverterString.write(conn, into: &buf)
 
 
-        case let .cancel(callId):
+        case let .cancelServer(conn):
             writeInt(&buf, Int32(3))
-            FfiConverterString.write(callId, into: &buf)
+            FfiConverterString.write(conn, into: &buf)
 
 
-        case let .end(callId,reason):
+        case let .refreshInstances(conn):
             writeInt(&buf, Int32(4))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterString.write(reason, into: &buf)
-
-        }
-    }
-}
+            FfiConverterString.write(conn, into: &buf)
 
 
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallControlInfo_lift(_ buf: RustBuffer) throws -> CallControlInfo {
-    return try FfiConverterTypeCallControlInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallControlInfo_lower(_ value: CallControlInfo) -> RustBuffer {
-    return FfiConverterTypeCallControlInfo.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * Public call state for the host UI (mirrors `sonar_core::call::engine::CallStateKind`).
- */
-
-public enum CallStateInfo: Equatable, Hashable {
-
-    case ringing
-    case connecting
-    case connected
-    case ended
-    case failed
-    case declined
-    case busy
-    case missed
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallStateInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallStateInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallStateInfo
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallStateInfo {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        case 1: return .ringing
-
-        case 2: return .connecting
-
-        case 3: return .connected
-
-        case 4: return .ended
-
-        case 5: return .failed
-
-        case 6: return .declined
-
-        case 7: return .busy
-
-        case 8: return .missed
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: CallStateInfo, into buf: inout [UInt8]) {
-        switch value {
-
-
-        case .ringing:
-            writeInt(&buf, Int32(1))
-
-
-        case .connecting:
-            writeInt(&buf, Int32(2))
-
-
-        case .connected:
-            writeInt(&buf, Int32(3))
-
-
-        case .ended:
-            writeInt(&buf, Int32(4))
-
-
-        case .failed:
+        case let .subscribe(conn,instance):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterInt32.write(instance, into: &buf)
 
 
-        case .declined:
+        case let .writeLink(conn,instance,bytes,afterMs):
             writeInt(&buf, Int32(6))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterInt32.write(instance, into: &buf)
+            FfiConverterData.write(bytes, into: &buf)
+            FfiConverterInt64.write(afterMs, into: &buf)
 
 
-        case .busy:
+        case let .notifyConn(conn,bytes,afterMs):
             writeInt(&buf, Int32(7))
-
-
-        case .missed:
-            writeInt(&buf, Int32(8))
+            FfiConverterString.write(conn, into: &buf)
+            FfiConverterData.write(bytes, into: &buf)
+            FfiConverterInt64.write(afterMs, into: &buf)
 
         }
     }
@@ -4635,15 +4957,142 @@ public struct FfiConverterTypeCallStateInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeCallStateInfo_lift(_ buf: RustBuffer) throws -> CallStateInfo {
-    return try FfiConverterTypeCallStateInfo.lift(buf)
+public func FfiConverterTypeMeshEngineCommand_lift(_ buf: RustBuffer) throws -> MeshEngineCommand {
+    return try FfiConverterTypeMeshEngineCommand.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustBuffer {
-    return FfiConverterTypeCallStateInfo.lower(value)
+public func FfiConverterTypeMeshEngineCommand_lower(_ value: MeshEngineCommand) -> RustBuffer {
+    return FfiConverterTypeMeshEngineCommand.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
+public enum MeshEngineEvent: Equatable, Hashable {
+
+    case peerAnnounced(fingerprint: String, nickname: String, peerIdHex: String, direct: Bool
+    )
+    case sonarPayload(fingerprint: String, payload: Data
+    )
+    case textReceived(fingerprint: String, messageId: String, content: String
+    )
+    case fileReceived(fingerprint: String, transferKey: String, fileName: String?, mimeType: String?, content: Data, timestampMs: Int64
+    )
+    case broadcastReceived(fingerprint: String, senderIdHex: String, content: String, timestampMs: Int64
+    )
+    case linkEstablished(fingerprint: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension MeshEngineEvent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = MeshEngineEvent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MeshEngineEvent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .peerAnnounced(fingerprint: try FfiConverterString.read(from: &buf), nickname: try FfiConverterString.read(from: &buf), peerIdHex: try FfiConverterString.read(from: &buf), direct: try FfiConverterBool.read(from: &buf)
+        )
+
+        case 2: return .sonarPayload(fingerprint: try FfiConverterString.read(from: &buf), payload: try FfiConverterData.read(from: &buf)
+        )
+
+        case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf)
+        )
+
+        case 4: return .fileReceived(fingerprint: try FfiConverterString.read(from: &buf), transferKey: try FfiConverterString.read(from: &buf), fileName: try FfiConverterOptionString.read(from: &buf), mimeType: try FfiConverterOptionString.read(from: &buf), content: try FfiConverterData.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 5: return .broadcastReceived(fingerprint: try FfiConverterString.read(from: &buf), senderIdHex: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 6: return .linkEstablished(fingerprint: try FfiConverterString.read(from: &buf)
+        )
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: MeshEngineEvent, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case let .peerAnnounced(fingerprint,nickname,peerIdHex,direct):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(nickname, into: &buf)
+            FfiConverterString.write(peerIdHex, into: &buf)
+            FfiConverterBool.write(direct, into: &buf)
+
+
+        case let .sonarPayload(fingerprint,payload):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterData.write(payload, into: &buf)
+
+
+        case let .textReceived(fingerprint,messageId,content):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(messageId, into: &buf)
+            FfiConverterString.write(content, into: &buf)
+
+
+        case let .fileReceived(fingerprint,transferKey,fileName,mimeType,content,timestampMs):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(transferKey, into: &buf)
+            FfiConverterOptionString.write(fileName, into: &buf)
+            FfiConverterOptionString.write(mimeType, into: &buf)
+            FfiConverterData.write(content, into: &buf)
+            FfiConverterInt64.write(timestampMs, into: &buf)
+
+
+        case let .broadcastReceived(fingerprint,senderIdHex,content,timestampMs):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(senderIdHex, into: &buf)
+            FfiConverterString.write(content, into: &buf)
+            FfiConverterInt64.write(timestampMs, into: &buf)
+
+
+        case let .linkEstablished(fingerprint):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(fingerprint, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineEvent_lift(_ buf: RustBuffer) throws -> MeshEngineEvent {
+    return try FfiConverterTypeMeshEngineEvent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeMeshEngineEvent_lower(_ value: MeshEngineEvent) -> RustBuffer {
+    return FfiConverterTypeMeshEngineEvent.lower(value)
 }
 
 
@@ -5344,30 +5793,6 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeCallEventInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallEventInfo?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeCallEventInfo.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeCallEventInfo.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffer {
     typealias SwiftType = MeshAnnounceInfo?
 
@@ -5384,6 +5809,30 @@ fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeMeshAnnounceInfo.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeMeshEngineOutput: FfiConverterRustBuffer {
+    typealias SwiftType = MeshEngineOutput?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeMeshEngineOutput.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeMeshEngineOutput.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -5584,30 +6033,6 @@ fileprivate struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallControlInfo?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeCallControlInfo.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeCallControlInfo.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeSonarNotificationKindInfo: FfiConverterRustBuffer {
     typealias SwiftType = SonarNotificationKindInfo?
 
@@ -5626,6 +6051,55 @@ fileprivate struct FfiConverterOptionTypeSonarNotificationKindInfo: FfiConverter
         case 1: return try FfiConverterTypeSonarNotificationKindInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionSequenceString: FfiConverterRustBuffer {
+    typealias SwiftType = [String]?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterSequenceString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterSequenceString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [Int32]
+
+    public static func write(_ value: [Int32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Int32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Int32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterInt32.read(from: &buf))
+        }
+        return seq
     }
 }
 
@@ -5978,60 +6452,78 @@ fileprivate struct FfiConverterSequenceTypeStickerInfo: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMeshEngineCommand: FfiConverterRustBuffer {
+    typealias SwiftType = [MeshEngineCommand]
+
+    public static func write(_ value: [MeshEngineCommand], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMeshEngineCommand.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MeshEngineCommand] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MeshEngineCommand]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMeshEngineCommand.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeMeshEngineEvent: FfiConverterRustBuffer {
+    typealias SwiftType = [MeshEngineEvent]
+
+    public static func write(_ value: [MeshEngineEvent], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeMeshEngineEvent.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [MeshEngineEvent] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [MeshEngineEvent]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeMeshEngineEvent.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
- * Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
+ * The default handle domain (bare nicknames resolve here, and only handles
+ * on this domain are claimable). Core owns this constant — hosts must not
+ * re-declare the literal, because external-vs-claim routing depends on it.
  */
-public func callEncodeAnswer(callId: String, answer: CallAnswerKind, nodeAddrB64: String) -> String  {
+public func defaultHandleDomain() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_answer(
-        FfiConverterString.lower(callId),
-        FfiConverterTypeCallAnswerKind_lower(answer),
-        FfiConverterString.lower(nodeAddrB64),$0
+    uniffi_sonar_ffi_fn_func_default_handle_domain($0
     )
 })
 }
 /**
- * Encode a CANCEL control line (offerer retracted before answer).
+ * True if `input` is plausibly a human-readable handle (`vincenzo` or
+ * `alice@example.com`). Pure string check — no network, safe to call per
+ * keystroke from search UIs to decide whether to offer a resolve action.
+ * Bech32 keys/events and Lightning strings return `false` so the npub and
+ * invite search paths keep priority.
  */
-public func callEncodeCancel(callId: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_cancel(
-        FfiConverterString.lower(callId),$0
-    )
-})
-}
-/**
- * Encode an END control line (either side hung up a connected call).
- */
-public func callEncodeEnd(callId: String, reason: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_end(
-        FfiConverterString.lower(callId),
-        FfiConverterString.lower(reason),$0
-    )
-})
-}
-/**
- * Encode an OFFER control line to send as encrypted message content.
- */
-public func callEncodeOffer(callId: String, video: Bool, nodeAddrB64: String, unixSecs: UInt64) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_offer(
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(video),
-        FfiConverterString.lower(nodeAddrB64),
-        FfiConverterUInt64.lower(unixSecs),$0
-    )
-})
-}
-/**
- * Parse message content as a `☎CALL` control line. `None` for plain chat,
- * `⚡PAY` lines, unknown versions, and malformed lines (so they are ignored).
- */
-public func callParseControl(content: String) -> CallControlInfo?  {
-    return try!  FfiConverterOptionTypeCallControlInfo.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_parse_control(
-        FfiConverterString.lower(content),$0
+public func handleLooksValid(input: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_handle_looks_valid(
+        FfiConverterString.lower(input),$0
     )
 })
 }
@@ -6363,19 +6855,10 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_answer() != 19224) {
+    if (uniffi_sonar_ffi_checksum_func_default_handle_domain() != 45849) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_cancel() != 22458) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_end() != 36912) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_offer() != 65011) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_func_call_parse_control() != 41480) {
+    if (uniffi_sonar_ffi_checksum_func_handle_looks_valid() != 39625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_max_media_plaintext_bytes() != 26928) {
@@ -6453,6 +6936,87 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_broadcast() != 44669) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_connected_count() != 39316) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_has_link() != 62785) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_is_linked_conn() != 57541) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_my_peer_id_hex() != 38058) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_client_connect_failed() != 36372) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_client_connected() != 21440) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_client_disconnected() != 58469) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_client_rx() != 26312) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_dial_deadline() != 61780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_dial_request() != 30957) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_instances_discovered() != 44263) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_server_connected() != 8981) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_server_disconnected() != 30001) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_server_rx() != 17564) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_server_subscribed() != 2074) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_subscribe_result() != 2280) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_on_tick() != 60013) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_reset() != 11836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_file() != 38273) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text() != 54890) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text_now() != 30800) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_allowlist() != 36838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_nickname() != 44969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_sonar_payload() != 44182) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_set_wall_clock() != 3693) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_should_dial_first() != 41857) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_meshreassembler_add() != 11739) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6483,31 +7047,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image_for_ref() != 15827) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_accept() != 7250) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_claim_handle() != 7894) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_hangup() != 32240) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_local_address() != 54349) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_on_answer() != 26235) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_on_incoming_offer() != 54164) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_place() != 62446) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_set_muted() != 49605) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_start() != 21488) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_claimed_handle() != 10681) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_conversation_change_listener() != 59668) {
@@ -6627,6 +7170,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_request_join_via_link() != 14691) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_resolve_handle() != 13801) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6678,6 +7224,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_verify_nip05() != 52785) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_wait_for_marmot_event() != 64873) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -6700,6 +7249,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnoise_write_message() != 7081) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_meshlinkengine_new() != 12347) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_meshreassembler_new() != 63788) {
