@@ -442,6 +442,8 @@ final class MarmotChatModel: ObservableObject {
     /// Group id → canonical npub → zone that member shared into that group.
     /// Sharing is per chat, so every lookup names the group.
     @Published private(set) var peerTimezonesByGroup: [String: [String: MarmotService.PeerTimezone]] = [:]
+    /// Solo Note to Self group id once ensured (nil until first local ensure).
+    @Published private(set) var noteToSelfGroupId: String?
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
     private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
@@ -2798,6 +2800,13 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalSummaries(resolveMembers: Bool = true) async -> Bool {
         do {
+            // Offline-safe solo MLS group — paint Note to Self without waiting
+            // on relays or KeyPackages (Signal-style always-present row).
+            if let id = try? await service.ensureNoteToSelf() {
+                noteToSelfGroupId = id
+            } else if let id = try? await service.findNoteToSelf() {
+                noteToSelfGroupId = id
+            }
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let pages = try await service.recentMessagePages(
@@ -5375,6 +5384,11 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Short label for a 1:1 group: the other member's npub prefix.
+    func isNoteToSelf(_ group: MarmotService.MarmotGroup) -> Bool {
+        if let noteToSelfGroupId, group.id == noteToSelfGroupId { return true }
+        return group.name == "Note to Self" && otherMembers(in: group).isEmpty
+    }
+
     func title(for group: MarmotService.MarmotGroup) -> String {
         let others = otherMembers(in: group)
         guard others.count == 1, let other = others.first else {
