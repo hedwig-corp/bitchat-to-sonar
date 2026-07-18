@@ -18,8 +18,11 @@ re-encodes of soft masters.
 Android packages MP3 copies of the same assets under
 `apps/sonar/composeApp/src/androidMain/res/raw/` — regenerate them after editing
 the WAVs, then bump the Android notification channel IDs in
-`Notifier.android.kt` so existing installs recreate channels against the new
-files:
+`Notifier.android.kt` **and** the Firebase
+`com.google.firebase.messaging.default_notification_channel_id` meta-data in
+`AndroidManifest.xml` so existing installs recreate channels against the new
+files and FCM notification-payload fallbacks keep using the louder message
+channel:
 
 ```sh
 ffmpeg -y -i assets/notifications/raw/sonar_notification.wav \

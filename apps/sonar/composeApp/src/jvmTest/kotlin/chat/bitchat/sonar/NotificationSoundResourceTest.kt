@@ -39,7 +39,7 @@ class NotificationSoundResourceTest {
                 assertTrue(durationSecs < 30f)
 
                 val pcm = audio.readAllBytes()
-                require(pcm.size % 2 == 0)
+                assertTrue(pcm.size % 2 == 0, "$resourceName PCM length must be even")
                 val samples = ShortArray(pcm.size / 2)
                 ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(samples)
 
