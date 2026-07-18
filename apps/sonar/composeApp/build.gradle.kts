@@ -33,6 +33,17 @@ val breezApiKey: String = run {
     (fromFile ?: System.getenv("BREEZ_API_KEY") ?: "").trim()
 }
 
+// Escape for BuildConfig string literals (`"` / `\`). Never log the key itself.
+fun escapeBuildConfigString(value: String): String =
+    value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+if (breezApiKey.isEmpty()) {
+    logger.warn(
+        "BREEZ_API_KEY is empty — Lightning wallet will show as Unavailable. " +
+            "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY.",
+    )
+}
+
 // Desktop has no Android-style BuildConfig, so the key is written to a generated
 // resource (`/breez_api_key.txt`) the jvm WalletBridge reads at runtime. The dir
 // is gitignored; the value never lands in source.
@@ -298,7 +309,11 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 11
         versionName = "0.1-alpha.11"
-        buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
+        buildConfigField(
+            "String",
+            "BREEZ_API_KEY",
+            "\"${escapeBuildConfigString(breezApiKey)}\"",
+        )
         val lp = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
@@ -422,4 +437,17 @@ dependencies {
     // devices don't apply APK profiles at install time without it).
     implementation(libs.androidx.profileinstaller)
     baselineProfile(project(":baselineprofile"))
+}
+
+// Alpha / Zapstore phone APKs must ship with a Breez key or every restore shows
+// a dead Lightning wallet. Debug may omit the key for CI unit/UI tests.
+tasks.matching {
+    it.name.startsWith("assemble") && it.name.contains("Release", ignoreCase = true)
+}.configureEach {
+    doFirst {
+        check(breezApiKey.isNotEmpty()) {
+            "BREEZ_API_KEY is empty — refusing release assemble. " +
+                "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY."
+        }
+    }
 }
