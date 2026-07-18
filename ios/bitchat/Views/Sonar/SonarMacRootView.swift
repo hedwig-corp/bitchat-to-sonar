@@ -2456,7 +2456,7 @@ private struct MacProfilePane: View {
         switch store.walletState {
         case .notConfigured:
             return SonarBreezBuildConfig.hasAPIKey
-                ? "Wallet not ready — tap to retry setup"
+                ? "Wallet not ready yet — setup retries in the background"
                 : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
         case .settingUp:
             return "Syncing wallet…"
@@ -2838,7 +2838,7 @@ private struct MacSettingsModal: View {
         switch store.walletState {
         case .notConfigured:
             return SonarBreezBuildConfig.hasAPIKey
-                ? "Wallet not ready — tap to retry setup"
+                ? "Wallet not ready yet — setup retries in the background"
                 : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
         case .settingUp:
             return "Syncing wallet…"
