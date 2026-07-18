@@ -38,6 +38,12 @@ enum SonarPushProcessor {
         category: "SonarPushProcessor"
     )
 
+    /// Single-flight Marmot wake. Concurrent Transponder pushes coalesce onto
+    /// one refresh so two tasks cannot share a stale unread baseline and
+    /// double-notify, and so ownership is not cleared while another wake runs.
+    @MainActor
+    private static var marmotWakeInFlight: Task<UIBackgroundFetchResult, Never>?
+
     /// Classify and process a remote notification payload.
     /// Returns true if the push was handled, false otherwise.
     @MainActor
@@ -77,60 +83,90 @@ enum SonarPushProcessor {
             return
         }
 
-        Task {
-            // Own push-wake banners so SonarAppStore's live message sink does
-            // not also fire for the same drained rows (duplicate lock-screen
-            // banners with different identifiers).
-            marmot.beginPushWakeNotificationOwnership()
-            defer { marmot.endPushWakeNotificationOwnership() }
-
-            let beforeUnread = unreadFingerprint(marmot: marmot)
-            var drained: [DrainNotificationInfo] = []
-            var synced = false
-            do {
-                drained = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
-                    await marmot.refresh()
-                }
-                synced = true
-            } catch {
-                log.warning("Marmot sync from push failed or timed out: \(error)")
-                // Partial drain often already wrote the pushed row; load local
-                // summaries so a delta check can still render titled copy.
-                await marmot.loadLocalSummaries()
+        if let existing = marmotWakeInFlight {
+            log.info("Marmot push wake already in flight — coalescing")
+            Task {
+                let result = await existing.value
+                completionHandler(result)
             }
+            return
+        }
 
-            guard prefs.enabled else {
-                log.info("Marmot wakeup done (synced=\(synced)), notifications disabled")
-                completionHandler(synced ? .newData : .failed)
-                return
-            }
+        let task = Task { @MainActor () -> UIBackgroundFetchResult in
+            defer { marmotWakeInFlight = nil }
+            return await runMarmotWakeup(marmot: marmot, prefs: prefs)
+        }
+        marmotWakeInFlight = task
+        Task { @MainActor in
+            let result = await task.value
+            completionHandler(result)
+        }
+    }
 
-            let notified: Int
-            if !drained.isEmpty {
-                notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
-            } else {
-                // Never fan out to every stale unread chat — only conversations
-                // whose unread fingerprint advanced during this wake.
-                notified = await notifyNewlyUnread(
-                    before: beforeUnread,
-                    marmot: marmot,
-                    prefs: prefs
-                )
-            }
+    @MainActor
+    private static func runMarmotWakeup(
+        marmot: MarmotChatModel,
+        prefs: SonarLocalNotificationPrefs
+    ) async -> UIBackgroundFetchResult {
+        // Own push-wake banners so SonarAppStore's live message sink does
+        // not also fire for the same drained rows (duplicate lock-screen
+        // banners with different identifiers).
+        marmot.beginPushWakeNotificationOwnership()
+        defer { marmot.endPushWakeNotificationOwnership() }
 
-            switch (notified > 0, synced) {
-            case (true, _):
-                log.info("Marmot wakeup: notified for \(notified) conversation(s) (synced=\(synced))")
-                removeDeliveredNSEPlaceholderBanners()
-                completionHandler(.newData)
-            case (false, true):
-                log.info("Marmot sync completed from push, no new unread messages")
-                completionHandler(.newData)
-            case (false, false):
-                log.warning("Marmot sync timed out with nothing new unread, showing fallback")
-                showFallbackNotification(prefs: prefs)
-                completionHandler(.failed)
+        // Hydrate the unread baseline from local storage BEFORE refresh.
+        // Cold/background launches often have an empty in-memory summary
+        // cache; capturing that empty map would treat every existing unread
+        // chat as "new" after refresh and re-alert stale threads.
+        await marmot.loadLocalSummaries()
+        let beforeUnread = unreadFingerprint(marmot: marmot)
+        let baselineHydrated = true
+
+        var drained: [DrainNotificationInfo] = []
+        var synced = false
+        do {
+            drained = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
+                await marmot.refresh()
             }
+            synced = true
+        } catch {
+            log.warning("Marmot sync from push failed or timed out: \(error)")
+            // Partial drain often already wrote the pushed row; reload local
+            // summaries so a delta check can still render titled copy.
+            await marmot.loadLocalSummaries()
+        }
+
+        guard prefs.enabled else {
+            log.info("Marmot wakeup done (synced=\(synced)), notifications disabled")
+            return synced ? .newData : .failed
+        }
+
+        let notified: Int
+        if !drained.isEmpty {
+            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
+        } else {
+            // Never fan out to every stale unread chat — only conversations
+            // whose unread fingerprint advanced during this wake.
+            notified = await notifyNewlyUnread(
+                before: beforeUnread,
+                baselineHydrated: baselineHydrated,
+                marmot: marmot,
+                prefs: prefs
+            )
+        }
+
+        switch (notified > 0, synced) {
+        case (true, _):
+            log.info("Marmot wakeup: notified for \(notified) conversation(s) (synced=\(synced))")
+            removeDeliveredNSEPlaceholderBanners()
+            return .newData
+        case (false, true):
+            log.info("Marmot sync completed from push, no new unread messages")
+            return .newData
+        case (false, false):
+            log.warning("Marmot sync timed out with nothing new unread, showing fallback")
+            showFallbackNotification(prefs: prefs)
+            return .failed
         }
     }
 
@@ -139,10 +175,10 @@ enum SonarPushProcessor {
     @MainActor
     private static func unreadFingerprint(
         marmot: MarmotChatModel
-    ) -> [String: (unread: UInt64, latestAt: Date, content: String)] {
-        var out: [String: (unread: UInt64, latestAt: Date, content: String)] = [:]
+    ) -> [String: SonarPushUnreadDelta.Fingerprint] {
+        var out: [String: SonarPushUnreadDelta.Fingerprint] = [:]
         for summary in marmot.conversationSummariesByGroup.values where summary.unreadCount > 0 {
-            out[summary.groupIdHex] = (
+            out[summary.groupIdHex] = SonarPushUnreadDelta.Fingerprint(
                 unread: summary.unreadCount,
                 latestAt: summary.latestAt,
                 content: summary.latestContent
@@ -206,16 +242,22 @@ enum SonarPushProcessor {
     /// Notify only unread conversations that advanced during this wake.
     @MainActor
     private static func notifyNewlyUnread(
-        before: [String: (unread: UInt64, latestAt: Date, content: String)],
+        before: [String: SonarPushUnreadDelta.Fingerprint],
+        baselineHydrated: Bool,
         marmot: MarmotChatModel,
         prefs: SonarLocalNotificationPrefs
     ) async -> Int {
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
-            guard summary.unreadCount > 0 else { return false }
-            guard let prior = before[summary.groupIdHex] else { return true }
-            return summary.unreadCount > prior.unread
-                || summary.latestAt > prior.latestAt
-                || summary.latestContent != prior.content
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: summary.groupIdHex,
+                after: SonarPushUnreadDelta.Fingerprint(
+                    unread: summary.unreadCount,
+                    latestAt: summary.latestAt,
+                    content: summary.latestContent
+                ),
+                before: before,
+                baselineHydrated: baselineHydrated
+            )
         }
         if after.isEmpty { return 0 }
 

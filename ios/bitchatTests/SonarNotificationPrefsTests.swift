@@ -125,6 +125,61 @@ struct SonarNotificationPrefsTests {
         #expect(routed == nil)
     }
 
+    @Test("unread delta ignores unknown keys until baseline is hydrated")
+    func unreadDeltaRequiresHydratedBaseline() {
+        let after = SonarPushUnreadDelta.Fingerprint(
+            unread: 1,
+            latestAt: Date(timeIntervalSince1970: 100),
+            content: "hello"
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "g1",
+                after: after,
+                before: [:],
+                baselineHydrated: false
+            ) == false
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "g1",
+                after: after,
+                before: [:],
+                baselineHydrated: true
+            ) == true
+        )
+    }
+
+    @Test("unread delta does not re-alert unchanged stale unread")
+    func unreadDeltaSkipsUnchangedStale() {
+        let stamp = Date(timeIntervalSince1970: 100)
+        let prior = SonarPushUnreadDelta.Fingerprint(
+            unread: 2,
+            latestAt: stamp,
+            content: "old"
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "g1",
+                after: prior,
+                before: ["g1": prior],
+                baselineHydrated: true
+            ) == false
+        )
+        #expect(
+            SonarPushUnreadDelta.isNewlyAdvanced(
+                groupId: "g1",
+                after: SonarPushUnreadDelta.Fingerprint(
+                    unread: 3,
+                    latestAt: stamp,
+                    content: "old"
+                ),
+                before: ["g1": prior],
+                baselineHydrated: true
+            ) == true
+        )
+    }
+
     #if os(iOS)
     @Test("NSE placeholder detection ignores router privacy-fallback copy")
     func nsePlaceholderMatchesIdentityNotCopy() {

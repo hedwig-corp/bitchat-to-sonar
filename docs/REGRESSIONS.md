@@ -332,9 +332,9 @@ invalidation for verified peer/profile changes.
 
 **Guarded by:** `SonarNotificationPrefsTests.privateMessageRespectsPreviewOptIn`
 
-**Also guarded by:** `SonarNotificationPrefsTests.privateMessageRespectsDefaultPrivacy`, `SonarNotificationPrefsTests.privateMessageRespectsNamesOff`, `SonarNotificationPrefsTests.disabledSuppresses`, `SonarNotificationPrefsTests.nsePlaceholderMatchesIdentityNotCopy`, `SonarNotificationRouterTest.previewsRequireOptIn` (Compose)
+**Also guarded by:** `SonarNotificationPrefsTests.privateMessageRespectsDefaultPrivacy`, `SonarNotificationPrefsTests.privateMessageRespectsNamesOff`, `SonarNotificationPrefsTests.disabledSuppresses`, `SonarNotificationPrefsTests.nsePlaceholderMatchesIdentityNotCopy`, `SonarNotificationPrefsTests.unreadDeltaRequiresHydratedBaseline`, `SonarNotificationPrefsTests.unreadDeltaSkipsUnchangedStale`, `SonarNotificationRouterTest.previewsRequireOptIn` (Compose)
 
-**Not guarded:** killed-app NSE rich rendering — the extension still has no App Group Marmot DB (#146 / #152), so force-quit banners stay generic until catch-up lands; `SonarPushProcessor` replaces them when the app is woken. Push-wake drain/unread-delta selection and `pushWakeOwnsNotifications` dual-path suppression need a constructible store. iOS tests do not run in CI.
+**Not guarded:** killed-app NSE rich rendering — the extension still has no App Group Marmot DB (#146 / #152), so force-quit banners stay generic until catch-up lands; `SonarPushProcessor` replaces them when the app is woken. Push-wake ownership/`markMarmotNotificationMessagesSeen` dual-path suppression needs a constructible store. iOS tests do not run in CI.
 
 **History:** #58 / #144 introduced the core renderer and privacy toggles → mesh helpers were left on hard-coded private copy → #152 filed the symptom → this fix wires mesh + push-wake through the router/prefs (Android #297 already rendered from unread summaries).
 

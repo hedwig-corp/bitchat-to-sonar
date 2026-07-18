@@ -284,7 +284,9 @@ final class MarmotChatModel: ObservableObject {
     @Published var unreadByGroup: [String: UInt64] = [:]
     /// While true, SonarAppStore must not emit process-alive Marmot banners —
     /// `SonarPushProcessor` owns lock-screen copy for the current push wake.
+    /// Backed by a refcount so overlapping wakes cannot clear ownership early.
     private(set) var pushWakeOwnsNotifications = false
+    private var pushWakeOwnershipCount = 0
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -1010,11 +1012,13 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func beginPushWakeNotificationOwnership() {
+        pushWakeOwnershipCount += 1
         pushWakeOwnsNotifications = true
     }
 
     func endPushWakeNotificationOwnership() {
-        pushWakeOwnsNotifications = false
+        pushWakeOwnershipCount = max(0, pushWakeOwnershipCount - 1)
+        pushWakeOwnsNotifications = pushWakeOwnershipCount > 0
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for

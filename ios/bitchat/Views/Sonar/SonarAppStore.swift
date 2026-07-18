@@ -2298,7 +2298,12 @@ final class SonarAppStore: ObservableObject {
     private func processIncomingMarmotNotifications() {
         // Push-wake owns banners for the current Transponder sync; emitting
         // here as well double-fires (different identifiers) for the same row.
-        if marmot.pushWakeOwnsNotifications { return }
+        // Still mark drained rows seen so the next invalidation after
+        // endPushWakeNotificationOwnership() does not re-alert them.
+        if marmot.pushWakeOwnsNotifications {
+            markMarmotNotificationMessagesSeen()
+            return
+        }
         for group in marmot.groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
@@ -2327,6 +2332,14 @@ final class SonarAppStore: ObservableObject {
                     groupName: groupName,
                     preview: message.content
                 )
+            }
+        }
+    }
+
+    private func markMarmotNotificationMessagesSeen() {
+        for group in marmot.groups {
+            for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
+                seenMarmotNotificationMessageIDs.insert(message.id)
             }
         }
     }
