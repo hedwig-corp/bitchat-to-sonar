@@ -114,11 +114,23 @@ final class NotificationService {
         message: String,
         sound: SonarNotificationSound = .standard
     ) {
-        let title = "You were mentioned"
-        let body = "Open Sonar to read it."
-        let identifier = "mention-\(UUID().uuidString)"
+        // Route through the core renderer so Show names / Message preview
+        // settings are honored (PR #58 had hard-coded the private fallback).
+        guard let routed = SonarLocalNotificationRouter.make(
+            idKey: UUID().uuidString,
+            kind: .mention,
+            conversationTitle: sender,
+            senderName: sender,
+            preview: message,
+            prefs: SonarNotificationPreferenceStore.loadMerged()
+        ) else { return }
 
-        sendLocalNotification(title: title, body: body, identifier: identifier, sound: sound)
+        sendLocalNotification(
+            title: routed.title,
+            body: routed.body,
+            identifier: "mention-\(routed.identifier)",
+            sound: sound
+        )
     }
 
     func sendPrivateMessageNotification(
@@ -127,20 +139,29 @@ final class NotificationService {
         peerID: PeerID,
         sound: SonarNotificationSound = .standard
     ) {
-        let title = "New Sonar message"
-        let body = "Open Sonar to read it."
-        let identifier = "private-\(UUID().uuidString)"
-        let userInfo: [String: Any] = [
-            SonarNotificationKeys.peerID: peerID.id,
-            SonarNotificationKeys.conversationId: peerID.id,
-            "senderName": sender,
-        ]
+        // Callers pass the real sender + body; never discard them for a
+        // hard-coded privacy fallback. The router applies Show names /
+        // Message preview (and the master Notifications toggle).
+        guard let routed = SonarLocalNotificationRouter.make(
+            idKey: peerID.id,
+            kind: .message,
+            conversationTitle: sender,
+            senderName: sender,
+            preview: message,
+            prefs: SonarNotificationPreferenceStore.loadMerged(),
+            userInfo: [
+                SonarNotificationKeys.peerID: peerID.id,
+                SonarNotificationKeys.conversationId: peerID.id,
+                "senderName": sender,
+            ]
+        ) else { return }
 
+        // Keep the `private-` prefix — NotificationDelegate routes taps by it.
         sendLocalNotification(
-            title: title,
-            body: body,
-            identifier: identifier,
-            userInfo: userInfo,
+            title: routed.title,
+            body: routed.body,
+            identifier: "private-\(routed.identifier)",
+            userInfo: routed.userInfo,
             sound: sound
         )
     }

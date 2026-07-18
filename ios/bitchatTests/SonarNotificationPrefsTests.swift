@@ -1,0 +1,126 @@
+//
+// SonarNotificationPrefsTests.swift
+// bitchatTests
+//
+// Regression: mesh/mention notifications must honor Show names / Message
+// preview settings via SonarLocalNotificationRouter (not hard-coded generic
+// copy). Fixes the gap introduced when PR #58 replaced rich local copy with
+// always-private placeholders.
+//
+// This is free and unencumbered software released into the public domain.
+// For more information, see <https://unlicense.org>
+//
+
+import Foundation
+import Testing
+@testable import Sonar
+
+struct SonarNotificationPrefsTests {
+
+    @Test("preference defaults match Settings: names on, preview off")
+    func preferenceDefaults() {
+        let suite = "sonar.notif.prefs.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let prefs = SonarNotificationPreferenceStore.load(from: defaults)
+        #expect(prefs.enabled == true)
+        #expect(prefs.showNames == true)
+        #expect(prefs.showPreview == false)
+    }
+
+    @Test("preference store reads explicit toggles")
+    func preferenceStoreReadsToggles() {
+        let suite = "sonar.notif.prefs.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set(false, forKey: SonarNotificationPreferenceStore.showNamesKey)
+        defaults.set(true, forKey: SonarNotificationPreferenceStore.showPreviewKey)
+
+        let prefs = SonarNotificationPreferenceStore.load(from: defaults)
+        #expect(prefs.showNames == false)
+        #expect(prefs.showPreview == true)
+    }
+
+    @Test("private-message router shows sender by default and hides preview")
+    func privateMessageRespectsDefaultPrivacy() {
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: true,
+            showNames: true,
+            showPreview: false,
+            showPaymentAmount: true
+        )
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "peer-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            senderName: "Alice",
+            preview: "secret hello",
+            prefs: prefs
+        )
+        #expect(routed?.title == "Alice")
+        #expect(routed?.body == "Open Sonar to read it.")
+    }
+
+    @Test("private-message router shows preview when setting is on")
+    func privateMessageRespectsPreviewOptIn() {
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: true,
+            showNames: true,
+            showPreview: true,
+            showPaymentAmount: true
+        )
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "peer-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            senderName: "Alice",
+            preview: "secret hello",
+            prefs: prefs
+        )
+        #expect(routed?.title == "Alice")
+        #expect(routed?.body == "secret hello")
+    }
+
+    @Test("private-message router hides names when setting is off")
+    func privateMessageRespectsNamesOff() {
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: true,
+            showNames: false,
+            showPreview: true,
+            showPaymentAmount: true
+        )
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "peer-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            senderName: "Alice",
+            preview: "secret hello",
+            prefs: prefs
+        )
+        #expect(routed?.title == "New Sonar message")
+        #expect(routed?.body == "secret hello")
+    }
+
+    @Test("disabled notifications suppress the envelope")
+    func disabledSuppresses() {
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: false,
+            showNames: true,
+            showPreview: true,
+            showPaymentAmount: true
+        )
+        let routed = SonarLocalNotificationRouter.make(
+            idKey: "peer-1",
+            kind: .message,
+            conversationTitle: "Alice",
+            senderName: "Alice",
+            preview: "secret hello",
+            prefs: prefs
+        )
+        #expect(routed == nil)
+    }
+}

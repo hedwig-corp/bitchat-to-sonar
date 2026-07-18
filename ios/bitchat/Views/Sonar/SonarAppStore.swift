@@ -590,9 +590,9 @@ final class SonarAppStore: ObservableObject {
         static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
-        static let notificationsEnabled = "sonar.notifications.enabled"
-        static let notificationShowNames = "sonar.notifications.showNames"
-        static let notificationShowPreview = "sonar.notifications.showPreview"
+        static let notificationsEnabled = SonarNotificationPreferenceStore.enabledKey
+        static let notificationShowNames = SonarNotificationPreferenceStore.showNamesKey
+        static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
         static let marmotNsecKeychainKey = "marmot-nsec"
@@ -2251,12 +2251,7 @@ final class SonarAppStore: ObservableObject {
     // MARK: Local notification routing
 
     private var notificationPrefs: SonarLocalNotificationPrefs {
-        SonarLocalNotificationPrefs(
-            enabled: notificationsEnabled,
-            showNames: notificationShowNames,
-            showPreview: notificationShowPreview,
-            showPaymentAmount: true
-        )
+        SonarNotificationPreferenceStore.loadMerged()
     }
 
     private func localNotificationKind(for content: String) -> SonarLocalNotificationKind {
