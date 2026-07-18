@@ -16,6 +16,7 @@ on:
       - 'packages/transcript-engine-compose/**'
       - 'packages/transcript-engine-sample/**'
       - 'packages/transcript-engine/**'
+      - 'ios/localPackages/TranscriptEngine/**'
       - 'core/**'
       - '.github/workflows/compose-tests.yml'
   pull_request:
@@ -27,6 +28,7 @@ on:
       - 'packages/transcript-engine-compose/**'
       - 'packages/transcript-engine-sample/**'
       - 'packages/transcript-engine/**'
+      - 'ios/localPackages/TranscriptEngine/**'
       - 'core/**'
       - '.github/workflows/compose-tests.yml'
 
@@ -64,6 +66,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      - name: Assert open-action golden copies stay in sync
+        # Canonical: packages/transcript-engine-policy/golden/open-action.json
+        # SPM tests carry a byte-identical copy for Bundle.module loading.
+        run: |
+          diff -u \
+            packages/transcript-engine-policy/golden/open-action.json \
+            ios/localPackages/TranscriptEngine/Tests/Resources/open-action.json
+
       - name: Run JVM unit tests (builds desktop Rust core + UniFFI bindings)
         # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
         # compile on current stable Rust; BLE is optional at runtime and the
@@ -80,6 +90,17 @@ jobs:
         working-directory: apps/sonar
         env:
           SONAR_SKIP_BLE: '1'
+
+  transcript-engine-spm:
+    name: TranscriptEngine SPM tests
+    runs-on: macos-15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: swift test (TranscriptEngine + SampleChat)
+        working-directory: ios/localPackages/TranscriptEngine
+        run: swift test
 
   android-device-test:
     name: Compose device tests (Android API 35)

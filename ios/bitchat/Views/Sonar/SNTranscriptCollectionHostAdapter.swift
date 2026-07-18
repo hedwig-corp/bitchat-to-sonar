@@ -93,6 +93,13 @@ final class SNTranscriptHostRenderContext: ObservableObject {
                     width: width
                 )
             },
+            configureHeader: { _, header, _, label in
+                header.contentConfiguration = UIHostingConfiguration {
+                    SNStickyDayHeader(label: label)
+                }
+                .margins(.all, 0)
+                header.backgroundConfiguration = .clear()
+            },
             unreadAnchorResolver: { [weak self] entries, unreadCount in
                 guard let self else { return nil }
                 var remaining = unreadCount

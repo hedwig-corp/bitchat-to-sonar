@@ -38,7 +38,11 @@ Use `TranscriptHostScaffold` + `TranscriptScrollPolicy.resolveOpenAction(...)`.
 
 Sample: `SampleTranscriptApp` in `:transcript-engine-sample`.
 
-Golden contract: `packages/transcript-engine-policy/golden/open-action.json` (asserted in `:transcript-engine-policy:check` and SPM tests).
+Golden contract (canonical): `packages/transcript-engine-policy/golden/open-action.json`.
+CI diffs that file against the SPM copy at
+`ios/localPackages/TranscriptEngine/Tests/Resources/open-action.json` — edit the
+canonical file and copy, do not diverge. Asserted in `:transcript-engine-policy:check`
+and `swift test` for TranscriptEngine.
 
 ## Swift (UIKit / SwiftUI)
 
@@ -53,14 +57,17 @@ TranscriptCollectionHostView(
     callbacks: TranscriptCollectionHostCallbacks(
         configureCell: { _, cell, _, item in /* dequeue + configure */ },
         itemHeight: { item, key, width in 44 },
-        headerHeight: { _, width in 28 }
+        headerHeight: { _, width in 28 },
+        configureHeader: { _, header, _, label in /* sticky day pill */ },
+        unreadAnchorResolver: { entries, count in /* oldest unread id */ }
     ),
+    unreadCountAtOpen: unreadCapture,
     composer: { MyComposerView() }
 )
 .ignoresSafeArea(.keyboard, edges: .bottom)
 ```
 
-SPM example: `SampleChatDemo.makeViewController(messages:)`.
+SPM example: `SampleChatDemo.makeViewController(messages:openMode:)` (LiveEdge or UnreadDivider).
 
 Sonar keeps `SN*` names via `TranscriptEngineSonarCompat.swift`; production iOS path uses `SNTranscriptCollectionHost` → `TranscriptCollectionHostView` through `SNTranscriptCollectionHostAdapter.swift`.
 
