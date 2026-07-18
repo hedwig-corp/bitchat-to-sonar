@@ -686,6 +686,21 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().startDm(peer: peer, name: name) }
     }
 
+    /// Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+    func ensureNoteToSelf() async throws -> String {
+        try await run { try $0.requireNode().ensureNoteToSelf() }
+    }
+
+    /// Return the Note to Self group id when already present.
+    func findNoteToSelf() async throws -> String? {
+        try await readOnly { try $0.requireNode().findNoteToSelf() }
+    }
+
+    /// True when `groupId` is this account's Note to Self conversation.
+    func isNoteToSelf(_ groupId: String) async throws -> Bool {
+        try await readOnly { try $0.requireNode().isNoteToSelf(groupIdHex: groupId) }
+    }
+
     /// Start a multi-member group with peers (`npub1...` or hex pubkeys).
     /// Returns the new group id (hex).
     func startGroup(with members: [String], name: String) async throws -> String {

@@ -189,7 +189,18 @@ class EventDrivenRefreshTest {
         snapshot: Int = 3,
         npub: String = "me",
         hold: Int = 0,
-    ) = VisibleChatsKey(chatsIdentity, folded, pendingChats, pendingGroups, social, snapshot, npub, hold)
+        noteToSelfGroupId: String? = null,
+    ) = VisibleChatsKey(
+        chatsIdentity,
+        folded,
+        pendingChats,
+        pendingGroups,
+        social,
+        snapshot,
+        npub,
+        hold,
+        noteToSelfGroupId,
+    )
 
     @Test
     fun identicalKeysAreEqual() {

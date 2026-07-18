@@ -318,9 +318,12 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
             if (chatRows.isEmpty() && meshRows.isEmpty()) {
                 item { EmptyHint("No secure chats yet — use Search to paste an npub and start one.") }
             }
-            val mergedRows = mergeHomeMessageRows(meshRows, chatRows) { chatId ->
-                state.marmotRow(chatId).tsSecs
-            }
+            val mergedRows = pinNoteToSelfHomeRows(
+                mergeHomeMessageRows(meshRows, chatRows) { chatId ->
+                    state.marmotRow(chatId).tsSecs
+                },
+                noteToSelfGroupId = state.noteToSelfId(),
+            )
             items(mergedRows, key = { it.listKey }) { homeRow ->
                 when (homeRow) {
                     is HomeMessageRow.Mesh -> {

@@ -140,6 +140,54 @@ async fn start_dm_reuses_existing_direct_group() {
 }
 
 #[tokio::test]
+async fn ensure_note_to_self_creates_solo_marked_group_once() {
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![])
+        .await
+        .expect("alice connects");
+
+    let first = alice
+        .ensure_note_to_self()
+        .await
+        .expect("create note to self");
+    let second = alice
+        .ensure_note_to_self()
+        .await
+        .expect("reuse note to self");
+
+    assert_eq!(second, first);
+    let groups = alice.groups().expect("alice groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].mls_group_id, first);
+    assert_eq!(groups[0].description, "sonar.note-to-self.v1");
+    assert_eq!(groups[0].name, "Note to Self");
+    let members = alice.members(&first).expect("members");
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0], alice.identity().public_key());
+    assert!(alice
+        .is_note_to_self_group_id(&first)
+        .expect("is note to self"));
+}
+
+#[tokio::test]
+async fn ensure_note_to_self_works_offline_without_relay() {
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![])
+        .await
+        .expect("alice connects");
+
+    let group_id = alice
+        .ensure_note_to_self()
+        .await
+        .expect("offline note to self");
+    alice
+        .send_text(&group_id, "remember milk")
+        .await
+        .expect("send to self");
+    let messages = alice.messages(&group_id).expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "remember milk");
+}
+
+#[tokio::test]
 async fn start_dm_rejects_self_before_reusing_existing_group() {
     let relay = MockRelay::run().await.expect("mock relay starts");
     let relay_url = relay.url().await;

@@ -580,6 +580,7 @@ internal data class VisibleChatsKey(
     val snapshotVersion: Int,
     val ownNpub: String,
     val holdVersion: Int,
+    val noteToSelfGroupId: String?,
 )
 
 private fun decodeGroupFoldMap(blob: String): Map<String, String> =
@@ -792,6 +793,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     private var localCoreReady = false
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
+    /** Real MLS group id for Note to Self once [ensureNoteToSelf] completes. */
+    private var noteToSelfGroupId by mutableStateOf<String?>(null)
         private set
     /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
      *  reassigned. Feeds the [visibleChats] memo key so the dedupe ordering
@@ -989,6 +992,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
             retainedTranscriptByChat.clear()
             transcriptWindows.clear()
+            noteToSelfGroupId = null
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -1925,6 +1929,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             snapshotVersion = snapshotVersion,
             ownNpub = npub,
             holdVersion = holdInputsVersion,
+            noteToSelfGroupId = noteToSelfGroupId,
         )
     }
 
@@ -1945,11 +1950,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (held) holdActive = true
             it.id in foldedGroupIds || held || isBlockedMarmotChat(it)
         }
-        val result = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
+        val deduped = pendingMarmotChats() + pendingMarmotGroupChats() + dedupeDirectMarmotChats(
             chats = standalone,
             ownNpub = npub,
             latestSecs = ::localLatestTs,
         )
+        val result = withPinnedNoteToSelf(deduped)
         // Only cache the stable (no active settle window) computation. A held
         // chat can flip to visible purely by time passing, which the key can't
         // capture, so leave the cache untouched until the window closes.
@@ -1961,6 +1967,24 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         return result
     }
+
+    /** Always expose Note to Self in the chat list (pending until ensure lands). */
+    private fun withPinnedNoteToSelf(rows: List<SonarChat>): List<SonarChat> {
+        val existing = rows.firstOrNull { isNoteToSelfChat(it, noteToSelfGroupId) }
+        if (existing != null) {
+            return listOf(existing) + rows.filterNot { it.id == existing.id }
+        }
+        val realId = noteToSelfGroupId
+        val real = realId?.let { id -> chats.firstOrNull { it.id == id } }
+        val pinned = real ?: pendingNoteToSelfChat(npub)
+        return listOf(pinned) + rows
+    }
+
+    fun isNoteToSelfChat(chatId: String): Boolean =
+        isNoteToSelfChatId(chatId, noteToSelfGroupId)
+
+    /** Real Note to Self group id when known (null while only the pending row exists). */
+    fun noteToSelfId(): String? = noteToSelfGroupId
 
     private fun pendingMarmotChats(): List<SonarChat> =
         pendingMarmotChatNpubs.mapNotNull { (id, pending) ->
@@ -3725,8 +3749,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // a freshly-started chat under older history (iOS dmRows parity).
                 tsSecs = newest?.tsSecs ?: pendingCreatedAtSecs(chat.id) ?: localLatestTs(chat.id),
                 verified = ids.any { it in verifiedChatIds },
-                unread = ids.sumOf { unreadByChat[it] ?: 0L } > 0,
-                pending = pending,
+                unread = !isNoteToSelfChat(chat, noteToSelfGroupId) &&
+                    ids.sumOf { unreadByChat[it] ?: 0L } > 0,
+                pending = pending && !isNoteToSelfChat(chat, noteToSelfGroupId),
                 multiMember = isMultiMemberChat(chat.id),
             )
         }
@@ -4102,6 +4127,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         changedPages: Map<String, List<SonarMsg>>,
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
+        if (isNoteToSelfChat(c, noteToSelfGroupId)) return
         var newestIncoming: SonarMsg? = null
         var newestTrill: SonarMsg? = null
         val isOpen = openChatId != null && openChatId in suppressIds
@@ -4419,6 +4445,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  is blank, so fall back to the counterpart's short npub — never an empty
      *  title. Mirrors iOS `MarmotChatModel.title(for:)`. */
     fun chatTitle(chat: SonarChat): String {
+        if (isNoteToSelfChat(chat, noteToSelfGroupId)) return NOTE_TO_SELF_TITLE
         pendingMarmotNpub(chat.id)?.let { pending ->
             profilesByNpub[canonicalProfileKey(pending)]?.bestName?.let { return it }
             return shortNpub(pending)
@@ -9588,6 +9615,16 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun refreshChatsInner() {
         val previousOrder = chats.map { it.id }
+        // Note to Self is offline-safe (solo MLS group); ensure before listing
+        // so the pinned row can open/send without waiting on relays.
+        if (localCoreReady || started) {
+            runCatching { SonarCore.ensureNoteToSelf() }
+                .onSuccess { noteToSelfGroupId = it }
+                .onFailure {
+                    noteToSelfGroupId = runCatching { SonarCore.findNoteToSelf() }.getOrNull()
+                        ?: noteToSelfGroupId
+                }
+        }
         val loadedChats = SonarCore.chats()
         val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
