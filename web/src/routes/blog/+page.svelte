@@ -159,16 +159,27 @@
         <p class="pagesub">{t('blog.sub')}</p>
       </div>
 
-      {#if feature}
-        <a class="feature" href="#{feature.id}">
-          <div class="ftext">
-            <span class="cat {catClass(feature.cat)}">{catLabel(feature.cat)}</span>
-            <h2>{feature.title}</h2>
-            <p>{feature.excerpt}</p>
-            <div class="meta"><b>{feature.author}</b> · {feature.date} · {feature.read}</div>
-          </div>
-          <div class="fart"><span class="glyph">{@html glyph(feature.cat)}</span></div>
-        </a>
+      {#if posts.length === 0}
+        <div class="empty">
+          <span class="eglyph">{@html glyph('')}</span>
+          <h2>{t('blog.empty.h2')}</h2>
+          <p>
+            {t('blog.empty.p')}
+            <a href="{base}/docs">{t('nav.docs')}</a>
+          </p>
+        </div>
+      {:else}
+        {#if feature}
+          <a class="feature" href="#{feature.id}">
+            <div class="ftext">
+              <span class="cat {catClass(feature.cat)}">{catLabel(feature.cat)}</span>
+              <h2>{feature.title}</h2>
+              <p>{feature.excerpt}</p>
+              <div class="meta"><b>{feature.author}</b> · {feature.date} · {feature.read}</div>
+            </div>
+            <div class="fart"><span class="glyph">{@html glyph(feature.cat)}</span></div>
+          </a>
+        {/if}
         <div class="grid">
           {#each rest as p (p.id)}
             <a class="post" href="#{p.id}">
@@ -181,15 +192,6 @@
               </div>
             </a>
           {/each}
-        </div>
-      {:else}
-        <div class="empty">
-          <span class="eglyph">{@html glyph('')}</span>
-          <h2>{t('blog.empty.h2')}</h2>
-          <p>
-            {t('blog.empty.p')}
-            <a href="{base}/docs">{t('nav.docs')}</a>
-          </p>
         </div>
       {/if}
     {:else}
