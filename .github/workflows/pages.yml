@@ -6,12 +6,14 @@ on:
       - main
     paths:
       - 'web/**'
+      - 'scripts/blog/**'
       - '.github/workflows/pages.yml'
   pull_request:
     branches:
       - main
     paths:
       - 'web/**'
+      - 'scripts/blog/**'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 

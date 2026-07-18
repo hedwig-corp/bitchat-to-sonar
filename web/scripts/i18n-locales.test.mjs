@@ -144,5 +144,12 @@ test('architecture post overlays match hash when present, else English', () => {
 	for (const [locale, overlay] of Object.entries(byLocale)) {
 		assert.equal(overlay.contentHash, hash, `${baked.id}/${locale}`);
 	}
-	assert.notEqual(it[0].title, baked.title);
+	// Partial bake (e.g. DE ok / IT missing) must fall back to English for IT
+	// without failing the Pages job.
+	if (byLocale.it) {
+		assert.notEqual(it[0].title, baked.title);
+	} else {
+		assert.equal(it[0].title, baked.title);
+		assert.equal(it[0].md, baked.md);
+	}
 });
