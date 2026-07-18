@@ -283,21 +283,30 @@ final class MarmotService: @unchecked Sendable {
 
     private let relayUrls: [String]
 
-    /// Serial queue: serializes engine maintenance (connect, sync, drain,
+    /// Serial queue: serializes engine maintenance (connect, sync,
     /// group management) and `node`/`identity` writes. Keeps the blocking
     /// Rust calls off the main thread and off the Swift concurrency
-    /// cooperative pool. Text/sticker sends run on `sendQueue` instead —
-    /// see its doc for why they must not share this lane.
+    /// cooperative pool. Text/sticker sends run on `sendQueue` and live
+    /// `drainPending` on `drainQueue` — they must not share this lane
+    /// (each sync can park it for a 10s relay timeout). Same shape as
+    /// Android: lifecycle serialization only; sync/drain hop independently.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
     /// Serial send lane for text/sticker sends: they must stay ordered with
-    /// each other, but must never FIFO-queue behind sync/drain relay quorum
+    /// each other, but must never FIFO-queue behind sync relay quorum
     /// fetches on `workQueue` (each can park it for a 10s timeout — the
     /// documented 6.6s p95 / 19.3s max send dispatch tail). The core engine
     /// serializes MLS mutations internally (`MarmotEngine::write_lock`), so a
     /// send here runs concurrently with an in-flight sync and waits at most
     /// for one in-flight MLS mutation, never for a relay fetch.
     private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
+
+    /// Serial receive/drain lane (Android `Dispatchers.IO` parity for drain).
+    /// Must never FIFO-queue behind blocking UniFFI `syncForce` on
+    /// `workQueue` — that was the ~10s banner→UI lag. Core `write_lock`
+    /// serializes MLS mutations; drain waits at most for one in-flight
+    /// mutation, never for a relay quorum fetch.
+    private let drainQueue = DispatchQueue(label: "chat.bitchat.marmot-drain", qos: .userInitiated)
 
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
@@ -916,11 +925,12 @@ final class MarmotService: @unchecked Sendable {
         return false
     }
 
-    /// Process buffered live Marmot events through the MLS engine on the serial
-    /// engine queue. Returns notifications for incoming messages (empty = nothing drained).
+    /// Process buffered live Marmot events through the MLS engine on the
+    /// dedicated drain lane (not `workQueue`). Returns notifications for
+    /// incoming messages (empty = nothing drained).
     @discardableResult
     func drainPending() async throws -> [DrainNotificationInfo] {
-        try await run { try $0.requireNode().drainPendingMarmot() }
+        try await drainLane { try $0.drainPendingMarmot() }
     }
 
     /// All Marmot groups the identity belongs to.
@@ -1453,6 +1463,12 @@ final class MarmotService: @unchecked Sendable {
     /// core engine's `write_lock` responsibility.
     private func sendLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: sendQueue, body)
+    }
+
+    /// Live receive drain on the dedicated serial drain lane. Must not share
+    /// `workQueue` with blocking `syncForce` (see `drainQueue` doc).
+    private func drainLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: drainQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
