@@ -6154,6 +6154,8 @@ final class SonarAppStore: ObservableObject {
                     let upload = pending.remove(at: match.offset)
                     mediaImageCache[media.url] = upload.data
                     mediaImageCache.removeValue(forKey: upload.localURL)
+                    // Keep in-flight voice playback / listened keys across publish.
+                    SNVoiceAttachmentIdentity.alias(from: upload.localURL, to: media.url)
                     if let disk = Self.mediaCacheURL(for: media.url) {
                         try? upload.data.write(to: disk, options: [.atomic, .completeFileProtection])
                     }

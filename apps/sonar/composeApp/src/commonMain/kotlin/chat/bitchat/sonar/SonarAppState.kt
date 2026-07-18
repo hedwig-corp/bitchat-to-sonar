@@ -6785,6 +6785,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             usedCanonicalUrls += published.url
             mediaCache[published.url] = data
             mediaCache.remove(pendingUrl)
+            // Keep in-flight voice playback / listened keys across publish.
+            VoiceAttachmentIdentity.alias(pendingUrl, published.url)
             return true
         }
         return false

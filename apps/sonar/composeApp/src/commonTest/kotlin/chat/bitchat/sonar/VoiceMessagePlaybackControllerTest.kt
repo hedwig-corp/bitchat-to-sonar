@@ -355,9 +355,18 @@ class VoiceMessagePlaybackControllerTest {
 
     @Test
     fun voiceAttachmentIdStableAcrossUrlPromotion() {
-        val pending = voiceAttachmentId("m1", 0, "note.m4a", "pending-media-abc")
-        val published = voiceAttachmentId("m1", 0, "note.m4a", "https://cdn.example/note.m4a")
+        val pending = voiceAttachmentId("pending-id", 0, "note.m4a", "pending-media-abc")
+        VoiceAttachmentIdentity.alias("pending-media-abc", "https://cdn.example/note.m4a")
+        val published = voiceAttachmentId("server-id", 0, "note.m4a", "https://cdn.example/note.m4a")
         assertEquals(pending, published)
+        assertEquals(
+            "chat-a|$pending",
+            item(id = "pending-id", attachment = pending).key,
+        )
+        assertEquals(
+            item(id = "pending-id", attachment = pending).key,
+            item(id = "server-id", attachment = published).key,
+        )
     }
 
     private object EmptyQueue : VoicePlaybackQueue {

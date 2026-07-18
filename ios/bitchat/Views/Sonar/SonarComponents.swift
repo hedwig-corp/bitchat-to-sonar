@@ -3860,11 +3860,13 @@ struct SNAudioBubble: View {
                 .accessibilityLabel(String(localized: "content.accessibility.voice_speed"))
             }
 
-            if let playbackItem, playback.isListened(playbackItem) {
-                Image(systemName: "checkmark")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundColor(SonarTheme.text3)
-                    .accessibilityLabel(String(localized: "content.voice.listened"))
+            // Unheard indicator (Signal / Compose parity) — for incoming notes
+            // only, clears once this note is marked listened.
+            if let playbackItem, !mine, !playback.isListened(playbackItem) {
+                Circle()
+                    .fill(SonarTheme.accent)
+                    .frame(width: 6, height: 6)
+                    .accessibilityLabel(String(localized: "content.accessibility.voice_unheard"))
             }
         }
         .padding(.horizontal, 12)
@@ -3919,12 +3921,37 @@ struct SNAudioBubble: View {
     }
 }
 
+enum SNVoiceAttachmentIdentity {
+    private static let pendingPrefix = "pending-media-"
+    private static var aliases: [String: String] = [:]
+
+    static func id(messageId: String, mediaIndex: Int, filename: String, url: String) -> String {
+        if let existing = aliases[url] { return existing }
+        let nameKey = filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "audio" : filename
+        let minted: String
+        if url.hasPrefix(pendingPrefix) {
+            minted = "p-" + String(url.dropFirst(pendingPrefix.count))
+            aliases[url] = minted
+        } else {
+            minted = "\(messageId)#\(mediaIndex)#\(nameKey)"
+        }
+        return minted
+    }
+
+    static func alias(from pendingURL: String, to canonicalURL: String) {
+        if let id = aliases[pendingURL] {
+            aliases[canonicalURL] = id
+        }
+    }
+}
+
 func snVoiceAttachmentId(messageId: String, mediaIndex: Int, filename: String, url: String) -> String {
-    // `url` is ignored so pending-media → published URL promotion keeps the
-    // same attachment id (matches Compose `voiceAttachmentId`).
-    _ = url
-    let nameKey = filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "audio" : filename
-    return "\(messageId)#\(mediaIndex)#\(nameKey)"
+    SNVoiceAttachmentIdentity.id(
+        messageId: messageId,
+        mediaIndex: mediaIndex,
+        filename: filename,
+        url: url
+    )
 }
 
 /// Optional fold resolver installed by `SonarAppStore` so bubbles can scope

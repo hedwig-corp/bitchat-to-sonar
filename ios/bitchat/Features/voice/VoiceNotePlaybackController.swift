@@ -43,11 +43,10 @@ struct VoicePlaybackItem {
     let localFile: URL
     let durationHint: TimeInterval?
 
-    /// Stable identity for playhead-cache / queue lookups. Two loads of "the
-    /// same" voice note (e.g. once a duration hint has been filled in) must
-    /// compare equal even if `durationHint` differs, so identity is keyed on
-    /// message + attachment, never on the whole struct.
-    var key: String { messageId + "#" + attachmentId }
+    /// Stable identity for playhead-cache / queue lookups. Must survive
+    /// optimistic pendingId → published messageId remaps; [attachmentId]
+    /// carries the send-stable identity (see `snVoiceAttachmentId`).
+    var key: String { logicalConversationId + "|" + attachmentId }
 }
 
 enum VoicePlaybackPhase: Equatable {

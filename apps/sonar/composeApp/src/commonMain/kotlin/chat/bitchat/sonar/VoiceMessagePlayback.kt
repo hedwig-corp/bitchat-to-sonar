@@ -22,8 +22,10 @@ data class VoicePlaybackItem(
     val localFile: String,
     val durationHintMs: Long? = null,
 ) {
+    /** Key must survive optimistic pendingId → published messageId remaps;
+     *  [attachmentId] carries the send-stable identity (see [voiceAttachmentId]). */
     val key: String
-        get() = "$logicalConversationId|$sourceConversationId|$messageId|$attachmentId"
+        get() = "$logicalConversationId|$attachmentId"
 }
 
 enum class VoicePlaybackPhase {
@@ -661,16 +663,39 @@ class VoiceMessagePlaybackController(
 }
 
 /**
- * Build a stable attachment id that survives optimistic URL → canonical URL
- * remaps (`pending-media-*` → published URL). [url] is accepted for call-site
- * compatibility but must not participate in the key.
+ * Send-/URL-stable attachment identity for voice playback keys.
+ *
+ * Pending uploads mint an id from the `pending-media-*` URL suffix and
+ * [alias] copies that id onto the published Blossom URL so in-flight
+ * playback / listened state survives publish. Received notes keep
+ * `messageId#index#filename`.
  */
+object VoiceAttachmentIdentity {
+    private const val PENDING_PREFIX = "pending-media-"
+    private val aliases = HashMap<String, String>()
+
+    fun id(messageId: String, mediaIndex: Int, filename: String, url: String): String {
+        aliases[url]?.let { return it }
+        val nameKey = filename.trim().ifEmpty { "audio" }
+        val minted = if (url.startsWith(PENDING_PREFIX)) {
+            "p-${url.removePrefix(PENDING_PREFIX)}"
+        } else {
+            "$messageId#$mediaIndex#$nameKey"
+        }
+        if (url.startsWith(PENDING_PREFIX)) {
+            aliases[url] = minted
+        }
+        return minted
+    }
+
+    fun alias(fromUrl: String, toUrl: String) {
+        aliases[fromUrl]?.let { aliases[toUrl] = it }
+    }
+}
+
 fun voiceAttachmentId(
     messageId: String,
     mediaIndex: Int,
     filename: String,
-    @Suppress("UNUSED_PARAMETER") url: String,
-): String {
-    val nameKey = filename.trim().ifEmpty { "audio" }
-    return "$messageId#$mediaIndex#$nameKey"
-}
+    url: String,
+): String = VoiceAttachmentIdentity.id(messageId, mediaIndex, filename, url)
