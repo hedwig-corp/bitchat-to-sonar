@@ -54,9 +54,11 @@ use crate::{Error, Result};
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
-/// primal.net returns HTTP 415 for Marmot ciphertext uploads (even with
-/// `application/octet-stream`); nostr.download accepts them (201 Created).
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
+/// Hedwig Blossom (`push.sonar.hedwig.sh`) accepts Marmot ciphertext as
+/// `application/octet-stream` (201) and wins upload latency vs the previous
+/// public default (`nostr.download`) in the status media bench. Prefer
+/// `https://blossom.sonar.hedwig.sh` once that DNS name is live.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
 
 /// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
 /// validate the request body's media type, so encrypted blobs must use the

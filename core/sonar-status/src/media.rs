@@ -1,7 +1,7 @@
 //! Blossom media storage probe for Sonar status.
 //!
-//! Compares the app default Blossom server against candidate hosts (notably
-//! `https://push.sonar.hedwig.sh`) so `/status` can show real upload latency —
+//! Compares the app default Blossom server against a public fallback
+//! (`https://nostr.download`) so `/status` can show real upload latency —
 //! the path that matters for media send — not only a HEAD reachability ping.
 //!
 //! When a probe nsec is available, each server gets a BUD-02 upload + GET +
@@ -27,8 +27,12 @@ const MEDIA_TIMEOUT: Duration = Duration::from_secs(20);
 /// dominating cron runtime.
 const CANARY_BYTES: usize = 4_096;
 
-/// Hedwig-operated Blossom candidate compared against [`DEFAULT_BLOSSOM_SERVER`].
-pub const HEDWIG_BLOSSOM_CANDIDATE: &str = "https://push.sonar.hedwig.sh";
+/// Previous public Blossom default — kept as the status compare target so
+/// `/status` shows Hedwig vs the old public host.
+pub const PUBLIC_BLOSSOM_COMPARE: &str = "https://nostr.download";
+
+/// Hedwig Blossom public URL (also the app [`sonar_core::client::DEFAULT_BLOSSOM_SERVER`]).
+pub const HEDWIG_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaServerSample {
@@ -141,7 +145,7 @@ pub fn blossom_servers_to_probe(
 
 /// Default compare list when the operator does not pass `--blossom-compare`.
 pub fn default_blossom_compare() -> Vec<String> {
-    vec![HEDWIG_BLOSSOM_CANDIDATE.to_owned()]
+    vec![PUBLIC_BLOSSOM_COMPARE.to_owned()]
 }
 
 /// Probe Blossom servers. With `probe_secret`, run BUD-02 upload+GET+delete;
@@ -463,7 +467,7 @@ fn summarize_blossom_err(err: &nostr_blossom::error::Error) -> String {
 mod tests {
     use super::*;
 
-    const PRIMARY: &str = "https://nostr.download";
+    const PRIMARY: &str = HEDWIG_BLOSSOM_SERVER;
 
     #[test]
     fn service_mapping_ok_omits_state() {
@@ -480,20 +484,20 @@ mod tests {
                     mode: "upload".into(),
                     status: Some(201),
                     head_ms: None,
-                    upload_ms: Some(180),
-                    get_ms: Some(90),
+                    upload_ms: Some(116),
+                    get_ms: Some(35),
                     error: None,
                 },
                 MediaServerSample {
-                    server: HEDWIG_BLOSSOM_CANDIDATE.into(),
+                    server: PUBLIC_BLOSSOM_COMPARE.into(),
                     primary: false,
-                    ok: false,
+                    ok: true,
                     mode: "upload".into(),
-                    status: Some(403),
+                    status: Some(201),
                     head_ms: None,
-                    upload_ms: Some(120),
-                    get_ms: None,
-                    error: Some("403 Forbidden".into()),
+                    upload_ms: Some(135),
+                    get_ms: Some(37),
+                    error: None,
                 },
             ],
         };
@@ -501,11 +505,11 @@ mod tests {
         assert_eq!(s.id, "media");
         assert!(s.state.is_none());
         assert!(s.desc.contains("primary"));
-        assert!(s.desc.contains("nostr.download"));
-        assert!(s.desc.contains("candidate"));
         assert!(s.desc.contains("push.sonar.hedwig.sh"));
-        assert!(s.desc.contains("upload 180 ms"));
-        assert!(s.desc.contains("fail: 403 Forbidden"));
+        assert!(s.desc.contains("candidate"));
+        assert!(s.desc.contains("nostr.download"));
+        assert!(s.desc.contains("upload 116 ms"));
+        assert!(s.desc.contains("upload 135 ms"));
     }
 
     #[test]
@@ -535,16 +539,17 @@ mod tests {
     #[test]
     fn servers_to_probe_dedupes_primary() {
         let list = blossom_servers_to_probe(
-            "https://nostr.download/",
+            "https://push.sonar.hedwig.sh/",
             &[
-                "https://push.sonar.hedwig.sh".into(),
                 "https://nostr.download".into(),
+                "https://push.sonar.hedwig.sh".into(),
             ],
         );
         assert_eq!(list.len(), 2);
         assert!(list[0].1);
-        assert_eq!(list[0].0, "https://nostr.download");
+        assert_eq!(list[0].0, "https://push.sonar.hedwig.sh");
         assert!(!list[1].1);
+        assert_eq!(list[1].0, "https://nostr.download");
     }
 
     #[test]

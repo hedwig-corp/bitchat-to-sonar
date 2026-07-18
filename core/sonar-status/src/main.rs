@@ -168,7 +168,7 @@ struct ProbeArgs {
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
     /// Extra Blossom servers to compare against the primary (comma-separated).
-    /// Defaults to https://push.sonar.hedwig.sh when unset.
+    /// Defaults to https://nostr.download when unset.
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
     blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.
@@ -234,7 +234,7 @@ struct PublishArgs {
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
     /// Extra Blossom servers to compare against the primary (comma-separated).
-    /// Defaults to https://push.sonar.hedwig.sh when unset.
+    /// Defaults to https://nostr.download when unset.
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
     blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.

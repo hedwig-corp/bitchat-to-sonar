@@ -101,9 +101,8 @@ REQs kind 30031 on bootstrap relays, counts visible sticker packs. No nsec neede
 ### Blossom media probe
 
 Compares the app default Blossom server (`DEFAULT_BLOSSOM_SERVER`, today
-`https://nostr.download`) against candidate hosts (default
-`https://push.sonar.hedwig.sh`) and publishes the timings on the `media` status
-row.
+`https://push.sonar.hedwig.sh`) against the previous public host (default
+`https://nostr.download`) and publishes the timings on the `media` status row.
 
 - With a probe nsec: BUD-02 upload + GET + best-effort delete of a ~4 KiB canary
   (this is the latency that matters for media send).
@@ -114,17 +113,16 @@ export SONAR_STATUS_STICKER_PROBE=1
 export SONAR_STATUS_MEDIA_PROBE=1
 export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
 # optional override:
-# export SONAR_STATUS_BLOSSOM_SERVER=https://nostr.download
-# export SONAR_STATUS_BLOSSOM_COMPARE=https://push.sonar.hedwig.sh
+# export SONAR_STATUS_BLOSSOM_SERVER=https://push.sonar.hedwig.sh
+# export SONAR_STATUS_BLOSSOM_COMPARE=https://nostr.download
 ./scripts/status/publish.sh
 ```
 
 The service description looks like:
 
 ```text
-primary nostr.download upload 180 ms · get 90 ms · candidate push.sonar.hedwig.sh fail: 403 Forbidden
+primary push.sonar.hedwig.sh upload 116 ms · get 35 ms · candidate nostr.download upload 135 ms · get 37 ms
 ```
 
-Service state follows the **primary** (app default) only — a failing candidate
-is shown in the description so ops can see when Hedwig Blossom is ready to
-become the default, without marking Media Messages down.
+Service state follows the **primary** (app default) only — a slower or failing
+compare host is shown in the description without marking Media Messages down.
