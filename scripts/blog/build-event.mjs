@@ -71,8 +71,8 @@ if (!title) {
 	process.exit(1);
 }
 
-// `date` (YYYY-MM-DD) → UTC-midnight unix seconds. Used for both created_at and
-// the published_at tag so the addressable event and its display date agree.
+// `date` (YYYY-MM-DD) → UTC-midnight unix seconds for the published_at tag
+// (display date). created_at uses wall-clock time so NIP-33 re-publishes win.
 const dateMs = Date.parse(`${fm.date ?? ''}T00:00:00Z`);
 if (!Number.isFinite(dateMs)) {
 	console.error(`${readmePath}: front-matter needs a valid date (YYYY-MM-DD)`);

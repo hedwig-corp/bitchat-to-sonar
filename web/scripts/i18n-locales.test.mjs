@@ -128,3 +128,21 @@ test('non-English catalogs include status ping and feed keys', () => {
 		assert.ok(CATALOG[locale]['stickers.relay.connecting'], `${locale} stickers.relay.connecting`);
 	}
 });
+
+test('architecture post overlays match hash when present, else English', () => {
+	const baked = SONAR_BLOG.posts.find((p) => p.id === 'how-sonar-is-built');
+	assert.ok(baked, 'architecture post must be baked');
+	const byLocale = BLOG_TRANSLATIONS['how-sonar-is-built'];
+	const it = localizePosts([baked], 'it');
+	if (!byLocale) {
+		// Missing overlays (PR bake without translate secret) keep English.
+		assert.equal(it[0].title, baked.title);
+		assert.equal(it[0].md, baked.md);
+		return;
+	}
+	const hash = blogContentHash(baked.title, baked.excerpt, baked.md);
+	for (const [locale, overlay] of Object.entries(byLocale)) {
+		assert.equal(overlay.contentHash, hash, `${baked.id}/${locale}`);
+	}
+	assert.notEqual(it[0].title, baked.title);
+});

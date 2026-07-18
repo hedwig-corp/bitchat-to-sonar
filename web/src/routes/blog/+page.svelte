@@ -21,8 +21,11 @@
   let englishPosts = $state(SONAR_BLOG.posts);
   const locale = $derived(getLocale());
   const posts = $derived(localizePosts(englishPosts, locale));
-  const feature = $derived(posts.find((p) => p.feature) ?? posts[0] ?? null);
-  const rest = $derived(posts.filter((p) => p !== feature));
+  // Only the explicit `featured` tag — never fall back to posts[0], or a newer
+  // unfeatured post would steal the hero card when Chat Control is live-refreshed
+  // without the tag.
+  const feature = $derived(posts.find((p) => p.feature) ?? null);
+  const rest = $derived(feature ? posts.filter((p) => p !== feature) : posts);
 
   // Author byline (Nostr kind-0 profile): baked-in copy first, refreshed live.
   let author = $state(SONAR_BLOG_AUTHOR);
@@ -37,10 +40,11 @@
     const map = {
       'Sonar Docs.html': `${base}/docs`,
       'Sonar%20Docs.html': `${base}/docs`,
-      'Sonar Landing.html': `${base}/`,
-      'Sonar%20Landing.html': `${base}/`,
-      'Sonar Prototype.html': `${base}/${DOWNLOAD_HREF}`,
-      'Sonar%20Prototype.html': `${base}/${DOWNLOAD_HREF}`,
+      // Home download section (same target as nav "Get the app").
+      'Sonar Landing.html': `${base}/#download`,
+      'Sonar%20Landing.html': `${base}/#download`,
+      'Sonar Prototype.html': `${base}/#download`,
+      'Sonar%20Prototype.html': `${base}/#download`,
       'Sonar Status.html': `${base}/status`,
       'Sonar%20Status.html': `${base}/status`,
       'Sonar Stickers.html': `${base}/stickers`,
