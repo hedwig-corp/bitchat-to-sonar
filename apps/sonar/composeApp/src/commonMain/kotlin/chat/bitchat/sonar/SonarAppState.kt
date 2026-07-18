@@ -33,6 +33,7 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -7737,11 +7738,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Calls always win over voice playback (Signal parity). Called before an
      *  outgoing call is placed, an incoming call starts ringing, and when a
-     *  call is accepted. */
+     *  call is accepted. Awaits engine release so call audio cannot race the
+     *  still-playing ExoPlayer (same contract as [stopVoiceForRecording]). */
     private fun stopVoiceForCall() {
-        voiceControllerIfPresent()?.dispatch(
-            VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call)
-        )
+        val controller = voiceControllerIfPresent() ?: return
+        runBlocking {
+            controller.dispatchSync(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call))
+        }
     }
 
     /** Starting to record a new voice note stops any note currently playing

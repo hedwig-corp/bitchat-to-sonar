@@ -3,6 +3,7 @@ package chat.bitchat.sonar
 import android.content.Intent
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
+import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
@@ -46,12 +47,18 @@ class VoiceMessagePlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
-    /** Never linger as a silent foreground service once the task is swiped
-     *  away with nothing playing — mirrors the "never leave a mode/lock held"
-     *  invariant [CallAudioRoute] already follows for call audio. */
+    /** Tear down only when the voice session is truly idle. A paused note
+     *  (`isPlaying == false` but READY with a loaded item) must keep the
+     *  service/player alive — otherwise `onDestroy` releases ExoPlayer while
+     *  the app-scoped controller still holds a Paused item. */
     override fun onTaskRemoved(rootIntent: Intent?) {
         val player = VoicePlaybackSessionHolder.player
-        if (player == null || !player.isPlaying) stopSelf()
+        val keepAlive = player != null && (
+            player.isPlaying ||
+                player.playbackState == Player.STATE_READY ||
+                player.playbackState == Player.STATE_BUFFERING
+            )
+        if (!keepAlive) stopSelf()
         super.onTaskRemoved(rootIntent)
     }
 
