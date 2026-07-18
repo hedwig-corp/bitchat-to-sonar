@@ -53,11 +53,21 @@ actual object Notifier {
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
-    actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
+    actual fun notify(
+        id: Int,
+        title: String,
+        body: String,
+        sound: SonarNotificationSound,
+        conversationId: String?,
+    ) {
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
             .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
         playNotificationSound(sound)
+    }
+
+    actual fun clearConversations(conversationIds: Collection<String>) {
+        // Desktop tray balloons are ephemeral; nothing durable to dismiss.
     }
 
     private fun playNotificationSound(sound: SonarNotificationSound) {

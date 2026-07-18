@@ -161,6 +161,23 @@ object SonarLifecycle {
         pendingSharedTexts.clear()
         queued.forEach(handler)
     }
+
+    @Volatile private var onOpenConversation: ((String) -> Unit)? = null
+    private val pendingOpenConversations = mutableListOf<String>()
+
+    fun submitOpenConversation(conversationId: String) {
+        val id = conversationId.trim()
+        if (id.isEmpty()) return
+        val handler = onOpenConversation
+        if (handler != null) handler(id) else pendingOpenConversations.add(id)
+    }
+
+    fun installOpenConversationHandler(handler: (String) -> Unit) {
+        onOpenConversation = handler
+        val queued = pendingOpenConversations.toList()
+        pendingOpenConversations.clear()
+        queued.forEach(handler)
+    }
 }
 
 @Composable
@@ -178,6 +195,13 @@ fun App(
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
+    }
+    // Notification taps must wait for a coherent local chat list so folded
+    // group → mesh remapping and openChat paint from real rows, not a blank
+    // fallback screen.
+    LaunchedEffect(state.onboarded, state.locked, state.homeMessagesHydrated) {
+        if (!state.onboarded || state.locked || !state.homeMessagesHydrated) return@LaunchedEffect
+        SonarLifecycle.installOpenConversationHandler { state.openConversationFromNotification(it) }
     }
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()

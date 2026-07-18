@@ -3643,7 +3643,74 @@ class SonarAppState(private val scope: CoroutineScope) {
             unreadCount = unreadCount,
             prefs = notificationPrefs(),
         ) ?: return
-        Notifier.notify(notification.id, notification.title, notification.body, sound)
+        Notifier.notify(
+            id = notification.id,
+            title = notification.title,
+            body = notification.body,
+            sound = sound,
+            conversationId = idKey,
+        )
+    }
+
+    /** Dismiss OS notifications for this chat and every folded/duplicate id. */
+    private fun clearNotificationsForChat(chatId: String) {
+        val related = buildList {
+            addAll(directMarmotChatIds(chatId))
+            addAll(transcriptGroupIds(chatId))
+            foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
+            for ((groupId, peerId) in foldedGroupPeerIds) {
+                if (meshChatId(peerId) == chatId) add(groupId)
+            }
+        }
+        Notifier.clearConversations(
+            SonarNotificationHandoff.conversationIdsToClear(chatId, related)
+        )
+    }
+
+    /**
+     * Open the conversation named by a notification tap. Resolves folded
+     * White Noise groups onto their mesh home-row id so the user lands on the
+     * same transcript the notification was posted for.
+     */
+    fun openConversationFromNotification(conversationId: String) {
+        val id = conversationId.trim()
+        if (id.isEmpty()) return
+        foldedGroupPeerIds[id]?.let { peerId ->
+            openDm(peerId, meshPeerName(peerId))
+            return
+        }
+        chats.firstOrNull { it.id == id }?.let { chat ->
+            if (chat.id in foldedGroupIds) {
+                foldedGroupPeerIds[chat.id]?.let { peerId ->
+                    openDm(peerId, meshPeerName(peerId))
+                    return
+                }
+            }
+            openChat(chat)
+            return
+        }
+        if (isMeshChat(id)) {
+            openDm(meshPeerId(id), meshPeerName(meshPeerId(id)))
+            return
+        }
+        // Unknown / not yet in the local snapshot — still navigate so the tap
+        // is not a dead end; catch-up can hydrate the transcript afterwards.
+        push(Screen.Chat(id, "Chat"))
+        clearNotificationsForChat(id)
+        captureOpenChatUnread(id)
+        clearTranscriptHydrated(id)
+        beginTranscriptSession(id)
+        scope.launch {
+            runCatching { SonarCore.markConversationRead(id) }
+            runCatching { refreshChats() }
+            if ((screen as? Screen.Chat)?.id == id) {
+                setCurrentVisibleMessages(
+                    id,
+                    withSendEchoes(id, mergePendingMediaUploads(id, marmotMessagesPageForChat(id))),
+                    processCalls = true,
+                )
+            }
+        }
     }
 
     /** Notify from pages already fetched by the incremental call/pay scan.
@@ -4060,6 +4127,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun openChat(chat: SonarChat) {
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
+        clearNotificationsForChat(chat.id)
         val generation = beginTranscriptSession(chat.id)
         resolveMarmotGroupId(chat.id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
@@ -4139,6 +4207,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
+        clearNotificationsForChat(id)
         captureOpenChatUnread(id)
         clearTranscriptHydrated(id)
         val generation = beginTranscriptSession(id)

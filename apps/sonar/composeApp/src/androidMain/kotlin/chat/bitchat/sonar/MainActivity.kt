@@ -123,6 +123,7 @@ class MainActivity : ComponentActivity() {
         }
         handleInviteIntent(intent)
         handleShareIntent(intent)
+        handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
     }
 
@@ -177,8 +178,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleInviteIntent(intent)
         handleShareIntent(intent)
+        handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
     }
 
@@ -200,6 +203,15 @@ class MainActivity : ComponentActivity() {
         if (intent?.action != Intent.ACTION_SEND) return
         val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
         SonarLifecycle.submitSharedText(text)
+    }
+
+    private fun handleNotificationIntent(intent: Intent?) {
+        val chatId = intent?.getStringExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?: return
+        intent.removeExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
+        SonarLifecycle.submitOpenConversation(chatId)
     }
 
     /**
