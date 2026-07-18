@@ -34,11 +34,22 @@ test('localizePosts overlays Italian blog title when present', () => {
 			cat: 'Policy',
 			date: 'July 14, 2026',
 			read: '8 min read',
-			author: 'The Sonar team'
+			author: 'The Sonar team',
+			_ts: Math.floor(Date.UTC(2026, 6, 14) / 1000)
 		}
 	];
 	const it = localizePosts(en, 'it');
 	assert.notEqual(it[0].title, 'English title');
+	assert.notEqual(it[0].date, 'July 14, 2026');
 	assert.ok(BLOG_TRANSLATIONS['chat-control-explained']?.it?.md?.length > 100);
 	assert.equal(localizePosts(en, 'en')[0].title, 'English title');
+});
+
+test('non-English catalogs include status ping and feed keys', () => {
+	for (const locale of ['it', 'de', 'es', 'pt', 'fr']) {
+		assert.ok(CATALOG[locale]['status.ping.none'], `${locale} status.ping.none`);
+		assert.ok(CATALOG[locale]['status.ping.ok'], `${locale} status.ping.ok`);
+		assert.ok(CATALOG[locale]['status.feed.updated'], `${locale} status.feed.updated`);
+		assert.ok(CATALOG[locale]['stickers.relay.connecting'], `${locale} stickers.relay.connecting`);
+	}
 });

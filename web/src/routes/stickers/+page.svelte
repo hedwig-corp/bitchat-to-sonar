@@ -69,14 +69,22 @@
 
     status = 'loading';
     statusText = t('stickers.loading');
-    relayStates = relayList.map((relay) => ({ relay, state: 'loading', message: 'connecting' }));
+    relayStates = relayList.map((relay) => ({
+      relay,
+      state: 'loading',
+      message: t('stickers.relay.connecting')
+    }));
     copied = false;
 
     const responses = await Promise.all(relayList.map((relay) => queryRelay(relay, filter)));
     relayStates = responses.map(({ relay, state, message, events }) => ({
       relay,
       state,
-      message: message || `${events.length} event${events.length === 1 ? '' : 's'}`
+      message:
+        message ||
+        (events.length === 1
+          ? t('stickers.relay.events', { n: events.length })
+          : t('stickers.relay.eventsPlural', { n: events.length }))
     }));
 
     const byId = new Map();
@@ -217,7 +225,10 @@
       }
 
       timer = setTimeout(() => {
-        finish(events.length > 0 ? 'partial' : 'timeout', 'timeout');
+        finish(
+          events.length > 0 ? 'partial' : 'timeout',
+          t('stickers.relay.timeout')
+        );
       }, QUERY_TIMEOUT_MS);
 
       socket.addEventListener('open', () => {
@@ -241,17 +252,30 @@
           events.push(body);
         }
         if (type === 'EOSE') {
-          finish('ok', `${events.length} event${events.length === 1 ? '' : 's'}`);
+          finish(
+            'ok',
+            events.length === 1
+              ? t('stickers.relay.events', { n: events.length })
+              : t('stickers.relay.eventsPlural', { n: events.length })
+          );
         }
         if (type === 'CLOSED') {
-          finish(events.length > 0 ? 'partial' : 'closed', String(body ?? 'closed'));
+          finish(
+            events.length > 0 ? 'partial' : 'closed',
+            typeof body === 'string' && body ? body : t('stickers.relay.closed')
+          );
         }
         if (type === 'NOTICE') {
-          finish(events.length > 0 ? 'partial' : 'error', String(body ?? 'relay notice'));
+          finish(
+            events.length > 0 ? 'partial' : 'error',
+            typeof body === 'string' && body ? body : t('stickers.relay.error')
+          );
         }
       });
-      socket.addEventListener('error', () => finish('error', 'connection failed'));
-      socket.addEventListener('close', () => finish(events.length > 0 ? 'partial' : 'closed', 'closed'));
+      socket.addEventListener('error', () => finish('error', t('stickers.relay.failed')));
+      socket.addEventListener('close', () =>
+        finish(events.length > 0 ? 'partial' : 'closed', t('stickers.relay.closed'))
+      );
     });
   }
 

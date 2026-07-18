@@ -194,7 +194,14 @@ const en = {
 	'stickers.empty': 'No packs loaded.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'No sticker pack selected.',
-	'stickers.count': '{n} stickers'
+	'stickers.count': '{n} stickers',
+	'stickers.relay.connecting': "connecting",
+	'stickers.relay.timeout': "timeout",
+	'stickers.relay.closed': "closed",
+	'stickers.relay.error': "relay notice",
+	'stickers.relay.failed': "connection failed",
+	'stickers.relay.events': "{n} event",
+	'stickers.relay.eventsPlural': "{n} events",
 };
 
 /** @type {Record<string, string>} */
@@ -371,7 +378,17 @@ const it = {
 	'stickers.empty': 'Nessun pack caricato.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'Nessun pack selezionato.',
-	'stickers.count': '{n} stickers'
+	'stickers.count': '{n} stickers',
+	'status.ping.none': "0/{total} relay raggiungibili dal tuo browser in questo momento",
+	'status.ping.ok': "{reachable}/{total} relay raggiungibili · mediana {ms} ms · misurato dal tuo browser ora",
+	'status.feed.updated': "feed di stato · aggiornato {when}",
+	'stickers.relay.connecting': "connessione",
+	'stickers.relay.timeout': "timeout",
+	'stickers.relay.closed': "chiuso",
+	'stickers.relay.error': "avviso relay",
+	'stickers.relay.failed': "connessione non riuscita",
+	'stickers.relay.events': "{n} evento",
+	'stickers.relay.eventsPlural': "{n} eventi",
 };
 
 /** @type {Record<string, string>} */
@@ -548,7 +565,17 @@ const de = {
 	'stickers.empty': 'Keine Packs geladen.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'Kein Sticker-Pack ausgewählt.',
-	'stickers.count': '{n} Sticker'
+	'stickers.count': '{n} Sticker',
+	'status.ping.none': "0/{total} Relays gerade von deinem Browser erreichbar",
+	'status.ping.ok': "{reachable}/{total} Relays erreichbar · Median {ms} ms · gerade von deinem Browser gemessen",
+	'status.feed.updated': "Status-Feed · aktualisiert {when}",
+	'stickers.relay.connecting': "verbinden",
+	'stickers.relay.timeout': "Timeout",
+	'stickers.relay.closed': "geschlossen",
+	'stickers.relay.error': "Relay-Hinweis",
+	'stickers.relay.failed': "Verbindung fehlgeschlagen",
+	'stickers.relay.events': "{n} Event",
+	'stickers.relay.eventsPlural': "{n} Events",
 };
 
 /** @type {Record<string, string>} */
@@ -725,7 +752,17 @@ const es = {
 	'stickers.empty': 'No hay packs cargados.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'Ningún pack de stickers seleccionado.',
-	'stickers.count': '{n} stickers'
+	'stickers.count': '{n} stickers',
+	'status.ping.none': "0/{total} relays alcanzables desde tu navegador ahora",
+	'status.ping.ok': "{reachable}/{total} relays alcanzables · mediana {ms} ms · medido desde tu navegador ahora",
+	'status.feed.updated': "feed de estado · actualizado {when}",
+	'stickers.relay.connecting': "conectando",
+	'stickers.relay.timeout': "timeout",
+	'stickers.relay.closed': "cerrado",
+	'stickers.relay.error': "aviso del relay",
+	'stickers.relay.failed': "conexión fallida",
+	'stickers.relay.events': "{n} evento",
+	'stickers.relay.eventsPlural': "{n} eventos",
 };
 
 /** @type {Record<string, string>} */
@@ -902,7 +939,17 @@ const pt = {
 	'stickers.empty': 'Nenhum pack carregado.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'Nenhum pack de stickers selecionado.',
-	'stickers.count': '{n} stickers'
+	'stickers.count': '{n} stickers',
+	'status.ping.none': "0/{total} relays alcançáveis do seu navegador agora",
+	'status.ping.ok': "{reachable}/{total} relays alcançáveis · mediana {ms} ms · medido do seu navegador agora",
+	'status.feed.updated': "feed de status · atualizado {when}",
+	'stickers.relay.connecting': "conectando",
+	'stickers.relay.timeout': "timeout",
+	'stickers.relay.closed': "fechado",
+	'stickers.relay.error': "aviso do relay",
+	'stickers.relay.failed': "falha na conexão",
+	'stickers.relay.events': "{n} evento",
+	'stickers.relay.eventsPlural': "{n} eventos",
 };
 
 /** @type {Record<string, string>} */
@@ -1079,7 +1126,17 @@ const fr = {
 	'stickers.empty': 'Aucun pack chargé.',
 	'stickers.pack': 'Pack',
 	'stickers.noneSelected': 'Aucun pack de stickers sélectionné.',
-	'stickers.count': '{n} stickers'
+	'stickers.count': '{n} stickers',
+	'status.ping.none': "0/{total} relays joignables depuis votre navigateur pour l’instant",
+	'status.ping.ok': "{reachable}/{total} relays joignables · médiane {ms} ms · mesuré depuis votre navigateur à l’instant",
+	'status.feed.updated': "flux de statut · mis à jour {when}",
+	'stickers.relay.connecting': "connexion",
+	'stickers.relay.timeout': "timeout",
+	'stickers.relay.closed': "fermé",
+	'stickers.relay.error': "avis du relay",
+	'stickers.relay.failed': "échec de connexion",
+	'stickers.relay.events': "{n} événement",
+	'stickers.relay.eventsPlural': "{n} événements",
 };
 
 /** @type {Record<string, Record<string, string>>} */

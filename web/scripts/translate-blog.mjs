@@ -11,7 +11,7 @@
 // Best-effort: never exits non-zero.
 
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, renameSync, existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SONAR_BLOG } from '../src/lib/blog-content.js';
@@ -179,7 +179,10 @@ async function main() {
 		console.error('translate-blog: nothing new to write.');
 		return;
 	}
-	writeFileSync(OUT, render(next), 'utf8');
+	// Atomic replace so a parent SIGKILL cannot leave a truncated overlays file.
+	const tmp = `${OUT}.tmp`;
+	writeFileSync(tmp, render(next), 'utf8');
+	renameSync(tmp, OUT);
 	console.error(`translate-blog: wrote ${wrote} overlay(s) to src/lib/blog-translations.js`);
 }
 

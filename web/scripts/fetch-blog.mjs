@@ -66,7 +66,8 @@ async function main() {
 		console.error('fetch-blog: no marked posts returned — leaving blog-content.js unchanged.');
 		return;
 	}
-	const posts = raw.map(({ _ts, ...p }) => p);
+	// Keep `_ts` so the site can localize dates without re-parsing English strings.
+	const posts = raw;
 	const author = await withTimeout(fetchAuthorProfile(), 15_000, 'fetchAuthorProfile').catch(
 		() => null
 	);
@@ -145,12 +146,13 @@ function render(posts, authorProfile) {
  * @property {string} id        url-hash slug, e.g. 'why-no-accounts'
  * @property {string} title
  * @property {'Policy' | 'Design' | 'Engineering'} cat  Policy = gold, Design = indigo, else cyan
- * @property {string} date      e.g. 'July 12, 2026'
+ * @property {string} date      e.g. 'July 12, 2026' (English bake; UI re-formats via _ts)
  * @property {string} read      e.g. '6 min read'
  * @property {string} author    e.g. 'The Sonar team'
  * @property {boolean} [feature] pinned as the featured card
  * @property {string} excerpt   one-paragraph teaser shown on the cards
  * @property {string} md        body in markdown — same parser as Docs ($lib/markdown.js)
+ * @property {number} [_ts]     unix seconds for locale-aware date formatting
  */
 
 /** @type {{ posts: BlogPost[] }} */

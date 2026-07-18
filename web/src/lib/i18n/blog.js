@@ -17,19 +17,23 @@ import { estimateReadTime, formatBlogDate } from '../blog-data.js';
 export function localizePosts(posts, locale) {
 	if (!locale || locale === 'en' || !Array.isArray(posts)) return posts;
 	return posts.map((post) => {
+		const date = localizedPostDate(/** @type {BlogPost & { _ts?: number }} */ (post), locale);
 		const overlay = BLOG_TRANSLATIONS?.[post.id]?.[locale];
-		if (!overlay) return post;
+		if (!overlay) {
+			return date === post.date ? post : { ...post, date };
+		}
 		const md = typeof overlay.md === 'string' && overlay.md.trim() ? overlay.md : post.md;
 		const read =
 			typeof overlay.read === 'string' && overlay.read.trim()
 				? overlay.read
-				: estimateReadTime(md);
+				: estimateReadTime(md, locale);
 		return {
 			...post,
 			title: overlay.title?.trim() || post.title,
 			excerpt: overlay.excerpt?.trim() || post.excerpt,
 			md,
-			read
+			read,
+			date
 		};
 	});
 }
