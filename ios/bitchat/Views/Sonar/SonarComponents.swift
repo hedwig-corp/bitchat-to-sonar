@@ -2548,7 +2548,9 @@ struct SNMediaBubble: View {
             failed = false
             // A deck loads each card's bytes itself (lazy, only visible pages),
             // so the bubble skips the single-item load path.
-            guard !isDeck, let item else { return }
+            // Voice notes are file-backed via SNAudioBubble — do not map them
+            // into mediaData just to discard the bytes.
+            guard !isDeck, let item, !item.mime.hasPrefix("audio/") else { return }
             let transfer = pipeline.state(item)
             failed = transfer.phase == .failed
             guard transfer.phase == .available else { return }

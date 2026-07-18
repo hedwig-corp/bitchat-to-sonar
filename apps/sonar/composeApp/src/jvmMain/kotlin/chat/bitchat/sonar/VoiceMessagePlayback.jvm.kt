@@ -45,6 +45,9 @@ private class JavaFxVoicePlaybackEngine(
                 try {
                     val media = Media(uri)
                     val mp = MediaPlayer(media)
+                    // Capture prepare generation so a disposed player's end/error
+                    // cannot be reported against a newer item after switch.
+                    val callbackGeneration = generation
                     mp.setOnReady {
                         ready.countDown()
                     }
@@ -55,11 +58,11 @@ private class JavaFxVoicePlaybackEngine(
                             prepareError = mp.error ?: IllegalStateException("javafx media error")
                             ready.countDown()
                         } else {
-                            host.onFailed(this.generation.get())
+                            host.onFailed(callbackGeneration)
                         }
                     }
                     mp.setOnEndOfMedia {
-                        host.onEnded(this.generation.get())
+                        host.onEnded(callbackGeneration)
                     }
                     mp.setOnPlaying {
                         // no-op; controller drives phase
@@ -122,8 +125,16 @@ private class JavaFxVoicePlaybackEngine(
     }
 
     private fun releaseLocked() {
-        runCatching { player?.stop() }
-        runCatching { player?.dispose() }
+        player?.let { mp ->
+            // Drop handlers before dispose so a late FX callback cannot race
+            // against the next prepare()'s generation.
+            runCatching { mp.setOnError(null) }
+            runCatching { mp.setOnEndOfMedia(null) }
+            runCatching { mp.setOnReady(null) }
+            runCatching { mp.setOnPlaying(null) }
+            runCatching { mp.stop() }
+            runCatching { mp.dispose() }
+        }
         player = null
     }
 
