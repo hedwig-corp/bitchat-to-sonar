@@ -899,8 +899,7 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        requireNode().deleteGroup(chatId)
     }
 
     // ── Push token registration (MIP-05) ──

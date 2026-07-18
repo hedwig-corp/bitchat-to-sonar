@@ -5357,6 +5357,9 @@ final class SonarAppStore: ObservableObject {
                 )
                 await finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
+                guard self.isActivePendingMarmotGroupSetup(pendingId: pendingId, token: setupToken) else {
+                    return
+                }
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
                 showToast("Couldn't accept invite: \(error.localizedDescription)")
                 await marmot.loadLocal()
@@ -5396,6 +5399,23 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotMessagesByChat[pendingId] = pendingMarmotMessagesByChat[pendingId]?.map {
             queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
         }
+    }
+
+    enum PendingInviteCancellationAction: Equatable {
+        case declineInvite(String)
+        case deleteGroup(String)
+    }
+
+    static func pendingInviteCancellationAction(
+        inviteId: String,
+        expectedGroupId: String?,
+        pendingInviteIds: Set<String>
+    ) -> PendingInviteCancellationAction? {
+        if pendingInviteIds.contains(inviteId) {
+            return .declineInvite(inviteId)
+        }
+        guard let expectedGroupId else { return nil }
+        return .deleteGroup(expectedGroupId)
     }
 
     static func isRecoveredGroupCancellation(_ error: Error) -> Bool {
@@ -7977,8 +7997,29 @@ final class SonarAppStore: ObservableObject {
                             showToast("Couldn't discard group setup: \(error.localizedDescription)")
                             return
                         }
-                    } else if let expectedGroupId = pendingGroup.inviteGroupId {
-                        await marmot.deleteGroup(expectedGroupId)
+                    } else if let inviteId = pendingGroup.inviteId {
+                        do {
+                            // Query the core after the cancelled accept settles;
+                            // the published invite list was hidden optimistically.
+                            let action = Self.pendingInviteCancellationAction(
+                                inviteId: inviteId,
+                                expectedGroupId: pendingGroup.inviteGroupId,
+                                pendingInviteIds: try await marmot.pendingGroupInviteIds()
+                            )
+                            switch action {
+                            case .declineInvite(let pendingInviteId):
+                                try await marmot.declineGroupInvite(inviteId: pendingInviteId)
+                            case .deleteGroup(let acceptedGroupId):
+                                try await marmot.deleteGroupChecked(acceptedGroupId)
+                            case nil:
+                                throw MarmotService.ServiceError.invalidInput(
+                                    "group invite is no longer available"
+                                )
+                            }
+                        } catch {
+                            showToast("Couldn't discard group setup: \(error.localizedDescription)")
+                            return
+                        }
                     }
                     discardPreRouteMessages(matching: [id])
                 }

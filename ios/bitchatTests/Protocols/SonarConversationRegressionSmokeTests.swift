@@ -31,6 +31,28 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func pendingInviteCancellationDeclinesWelcomeBeforeItCanResurface() {
+        let inviteId = "welcome-event"
+        let groupId = "expected-group"
+
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: groupId,
+            pendingInviteIds: Set([inviteId])
+        ) == .declineInvite(inviteId))
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: groupId,
+            pendingInviteIds: []
+        ) == .deleteGroup(groupId))
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: nil,
+            pendingInviteIds: []
+        ) == nil)
+    }
+
+    @Test
     func saraAndVincenzoRemainSeparateCryptographicConversations() {
         let own = npub(1)
         let sara = npub(2)

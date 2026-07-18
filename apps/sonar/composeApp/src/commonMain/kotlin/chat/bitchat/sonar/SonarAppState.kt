@@ -140,6 +140,21 @@ internal data class PreRouteGroupRestorePlan(
     val restoreMessage: Boolean,
 )
 
+internal data class PendingInviteCancellationAction(
+    val inviteIdToDecline: String? = null,
+    val groupIdToDelete: String? = null,
+)
+
+internal fun pendingInviteCancellationAction(
+    inviteId: String,
+    expectedGroupId: String?,
+    pendingInviteIds: Set<String>,
+): PendingInviteCancellationAction? = when {
+    inviteId in pendingInviteIds -> PendingInviteCancellationAction(inviteIdToDecline = inviteId)
+    expectedGroupId != null -> PendingInviteCancellationAction(groupIdToDelete = expectedGroupId)
+    else -> null
+}
+
 internal fun preRouteGroupRestorePlan(routeKind: String, routeContext: String): PreRouteGroupRestorePlan? {
     val parts = decodePreRouteContext(routeContext) ?: return null
     return when (routeKind) {
@@ -4598,7 +4613,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                         runCatching { SonarCore.discardPreRouteGroupOperation(chatId) }
                     } else {
                         runCatching {
-                            pendingGroup.inviteGroupId?.let { SonarCore.deleteChat(it) }
+                            val action = pendingInviteCancellationAction(
+                                inviteId = pendingGroup.inviteId,
+                                expectedGroupId = pendingGroup.inviteGroupId,
+                                pendingInviteIds = SonarCore.pendingGroupInvites().mapTo(mutableSetOf()) { it.id },
+                            ) ?: error("group invite is no longer available")
+                            action.inviteIdToDecline?.let { SonarCore.declineGroupInvite(it) }
+                            action.groupIdToDelete?.let { SonarCore.deleteChat(it) }
                         }
                     }
                     discard

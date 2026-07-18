@@ -3175,7 +3175,20 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func declineGroupInvite(_ invite: MarmotService.GroupInvite) async throws {
-        try await service.declineGroupInvite(invite.id)
+        try await declineGroupInvite(inviteId: invite.id)
+    }
+
+    func declineGroupInvite(inviteId: String) async throws {
+        try await service.declineGroupInvite(inviteId)
+        await loadLocal()
+    }
+
+    func pendingGroupInviteIds() async throws -> Set<String> {
+        Set(try await service.pendingGroupInvites().map(\.id))
+    }
+
+    func deleteGroupChecked(_ groupId: String) async throws {
+        try await service.deleteGroup(groupId: groupId)
         await loadLocal()
     }
 

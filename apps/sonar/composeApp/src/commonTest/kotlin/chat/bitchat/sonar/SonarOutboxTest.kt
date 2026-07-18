@@ -145,4 +145,20 @@ class SonarOutboxTest {
         assertEquals(groupId, resolvedPreRouteChatId(groupId, "group-pending:setup"))
         assertEquals("mesh:peer", resolvedPreRouteChatId(groupId, "mesh:peer"))
     }
+
+    @Test
+    fun pendingInviteCancellationDeclinesWelcomeBeforeItCanResurface() {
+        val inviteId = "welcome-event"
+        val groupId = "expected-group"
+
+        assertEquals(
+            PendingInviteCancellationAction(inviteIdToDecline = inviteId),
+            pendingInviteCancellationAction(inviteId, groupId, setOf(inviteId)),
+        )
+        assertEquals(
+            PendingInviteCancellationAction(groupIdToDelete = groupId),
+            pendingInviteCancellationAction(inviteId, groupId, emptySet()),
+        )
+        assertNull(pendingInviteCancellationAction(inviteId, null, emptySet()))
+    }
 }
