@@ -95,58 +95,70 @@ private class AndroidVoicePlaybackEngine(
     override suspend fun prepare(item: VoicePlaybackItem, generation: Long) {
         val file = File(item.localFile)
         if (!file.isFile) error("missing local voice file")
+        var prepareError: Throwable? = null
         runOnMain {
-            val exoPlayer = ensureServiceStartedOnMain()
-            synchronized(lock) {
-                releaseListenerLocked(exoPlayer)
-                this.generation.set(generation)
-                exoPlayer.stop()
-                exoPlayer.clearMediaItems()
-                // Privacy-safe metadata only — never a sender name, chat title, or path.
-                exoPlayer.setMediaItem(
-                    MediaItem.Builder()
-                        .setUri(file.toURI().toString())
-                        .setMediaMetadata(
-                            MediaMetadata.Builder()
-                                .setTitle("Voice message")
-                                .build()
-                        )
-                        .build()
-                )
-                val playerListener = object : Player.Listener {
-                    override fun onPlaybackStateChanged(playbackState: Int) {
-                        if (playbackState == Player.STATE_ENDED) {
-                            host.onEnded(this@AndroidVoicePlaybackEngine.generation.get())
+            try {
+                val exoPlayer = ensureServiceStartedOnMain()
+                synchronized(lock) {
+                    releaseListenerLocked(exoPlayer)
+                    this.generation.set(generation)
+                    exoPlayer.stop()
+                    exoPlayer.clearMediaItems()
+                    // Privacy-safe metadata only — never a sender name, chat title, or path.
+                    exoPlayer.setMediaItem(
+                        MediaItem.Builder()
+                            .setUri(file.toURI().toString())
+                            .setMediaMetadata(
+                                MediaMetadata.Builder()
+                                    .setTitle("Voice message")
+                                    .build()
+                            )
+                            .build()
+                    )
+                    val playerListener = object : Player.Listener {
+                        override fun onPlaybackStateChanged(playbackState: Int) {
+                            if (playbackState == Player.STATE_ENDED) {
+                                host.onEnded(this@AndroidVoicePlaybackEngine.generation.get())
+                            }
+                        }
+                        override fun onIsPlayingChanged(isPlaying: Boolean) {
+                            // Lock-screen / notification / BT can pause/play the
+                            // ExoPlayer without going through the controller. The
+                            // host must only apply these when they diverge from
+                            // controller state (see SonarAppState wiring).
+                            val gen = this@AndroidVoicePlaybackEngine.generation.get()
+                            if (!isPlaying) {
+                                if (suppressExternalPause.get()) return
+                                val reason = synchronized(lock) { player?.playbackState }
+                                if (reason == Player.STATE_ENDED || reason == Player.STATE_IDLE) return
+                                host.onExternalPaused(gen)
+                            } else {
+                                suppressExternalPause.set(false)
+                                host.onExternalResumed(gen)
+                            }
+                        }
+                        override fun onPlayerError(error: PlaybackException) {
+                            host.onFailed(this@AndroidVoicePlaybackEngine.generation.get())
                         }
                     }
-                    override fun onIsPlayingChanged(isPlaying: Boolean) {
-                        // Lock-screen / notification / BT can pause/play the
-                        // ExoPlayer without going through the controller. The
-                        // host must only apply these when they diverge from
-                        // controller state (see SonarAppState wiring).
-                        val gen = this@AndroidVoicePlaybackEngine.generation.get()
-                        if (!isPlaying) {
-                            if (suppressExternalPause.get()) return
-                            val reason = synchronized(lock) { player?.playbackState }
-                            if (reason == Player.STATE_ENDED || reason == Player.STATE_IDLE) return
-                            host.onExternalPaused(gen)
-                        } else {
-                            suppressExternalPause.set(false)
-                            host.onExternalResumed(gen)
-                        }
+                    exoPlayer.addListener(playerListener)
+                    listener = playerListener
+                    player = exoPlayer
+                    exoPlayer.prepare()
+                    if (!requestFocus()) {
+                        releaseListenerLocked(exoPlayer)
+                        runCatching { exoPlayer.stop() }
+                        runCatching { exoPlayer.clearMediaItems() }
+                        player = null
+                        throw IllegalStateException("audio focus denied")
                     }
-                    override fun onPlayerError(error: PlaybackException) {
-                        host.onFailed(this@AndroidVoicePlaybackEngine.generation.get())
-                    }
+                    registerNoisy()
                 }
-                exoPlayer.addListener(playerListener)
-                listener = playerListener
-                player = exoPlayer
-                exoPlayer.prepare()
-                requestFocus()
-                registerNoisy()
+            } catch (t: Throwable) {
+                prepareError = t
             }
         }
+        prepareError?.let { throw it }
     }
 
     override fun play() {
@@ -245,9 +257,11 @@ private class AndroidVoicePlaybackEngine(
         return created
     }
 
-    private fun requestFocus() {
-        val am = AppContextHolder.ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    /** Returns true only when the system granted exclusive media focus. */
+    private fun requestFocus(): Boolean {
+        val am = AppContextHolder.ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(
                     PlatformAudioAttributes.Builder()
@@ -258,14 +272,14 @@ private class AndroidVoicePlaybackEngine(
                 .setOnAudioFocusChangeListener(focusChangeListener)
                 .build()
             focusRequest = req
-            am.requestAudioFocus(req)
+            am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         } else {
             @Suppress("DEPRECATION")
             am.requestAudioFocus(
                 focusChangeListener,
                 AudioManager.STREAM_MUSIC,
                 AudioManager.AUDIOFOCUS_GAIN,
-            )
+            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         }
     }
 

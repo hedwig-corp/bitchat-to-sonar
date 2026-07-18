@@ -33,7 +33,6 @@ import kotlinx.coroutines.flow.launchIn
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -1349,15 +1348,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         // setup (bind/offer) runs below. (ensureCallStarted is idempotent — it
         // guards on callStarted, so unlike the old iOS path it never re-binds.)
         // iOS parity: video defaults to speaker, voice to earpiece (+ proximity).
-        // Calls always win over voice-note playback.
-        stopVoiceForCall()
-        CallAudioRoute.configure(active = true, speakerOn = video, voiceProximity = !video)
+        // Paint the ringing screen immediately; await voice teardown off the
+        // UI thread before taking call audio (never runBlocking on Main).
         activeCall = ActiveCall(
             callId, chatId, peerName, video, incoming = false, phase = SonarCallState.Ringing,
             speakerOn = video, camOn = video,
         )
         push(Screen.Call(chatId, peerName, video))
         scope.launch {
+            stopVoiceForCall()
+            CallAudioRoute.configure(active = true, speakerOn = video, voiceProximity = !video)
             ensureCallStarted()
             if (!callStarted) {
                 toast = "Calling isn’t available right now"
@@ -1399,9 +1399,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun acceptCall() {
         val c = activeCall ?: return
         activeCall = c.copy(phase = SonarCallState.Connecting)
-        stopVoiceForCall()
-        CallAudioRoute.configure(active = true, speakerOn = c.speakerOn, voiceProximity = !c.video)
         scope.launch {
+            stopVoiceForCall()
+            CallAudioRoute.configure(active = true, speakerOn = c.speakerOn, voiceProximity = !c.video)
             try {
                 val addr = SonarCore.callLocalAddress()
                 val sent = sendCallControl(c.chatId, SonarCore.callEncodeAnswer(c.callId, SonarAnswer.Accept, addr))
@@ -1606,25 +1606,28 @@ class SonarAppState(private val scope: CoroutineScope) {
                 val name = callPeerName(callChatId)
                 // iOS parity (SNActiveCall(speakerOn: video)): video rings on
                 // speaker with the camera armed; voice rings for the earpiece.
-                // A ringing call preempts any voice note already playing.
-                stopVoiceForCall()
-                activeCall = ActiveCall(
-                    ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing,
-                    speakerOn = ctrl.video, camOn = ctrl.video,
-                )
-                notifyIncoming(
-                    idKey = callChatId,
-                    conversationTitle = name,
-                    content = m.content,
-                    forcedKind = SonarNotificationKind.Call,
-                    senderName = name,
-                    sound = if (isMeshChat(chatId) && !m.viaInternet) {
-                        SonarNotificationSound.Ble
-                    } else {
-                        SonarNotificationSound.Default
-                    },
-                )
-                push(Screen.Call(callChatId, name, ctrl.video))
+                // Await voice teardown off the event path before ringing UI —
+                // never block the Main Looper with runBlocking + dispatchSync.
+                scope.launch {
+                    stopVoiceForCall()
+                    activeCall = ActiveCall(
+                        ctrl.callId, callChatId, name, ctrl.video, incoming = true, phase = SonarCallState.Ringing,
+                        speakerOn = ctrl.video, camOn = ctrl.video,
+                    )
+                    notifyIncoming(
+                        idKey = callChatId,
+                        conversationTitle = name,
+                        content = m.content,
+                        forcedKind = SonarNotificationKind.Call,
+                        senderName = name,
+                        sound = if (isMeshChat(chatId) && !m.viaInternet) {
+                            SonarNotificationSound.Ble
+                        } else {
+                            SonarNotificationSound.Default
+                        },
+                    )
+                    push(Screen.Call(callChatId, name, ctrl.video))
+                }
             }
             is SonarCallControl.Answer ->
                 if (activeCall?.callId == ctrl.callId) runCatching { SonarCore.callAnswer(ctrl.callId, ctrl.answer, ctrl.addrB64) }
@@ -7629,6 +7632,16 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun rememberVoiceQueueSnapshot(logicalConversationId: String) {
         voiceQueueSnapshot = logicalConversationId to voiceItemsInOpenWindow(logicalConversationId)
+        // Probe disk-cached voice notes that bubbles have not prepared yet so
+        // Next/autoplay survives app restart / offscreen rows (MediaCache
+        // exists() is suspend — never call it on the UI path).
+        scope.launch {
+            warmVoiceTransfersInOpenWindow()
+            if (voiceQueueSnapshot?.first == logicalConversationId) {
+                voiceQueueSnapshot =
+                    logicalConversationId to voiceItemsInOpenWindow(logicalConversationId)
+            }
+        }
     }
 
     private inner class AppVoicePlaybackQueue : VoicePlaybackQueue {
@@ -7654,7 +7667,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Every locally-available voice attachment in the bounded open transcript
      *  window for [chatId], oldest first. Undownloaded rows are excluded so
-     *  Next/autoplay never lands on an empty `localFile`. */
+     *  Next/autoplay never lands on an empty `localFile`. Relies on
+     *  [mediaTransfers]; [warmVoiceTransfersInOpenWindow] probes disk cache
+     *  for unprobed audio rows so restart/offscreen notes still enqueue. */
     private fun voiceItemsInOpenWindow(chatId: String): List<VoicePlaybackItem> =
         messages.asSequence()
             .sortedWith(compareBy({ it.tsSecs }, { it.id }))
@@ -7670,6 +7685,26 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
             }
             .toList()
+
+    /** Bounded open-window probe: mark disk-cached voice notes Available in
+     *  [mediaTransfers] without scanning full history. */
+    private suspend fun warmVoiceTransfersInOpenWindow() {
+        for (msg in messages) {
+            for (media in msg.media) {
+                if (!media.isAudio) continue
+                val existing = mediaTransfers[media.url]
+                if (existing?.phase == MediaTransferPhase.Available &&
+                    !existing.localPath.isNullOrEmpty()
+                ) {
+                    continue
+                }
+                val finalPath = MediaCache.finalPath(media.url)
+                if (MediaCache.exists(finalPath)) {
+                    setMediaTransfer(media.url, MediaTransferState.available(finalPath))
+                }
+            }
+        }
+    }
 
     /** Build the stable identity for one voice attachment. [chatId] is
      *  already the canonical/folded UI conversation id — every media helper
@@ -7734,13 +7769,13 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Calls always win over voice playback (Signal parity). Called before an
      *  outgoing call is placed, an incoming call starts ringing, and when a
-     *  call is accepted. Awaits engine release so call audio cannot race the
-     *  still-playing ExoPlayer (same contract as [stopVoiceForRecording]). */
-    private fun stopVoiceForCall() {
-        val controller = voiceControllerIfPresent() ?: return
-        runBlocking {
-            controller.dispatchSync(VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call))
-        }
+     *  call is accepted. Suspends until engine release — callers must await
+     *  from a coroutine (never `runBlocking` on Main; Android engine hops to
+     *  the main Looper while the controller mutex is held). */
+    private suspend fun stopVoiceForCall() {
+        voiceControllerIfPresent()?.dispatchSync(
+            VoicePlaybackCommand.Stop(VoicePlaybackStopReason.Call)
+        )
     }
 
     /** Starting to record a new voice note stops any note currently playing
