@@ -639,7 +639,8 @@ struct ContentView: View {
                     prompt: Text(
                         String(localized: "content.input.message_placeholder", comment: "Placeholder shown in the chat composer")
                     )
-                    .foregroundColor(secondaryTextColor.opacity(0.6))
+                    .foregroundColor(secondaryTextColor.opacity(0.6)),
+                    onSend: sendMessage
                 )
                 .textFieldStyle(.plain)
                 .font(.bitchatSystem(size: 15, design: .monospaced))

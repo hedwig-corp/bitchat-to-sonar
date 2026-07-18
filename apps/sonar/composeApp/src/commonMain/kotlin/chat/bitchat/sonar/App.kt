@@ -1509,7 +1509,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         value = draft, onValueChange = { draft = it },
                         textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                         cursorBrush = SolidColor(s.accent),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
+                        onSend = {
+                            if (draft.isBlank()) return@MessageComposerTextField
+                            val d = draft; draft = ""
+                            emojiTray = false
+                            if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
+                                state.send(screen.id, d)
+                            }
+                        },
                     )
                 }
             }
@@ -2019,7 +2027,12 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    onSend = {
+                        if (draft.isBlank()) return@MessageComposerTextField
+                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, draft)
+                        draft = ""
+                    },
                 )
             }
             Spacer(Modifier.width(8.dp))
