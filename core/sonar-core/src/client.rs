@@ -2322,6 +2322,17 @@ impl SonarClient {
     ) -> Result<GroupId> {
         let _operation_guard = self.group_operation_gate.lock().await;
         let description = group_operation_description(operation_id)?;
+        let cancellation_pending = self
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(&description)
+            .is_some_and(|checkpoint| checkpoint.cancelled);
+        if cancellation_pending {
+            self.finish_cancelled_group_operation(operation_id, &description)
+                .await?;
+            return Err(Error::InvalidInput("group operation was cancelled".into()));
+        }
         if let Some(group_id) = self.find_group_for_operation(&members, name, &description)? {
             if let Some(group_id) = self
                 .resume_idempotent_group_creation(&description, group_id)
@@ -2338,6 +2349,7 @@ impl SonarClient {
                     operation_description: description.clone(),
                     group_id_hex: None,
                     welcome_event_jsons: Vec::new(),
+                    cancelled: false,
                 })?,
                 Some(checkpoint) if checkpoint.group_id_hex.is_none() => {}
                 Some(_) => {
@@ -2536,6 +2548,7 @@ impl SonarClient {
             operation_description: operation_description.to_string(),
             group_id_hex: Some(hex::encode(group_id.as_slice())),
             welcome_event_jsons,
+            cancelled: false,
         };
         if let Err(err) = self
             .pre_route_outbox
@@ -3772,11 +3785,24 @@ impl SonarClient {
     }
 
     /// Cancel a durable host group operation after the user explicitly deletes
-    /// its pending row. Any locally-created marker group is removed before the
-    /// encrypted sentinel and Welcome checkpoint are cleared.
+    /// its pending row. Cancellation is checkpointed before MLS deletion; the
+    /// encrypted marker and sentinel remain until cleanup finishes atomically.
     pub async fn discard_pre_route_group_operation(&self, operation_id: &str) -> Result<()> {
         let _operation_guard = self.group_operation_gate.lock().await;
         let description = group_operation_description(operation_id)?;
+        self.pre_route_outbox
+            .lock()
+            .unwrap()
+            .mark_pending_group_operation_cancelled(&description)?;
+        self.finish_cancelled_group_operation(operation_id, &description)
+            .await
+    }
+
+    async fn finish_cancelled_group_operation(
+        &self,
+        operation_id: &str,
+        description: &str,
+    ) -> Result<()> {
         let group_ids: Vec<_> = self
             .engine
             .groups()?
@@ -3790,7 +3816,7 @@ impl SonarClient {
         self.pre_route_outbox
             .lock()
             .unwrap()
-            .discard_pending_group_operation(operation_id, &description)
+            .discard_pending_group_operation(operation_id, description)
     }
 
     /// Retry one failed outgoing message using the exact encrypted event stored
@@ -7750,6 +7776,7 @@ mod tests {
                 operation_description: description.clone(),
                 group_id_hex: None,
                 welcome_event_jsons: Vec::new(),
+                cancelled: false,
             })
             .unwrap();
         bob.engine
@@ -7807,6 +7834,7 @@ mod tests {
                 operation_description: description.clone(),
                 group_id_hex: Some(hex::encode(group_id.as_slice())),
                 welcome_event_jsons: wrapped.iter().map(|event| event.as_json()).collect(),
+                cancelled: false,
             })
             .unwrap();
 
@@ -7876,6 +7904,7 @@ mod tests {
                 operation_description: description.clone(),
                 group_id_hex: None,
                 welcome_event_jsons: Vec::new(),
+                cancelled: false,
             })
             .unwrap();
         bob.enqueue_pre_route_message(PreRouteMessage {
@@ -7902,6 +7931,76 @@ mod tests {
             None
         );
         assert!(bob.engine.create_text_message(&group_id, "gone").is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_operation_finishes_cleanup_after_group_delete_crash() {
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let members = vec![carol.identity().public_key(), dave.identity().public_key()];
+        let operation_id = "cancelled-after-group-delete";
+        let description = group_operation_description(operation_id).unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Cancelled group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays,
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                welcome_event_jsons: vec!["{}".into()],
+                cancelled: false,
+            })
+            .unwrap();
+        bob.enqueue_pre_route_message(PreRouteMessage {
+            id: "cancelled-group-sentinel".into(),
+            route_kind: crate::pre_route_outbox::GROUP_OPERATION_ROUTE_KIND.into(),
+            route_id: operation_id.into(),
+            route_context: "metadata".into(),
+            content: String::new(),
+            created_at_secs: 1,
+        })
+        .unwrap();
+
+        // Model a process death after the durable cancellation marker and MLS
+        // deletion, but before the marker + sentinel manifest cleanup.
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .mark_pending_group_operation_cancelled(&description)
+            .unwrap();
+        bob.engine.delete_group(&group_id).unwrap();
+
+        let error = bob
+            .start_group_idempotent(members, "Cancelled group", operation_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert!(bob.engine.groups().unwrap().is_empty());
+        assert!(bob.pre_route_messages().is_empty());
+        assert_eq!(
+            bob.pre_route_outbox
+                .lock()
+                .unwrap()
+                .pending_group_creation(&description),
+            None
+        );
     }
 
     #[tokio::test]

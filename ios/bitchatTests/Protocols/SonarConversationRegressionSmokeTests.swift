@@ -18,6 +18,16 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func recoveredGroupCancellationIsRetiredInsteadOfShownAsFailed() {
+        #expect(SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.invalidInput("group operation was cancelled")
+        ))
+        #expect(!SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.core("relay temporarily unavailable")
+        ))
+    }
+
+    @Test
     func saraAndVincenzoRemainSeparateCryptographicConversations() {
         let own = npub(1)
         let sara = npub(2)

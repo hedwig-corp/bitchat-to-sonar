@@ -92,6 +92,7 @@ internal const val PRE_ROUTE_GROUP_CREATE = "group-create"
 internal const val PRE_ROUTE_GROUP_INVITE = "group-invite"
 internal const val PRE_ROUTE_GROUP_OPERATION = "group-operation"
 private const val PRE_ROUTE_GROUP_OPERATION_ID_PREFIX = "group-operation:"
+internal const val RECOVERED_GROUP_CANCELLATION = "group operation was cancelled"
 private const val PRE_ROUTE_PEER = "peer"
 private const val PRE_ROUTE_MARMOT_GROUP = "marmot-group"
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
@@ -102,6 +103,9 @@ internal fun encodePreRouteContext(parts: List<String>): String =
             byte.toUByte().toString(16).padStart(2, '0')
         }
     }
+
+internal fun isRecoveredGroupCancellation(message: String?): Boolean =
+    message?.contains(RECOVERED_GROUP_CANCELLATION) == true
 
 internal fun decodePreRouteContext(context: String): List<String>? =
     if (context.isEmpty()) emptyList() else runCatching {
@@ -4922,6 +4926,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 )
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
+                if (isRecoveredGroupCancellation(t.message)) {
+                    pendingMarmotGroups = pendingMarmotGroups - pendingChatId
+                    pendingMarmotGroupSends.remove(pendingChatId)
+                    pendingSendEchoes.remove(pendingChatId)
+                    return@launch
+                }
                 if (failPendingMarmotGroup(pendingChatId, setupToken)) {
                     toast = "couldn’t create group: ${t.message}"
                 }

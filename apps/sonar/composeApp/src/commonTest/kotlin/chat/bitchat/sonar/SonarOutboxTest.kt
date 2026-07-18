@@ -4,8 +4,16 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class SonarOutboxTest {
+    @Test
+    fun recoveredGroupCancellationIsRetiredInsteadOfShownAsFailed() {
+        assertTrue(isRecoveredGroupCancellation("invalid input: group operation was cancelled"))
+        assertFalse(isRecoveredGroupCancellation("relay temporarily unavailable"))
+        assertFalse(isRecoveredGroupCancellation(null))
+    }
+
     @Test
     fun enqueueEvictsOldestMessageWhenPeerQueueIsFull() {
         val outbox = SonarOutbox(maxPerPeer = 3)

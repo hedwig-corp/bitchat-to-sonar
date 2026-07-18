@@ -5327,6 +5327,12 @@ final class SonarAppStore: ObservableObject {
                 )
                 await finishPendingMarmotGroup(pendingId: pendingId, groupId: groupId, setupToken: setupToken)
             } catch {
+                if Self.isRecoveredGroupCancellation(error) {
+                    pendingMarmotGroups[pendingId] = nil
+                    pendingMarmotGroupSends[pendingId] = nil
+                    pendingMarmotMessagesByChat[pendingId] = nil
+                    return
+                }
                 failPendingMarmotGroup(pendingId: pendingId, setupToken: setupToken)
                 showToast("Couldn't create group: \(error.localizedDescription)")
             }
@@ -5390,6 +5396,11 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotMessagesByChat[pendingId] = pendingMarmotMessagesByChat[pendingId]?.map {
             queuedIds.contains($0.id) ? failedPendingMessage($0) : $0
         }
+    }
+
+    static func isRecoveredGroupCancellation(_ error: Error) -> Bool {
+        guard case MarmotService.ServiceError.invalidInput(let detail) = error else { return false }
+        return detail == "group operation was cancelled"
     }
 
     private func isActivePendingMarmotGroupSetup(pendingId: String, token: UUID?) -> Bool {

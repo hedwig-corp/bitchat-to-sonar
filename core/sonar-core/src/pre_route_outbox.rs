@@ -66,6 +66,10 @@ pub(crate) struct PendingGroupCreation {
     /// crashed before publication began and is therefore safe to recreate.
     pub group_id_hex: Option<String>,
     pub welcome_event_jsons: Vec<String>,
+    /// Durable cancellation intent. Written before local MLS deletion so a
+    /// restart finishes cleanup instead of replaying a cancelled operation.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -170,6 +174,48 @@ impl PreRouteOutbox {
         let removed = self.pending_group_creations.remove(index);
         if let Err(error) = self.save() {
             self.pending_group_creations.insert(index, removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Persist cancellation before deleting local MLS state. This marker stays
+    /// beside the operation sentinel until final cleanup removes both in one
+    /// encrypted manifest replacement.
+    pub fn mark_pending_group_operation_cancelled(
+        &mut self,
+        operation_description: &str,
+    ) -> Result<()> {
+        let marker = PendingGroupCreation {
+            operation_description: operation_description.to_string(),
+            group_id_hex: None,
+            welcome_event_jsons: Vec::new(),
+            cancelled: true,
+        };
+        validate_pending_group_creation(&marker)?;
+        if let Some(index) = self
+            .pending_group_creations
+            .iter()
+            .position(|entry| entry.operation_description == operation_description)
+        {
+            if self.pending_group_creations[index].cancelled {
+                return Ok(());
+            }
+            self.pending_group_creations[index].cancelled = true;
+            if let Err(error) = self.save() {
+                self.pending_group_creations[index].cancelled = false;
+                return Err(error);
+            }
+            return Ok(());
+        }
+        if self.pending_group_creations.len() >= MAX_PENDING_GROUP_CREATIONS {
+            return Err(Error::InvalidInput(
+                "pending group creation recovery journal is full".into(),
+            ));
+        }
+        self.pending_group_creations.push(marker);
+        if let Err(error) = self.save() {
+            self.pending_group_creations.pop();
             return Err(error);
         }
         Ok(())
@@ -750,6 +796,7 @@ mod tests {
             operation_description: operation.into(),
             group_id_hex: Some("ab".repeat(32)),
             welcome_event_jsons: vec!["{\"id\":\"welcome\"}".into()],
+            cancelled: false,
         }
     }
 
@@ -858,6 +905,7 @@ mod tests {
                 operation_description: "operation-hash".into(),
                 group_id_hex: None,
                 welcome_event_jsons: Vec::new(),
+                cancelled: false,
             })
             .unwrap();
         outbox
@@ -885,12 +933,14 @@ mod tests {
             operation_description: "first-operation".into(),
             group_id_hex: Some("ab".repeat(32)),
             welcome_event_jsons: large_events.clone(),
+            cancelled: false,
         };
         outbox.save_pending_group_creation(first.clone()).unwrap();
         let second = PendingGroupCreation {
             operation_description: "second-operation".into(),
             group_id_hex: Some("cd".repeat(32)),
             welcome_event_jsons: large_events,
+            cancelled: false,
         };
 
         assert!(outbox.save_pending_group_creation(second).is_err());
@@ -922,6 +972,7 @@ mod tests {
                 operation_description: "operation-description".into(),
                 group_id_hex: None,
                 welcome_event_jsons: Vec::new(),
+                cancelled: false,
             })
             .unwrap();
 
@@ -931,6 +982,27 @@ mod tests {
         assert!(outbox.messages().is_empty());
         assert_eq!(outbox.pending_group_creation("operation-description"), None);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn group_cancellation_marker_survives_restart_until_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.enc");
+        let key = [6u8; 32];
+        let mut outbox = PreRouteOutbox::open(Some(path.clone()), Some(key)).unwrap();
+        outbox
+            .save_pending_group_creation(group_creation("operation-description"))
+            .unwrap();
+
+        outbox
+            .mark_pending_group_operation_cancelled("operation-description")
+            .unwrap();
+        drop(outbox);
+
+        let restored = PreRouteOutbox::open(Some(path), Some(key)).unwrap();
+        assert!(restored
+            .pending_group_creation("operation-description")
+            .is_some_and(|checkpoint| checkpoint.cancelled));
     }
 
     #[test]
