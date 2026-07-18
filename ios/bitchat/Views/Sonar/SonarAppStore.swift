@@ -388,6 +388,16 @@ func snCanRetryFailedMessage(_ message: SNMessage) -> Bool {
     message.mine && message.via == .internet && message.state == "Couldn't send"
 }
 
+/// Platform-local setup rows must use the plaintext retry pipeline rather
+/// than asking the core outbox for an MLS message id it has never owned.
+func snPendingRetryMessageID() -> String {
+    "echo-\(UUID().uuidString)"
+}
+
+func snIsPendingRetryMessageID(_ id: String) -> Bool {
+    id.hasPrefix("echo-") || id.hasPrefix("pre-route-")
+}
+
 /// Optimistic sticker rows intentionally keep their display text empty. Retry
 /// must rebuild the transport marker from the retained sticker reference.
 func snRetryContent(_ message: SNMessage) -> String? {
@@ -4817,7 +4827,7 @@ final class SonarAppStore: ObservableObject {
             return
         }
 
-        if message.id.hasPrefix("echo-") {
+        if snIsPendingRetryMessageID(message.id) {
             retryFailedPendingText(id, message: message, groupId: groupId)
             return
         }
@@ -5054,7 +5064,7 @@ final class SonarAppStore: ObservableObject {
             plaintextSha256: sticker.sha256
         )
         let clean = SNMarmotProfileCache.canonicalKey(npub)
-        let id = "pre-route-\(UUID().uuidString)"
+        let id = snPendingRetryMessageID()
         let createdAt = Date()
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -5078,7 +5088,7 @@ final class SonarAppStore: ObservableObject {
             return
         }
         let clean = SNMarmotProfileCache.canonicalKey(npub)
-        let id = "pre-route-\(UUID().uuidString)"
+        let id = snPendingRetryMessageID()
         let createdAt = Date()
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -5177,7 +5187,7 @@ final class SonarAppStore: ObservableObject {
 
     private func pendingMarmotEcho(
         text: String,
-        id: String = "echo-\(UUID().uuidString)",
+        id: String = snPendingRetryMessageID(),
         createdAt: Date,
         state: String = "Sending"
     ) -> SNMessage {

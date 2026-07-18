@@ -116,6 +116,18 @@ internal fun decodePreRouteContext(context: String): List<String>? =
         }
     }.getOrNull()
 
+/** Choose the transcript that owns a checkpoint after route setup completed.
+ * Group setup contexts are encoded recovery metadata, not chat ids. Mesh
+ * conversations keep their explicit host chat id so BLE/relay legs stay
+ * folded into one transcript. */
+internal fun resolvedPreRouteChatId(routeId: String, routeContext: String): String =
+    routeContext.takeIf { context ->
+        context.isNotBlank() &&
+            !context.startsWith(PENDING_MARMOT_CHAT_PREFIX) &&
+            !context.startsWith(PENDING_MARMOT_GROUP_PREFIX) &&
+            decodePreRouteContext(context) == null
+    } ?: routeId
+
 internal data class PreRouteGroupRestorePlan(
     val name: String,
     val members: List<String>,
@@ -7534,9 +7546,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 )
                 PRE_ROUTE_MARMOT_GROUP -> {
-                    val chatId = record.routeContext.takeIf { it.isNotBlank() }
-                        ?.takeUnless { it.startsWith(PENDING_MARMOT_CHAT_PREFIX) || it.startsWith(PENDING_MARMOT_GROUP_PREFIX) }
-                        ?: record.routeId
+                    val chatId = resolvedPreRouteChatId(record.routeId, record.routeContext)
                     // The normal local outbox may already own this send and
                     // only journal cleanup may have failed. Never auto-replay
                     // a fresh MLS message id after restart; let the user decide

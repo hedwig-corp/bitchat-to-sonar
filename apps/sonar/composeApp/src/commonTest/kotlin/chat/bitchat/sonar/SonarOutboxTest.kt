@@ -127,4 +127,14 @@ class SonarOutboxTest {
         )
         assertEquals(true, queuedMessage?.restoreMessage)
     }
+
+    @Test
+    fun resolvedGroupCheckpointUsesConcreteGroupInsteadOfEncodedSetupContext() {
+        val groupId = "real-mls-group"
+        val setupContext = encodePreRouteContext(listOf("Low signal", "npub1alice"))
+
+        assertEquals(groupId, resolvedPreRouteChatId(groupId, setupContext))
+        assertEquals(groupId, resolvedPreRouteChatId(groupId, "group-pending:setup"))
+        assertEquals("mesh:peer", resolvedPreRouteChatId(groupId, "mesh:peer"))
+    }
 }

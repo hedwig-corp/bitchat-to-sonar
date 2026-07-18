@@ -181,6 +181,16 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func preRouteRowsUseAndRecognizeThePlaintextRetryIdentity() {
+        let id = snPendingRetryMessageID()
+
+        #expect(id.hasPrefix("echo-"))
+        #expect(snIsPendingRetryMessageID(id))
+        #expect(snIsPendingRetryMessageID("pre-route-legacy"))
+        #expect(!snIsPendingRetryMessageID("core-message"))
+    }
+
+    @Test
     func retryReconstructsStickerTransportContentFromTheRetainedReference() {
         let message = SNMessage(
             mine: true,
