@@ -9,12 +9,17 @@
 import Foundation
 import BitLogger
 
+enum BitchatMediaRole: String {
+    case videoNote = "video_note"
+}
+
 /// TLV payload for Bluetooth mesh file transfers (voice notes, images, generic files).
 /// Mirrors the Android client specification to ensure cross-platform interoperability.
 struct BitchatFilePacket {
     var fileName: String?
     var fileSize: UInt64?
     var mimeType: String?
+    var mediaRole: BitchatMediaRole? = nil
     var content: Data
 
     /// Canonical TLV tags defined by the Android implementation.
@@ -23,6 +28,7 @@ struct BitchatFilePacket {
         case fileSize = 0x02
         case mimeType = 0x03
         case content = 0x04
+        case mediaRole = 0x05
     }
 
     /// Encodes the packet using v2 canonical TLVs (4-byte FILE_SIZE, 4-byte CONTENT length).
@@ -57,6 +63,14 @@ struct BitchatFilePacket {
             encoded.append(mimeData)
         }
 
+        if let role = mediaRole,
+           let roleData = role.rawValue.data(using: .utf8),
+           roleData.count <= Int(UInt16.max) {
+            encoded.append(TLVType.mediaRole.rawValue)
+            appendBE(UInt16(roleData.count), into: &encoded)
+            encoded.append(roleData)
+        }
+
         encoded.append(TLVType.content.rawValue)
         appendBE(UInt32(content.count), into: &encoded)
         encoded.append(content)
@@ -72,6 +86,7 @@ struct BitchatFilePacket {
         var fileName: String?
         var fileSize: UInt64?
         var mimeType: String?
+        var mediaRole: BitchatMediaRole?
         var content = Data()
 
         while cursor < end {
@@ -132,6 +147,9 @@ struct BitchatFilePacket {
                 }
             case .mimeType:
                 mimeType = String(data: Data(value), encoding: .utf8)
+            case .mediaRole:
+                mediaRole = String(data: Data(value), encoding: .utf8)
+                    .flatMap(BitchatMediaRole.init(rawValue:))
             case .content:
                 let proposedSize = content.count + value.count
                 if proposedSize > FileTransferLimits.maxPayloadBytes {
@@ -145,10 +163,19 @@ struct BitchatFilePacket {
 
         guard !content.isEmpty else { return nil }
         guard FileTransferLimits.isValidPayload(content.count) else { return nil }
+        let normalizedMime = mimeType?
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            .first?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedMime != "video/mp4" {
+            mediaRole = nil
+        }
         return BitchatFilePacket(
             fileName: fileName,
             fileSize: fileSize ?? UInt64(content.count),
             mimeType: mimeType,
+            mediaRole: mediaRole,
             content: content
         )
     }

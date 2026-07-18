@@ -102,6 +102,7 @@ actual object MeshRadio {
     actual fun drainMeshDm(): List<MeshDmIn> =
         MeshLink.drainDms().filter { isKnownPeer(it.peerId) }
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = false
+    actual fun sendMeshVideoNote(peerId: String, messageId: String, bytes: ByteArray, filename: String): Boolean = false
     actual fun drainMeshMedia(): List<MeshMediaIn> = emptyList()
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 

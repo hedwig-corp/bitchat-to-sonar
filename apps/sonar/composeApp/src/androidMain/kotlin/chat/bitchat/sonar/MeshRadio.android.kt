@@ -103,9 +103,9 @@ actual object MeshRadio {
             if (!isKnownPeer(fingerprint)) return@addMessageListener
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
         }
-        MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
+        MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes, role ->
             if (!isKnownPeer(fingerprint)) return@addFileListener
-            meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000))
+            meshMediaInbox.add(MeshMediaIn(fingerprint, messageId, filename, mime, bytes, System.currentTimeMillis() / 1000, role))
         }
         // Buffer incoming public broadcasts (the BLE "Mesh" channel).
         MeshGatt.addBroadcastListener { senderFingerprint, pm ->
@@ -386,6 +386,9 @@ actual object MeshRadio {
 
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
         MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+
+    actual fun sendMeshVideoNote(peerId: String, messageId: String, bytes: ByteArray, filename: String): Boolean =
+        MeshGatt.sendVideoNoteToPeer(peerId, messageId, bytes, filename)
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()

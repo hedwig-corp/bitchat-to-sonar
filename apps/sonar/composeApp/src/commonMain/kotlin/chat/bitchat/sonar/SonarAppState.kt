@@ -3370,6 +3370,8 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──
     private var foreground = true
+    var appForeground by mutableStateOf(true)
+        private set
     /** The payment-only nearby scan is scoped to the visible Radar screen. */
     private var isNearbyVisible = false
     /** Copies scan callbacks' radio cache into Compose state only while useful. */
@@ -3574,6 +3576,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun setForeground(value: Boolean) {
         val cameToForeground = value && !foreground
         foreground = value
+        appForeground = value
+        if (!value) audibleVideoNoteUrl = null
         updateNearbyScanning()
         if (cameToForeground) {
             if (bypassRelock) bypassRelock = false        // return from our own unlock prompt
@@ -4341,9 +4345,15 @@ class SonarAppState(private val scope: CoroutineScope) {
      * read is cheap (no pixel buffer) and happens once, off the render path,
      * while we still hold the bytes.
      */
-    private fun meshMediaFor(url: String, mime: String, filename: String, bytes: ByteArray): SonarMedia {
+    private fun meshMediaFor(
+        url: String,
+        mime: String,
+        filename: String,
+        bytes: ByteArray,
+        role: MediaRole = MediaRole.Standard,
+    ): SonarMedia {
         val bounds = if (mime.startsWith("image/")) decodeImageBounds(bytes) else null
-        return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null)
+        return SonarMedia(url, mime, filename, bounds?.first, bounds?.second, null, role = role)
     }
 
     /**
@@ -5286,7 +5296,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 if (uploads.size == 1) {
                     val upload = uploads.single()
-                    SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                    if (upload.message.media.singleOrNull()?.isVideoNote == true) {
+                        SonarCore.sendVideoNote(groupId, upload.data, upload.filename)
+                    } else {
+                        SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                    }
                 } else {
                     SonarCore.sendMediaMulti(
                         groupId,
@@ -5759,6 +5773,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Decrypted-media cache (raw bytes), keyed by the ciphertext's Blossom URL. */
     private val mediaCache = mutableMapOf<String, ByteArray>()
     private var mediaTransfers by mutableStateOf<Map<String, MediaTransferState>>(emptyMap())
+    var audibleVideoNoteUrl by mutableStateOf<String?>(null)
+        private set
     private val mediaDownloadJobs = mutableMapOf<String, Job>()
     private val mediaDownloadControls = mutableMapOf<String, MediaDownloadControl>()
     private val mediaDownloadGenerations = mutableMapOf<String, Long>()
@@ -5783,6 +5799,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private val pendingMediaUrlPrefix = "pending-media-"
+
+    fun toggleVideoNoteAudio(url: String) {
+        audibleVideoNoteUrl = if (audibleVideoNoteUrl == url) null else url
+    }
+
+    fun releaseVideoNoteAudio(url: String) {
+        if (audibleVideoNoteUrl == url) audibleVideoNoteUrl = null
+    }
 
     private data class PendingMediaUpload(
         val message: SonarMsg,
@@ -6294,6 +6318,81 @@ class SonarAppState(private val scope: CoroutineScope) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
                 }
                 toast = "couldn't send voice note: ${e.message}"
+            }
+        }
+    }
+
+    /** Send a short circular video note. The bytes are an ordinary MP4; the
+     * role selects Sonar's circular transcript treatment while preserving a
+     * normal playable-video fallback for older White Noise clients. */
+    fun sendVideoNote(chatId: String, bytes: ByteArray) {
+        if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
+        val filename = "video-note-${(1000..99999).random()}.mp4"
+        val mime = "video/mp4"
+        if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
+            if (bytes.size.toLong() <= MAX_MESH_ATTACHMENT_BYTES &&
+                sendMeshVideoNote(meshPeerId(chatId), bytes, filename)
+            ) return
+            if (resolveMarmotGroupId(chatId) == null) {
+                toast = "Video note is too large for Bluetooth — start the secure chat to send it."
+                return
+            }
+        }
+        scope.launch {
+            val groupId = resolveMarmotGroupId(chatId)
+            if (groupId == null) { toast = "Start the secure chat first to send a video note."; return@launch }
+            val pendingId = "pending-media-${randomMeshId()}"
+            val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
+            val startedAtSecs = SonarClock.nowSecs()
+            val existingMediaUrls = existingPublishedMediaUrls(groupId)
+            val pending = SonarMsg(
+                id = pendingId,
+                senderNpub = npub,
+                content = "",
+                mine = true,
+                tsSecs = startedAtSecs,
+                viaInternet = true,
+                media = listOf(
+                    SonarMedia(
+                        pendingUrl,
+                        mime,
+                        filename,
+                        null,
+                        null,
+                        null,
+                        role = MediaRole.VideoNote,
+                    )
+                ),
+                state = "Uploading",
+            )
+            rememberPendingMediaUpload(
+                chatId,
+                PendingMediaUpload(
+                    message = pending,
+                    data = bytes,
+                    filename = filename,
+                    mime = mime,
+                    startedAtSecs = startedAtSecs,
+                    pendingUrl = pendingUrl,
+                    existingMediaUrls = existingMediaUrls,
+                )
+            )
+            mediaCache[pendingUrl] = bytes
+            if ((screen as? Screen.Chat)?.id == chatId) {
+                messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
+            }
+            try {
+                SonarCore.sendVideoNote(groupId, bytes, filename)
+                markPendingMediaCompleted(chatId, pendingId)
+                (screen as? Screen.Chat)?.let { sc ->
+                    if (sc.id == chatId) refreshOpenDm(if (isMeshChat(chatId)) meshPeerId(chatId) else chatId)
+                }
+            } catch (e: Throwable) {
+                markPendingMediaFailed(chatId, pendingId)
+                if ((screen as? Screen.Chat)?.id == chatId) {
+                    messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
+                }
+                toast = "couldn't send video note: ${e.message}"
             }
         }
     }
@@ -7016,6 +7115,30 @@ class SonarAppState(private val scope: CoroutineScope) {
             return false
         }
         val media = meshMediaFor(mediaUrl, mime, filename, data)
+        mediaCache[mediaUrl] = data
+        scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
+        val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
+        meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
+        persistMesh(routePeerId)
+        scope.launch { refreshOpenDm(canonicalMeshPeerId(routePeerId)) }
+        refreshMeshDmRows()
+        return true
+    }
+
+    private fun sendMeshVideoNote(peerId: String, data: ByteArray, filename: String): Boolean {
+        if (isMeshContactBlocked(peerId)) {
+            toast = "Unblock this contact before sending."
+            return false
+        }
+        val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
+        val mid = randomMeshId()
+        val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
+        val ok = MeshRadio.sendMeshVideoNote(routePeerId, mid, data, filename)
+        if (!ok) {
+            toast = "Not connected over Bluetooth yet — stay close and try again"
+            return false
+        }
+        val media = meshMediaFor(mediaUrl, "video/mp4", filename, data, MediaRole.VideoNote)
         mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
@@ -8374,7 +8497,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val id = m.messageId.ifBlank { randomMeshId() }
             if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
-            val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
+            val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes, m.role)
             mediaCache[mediaUrl] = m.bytes
             scope.launch { MessageStore.saveMeshMedia(mediaUrl, m.bytes) }
             val msg = SonarMsg(id, m.peerId, "", mine = false, tsSecs = m.tsSecs, media = listOf(media))

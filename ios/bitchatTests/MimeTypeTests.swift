@@ -29,6 +29,7 @@ struct MimeTypeTests {
         ("audio/wav", MimeType.wav, "wav"),
         ("audio/x-wav", MimeType.xWav, "wav"),
         ("audio/ogg", MimeType.ogg, "ogg"),
+        ("video/mp4", MimeType.mp4Video, "mp4"),
         ("application/pdf", MimeType.pdf, "pdf"),
         ("application/octet-stream", MimeType.octetStream, "bin")
     ])
@@ -62,6 +63,7 @@ struct MimeTypeTests {
         (MimeType.wav,  [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00,
                          0x57, 0x41, 0x56, 0x45]),             // "RIFF....WAVE"
         (MimeType.ogg,  [0x4F, 0x67, 0x67, 0x53]),             // "OggS"
+        (MimeType.mp4Video, [0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6F, 0x6D]),
 
         // === Application types ===
         (MimeType.pdf,  [0x25, 0x50, 0x44, 0x46])              // "%PDF"

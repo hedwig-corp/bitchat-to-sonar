@@ -314,6 +314,39 @@ invalidation for verified peer/profile changes.
 
 **Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
+## R-009 — Media presentation roles never gate attachment compatibility
+
+**Invariant:** A video note is always transported as a standards-compatible
+`video/mp4`; its circular presentation role is optional, authenticated metadata.
+An absent or unknown role must leave the attachment available as an ordinary
+video on both Marmot and BLE mesh paths.
+
+**Breaks as:** Older clients cannot open a video note, or a future role value
+hides an otherwise valid attachment after an app downgrade.
+
+**Call sites:** core `media.rs`, `marmot.rs`, and `mesh.rs`; iOS
+`BitchatFilePacket.swift` / `MarmotService.swift`; Compose `MessageStore.kt` /
+`MeshGatt.android.kt`
+
+**Guarded by:** `bitchat_interop.rs::video_note_role_round_trips_as_optional_forward_compatible_tlv`
+
+**Also guarded by:** `MessageCodecTest.dmRoundTripPreservesVideoNoteRole`,
+`BitchatFilePacketTests.testVideoNoteRoleRoundTripsAndRemainsOptional`
+
+**Coverage (honest):** Rust pins unknown-role tolerance on the shared mesh wire
+codec and Compose pins role persistence. The Swift test pins the native mesh
+codec but, like the other iOS citations, is not currently run by CI. The Marmot
+round trip is additionally exercised by the core media sender/receiver test.
+
+**History:** Added with Telegram-style video notes as a compatibility boundary
+before the first release of the feature.
+
+**Rejected:** *A Sonar-only MIME or message kind.* It makes the presentation
+hint part of attachment validity and removes the ordinary-video fallback for
+clients that do not yet understand circular notes.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

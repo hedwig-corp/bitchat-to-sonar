@@ -1,5 +1,6 @@
 package chat.bitchat.sonar.store
 
+import chat.bitchat.sonar.MediaRole
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.SonarMedia
 import chat.bitchat.sonar.SonarMsg
@@ -85,6 +86,23 @@ class MessageCodecTest {
         assertTrue(decoded[1].media.isEmpty())
     }
 
+    @Test
+    fun dmRoundTripPreservesVideoNoteRole() {
+        val media = SonarMedia(
+            "mesh-media:peer:message:note.mp4",
+            "video/mp4",
+            "note.mp4",
+            null,
+            null,
+            12_000,
+            role = MediaRole.VideoNote,
+        )
+        val decoded = MessageCodec.decodeDm(
+            MessageCodec.encodeDm(listOf(SonarMsg("v", "npub1xx", "", true, 1, media = listOf(media))))
+        ).single()
+        assertEquals(MediaRole.VideoNote, decoded.media.single().role)
+    }
+
     @Test fun dmRoundTripPreservesInternetTransportFlag() {
         val msg = SonarMsg("a", "npub1xx", "plain direct", mine = false, tsSecs = 3, viaInternet = true)
         val decoded = MessageCodec.decodeDm(MessageCodec.encodeDm(listOf(msg))).single()
@@ -144,8 +162,8 @@ class MessageCodecTest {
         val media = SonarMedia("mesh-media:p:m:photo.jpg", "image/jpeg", "photo.jpg", 640, 480, null)
         val msg = SonarMsg("a", "npub1xx", "", mine = true, tsSecs = 1, media = listOf(media), viaInternet = true)
         val encoded = MessageCodec.encodeDm(listOf(msg))
-        // Strip the trailing (16th) caption field to simulate the old format.
-        val old = encoded.split("\t").dropLast(1).joinToString("\t")
+        // Strip the trailing caption + role fields to simulate the old format.
+        val old = encoded.split("\t").dropLast(2).joinToString("\t")
         val decoded = MessageCodec.decodeDm(old).single()
         assertEquals(media, decoded.media.single())
         assertNull(decoded.media.single().caption)

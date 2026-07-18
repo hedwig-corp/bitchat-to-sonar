@@ -404,11 +404,17 @@ struct SNMediaItem: Equatable {
     /// cells from these so the decoded image never reflows the transcript.
     var width: UInt32? = nil
     var height: UInt32? = nil
+    var role: SNMediaRole = .standard
     var isImage: Bool { mime.hasPrefix("image/") }
     var isGif: Bool {
         mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
         filename.lowercased().hasSuffix(".gif")
     }
+}
+
+enum SNMediaRole: Equatable {
+    case standard
+    case videoNote
 }
 
 enum SNMediaTransferPhase: Equatable {
@@ -5171,7 +5177,8 @@ final class SonarAppStore: ObservableObject {
                 filename: $0.filename,
                 groupId: groupId,
                 width: $0.width,
-                height: $0.height
+                height: $0.height,
+                role: $0.role == .videoNote ? .videoNote : .standard
             )
         }
     }
@@ -5318,6 +5325,7 @@ final class SonarAppStore: ObservableObject {
                 mime: payload.item.mime,
                 caption: message.text,
                 localPreviewURL: payload.item.url,
+                videoNote: payload.item.role == .videoNote,
                 onEchoVisible: { [weak self] in
                     self?.marmot.removeFailedOptimisticMessage(
                         groupId: groupId,
@@ -5754,6 +5762,69 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Send an H.264/AAC MP4 as a Telegram-style video note. Its role is
+    /// authenticated inside the Marmot rumor (or carried as an optional mesh
+    /// TLV); clients without role support still receive an ordinary video.
+    func sendVideoNote(_ id: String, url: URL) {
+        defer { try? FileManager.default.removeItem(at: url) }
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else { return }
+        let filename = "video-note-\(UUID().uuidString).mp4"
+
+        if meshReachable(id), FileTransferLimits.isValidPayload(data.count) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+            if chatViewModel.sendVideoNote(data: data, filename: filename) { return }
+        }
+
+        let groupId: String?
+        if let gid = marmotGroupId(id) {
+            groupId = gid
+        } else if let profile = resolvedSonarProfile(id) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        } else {
+            groupId = nil
+        }
+        guard let gid = groupId else {
+            showToast("Video note is too large for Bluetooth — start the secure chat to send it.")
+            return
+        }
+
+        let pendingURL = Self.pendingMediaURL()
+        rememberPendingUploadMedia(
+            groupId: gid,
+            filename: filename,
+            mime: "video/mp4",
+            caption: "",
+            localURL: pendingURL,
+            data: data
+        )
+        marmot.sendMedia(
+            groupId: gid,
+            data: data,
+            filename: filename,
+            mime: "video/mp4",
+            localPreviewURL: pendingURL,
+            videoNote: true,
+            onComplete: { [weak self] in
+                self?.markPendingUploadMediaCompleted(
+                    groupId: gid,
+                    filename: filename,
+                    mime: "video/mp4",
+                    caption: "",
+                    localURL: pendingURL
+                )
+            },
+            onFailure: { [weak self] in
+                self?.forgetPendingUploadMedia(
+                    groupId: gid,
+                    filename: filename,
+                    mime: "video/mp4",
+                    caption: "",
+                    localURL: pendingURL
+                )
+            }
+        )
+    }
+
     /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
     /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
     private func sendImageOverMesh(_ peerID: PeerID, data: Data) {
@@ -5795,6 +5866,7 @@ final class SonarAppStore: ObservableObject {
         let kinds: [(prefix: String, mime: String, dirs: [String])] = [
             ("[image] ", "image/jpeg", ["images/incoming", "images/outgoing"]),
             ("[voice] ", "audio/mp4", ["voicenotes/incoming", "voicenotes/outgoing"]),
+            ("[video-note] ", "video/mp4", ["videonotes/incoming", "videonotes/outgoing"]),
             ("[file] ", "application/octet-stream", ["files/incoming", "files/outgoing"]),
         ]
         guard let k = kinds.first(where: { content.hasPrefix($0.prefix) }) else { return nil }
@@ -5816,7 +5888,8 @@ final class SonarAppStore: ObservableObject {
                     groupId: "",
                     localPath: path,
                     width: bounds?.0,
-                    height: bounds?.1
+                    height: bounds?.1,
+                    role: k.prefix == "[video-note] " ? .videoNote : .standard
                 )
             }
         }

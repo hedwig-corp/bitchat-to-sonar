@@ -212,6 +212,12 @@ kotlin {
             implementation(libs.okhttp.client)
             // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY.
             implementation(libs.breez.sdk.liquid)
+            implementation(libs.androidx.camera.camera2)
+            implementation(libs.androidx.camera.lifecycle)
+            implementation(libs.androidx.camera.video)
+            implementation(libs.androidx.camera.view)
+            implementation(libs.androidx.media3.exoplayer)
+            implementation(libs.androidx.media3.ui)
             // UniFFI Kotlin bindings for the Rust core use JNA at runtime.
             // MUST be the @aar variant on Android — it ships libjnidispatch.so
             // as proper jniLibs (the plain jar hides it as a classpath resource

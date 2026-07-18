@@ -34,6 +34,7 @@ use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
 
+use crate::media::MediaRole;
 use crate::mesh::{self, msg_type, noise_payload};
 use crate::noise::{NoiseHandshake, NoiseSession};
 
@@ -131,6 +132,7 @@ pub enum AppEvent {
         transfer_key: String,
         file_name: Option<String>,
         mime_type: Option<String>,
+        media_role: Option<MediaRole>,
         content: Vec<u8>,
         timestamp_ms: u64,
     },
@@ -724,7 +726,48 @@ impl Engine {
         mime_type: &str,
         now_ms: u64,
     ) -> Option<Output> {
-        if !self.fp_allowed(fingerprint) || content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
+        self.send_file_with_role(
+            fingerprint,
+            content,
+            file_name,
+            mime_type,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Private circular video note over a live route. The payload is still an
+    /// ordinary MP4; the optional role TLV is ignored by older clients.
+    pub fn send_video_note(
+        &mut self,
+        fingerprint: &str,
+        content: &[u8],
+        file_name: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        self.send_file_with_role(
+            fingerprint,
+            content,
+            file_name,
+            "video/mp4",
+            Some(MediaRole::VideoNote),
+            now_ms,
+        )
+    }
+
+    fn send_file_with_role(
+        &mut self,
+        fingerprint: &str,
+        content: &[u8],
+        file_name: &str,
+        mime_type: &str,
+        media_role: Option<MediaRole>,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint)
+            || content.is_empty()
+            || content.len() > MAX_FILE_TRANSFER_BYTES
+        {
             return None;
         }
         let route = self.sendable_route(fingerprint)?;
@@ -734,6 +777,7 @@ impl Engine {
             file_name: Some(file_name.to_string()),
             file_size: Some(content.len() as u64),
             mime_type: Some(mime_type.to_string()),
+            media_role,
             content: content.to_vec(),
         }
         .encode()?;
@@ -1793,6 +1837,7 @@ impl Engine {
             transfer_key,
             file_name: file.file_name,
             mime_type: file.mime_type,
+            media_role: file.media_role,
             content: file.content,
             timestamp_ms: packet.timestamp,
         });

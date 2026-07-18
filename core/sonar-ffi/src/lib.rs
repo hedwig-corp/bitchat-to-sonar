@@ -314,6 +314,14 @@ pub struct RecentMessagePageInfo {
     pub messages: Vec<MessageInfo>,
 }
 
+/// Host-facing attachment presentation role. The encrypted payload remains a
+/// normal media file; this only selects Sonar's transcript treatment.
+#[derive(uniffi::Enum)]
+pub enum MediaRoleInfo {
+    Standard,
+    VideoNote,
+}
+
 /// FFI-friendly reference to an encrypted media attachment. `url` is the Blossom
 /// URL of the CIPHERTEXT; call `fetch_media(groupId, url)` to download + decrypt.
 #[derive(uniffi::Record)]
@@ -324,6 +332,7 @@ pub struct MediaInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub duration_ms: Option<u64>,
+    pub role: MediaRoleInfo,
 }
 
 /// One attachment for an album send (see `send_media_multi`). Raw plaintext
@@ -1203,6 +1212,25 @@ impl SonarNode {
         Ok(())
     }
 
+    /// Encrypt + upload one standards-compatible MP4, then publish it with the
+    /// encrypted Sonar video-note presentation role.
+    pub fn send_video_note(
+        &self,
+        group_id_hex: String,
+        data: Vec<u8>,
+        filename: String,
+        server_url: String,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.runtime.block_on(self.client.send_video_note(
+            &group_id,
+            data,
+            &filename,
+            &server_url,
+        ))?;
+        Ok(())
+    }
+
     /// Encrypt + upload every `item`, then publish them as ONE album message
     /// (a single kind-445 event with N `imeta` tags, in order) carrying the
     /// optional `caption`. `server_url` empty → the core default. Blocks on the
@@ -1904,6 +1932,7 @@ pub struct MeshFileInfo {
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub mime_type: Option<String>,
+    pub role: MediaRoleInfo,
     pub content: Vec<u8>,
 }
 
@@ -2266,6 +2295,7 @@ pub fn mesh_encode_file_packet(
         file_name,
         file_size,
         mime_type,
+        media_role: None,
         content,
     }
     .encode()
@@ -2280,6 +2310,7 @@ pub fn mesh_decode_file_packet(bytes: Vec<u8>) -> Option<MeshFileInfo> {
         file_name: p.file_name,
         file_size: p.file_size,
         mime_type: p.mime_type,
+        role: media_role_info(p.media_role.unwrap_or_default()),
         content: p.content,
     })
 }
@@ -2408,6 +2439,7 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
                 width: r.width,
                 height: r.height,
                 duration_ms: r.duration_ms,
+                role: media_role_info(r.role),
             })
             .collect(),
         sticker_ref: m.sticker_ref.map(|s| StickerRefInfo {
@@ -2415,6 +2447,13 @@ fn message_info(m: sonar_core::marmot::ChatMessage) -> MessageInfo {
             shortcode: s.shortcode,
             plaintext_sha256: s.plaintext_sha256,
         }),
+    }
+}
+
+fn media_role_info(role: sonar_core::media::MediaRole) -> MediaRoleInfo {
+    match role {
+        sonar_core::media::MediaRole::Standard => MediaRoleInfo::Standard,
+        sonar_core::media::MediaRole::VideoNote => MediaRoleInfo::VideoNote,
     }
 }
 
@@ -2554,6 +2593,7 @@ pub enum MeshEngineEvent {
         transfer_key: String,
         file_name: Option<String>,
         mime_type: Option<String>,
+        role: MediaRoleInfo,
         content: Vec<u8>,
         timestamp_ms: i64,
     },
@@ -2651,6 +2691,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                     transfer_key,
                     file_name,
                     mime_type,
+                    media_role,
                     content,
                     timestamp_ms,
                 } => MeshEngineEvent::FileReceived {
@@ -2658,6 +2699,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                     transfer_key,
                     file_name,
                     mime_type,
+                    role: media_role_info(media_role.unwrap_or_default()),
                     content,
                     timestamp_ms: timestamp_ms as i64,
                 },
@@ -2857,6 +2899,19 @@ impl MeshLinkEngine {
     ) -> Option<MeshEngineOutput> {
         self.lock()
             .send_file(&fingerprint, &content, &file_name, &mime_type, ms(now_ms))
+            .map(engine_output)
+    }
+
+    /// None = no live route / oversized (never queues).
+    pub fn send_video_note(
+        &self,
+        fingerprint: String,
+        content: Vec<u8>,
+        file_name: String,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        self.lock()
+            .send_video_note(&fingerprint, &content, &file_name, ms(now_ms))
             .map(engine_output)
     }
 

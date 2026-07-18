@@ -31,6 +31,7 @@ data class MeshMediaIn(
     val mimeType: String,
     val bytes: ByteArray,
     val tsSecs: Long,
+    val role: MediaRole = MediaRole.Standard,
 ) {
     override fun equals(other: Any?): Boolean =
         other is MeshMediaIn &&
@@ -39,7 +40,8 @@ data class MeshMediaIn(
             filename == other.filename &&
             mimeType == other.mimeType &&
             bytes.contentEquals(other.bytes) &&
-            tsSecs == other.tsSecs
+            tsSecs == other.tsSecs &&
+            role == other.role
 
     override fun hashCode(): Int {
         var result = peerId.hashCode()
@@ -48,6 +50,7 @@ data class MeshMediaIn(
         result = 31 * result + mimeType.hashCode()
         result = 31 * result + bytes.contentHashCode()
         result = 31 * result + tsSecs.hashCode()
+        result = 31 * result + role.hashCode()
         return result
     }
 }
@@ -235,6 +238,8 @@ expect object MeshRadio {
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean
+    /** Same file transfer with optional Sonar video-note presentation metadata. */
+    fun sendMeshVideoNote(peerId: String, messageId: String, bytes: ByteArray, filename: String): Boolean
     /** Pull (and clear) mesh media transfers received since the last call. */
     fun drainMeshMedia(): List<MeshMediaIn>
     /** Wall-clock seconds (platform clock) — for mesh message timestamps. */

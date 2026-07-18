@@ -2430,7 +2430,7 @@ struct SNMediaBubble: View {
         .padding(.top, 7)
         .task(id: prepareKey) {
             guard !isDeck, let item else { return }
-            pipeline.prepare(item, item.isImage || item.mime.hasPrefix("audio/"))
+            pipeline.prepare(item, item.isImage || item.mime.hasPrefix("audio/") || item.role == .videoNote)
         }
         .task(id: loadKey) {
             // Keep an existing thumb across loadKey restarts when the URL is
@@ -2447,6 +2447,9 @@ struct SNMediaBubble: View {
             let transfer = pipeline.state(item)
             failed = transfer.phase == .failed
             guard transfer.phase == .available else { return }
+            // Video notes stream from the private local file through AVPlayer;
+            // never duplicate a potentially 25 MiB clip into SwiftUI state.
+            guard item.role != .videoNote else { return }
             if keepThumb { return }
             if item.isImage, !(item.isGif) {
                 // Signal-style: bounded ImageIO thumbnail off-main; never
@@ -2493,6 +2496,17 @@ struct SNMediaBubble: View {
                 viewerIndex = idx
                 viewerOpen = true
             }
+        } else if let item, item.role == .videoNote {
+            #if os(iOS)
+            SNVideoNoteBubble(
+                item: item,
+                transfer: pipeline.state(item),
+                onRequest: { pipeline.request(item) },
+                onCancel: { pipeline.cancel(item) }
+            )
+            #else
+            fileChip(for: item)
+            #endif
         } else if let item, item.isImage {
             if let bytes, item.isGif, bytes.snLooksLikeGif {
                 SNGifView(data: bytes)
@@ -2689,6 +2703,166 @@ struct SNMediaBubble: View {
         nativePreviewDirectory = nil
     }
 }
+
+#if os(iOS)
+private final class SNVideoPlayerUIView: UIView {
+    override class var layerClass: AnyClass { AVPlayerLayer.self }
+    var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+}
+
+private struct SNVideoPlayerSurface: UIViewRepresentable {
+    let player: AVPlayer
+
+    func makeUIView(context: Context) -> SNVideoPlayerUIView {
+        let view = SNVideoPlayerUIView()
+        view.playerLayer.videoGravity = .resizeAspectFill
+        view.playerLayer.player = player
+        return view
+    }
+
+    func updateUIView(_ uiView: SNVideoPlayerUIView, context: Context) {
+        uiView.playerLayer.player = player
+    }
+}
+
+@MainActor
+private final class SNVideoNoteAudioCoordinator: ObservableObject {
+    static let shared = SNVideoNoteAudioCoordinator()
+
+    @Published private(set) var audibleID: String?
+
+    func toggle(_ id: String) {
+        audibleID = audibleID == id ? nil : id
+    }
+
+    func release(_ id: String) {
+        if audibleID == id { audibleID = nil }
+    }
+}
+
+/// Circular, muted autoplay for a locally available video-note stream. The
+/// player is created only while the row is visible and never blocks transcript
+/// first paint or performs network I/O.
+private struct SNVideoNoteBubble: View {
+    @Environment(\.scenePhase) private var scenePhase
+
+    let item: SNMediaItem
+    let transfer: SNMediaTransferState
+    let onRequest: () -> Void
+    let onCancel: () -> Void
+
+    @State private var player: AVPlayer?
+    @ObservedObject private var audio = SNVideoNoteAudioCoordinator.shared
+
+    private var audioID: String { item.localPath ?? item.url }
+    private var muted: Bool { audio.audibleID != audioID }
+
+    var body: some View {
+        ZStack {
+            Circle().fill(SonarTheme.surface2)
+            if let player {
+                SNVideoPlayerSurface(player: player)
+                    .clipShape(Circle())
+                    .onTapGesture {
+                        audio.toggle(audioID)
+                        if player.timeControlStatus != .playing { player.play() }
+                    }
+                Image(systemName: muted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(7)
+                    .background(Circle().fill(Color.black.opacity(0.52)))
+                    .allowsHitTesting(false)
+                TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+                    Circle()
+                        .trim(from: 0, to: playbackProgress(player))
+                        .stroke(
+                            SonarTheme.accent,
+                            style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .padding(1)
+                        .allowsHitTesting(false)
+                }
+            } else {
+                switch transfer.phase {
+                case .notDownloaded:
+                    VStack(spacing: 6) {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 26, weight: .medium))
+                        Text(verbatim: "Video note")
+                            .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                    }
+                    .foregroundColor(SonarTheme.accent)
+                case .downloading:
+                    ProgressView()
+                case .failed:
+                    VStack(spacing: 5) {
+                        Image(systemName: "exclamationmark.circle")
+                        Text(verbatim: "Retry")
+                            .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                    }
+                    .foregroundColor(SonarTheme.danger)
+                case .available:
+                    ProgressView()
+                }
+            }
+        }
+        .frame(width: 208, height: 208)
+        .clipShape(Circle())
+        .overlay(Circle().stroke(Color.black.opacity(0.08), lineWidth: 1))
+        .contentShape(Circle())
+        .onTapGesture {
+            switch transfer.phase {
+            case .notDownloaded, .failed: onRequest()
+            case .downloading: onCancel()
+            case .available: break
+            }
+        }
+        .onAppear { configurePlayer() }
+        .onChange(of: transfer.localURL) { _ in configurePlayer() }
+        .onChange(of: audio.audibleID) { _ in player?.isMuted = muted }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                player?.play()
+            } else {
+                audio.release(audioID)
+                player?.pause()
+            }
+        }
+        .onDisappear {
+            audio.release(audioID)
+            player?.pause()
+            player = nil
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
+            guard let player,
+                  let currentItem = player.currentItem,
+                  let endedItem = note.object as? AVPlayerItem,
+                  endedItem === currentItem
+            else { return }
+            player.seek(to: .zero)
+            player.play()
+        }
+    }
+
+    private func configurePlayer() {
+        guard player == nil, transfer.phase == .available, let url = transfer.localURL else { return }
+        let p = AVPlayer(url: url)
+        p.isMuted = muted
+        p.actionAtItemEnd = .none
+        player = p
+        p.play()
+    }
+
+    private func playbackProgress(_ player: AVPlayer) -> CGFloat {
+        let elapsed = player.currentTime().seconds
+        let duration = player.currentItem?.duration.seconds ?? 0
+        guard elapsed.isFinite, duration.isFinite, duration > 0 else { return 0 }
+        return CGFloat(min(max(elapsed / duration, 0), 1))
+    }
+}
+#endif
 
 /// One image card in a media deck: loads + decodes its own bytes and renders
 /// the image FILL-CROPPED into the deck's uniform card frame (every card in
@@ -3783,7 +3957,14 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 }
 
+private enum SNCaptureMode {
+    case voice
+    case video
+}
+
 struct SNComposer: View {
+    @Environment(\.scenePhase) private var scenePhase
+
     let placeholder: String
     let transport: SNVia
     let onSend: (String) -> Void
@@ -3797,6 +3978,8 @@ struct SNComposer: View {
     var voiceEnabled: Bool = true
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
+    /// Hold-to-record produced a 60-second-or-shorter H.264/AAC MP4 video note.
+    var onVideoNote: (URL) -> Void = { _ in }
 
     @State private var text = ""
     @State private var showEmojiTray = false
@@ -3804,11 +3987,22 @@ struct SNComposer: View {
     @FocusState private var composerFocused: Bool
     #if os(iOS)
     @StateObject private var voice = VoiceNoteRecorder()
+    @StateObject private var video = VideoNoteRecorder()
+    @State private var captureMode: SNCaptureMode = .voice
     @State private var recording = false
+    @State private var locked = false
     @State private var dragX: CGFloat = 0
+    @State private var dragY: CGFloat = 0
     @State private var voiceError: String?
     @State private var recordingStartTask: Task<Bool, Never>?
+    @State private var holdArmTask: Task<Void, Never>?
+    @State private var pressArmed = false
+    @State private var endingRecording = false
     private var cancelArmed: Bool { dragX < -100 }
+    private var lockArmed: Bool { dragY < -80 }
+    private var recordingElapsed: Int { captureMode == .voice ? voice.elapsed : video.elapsed }
+    private var recordingLevel: CGFloat { captureMode == .voice ? voice.level : CGFloat(video.level) }
+    private var videoDurationLimit: Int { transport == .internet ? 60 : 30 }
     #endif
 
     private var slash: Bool { text.hasPrefix("/") }
@@ -3915,10 +4109,26 @@ struct SNComposer: View {
                 .padding(.top, 8)
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
+            if recording && captureMode == .video {
+                videoPreview
+                    .padding(.top, 10)
+                    .transition(.scale(scale: 0.88).combined(with: .opacity))
+            }
             #endif
             inputRow
         }
         .background(SonarTheme.bg)
+        #if os(iOS)
+        .onChange(of: scenePhase) { phase in
+            if phase != .active && recording { endRecording(send: false) }
+        }
+        .onDisappear {
+            pressArmed = false
+            holdArmTask?.cancel()
+            holdArmTask = nil
+            if recording { endRecording(send: false) }
+        }
+        #endif
     }
 
     private var inputRow: some View {
@@ -3932,7 +4142,7 @@ struct SNComposer: View {
             if hasText && !recording {
                 sendButton
             } else if voiceEnabled {
-                micButton
+                captureButton
             } else {
                 sendButton
             }
@@ -4008,42 +4218,83 @@ struct SNComposer: View {
     }
 
     #if os(iOS)
-    /// Hold-to-record mic (design: bc-sendbtn mic). Press starts recording; drag
-    /// left past the threshold cancels; release sends the note.
-    private var micButton: some View {
+    /// Tap toggles mic/video. Hold starts the selected recorder, release sends,
+    /// slide left cancels, and swipe up locks hands-free recording.
+    private var captureButton: some View {
         let net = transport == .internet
         return Circle()
             .fill(recording ? (net ? SonarTheme.netFill : SonarTheme.accentFill) : SonarTheme.surface2)
             .frame(width: 34, height: 34)
             .overlay(
-                SNIcon(name: .mic, size: 18, weight: 2)
+                SNIcon(name: captureMode == .voice ? .mic : .videocam, size: 18, weight: 2)
                     .foregroundColor(recording ? (net ? SonarTheme.onNet : SonarTheme.onAccent) : SonarTheme.text2)
             )
             .padding(.bottom, 1)
             .gesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { g in
-                        if !recording {
-                            beginVoiceRecording()
-                        } else {
-                            dragX = min(0, g.translation.width)
-                        }
+                        handleCaptureDrag(g)
                     }
                     .onEnded { _ in
-                        endVoiceRecording(send: true)
+                        handleCaptureRelease()
                     }
             )
+            .accessibilityLabel(captureMode == .voice ? "Voice message" : "Video message")
+            .accessibilityHint("Tap to switch mode. Hold to record.")
     }
 
-    private func beginVoiceRecording() {
+    private func handleCaptureDrag(_ gesture: DragGesture.Value) {
+        if !recording && !pressArmed {
+            pressArmed = true
+            holdArmTask?.cancel()
+            holdArmTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                guard !Task.isCancelled, pressArmed else { return }
+                beginRecording()
+            }
+        }
+        guard recording else { return }
+        dragX = min(0, gesture.translation.width)
+        dragY = min(0, gesture.translation.height)
+        if lockArmed { locked = true }
+    }
+
+    private func handleCaptureRelease() {
+        pressArmed = false
+        holdArmTask?.cancel()
+        holdArmTask = nil
+        guard recording else {
+            captureMode = captureMode == .voice ? .video : .voice
+            return
+        }
+        if cancelArmed {
+            endRecording(send: false)
+        } else if !locked {
+            endRecording(send: true)
+        }
+    }
+
+    private func beginRecording() {
         recording = true
+        endingRecording = false
+        locked = false
         dragX = 0
+        dragY = 0
         voiceError = nil
-        recordingStartTask = Task { await voice.start() }
+        let selectedMode = captureMode
+        recordingStartTask = Task {
+            switch selectedMode {
+            case .voice: return await voice.start()
+            case .video: return await video.start()
+            }
+        }
     }
 
-    private func endVoiceRecording(send: Bool) {
+    private func endRecording(send: Bool) {
+        guard recording, !endingRecording else { return }
+        endingRecording = true
         let cancel = cancelArmed || !send
+        let selectedMode = captureMode
         let startTask = recordingStartTask
         recordingStartTask = nil
         Task { @MainActor in
@@ -4054,16 +4305,28 @@ struct SNComposer: View {
                 started = false
             }
             recording = false
+            endingRecording = false
+            locked = false
             dragX = 0
+            dragY = 0
             guard started else {
-                voice.cancel()
-                showVoiceError("Microphone access is needed for voice notes.")
+                if selectedMode == .voice { voice.cancel() } else { video.cancel() }
+                showVoiceError(
+                    selectedMode == .voice
+                        ? "Microphone access is needed for voice notes."
+                        : "Camera and microphone access are needed for video notes."
+                )
                 return
             }
             if cancel {
-                voice.cancel()
-            } else if let url = voice.finish() {
-                onVoice(url)
+                if selectedMode == .voice { voice.cancel() } else { video.cancel() }
+            } else {
+                switch selectedMode {
+                case .voice:
+                    if let url = voice.finish() { onVoice(url) }
+                case .video:
+                    if let url = await video.finish() { onVideoNote(url) }
+                }
             }
         }
     }
@@ -4082,22 +4345,22 @@ struct SNComposer: View {
     /// rec dot, timer, live waveform and slide-to-cancel hint.
     private var recordingStatus: some View {
         HStack(alignment: .center, spacing: 8) {
-            Button { endVoiceRecording(send: false) } label: {
+            Button { endRecording(send: false) } label: {
                 SNIcon(name: .trash, size: 19, weight: 2).foregroundColor(SonarTheme.danger)
             }
             HStack(spacing: 9) {
                 Circle().fill(SonarTheme.danger).frame(width: 9, height: 9)
-                Text(verbatim: snFmtDur(voice.elapsed))
+                Text(verbatim: snFmtDur(recordingElapsed))
                     .font(SonarTheme.monoFont(size: 13, weight: .medium))
                     .foregroundColor(SonarTheme.text)
                     .frame(width: 38, alignment: .leading)
-                SNLiveWave(level: voice.level)
+                SNLiveWave(level: recordingLevel)
                     .frame(maxWidth: .infinity)
                 Spacer(minLength: 0)
                 HStack(spacing: 3) {
                     SNIcon(name: .chevron, size: 12, weight: 2.4).foregroundColor(SonarTheme.text3)
                         .rotationEffect(.degrees(180))
-                    Text(verbatim: cancelArmed ? "release to cancel" : "slide to cancel")
+                    Text(verbatim: locked ? "locked" : (cancelArmed ? "release to cancel" : "slide to cancel"))
                         .font(SonarTheme.uiFont(size: 12))
                         .foregroundColor(cancelArmed ? SonarTheme.danger : SonarTheme.text3)
                 }
@@ -4107,6 +4370,45 @@ struct SNComposer: View {
             .padding(.horizontal, 12)
             .frame(minHeight: 36)
             .background(RoundedRectangle(cornerRadius: 19, style: .continuous).fill(SonarTheme.surface2))
+            if captureMode == .video {
+                Button { video.flipCamera() } label: {
+                    SNIcon(name: .cameraFlip, size: 18, weight: 2).foregroundColor(SonarTheme.text2)
+                }
+                .buttonStyle(.plain)
+            }
+            if locked {
+                Button { endRecording(send: true) } label: {
+                    Circle()
+                        .fill(transport == .internet ? SonarTheme.netFill : SonarTheme.accentFill)
+                        .frame(width: 34, height: 34)
+                        .overlay(
+                            SNIcon(name: .send, size: 16, weight: 2.2)
+                                .foregroundColor(transport == .internet ? SonarTheme.onNet : SonarTheme.onAccent)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var videoPreview: some View {
+        ZStack(alignment: .bottom) {
+            VideoNotePreview(session: video.session)
+                .frame(width: 176, height: 176)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(SonarTheme.accent.opacity(0.7), lineWidth: 3))
+            Text(verbatim: recordingElapsed >= videoDurationLimit ? snFmtDur(videoDurationLimit) : snFmtDur(recordingElapsed))
+                .font(SonarTheme.monoFont(size: 12, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 9)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.black.opacity(0.58)))
+                .padding(.bottom, 10)
+        }
+        .onChange(of: video.elapsed) { elapsed in
+            if recording && captureMode == .video && elapsed >= videoDurationLimit {
+                endRecording(send: true)
+            }
         }
     }
     #endif

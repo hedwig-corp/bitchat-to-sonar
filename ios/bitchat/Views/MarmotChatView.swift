@@ -2193,6 +2193,7 @@ final class MarmotChatModel: ObservableObject {
         mime: String,
         caption: String = "",
         localPreviewURL: String? = nil,
+        videoNote: Bool = false,
         onEchoVisible: (() -> Void)? = nil,
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
@@ -2210,7 +2211,8 @@ final class MarmotChatModel: ObservableObject {
                     filename: filename,
                     width: nil,
                     height: nil,
-                    durationMs: nil
+                    durationMs: nil,
+                    role: videoNote ? .videoNote : nil
                 )
             ]
         )
@@ -2227,9 +2229,13 @@ final class MarmotChatModel: ObservableObject {
                 guard await ensureRelayConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                try await service.sendMedia(
-                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
-                )
+                if videoNote {
+                    try await service.sendVideoNote(groupId: groupId, data: data, filename: filename)
+                } else {
+                    try await service.sendMedia(
+                        groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                    )
+                }
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
