@@ -812,44 +812,71 @@ final class VoiceNotePlaybackController: ObservableObject {
     // MARK: Now Playing / remote commands
 
     #if canImport(MediaPlayer)
+    /// `MPRemoteCommandCenter` callbacks are not guaranteed on the main actor;
+    /// hop before touching `@MainActor` session state.
+    private func onRemoteCommand(
+        _ body: @escaping () -> MPRemoteCommandHandlerStatus
+    ) -> MPRemoteCommandHandlerStatus {
+        if Thread.isMainThread { return body() }
+        var status: MPRemoteCommandHandlerStatus = .commandFailed
+        DispatchQueue.main.sync { status = body() }
+        return status
+    }
+
     private func configureRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
         center.playCommand.addTarget { [weak self] _ in
-            guard let self, self.state.phase == .paused else { return .noActionableNowPlayingItem }
-            self.resume()
-            return .success
+            guard let self else { return .commandFailed }
+            return self.onRemoteCommand {
+                guard self.state.phase == .paused else { return .noActionableNowPlayingItem }
+                self.resume()
+                return .success
+            }
         }
         center.pauseCommand.addTarget { [weak self] _ in
-            guard let self, self.state.phase == .playing else { return .noActionableNowPlayingItem }
-            self.pause()
-            return .success
+            guard let self else { return .commandFailed }
+            return self.onRemoteCommand {
+                guard self.state.phase == .playing else { return .noActionableNowPlayingItem }
+                self.pause()
+                return .success
+            }
         }
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
-            switch self.state.phase {
-            case .playing: self.pause()
-            case .paused: self.resume()
-            default: return .noActionableNowPlayingItem
+            return self.onRemoteCommand {
+                switch self.state.phase {
+                case .playing: self.pause()
+                case .paused: self.resume()
+                default: return .noActionableNowPlayingItem
+                }
+                return .success
             }
-            return .success
         }
         center.nextTrackCommand.addTarget { [weak self] _ in
-            guard let self, self.state.item != nil else { return .noActionableNowPlayingItem }
-            self.next()
-            return .success
+            guard let self else { return .commandFailed }
+            return self.onRemoteCommand {
+                guard self.state.item != nil else { return .noActionableNowPlayingItem }
+                self.next()
+                return .success
+            }
         }
         center.previousTrackCommand.addTarget { [weak self] _ in
-            guard let self, self.state.item != nil else { return .noActionableNowPlayingItem }
-            self.previous()
-            return .success
+            guard let self else { return .commandFailed }
+            return self.onRemoteCommand {
+                guard self.state.item != nil else { return .noActionableNowPlayingItem }
+                self.previous()
+                return .success
+            }
         }
         center.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let self,
-                  let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
-                  self.state.duration > 0
-            else { return .commandFailed }
-            self.seek(fraction: positionEvent.positionTime / self.state.duration)
-            return .success
+            guard let self else { return .commandFailed }
+            return self.onRemoteCommand {
+                guard let positionEvent = event as? MPChangePlaybackPositionCommandEvent,
+                      self.state.duration > 0
+                else { return .commandFailed }
+                self.seek(fraction: positionEvent.positionTime / self.state.duration)
+                return .success
+            }
         }
         clearNowPlayingInfo()
     }

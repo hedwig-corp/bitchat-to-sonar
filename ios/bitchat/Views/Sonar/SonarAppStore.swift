@@ -8692,6 +8692,14 @@ final class SonarAppStore: ObservableObject {
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
+        // Stop voice if the active note belongs to this logical conversation
+        // (or any folded source mapped under it) before local media is removed.
+        VoiceNotePlaybackController.shared.stopIfActiveItem(
+            matching: { item in
+                item.logicalConversationId == id || item.sourceConversationId == id
+            },
+            reason: .deleted
+        )
         if isPendingSecureChat(id) {
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
