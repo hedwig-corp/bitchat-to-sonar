@@ -1349,7 +1349,12 @@ final class MarmotChatModel: ObservableObject {
             .reduce(UInt64(0)) { $0 + $1.unreadCount }
     }
 
-    func loadLocalSummaries(resolveMembers: Bool = true) async {
+    /// Load conversation summaries from the local Marmot DB.
+    /// Returns `true` only when the read path succeeded — callers that use
+    /// the result as an unread-delta baseline must not treat a failed load
+    /// (empty in-memory cache) as a hydrated empty inbox.
+    @discardableResult
+    func loadLocalSummaries(resolveMembers: Bool = true) async -> Bool {
         do {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
@@ -1431,8 +1436,10 @@ final class MarmotChatModel: ObservableObject {
                     }
                 }
             }
+            return true
         } catch {
             self.errorText = Self.describe(error)
+            return false
         }
     }
 

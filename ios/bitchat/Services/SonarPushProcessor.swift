@@ -39,10 +39,12 @@ enum SonarPushProcessor {
     )
 
     /// Single-flight Marmot wake. Concurrent Transponder pushes coalesce onto
-    /// one refresh so two tasks cannot share a stale unread baseline and
-    /// double-notify, and so ownership is not cleared while another wake runs.
+    /// one owner task; `marmotWakeNeedsRerun` forces another refresh after any
+    /// push observed while the owner is still finishing (name resolve / notify).
     @MainActor
     private static var marmotWakeInFlight: Task<UIBackgroundFetchResult, Never>?
+    @MainActor
+    private static var marmotWakeNeedsRerun = false
 
     /// Classify and process a remote notification payload.
     /// Returns true if the push was handled, false otherwise.
@@ -84,7 +86,11 @@ enum SonarPushProcessor {
         }
 
         if let existing = marmotWakeInFlight {
-            log.info("Marmot push wake already in flight — coalescing")
+            // Coalesce duplicate work, but ensure at least one refresh runs
+            // after this push — the in-flight wake may already be past drain
+            // (e.g. resolving sender names) and would otherwise miss the row.
+            log.info("Marmot push wake already in flight — coalescing with trailing refresh")
+            marmotWakeNeedsRerun = true
             Task {
                 let result = await existing.value
                 completionHandler(result)
@@ -93,8 +99,17 @@ enum SonarPushProcessor {
         }
 
         let task = Task { @MainActor () -> UIBackgroundFetchResult in
-            defer { marmotWakeInFlight = nil }
-            return await runMarmotWakeup(marmot: marmot, prefs: prefs)
+            defer {
+                marmotWakeInFlight = nil
+                marmotWakeNeedsRerun = false
+            }
+            var overall: UIBackgroundFetchResult = .noData
+            repeat {
+                marmotWakeNeedsRerun = false
+                let result = await runMarmotWakeup(marmot: marmot, prefs: prefs)
+                overall = mergeFetchResult(overall, result)
+            } while marmotWakeNeedsRerun
+            return overall
         }
         marmotWakeInFlight = task
         Task { @MainActor in
@@ -118,9 +133,11 @@ enum SonarPushProcessor {
         // Cold/background launches often have an empty in-memory summary
         // cache; capturing that empty map would treat every existing unread
         // chat as "new" after refresh and re-alert stale threads.
-        await marmot.loadLocalSummaries()
+        // Only trust the baseline when the local read actually succeeded —
+        // a failed load leaves the cache empty and must not count as hydrated.
+        _ = await marmot.ensureConnected()
+        let baselineHydrated = await marmot.loadLocalSummaries()
         let beforeUnread = unreadFingerprint(marmot: marmot)
-        let baselineHydrated = true
 
         var drained: [DrainNotificationInfo] = []
         var synced = false
@@ -133,7 +150,7 @@ enum SonarPushProcessor {
             log.warning("Marmot sync from push failed or timed out: \(error)")
             // Partial drain often already wrote the pushed row; reload local
             // summaries so a delta check can still render titled copy.
-            await marmot.loadLocalSummaries()
+            _ = await marmot.loadLocalSummaries()
         }
 
         guard prefs.enabled else {
@@ -158,6 +175,9 @@ enum SonarPushProcessor {
         switch (notified > 0, synced) {
         case (true, _):
             log.info("Marmot wakeup: notified for \(notified) conversation(s) (synced=\(synced))")
+            // NSE placeholders are conversation-agnostic (plaintext-free APNS).
+            // After a successful prefs-aware render, drop all of them so the
+            // lock screen is not left with both generic + titled banners.
             removeDeliveredNSEPlaceholderBanners()
             return .newData
         case (false, true):
@@ -333,6 +353,18 @@ enum SonarPushProcessor {
     }
 
     // MARK: - Helpers
+
+    private static func mergeFetchResult(
+        _ a: UIBackgroundFetchResult,
+        _ b: UIBackgroundFetchResult
+    ) -> UIBackgroundFetchResult {
+        // Prefer evidence of work: newData > failed > noData.
+        switch (a, b) {
+        case (.newData, _), (_, .newData): return .newData
+        case (.failed, _), (_, .failed): return .failed
+        default: return .noData
+        }
+    }
 
     private static func showFallbackNotification(prefs: SonarLocalNotificationPrefs) {
         var mutedPreview = prefs
