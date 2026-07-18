@@ -8003,6 +8003,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_wipe_removes_pre_route_sidecar_and_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let pre_route = pre_route_outbox_path_for_db(&db);
+        let pre_route_name = pre_route.file_name().unwrap().to_string_lossy();
+        let pre_route_tmp = pre_route.with_file_name(format!("{pre_route_name}.tmp"));
+        for path in [&db, &pre_route, &pre_route_tmp] {
+            std::fs::write(path, b"wipe me").unwrap();
+        }
+
+        SonarClient::wipe_database(&db).unwrap();
+
+        assert!(!db.exists());
+        assert!(!pre_route.exists());
+        assert!(!pre_route_tmp.exists());
+    }
+
     #[tokio::test]
     async fn durable_group_start_and_discard_share_one_operation_gate() {
         let bob = Arc::new(

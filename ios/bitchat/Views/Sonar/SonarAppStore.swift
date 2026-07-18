@@ -5399,8 +5399,17 @@ final class SonarAppStore: ObservableObject {
     }
 
     static func isRecoveredGroupCancellation(_ error: Error) -> Bool {
-        guard case MarmotService.ServiceError.invalidInput(let detail) = error else { return false }
-        return detail == "group operation was cancelled"
+        let cancellation = "group operation was cancelled"
+        switch error {
+        case MarmotService.ServiceError.invalidInput(let detail):
+            return detail == cancellation
+        case MarmotService.ServiceError.core(let detail):
+            // sonar_core::Error::InvalidInput currently crosses the flat
+            // UniFFI boundary as Core with its rendered "invalid input:" prefix.
+            return detail == "invalid input: \(cancellation)"
+        default:
+            return false
+        }
     }
 
     private func isActivePendingMarmotGroupSetup(pendingId: String, token: UUID?) -> Bool {

@@ -22,6 +22,9 @@ struct SonarConversationRegressionSmokeTests {
         #expect(SonarAppStore.isRecoveredGroupCancellation(
             MarmotService.ServiceError.invalidInput("group operation was cancelled")
         ))
+        #expect(SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.core("invalid input: group operation was cancelled")
+        ))
         #expect(!SonarAppStore.isRecoveredGroupCancellation(
             MarmotService.ServiceError.core("relay temporarily unavailable")
         ))
