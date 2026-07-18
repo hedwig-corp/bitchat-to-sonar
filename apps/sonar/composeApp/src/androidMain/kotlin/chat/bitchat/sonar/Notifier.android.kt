@@ -15,8 +15,8 @@ import android.os.Build
 
 /** Android `actual`: transport-specific channels with sound, vibration, and badges. */
 actual object Notifier {
-    private const val MESSAGE_CHANNEL = "messages_v7"
-    private const val BLE_CHANNEL = "ble_notifications_v5"
+    private const val MESSAGE_CHANNEL = "messages_v8"
+    private const val BLE_CHANNEL = "ble_notifications_v6"
     private val LEGACY_CHANNELS = listOf(
         "messages",
         "messages_v2",
@@ -24,10 +24,12 @@ actual object Notifier {
         "messages_v4",
         "messages_v5",
         "messages_v6",
+        "messages_v7",
         "ble_notifications_v1",
         "ble_notifications_v2",
         "ble_notifications_v3",
         "ble_notifications_v4",
+        "ble_notifications_v5",
     )
 
     private val ctx: Context get() = AppContextHolder.ctx
