@@ -3920,9 +3920,11 @@ struct SNAudioBubble: View {
 }
 
 func snVoiceAttachmentId(messageId: String, mediaIndex: Int, filename: String, url: String) -> String {
-    let urlKey = url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "empty-url" : url
+    // `url` is ignored so pending-media → published URL promotion keeps the
+    // same attachment id (matches Compose `voiceAttachmentId`).
+    _ = url
     let nameKey = filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "audio" : filename
-    return "\(messageId)#\(mediaIndex)#\(nameKey)#\(urlKey.hashValue)"
+    return "\(messageId)#\(mediaIndex)#\(nameKey)"
 }
 
 /// Optional fold resolver installed by `SonarAppStore` so bubbles can scope

@@ -7543,16 +7543,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // Intentionally empty — route-lost never auto-resumes.
             }
             override fun onTransientInterruptionBegan(generation: Long) {
-                val controller = voiceControllerRef ?: return
-                if (generation == controller.state.generation) {
-                    controller.onTransientInterruptionBegan()
-                }
+                // Generation is re-checked under the controller mutex so a
+                // focus callback for item A cannot pause a newer item B.
+                voiceControllerRef?.onTransientInterruptionBegan(generation)
             }
             override fun onTransientInterruptionEnded(generation: Long) {
-                val controller = voiceControllerRef ?: return
-                if (generation == controller.state.generation) {
-                    controller.onTransientInterruptionEnded()
-                }
+                voiceControllerRef?.onTransientInterruptionEnded(generation)
             }
             override fun onExternalPaused(generation: Long) {
                 val controller = voiceControllerRef ?: return

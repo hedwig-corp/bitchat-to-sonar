@@ -78,7 +78,7 @@ class VoiceMessagePlaybackControllerTest {
             runCurrent()
             assertEquals(VoicePlaybackPhase.Paused, controller.state.phase)
             assertEquals(VoicePlaybackInterruption.RouteLost, controller.state.interruptionReason)
-            controller.onTransientInterruptionEnded()
+            controller.onTransientInterruptionEnded(controller.state.generation)
             runCurrent()
             assertEquals(VoicePlaybackPhase.Paused, controller.state.phase)
             assertFalse(engine.playing)
@@ -104,9 +104,10 @@ class VoiceMessagePlaybackControllerTest {
         runCurrent()
         controller.dispatchSync(VoicePlaybackCommand.Pause)
         runCurrent()
-        controller.onTransientInterruptionBegan()
+        val gen = controller.state.generation
+        controller.onTransientInterruptionBegan(gen)
         runCurrent()
-        controller.onTransientInterruptionEnded()
+        controller.onTransientInterruptionEnded(gen)
         runCurrent()
         assertEquals(VoicePlaybackPhase.Paused, controller.state.phase)
         assertFalse(engine.playing)
@@ -130,14 +131,44 @@ class VoiceMessagePlaybackControllerTest {
         try {
         controller.dispatchSync(VoicePlaybackCommand.Play(item()))
         runCurrent()
-        controller.onTransientInterruptionBegan()
+        val gen = controller.state.generation
+        controller.onTransientInterruptionBegan(gen)
         runCurrent()
         assertEquals(VoicePlaybackPhase.Paused, controller.state.phase)
         assertEquals(VoicePlaybackInterruption.TransientSystem, controller.state.interruptionReason)
-        controller.onTransientInterruptionEnded()
+        controller.onTransientInterruptionEnded(gen)
         runCurrent()
         assertEquals(VoicePlaybackPhase.Playing, controller.state.phase)
         assertTrue(engine.playing)
+        } finally {
+            controller.close()
+        }
+    }
+
+    @Test
+    fun staleTransientInterruptionDoesNotPauseNewerItem() = runTest {
+        val dispatcher = StandardTestDispatcher(testScheduler)
+        val engine = FakeVoicePlaybackEngine()
+        val controller = VoiceMessagePlaybackController(
+            engine = engine,
+            rateStore = InMemoryVoicePlaybackRateStore(),
+            queue = EmptyQueue,
+            listenedStore = InMemoryVoicePlaybackListenedStore(),
+            dispatcher = dispatcher,
+            progressIntervalMs = 1_000L,
+        )
+        try {
+            controller.dispatchSync(VoicePlaybackCommand.Play(item(id = "a")))
+            runCurrent()
+            val staleGen = controller.state.generation
+            controller.dispatchSync(VoicePlaybackCommand.Play(item(id = "b")))
+            runCurrent()
+            assertEquals(VoicePlaybackPhase.Playing, controller.state.phase)
+            controller.onTransientInterruptionBegan(staleGen)
+            runCurrent()
+            assertEquals(VoicePlaybackPhase.Playing, controller.state.phase)
+            assertEquals(null, controller.state.interruptionReason)
+            assertTrue(engine.playing)
         } finally {
             controller.close()
         }
@@ -320,6 +351,13 @@ class VoiceMessagePlaybackControllerTest {
         val c = voiceAttachmentId("m1", 1, "note.m4a", "")
         assertEquals(a, b)
         assertTrue(a != c)
+    }
+
+    @Test
+    fun voiceAttachmentIdStableAcrossUrlPromotion() {
+        val pending = voiceAttachmentId("m1", 0, "note.m4a", "pending-media-abc")
+        val published = voiceAttachmentId("m1", 0, "note.m4a", "https://cdn.example/note.m4a")
+        assertEquals(pending, published)
     }
 
     private object EmptyQueue : VoicePlaybackQueue {

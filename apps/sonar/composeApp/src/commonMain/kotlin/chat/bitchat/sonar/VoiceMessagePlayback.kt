@@ -368,9 +368,12 @@ class VoiceMessagePlaybackController(
         }
     }
 
-    fun onTransientInterruptionBegan() {
+    fun onTransientInterruptionBegan(generation: Long) {
         scope.launch {
             mutex.withLock {
+                // Re-check under the mutex: the host-side generation gate can
+                // race a Play of a newer item before this coroutine runs.
+                if (generation != state.generation) return@withLock
                 if (state.phase != VoicePlaybackPhase.Playing) return@withLock
                 resumeAfterTransient = true
                 stopProgress()
@@ -386,9 +389,10 @@ class VoiceMessagePlaybackController(
         }
     }
 
-    fun onTransientInterruptionEnded() {
+    fun onTransientInterruptionEnded(generation: Long) {
         scope.launch {
             mutex.withLock {
+                if (generation != state.generation) return@withLock
                 if (!resumeAfterTransient) return@withLock
                 if (state.phase != VoicePlaybackPhase.Paused) {
                     resumeAfterTransient = false
@@ -656,14 +660,17 @@ class VoiceMessagePlaybackController(
     }
 }
 
-/** Build a stable attachment id that survives optimistic URL → canonical URL remaps. */
+/**
+ * Build a stable attachment id that survives optimistic URL → canonical URL
+ * remaps (`pending-media-*` → published URL). [url] is accepted for call-site
+ * compatibility but must not participate in the key.
+ */
 fun voiceAttachmentId(
     messageId: String,
     mediaIndex: Int,
     filename: String,
-    url: String,
+    @Suppress("UNUSED_PARAMETER") url: String,
 ): String {
-    val urlKey = url.trim().ifEmpty { "empty-url" }
     val nameKey = filename.trim().ifEmpty { "audio" }
-    return "$messageId#$mediaIndex#$nameKey#${urlKey.hashCode()}"
+    return "$messageId#$mediaIndex#$nameKey"
 }
