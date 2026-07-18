@@ -160,11 +160,10 @@ enum SonarPushProcessor {
 
         // Prefer drain metadata, then also run unread-delta so rows that land
         // via gap recovery after the returned drain list are not dropped.
-        // Delta skips content already bannered from the drain list.
-        var drainedKeys = Set<String>()
+        // Delta skips groups already bannered from the drain list.
         var notified = 0
         if !drained.isEmpty {
-            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs, notifiedKeys: &drainedKeys)
+            notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
         }
         // Reload summaries so delta sees gap-recovery advances during name resolve.
         _ = await marmot.loadLocalSummaries()
@@ -173,7 +172,7 @@ enum SonarPushProcessor {
             baselineHydrated: baselineHydrated,
             marmot: marmot,
             prefs: prefs,
-            excludingKeys: drainedKeys
+            excludingGroupIds: marmot.pushWakeNotifiedGroupIds
         )
 
         switch (notified > 0, synced) {
@@ -217,8 +216,7 @@ enum SonarPushProcessor {
     private static func notifyDrained(
         _ drained: [DrainNotificationInfo],
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs,
-        notifiedKeys: inout Set<String>
+        prefs: SonarLocalNotificationPrefs
     ) async -> Int {
         var notified = 0
         for notif in drained {
@@ -261,12 +259,8 @@ enum SonarPushProcessor {
                 body: routed.body,
                 identifier: routed.identifier
             )
-            let key = MarmotChatModel.pushWakeNotificationKey(
-                groupName: groupName ?? conversationTitle,
-                content: notif.contentPreview
-            )
-            notifiedKeys.insert(key)
-            marmot.notePushWakeNotified(groupName: groupName ?? conversationTitle, content: notif.contentPreview)
+            // Correlate to local message IDs (handles truncated drain previews).
+            marmot.notePushWakeNotified(drain: notif)
             notified += 1
         }
         return notified
@@ -279,10 +273,11 @@ enum SonarPushProcessor {
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
         prefs: SonarLocalNotificationPrefs,
-        excludingKeys: Set<String> = []
+        excludingGroupIds: Set<String> = []
     ) async -> Int {
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
-            SonarPushUnreadDelta.isNewlyAdvanced(
+            guard !excludingGroupIds.contains(summary.groupIdHex) else { return false }
+            return SonarPushUnreadDelta.isNewlyAdvanced(
                 groupId: summary.groupIdHex,
                 after: SonarPushUnreadDelta.Fingerprint(
                     unread: summary.unreadCount,
@@ -319,11 +314,6 @@ enum SonarPushProcessor {
                 }
                 return summary.name
             }()
-            let contentKey = MarmotChatModel.pushWakeNotificationKey(
-                groupName: groupName ?? conversationTitle,
-                content: summary.latestContent
-            )
-            if excludingKeys.contains(contentKey) { continue }
 
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: summary.groupIdHex,
@@ -341,10 +331,7 @@ enum SonarPushProcessor {
                 body: routed.body,
                 identifier: routed.identifier
             )
-            marmot.notePushWakeNotified(
-                groupName: groupName ?? conversationTitle,
-                content: summary.latestContent
-            )
+            marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)
             notified += 1
         }
         return notified

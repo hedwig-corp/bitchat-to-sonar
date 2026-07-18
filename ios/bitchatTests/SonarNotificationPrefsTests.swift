@@ -150,6 +150,16 @@ struct SonarNotificationPrefsTests {
         )
     }
 
+    @Test("drain preview matching handles core truncation ellipsis")
+    func drainPreviewMatchesTruncation() {
+        let full = String(repeating: "a", count: 150)
+        let preview = String(full.prefix(100)) + "…"
+        #expect(SonarPushWakeDedup.matchesPreview(fullContent: full, preview: preview))
+        #expect(SonarPushWakeDedup.matchesPreview(fullContent: "hello", preview: "hello"))
+        #expect(!SonarPushWakeDedup.matchesPreview(fullContent: "hello", preview: "goodbye"))
+        #expect(!SonarPushWakeDedup.matchesPreview(fullContent: full, preview: "bbbb…"))
+    }
+
     @Test("unread delta does not re-alert unchanged stale unread")
     func unreadDeltaSkipsUnchangedStale() {
         let stamp = Date(timeIntervalSince1970: 100)

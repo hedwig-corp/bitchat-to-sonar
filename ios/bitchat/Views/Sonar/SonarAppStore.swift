@@ -2316,12 +2316,8 @@ final class SonarAppStore: ObservableObject {
                     continue
                 }
                 let groupName = group.memberNpubs.count > 2 ? title : nil
-                // Push wake already bannered this content — mark seen, no second banner.
-                let pushKey = MarmotChatModel.pushWakeNotificationKey(
-                    groupName: groupName ?? title,
-                    content: message.content
-                )
-                if marmot.pushWakeNotifiedKeys.contains(pushKey) {
+                // Push wake already bannered this message id — mark seen, no second banner.
+                if marmot.pushWakeNotifiedMessageIDs.contains(message.id) {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }

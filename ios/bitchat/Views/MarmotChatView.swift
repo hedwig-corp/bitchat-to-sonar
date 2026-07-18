@@ -287,10 +287,11 @@ final class MarmotChatModel: ObservableObject {
     /// Backed by a refcount so overlapping wakes cannot clear ownership early.
     private(set) var pushWakeOwnsNotifications = false
     private var pushWakeOwnershipCount = 0
-    /// Content keys (`groupName|preview`) the push wake already bannered.
-    /// Live path marks matching rows seen after ownership ends instead of
-    /// blanket-marking every in-memory message (which dropped gap-recovery rows).
-    private(set) var pushWakeNotifiedKeys = Set<String>()
+    /// Message IDs the push wake already bannered. Live path marks these seen
+    /// after ownership ends — stable IDs, not display labels / truncated previews.
+    private(set) var pushWakeNotifiedMessageIDs = Set<String>()
+    /// Group IDs already covered by a push-wake banner (drain or unread-delta).
+    private(set) var pushWakeNotifiedGroupIds = Set<String>()
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -1019,7 +1020,8 @@ final class MarmotChatModel: ObservableObject {
         pushWakeOwnershipCount += 1
         pushWakeOwnsNotifications = true
         if pushWakeOwnershipCount == 1 {
-            pushWakeNotifiedKeys = []
+            pushWakeNotifiedMessageIDs = []
+            pushWakeNotifiedGroupIds = []
         }
     }
 
@@ -1028,12 +1030,44 @@ final class MarmotChatModel: ObservableObject {
         pushWakeOwnsNotifications = pushWakeOwnershipCount > 0
     }
 
-    static func pushWakeNotificationKey(groupName: String?, content: String) -> String {
-        "\(groupName ?? "")|\(content)"
+    /// Record that push wake already bannered the local rows matching a drain
+    /// notification (preview may be core-truncated with `…`).
+    func notePushWakeNotified(drain notif: DrainNotificationInfo) {
+        let preview = notif.contentPreview
+        for (groupId, messages) in messagesByGroup {
+            if !notif.groupName.isEmpty {
+                let title = groups.first(where: { $0.id == groupId }).map { self.title(for: $0) } ?? ""
+                let summaryName = conversationSummariesByGroup[groupId]?.name ?? ""
+                if title != notif.groupName && summaryName != notif.groupName {
+                    continue
+                }
+            }
+            var matched = false
+            for message in messages where !message.isMine {
+                if SonarPushWakeDedup.matchesPreview(fullContent: message.content, preview: preview) {
+                    pushWakeNotifiedMessageIDs.insert(message.id)
+                    matched = true
+                }
+            }
+            if matched {
+                pushWakeNotifiedGroupIds.insert(groupId)
+            }
+        }
     }
 
-    func notePushWakeNotified(groupName: String?, content: String) {
-        pushWakeNotifiedKeys.insert(Self.pushWakeNotificationKey(groupName: groupName, content: content))
+    /// Record that push wake bannered the latest unread advance for a group.
+    func notePushWakeNotified(groupIdHex: String, content: String) {
+        pushWakeNotifiedGroupIds.insert(groupIdHex)
+        guard let messages = messagesByGroup[groupIdHex] else { return }
+        if let match = messages.last(where: {
+            !$0.isMine && SonarPushWakeDedup.matchesPreview(fullContent: $0.content, preview: content)
+        }) {
+            pushWakeNotifiedMessageIDs.insert(match.id)
+            return
+        }
+        if let latest = messages.last(where: { !$0.isMine }) {
+            pushWakeNotifiedMessageIDs.insert(latest.id)
+        }
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for
