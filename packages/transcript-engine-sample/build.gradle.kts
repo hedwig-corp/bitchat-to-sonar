@@ -1,5 +1,7 @@
 plugins {
     alias(libs.plugins.multiplatform)
+    alias(libs.plugins.compose)
+    alias(libs.plugins.compose.compiler)
     alias(libs.plugins.android.library)
 }
 
@@ -15,17 +17,18 @@ kotlin {
         }
     }
     sourceSets {
-        commonTest.dependencies {
-            implementation(kotlin("test"))
-        }
-        val commonTest by getting {
-            resources.srcDir("src/commonTest/resources")
+        commonMain.dependencies {
+            api(project(":transcript-engine-compose"))
+            api(project(":transcript-engine-policy"))
+            implementation(compose.runtime)
+            implementation(compose.foundation)
+            implementation(compose.material3)
         }
     }
 }
 
 android {
-    namespace = "chat.hedwig.transcript"
+    namespace = "chat.hedwig.transcript.sample"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
@@ -34,5 +37,4 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    sourceSets["test"].resources.srcDir("src/commonTest/resources")
 }
