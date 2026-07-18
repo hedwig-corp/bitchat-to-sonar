@@ -2447,14 +2447,22 @@ private struct MacProfilePane: View {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up..."
-        case .notConfigured: return "Set up"
+        case .notConfigured:
+            return SonarBreezBuildConfig.hasAPIKey ? "Not ready" : "Unavailable"
         }
     }
 
     private var walletSubtitle: String {
-        store.balanceSats == nil
-            ? "Needs Breez API key and Sonar identity"
-            : "Pays like you message - Bluetooth or Lightning"
+        switch store.walletState {
+        case .notConfigured:
+            return SonarBreezBuildConfig.hasAPIKey
+                ? "Wallet not ready yet — setup retries in the background"
+                : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
+        case .settingUp:
+            return "Syncing wallet…"
+        case .ready:
+            return "Pays like you message - Bluetooth or Lightning"
+        }
     }
 
     private func saveName() {
@@ -2821,14 +2829,22 @@ private struct MacSettingsModal: View {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up..."
-        case .notConfigured: return "Set up"
+        case .notConfigured:
+            return SonarBreezBuildConfig.hasAPIKey ? "Not ready" : "Unavailable"
         }
     }
 
     private var walletSubtitle: String {
-        store.balanceSats == nil
-            ? "Needs Breez API key and Sonar identity"
-            : "Pays like you message - Bluetooth or Lightning"
+        switch store.walletState {
+        case .notConfigured:
+            return SonarBreezBuildConfig.hasAPIKey
+                ? "Wallet not ready yet — setup retries in the background"
+                : "This build has no Breez API key, so Lightning stays off. Chat and restore still work."
+        case .settingUp:
+            return "Syncing wallet…"
+        case .ready:
+            return "Pays like you message - Bluetooth or Lightning"
+        }
     }
 
     private func saveName() {

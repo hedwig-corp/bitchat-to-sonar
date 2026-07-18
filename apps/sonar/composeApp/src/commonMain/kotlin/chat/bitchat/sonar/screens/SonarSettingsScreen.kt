@@ -161,7 +161,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSettingsCard {
                 SNSettingsRow(
                     icon = SNIconName.Coin, tone = SNTone.Gold, label = "Balance",
-                    value = if (state.walletAvailable) state.money(balance) else "Off",
+                    value = if (state.walletAvailable) state.money(balance) else "Unavailable",
                     divider = state.walletAvailable,
                 ) { if (state.walletAvailable) state.push(Screen.WalletActivity) }
                 if (state.walletAvailable) {
@@ -177,6 +177,8 @@ fun SonarSettingsScreen(state: SonarAppState) {
             }
             if (state.walletAvailable) {
                 StNote("Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.")
+            } else {
+                StNote("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
             }
 
             SNSectionLabel("Privacy & safety")

@@ -2531,6 +2531,9 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun setupWallet() {
         if (!walletAvailable) {
+            // BuildConfig.BREEZ_API_KEY was empty in this APK — not an nsec/restore
+            // failure. Settings shows "Unavailable"; Lightning stays off.
+            sonarLog("SonarWallet", "wallet unavailable: Breez API key missing from this build")
             scope.launch { publishSonarDescriptorIfNeeded(force = true) }
             return
         }

@@ -31,11 +31,26 @@ import Foundation
 /// Lifecycle of the on-device Lightning wallet.
 enum SonarWalletState: Equatable {
     /// No wallet exists on this phone yet.
+    ///
+    /// Also used briefly after a transient setup failure / background teardown
+    /// when a Breez key *is* present — do not treat this alone as "keyless
+    /// build". Use `SonarBreezBuildConfig.hasAPIKey` for that.
     case notConfigured
     /// A wallet is being created / restored / synced.
     case settingUp
     /// Wallet ready with a spendable balance (sats).
     case ready(balanceSats: Int64)
+}
+
+/// Build-time Breez key presence (`Info.plist` ← xcconfig). Independent of
+/// `SonarWalletState`, which also covers transient setup failure.
+enum SonarBreezBuildConfig {
+    static var hasAPIKey: Bool {
+        guard let raw = Bundle.main.object(forInfoDictionaryKey: "BREEZ_API_KEY") as? String else {
+            return false
+        }
+        return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 }
 
 /// A fiat currency the wallet can display amounts in.

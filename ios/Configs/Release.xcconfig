@@ -35,5 +35,7 @@ NDS_URL = nds.sonar.hedwig.sh
 // Real secret (Breez API key) + signing team live ONLY in the gitignored
 // Local.xcconfig, included below so local Release builds / archives (TestFlight)
 // pick them up without committing. CI injects BREEZ_API_KEY the same way.
+// Release app targets fail the build when this stays empty after includes
+// (see "Require Breez API key for Release" Run Script in bitchat.xcodeproj).
 BREEZ_API_KEY =
 #include? "Local.xcconfig"

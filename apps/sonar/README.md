@@ -122,7 +122,9 @@ ANDROID_NDK_HOME=/path/to/ndk ../../core/build-android.sh
 ```
 
 Put `sdk.dir` and `breez.apiKey` in gitignored `local.properties` (or export
-`BREEZ_API_KEY`). Release APKs are unsigned unless you configure signing.
+`BREEZ_API_KEY`). Debug may omit the key (Settings → Unavailable); release
+`assembleRelease` / `bundleRelease` refuse without it. Release APKs are
+unsigned unless you configure signing.
 
 ## Tests
 

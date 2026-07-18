@@ -33,6 +33,17 @@ val breezApiKey: String = run {
     (fromFile ?: System.getenv("BREEZ_API_KEY") ?: "").trim()
 }
 
+// Escape for BuildConfig string literals (`"` / `\`). Never log the key itself.
+fun escapeBuildConfigString(value: String): String =
+    value.replace("\\", "\\\\").replace("\"", "\\\"")
+
+if (breezApiKey.isEmpty()) {
+    logger.warn(
+        "BREEZ_API_KEY is empty — Lightning wallet will show as Unavailable. " +
+            "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY.",
+    )
+}
+
 // Desktop has no Android-style BuildConfig, so the key is written to a generated
 // resource (`/breez_api_key.txt`) the jvm WalletBridge reads at runtime. The dir
 // is gitignored; the value never lands in source.
@@ -298,7 +309,11 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 11
         versionName = "0.1-alpha.11"
-        buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
+        buildConfigField(
+            "String",
+            "BREEZ_API_KEY",
+            "\"${escapeBuildConfigString(breezApiKey)}\"",
+        )
         val lp = Properties().apply {
             val f = rootProject.file("local.properties")
             if (f.exists()) f.inputStream().use { load(it) }
@@ -422,4 +437,38 @@ dependencies {
     // devices don't apply APK profiles at install time without it).
     implementation(libs.androidx.profileinstaller)
     baselineProfile(project(":baselineprofile"))
+}
+
+// Alpha / Zapstore phone APKs (and future Play AABs) must ship with a Breez key
+// or every restore shows a dead Lightning wallet. Debug may omit the key for CI
+// unit/UI tests.
+//
+// Use a shared prerequisite (not doFirst on assemble*) so packageRelease /
+// installRelease fail *before* writing a keyless APK — assembleRelease's
+// doFirst would otherwise run after packageRelease already produced the file.
+val requireBreezApiKeyForRelease = tasks.register("requireBreezApiKeyForRelease") {
+    group = "verification"
+    description = "Fails when BREEZ_API_KEY is empty (release packaging must ship a live wallet)."
+    doLast {
+        check(breezApiKey.isNotEmpty()) {
+            "BREEZ_API_KEY is empty — refusing release packaging. " +
+                "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY."
+        }
+    }
+}
+
+tasks.matching {
+    val n = it.name
+    // Android phone APK/AAB paths only — not Compose Desktop packageReleaseDeb/Dmg/Msi.
+    n.contains("Release", ignoreCase = true) && (
+        n == "packageRelease" ||
+            n == "packageReleaseUniversalApk" ||
+            n == "packageReleaseBundle" ||
+            n.startsWith("assemble") ||
+            (n.startsWith("install") && !n.startsWith("uninstall")) ||
+            (n.startsWith("bundle") && n.endsWith("Release") &&
+                !n.contains("Classes") && !n.contains("Resources"))
+        )
+}.configureEach {
+    dependsOn(requireBreezApiKeyForRelease)
 }

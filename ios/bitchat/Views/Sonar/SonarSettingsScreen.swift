@@ -106,32 +106,41 @@ struct SonarSettingsScreen: View {
                     SNSettingsCard {
                         SNSettingsRow(
                             icon: .coin, tone: .gold, label: "Balance",
-                            sub: "Pays like you message — tap to pay nearby or over the internet",
+                            sub: walletBalanceSub,
                             value: walletValue,
-                            divider: true
+                            divider: walletKeyConfigured
                         ) {
                             if case .ready = store.walletState {
                                 store.push(.walletActivity)
-                            } else {
+                            } else if walletKeyConfigured {
                                 walletSheet = true
                             }
                         }
-                        // Show balance in fiat (default) or bitcoin (sats).
-                        SNSettingsRow(
-                            icon: .coin, tone: .gold, label: "Show balance in",
-                            value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
-                            divider: true
-                        ) {
-                            store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                        if walletKeyConfigured {
+                            // Show balance in fiat (default) or bitcoin (sats).
+                            SNSettingsRow(
+                                icon: .coin, tone: .gold, label: "Show balance in",
+                                value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
+                                divider: true
+                            ) {
+                                store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                            }
+                            // Currency for the fiat display.
+                            SNSettingsRow(
+                                icon: .coin, tone: .gold, label: "Currency",
+                                value: store.displayCurrency,
+                                divider: false
+                            ) {
+                                currencySheet = true
+                            }
                         }
-                        // Currency for the fiat display.
-                        SNSettingsRow(
-                            icon: .coin, tone: .gold, label: "Currency",
-                            value: store.displayCurrency,
-                            divider: false
-                        ) {
-                            currencySheet = true
-                        }
+                    }
+                    if !walletKeyConfigured {
+                        Text("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
+                            .font(SonarTheme.uiFont(size: 12))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, 4)
                     }
 
                     SNSectionLabel("Privacy & safety")
@@ -271,13 +280,25 @@ struct SonarSettingsScreen: View {
         #endif
     }
 
+    /// Build has a non-empty Breez key — not the same as wallet lifecycle ready.
+    /// `.notConfigured` also covers transient setup failure when the key exists.
+    private var walletKeyConfigured: Bool { SonarBreezBuildConfig.hasAPIKey }
+
+    private var walletBalanceSub: String {
+        walletKeyConfigured
+            ? "Pays like you message — tap to pay nearby or over the internet"
+            : "Lightning wallet unavailable in this build"
+    }
+
     /// Real balance when the wallet is ready, in the chosen display unit;
-    /// honest affordance otherwise.
+    /// honest affordance otherwise. Keyless builds say Unavailable (Compose parity).
+    /// Key-present + `.notConfigured` is a transient/setup gap, not a missing key.
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up\u{2026}"
-        case .notConfigured: return "Set up"
+        case .notConfigured:
+            return walletKeyConfigured ? "Not ready" : "Unavailable"
         }
     }
 
