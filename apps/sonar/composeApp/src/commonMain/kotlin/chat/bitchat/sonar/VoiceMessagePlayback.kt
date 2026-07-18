@@ -211,9 +211,9 @@ object AppVoicePlaybackSession {
  */
 class VoiceMessagePlaybackController(
     private val engine: VoicePlaybackEngine,
-    private val rateStore: VoicePlaybackRateStore,
-    private val queue: VoicePlaybackQueue,
-    private val listenedStore: VoicePlaybackListenedStore,
+    private var rateStore: VoicePlaybackRateStore,
+    private var queue: VoicePlaybackQueue,
+    private var listenedStore: VoicePlaybackListenedStore,
     private val clock: VoicePlaybackClock = object : VoicePlaybackClock {
         override fun nowMs(): Long = 0L
     },
@@ -235,6 +235,18 @@ class VoiceMessagePlaybackController(
         private set
 
     var onStateChanged: ((VoicePlaybackState) -> Unit)? = null
+
+    /** After Android Activity/UI recreation, point queue/rate/listened seams at
+     *  the live [SonarAppState] so Next/Previous read the new transcript window. */
+    fun rebindDependencies(
+        rateStore: VoicePlaybackRateStore,
+        queue: VoicePlaybackQueue,
+        listenedStore: VoicePlaybackListenedStore,
+    ) {
+        this.rateStore = rateStore
+        this.queue = queue
+        this.listenedStore = listenedStore
+    }
 
     fun dispatch(command: VoicePlaybackCommand) {
         scope.launch { mutex.withLock { applyCommand(command) } }

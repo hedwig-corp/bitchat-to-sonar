@@ -49,8 +49,14 @@ private class JavaFxVoicePlaybackEngine(
                         ready.countDown()
                     }
                     mp.setOnError {
-                        prepareError = mp.error ?: IllegalStateException("javafx media error")
-                        ready.countDown()
+                        // During prepare, fail the latch. After ready, forward
+                        // to the host so the UI leaves Playing on decode errors.
+                        if (ready.count > 0L) {
+                            prepareError = mp.error ?: IllegalStateException("javafx media error")
+                            ready.countDown()
+                        } else {
+                            host.onFailed(this.generation.get())
+                        }
                     }
                     mp.setOnEndOfMedia {
                         host.onEnded(this.generation.get())

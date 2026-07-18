@@ -7492,6 +7492,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 existing.onStateChanged = { s -> voicePlayback = s }
                 voicePlayback = existing.state
             }
+            // Always rebind queue/rate/listened to THIS state — the process-
+            // scoped controller may still hold inner classes from a prior
+            // SonarAppState after Activity recreation.
+            existing.rebindDependencies(
+                rateStore = AppVoicePlaybackRateStore(),
+                queue = AppVoicePlaybackQueue(),
+                listenedStore = voiceListenedStore,
+            )
             return existing
         }
         return VoiceMessagePlaybackController(

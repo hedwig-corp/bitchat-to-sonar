@@ -2205,6 +2205,9 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func clearAccountBoundLocalStateForRestore() {
+        // Same teardown as wipe/erase — stop playback before media cache delete
+        // so a restore mid-play cannot keep the prior account's voice session.
+        VoiceNotePlaybackController.shared.clearAll()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
