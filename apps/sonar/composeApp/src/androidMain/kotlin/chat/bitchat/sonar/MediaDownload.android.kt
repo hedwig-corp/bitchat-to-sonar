@@ -23,6 +23,8 @@ actual object MediaCache {
         File(path).isFile
     }
 
+    actual fun existsSync(path: String): Boolean = File(path).isFile
+
     actual suspend fun read(path: String): ByteArray? = withContext(Dispatchers.IO) {
         runCatching { File(path).takeIf(File::isFile)?.readBytes() }.getOrNull()
     }

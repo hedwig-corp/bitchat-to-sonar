@@ -311,19 +311,48 @@ actual fun decodeImageBounds(bytes: ByteArray): Pair<Int, Int>? {
 }
 
 internal actual fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): ThumbnailDecode? {
-    // Pass 1: header only — no pixel buffer is allocated, so the full-size
-    // bitmap never exists even for a 12MP photo.
-    val (width, height) = decodeImageBounds(bytes) ?: return null // not an image
-    val longestEdge = maxOf(width, height)
+    val (width, height) = decodeImageBounds(bytes) ?: return null
+    return decodeThumbnailSampled(
+        width = width,
+        height = height,
+        maxEdgePx = maxEdgePx,
+        decode = { options -> BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) },
+    )
+}
 
+/**
+ * Signal-Android `ThumbnailView` / Glide path: bound decode from a file stream
+ * so the conversation list never materialises the full attachment as a
+ * `ByteArray` (12MP plaintext would stall open and blow the heap).
+ */
+internal actual fun decodeThumbnailFromPath(path: String, maxEdgePx: Int): ThumbnailDecode? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    runCatching { BitmapFactory.decodeFile(path, bounds) }
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+    return decodeThumbnailSampled(
+        width = bounds.outWidth,
+        height = bounds.outHeight,
+        maxEdgePx = maxEdgePx,
+        decode = { options -> BitmapFactory.decodeFile(path, options) },
+    )
+}
+
+private fun decodeThumbnailSampled(
+    width: Int,
+    height: Int,
+    maxEdgePx: Int,
+    decode: (BitmapFactory.Options) -> Bitmap?,
+): ThumbnailDecode? {
+    val longestEdge = maxOf(width, height)
     // inSampleSize must be a power of two; BitmapFactory rounds down to one
     // anyway. Halve until the decoded edge fits, so the sampled bitmap is at
-    // most 2x the target before the exact scale below.
+    // most 2x the target before the exact scale below — same idea as Signal's
+    // SignalDownsampleStrategy + Glide.override(bubbleW, bubbleH).
     var sample = 1
     while (longestEdge / (sample * 2) >= maxEdgePx) sample *= 2
 
     val options = BitmapFactory.Options().apply { inSampleSize = sample }
-    val sampled = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: return null
+    val sampled = decode(options) ?: return null
 
     val sampledEdge = maxOf(sampled.width, sampled.height)
     val scaled = if (sampledEdge > maxEdgePx) {
@@ -341,8 +370,7 @@ internal actual fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): Thumbnail
     }
 
     // Re-encode only when sampling actually shrank the source; a photo already
-    // under the bound would round-trip through JPEG for nothing (lossy, and no
-    // decode saved next time — the original is already thumbnail-sized).
+    // under the bound would round-trip through WebP for nothing.
     val encoded = if (scaled !== sampled || sample > 1 || sampledEdge > maxEdgePx) {
         runCatching {
             java.io.ByteArrayOutputStream().use { out ->

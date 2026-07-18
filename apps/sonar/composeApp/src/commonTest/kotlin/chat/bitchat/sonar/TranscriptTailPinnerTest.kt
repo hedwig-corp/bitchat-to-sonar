@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class TranscriptTailPinnerTest {
 
@@ -105,6 +106,34 @@ class TranscriptTailPinnerTest {
         assertEquals(
             0,
             transcriptTailOverflowPx(lastOffset = 1900, lastSize = 100, viewportEndOffset = 2200, afterContentPadding = 30),
+        )
+        // Layout proof for ending LiveEdge open recovery: overflow 0 ⇒ at live edge.
+        assertEquals(
+            0,
+            transcriptTailOverflowPx(
+                lastOffset = 1900,
+                lastSize = 100,
+                viewportEndOffset = 2200,
+                afterContentPadding = 200, // end content = 2000; last bottom = 2000
+            ),
+        )
+        assertTrue(
+            transcriptTailOverflowPx(
+                lastOffset = 1900,
+                lastSize = 150,
+                viewportEndOffset = 2200,
+                afterContentPadding = 200,
+            ) > 0,
+            "overflow must stay positive while the newest row hangs below the fold",
+        )
+    }
+
+    @Test
+    fun liveEdgeLayoutProof_zeroOverflowMeansSettled() {
+        // Mirrors isTranscriptTailAtLiveEdge: newest row bottom flush with viewport.
+        assertEquals(
+            0,
+            transcriptTailOverflowPx(lastOffset = 0, lastSize = 100, viewportEndOffset = 130, afterContentPadding = 30),
         )
     }
 }

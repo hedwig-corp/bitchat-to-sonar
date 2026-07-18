@@ -11,6 +11,7 @@
 //
 
 import Combine
+import ImageIO
 import SwiftUI
 import WebKit
 import QuickLook
@@ -214,6 +215,55 @@ struct SNSectionLabel: View {
             .foregroundColor(SonarTheme.text3)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(EdgeInsets(top: 16, leading: 18, bottom: 7, trailing: 18))
+    }
+}
+
+// MARK: - Transcript day chip (Signal / Compose bc-datechip)
+
+/// Whether to insert a day chip before [current] given the previous row's date.
+func snTranscriptShowsDayChip(previous: Date?, current: Date?, calendar: Calendar = .current) -> Bool {
+    guard let current else { return false }
+    guard let previous else { return true }
+    return !calendar.isDate(previous, inSameDayAs: current)
+}
+
+/// Today / Yesterday / weekday / `d MMM` — matches Compose `dayLabel`.
+/// Today/Yesterday derive from `now` (not the wall clock) so labels are
+/// deterministic under test and consistent with the day-delta branch.
+func snTranscriptDayLabel(for date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
+    let start = calendar.startOfDay(for: date)
+    let todayStart = calendar.startOfDay(for: now)
+    let days = calendar.dateComponents([.day], from: start, to: todayStart).day ?? Int.max
+    if days == 0 { return "Today" }
+    if days == 1 { return "Yesterday" }
+    if days > 0, days < 7 {
+        return snTranscriptWeekdayFormatter.string(from: date)
+    }
+    return snTranscriptShortDateFormatter.string(from: date)
+}
+
+private let snTranscriptWeekdayFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "EEE"
+    return f
+}()
+
+private let snTranscriptShortDateFormatter: DateFormatter = {
+    let f = DateFormatter()
+    f.dateFormat = "d MMM"
+    return f
+}()
+
+/// Centered day marker in the transcript (bc-datechip).
+struct SNDateChip: View {
+    let label: String
+
+    var body: some View {
+        Text(verbatim: label)
+            .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
+            .foregroundColor(SonarTheme.text3)
+            .frame(maxWidth: .infinity)
+            .padding(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
     }
 }
 
@@ -701,12 +751,6 @@ struct SNMediaPipeline {
     )
 }
 
-enum SNTailPinAction: Equatable {
-    case none
-    case snap
-    case animate
-}
-
 /// O(1) identity for transcript changes that can affect the live edge. A
 /// bounded window can replace its tail without changing count, so both fields
 /// are required; intermediate row identities do not change tail-following.
@@ -715,143 +759,11 @@ struct SNTailRevision: Equatable {
     let tailID: String?
 }
 
-/// Signal coalesces rapid safe-area/inset notifications with a 10 ms,
-/// last-event-only debounce. Keyboard layout steps all request the same snap,
-/// so keep at most one pending main-queue correction per debounce window.
-struct SNTailSnapCoalescer {
-    private(set) var isScheduled = false
-
-    mutating func request() -> Bool {
-        guard !isScheduled else { return false }
-        isScheduled = true
-        return true
-    }
-
-    mutating func consume() -> Bool {
-        guard isScheduled else { return false }
-        isScheduled = false
-        return true
-    }
-}
-
 /// Reference-semantic height scratchpad. Mutating `last` does not invalidate
 /// SwiftUI the way `@State CGFloat` would, so keyboard animation can update
 /// the previous-height sample without rebuilding the transcript.
 final class SNViewportHeightTracker {
     var last: CGFloat = 0
-}
-
-/// Previous-frame tail state, mirroring Signal-iOS `updateContentInsets`:
-/// capture `wasScrolledToBottom` before the inset/viewport change, then
-/// `scrollToBottomOfLoadWindow(animated: false)` when pinned
-/// (`ConversationViewController+OWS.updateContentInsets`). Sentinel
-/// disappearance alone is ambiguous — keyboard shrink, append, and user
-/// scroll all hide it — so keep prior pin until user scroll or history open.
-struct SNTailPinLatch {
-    private(set) var wasPinned = false
-    private(set) var lastItemCount = 0
-    private(set) var lastTailID: String?
-
-    mutating func tailVisible(itemCount: Int, tailID: String?) {
-        wasPinned = true
-        updateSnapshot(itemCount: itemCount, tailID: tailID)
-    }
-
-    mutating func openInHistory(itemCount: Int, tailID: String?) {
-        wasPinned = false
-        updateSnapshot(itemCount: itemCount, tailID: tailID)
-    }
-
-    mutating func userScrolled(isNearBottom: Bool) {
-        if !isNearBottom { wasPinned = false }
-    }
-
-    mutating func itemsChanged(
-        itemCount: Int,
-        tailID: String?,
-        isNearBottom: Bool,
-        userScrolling: Bool,
-        isPrepending: Bool
-    ) -> SNTailPinAction {
-        // A full bounded window can replace its oldest row when a new message
-        // arrives, leaving the item count unchanged. The tail identity is the
-        // authoritative live-edge signal in that case.
-        let appendedAtTail = tailID != lastTailID
-        updateSnapshot(itemCount: itemCount, tailID: tailID)
-        if isPrepending {
-            // A deliberate history-page insert owns the scroll position even
-            // when the old short transcript still fits and reports its tail
-            // visible during the first update frame.
-            wasPinned = false
-            return .none
-        }
-        if userScrolling {
-            wasPinned = isNearBottom
-            return .none
-        }
-        guard wasPinned, appendedAtTail else { return .none }
-        return .animate
-    }
-
-    mutating func tailHidden(
-        itemCount: Int,
-        tailID: String?,
-        userScrolling: Bool,
-        isPrepending: Bool
-    ) -> SNTailPinAction {
-        let appendedAtTail = tailID != lastTailID
-        updateSnapshot(itemCount: itemCount, tailID: tailID)
-        if userScrolling || isPrepending {
-            wasPinned = false
-            return .none
-        }
-        guard wasPinned, itemCount > 0 else { return .none }
-        return appendedAtTail ? .animate : .snap
-    }
-
-    mutating func viewportShrank(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
-        viewportResized(userScrolling: userScrolling, isPrepending: isPrepending)
-    }
-
-    /// Signal `updateContentInsets` re-pins whenever insets change while
-    /// `wasScrolledToBottom` — grow or shrink (keyboard dismiss / phantom
-    /// safe-area clear). Only user scroll unpins.
-    mutating func viewportExpanded(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
-        viewportResized(userScrolling: userScrolling, isPrepending: isPrepending)
-    }
-
-    private mutating func viewportResized(userScrolling: Bool, isPrepending: Bool) -> SNTailPinAction {
-        if userScrolling || isPrepending {
-            wasPinned = false
-            return .none
-        }
-        return wasPinned ? .snap : .none
-    }
-
-    /// Signal: `let wasScrolledToBottom = self.isScrolledToBottom` before
-    /// mutating `contentInset`. Keyboard frame notification is the SwiftUI
-    /// equivalent — capture before the safe-area shrink/offset clamp.
-    mutating func viewportWillChange(
-        isNearBottom: Bool,
-        userScrolling: Bool,
-        isPrepending: Bool
-    ) -> SNTailPinAction {
-        if isPrepending {
-            wasPinned = false
-            return .none
-        }
-        if userScrolling {
-            wasPinned = isNearBottom
-            return .none
-        }
-        if isNearBottom { wasPinned = true }
-        return wasPinned ? .snap : .none
-    }
-
-    private mutating func updateSnapshot(itemCount: Int, tailID: String?) {
-        lastItemCount = itemCount
-        lastTailID = tailID
-    }
 }
 
 /// Distinguishes scrolls that can move the reader away from the tail from
@@ -909,16 +821,6 @@ func snScrollToBottomOfLoadWindowOffsetY(
 ) -> CGFloat {
     let minY = -topInset
     return max(minY, contentHeight + bottomInset - boundsHeight)
-}
-
-/// Fully-read opens may use `defaultScrollAnchor(.bottom)` (iOS 17+). Unread
-/// / pending-unread opens stay top-anchored so the divider owns first paint.
-func snUsesBottomScrollAnchor(
-    unreadAnchorId: String?,
-    unreadCountAtOpen: UInt64,
-    unreadAnchorAbandoned: Bool
-) -> Bool {
-    unreadAnchorId == nil && (unreadCountAtOpen == 0 || unreadAnchorAbandoned)
 }
 
 /// iOS 17+ / macOS 14+: start (and keep) the scroll view at the live edge —
@@ -1108,6 +1010,58 @@ func snShouldRecordUserScroll(
 }
 
 #if os(iOS)
+/// Holds the enclosing UIScrollView for ContinuityToken capture/restore on the
+/// SNMsgList fallback path (Phase 2 collection host has its own).
+@MainActor
+final class SNScrollContinuityBridge {
+    weak var scrollView: UIScrollView?
+
+    func capture(anchorId: String) -> SNTranscriptContinuityToken {
+        guard let scrollView else {
+            return SNTranscriptScrollPolicy.continuityToken(anchorId: anchorId, pixelOffset: 0)
+        }
+        let maxY = snScrollToBottomOfLoadWindowOffsetY(
+            boundsHeight: scrollView.bounds.height,
+            contentHeight: scrollView.contentSize.height,
+            topInset: scrollView.adjustedContentInset.top,
+            bottomInset: scrollView.adjustedContentInset.bottom
+        )
+        let edgeDistance = maxY - scrollView.contentOffset.y
+        return SNTranscriptScrollPolicy.continuityToken(
+            anchorId: anchorId,
+            edgeDistance: edgeDistance
+        )
+    }
+
+    func restore(_ token: SNTranscriptContinuityToken) {
+        guard let scrollView else { return }
+        scrollView.layoutIfNeeded()
+        switch token.edge {
+        case .edgeDistance(let distance):
+            let contentHeight = scrollView.contentSize.height
+            if contentHeight < 1 { return }
+            let maxY = snScrollToBottomOfLoadWindowOffsetY(
+                boundsHeight: scrollView.bounds.height,
+                contentHeight: contentHeight,
+                topInset: scrollView.adjustedContentInset.top,
+                bottomInset: scrollView.adjustedContentInset.bottom
+            )
+            let minY = -scrollView.adjustedContentInset.top
+            let y = max(minY, maxY - distance)
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: y),
+                animated: false
+            )
+        case .pixelOffset(let y):
+            let minY = -scrollView.adjustedContentInset.top
+            scrollView.setContentOffset(
+                CGPoint(x: scrollView.contentOffset.x, y: max(minY, y)),
+                animated: false
+            )
+        }
+    }
+}
+
 /// Bridges the underlying scroll view's user-driven offset changes without
 /// taking over its delegate. Programmatic `scrollTo` calls and keyboard layout
 /// adjustments toward the tail do not report as user scrolling. Offset moves
@@ -1116,17 +1070,25 @@ func snShouldRecordUserScroll(
 private struct SNUserScrollObserver: UIViewRepresentable {
     let onUserScroll: (SNUserScrollActivity) -> Void
     let onViewportWillChange: (Notification) -> Void
+    /// Fires when `contentSize.height` grows (media decode, self-sizing cells).
+    /// Hosts re-pin the live edge — Signal keeps the tail across content growth.
+    var onContentSizeGrow: (() -> Void)? = nil
+    var continuityBridge: SNScrollContinuityBridge?
 
     func makeUIView(context: Context) -> ObserverView {
         let view = ObserverView()
         view.onUserScroll = onUserScroll
         view.onViewportWillChange = onViewportWillChange
+        view.onContentSizeGrow = onContentSizeGrow
+        view.continuityBridge = continuityBridge
         return view
     }
 
     func updateUIView(_ uiView: ObserverView, context: Context) {
         uiView.onUserScroll = onUserScroll
         uiView.onViewportWillChange = onViewportWillChange
+        uiView.onContentSizeGrow = onContentSizeGrow
+        uiView.continuityBridge = continuityBridge
         // Only scan/attach when we are not already observing. Calling this on
         // every keyboard-driven body pass was a major agent-DM cost (bench:
         // attach_requests≈revisions per transition).
@@ -1141,8 +1103,12 @@ private struct SNUserScrollObserver: UIViewRepresentable {
     final class ObserverView: UIView {
         var onUserScroll: (SNUserScrollActivity) -> Void = { _ in }
         var onViewportWillChange: (Notification) -> Void = { _ in }
+        var onContentSizeGrow: (() -> Void)?
+        var continuityBridge: SNScrollContinuityBridge?
         private weak var observedScrollView: UIScrollView?
         private var contentOffsetObservation: NSKeyValueObservation?
+        private var contentSizeObservation: NSKeyValueObservation?
+        private var lastContentHeight: CGFloat = 0
         private var offsetClassifier = SNUserScrollOffsetClassifier()
         private var keyboardFrameObserver: NSObjectProtocol?
         private var viewportTransitionDeadline: TimeInterval = 0
@@ -1285,6 +1251,7 @@ private struct SNUserScrollObserver: UIViewRepresentable {
             guard let scrollView = ancestor as? UIScrollView,
                   scrollView !== observedScrollView else { return }
             observedScrollView = scrollView
+            continuityBridge?.scrollView = scrollView
             // Signal owns conversation insets; disable UIKit keyboard
             // automatic adjustment so it cannot leave a phantom bottom band.
             scrollView.contentInsetAdjustmentBehavior = .never
@@ -1301,6 +1268,20 @@ private struct SNUserScrollObserver: UIViewRepresentable {
                 viewportHeight: scrollView.bounds.height,
                 bottomInset: scrollView.adjustedContentInset.bottom
             )
+            lastContentHeight = scrollView.contentSize.height
+            contentSizeObservation = scrollView.observe(\.contentSize, options: [.new]) {
+                [weak self] scrollView, _ in
+                guard let self else { return }
+                let height = scrollView.contentSize.height
+                // Only growth: media thumbs / self-sizing cells lengthening the
+                // transcript. Shrink/no-op must not yank the reader.
+                guard height > self.lastContentHeight + 0.5 else {
+                    self.lastContentHeight = height
+                    return
+                }
+                self.lastContentHeight = height
+                self.onContentSizeGrow?()
+            }
             contentOffsetObservation = scrollView.observe(\.contentOffset, options: [.new]) {
                 [weak self] scrollView, _ in
                 guard let self else { return }
@@ -1410,9 +1391,10 @@ struct SNMsgList: View {
     /// Restore a movable historical window to its newest local page.
     var loadNewest: (() async -> Void)? = nil
     /// Unread count captured at open time (before read-marking zeroed the core
-    /// counter). Non-zero opens the transcript anchored at the first unread
-    /// row with a divider, Signal-style, instead of pinning the tail.
-    var unreadCountAtOpen: UInt64 = 0
+    /// counter). `nil` means capture has not settled yet — do not treat as
+    /// fully-read. Non-zero opens anchored at the first unread row with a
+    /// divider, Signal-style, instead of pinning the tail.
+    var unreadCountAtOpen: UInt64? = nil
     /// Newest known message date across the chat's folded sources. The unread
     /// anchor may only be resolved once the visible rows have caught up to
     /// this — hydration can publish one transport leg before the folded White
@@ -1444,6 +1426,13 @@ struct SNMsgList: View {
     @State private var viewportHeightTracker = SNViewportHeightTracker()
     @State private var isUserScrolling = false
     @State private var userScrollGeneration = 0
+    /// Fully-read open: keep snapping to the live edge until `sn-bottom`
+    /// appears (or the user scrolls away / unread takes over). Clears the
+    /// alpha.11 race where one async `scrollTo` lost to LazyVStack layout.
+    @State private var needsLiveEdgeOpen = false
+    #if os(iOS)
+    @State private var continuityBridge = SNScrollContinuityBridge()
+    #endif
 
     /// The live-edge identity must participate in change detection. Once the
     /// bounded transcript reaches capacity, a send replaces an old row and
@@ -1467,7 +1456,16 @@ struct SNMsgList: View {
     }
 
     private var usesBottomScrollAnchor: Bool {
-        snUsesBottomScrollAnchor(
+        SNTranscriptScrollPolicy.usesBottomScrollAnchor(
+            unreadAnchorId: unreadAnchorId,
+            unreadCountAtOpen: unreadCountAtOpen,
+            unreadAnchorAbandoned: unreadAnchorAbandoned
+        )
+    }
+
+    /// Signal `scrollToInitialPosition` vocabulary for this open.
+    private var transcriptOpenAction: SNTranscriptOpenAction {
+        SNTranscriptScrollPolicy.openAction(
             unreadAnchorId: unreadAnchorId,
             unreadCountAtOpen: unreadCountAtOpen,
             unreadAnchorAbandoned: unreadAnchorAbandoned
@@ -1479,7 +1477,7 @@ struct SNMsgList: View {
     /// interleave without consuming budget. Re-resolves only when the frozen
     /// row leaves the loaded window (e.g. replaced by a fresh local page).
     private func resolveUnreadAnchor() {
-        guard unreadCountAtOpen > 0 else { return }
+        guard let unreadCountAtOpen, unreadCountAtOpen > 0 else { return }
         if let current = unreadAnchorId, msgs.contains(where: { $0.id == current }) { return }
         // Wait for the rows to catch up with the newest known message before
         // counting from the tail; freezing against a partially merged feed
@@ -1497,7 +1495,11 @@ struct SNMsgList: View {
             if remaining == 0 { break }
         }
         unreadAnchorId = anchor
-        if anchor == nil { unreadAnchorAbandoned = true }
+        if anchor == nil {
+            // Caught-up feed cannot place a divider — fall back to live edge
+            // (agent/control-only unread budgets). Hosts must start open recovery.
+            unreadAnchorAbandoned = true
+        }
     }
 
     #if os(iOS)
@@ -1513,6 +1515,10 @@ struct SNMsgList: View {
 
     private func recordUserScroll() {
         isUserScrolling = true
+        // Genuine user scroll abandons fully-read open recovery even when the
+        // bottom sentinel never appeared (isNearBottom can still be the
+        // initial `true` while the list is mid-history).
+        needsLiveEdgeOpen = false
         tailPin.userScrolled(isNearBottom: isNearBottom)
         userScrollGeneration &+= 1
         let generation = userScrollGeneration
@@ -1522,18 +1528,41 @@ struct SNMsgList: View {
         }
     }
 
+    /// Signal `scrollToBottomOfLoadWindow` for a fully-read open: last row +
+    /// sentinel. Safe to call repeatedly while `needsLiveEdgeOpen` is set.
+    private func snapFullyReadOpen(proxy: ScrollViewProxy) {
+        guard SNTranscriptScrollPolicy.shouldResnapFullyReadOpen(
+            usesBottomScrollAnchor: usesBottomScrollAnchor,
+            needsLiveEdgeOpen: needsLiveEdgeOpen,
+            hasLeftBottom: hasLeftBottom,
+            userScrolling: isUserScrolling,
+            hasTailRow: msgs.last?.id != nil
+        ) else { return }
+        tailPin.tailVisible(itemCount: msgs.count, tailID: msgs.last?.id)
+        followTail(.snap, proxy: proxy, animateAppends: false)
+        if let tailID = msgs.last?.id {
+            DispatchQueue.main.async {
+                proxy.scrollTo(tailID, anchor: .bottom)
+            }
+        }
+    }
+
     private func followTail(
         _ action: SNTailPinAction,
         proxy: ScrollViewProxy,
         animateAppends: Bool = true
     ) {
+        // Latch already applied SNTranscriptScrollPolicy inset decisions;
+        // `.none` is lockstep or ignore — do not programmatic-scroll.
         guard action != .none else { return }
         #if SONAR_KEYBOARD_BENCH && os(iOS)
         SNKeyboardTailBenchmark.shared.recordTailRequest()
         #endif
         if action == .snap {
             guard tailSnapCoalescer.request() else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + SNTranscriptScrollPolicy.snapCoalesceSeconds
+            ) {
                 guard tailSnapCoalescer.consume() else { return }
                 #if SONAR_KEYBOARD_BENCH && os(iOS)
                 SNKeyboardTailBenchmark.shared.recordTailExecution()
@@ -1563,11 +1592,15 @@ struct SNMsgList: View {
                     // eagerly building every attributed-text bubble here stalls
                     // first paint even though the database read is already bounded.
                     LazyVStack(spacing: 0) {
-                        Text("Today")
-                            .font(SonarTheme.uiFont(size: 11.5, weight: .semibold))
-                            .foregroundColor(SonarTheme.text3)
-                            .padding(EdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10))
                         ForEach(Array(msgs.enumerated()), id: \.element.id) { i, m in
+                            // Day chip when the local calendar day flips (not a
+                            // hardcoded "Today" at the top of the window).
+                            let prevDate = i > 0 ? msgs[i - 1].sortDate : nil
+                            if snTranscriptShowsDayChip(previous: prevDate, current: m.sortDate),
+                               let day = m.sortDate
+                            {
+                                SNDateChip(label: snTranscriptDayLabel(for: day))
+                            }
                             // Signal-style unread marker above the oldest unread row.
                             if m.id == unreadAnchorId {
                                 SNUnreadDivider().id("sn-unread")
@@ -1635,13 +1668,24 @@ struct SNMsgList: View {
                                 guard i == 0, hasLeftBottom || unreadAnchorId != nil,
                                       let loadOlder, !isLoadingOlder else { return }
                                 let preserveID = m.id
+                                #if os(iOS)
+                                let token = continuityBridge.capture(anchorId: preserveID)
+                                #endif
                                 isLoadingOlder = true
                                 Task { @MainActor in
                                     let added = await loadOlder()
                                     isLoadingOlder = false
                                     guard added else { return }
                                     await Task.yield()
+                                    #if os(iOS)
+                                    if continuityBridge.scrollView != nil {
+                                        continuityBridge.restore(token)
+                                    } else {
+                                        proxy.scrollTo(token.anchorId, anchor: .top)
+                                    }
+                                    #else
                                     proxy.scrollTo(preserveID, anchor: .top)
+                                    #endif
                                 }
                             }
                         }
@@ -1649,6 +1693,9 @@ struct SNMsgList: View {
                             .onAppear {
                                 isNearBottom = true
                                 hasReachedBottomOnce = true
+                                // Live edge is on screen — fully-read open
+                                // recovery can stop re-snapping.
+                                needsLiveEdgeOpen = false
                                 // Reaching the tail consumes any transient
                                 // drag/deceleration marker. Without this, a
                                 // composer tap inside the 0.2-second debounce
@@ -1681,20 +1728,50 @@ struct SNMsgList: View {
                     // A modifier on ScrollView itself is a native sibling, so
                     // ancestor lookup cannot reach UIScrollView/NSScrollView.
                     .background(
-                        SNUserScrollObserver(
-                            onUserScroll: noteUserScroll,
-                            onViewportWillChange: { notification in
-                                #if SONAR_KEYBOARD_BENCH && os(iOS)
-                                SNKeyboardTailBenchmark.shared.begin(notification)
-                                #endif
-                                let action = tailPin.viewportWillChange(
-                                    isNearBottom: isNearBottom,
-                                    userScrolling: isUserScrolling,
-                                    isPrepending: isLoadingOlder
-                                )
-                                followTail(action, proxy: proxy)
-                            }
-                        )
+                        Group {
+                            #if os(iOS)
+                            SNUserScrollObserver(
+                                onUserScroll: noteUserScroll,
+                                onViewportWillChange: { notification in
+                                    #if SONAR_KEYBOARD_BENCH
+                                    SNKeyboardTailBenchmark.shared.begin(notification)
+                                    #endif
+                                    let action = tailPin.viewportWillChange(
+                                        isNearBottom: isNearBottom,
+                                        userScrolling: isUserScrolling,
+                                        isPrepending: isLoadingOlder
+                                    )
+                                    followTail(action, proxy: proxy)
+                                },
+                                onContentSizeGrow: {
+                                    // Long-chat gap: last bubble grows (ImageIO
+                                    // thumb / self-size) after sn-bottom already
+                                    // cleared open recovery — re-pin while at tail.
+                                    guard !isUserScrolling, !isLoadingOlder else { return }
+                                    guard needsLiveEdgeOpen || isNearBottom || tailPin.wasPinned else {
+                                        return
+                                    }
+                                    followTail(.snap, proxy: proxy)
+                                    if needsLiveEdgeOpen {
+                                        snapFullyReadOpen(proxy: proxy)
+                                    }
+                                },
+                                continuityBridge: continuityBridge
+                            )
+                            #else
+                            SNUserScrollObserver(
+                                onUserScroll: noteUserScroll,
+                                onViewportWillChange: { _ in
+                                    let action = tailPin.viewportWillChange(
+                                        isNearBottom: isNearBottom,
+                                        userScrolling: isUserScrolling,
+                                        isPrepending: isLoadingOlder
+                                    )
+                                    followTail(action, proxy: proxy)
+                                }
+                            )
+                            #endif
+                        }
                             .frame(width: 0, height: 0)
                             .accessibilityHidden(true)
                     )
@@ -1705,10 +1782,14 @@ struct SNMsgList: View {
                 .modifier(SNTranscriptScrollAnchor(bottomAligned: usesBottomScrollAnchor))
                 .onAppear {
                     viewportHeightTracker.last = geo.size.height
-                    // Signal `scrollToInitialPosition`: unread divider at top,
-                    // otherwise `scrollToBottomOfLoadWindow`.
+                    // Signal `scrollToInitialPosition` via shared open policy.
                     resolveUnreadAnchor()
-                    if unreadAnchorId != nil {
+                    switch transcriptOpenAction {
+                    case .unreadDivider:
+                        needsLiveEdgeOpen = false
+                        // Pending unread without a resolved divider id must
+                        // not scroll yet (same as pre-policy: neither branch).
+                        guard unreadAnchorId != nil else { break }
                         isNearBottom = false
                         tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
                         // The divider enters the hierarchy on the render pass
@@ -1716,28 +1797,52 @@ struct SNMsgList: View {
                         DispatchQueue.main.async {
                             proxy.scrollTo("sn-unread", anchor: .top)
                         }
-                    } else {
-                        // Wait one turn so LazyVStack has materialised the tail;
-                        // scroll the last row and the sentinel (Signal bottom).
+                    case .liveEdge:
+                        // Latch the live edge *before* the first scroll so
+                        // hydration / LazyVStack growth can re-snap even when
+                        // the first `scrollTo` races an under-measured size.
+                        needsLiveEdgeOpen = true
+                        snapFullyReadOpen(proxy: proxy)
+                        // Second pass after layout; still gated by
+                        // `needsLiveEdgeOpen` until `sn-bottom` appears.
                         DispatchQueue.main.async {
-                            if let tailID = msgs.last?.id {
-                                proxy.scrollTo(tailID, anchor: .bottom)
-                            }
-                            proxy.scrollTo("sn-bottom", anchor: .bottom)
+                            snapFullyReadOpen(proxy: proxy)
+                        }
+                    case .jump(let id):
+                        needsLiveEdgeOpen = false
+                        isNearBottom = false
+                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+                        DispatchQueue.main.async {
+                            proxy.scrollTo(id, anchor: .top)
                         }
                     }
                 }
                 .onChange(of: unreadCountAtOpen) { _ in
-                    // A cold launch captures the unread count asynchronously
-                    // (core index read); anchor when it lands, unless the
-                    // divider already resolved.
-                    guard unreadAnchorId == nil, unreadCountAtOpen > 0 else { return }
+                    // Capture settled (was nil → 0 or N). Drive open from
+                    // policy only — never chase the live edge while unset.
                     resolveUnreadAnchor()
-                    guard unreadAnchorId != nil else { return }
-                    isNearBottom = false
-                    tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
-                    DispatchQueue.main.async {
-                        proxy.scrollTo("sn-unread", anchor: .top)
+                    switch transcriptOpenAction {
+                    case .unreadDivider:
+                        guard unreadAnchorId != nil else { return }
+                        needsLiveEdgeOpen = false
+                        isNearBottom = false
+                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+                        DispatchQueue.main.async {
+                            proxy.scrollTo("sn-unread", anchor: .top)
+                        }
+                    case .liveEdge:
+                        needsLiveEdgeOpen = true
+                        snapFullyReadOpen(proxy: proxy)
+                        DispatchQueue.main.async {
+                            snapFullyReadOpen(proxy: proxy)
+                        }
+                    case .jump(let id):
+                        needsLiveEdgeOpen = false
+                        isNearBottom = false
+                        tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
+                        DispatchQueue.main.async {
+                            proxy.scrollTo(id, anchor: .top)
+                        }
                     }
                 }
                 .onChange(of: messageRevision) { _ in
@@ -1747,10 +1852,12 @@ struct SNMsgList: View {
                     )
                     #endif
                     let hadAnchor = unreadAnchorId != nil
+                    let wasAbandoned = unreadAnchorAbandoned
                     resolveUnreadAnchor()
                     if !hadAnchor, unreadAnchorId != nil {
                         // A late-merged transport leg just made the divider
                         // resolvable: it owns this scroll, not the tail.
+                        needsLiveEdgeOpen = false
                         isNearBottom = false
                         tailPin.openInHistory(itemCount: msgs.count, tailID: msgs.last?.id)
                         DispatchQueue.main.async {
@@ -1758,10 +1865,34 @@ struct SNMsgList: View {
                         }
                         return
                     }
-                    // While the divider is still pending, don't follow merged
-                    // rows to the bottom — the anchor scroll would lose the
-                    // race. An abandoned anchor is no longer pending.
-                    if unreadCountAtOpen > 0, unreadAnchorId == nil, !unreadAnchorAbandoned { return }
+                    if !wasAbandoned, unreadAnchorAbandoned {
+                        // Unread budget could not place a divider — Signal falls
+                        // back to the live edge; start open recovery.
+                        needsLiveEdgeOpen = true
+                        snapFullyReadOpen(proxy: proxy)
+                        return
+                    }
+                    // While a settled unread divider is still pending, don't
+                    // follow merged rows to the bottom — the anchor scroll
+                    // would lose the race. Unset capture is provisional live
+                    // edge (keep resnapping). Abandoned anchor is not pending.
+                    if let unreadCountAtOpen, unreadCountAtOpen > 0,
+                       unreadAnchorId == nil, !unreadAnchorAbandoned
+                    {
+                        return
+                    }
+                    // Fully-read open recovery: re-snap across hydration and
+                    // LazyVStack growth until the sentinel is on screen.
+                    if SNTranscriptScrollPolicy.shouldResnapFullyReadOpen(
+                        usesBottomScrollAnchor: usesBottomScrollAnchor,
+                        needsLiveEdgeOpen: needsLiveEdgeOpen,
+                        hasLeftBottom: hasLeftBottom,
+                        userScrolling: isUserScrolling,
+                        hasTailRow: msgs.last?.id != nil
+                    ) {
+                        snapFullyReadOpen(proxy: proxy)
+                        return
+                    }
                     let action = tailPin.itemsChanged(
                         itemCount: msgs.count,
                         tailID: msgs.last?.id,
@@ -1773,6 +1904,10 @@ struct SNMsgList: View {
                     // folded chat never visibly chases its late local rows.
                     followTail(action, proxy: proxy, animateAppends: feedCaughtUp)
                 }
+                .onChange(of: feedCaughtUp) { caughtUp in
+                    guard caughtUp else { return }
+                    snapFullyReadOpen(proxy: proxy)
+                }
                 // Viewport shrink (keyboard/composer) and expand (keyboard
                 // dismiss / phantom safe-area clear) both re-anchor while
                 // pinned — Signal keeps the tail across either inset change.
@@ -1781,6 +1916,9 @@ struct SNMsgList: View {
                     let previous = viewportHeightTracker.last
                     viewportHeightTracker.last = newHeight
                     guard previous > 0, abs(newHeight - previous) > 0.5 else { return }
+                    // Layout settle during fully-read open (under-measured
+                    // LazyVStack growing into the viewport). Still run the
+                    // R-009 latch so keyboard during open recovery pins.
                     let action: SNTailPinAction
                     if newHeight < previous {
                         #if SONAR_KEYBOARD_BENCH && os(iOS)
@@ -1797,6 +1935,9 @@ struct SNMsgList: View {
                         )
                     }
                     followTail(action, proxy: proxy)
+                    if needsLiveEdgeOpen {
+                        snapFullyReadOpen(proxy: proxy)
+                    }
                 }
             }
         }
@@ -1882,7 +2023,18 @@ private struct SNDecodedPlatformImage {
     let size: CGSize
 }
 
+/// Carrier so ImageIO can run off-main without requiring `Image` to be Sendable.
+private final class SNThumbBox: @unchecked Sendable {
+    let value: SNDecodedPlatformImage?
+    init(_ value: SNDecodedPlatformImage?) { self.value = value }
+}
+
+/// Longest edge for transcript list thumbnails (Compose `TRANSCRIPT_THUMB_MAX_EDGE_PX`,
+/// Signal ThumbnailView parity). Full capture resolution stays for the viewer.
+let snTranscriptThumbMaxEdgePx: CGFloat = 1024
+
 /// Decode a platform image (UIImage on iOS, NSImage on macOS) from raw bytes.
+/// Prefer [snDecodeTranscriptThumbnail] for list cells — full decode stalls open.
 private func snDecodedPlatformImage(_ data: Data) -> SNDecodedPlatformImage? {
     #if canImport(UIKit)
     guard let uiImage = UIImage(data: data) else { return nil }
@@ -1899,6 +2051,53 @@ func snPlatformImage(_ data: Data) -> Image? {
     snDecodedPlatformImage(data)?.image
 }
 
+/// Signal/Compose-style bounded thumbnail: ImageIO never materialises the full
+/// ARGB bitmap. Safe to call off the main actor.
+private func snDecodeTranscriptThumbnail(
+    url: URL,
+    maxEdge: CGFloat = snTranscriptThumbMaxEdgePx
+) -> SNDecodedPlatformImage? {
+    let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, options as CFDictionary) else {
+        return nil
+    }
+    return snThumbnail(from: source, maxEdge: maxEdge)
+}
+
+/// Bounded thumbnail from in-memory bytes (fallback when only `Data` is available).
+private func snDecodeTranscriptThumbnail(
+    data: Data,
+    maxEdge: CGFloat = snTranscriptThumbMaxEdgePx
+) -> SNDecodedPlatformImage? {
+    let options: [CFString: Any] = [kCGImageSourceShouldCache: false]
+    guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+        return nil
+    }
+    return snThumbnail(from: source, maxEdge: maxEdge)
+}
+
+private func snThumbnail(from source: CGImageSource, maxEdge: CGFloat) -> SNDecodedPlatformImage? {
+    let thumbOpts: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceThumbnailMaxPixelSize: max(64, Int(maxEdge)),
+        kCGImageSourceShouldCacheImmediately: true
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOpts as CFDictionary) else {
+        return nil
+    }
+    let size = CGSize(width: CGFloat(cgImage.width), height: CGFloat(cgImage.height))
+    #if canImport(UIKit)
+    let ui = UIImage(cgImage: cgImage)
+    return SNDecodedPlatformImage(image: Image(uiImage: ui), size: size)
+    #elseif canImport(AppKit)
+    let ns = NSImage(cgImage: cgImage, size: size)
+    return SNDecodedPlatformImage(image: Image(nsImage: ns), size: size)
+    #else
+    return nil
+    #endif
+}
+
 private func snFittedMediaSize(_ size: CGSize, maxWidth: CGFloat, maxHeight: CGFloat) -> CGSize {
     guard size.width > 0, size.height > 0 else {
         return CGSize(width: maxWidth * 0.62, height: 150)
@@ -1911,8 +2110,10 @@ private func snFittedMediaSize(_ size: CGSize, maxWidth: CGFloat, maxHeight: CGF
 /// ThumbnailView measures from DB width/height; Signal-iOS CVMediaAlbumView from
 /// sourceMediaSizePixels) so the decoded image never reflows the transcript.
 /// Reserve the exact box the decoded image will occupy; dimension-less media
-/// keeps the legacy fixed skeleton box.
-private func snReservedMediaSize(_ item: SNMediaItem, maxWidth: CGFloat) -> CGSize {
+/// keeps the legacy fixed skeleton box. The decoded thumbnail is rendered INTO
+/// this same box (aspect-fit), so a media row's height is a pure function of
+/// message data — required by the pre-measured collection host.
+func snReservedMediaSize(_ item: SNMediaItem, maxWidth: CGFloat) -> CGSize {
     if item.isGif { return CGSize(width: maxWidth, height: 220) }
     guard let w = item.width, let h = item.height, w > 0, h > 0 else {
         return CGSize(width: maxWidth * 0.62, height: 150)
@@ -2173,6 +2374,9 @@ struct SNMediaBubble: View {
     var pipeline: SNMediaPipeline = .unavailable
 
     @State private var bytes: Data?
+    /// Bounded transcript thumbnail (Signal/Compose parity). Body paints this;
+    /// full bytes are only kept for GIF / native preview.
+    @State private var thumb: SNDecodedPlatformImage?
     @State private var failed = false
     @State private var viewerOpen = false
     @State private var viewerIndex = 0
@@ -2189,16 +2393,16 @@ struct SNMediaBubble: View {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? ""].joined(separator: "|")
     }
+    /// Identity for reload: url + on-disk path (+ gif). Phase-only churn must
+    /// not clear an already-decoded thumb (Signal skip-reload).
     private var loadKey: String {
         guard let item else { return "" }
         let state = pipeline.state(item)
         return [
             item.url,
-            item.groupId,
-            item.localPath ?? "",
-            String(loadAttempt),
-            String(describing: state.phase),
-            state.localURL?.path ?? ""
+            state.localURL?.path ?? item.localPath ?? "",
+            item.isGif ? "gif" : "img",
+            String(loadAttempt)
         ].joined(separator: "|")
     }
 
@@ -2262,7 +2466,13 @@ struct SNMediaBubble: View {
             pipeline.prepare(item, item.isImage || item.mime.hasPrefix("audio/"))
         }
         .task(id: loadKey) {
-            bytes = nil
+            // Keep an existing thumb across loadKey restarts when the URL is
+            // unchanged — only clear when we have nothing to paint yet.
+            let keepThumb = thumb != nil
+            if !keepThumb {
+                bytes = nil
+                thumb = nil
+            }
             failed = false
             // A deck loads each card's bytes itself (lazy, only visible pages),
             // so the bubble skips the single-item load path.
@@ -2270,9 +2480,40 @@ struct SNMediaBubble: View {
             let transfer = pipeline.state(item)
             failed = transfer.phase == .failed
             guard transfer.phase == .available else { return }
+            if keepThumb { return }
+            if item.isImage, !(item.isGif) {
+                // Signal-style: bounded ImageIO thumbnail off-main; never
+                // UIImage(data:) full-res in the list body.
+                let localURL = transfer.localURL
+                let box = await Task.detached(priority: .userInitiated) {
+                    if let localURL {
+                        return SNThumbBox(snDecodeTranscriptThumbnail(url: localURL))
+                    }
+                    return SNThumbBox(nil)
+                }.value
+                if let decoded = box.value {
+                    thumb = decoded
+                    return
+                }
+                if let d = await pipeline.loadLocal(item) {
+                    let tBox = await Task.detached(priority: .userInitiated) {
+                        SNThumbBox(snDecodeTranscriptThumbnail(data: d))
+                    }.value
+                    if let t = tBox.value {
+                        thumb = t
+                    } else {
+                        snLogRecoveredUndecodableImage(item, bytes: d)
+                        failed = true
+                    }
+                } else {
+                    failed = true
+                }
+                return
+            }
+            // GIF / audio / file: still need original bytes.
             if let d = await pipeline.loadLocal(item) {
                 bytes = d
-                snLogRecoveredUndecodableImage(item, bytes: d)
+                if item.isImage { snLogRecoveredUndecodableImage(item, bytes: d) }
             } else {
                 failed = true
             }
@@ -2295,9 +2536,12 @@ struct SNMediaBubble: View {
                     }
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
-            } else if let bytes, let decoded = snDecodedPlatformImage(bytes) {
-                let size = snFittedMediaSize(decoded.size, maxWidth: maxBubbleWidth, maxHeight: 300)
-                decoded.image
+            } else if let thumb {
+                // Stable transcript geometry: render into the reserved box
+                // (stored dims / fixed skeleton), never the decoded size —
+                // decode must not reflow rows under the pre-measured host.
+                let size = snReservedMediaSize(item, maxWidth: maxBubbleWidth)
+                thumb.image
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: size.width, height: size.height)
@@ -2309,7 +2553,7 @@ struct SNMediaBubble: View {
                     )
                     .contentShape(RoundedRectangle(cornerRadius: 18))
                     .onTapGesture { viewerOpen = true }
-            } else if bytes != nil {
+            } else if failed, pipeline.state(item).phase == .available {
                 fileChip(for: item)
             } else {
                 let reserved = snReservedMediaSize(item, maxWidth: maxBubbleWidth)
@@ -2492,6 +2736,7 @@ private struct SNMediaCardImage: View {
     var pipeline: SNMediaPipeline
 
     @State private var bytes: Data?
+    @State private var thumb: SNDecodedPlatformImage?
     @State private var failed = false
     @State private var loadAttempt = 0
 
@@ -2503,11 +2748,9 @@ private struct SNMediaCardImage: View {
         let transfer = pipeline.state(item)
         return [
             item.url,
-            item.groupId,
-            item.localPath ?? "",
-            String(loadAttempt),
-            String(describing: transfer.phase),
-            transfer.localURL?.path ?? ""
+            transfer.localURL?.path ?? item.localPath ?? "",
+            item.isGif ? "gif" : "img",
+            String(loadAttempt)
         ].joined(separator: "|")
     }
 
@@ -2528,12 +2771,39 @@ private struct SNMediaCardImage: View {
                 pipeline.prepare(item, true)
             }
             .task(id: loadKey) {
-                bytes = nil
+                let keepThumb = thumb != nil || bytes != nil
+                if !keepThumb {
+                    bytes = nil
+                    thumb = nil
+                }
                 let transfer = pipeline.state(item)
                 failed = transfer.phase == .failed
                 guard transfer.phase == .available else { return }
+                if keepThumb { return }
+                if item.isGif {
+                    if let d = await pipeline.loadLocal(item) {
+                        bytes = d
+                    } else {
+                        failed = true
+                    }
+                    return
+                }
+                let localURL = transfer.localURL
+                let box = await Task.detached(priority: .userInitiated) {
+                    if let localURL {
+                        return SNThumbBox(snDecodeTranscriptThumbnail(url: localURL))
+                    }
+                    return SNThumbBox(nil)
+                }.value
+                if let decoded = box.value {
+                    thumb = decoded
+                    return
+                }
                 if let d = await pipeline.loadLocal(item) {
-                    bytes = d
+                    let tBox = await Task.detached(priority: .userInitiated) {
+                        SNThumbBox(snDecodeTranscriptThumbnail(data: d))
+                    }.value
+                    if let t = tBox.value { thumb = t } else { failed = true }
                 } else {
                     failed = true
                 }
@@ -2545,16 +2815,15 @@ private struct SNMediaCardImage: View {
             SNGifView(data: bytes)
                 .frame(width: width, height: height)
                 .overlay(alignment: .topTrailing) { SNGifBadge().padding(8) }
-        } else if item.isImage, let bytes, let decoded = snDecodedPlatformImage(bytes) {
-            decoded.image
+        } else if item.isImage, let thumb {
+            thumb.image
                 .resizable()
                 .aspectRatio(contentMode: .fill)
                 .frame(width: width, height: height)
                 .clipped()
-        } else if item.isImage, bytes != nil {
-            // Bytes loaded but not decodable (corrupt / mislabeled MIME, e.g. a
-            // bad attachment from a peer). Fall back to a chip instead of an
-            // endless spinner, so a bad photo can't hide behind a good front card.
+        } else if item.isImage, failed, pipeline.state(item).phase == .available {
+            // Bytes/thumb failed (corrupt / mislabeled MIME). Fall back to a
+            // chip instead of an endless spinner.
             deckFileChip
         } else if item.isImage {
             RoundedRectangle(cornerRadius: 18)

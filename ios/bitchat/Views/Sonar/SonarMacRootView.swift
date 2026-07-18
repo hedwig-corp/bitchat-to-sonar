@@ -285,8 +285,9 @@ private struct SonarMacSidebar: View {
                                 row: row,
                                 selected: selection == .dm(row.id)
                             ) {
-                                store.openedDM(row.id)
-                                selection = .dm(row.id)
+                                store.openDM(row.id, marmotGroupId: row.marmotGroupId) {
+                                    selection = .dm(row.id)
+                                }
                             }
                         }
                     }
@@ -550,8 +551,22 @@ private struct MacConversationPane: View {
         VStack(spacing: 0) {
             header
             banner
-            transcript
-            composer
+            if SNTranscriptCollectionHostFlag.isEnabled, !isChannel {
+                // Production owned-chrome host (default ON). Mac keeps the
+                // SwiftUI shell (SNMsgList engine) — AppKit collection parity
+                // is a tracked gap in docs/SIGNAL-TRANSCRIPT-PATTERNS.md.
+                MacCollectionHostDM(
+                    convo: store.conversationViewState(id),
+                    peerId: id,
+                    peerName: peer.name,
+                    isMultiMemberMarmot: isMultiMemberMarmot,
+                    onTapPack: { previewPackCoordinate = $0 },
+                    composer: { composer }
+                )
+            } else {
+                transcript
+                composer
+            }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay {
@@ -1378,8 +1393,9 @@ private struct MacRadarPane: View {
                 selectedPeer = peer
             }
         } else {
-            store.openedDM(peer.id)
-            selection = .dm(peer.id)
+            store.openDM(peer.id) {
+                selection = .dm(peer.id)
+            }
         }
     }
 
@@ -1779,8 +1795,9 @@ private struct MacCommandPalette: View {
                         section("Messages")
                         ForEach(filteredDMs) { row in
                             MacPaletteRow(icon: row.presence ? .mesh : .lock, title: row.title, sub: row.preview) {
-                                store.openedDM(row.id)
-                                choose(.dm(row.id))
+                                store.openDM(row.id, marmotGroupId: row.marmotGroupId) {
+                                    choose(.dm(row.id))
+                                }
                             }
                         }
                         section("Nearby")
@@ -1948,8 +1965,9 @@ private struct MacCommandPalette: View {
         } else if let channel = filteredChannels.first {
             choose(.channel(channel.id))
         } else if let row = filteredDMs.first {
-            store.openedDM(row.id)
-            choose(.dm(row.id))
+            store.openDM(row.id, marmotGroupId: row.marmotGroupId) {
+                choose(.dm(row.id))
+            }
         } else if let peer = filteredPeers.first {
             choosePeer(peer)
         }
@@ -1971,8 +1989,9 @@ private struct MacCommandPalette: View {
             store.sendSatsToUnify(peer.id)
             isPresented = false
         } else {
-            store.openedDM(peer.id)
-            choose(.dm(peer.id))
+            store.openDM(peer.id) {
+                choose(.dm(peer.id))
+            }
         }
     }
 
@@ -3537,7 +3556,143 @@ private struct MacDMTranscript: View {
                 onTapPack: onTapPack,
                 onRetry: { store.retryDm(peerId, message: $0) },
                 loadOlder: { await convo.loadOlder() },
-                loadNewest: { await convo.loadNewestIfNeeded() }
+                loadNewest: { await convo.loadNewestIfNeeded() },
+                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                expectedNewestDate: store.expectedNewestMessageDate(peerId)
+            )
+        }
+    }
+}
+
+/// Phase 2 collection-host DM shell for Mac (SwiftUI owned-chrome overlay).
+private struct MacCollectionHostDM<Composer: View>: View {
+    @EnvironmentObject private var store: SonarAppStore
+    @ObservedObject private var convo: ConversationViewState
+    let peerId: String
+    let peerName: String
+    let isMultiMemberMarmot: Bool
+    let onTapPack: (String) -> Void
+    @ViewBuilder var composer: () -> Composer
+
+    init(
+        convo: ConversationViewState,
+        peerId: String,
+        peerName: String,
+        isMultiMemberMarmot: Bool,
+        onTapPack: @escaping (String) -> Void,
+        @ViewBuilder composer: @escaping () -> Composer
+    ) {
+        self._convo = ObservedObject(wrappedValue: convo)
+        self.peerId = peerId
+        self.peerName = peerName
+        self.isMultiMemberMarmot = isMultiMemberMarmot
+        self.onTapPack = onTapPack
+        self.composer = composer
+    }
+
+    var body: some View {
+        let msgs = convo.messages
+        if msgs.isEmpty {
+            VStack(spacing: 0) {
+                SNEmptyState(
+                    icon: .lock,
+                    iconSize: 24,
+                    title: "Say hi to \(peerName)",
+                    desc: isMultiMemberMarmot
+                        ? "Messages here are end-to-end encrypted. Only group members can read them."
+                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
+                )
+                composer()
+            }
+        } else {
+            SNTranscriptCollectionHost(
+                msgs: msgs,
+                showAuthors: isMultiMemberMarmot,
+                peerName: peerName,
+                money: { store.money($0) },
+                fiatText: { store.moneySatsLine($0) },
+                mediaPipeline: SNMediaPipeline(
+                    state: { store.mediaTransferState($0) },
+                    prepare: { store.prepareMedia($0, autoDownload: $1) },
+                    request: { store.requestMediaDownload($0) },
+                    cancel: { store.cancelMediaDownload($0) },
+                    loadLocal: { await store.mediaData($0) }
+                ),
+                loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
+                onTapPack: onTapPack,
+                onRetry: { store.retryDm(peerId, message: $0) },
+                loadOlder: { await convo.loadOlder() },
+                loadNewest: { await convo.loadNewestIfNeeded() },
+                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                composer: composer
+            )
+        }
+    }
+}
+
+/// Spike A DM shell for Mac: empty-state or Signal short-feed host + composer.
+private struct MacSpikeADMHost<Composer: View>: View {
+    @EnvironmentObject private var store: SonarAppStore
+    @ObservedObject private var convo: ConversationViewState
+    let peerId: String
+    let peerName: String
+    let isMultiMemberMarmot: Bool
+    let onTapPack: (String) -> Void
+    @ViewBuilder var composer: () -> Composer
+
+    init(
+        convo: ConversationViewState,
+        peerId: String,
+        peerName: String,
+        isMultiMemberMarmot: Bool,
+        onTapPack: @escaping (String) -> Void,
+        @ViewBuilder composer: @escaping () -> Composer
+    ) {
+        self._convo = ObservedObject(wrappedValue: convo)
+        self.peerId = peerId
+        self.peerName = peerName
+        self.isMultiMemberMarmot = isMultiMemberMarmot
+        self.onTapPack = onTapPack
+        self.composer = composer
+    }
+
+    var body: some View {
+        let msgs = convo.messages
+        if msgs.isEmpty {
+            VStack(spacing: 0) {
+                SNEmptyState(
+                    icon: .lock,
+                    iconSize: 24,
+                    title: "Say hi to \(peerName)",
+                    desc: isMultiMemberMarmot
+                        ? "Messages here are end-to-end encrypted. Only group members can read them."
+                        : "Messages here are end-to-end encrypted. Only the two of you can read them."
+                )
+                composer()
+            }
+        } else {
+            SNSignalTranscriptSpikeAHost(
+                msgs: msgs,
+                showAuthors: isMultiMemberMarmot,
+                peerName: peerName,
+                money: { store.money($0) },
+                fiatText: { store.moneySatsLine($0) },
+                mediaPipeline: SNMediaPipeline(
+                    state: { store.mediaTransferState($0) },
+                    prepare: { store.prepareMedia($0, autoDownload: $1) },
+                    request: { store.requestMediaDownload($0) },
+                    cancel: { store.cancelMediaDownload($0) },
+                    loadLocal: { await store.mediaData($0) }
+                ),
+                loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
+                onTapPack: onTapPack,
+                onRetry: { store.retryDm(peerId, message: $0) },
+                loadOlder: { await convo.loadOlder() },
+                loadNewest: { await convo.loadNewestIfNeeded() },
+                unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0,
+                expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                composer: composer
             )
         }
     }

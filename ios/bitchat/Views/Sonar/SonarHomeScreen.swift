@@ -215,8 +215,7 @@ struct SonarHomeScreen: View {
                         unread: d.unread,
                         divider: i < rows.count - 1,
                         action: {
-                            store.openedDM(d.id, marmotGroupId: d.marmotGroupId)
-                            store.push(.dm(d.id))
+                            store.openDM(d.id, marmotGroupId: d.marmotGroupId)
                         },
                         avatar: { SonarAvatar(name: d.title, size: 52, presence: d.presence) },
                         sub: { SNLockedPreview(preview: d.preview) }
@@ -306,8 +305,7 @@ struct SonarHomeScreen: View {
                             divider: i < min(inRange.count, 4) - 1,
                             action: {
                                 composeSheet = false
-                                store.openedDM(p.id)
-                                store.push(.dm(p.id))
+                                store.openDM(p.id)
                             },
                             avatar: { SonarAvatar(name: p.name, size: 44, presence: true) },
                             sub: {
@@ -781,14 +779,12 @@ struct SNSearchSheetContent: View {
 
     private func openDM(_ row: SNDMRow) {
         onClose()
-        store.openedDM(row.id, marmotGroupId: row.marmotGroupId)
-        store.push(.dm(row.id))
+        store.openDM(row.id, marmotGroupId: row.marmotGroupId)
     }
 
     private func openDM(_ id: String) {
         onClose()
-        store.openedDM(id)
-        store.push(.dm(id))
+        store.openDM(id)
     }
 
     private func openPeer(_ id: String) {

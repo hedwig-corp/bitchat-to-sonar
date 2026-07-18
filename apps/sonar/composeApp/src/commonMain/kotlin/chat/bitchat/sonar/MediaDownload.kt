@@ -23,6 +23,15 @@ data class MediaTransferState(
     }
 }
 
+/**
+ * When the attachment file is already on disk, only publish Available if we are
+ * recovering from Downloading/Failed. Nil / already-Available must not rewrite
+ * [SonarAppState] mediaTransfers — every bubble appear would rebuild the
+ * transcript on chat open (Signal / iOS avoid this churn).
+ */
+internal fun shouldPublishDiskHit(current: MediaTransferPhase?): Boolean =
+    current == MediaTransferPhase.Downloading || current == MediaTransferPhase.Failed
+
 /** Platform-neutral listener wrapped by each UniFFI actual implementation. */
 interface SonarMediaDownloadListener {
     fun onProgress(bytesReceived: ULong, totalBytes: ULong?)
@@ -59,6 +68,13 @@ expect object MediaCache {
     fun thumbnailPath(url: String): String
     suspend fun prepare()
     suspend fun exists(path: String): Boolean
+
+    /**
+     * Cheap main-thread existence check for transcript open.
+     * [mediaTransferState] synthesises Available from disk without writing
+     * observable state — same shape as iOS `existingMediaURL` / FileManager.
+     */
+    fun existsSync(path: String): Boolean
     suspend fun read(path: String): ByteArray?
     suspend fun readPrefix(path: String, maxBytes: Int): ByteArray?
     suspend fun write(path: String, bytes: ByteArray): Boolean

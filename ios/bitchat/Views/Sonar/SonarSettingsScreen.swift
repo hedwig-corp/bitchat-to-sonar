@@ -30,6 +30,8 @@ struct SonarSettingsScreen: View {
     @State private var exportKeySheet = false
     @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
+    @State private var transcriptSpikeB = false
+    @State private var collectionHostEnabled = SNTranscriptCollectionHostFlag.isEnabled
 
     var body: some View {
         VStack(spacing: 0) {
@@ -165,6 +167,35 @@ struct SonarSettingsScreen: View {
                     }
                     settingsNote("Tip: triple-tap the sonar title on the home screen to wipe instantly.")
 
+                    if SNTranscriptCollectionHostFlag.entryVisible || SonarTranscriptSpikeB.entryVisible {
+                        SNSectionLabel("Developer")
+                        SNSettingsCard {
+                            if SNTranscriptCollectionHostFlag.entryVisible {
+                                SNSettingsRow(
+                                    icon: .info,
+                                    label: "UIKit transcript host",
+                                    sub: "Signal engine (pre-measured cells / sticky days) — default ON",
+                                    trail: .toggle(collectionHostEnabled),
+                                    divider: SonarTranscriptSpikeB.entryVisible
+                                ) {
+                                    collectionHostEnabled.toggle()
+                                    SNTranscriptCollectionHostFlag.setEnabled(collectionHostEnabled)
+                                }
+                            }
+                            if SonarTranscriptSpikeB.entryVisible {
+                                SNSettingsRow(
+                                    icon: .info,
+                                    label: "Transcript Spike B",
+                                    sub: "Signal-Android reverse / stack-from-end host",
+                                    trail: .none,
+                                    divider: false
+                                ) {
+                                    transcriptSpikeB = true
+                                }
+                            }
+                        }
+                    }
+
                     SNSectionLabel("About")
                     SNSettingsCard {
                         SNSettingsRow(
@@ -229,6 +260,15 @@ struct SonarSettingsScreen: View {
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
         }
+        #if os(iOS)
+        .fullScreenCover(isPresented: $transcriptSpikeB) {
+            SonarTranscriptSpikeBDemo(onClose: { transcriptSpikeB = false })
+        }
+        #else
+        .sheet(isPresented: $transcriptSpikeB) {
+            SonarTranscriptSpikeBDemo(onClose: { transcriptSpikeB = false })
+        }
+        #endif
     }
 
     /// Real balance when the wallet is ready, in the chosen display unit;

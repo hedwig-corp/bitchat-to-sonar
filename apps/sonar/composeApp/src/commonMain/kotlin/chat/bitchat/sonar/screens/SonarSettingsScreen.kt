@@ -51,6 +51,10 @@ import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarClock
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.ToastBar
+import chat.bitchat.sonar.TranscriptPolicyHostDemo
+import chat.bitchat.sonar.TranscriptSpikeBDemo
+import chat.bitchat.sonar.sonarTranscriptPolicyHostEntryVisible
+import chat.bitchat.sonar.sonarTranscriptSpikeBEntryVisible
 import kotlinx.coroutines.launch
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.WalletState
@@ -90,6 +94,8 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var appicon by remember { mutableStateOf(false) }
     var requests by remember { mutableStateOf(false) }
     var diagnostics by remember { mutableStateOf(false) }
+    var transcriptSpikeB by remember { mutableStateOf(false) }
+    var transcriptPolicyHost by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
@@ -249,6 +255,28 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 ) { state.togglePref("wifiOnly") }
             }
 
+            if (sonarTranscriptSpikeBEntryVisible || sonarTranscriptPolicyHostEntryVisible) {
+                SNSectionLabel("Developer")
+                SNSettingsCard {
+                    if (sonarTranscriptSpikeBEntryVisible) {
+                        SNSettingsRow(
+                            icon = SNIconName.Info,
+                            label = "Transcript Spike B",
+                            sub = "Signal-Android reverseLayout / stack-from-end host",
+                            divider = sonarTranscriptPolicyHostEntryVisible,
+                        ) { transcriptSpikeB = true }
+                    }
+                    if (sonarTranscriptPolicyHostEntryVisible) {
+                        SNSettingsRow(
+                            icon = SNIconName.Info,
+                            label = "Transcript Phase 2 host",
+                            sub = "Signal engine demo — production default ON (kill switch: =0)",
+                            divider = false,
+                        ) { transcriptPolicyHost = true }
+                    }
+                }
+            }
+
             SNSectionLabel("About")
             SNSettingsCard {
                 SNSettingsRow(
@@ -282,6 +310,16 @@ fun SonarSettingsScreen(state: SonarAppState) {
     if (appicon) AppIconSheet(state) { appicon = false }
     if (requests) RequestsSheet { requests = false }
     if (diagnostics) DiagnosticsSheet(state) { diagnostics = false }
+    if (transcriptSpikeB) {
+        Box(Modifier.fillMaxSize()) {
+            TranscriptSpikeBDemo(onClose = { transcriptSpikeB = false })
+        }
+    }
+    if (transcriptPolicyHost) {
+        Box(Modifier.fillMaxSize()) {
+            TranscriptPolicyHostDemo(onClose = { transcriptPolicyHost = false })
+        }
+    }
 
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }

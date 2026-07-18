@@ -197,8 +197,7 @@ struct SonarRadarScreen: View {
     }
 
     private func openMeshDM(_ id: String) {
-        store.openedDM(id)
-        store.push(.dm(id))
+        store.openDM(id)
     }
 
     // ── Radar view ──
