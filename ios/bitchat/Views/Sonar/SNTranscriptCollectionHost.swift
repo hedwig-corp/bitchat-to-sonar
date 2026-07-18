@@ -13,6 +13,7 @@
 //
 
 import SwiftUI
+import TranscriptEngine
 #if os(iOS)
 import UIKit
 #endif
@@ -97,98 +98,6 @@ func snCollectionHostOwnedBottomContentInset(barHeight: CGFloat, safeAreaBottom:
 /// later MIP-04 bounds must not share a cache entry (reserved box changes).
 func snCollectionHostMediaHeightFingerprint(_ media: [SNMediaItem]) -> String {
     media.map { "\($0.width ?? 0)x\($0.height ?? 0):\($0.mime)" }.joined(separator: ",")
-}
-
-// MARK: - Day sections (pure, testable)
-
-/// One transcript row inside a day section.
-enum SNTranscriptDayRow: Hashable {
-    case unreadDivider
-    case message(String)
-}
-
-/// A calendar-day section. `dayKey` is the unique diffable identity (epoch of
-/// the local day start, suffixed on pathological re-occurrence); `label` is
-/// display-only — two "5 Jul"s from different years must not collide.
-struct SNTranscriptDaySection: Hashable {
-    let dayKey: String
-    let label: String
-    var rows: [SNTranscriptDayRow]
-}
-
-/// Build day sections the way the transcript shows chips today: a section
-/// starts on the first dated message of each new local day; undated rows
-/// inherit the running section (leading undated rows get a headerless "" day).
-/// Duplicate message ids are dropped (diffable traps on duplicates); the
-/// unread divider lands immediately before its anchor row.
-func snTranscriptDaySections(
-    entries: [(id: String, date: Date?)],
-    unreadAnchorId: String?,
-    calendar: Calendar = .current,
-    now: Date = Date()
-) -> [SNTranscriptDaySection] {
-    var sections: [SNTranscriptDaySection] = []
-    var seenIDs = Set<String>()
-    var usedDayKeys = Set<String>()
-    var previousDay: Date?
-    for entry in entries {
-        let opensNewSection = sections.isEmpty
-            || snTranscriptShowsDayChip(previous: previousDay, current: entry.date, calendar: calendar)
-        if opensNewSection {
-            var dayKey = ""
-            var label = ""
-            if let date = entry.date {
-                dayKey = String(Int(calendar.startOfDay(for: date).timeIntervalSince1970))
-                label = snTranscriptDayLabel(for: date, now: now, calendar: calendar)
-            }
-            // An unsorted feed could revisit a day; keep identities unique.
-            var unique = dayKey
-            var bump = 1
-            while !usedDayKeys.insert(unique).inserted {
-                unique = "\(dayKey)#\(bump)"
-                bump += 1
-            }
-            sections.append(SNTranscriptDaySection(dayKey: unique, label: label, rows: []))
-        }
-        previousDay = entry.date ?? previousDay
-        guard seenIDs.insert(entry.id).inserted else { continue }
-        if entry.id == unreadAnchorId {
-            sections[sections.count - 1].rows.append(.unreadDivider)
-        }
-        sections[sections.count - 1].rows.append(.message(entry.id))
-    }
-    return sections
-}
-
-// MARK: - Pre-measured heights (Signal CVC measure pass)
-
-/// Width-scoped cache of exact row heights. Signal never lets the list layout
-/// guess: every cell height is known before layout, so contentSize is exact
-/// and open/continuity offset math is trustworthy. Keys must encode everything
-/// that changes a row's height (text, expanded, footer state, neighbor flags).
-final class SNTranscriptRowHeightCache {
-    private(set) var width: CGFloat = 0
-    private var heights: [String: CGFloat] = [:]
-
-    /// Returns true when the width changed and every height was invalidated.
-    @discardableResult
-    func updateWidth(_ newWidth: CGFloat) -> Bool {
-        guard abs(newWidth - width) > 0.5 else { return false }
-        width = newWidth
-        heights.removeAll()
-        return true
-    }
-
-    func height(forKey key: String, measure: () -> CGFloat) -> CGFloat {
-        if let cached = heights[key] { return cached }
-        let measured = measure()
-        heights[key] = measured
-        return measured
-    }
-
-    var count: Int { heights.count }
-
-    func removeAll() { heights.removeAll() }
 }
 
 // MARK: - SwiftUI entry (DM / Mac)

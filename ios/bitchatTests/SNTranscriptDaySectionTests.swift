@@ -9,6 +9,7 @@
 
 import Foundation
 import Testing
+import TranscriptEngine
 @testable import Sonar
 
 struct SNTranscriptDaySectionTests {

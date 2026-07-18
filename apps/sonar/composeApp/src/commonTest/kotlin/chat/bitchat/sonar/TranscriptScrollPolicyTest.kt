@@ -1,5 +1,11 @@
 package chat.bitchat.sonar
 
+import chat.hedwig.transcript.TranscriptContinuityToken
+import chat.hedwig.transcript.TranscriptInsetCoalescer
+import chat.hedwig.transcript.TranscriptOpenAction
+import chat.hedwig.transcript.TranscriptScrollDecision
+import chat.hedwig.transcript.TranscriptScrollPolicy
+import chat.hedwig.transcript.TranscriptTailPinSession
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -234,19 +240,19 @@ class TranscriptScrollPolicyTest {
     fun toLegacyPin_mapsPinAndSuppressesLockstep() {
         assertEquals(
             TranscriptTailPin.Snap,
-            TranscriptScrollPolicy.toLegacyPin(TranscriptScrollDecision.Pin(animate = false)),
+            transcriptDecisionToLegacyPin(TranscriptScrollDecision.Pin(animate = false)),
         )
         assertEquals(
             TranscriptTailPin.Animate,
-            TranscriptScrollPolicy.toLegacyPin(TranscriptScrollDecision.Pin(animate = true)),
+            transcriptDecisionToLegacyPin(TranscriptScrollDecision.Pin(animate = true)),
         )
         assertEquals(
             TranscriptTailPin.None,
-            TranscriptScrollPolicy.toLegacyPin(TranscriptScrollDecision.Lockstep),
+            transcriptDecisionToLegacyPin(TranscriptScrollDecision.Lockstep),
         )
         assertEquals(
             TranscriptTailPin.None,
-            TranscriptScrollPolicy.toLegacyPin(TranscriptScrollDecision.Ignore),
+            transcriptDecisionToLegacyPin(TranscriptScrollDecision.Ignore),
         )
     }
 }

@@ -1,5 +1,6 @@
 package chat.bitchat.sonar
 
+import chat.hedwig.transcript.compose.transcriptTailOverflowPx
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

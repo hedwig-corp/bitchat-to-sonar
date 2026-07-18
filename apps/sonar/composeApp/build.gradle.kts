@@ -170,6 +170,8 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
+            api(project(":transcript-engine-compose"))
+            api(project(":transcript-engine-policy"))
             implementation(compose.runtime)
             implementation(compose.foundation)
             implementation(compose.material3)

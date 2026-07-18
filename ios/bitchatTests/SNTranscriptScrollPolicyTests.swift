@@ -9,6 +9,7 @@
 
 import CoreGraphics
 import Testing
+import TranscriptEngine
 @testable import Sonar
 
 struct SNTranscriptScrollPolicyTests {

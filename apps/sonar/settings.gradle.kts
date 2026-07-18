@@ -30,3 +30,8 @@ dependencyResolutionManagement {
 rootProject.name = "Sonar"
 include(":composeApp")
 include(":baselineprofile")
+include(":transcript-engine-policy")
+include(":transcript-engine-compose")
+
+project(":transcript-engine-policy").projectDir = file("../../packages/transcript-engine-policy")
+project(":transcript-engine-compose").projectDir = file("../../packages/transcript-engine-compose")

@@ -41,7 +41,12 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.gestures.scrollBy
+import chat.hedwig.transcript.compose.anchorTranscriptTail
+import chat.hedwig.transcript.compose.isTranscriptTailAtLiveEdge
+import chat.hedwig.transcript.compose.transcriptTailOverflowPx
+import chat.hedwig.transcript.TranscriptOpenAction
+import chat.hedwig.transcript.TranscriptScrollPolicy
+import chat.hedwig.transcript.TranscriptTailPinSession
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
@@ -926,7 +931,7 @@ internal class TranscriptTailPinner {
     private val session = TranscriptTailPinSession()
 
     fun onFrame(frame: TranscriptTailFrame): TranscriptTailPin =
-        TranscriptScrollPolicy.toLegacyPin(
+        transcriptDecisionToLegacyPin(
             session.onLayoutFrame(
                 itemCount = frame.itemCount,
                 tailFullyVisible = frame.tailFullyVisible,
@@ -934,52 +939,6 @@ internal class TranscriptTailPinner {
                 prepending = frame.prepending,
             ),
         )
-}
-
-/** Pixels the tail row still hangs below the viewport's content area after a
- *  scroll-to-tail (0 when its bottom edge is visible). Non-zero only when the
- *  row is taller than the viewport — e.g. a large media bubble over an open
- *  keyboard — because scrollToItem top-aligns the row. */
-internal fun transcriptTailOverflowPx(
-    lastOffset: Int,
-    lastSize: Int,
-    viewportEndOffset: Int,
-    afterContentPadding: Int,
-): Int = (lastOffset + lastSize - (viewportEndOffset - afterContentPadding)).coerceAtLeast(0)
-
-/** Anchor the newest transcript row bottom-aligned, Signal-style. scrollToItem
- *  alone top-aligns the row; when the row is taller than the (keyboard-shrunk)
- *  viewport that leaves the newest content hidden below the fold, so any
- *  remaining overflow is corrected with a follow-up scroll. */
-internal suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boolean) {
-    if (index < 0) return
-    if (animate) animateScrollToItem(index) else scrollToItem(index)
-    val info = layoutInfo
-    val last = info.visibleItemsInfo.lastOrNull() ?: return
-    if (last.index != index) return
-    val overflow = transcriptTailOverflowPx(
-        lastOffset = last.offset,
-        lastSize = last.size,
-        viewportEndOffset = info.viewportEndOffset,
-        afterContentPadding = info.afterContentPadding,
-    )
-    if (overflow > 0) scrollBy(overflow.toFloat())
-}
-
-/** True when the newest row's bottom edge is already at the viewport end —
- *  layout proof for ending LiveEdge open recovery (not merely "last indices
- *  visible", which can still leave overflow / mid-list under-measure). */
-internal fun LazyListState.isTranscriptTailAtLiveEdge(lastIndex: Int): Boolean {
-    if (lastIndex < 0) return true
-    val info = layoutInfo
-    val last = info.visibleItemsInfo.lastOrNull() ?: return false
-    if (last.index != lastIndex) return false
-    return transcriptTailOverflowPx(
-        lastOffset = last.offset,
-        lastSize = last.size,
-        viewportEndOffset = info.viewportEndOffset,
-        afterContentPadding = info.afterContentPadding,
-    ) == 0
 }
 
 /** Wire [TranscriptTailPinner] to a transcript list: re-anchor the newest row
