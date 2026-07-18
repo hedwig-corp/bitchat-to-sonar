@@ -1616,6 +1616,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     shouldCloseEmojiTrayOnComposerFocus(
                                         composerFocused = focusState.isFocused,
                                         trayOpen = emojiTray,
+                                        // Desktop Enter-sends ⇒ hardware keyboard; do not
+                                        // auto-close the tray when the field is focused.
+                                        usesSoftKeyboard = !messageComposerEnterSends,
                                     )
                                 ) {
                                     emojiTray = false
@@ -1638,9 +1641,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Modifier.size(34.dp).clip(CircleShape).background(if (emojiTray) s.accentSoft else s.surface2)
                         .clickable {
                             val opening = !emojiTray
-                            if (shouldDismissKeyboardWhenOpeningEmojiTray(opening)) {
+                            val usesSoftKeyboard = !messageComposerEnterSends
+                            if (
+                                shouldDismissKeyboardWhenOpeningEmojiTray(
+                                    openingTray = opening,
+                                    usesSoftKeyboard = usesSoftKeyboard,
+                                )
+                            ) {
                                 focusManager.clearFocus(force = true)
                                 keyboardController?.hide()
+                            }
+                            if (opening) {
                                 stickerPacks = state.cachedStickerPacks()
                             }
                             emojiTray = opening

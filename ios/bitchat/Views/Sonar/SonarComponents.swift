@@ -3813,10 +3813,19 @@ struct SNComposer: View {
 
     private var slash: Bool { text.hasPrefix("/") }
     private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
+    /// keyboard occupying the transcript — do not steal hardware-keyboard focus.
+    private var usesSoftKeyboard: Bool {
+        #if os(iOS)
+        true
+        #else
+        false
+        #endif
+    }
 
     private func dismissKeyboardForEmojiTray() {
-        composerFocused = false
         #if os(iOS)
+        composerFocused = false
         UIApplication.shared.sendAction(
             #selector(UIResponder.resignFirstResponder),
             to: nil,
@@ -3828,8 +3837,13 @@ struct SNComposer: View {
 
     private func toggleEmojiTray() {
         let opening = !showEmojiTray
-        if snShouldDismissKeyboardWhenOpeningEmojiTray(openingTray: opening) {
+        if snShouldDismissKeyboardWhenOpeningEmojiTray(
+            openingTray: opening,
+            usesSoftKeyboard: usesSoftKeyboard
+        ) {
             dismissKeyboardForEmojiTray()
+        }
+        if opening {
             stickerPacks = cachedStickerPacks()
         }
         showEmojiTray = opening
@@ -3956,7 +3970,8 @@ struct SNComposer: View {
                     .onChange(of: composerFocused) { focused in
                         if snShouldCloseEmojiTrayOnComposerFocus(
                             composerFocused: focused,
-                            trayOpen: showEmojiTray
+                            trayOpen: showEmojiTray,
+                            usesSoftKeyboard: usesSoftKeyboard
                         ) {
                             showEmojiTray = false
                         }
