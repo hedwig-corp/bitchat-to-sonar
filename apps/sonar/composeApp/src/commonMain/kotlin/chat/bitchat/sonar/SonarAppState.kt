@@ -3358,8 +3358,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.setNickname(value)
         nick = value
         refreshMeshIdentity()
-        // Re-publish our kind-0 profile so peers see the new name.
-        if (SonarCore.isRelayConnected()) scope.launch { runCatching { SonarCore.publishProfile(value) } }
+        // Re-publish our kind-0 profile so peers see the new name — but never
+        // when a local handle pref exists without the core sidecar. That emit
+        // would omit `nip05` and replace the durable kind-0 after restore.
+        if (SonarCore.isRelayConnected()) scope.launch {
+            val claimed = coreClaimedHandle ?: SonarCore.claimedHandle()
+            if (!canPublishOwnProfile(bip353, claimed)) return@launch
+            runCatching { SonarCore.publishProfile(value) }
+        }
     }
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──

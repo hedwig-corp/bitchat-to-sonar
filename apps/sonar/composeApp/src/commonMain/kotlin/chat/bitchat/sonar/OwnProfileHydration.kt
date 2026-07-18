@@ -54,3 +54,18 @@ fun planOwnProfileHydration(
         shouldPublishNickname = effectiveNick.isNotBlank(),
     )
 }
+
+/**
+ * Whether a rename / opportunistic kind-0 republish is safe.
+ *
+ * After nsec restore the host may mirror remote `nip05` into prefs before the
+ * core sidecar is re-claimed. Publishing in that window omits `nip05` and
+ * replaces the durable kind-0 on relays.
+ */
+fun canPublishOwnProfile(
+    localBip353: String,
+    coreClaimedHandle: String?,
+): Boolean {
+    if (localBip353.isBlank()) return true
+    return !coreClaimedHandle.isNullOrBlank()
+}

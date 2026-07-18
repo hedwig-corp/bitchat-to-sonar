@@ -1296,9 +1296,10 @@ final class SonarAppStore: ObservableObject {
                 guard let self, connected else { return }
                 // Relay-dependent work starts only after the delayed background
                 // attach, never as a side effect of publishing the local Home.
-                // MarmotChatModel already hydrated + published on connect; only
-                // republish when we still have a non-blank local nick.
-                self.marmot.publishProfile(name: self.chatViewModel.nickname)
+                // Kind-0 republish lives only in MarmotChatModel's connect path
+                // (hydrate own profile first). Publishing here after nsec restore
+                // can emit metadata without `nip05` and replace the durable
+                // kind-0 on relays.
                 self.adoptClaimedHandleIfNeeded()
                 self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
@@ -1682,8 +1683,20 @@ final class SonarAppStore: ObservableObject {
     func rename(_ nick: String) {
         chatViewModel.nickname = nick
         chatViewModel.validateAndSaveNickname()
-        // Re-publish our kind-0 profile so peers see the new name.
-        if marmot.npub != nil { marmot.publishProfile(name: chatViewModel.nickname) }
+        // Re-publish our kind-0 profile so peers see the new name — but never
+        // when a local handle pref exists without the core sidecar. That emit
+        // would omit `nip05` and replace the durable kind-0 after restore.
+        guard marmot.npub != nil else { return }
+        let name = chatViewModel.nickname
+        let handlePref = bip353
+        Task { @MainActor in
+            let claimed = await marmot.claimedHandle()
+            guard OwnProfileHydration.canPublishOwnProfile(
+                localBip353: handlePref,
+                coreClaimedHandle: claimed
+            ) else { return }
+            marmot.publishProfile(name: name)
+        }
     }
 
     func completeOnboarding(nick: String) {

@@ -48,4 +48,25 @@ enum OwnProfileHydration {
             shouldPublishNickname: !effectiveNick.isEmpty
         )
     }
+
+    /// Whether a rename / opportunistic kind-0 republish is safe.
+    /// After nsec restore the host may mirror remote `nip05` into prefs before
+    /// the core sidecar is re-claimed; publishing then omits `nip05` and
+    /// replaces the durable kind-0 on relays.
+    static func canPublishOwnProfile(
+        localBip353: String,
+        coreClaimedHandle: String?
+    ) -> Bool {
+        let hasHandle = !localBip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if !hasHandle { return true }
+        let claimed = coreClaimedHandle?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return !claimed.isEmpty
+    }
+
+    /// Missing key = first launch (mint anon). Present key including "" =
+    /// respect it so restore-cleared nick does not regenerate anonXXXX.
+    static func shouldMintAnonymousNickname(savedValue: String?) -> Bool {
+        savedValue == nil
+    }
 }

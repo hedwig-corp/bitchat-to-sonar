@@ -57,4 +57,37 @@ final class OwnProfileHydrationTests: XCTestCase {
         XCTAssertNil(plan.handleLocalToClaim)
         XCTAssertTrue(plan.shouldPublishNickname)
     }
+
+    func testRenameMustNotPublishWhenHandlePrefLacksCoreSidecar() {
+        XCTAssertFalse(
+            OwnProfileHydration.canPublishOwnProfile(
+                localBip353: "alice@sonarprivacy.xyz",
+                coreClaimedHandle: nil
+            )
+        )
+        XCTAssertFalse(
+            OwnProfileHydration.canPublishOwnProfile(
+                localBip353: "alice@sonarprivacy.xyz",
+                coreClaimedHandle: "  "
+            )
+        )
+        XCTAssertTrue(
+            OwnProfileHydration.canPublishOwnProfile(
+                localBip353: "alice@sonarprivacy.xyz",
+                coreClaimedHandle: "alice@sonarprivacy.xyz"
+            )
+        )
+        XCTAssertTrue(
+            OwnProfileHydration.canPublishOwnProfile(
+                localBip353: "",
+                coreClaimedHandle: nil
+            )
+        )
+    }
+
+    func testRestoreClearedNicknameMustNotMintAnonymousOnRelaunch() {
+        XCTAssertTrue(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: nil))
+        XCTAssertFalse(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: ""))
+        XCTAssertFalse(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: "Alice"))
+    }
 }

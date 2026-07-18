@@ -82,4 +82,12 @@ class OwnProfileHydrationTest {
         assertEquals("bob", plan.nicknameToAdopt)
         assertTrue(plan.shouldPublishNickname)
     }
+
+    @Test
+    fun renameMustNotPublishWhenHandlePrefLacksCoreSidecar() {
+        assertFalse(canPublishOwnProfile("alice@sonarprivacy.xyz", null))
+        assertFalse(canPublishOwnProfile("alice@sonarprivacy.xyz", "  "))
+        assertTrue(canPublishOwnProfile("alice@sonarprivacy.xyz", "alice@sonarprivacy.xyz"))
+        assertTrue(canPublishOwnProfile("", null))
+    }
 }
