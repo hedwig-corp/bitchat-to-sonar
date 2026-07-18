@@ -21,8 +21,7 @@ struct SonarProfileScreen: View {
 
     @State private var editing = false
     @State private var draft = ""
-    @State private var handleDraft = ""
-    @State private var editingHandle = false
+    @State private var paymentCopied = false
     @FocusState private var draftFocused: Bool
 
     private var displayNick: String { store.nick.isEmpty ? "you" : store.nick }
@@ -35,34 +34,17 @@ struct SonarProfileScreen: View {
         editing = false
     }
 
-    /// Address to show as already claimed: the claim just made this session,
-    /// else the persisted BIP-353 address (which the claim flow also writes).
-    private var claimedHandleAddress: String? {
-        if case .claimed(let address) = store.handleClaimState { return address }
-        let stored = store.bip353.trimmingCharacters(in: .whitespacesAndNewlines)
-        return stored.isEmpty ? nil : stored
-    }
-
-    private var claimingHandle: Bool { store.handleClaimState == .claiming }
-
-    private var trimmedHandleDraft: String {
-        handleDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private var handleDraftValid: Bool {
-        MarmotService.handleLooksValid(trimmedHandleDraft)
-    }
-
-    /// A full non-default-domain address is an external payment address —
-    /// saved locally, never claimed at the registrar (matches the store path).
-    private var isExternalDraft: Bool {
-        trimmedHandleDraft.contains("@")
-            && !trimmedHandleDraft.hasSuffix("@\(SonarAppStore.handleDomain)")
-    }
-
-    private func claimHandle() {
-        guard handleDraftValid, !claimingHandle else { return }
-        store.claimHandle(trimmedHandleDraft)
+    private func copyPaymentAddress(_ address: String) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = address
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(address, forType: .string)
+        #endif
+        withAnimation(.easeOut(duration: 0.15)) { paymentCopied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) {
+            withAnimation(.easeOut(duration: 0.15)) { paymentCopied = false }
+        }
     }
 
     var body: some View {
@@ -72,7 +54,7 @@ struct SonarProfileScreen: View {
             }
             ScrollView {
                 VStack(spacing: 0) {
-                    // pf-head
+                    // pf-head — Name
                     VStack(spacing: 8) {
                         SonarAvatar(
                             name: editing
@@ -82,7 +64,7 @@ struct SonarProfileScreen: View {
                         )
                         if editing {
                             HStack(spacing: 8) {
-                                TextField("", text: $draft, prompt: Text("nickname").foregroundColor(SonarTheme.text3))
+                                TextField("", text: $draft, prompt: Text("Name").foregroundColor(SonarTheme.text3))
                                     .textFieldStyle(.plain)
                                     .font(SonarTheme.uiFont(size: 18, weight: .bold))
                                     .foregroundColor(SonarTheme.text)
@@ -118,10 +100,10 @@ struct SonarProfileScreen: View {
                                 }) {
                                     SNIcon(name: .pencil, size: 15, weight: 2)
                                 }
-                                .accessibilityLabel("Edit nickname")
+                                .accessibilityLabel("Edit name")
                             }
                         }
-                        Text(verbatim: store.shortKey)
+                        Text(verbatim: store.profileCardSubtitle)
                             .font(SonarTheme.monoFont(size: 12))
                             .foregroundColor(SonarTheme.text3)
                             .padding(EdgeInsets(top: 4, leading: 11, bottom: 4, trailing: 11))
@@ -154,145 +136,64 @@ struct SonarProfileScreen: View {
                             trail: .none, divider: false
                         ) {}
                     }
-                    Text("Your nickname is just what people see — your key never leaves this phone.")
+                    Text("Your name is just what people see — your key never leaves this phone.")
                         .font(SonarTheme.uiFont(size: 12))
                         .lineSpacing(12 * 0.3)
                         .foregroundColor(SonarTheme.text3)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(EdgeInsets(top: 0, leading: 24, bottom: 4, trailing: 24))
 
-                    SNSectionLabel("Your handle")
+                    SNSectionLabel("Username")
                     SNSettingsCard {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Sonar handle")
-                                .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                                .foregroundColor(SonarTheme.text)
-                            if let address = claimedHandleAddress, !editingHandle {
-                                claimedHandleRow(address)
-                            } else {
-                                handleClaimField
-                            }
-                        }
-                        .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                        SonarHandleClaimCard(store: store, showTitle: false)
+                            .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
                     }
-                    Text("Your handle is how people find you and pay you — it's published with your profile and shared with your Sonar announce.")
+                    Text("Your username is how people find you and pay you — it's published with your profile and shared with your Sonar announce.")
                         .font(SonarTheme.uiFont(size: 12))
                         .lineSpacing(12 * 0.3)
                         .foregroundColor(SonarTheme.text3)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(EdgeInsets(top: 0, leading: 24, bottom: 4, trailing: 24))
+
+                    if let address = store.paymentAddressDisplay {
+                        SNSectionLabel("Payment address")
+                        Button {
+                            copyPaymentAddress(address)
+                        } label: {
+                            HStack(spacing: 12) {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(SonarTheme.goldSoft)
+                                    .frame(width: 38, height: 38)
+                                    .overlay(
+                                        SNIcon(name: .coin, size: 17)
+                                            .foregroundColor(SonarTheme.goldDeep)
+                                    )
+                                Text(verbatim: address)
+                                    .font(SonarTheme.monoFont(size: 13))
+                                    .foregroundColor(SonarTheme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(paymentCopied ? "Copied" : "Copy")
+                                    .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                                    .foregroundColor(paymentCopied ? SonarTheme.green : SonarTheme.accentDeep)
+                            }
+                            .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                            .background(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(SonarTheme.surface)
+                            )
+                            .padding(.horizontal, 14)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.99))
+                        .accessibilityLabel("Copy payment address")
+                    }
                 }
                 .padding(.bottom, 40)
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
-        .onChange(of: store.handleClaimState) { state in
-            if case .claimed = state {
-                editingHandle = false
-                handleDraft = ""
-            }
-        }
-    }
-
-    private func claimedHandleRow(_ address: String) -> some View {
-        // The seal marks a registrar-claimed handle only. An external payment
-        // address (from another wallet) is stored in the same field but is
-        // NOT a claimed identity — plain link glyph for it.
-        let isCoreClaimed = address == store.coreClaimedHandle
-        return HStack(spacing: 8) {
-            Image(systemName: isCoreClaimed ? "checkmark.seal.fill" : "link")
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundColor(isCoreClaimed ? SonarTheme.green : SonarTheme.text3)
-            Text(verbatim: address)
-                .font(SonarTheme.monoFont(size: 13))
-                .foregroundColor(SonarTheme.text)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            Spacer(minLength: 8)
-            Button {
-                handleDraft = String(address.split(separator: "@").first ?? "")
-                editingHandle = true
-            } label: {
-                Text("Edit")
-                    .font(SonarTheme.uiFont(size: 13.5, weight: .bold))
-                    .foregroundColor(SonarTheme.accentDeep)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Edit handle")
-        }
-        .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
-    }
-
-    @ViewBuilder
-    private var handleClaimField: some View {
-        TextField(
-            "",
-            text: $handleDraft,
-            prompt: Text(verbatim: "yourname").foregroundColor(SonarTheme.text3)
-        )
-        .textFieldStyle(.plain)
-        .font(SonarTheme.monoFont(size: 13))
-        .foregroundColor(SonarTheme.text)
-        #if os(iOS)
-        .textInputAutocapitalization(.never)
-        .autocorrectionDisabled()
-        #endif
-        .onSubmit { claimHandle() }
-        .disabled(claimingHandle)
-        .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
-        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
-
-        if !trimmedHandleDraft.isEmpty {
-            Text(verbatim: isExternalDraft
-                ? "External address — saved as your payment address only."
-                : "\(trimmedHandleDraft.components(separatedBy: "@")[0])@\(SonarAppStore.handleDomain)")
-                .font(SonarTheme.monoFont(size: 12))
-                .foregroundColor(SonarTheme.text2)
-                .lineLimit(1)
-                .truncationMode(.middle)
-        }
-
-        if case .failed(let message) = store.handleClaimState {
-            Text(verbatim: message)
-                .font(SonarTheme.uiFont(size: 12))
-                .foregroundColor(SonarTheme.danger)
-        }
-
-        HStack(spacing: 8) {
-            Button(action: claimHandle) {
-                HStack(spacing: 7) {
-                    if claimingHandle {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: SonarTheme.onAccent))
-                            .scaleEffect(0.7)
-                    }
-                    Text(claimingHandle
-                        ? "Claiming\u{2026}"
-                        : (isExternalDraft ? "Save address" : "Claim"))
-                        .font(SonarTheme.uiFont(size: 14, weight: .bold))
-                }
-                .foregroundColor(SonarTheme.onAccent)
-                .padding(EdgeInsets(top: 12, leading: 18, bottom: 12, trailing: 18))
-                .background(Capsule().fill(SonarTheme.accentFill))
-                .opacity(claimingHandle || !handleDraftValid ? 0.4 : 1)
-            }
-            .buttonStyle(SNScaleStyle(scale: 0.97))
-            .disabled(claimingHandle || !handleDraftValid)
-            if editingHandle, claimedHandleAddress != nil {
-                Button {
-                    editingHandle = false
-                    handleDraft = ""
-                } label: {
-                    Text("Cancel")
-                        .font(SonarTheme.uiFont(size: 14, weight: .semibold))
-                        .foregroundColor(SonarTheme.text2)
-                        .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
-                }
-                .buttonStyle(.plain)
-                .disabled(claimingHandle)
-            }
-        }
     }
 }
 

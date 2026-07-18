@@ -235,7 +235,10 @@
     <string name="paste_key">Paste key</string>
     <string name="paste_the">Paste the </string>
     <string name="paste_your_nsec_private_key_to_bring">Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history is recovered from your encrypted Blossom backup when one exists for this key.</string>
-    <string name="payment_address_bip_353">Payment address (BIP-353)</string>
+    <string name="payment_address_bip_353">Payment address</string>
+    <string name="find_by_username">Find by username</string>
+    <string name="find_someone">Find someone</string>
+    <string name="username">Username</string>
     <string name="people_in_range">%1$s people in range</string>
     <string name="people_nearby_can_send_you_money_at">People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing.</string>
     <string name="pick_a_nickname">Pick a nickname</string>

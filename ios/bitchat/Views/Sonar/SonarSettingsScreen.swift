@@ -319,7 +319,7 @@ struct SonarSettingsScreen: View {
                     Text(verbatim: store.nick.isEmpty ? "you" : store.nick)
                         .font(SonarTheme.uiFont(size: 18, weight: .bold))
                         .foregroundColor(SonarTheme.text)
-                    Text(verbatim: store.shortKey)
+                    Text(verbatim: store.profileCardSubtitle)
                         .font(SonarTheme.monoFont(size: 12))
                         .foregroundColor(SonarTheme.text3)
                         .lineLimit(1)

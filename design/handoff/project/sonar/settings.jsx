@@ -136,7 +136,7 @@ function ExportKeySheet({ onClose }) {
         </button>
       </div>
       <p className="bc-note" style={{ textAlign: 'center', padding: '12px 18px 4px' }}>
-        Tip: store it in a password manager. Sonar can\u2019t recover it for you.
+        Tip: store it in a password manager. Sonar can’t recover it for you.
       </p>
     </Sheet>
   );
@@ -144,6 +144,7 @@ function ExportKeySheet({ onClose }) {
 
 /* ── Profile screen ── */
 function ProfileScreen({ app, nav, pop, onRename }) {
+  const prefs = app.prefs || {};
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(app.nick || '');
   const shortKey = BC_DATA.pubkey.slice(0, 14) + '\u2026' + BC_DATA.pubkey.slice(-6);
@@ -177,7 +178,7 @@ function ProfileScreen({ app, nav, pop, onRename }) {
               </button>
             </div>
           )}
-          <span className="pf-key">{shortKey}</span>
+          <span className="pf-key">{prefs.pubkeyUI ? shortKey : '@' + (app.nick || 'you')}</span>
         </div>
 
         <SectionLabel>Your key</SectionLabel>
@@ -199,12 +200,37 @@ function ProfileScreen({ app, nav, pop, onRename }) {
 }
 
 /* ── Sheets ── */
-function NotifSheet({ onClose, prefs, onPref }) {
+function NotifSheet({ onClose, prefs, onPref, muted, onUnmute }) {
+  const mutedIds = Object.keys(muted || {});
+  const allPeers = BC_DATA.peers || [];
+  const allGroups = BC_DATA.groups || [];
+  const allChannels = [...(BC_DATA.channels || []), ...(BC_DATA.here || [])];
+  function mutedName(id) {
+    if (id.startsWith('g-')) { const g = allGroups.find((x) => 'g-' + x.id === id); return g ? g.name : id; }
+    const p = allPeers.find((x) => x.id === id); if (p) return p.name;
+    const ch = allChannels.find((x) => x.id === id); if (ch) return ch.name;
+    return id;
+  }
   return (
     <Sheet onClose={onClose} title="Notifications">
       <StRow icon="bell" label="Allow notifications" onClick={() => onPref('notifs', !prefs.notifs)} toggle={prefs.notifs} />
       <StRow icon="people" label="Show names" sub="Hide to keep the lock screen private" onClick={() => onPref('names', !prefs.names)} toggle={prefs.names && prefs.notifs} />
       <StRow icon="list" label="Show message preview" onClick={() => onPref('preview', !prefs.preview)} toggle={prefs.preview && prefs.notifs} />
+      {mutedIds.length > 0 && (
+        <React.Fragment>
+          <div className="bc-sect" style={{ paddingTop: 14 }}>Muted conversations · {mutedIds.length}</div>
+          {mutedIds.map((id) => (
+            <button key={id} className="bc-actionrow" onClick={() => onUnmute(id)}>
+              <span className="bc-actionicon" style={{ background: 'var(--surface2)', color: 'var(--text3)' }}><BCIcon name="bellOff" size={18} /></span>
+              <span className="bc-actionmain">
+                <span className="bc-actionlabel">{mutedName(id)}</span>
+                <div className="bc-actiondesc">{muted[id] === 'forever' ? 'Muted permanently' : 'Muted for ' + muted[id]}</div>
+              </span>
+              <span className="cp-copybtn">Unmute</span>
+            </button>
+          ))}
+        </React.Fragment>
+      )}
       <div className="bc-sheetactions">
         <button className="bc-ghost" onClick={onClose}>Done</button>
       </div>
@@ -259,7 +285,7 @@ function AppIconSheet({ onClose, current, onPick }) {
 }
 
 /* ── Settings screen (full) ── */
-function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork, onWipe, onPref }) {
+function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork, onWipe, onPref, onUnmute }) {
   const [notif, setNotif] = React.useState(false);
   const [requests, setRequests] = React.useState(false);
   const [appicon, setAppicon] = React.useState(false);
@@ -279,7 +305,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
           <Avatar name={app.nick || 'you'} size={56} />
           <span className="st-profmain">
             <div className="st-profname">{app.nick || 'you'}</div>
-            <div className="st-profkey">{shortKey}</div>
+            <div className="st-profkey">{prefs.pubkeyUI ? shortKey : '@' + (app.nick || 'you') + ' · tap to view key'}</div>
           </span>
           <BCIcon name="chevron" size={15} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
         </button>
@@ -288,7 +314,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         <div className="st-card">
           <StRow icon="moon" label="Appearance" value={mode === 'dark' ? 'Dark' : 'Light'} onClick={onToggleMode} />
           <StRow icon="rings" label="App icon" value={(prefs.icon || 'default') === 'square' ? 'Square' : 'Default'} onClick={() => setAppicon(true)} />
-          <StRow icon="bell" label="Notifications" value={prefs.notifs ? 'On' : 'Off'} onClick={() => setNotif(true)} />
+          <StRow icon="bell" label="Notifications" value={prefs.notifs ? (Object.keys(app.muted || {}).length ? Object.keys(app.muted).length + ' muted' : 'On') : 'Off'} onClick={() => setNotif(true)} />
         </div>
 
         <SectionLabel>Network</SectionLabel>
@@ -304,15 +330,16 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         <SectionLabel>Wallet</SectionLabel>
         <div className="st-card">
           <StRow icon="coin" tone="gold" label="Balance" value={walletStr(app)} chevron={false} onClick={() => {}} />
+          <StRow icon="list" label="Activity" sub="All payments in & out" onClick={() => push('wallet')} />
           <StRow icon="globe" label="Currency" value={(prefs.currency || 'EUR')} onClick={() => setCurSheet(true)} />
           <StRow icon="bolt" label="Bitcoin mode" sub="Show sats and bitcoin networks" onClick={() => onPref('btcMode', !prefs.btcMode)} toggle={!!prefs.btcMode} />
         </div>
         <p className="st-note">Off by default — amounts show in your currency. Turn on to see sats, Lightning and ecash.</p>
-
         <SectionLabel>Privacy &amp; safety</SectionLabel>
         <div className="st-card">
           <StRow icon="faceid" label="App lock" sub="Require Face ID to open Sonar" onClick={() => onPref('appLock', !prefs.appLock)} toggle={!!prefs.appLock} />
           <StRow icon="check" label="Read receipts" onClick={() => onPref('readReceipts', !prefs.readReceipts)} toggle={!!prefs.readReceipts} />
+          <StRow icon="key" label="Show public keys" sub={prefs.pubkeyUI ? 'Raw npub shown under every name' : 'Nicknames everywhere — keys on tap'} onClick={() => onPref('pubkeyUI', !prefs.pubkeyUI)} toggle={!!prefs.pubkeyUI} />
           <StRow icon="inbox" label="Message requests" value={prefs.requests > 0 ? String(prefs.requests) : ''} onClick={() => setRequests(true)} />
           <StRow icon="shieldCheck" tone="cyan" label="Verified people" value={String(verifiedCount)} onClick={() => push('nearby')} />
           <StRow icon="importKey" label="Export private key" sub="Move your account to another wallet" onClick={() => setExportKey(true)} />
@@ -326,6 +353,19 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
           <StRow icon="data" label="Data usage" value="Wi-Fi only" onClick={() => {}} />
         </div>
 
+        <SectionLabel>Support Sonar</SectionLabel>
+        <button className="st-donate" onClick={() => push('donate')}>
+          <span className="st-donateic"><BCIcon name="heart" size={20} /></span>
+          <span className="st-donatemain">
+            <span className="st-donatetitle">
+              {prefs.supporter ? 'You\u2019re a Sonar supporter' : 'Become a supporter'}
+              {prefs.supporter ? <SupporterBadge size={15} /> : null}
+            </span>
+            <span className="st-donatesub">{prefs.supporter ? 'Thank you for keeping Sonar independent' : 'Fund development \u00b7 get a badge \u00b7 no ads, ever'}</span>
+          </span>
+          <BCIcon name="chevron" size={15} weight={2.2} style={{ color: 'var(--text3)', flex: 'none' }} />
+        </button>
+
         <SectionLabel>About</SectionLabel>
         <div className="st-card">
           <StRow icon="info" label="About Sonar" sub="Open protocols — Bluetooth mesh + Nostr" onClick={() => {}} />
@@ -334,7 +374,7 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
         <div style={{ height: 16 }}></div>
       </div>
 
-      {notif && <NotifSheet onClose={() => setNotif(false)} prefs={prefs} onPref={onPref} />}
+      {notif && <NotifSheet onClose={() => setNotif(false)} prefs={prefs} onPref={onPref} muted={app.muted || {}} onUnmute={onUnmute} />}
       {requests && <RequestsSheet onClose={() => setRequests(false)} onResolve={() => onPref('requests', 0)} />}
       {appicon && <AppIconSheet onClose={() => setAppicon(false)} current={prefs.icon || 'cyan'} onPick={(id) => onPref('icon', id)} />}
       {curSheet && (
@@ -351,4 +391,133 @@ function SettingsScreen({ app, nav, pop, push, mode, onToggleMode, toggleNetwork
   );
 }
 
-Object.assign(window, { SettingsScreen, ProfileScreen, ShareCode, KeyShareCard, ExportKeySheet, StRow, StSwitch });
+/* ── Donate / become a supporter (Bolt12) ── */
+const DONATE_TIERS = {
+  once: [
+    { sats: 2100, fiat: '€1.20', label: 'Tip' },
+    { sats: 10000, fiat: '€5.80', label: 'Coffee' },
+    { sats: 50000, fiat: '€29', label: 'Generous' },
+  ],
+  monthly: [
+    { sats: 2100, fiat: '€1.20/mo', label: 'Friend', badge: true },
+    { sats: 8400, fiat: '€4.90/mo', label: 'Sustainer', badge: true },
+    { sats: 21000, fiat: '€12/mo', label: 'Patron', badge: true },
+  ],
+};
+const BOLT12_OFFER = 'lno1pg257enxv4ezqcneype82um50ynhxgrwdajx283qfwdpl28qqmc78ymlvhmxcsywdk5wrjnj36jryg488qwlrnzyjczlqsp9nyu4phcg6dqhlhzgxagfu7zh';
+
+function DonateScreen({ app, nav, pop, onBecomeSupporter, overlay }) {
+  const isSupporter = !!(app.prefs && app.prefs.supporter);
+  const [mode, setMode] = React.useState('monthly');
+  const [pick, setPick] = React.useState(1);
+  const [paid, setPaid] = React.useState(isSupporter);
+  const [copied, setCopied] = React.useState(false);
+  const tiers = DONATE_TIERS[mode];
+  const tier = tiers[pick] || tiers[0];
+  const copy = () => {
+    try { navigator.clipboard && navigator.clipboard.writeText(BOLT12_OFFER); } catch (e) {}
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
+  };
+  const pay = () => { setPaid(true); if (mode === 'monthly') onBecomeSupporter(); };
+
+  if (paid && mode === 'monthly') {
+    return (
+      <div className={'bc-screen' + (overlay ? ' dk-overlay' : '')} data-nav={nav} data-screen-label="Donate — thank you">
+        <NavHeader onBack={pop} hairline={false}><div className="bc-hname"><span>Support Sonar</span></div></NavHeader>
+        <div className="bc-scroll">
+          <div className="dn-thanks">
+            <span className="dn-thanksbadge"><BCIcon name="heart" size={40} /></span>
+            <h2 className="dn-thankstitle">You’re a supporter</h2>
+            <p className="dn-thankssub">Your badge is now visible on your profile and in group chats. Thank you for keeping Sonar independent, open, and ad-free.</p>
+            <div className="dn-namepreview">
+              <Avatar name={app.nick || 'you'} size={34} />
+              <span>{app.nick || 'you'}</span>
+              <SupporterBadge size={16} />
+            </div>
+            <p className="dn-renew">{tier.fiat + ' · renews automatically over Lightning · cancel anytime in Wallet.'}</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={'bc-screen' + (overlay ? ' dk-overlay' : '')} data-nav={nav} data-screen-label="Donate">
+      <NavHeader onBack={pop} hairline={false}><div className="bc-hname"><span>Support Sonar</span></div></NavHeader>
+      <div className="bc-scroll">
+        <div className="dn-hero">
+          <span className="dn-heroic"><BCIcon name="heart" size={32} /></span>
+          <h2 className="dn-herotitle">Sonar runs on bitcoin, not ads</h2>
+          <p className="dn-herosub">No investors, no tracking, no data to sell. Donations pay for development and relays — and keep the app free for everyone.</p>
+        </div>
+
+        <div className="dn-seg">
+          <button className={mode === 'once' ? 'on' : ''} onClick={() => { setMode('once'); setPick(1); setPaid(false); }}>One-time</button>
+          <button className={mode === 'monthly' ? 'on' : ''} onClick={() => { setMode('monthly'); setPick(1); setPaid(false); }}>Monthly</button>
+        </div>
+
+        <div className="dn-tiers">
+          {tiers.map((t, i) => (
+            <button key={i} className={'dn-tier' + (pick === i ? ' on' : '')} onClick={() => setPick(i)}>
+              <span className="dn-tierlabel">{t.label}{t.badge ? <SupporterBadge size={13} /> : null}</span>
+              <span className="dn-tiersats">{t.sats.toLocaleString('en-US')} <small>sats</small></span>
+              <span className="dn-tierfiat">{t.fiat}</span>
+            </button>
+          ))}
+        </div>
+
+        {mode === 'monthly' ? (
+          <div className="dn-perk">
+            <BCIcon name="shieldCheck" size={16} weight={2.1} />
+            <span>Supporters get a <b>badge</b> shown on their profile and in every group chat.</span>
+          </div>
+        ) : (
+          <div className="dn-perk subtle">
+            <BCIcon name="heart" size={15} />
+            <span>One-time gifts help too — the supporter badge comes with a monthly plan.</span>
+          </div>
+        )}
+
+        <div className="dn-offer">
+          <span className="dn-offerlabel">Bolt12 offer</span>
+          <button className="dn-offerrow" onClick={copy}>
+            <BCIcon name="bolt" size={15} weight={2.2} style={{ color: 'var(--net)', flex: 'none' }} />
+            <span className="dn-offerval">{BOLT12_OFFER.slice(0, 22) + '…' + BOLT12_OFFER.slice(-6)}</span>
+            <span className="dn-offercopy">{copied ? 'Copied' : 'Copy'}</span>
+          </button>
+        </div>
+      </div>
+      <div className="bc-composerwrap">
+        <div style={{ padding: '10px 14px 30px' }}>
+          <button className="bc-primary net" onClick={pay}>
+            {mode === 'monthly'
+              ? 'Subscribe · ' + tier.fiat
+              : 'Donate ' + tier.sats.toLocaleString('en-US') + ' sats'}
+          </button>
+          <p className="dn-paynote">Pays over Lightning to Sonar’s Bolt12 offer. Your name and key are never shared.</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Wallet activity screen ── */
+function WalletScreen({ app, nav, pop }) {
+  return (
+    <div className="bc-screen" data-nav={nav} data-screen-label="Wallet activity">
+      <NavHeader onBack={pop} hairline={false}>
+        <div className="bc-hname"><span>Wallet</span></div>
+      </NavHeader>
+      <div className="bc-scroll">
+        <div className="wallet-balance">
+          <span className="wallet-balnum">{walletStr(app)}</span>
+          <span className="wallet-ballabel">Balance · pays directly, no claim step</span>
+        </div>
+        <SectionLabel>Activity</SectionLabel>
+        <WalletActivity app={app} txns={app.txns} />
+      </div>
+    </div>
+  );
+}
+
+Object.assign(window, { SettingsScreen, WalletScreen, ProfileScreen, DonateScreen, ShareCode, KeyShareCard, ExportKeySheet, StRow, StSwitch });

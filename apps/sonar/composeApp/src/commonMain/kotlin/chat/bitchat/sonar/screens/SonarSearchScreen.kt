@@ -164,9 +164,9 @@ fun SonarSearchScreen(state: SonarAppState) {
                     when {
                         resolvingHandle -> "Looking up $handleAddress…"
                         handleMiss -> "No one found for $handleAddress"
-                        else -> "Start secure chat"
+                        else -> "Start secure chat with $query"
                     },
-                    handleAddress,
+                    if (resolvingHandle) "Looking up this username…" else "Encrypted chat over the internet",
                     net = true,
                 ) {
                     if (!resolvingHandle) {

@@ -33,6 +33,7 @@ struct SonarContactProfileScreen: View {
     /// on appear so paint never waits on the network.
     @State private var nip05Verified: [String: Bool] = [:]
     @State private var nip05Checks: Set<String> = []
+    @State private var paymentCopied = false
 
     private var effectiveChatId: String {
         guard peerId.hasPrefix("npub1") else { return peerId }
@@ -101,6 +102,36 @@ struct SonarContactProfileScreen: View {
             return "@\(parts[0])"
         }
         return address
+    }
+
+    /// Mesh BIP-353 first, then verified kind-0 NIP-05 (never an unverified claim).
+    private var paymentAddress: String? {
+        let candidates = [peerId, effectiveChatId]
+        for id in candidates {
+            if let bip = store.sonarProfile(id)?.bip353?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !bip.isEmpty {
+                return bip
+            }
+        }
+        if let nip05 = nip05Address, nip05.contains("@"), nip05Verified[nip05] == true {
+            return nip05
+        }
+        return nil
+    }
+
+    private func copyPaymentAddress(_ address: String) {
+        #if canImport(UIKit)
+        UIPasteboard.general.string = address
+        #elseif canImport(AppKit)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(address, forType: .string)
+        #endif
+        paymentCopied = true
+        showToast("Payment address copied")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.7) {
+            if paymentCopied { paymentCopied = false }
+        }
     }
 
     /// Kick off (at most once per address) the background NIP-05 check. Never
@@ -206,6 +237,41 @@ struct SonarContactProfileScreen: View {
                     if showVerify {
                         verifySection
                             .padding(.bottom, 12)
+                    }
+
+                    if let address = paymentAddress {
+                        SNSectionLabel("Payment address")
+                        Button {
+                            copyPaymentAddress(address)
+                        } label: {
+                            HStack(spacing: 12) {
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(SonarTheme.goldSoft)
+                                    .frame(width: 38, height: 38)
+                                    .overlay(
+                                        SNIcon(name: .coin, size: 17)
+                                            .foregroundColor(SonarTheme.goldDeep)
+                                    )
+                                Text(verbatim: address)
+                                    .font(SonarTheme.monoFont(size: 13))
+                                    .foregroundColor(SonarTheme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(paymentCopied ? "Copied" : "Copy")
+                                    .font(SonarTheme.uiFont(size: 13, weight: .bold))
+                                    .foregroundColor(paymentCopied ? SonarTheme.green : SonarTheme.accentDeep)
+                            }
+                            .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                            .background(
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(SonarTheme.surface)
+                            )
+                            .padding(.horizontal, 14)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SNScaleStyle(scale: 0.99))
+                        .accessibilityLabel("Copy payment address")
                     }
 
                     // ── Identity ──

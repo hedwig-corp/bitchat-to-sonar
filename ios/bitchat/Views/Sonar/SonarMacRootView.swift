@@ -13,6 +13,7 @@
 
 #if os(macOS)
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 extension Notification.Name {
@@ -1655,6 +1656,7 @@ private struct MacRadarPeerRow: View {
 
 private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     case profile
+    case findUsername
     case secureChat
     case newGroup
     case settings
@@ -1665,6 +1667,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var icon: SNIconName {
         switch self {
         case .profile: return .key
+        case .findUsername: return .key
         case .secureChat: return .key
         case .newGroup: return .people
         case .settings: return .list
@@ -1675,6 +1678,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .profile: return "Profile"
+        case .findUsername: return "Find by username"
         case .secureChat: return "Secure chat via npub"
         case .newGroup: return "New group"
         case .settings: return "Settings"
@@ -1684,7 +1688,8 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
 
     var sub: String {
         switch self {
-        case .profile: return "Identity, key sharing, safety, and payment address"
+        case .profile: return "Name, username, key sharing, and payment address"
+        case .findUsername: return "e.g. vincenzo · or name@domain · reaches anywhere"
         case .secureChat: return "Encrypted chat over the internet - reaches anywhere"
         case .newGroup: return "Invite people by npub"
         case .settings: return "Appearance, network, wallet, and privacy"
@@ -1701,6 +1706,13 @@ private struct MacCommandPalette: View {
     @State private var query = ""
     @State private var npubDraft = ""
     @State private var npubEntry = false
+    @State private var findUsernameEntry = false
+    @State private var findDraft = ""
+    @State private var findResolving = false
+    @State private var findNpub: String?
+    @State private var findMiss = false
+    @State private var findLookupGeneration = 0
+    @State private var findStartError: String?
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
     @State private var selectedGroupNpubs: Set<String> = []
@@ -1771,6 +1783,45 @@ private struct MacCommandPalette: View {
                                 resolveHandleAndStartChat()
                             }
                         }
+                        if findUsernameEntry {
+                            MacFindUsernameCard(
+                                draft: Binding(
+                                    get: { findDraft },
+                                    set: {
+                                        findDraft = $0
+                                        findNpub = nil
+                                        findMiss = false
+                                        findResolving = false
+                                        findStartError = nil
+                                        findLookupGeneration &+= 1
+                                    }
+                                ),
+                                resolving: findResolving,
+                                foundNpub: findNpub,
+                                missed: findMiss,
+                                startError: findStartError,
+                                domain: SonarAppStore.handleDomain,
+                                onLookup: { lookupUsernameFromPalette() },
+                                onStart: { npub in
+                                    findStartError = nil
+                                    if store.startSecureChat(npub: npub) != nil {
+                                        isPresented = false
+                                    } else {
+                                        findStartError = "That key isn't a valid npub — check it and try again."
+                                        findNpub = nil
+                                    }
+                                },
+                                onBack: {
+                                    findLookupGeneration &+= 1
+                                    findUsernameEntry = false
+                                    findDraft = ""
+                                    findNpub = nil
+                                    findMiss = false
+                                    findResolving = false
+                                    findStartError = nil
+                                }
+                            )
+                        }
                         if npubEntry || canStartSecureChatFromQuery {
                             MacNpubComposeCard(
                                 npub: secureChatBinding,
@@ -1838,10 +1889,19 @@ private struct MacCommandPalette: View {
             if !open {
                 npubEntry = false
                 groupEntry = false
+                findUsernameEntry = false
+                findDraft = ""
+                findResolving = false
+                findNpub = nil
+                findMiss = false
+                findStartError = nil
+                findLookupGeneration &+= 1
                 npubDraft = ""
                 groupNameDraft = ""
                 groupMembersDraft = ""
                 selectedGroupNpubs = []
+                resolvingHandle = false
+                handleMissQuery = nil
             }
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
@@ -1928,6 +1988,17 @@ private struct MacCommandPalette: View {
         switch command {
         case .profile:
             choose(SonarMacSelection.profile)
+        case .findUsername:
+            if canStartHandleChatFromQuery {
+                resolveHandleAndStartChat()
+            } else {
+                if findDraft.isEmpty, !trimmedQuery.hasPrefix("npub"), !trimmedQuery.isEmpty {
+                    findDraft = trimmedQuery
+                }
+                findUsernameEntry = true
+                npubEntry = false
+                groupEntry = false
+            }
         case .secureChat:
             if canStartSecureChatFromQuery {
                 startSecureChat(with: trimmedQuery)
@@ -1937,6 +2008,7 @@ private struct MacCommandPalette: View {
                 }
                 npubEntry = true
                 groupEntry = false
+                findUsernameEntry = false
             }
         case .newGroup:
             if groupNameDraft.isEmpty, !trimmedQuery.hasPrefix("npub") {
@@ -1945,12 +2017,46 @@ private struct MacCommandPalette: View {
                 groupMembersDraft = trimmedQuery
             }
             npubEntry = false
+            findUsernameEntry = false
             groupEntry = true
         case .settings:
             openSettings()
             isPresented = false
         case .nearby:
             choose(SonarMacSelection.radar)
+        }
+    }
+
+    private func lookupUsernameFromPalette() {
+        let trimmed = findDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !findResolving else { return }
+        findStartError = nil
+        if trimmed.lowercased().hasPrefix("npub1") {
+            if let decoded = try? Bech32.decode(trimmed), decoded.hrp == "npub", decoded.data.count == 32 {
+                findNpub = SNMarmotProfileCache.canonicalKey(trimmed)
+                findMiss = false
+            } else {
+                findNpub = nil
+                findMiss = false
+                findStartError = "That key isn't a valid npub — check it and try again."
+            }
+            return
+        }
+        guard MarmotService.handleLooksValid(trimmed) else { return }
+        findLookupGeneration &+= 1
+        let generation = findLookupGeneration
+        findResolving = true
+        findMiss = false
+        findNpub = nil
+        Task { @MainActor in
+            let npub = await store.resolveHandleForChat(trimmed)
+            guard generation == findLookupGeneration else { return }
+            findResolving = false
+            if let npub {
+                findNpub = npub
+            } else {
+                findMiss = true
+            }
         }
     }
 
@@ -2085,6 +2191,91 @@ private struct MacPaletteRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(SNRowPressStyle(cornerRadius: 0))
+    }
+}
+
+private struct MacFindUsernameCard: View {
+    @Binding var draft: String
+    let resolving: Bool
+    let foundNpub: String?
+    let missed: Bool
+    var startError: String? = nil
+    let domain: String
+    let onLookup: () -> Void
+    let onStart: (String) -> Void
+    let onBack: () -> Void
+
+    private var trimmed: String {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var looksValid: Bool {
+        MarmotService.handleLooksValid(trimmed) || trimmed.hasPrefix("npub1")
+    }
+
+    private var showSuffix: Bool {
+        !trimmed.isEmpty && !trimmed.contains("@") && !trimmed.hasPrefix("npub1")
+    }
+
+    private var previewAddress: String {
+        if trimmed.hasPrefix("npub1") { return trimmed }
+        if trimmed.contains("@") { return trimmed }
+        return "\(trimmed)@\(domain)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Type a Sonar username or paste an npub.")
+                .font(SonarTheme.uiFont(size: 13))
+                .foregroundColor(SonarTheme.text2)
+            HStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $draft,
+                    prompt: Text(verbatim: "vincenzo").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.monoFont(size: 13))
+                .foregroundColor(SonarTheme.text)
+                .onSubmit { onLookup() }
+                if showSuffix {
+                    Text(verbatim: "@\(domain)")
+                        .font(SonarTheme.monoFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                }
+            }
+            .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+            if resolving {
+                Text(verbatim: "Looking up \(previewAddress)\u{2026}")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.text2)
+            } else if let startError {
+                Text(verbatim: startError)
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.danger)
+            } else if missed {
+                Text("No Sonar user found at that address.")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.danger)
+            }
+
+            if let npub = foundNpub {
+                SNPrimaryButton(label: "Start encrypted chat", disabled: false) {
+                    onStart(npub)
+                }
+            } else {
+                SNPrimaryButton(
+                    label: resolving ? "Looking up\u{2026}" : "Look up",
+                    disabled: !looksValid || resolving
+                ) {
+                    onLookup()
+                }
+            }
+            SNGhostButton(label: "Back", action: onBack)
+        }
+        .padding(EdgeInsets(top: 4, leading: 14, bottom: 7, trailing: 14))
     }
 }
 
@@ -2394,10 +2585,27 @@ private struct MacProfilePane: View {
 
     private var paymentCard: some View {
         VStack(spacing: 0) {
-            SNSectionLabel("Payments")
+            SNSectionLabel("Username")
             SNSettingsCard {
-                SonarHandleClaimCard(store: store)
+                SonarHandleClaimCard(store: store, showTitle: false)
                     .padding(16)
+            }
+            if let address = store.paymentAddressDisplay {
+                SNSectionLabel("Payment address")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon: .coin,
+                        tone: .gold,
+                        label: "Payment address",
+                        sub: address,
+                        value: "Copy",
+                        trail: .none,
+                        divider: false
+                    ) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(address, forType: .string)
+                    }
+                }
             }
         }
     }
@@ -2812,8 +3020,9 @@ private struct MacSettingsModal: View {
                     wipeAsk = true
                 }
             }
+            SNSectionLabel("Username")
             SNSettingsCard {
-                SonarHandleClaimCard(store: store)
+                SonarHandleClaimCard(store: store, showTitle: false)
                     .padding(14)
             }
         }

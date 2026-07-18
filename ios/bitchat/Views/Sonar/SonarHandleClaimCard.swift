@@ -8,16 +8,17 @@
 
 import SwiftUI
 
-/// Unified handle claim flow (`name@sonarprivacy.xyz`) as a reusable card
-/// body: name field with live preview, claim/save button, claimed row with
-/// the registrar-claim seal. Used by the macOS profile pane and settings
-/// modal; the mobile `SonarProfileScreen` lays out the same flow natively.
+/// Username claim flow (`name@sonarprivacy.xyz`) as a reusable card body:
+/// name field with live preview, claim/save button, claimed row with the
+/// registrar-claim seal. Used by Profile (iOS + macOS) and Settings modals.
 ///
 /// The seal renders only for the registrar-claimed address
 /// (`store.coreClaimedHandle`) — an external payment address from another
 /// wallet is stored in the same `bip353` field but is NOT a claimed identity.
 struct SonarHandleClaimCard: View {
     @ObservedObject var store: SonarAppStore
+    /// When false, parent already rendered `SNSectionLabel("Username")`.
+    var showTitle: Bool = true
 
     @State private var handleDraft = ""
     @State private var editingHandle = false
@@ -45,15 +46,17 @@ struct SonarHandleClaimCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("Sonar handle")
-                .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                .foregroundColor(SonarTheme.text)
+            if showTitle {
+                Text("Username")
+                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                    .foregroundColor(SonarTheme.text)
+            }
             if let address = claimedAddress, !editingHandle {
                 claimedRow(address)
             } else {
                 claimField
             }
-            Text("Claim a name — friends can start a chat or pay you with it. Optional.")
+            Text("Claim a username — friends can start a chat or pay you with it. Optional.")
                 .font(SonarTheme.uiFont(size: 12))
                 .foregroundColor(SonarTheme.text3)
                 .lineSpacing(3)
@@ -87,7 +90,7 @@ struct SonarHandleClaimCard: View {
                     .foregroundColor(SonarTheme.accentDeep)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Edit handle")
+            .accessibilityLabel("Edit username")
         }
         .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
         .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(SonarTheme.surface2))
@@ -103,6 +106,10 @@ struct SonarHandleClaimCard: View {
         .textFieldStyle(.plain)
         .font(SonarTheme.monoFont(size: 13))
         .foregroundColor(SonarTheme.text)
+        #if os(iOS)
+        .textInputAutocapitalization(.never)
+        .autocorrectionDisabled()
+        #endif
         .onSubmit(claim)
         .disabled(claiming)
         .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
@@ -159,5 +166,28 @@ struct SonarHandleClaimCard: View {
     private func claim() {
         guard draftValid, !claiming else { return }
         store.claimHandle(trimmedDraft)
+    }
+}
+
+// MARK: - Shared identity display helpers
+
+extension SonarAppStore {
+    /// Settings/profile card subtitle: `@username` when claimed on the default
+    /// domain, full address for external payment addresses, else short npub.
+    var profileCardSubtitle: String {
+        let address = (coreClaimedHandle ?? bip353)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !address.isEmpty else { return shortKey }
+        let parts = address.split(separator: "@", maxSplits: 1)
+        if parts.count == 2, parts[1].lowercased() == Self.handleDomain {
+            return "@\(parts[0])"
+        }
+        return address
+    }
+
+    /// Persisted payment / username address for copy rows (empty → nil).
+    var paymentAddressDisplay: String? {
+        let stored = bip353.trimmingCharacters(in: .whitespacesAndNewlines)
+        return stored.isEmpty ? nil : stored
     }
 }

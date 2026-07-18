@@ -41,6 +41,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -62,11 +63,8 @@ import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.delay
 
 /**
- * Profile — 1:1 reproduction of design/handoff/project/sonar/settings.jsx
- * ProfileScreen: pf-head (avatar, name + pencil, key pill), the "Your key"
- * KeyShareCard (QR + tap-to-expand key + Copy key / Share), the Safety
- * fingerprint row, and the nickname note. The Payments (BIP-353) card is a
- * platform addition with no design counterpart.
+ * Profile — Name edit, key share, Safety, Username claim, and Payment address.
+ * Username / payment are platform additions on top of settings.jsx ProfileScreen.
  */
 @Composable
 fun SonarProfileScreen(state: SonarAppState) {
@@ -74,12 +72,16 @@ fun SonarProfileScreen(state: SonarAppState) {
     var editing by remember { mutableStateOf(false) }
     var draft by remember { mutableStateOf(state.nick) }
     var payDraft by remember { mutableStateOf(state.bip353) }
+    val clipboard = LocalClipboardManager.current
+    var paymentCopied by remember { mutableStateOf(false) }
+    LaunchedEffect(paymentCopied) { if (paymentCopied) { delay(1700); paymentCopied = false } }
     val displayNick = state.nick.ifBlank { "you" }
+    val paymentAddress = state.bip353.trim().takeIf { it.isNotEmpty() }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Profile", hairline = false, onBack = { state.back() })
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-            // pf-head
+            // pf-head — Name
             Column(
                 Modifier.fillMaxWidth().padding(top = 14.dp, start = 28.dp, end = 28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
@@ -87,13 +89,12 @@ fun SonarProfileScreen(state: SonarAppState) {
                 SonarAvatar(if (editing) draft.ifBlank { "you" } else displayNick, 96.dp)
                 Spacer(Modifier.height(8.dp))
                 if (editing) {
-                    // pf-editrow: input + Save
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Box(
                             Modifier.weight(1f).clip(RoundedCornerShape(16.dp)).background(s.surface2)
                                 .padding(horizontal = 14.dp, vertical = 11.dp)
                         ) {
-                            if (draft.isEmpty()) Text("nickname", color = s.text3, fontSize = 18.sp)
+                            if (draft.isEmpty()) Text("Name", color = s.text3, fontSize = 18.sp)
                             BasicTextField(
                                 value = draft, onValueChange = { if (it.length <= 20) draft = it }, singleLine = true,
                                 textStyle = TextStyle(color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold),
@@ -109,7 +110,6 @@ fun SonarProfileScreen(state: SonarAppState) {
                         ) { Text("Save", color = s.onAccent, fontSize = 14.sp, fontWeight = FontWeight.Bold) }
                     }
                 } else {
-                    // pf-name: 24/800 + 30dp pencil icon button
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(displayNick, color = s.text, fontSize = 24.sp, fontWeight = FontWeight.Black)
                         Spacer(Modifier.width(6.dp))
@@ -121,14 +121,12 @@ fun SonarProfileScreen(state: SonarAppState) {
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                // pf-key pill
                 Box(Modifier.clip(RoundedCornerShape(999.dp)).background(s.surface2).padding(horizontal = 11.dp, vertical = 4.dp)) {
-                    Text(shortKey(state.npub), color = s.text3, style = SonarType.mono(12.0))
+                    Text(profileCardSubtitle(state), color = s.text3, style = SonarType.mono(12.0))
                 }
             }
 
             SNSectionLabel("Your key")
-            // st-card wrapping the KeyShareCard
             Column(
                 Modifier.fillMaxWidth().padding(horizontal = 14.dp)
                     .clip(RoundedCornerShape(18.dp)).background(s.surface)
@@ -147,30 +145,65 @@ fun SonarProfileScreen(state: SonarAppState) {
                 ) {}
             }
             Text(
-                "Your nickname is just what people see — your key never leaves this phone.",
+                "Your name is just what people see — your key never leaves this phone.",
                 color = s.text3, fontSize = 12.sp, lineHeight = 18.sp,
                 modifier = Modifier.padding(start = 24.dp, end = 24.dp, bottom = 4.dp),
             )
 
-            // Platform addition (no design counterpart): unified handle claim.
-            // One claimed name serves chat (NIP-05 → this key) and payments
-            // (BIP-353 → the wallet's BOLT12 offer).
-            SNSectionLabel("Handle")
-            HandleCard(state, payDraft, onDraftChange = { payDraft = it })
+            SNSectionLabel("Username")
+            UsernameCard(state, payDraft, onDraftChange = { payDraft = it })
+            Text(
+                "Your username is how people find you and pay you — it's published with your profile and shared with your Sonar announce.",
+                color = s.text3, fontSize = 12.sp, lineHeight = 18.sp,
+                modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 4.dp, bottom = 4.dp),
+            )
+
+            if (paymentAddress != null) {
+                SNSectionLabel("Payment address")
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp)
+                        .clip(RoundedCornerShape(18.dp)).background(s.surface)
+                        .clickable {
+                            clipboard.setText(AnnotatedString(paymentAddress))
+                            paymentCopied = true
+                        }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(s.goldSoft),
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Coin, 17.dp, s.goldDeep) }
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        paymentAddress,
+                        color = s.text,
+                        style = SonarType.mono(13.0),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        if (paymentCopied) "Copied" else "Copy",
+                        color = if (paymentCopied) s.green else s.accent,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
             Spacer(Modifier.height(40.dp))
         }
     }
 }
 
 /**
- * Handle claim card. Three shapes:
- * - claimed: show the address with a check + "Change" affordance
- * - editing: name field, live `name@sonarprivacy.xyz` preview, Claim button
- * - external: a pasted full `name@domain` address is stored as-is (a payment
- *   address from another wallet), without hitting the Sonar registrar
+ * Username claim card. Three shapes:
+ * - claimed: address with seal + Edit
+ * - editing: name field, live `name@domain` preview, Claim button
+ * - external: pasted `name@other` saved as payment address only
  */
 @Composable
-private fun HandleCard(
+private fun UsernameCard(
     state: SonarAppState,
     payDraft: String,
     onDraftChange: (String) -> Unit,
@@ -180,24 +213,18 @@ private fun HandleCard(
     var editing by remember { mutableStateOf(false) }
     val claimed = state.bip353
     val showClaimed = claimed.isNotBlank() && !editing
-    // Claim finished while editing: fold back to the claimed row.
     LaunchedEffect(claim) { if (claim is HandleClaimState.Claimed) editing = false }
 
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 14.dp)
             .clip(RoundedCornerShape(18.dp)).background(s.surface).padding(14.dp)
     ) {
-        Text("Sonar handle", color = s.text, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
-        Spacer(Modifier.height(4.dp))
         Text(
-            "Claim a name — friends can start a chat or pay you with it. Optional.",
+            "Claim a username — friends can start a chat or pay you with it. Optional.",
             color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp
         )
         Spacer(Modifier.height(10.dp))
         if (showClaimed) {
-            // The check marks a registrar-claimed handle only. An external
-            // payment address (from another wallet) is stored in the same
-            // field but is NOT a claimed identity — no check for it.
             val isCoreClaimed = claimed == state.coreClaimedHandle
             Row(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
@@ -212,7 +239,7 @@ private fun HandleCard(
                 Spacer(Modifier.width(8.dp))
                 Text(claimed, color = s.text, fontSize = 14.sp, modifier = Modifier.weight(1f))
                 Text(
-                    "Change",
+                    "Edit",
                     color = s.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.clickable {
                         editing = true
@@ -223,9 +250,6 @@ private fun HandleCard(
             }
         } else {
             val draft = payDraft.trim()
-            // A full default-domain address is still a registrar claim (iOS
-            // parity); only foreign domains are stored as external payment
-            // addresses without claiming.
             val isExternal = '@' in draft && !draft.lowercase().endsWith("@${state.handleDomain}")
             Box(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
@@ -262,7 +286,7 @@ private fun HandleCard(
                 label = when {
                     claiming -> "Claiming…"
                     isExternal -> "Save address"
-                    else -> "Claim handle"
+                    else -> "Claim"
                 },
                 disabled = claiming || !valid,
                 net = !isExternal,
@@ -274,7 +298,34 @@ private fun HandleCard(
                     state.claimHandle(draft)
                 }
             }
+            if (editing && claimed.isNotBlank()) {
+                Text(
+                    "Cancel",
+                    color = s.text2,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .padding(top = 8.dp)
+                        .clickable(enabled = !claiming) {
+                            editing = false
+                            onDraftChange("")
+                            state.resetHandleClaimState()
+                        }
+                )
+            }
         }
+    }
+}
+
+/** Settings/profile card subtitle: `@username` when claimed, else short npub. */
+internal fun profileCardSubtitle(state: SonarAppState): String {
+    val address = (state.coreClaimedHandle ?: state.bip353).trim()
+    if (address.isEmpty()) return shortKey(state.npub)
+    val parts = address.split("@", limit = 2)
+    return if (parts.size == 2 && parts[1].equals(state.handleDomain, ignoreCase = true)) {
+        "@${parts[0]}"
+    } else {
+        address
     }
 }
 

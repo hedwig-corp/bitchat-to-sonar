@@ -28,6 +28,14 @@ struct SonarHomeScreen: View {
     @State private var pendingInvite: MarmotService.GroupInvite?
     @State private var npubEntry = false
     @State private var groupEntry = false
+    @State private var findUsername = false
+    @State private var findDraft = ""
+    @State private var findResolving = false
+    @State private var findNpub: String?
+    @State private var findMiss = false
+    /// Bumped on draft edit / Back so in-flight lookups cannot apply stale results.
+    @State private var findLookupGeneration = 0
+    @State private var findStartError: String?
     @State private var npubDraft = ""
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
@@ -86,8 +94,12 @@ struct SonarHomeScreen: View {
         .snSheet(isPresented: $searchSheet, title: "Search") {
             SNSearchSheetContent(onClose: { searchSheet = false })
         }
-        .snSheet(isPresented: $composeSheet, title: "Start a chat") {
-            composeContent
+        .snSheet(isPresented: $composeSheet, title: findUsername ? "Find someone" : "Start a chat") {
+            if findUsername {
+                findUsernameContent
+            } else {
+                composeContent
+            }
         }
         .snSheet(
             isPresented: Binding(
@@ -104,6 +116,13 @@ struct SonarHomeScreen: View {
             if !open {
                 npubEntry = false
                 groupEntry = false
+                findUsername = false
+                findDraft = ""
+                findResolving = false
+                findNpub = nil
+                findMiss = false
+                findLookupGeneration &+= 1
+                findStartError = nil
                 npubDraft = ""
                 groupNameDraft = ""
                 groupMembersDraft = ""
@@ -323,13 +342,23 @@ struct SonarHomeScreen: View {
                     composeSheet = false
                     store.push(.nearby)
                 }
+                SNActionRow(icon: .key, label: "Find by username", desc: "e.g. vincenzo · or name@domain · reaches anywhere") {
+                    findUsername = true
+                    npubEntry = false
+                    groupEntry = false
+                    findDraft = ""
+                    findNpub = nil
+                    findMiss = false
+                }
                 SNActionRow(icon: .key, label: "Secure chat via npub", desc: "Encrypted chat over the internet — reaches anywhere") {
                     npubEntry = true
                     groupEntry = false
+                    findUsername = false
                 }
                 SNActionRow(icon: .people, label: "New group", desc: "Invite people by npub") {
                     groupEntry = true
                     npubEntry = false
+                    findUsername = false
                 }
                 if npubEntry {
                     npubField
@@ -340,6 +369,180 @@ struct SonarHomeScreen: View {
             }
         }
         .frame(maxHeight: 560)
+    }
+
+    /// Nested "Find someone" sheet — username / NIP-05 resolve → start chat.
+    private var findUsernameContent: some View {
+        let trimmed = findDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let looksValid = MarmotService.handleLooksValid(trimmed) || trimmed.hasPrefix("npub1")
+        let showSuffix = !trimmed.isEmpty && !trimmed.contains("@") && !trimmed.hasPrefix("npub1")
+        let previewAddress: String = {
+            if trimmed.hasPrefix("npub1") { return trimmed }
+            if trimmed.contains("@") { return trimmed }
+            return "\(trimmed)@\(SonarAppStore.handleDomain)"
+        }()
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Type a Sonar username — just vincenzo for a @\(SonarAppStore.handleDomain) account, or a full address like name@domain. You can also paste a raw npub.")
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .foregroundColor(SonarTheme.text2)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    SNIcon(name: .key, size: 16, weight: 2)
+                        .foregroundColor(SonarTheme.text3)
+                    TextField(
+                        "",
+                        text: $findDraft,
+                        prompt: Text(verbatim: "vincenzo").foregroundColor(SonarTheme.text3)
+                    )
+                    .textFieldStyle(.plain)
+                    .font(SonarTheme.monoFont(size: 14))
+                    .foregroundColor(SonarTheme.text)
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    #endif
+                    .onChange(of: findDraft) { _ in
+                        findNpub = nil
+                        findMiss = false
+                        findResolving = false
+                        findStartError = nil
+                        findLookupGeneration &+= 1
+                    }
+                    .onSubmit { lookupUsername() }
+                    if showSuffix {
+                        Text(verbatim: "@\(SonarAppStore.handleDomain)")
+                            .font(SonarTheme.monoFont(size: 12))
+                            .foregroundColor(SonarTheme.text3)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+                if findResolving {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(verbatim: "Looking up \(previewAddress)\u{2026}")
+                            .font(SonarTheme.uiFont(size: 13))
+                            .foregroundColor(SonarTheme.text2)
+                    }
+                } else if findMiss {
+                    Text("No Sonar user found at that address.")
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.danger)
+                } else if let err = findStartError {
+                    Text(verbatim: err)
+                        .font(SonarTheme.uiFont(size: 13))
+                        .foregroundColor(SonarTheme.danger)
+                } else if let npub = findNpub {
+                    Button {
+                        startChatFromFind(npub)
+                    } label: {
+                        HStack(spacing: 12) {
+                            SonarAvatar(name: trimmed.contains("@") ? String(trimmed.split(separator: "@").first ?? "user") : (trimmed.isEmpty ? "user" : trimmed), size: 46)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(verbatim: showSuffix || (!trimmed.contains("@") && !trimmed.hasPrefix("npub1"))
+                                    ? trimmed
+                                    : (trimmed.contains("@") ? String(trimmed.split(separator: "@").first ?? trimmed) : trimmed))
+                                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                                    .foregroundColor(SonarTheme.text)
+                                Text(verbatim: previewAddress)
+                                    .font(SonarTheme.monoFont(size: 12))
+                                    .foregroundColor(SonarTheme.text2)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Text(verbatim: npub.count > 22 ? String(npub.prefix(22)) + "\u{2026}" : npub)
+                                    .font(SonarTheme.monoFont(size: 11.5))
+                                    .foregroundColor(SonarTheme.text3)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            SNIcon(name: .chevron, size: 16, weight: 2.4)
+                                .foregroundColor(SonarTheme.text3)
+                        }
+                        .padding(12)
+                        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SNScaleStyle(scale: 0.99))
+                }
+
+                VStack(spacing: 6) {
+                    if findNpub != nil {
+                        SNPrimaryButton(label: "Start encrypted chat", disabled: false) {
+                            if let npub = findNpub {
+                                startChatFromFind(npub)
+                            }
+                        }
+                    } else {
+                        SNPrimaryButton(
+                            label: findResolving ? "Looking up\u{2026}" : "Look up",
+                            disabled: !looksValid || findResolving
+                        ) {
+                            lookupUsername()
+                        }
+                    }
+                    SNGhostButton(label: "Back") {
+                        findLookupGeneration &+= 1
+                        findUsername = false
+                        findDraft = ""
+                        findNpub = nil
+                        findMiss = false
+                        findResolving = false
+                        findStartError = nil
+                    }
+                }
+                .padding(.top, 4)
+            }
+            .padding(.horizontal, 4)
+        }
+        .frame(maxHeight: 560)
+    }
+
+    private func startChatFromFind(_ npub: String) {
+        findStartError = nil
+        if store.startSecureChat(npub: npub) != nil {
+            composeSheet = false
+        } else {
+            findStartError = "That key isn't a valid npub — check it and try again."
+            findNpub = nil
+        }
+    }
+
+    private func lookupUsername() {
+        let trimmed = findDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !findResolving else { return }
+        findStartError = nil
+        if trimmed.lowercased().hasPrefix("npub1") {
+            if let decoded = try? Bech32.decode(trimmed), decoded.hrp == "npub", decoded.data.count == 32 {
+                findNpub = SNMarmotProfileCache.canonicalKey(trimmed)
+                findMiss = false
+            } else {
+                findNpub = nil
+                findMiss = false
+                findStartError = "That key isn't a valid npub — check it and try again."
+            }
+            return
+        }
+        guard MarmotService.handleLooksValid(trimmed) else { return }
+        findLookupGeneration &+= 1
+        let generation = findLookupGeneration
+        findResolving = true
+        findMiss = false
+        findNpub = nil
+        Task { @MainActor in
+            let npub = await store.resolveHandleForChat(trimmed)
+            guard generation == findLookupGeneration else { return }
+            findResolving = false
+            if let npub {
+                findNpub = npub
+            } else {
+                findMiss = true
+            }
+        }
     }
 
     private var npubField: some View {
@@ -693,7 +896,7 @@ struct SNSearchSheetContent: View {
                             .font(SonarTheme.uiFont(size: 12.5))
                             .foregroundColor(SonarTheme.danger)
                     } else {
-                        Text(resolvingHandle ? "Looking up this handle\u{2026}" : "Encrypted chat over the internet")
+                        Text(resolvingHandle ? "Looking up this username\u{2026}" : "Encrypted chat over the internet")
                             .font(SonarTheme.uiFont(size: 12.5))
                             .foregroundColor(SonarTheme.text2)
                     }

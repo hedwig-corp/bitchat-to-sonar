@@ -31493,7 +31493,16 @@
     "Paste the " : {
 
     },
-    "Payment address (BIP-353)" : {
+    "Payment address" : {
+
+    },
+    "Find by username" : {
+
+    },
+    "Find someone" : {
+
+    },
+    "Username" : {
 
     },
     "People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing." : {
