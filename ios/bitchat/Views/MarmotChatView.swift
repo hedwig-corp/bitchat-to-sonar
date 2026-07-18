@@ -3168,7 +3168,15 @@ struct MarmotConversationView: View {
 
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
-            SNMessageComposerField(text: $draft, prompt: Text("Message"))
+            SNMessageComposerField(
+                text: $draft,
+                prompt: Text("Message"),
+                onSend: {
+                    guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    model.send(draft, to: group.id)
+                    draft = ""
+                }
+            )
                 .font(SonarTheme.uiFont(size: 16))
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 14)

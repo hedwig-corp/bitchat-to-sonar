@@ -198,23 +198,24 @@ roughly halves it. The ranking is stable across all three.)
 
 ---
 
-## R-007 — Return inserts a newline in every message composer
+## R-007 — Composer Return is platform-correct (newline on mobile, send on desktop)
 
-**Invariant:** Message composers are multiline fields where Return inserts a newline; only the adjacent send button sends the draft.
+**Invariant:** On iOS/Android soft keyboards, Return inserts a newline and only the adjacent send button sends. On macOS / Compose desktop, bare Return/Enter sends the draft (desktop messenger default). Multiline desktop shortcuts (Shift/Option+Return) are deferred.
 
-**Breaks as:** Return intermittently sends or dismisses the keyboard instead of inserting a newline, depending on the app surface and software keyboard.
+**Breaks as:** On phones, Return intermittently sends or dismisses the keyboard instead of inserting a newline. On desktop, Return neither sends nor inserts a newline (the #314 macOS regression).
 
 **Call sites:** Apple `SNMessageComposerField` (used by `ContentView`, `SNComposer`, and `MarmotConversationView`); Compose `MessageComposerTextField` (used by `ChatScreen`, `GeoDmScreen`, and `SonarChannelScreen`)
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeyInsertsNewlineInSharedComposer`
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer` (and `returnKeyInsertsNewlineWhenDesktopSendDisabled` for the mobile-style path)
 
-**Coverage (honest):** The JVM UI test presses a real desktop Enter key against the shared Compose field and also pins `ImeAction.None`, so both the hardware-key path and the Android software-IME contract fail if the policy regresses. Apple routes every message composer through one SwiftUI field with `.submitLabel(.return)` and no submit handler, but iOS tests do not currently exercise software-keyboard input in CI.
+**Coverage (honest):** The JVM UI test presses a real desktop Enter key against the shared Compose field with `onSend` wired and pins `messageComposerEnterSends` + `ImeAction.None`. Apple macOS uses `.onKeyPress(.return)` + `.onSubmit`; iOS keeps `.submitLabel(.return)` with no submit handler. iOS tests do not currently exercise software-keyboard input in CI.
 
-**History:** `a4a9e6a5e` made the composers multiline but left conflicting submit/default IME behavior -> #313 reported the intermittent Return failure -> #314 centralized and pinned the policy across both apps.
+**History:** `a4a9e6a5e` made the composers multiline but left conflicting submit/default IME behavior -> #313 reported the intermittent Return failure -> #314 centralized Return=newline everywhere, which left macOS Return dead (neither send nor newline) -> desktop Enter=send restored while keeping mobile newline.
 
 **Rejected:**
 - *`ImeAction.Default` on Compose.* It is already `BasicTextField`'s effective default and lets the platform/keyboard choose the action, so it does not change the failing path.
 - *Fixing only the reported screen.* The issue did not identify a platform or conversation type, and the same product contract had diverged across six reachable composers.
+- *Shipping Shift/Option+Return newline in the same change.* Prefer Enter=send now; track the combo in #334.
 
 ---
 

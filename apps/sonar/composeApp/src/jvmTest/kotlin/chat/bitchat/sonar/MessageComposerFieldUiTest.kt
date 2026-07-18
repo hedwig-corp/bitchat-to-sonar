@@ -19,11 +19,42 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.sp
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 @OptIn(ExperimentalTestApi::class)
 class MessageComposerFieldUiTest {
     @Test
-    fun returnKeyInsertsNewlineInSharedComposer() = runComposeUiTest {
+    fun returnKeySendsDraftOnDesktopComposer() = runComposeUiTest {
+        var text by mutableStateOf("")
+        var sent: String? = null
+        setContent {
+            MessageComposerTextField(
+                value = text,
+                onValueChange = { text = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                modifier = Modifier.testTag("message-composer"),
+                onSend = {
+                    sent = text
+                    text = ""
+                },
+            )
+        }
+
+        onNodeWithTag("message-composer").performClick()
+        onNodeWithTag("message-composer").performTextInput("hello desktop")
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+
+        runOnIdle {
+            assertTrue(messageComposerEnterSends)
+            assertEquals("hello desktop", sent)
+            assertEquals("", text)
+            assertEquals(ImeAction.None, messageComposerKeyboardOptions.imeAction)
+        }
+    }
+
+    @Test
+    fun returnKeyInsertsNewlineWhenDesktopSendDisabled() = runComposeUiTest {
         var text by mutableStateOf("")
         setContent {
             MessageComposerTextField(
@@ -32,6 +63,7 @@ class MessageComposerFieldUiTest {
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
                 modifier = Modifier.testTag("message-composer"),
+                onSend = null,
             )
         }
 
@@ -42,7 +74,6 @@ class MessageComposerFieldUiTest {
 
         runOnIdle {
             assertEquals("first line\nsecond line", text)
-            assertEquals(ImeAction.None, messageComposerKeyboardOptions.imeAction)
         }
     }
 }

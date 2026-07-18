@@ -154,7 +154,15 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                     value = draft, onValueChange = { draft = it },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    onSend = {
+                        if (draft.isBlank()) return@MessageComposerTextField
+                        val d = draft
+                        draft = ""
+                        if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
+                            state.sendChannelMsg(screen.geohash, d)
+                        }
+                    },
                 )
             }
             Spacer(Modifier.width(8.dp))

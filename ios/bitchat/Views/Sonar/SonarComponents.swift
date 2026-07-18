@@ -3688,7 +3688,8 @@ struct SNComposer: View {
             HStack {
                 SNMessageComposerField(
                     text: $text,
-                    prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3)
+                    prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3),
+                    onSend: send
                 )
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 16))
@@ -3852,16 +3853,31 @@ struct SNLiveWave: View {
     }
 }
 
-/// Shared Apple message field: Return always inserts a newline and sending is
-/// owned exclusively by the composer's explicit send button.
+/// Shared Apple message field.
+///
+/// - iOS: Return inserts a newline; the adjacent send button owns sending.
+/// - macOS: Return sends the draft. Desktop multiline shortcuts (Shift/Option+Return)
+///   are intentionally deferred — see #334.
 struct SNMessageComposerField: View {
     @Binding var text: String
     let prompt: Text
+    var onSend: (() -> Void)? = nil
 
     var body: some View {
         TextField("", text: $text, prompt: prompt, axis: .vertical)
             .lineLimit(1...5)
+            #if os(iOS)
             .submitLabel(.return)
+            #else
+            .submitLabel(.send)
+            // Vertical TextField on macOS often neither inserts a newline nor
+            // fires onSubmit for bare Return — claim the key for send.
+            .onKeyPress(.return) {
+                onSend?()
+                return .handled
+            }
+            .onSubmit { onSend?() }
+            #endif
             .accessibilityLabel(prompt)
     }
 }
