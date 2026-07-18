@@ -1392,6 +1392,31 @@ mod wipe_tests {
 }
 
 #[cfg(test)]
+mod commit_recovery_tests {
+    use super::{Identity, MarmotEngine, RelayUrl};
+
+    #[test]
+    fn merge_pending_commit_is_idempotent_after_group_creation() {
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let bob_key_package = bob.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("idempotent merge", vec![bob_key_package], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+
+        alice.merge_pending_commit(&group_id).unwrap();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("recovery may safely replay an already-merged commit");
+        alice
+            .create_text_message(&group_id, "group remains usable")
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod message_cursor_tests {
     use super::{compare_message_cursor_keys_desc, is_before_message_cursor, EventId, Timestamp};
 
