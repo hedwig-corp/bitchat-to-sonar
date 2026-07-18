@@ -18,7 +18,10 @@ expect object Notifier {
         title: String,
         body: String,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
+        conversationId: String? = null,
     )
+    /** Dismiss delivered notifications that belong to any of [conversationIds]. */
+    fun clearConversations(conversationIds: Collection<String>)
     /** Called after the wallet reaches Ready — retries push webhook registration
      *  that was deferred because the wallet was not connected at startup. */
     fun onWalletReady()

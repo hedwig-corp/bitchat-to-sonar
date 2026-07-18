@@ -120,16 +120,25 @@ actual object Notifier {
         }
     }
 
-    actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
+    actual fun notify(
+        id: Int,
+        title: String,
+        body: String,
+        sound: SonarNotificationSound,
+        conversationId: String?,
+    ) {
         if (!canNotify()) return
-        val open = ctx.packageManager.getLaunchIntentForPackage(ctx.packageName)
-            ?.apply { flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP }
-        val pi = open?.let {
-            PendingIntent.getActivity(
-                ctx, id, it,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
+        val open = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                Intent.FLAG_ACTIVITY_SINGLE_TOP
+            if (!conversationId.isNullOrBlank()) {
+                putExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID, conversationId)
+            }
         }
+        val pi = PendingIntent.getActivity(
+            ctx, id, open,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         val channel = when (sound) {
             SonarNotificationSound.Default -> MESSAGE_CHANNEL
             SonarNotificationSound.Ble -> BLE_CHANNEL
@@ -141,8 +150,15 @@ actual object Notifier {
             .setAutoCancel(true)
             .setNumber(1)
             .setCategory(Notification.CATEGORY_MESSAGE)
-            .apply { if (pi != null) setContentIntent(pi) }
+            .setContentIntent(pi)
             .build()
         manager().notify(id, n)
+    }
+
+    actual fun clearConversations(conversationIds: Collection<String>) {
+        val nm = manager()
+        for (id in SonarNotificationHandoff.notificationIdsToClear(conversationIds)) {
+            nm.cancel(id)
+        }
     }
 }

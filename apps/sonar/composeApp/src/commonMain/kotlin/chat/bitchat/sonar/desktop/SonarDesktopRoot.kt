@@ -64,6 +64,7 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.awaitCancellation
 
 /**
  * Desktop application root: theme + boot + onboarding gating around
@@ -78,9 +79,27 @@ fun DesktopApp() {
     val state = remember { SonarAppState(scope).also { it.callOverlay = true } }
     DisposableEffect(state) {
         MeshRadio.setPeerUpdateListener(state::onMeshPeersChanged)
-        onDispose { MeshRadio.setPeerUpdateListener(null) }
+        onDispose {
+            MeshRadio.setPeerUpdateListener(null)
+            SonarLifecycle.clearOpenConversationHandler()
+        }
     }
     LaunchedEffect(state) { SonarLifecycle.onForeground = { state.setForeground(it) } }
+    // Tray-icon taps (Notifier.jvm) land here once local Home is coherent —
+    // same hydrate gate as the phone App composable.
+    LaunchedEffect(state, state.onboarded, state.homeMessagesHydrated) {
+        if (!state.onboarded || !state.homeMessagesHydrated) {
+            SonarLifecycle.clearOpenConversationHandler()
+            return@LaunchedEffect
+        }
+        val handler: (String) -> Unit = { state.openConversationFromNotification(it) }
+        try {
+            SonarLifecycle.installOpenConversationHandler(handler)
+            awaitCancellation()
+        } finally {
+            SonarLifecycle.clearOpenConversationHandler(handler)
+        }
+    }
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()
     }

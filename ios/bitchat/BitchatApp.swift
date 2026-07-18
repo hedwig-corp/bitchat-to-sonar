@@ -66,7 +66,10 @@ struct BitchatApp: App {
             SonarRootView()
                 .environmentObject(sonarStore)
                 .onAppear {
-                    NotificationDelegate.shared.chatViewModel = chatViewModel
+                    NotificationDelegate.shared.bind(
+                        chatViewModel: chatViewModel,
+                        sonarStore: sonarStore
+                    )
                     // Inject live Noise service into VerificationService to avoid creating new BLE instances
                     VerificationService.shared.configure(with: chatViewModel.meshService.getNoiseService())
                     // Prewarm Nostr identity and QR to make first VERIFY sheet fast
@@ -360,18 +363,46 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
 final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     static let shared = NotificationDelegate()
     weak var chatViewModel: ChatViewModel?
+    weak var sonarStore: SonarAppStore?
+    /// Cold-launch taps can arrive before `bind` wires the store.
+    private var pendingConversationId: String?
+
+    func bind(chatViewModel: ChatViewModel, sonarStore: SonarAppStore) {
+        self.chatViewModel = chatViewModel
+        self.sonarStore = sonarStore
+        if let pending = pendingConversationId {
+            pendingConversationId = nil
+            openConversation(pending)
+        }
+    }
+
+    private func openConversation(_ conversationId: String) {
+        let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        guard let store = sonarStore else {
+            pendingConversationId = id
+            return
+        }
+        DispatchQueue.main.async {
+            store.openConversationFromNotification(id)
+        }
+    }
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completionHandler: @escaping () -> Void) {
         let identifier = response.notification.request.identifier
         let userInfo = response.notification.request.content.userInfo
 
-        // Check if this is a private message notification
-        if identifier.hasPrefix("private-") {
-            // Get peer ID from userInfo
-            if let peerID = userInfo["peerID"] as? String {
-                DispatchQueue.main.async {
-                    self.chatViewModel?.startPrivateChat(with: PeerID(str: peerID))
-                }
+        // Sonar local notifications carry `sonarConversationId`; private-message
+        // notifications carry `peerID` (also mirrored as conversation id). The
+        // Sonar root owns DM navigation — prefer that over the legacy
+        // ChatViewModel private-chat path so the tap lands on the real chat.
+        if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
+            openConversation(conversationId)
+        } else if identifier.hasPrefix("private-"),
+                  let peerID = userInfo[SonarNotificationKeys.peerID] as? String {
+            DispatchQueue.main.async {
+                self.chatViewModel?.startPrivateChat(with: PeerID(str: peerID))
+                NotificationService.shared.clearNotifications(forConversationIds: [peerID])
             }
         }
         // Handle deeplink (e.g., geohash activity)
@@ -390,21 +421,20 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         let identifier = notification.request.identifier
         let userInfo = notification.request.content.userInfo
 
-        // Check if this is a private message notification
-        if identifier.hasPrefix("private-") {
-            // Get peer ID from userInfo
-            if let peerID = userInfo["peerID"] as? String {
-                // Don't show notification if the private chat is already open
-                // Access main-actor-isolated property via Task
-                Task { @MainActor in
-                    if self.chatViewModel?.selectedPrivateChatPeer == PeerID(str: peerID) {
-                        completionHandler([])
-                    } else {
-                        completionHandler([.banner, .sound])
-                    }
+        if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
+            Task { @MainActor in
+                if self.sonarStore?.isConversationOpen(conversationId) == true ||
+                    self.chatViewModel?.selectedPrivateChatPeer == PeerID(str: conversationId) {
+                    // Already viewing this chat — consume rather than banner.
+                    NotificationService.shared.clearNotifications(
+                        forConversationIds: [conversationId]
+                    )
+                    completionHandler([])
+                } else {
+                    completionHandler([.banner, .sound])
                 }
-                return
             }
+            return
         }
         // Suppress geohash activity notification if we're already in that geohash channel
         if identifier.hasPrefix("geo-activity-"),

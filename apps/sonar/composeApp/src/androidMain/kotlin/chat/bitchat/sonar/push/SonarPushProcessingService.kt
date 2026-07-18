@@ -168,7 +168,12 @@ class SonarPushProcessingService : Service() {
                 prefs = prefs,
             )
             if (notif != null) {
-                Notifier.notify(notif.id, notif.title, notif.body)
+                Notifier.notify(
+                    id = notif.id,
+                    title = notif.title,
+                    body = notif.body,
+                    conversationId = summary.groupIdHex,
+                )
                 notified++
             }
         }

@@ -2209,7 +2209,7 @@ final class SonarAppStore: ObservableObject {
         sound: SonarNotificationSound = .standard
     ) {
         guard !isForeground else { return }
-        let userInfo: [String: Any] = conversationId.map { ["sonarConversationId": $0] } ?? [:]
+        let userInfo: [String: Any] = conversationId.map { [SonarNotificationKeys.conversationId: $0] } ?? [:]
         guard let notification = SonarLocalNotificationRouter.make(
             idKey: idKey,
             kind: kind,
@@ -6808,11 +6808,112 @@ final class SonarAppStore: ObservableObject {
             // Capture at navigation time — the screen's own onAppear would
             // lose the race against its child list's onAppear.
             captureUnreadAtOpen(id)
+            clearNotificationsForConversation(id)
         }
         #if os(iOS)
         if case .call = route { return }
         #endif
         path.append(route)
+    }
+
+    /// Whether the given conversation is the top DM route (used to suppress
+    /// banners while that chat is already open). Matches fold / fingerprint
+    /// aliases of the same person, not only exact string equality.
+    func isConversationOpen(_ conversationId: String) -> Bool {
+        guard let openId = currentDMId else { return false }
+        return conversationsMatchForNotification(openId, conversationId)
+    }
+
+    /// Open a conversation from a notification tap (local or private-message).
+    /// Uses the local-first `openDM` path (await newest page before present) and
+    /// refuses stale ids that no longer resolve to a live local conversation.
+    func openConversationFromNotification(_ conversationId: String) {
+        let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        if isConversationOpen(id) {
+            clearNotificationsForConversation(id)
+            return
+        }
+        guard let target = resolveNotificationConversation(id) else {
+            // Deleted / left / never-hydrated — clear the shade, stay on Home.
+            clearNotificationsForConversation(id)
+            return
+        }
+        openDM(target.id, marmotGroupId: target.marmotGroupId)
+    }
+
+    /// Map a notification conversation id onto a current local DM row / pending
+    /// chat / live Marmot group. Nil means the tap target is gone.
+    private func resolveNotificationConversation(
+        _ id: String
+    ) -> (id: String, marmotGroupId: String?)? {
+        if let row = dmRows.first(where: {
+            $0.id == id || conversationsMatchForNotification($0.id, id)
+        }) {
+            return (row.id, row.marmotGroupId)
+        }
+        if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
+            return (id, nil)
+        }
+        if let groupId = marmotGroupId(id),
+           marmot.groups.contains(where: { $0.id == groupId }) {
+            if let row = dmRows.first(where: {
+                $0.marmotGroupId == groupId || conversationsMatchForNotification($0.id, id)
+            }) {
+                return (row.id, groupId)
+            }
+            return (Self.marmotIDPrefix + groupId, groupId)
+        }
+        // Mesh / bitchat private chat that still has local state.
+        if !id.hasPrefix(Self.marmotIDPrefix) {
+            let peerID = PeerID(str: id)
+            let hasPrivate = chatViewModel.privateChats[peerID] != nil
+                || chatViewModel.unifiedPeerService.getPeer(by: peerID) != nil
+            if hasPrivate {
+                return (id, marmotGroupId(id))
+            }
+        }
+        return nil
+    }
+
+    /// True when both ids name the same DM under fold / fingerprint aliases.
+    private func conversationsMatchForNotification(_ left: String, _ right: String) -> Bool {
+        if left == right { return true }
+        if let leftGroup = marmotGroupId(left),
+           let rightGroup = marmotGroupId(right),
+           leftGroup == rightGroup {
+            return true
+        }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: left)), fp == right { return true }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: right)), fp == left { return true }
+        return false
+    }
+
+    /// Dismiss OS notifications that were posted for this conversation (and
+    /// any folded / duplicate ids that share its notification userInfo).
+    func clearNotificationsForConversation(_ conversationId: String) {
+        var ids: Set<String> = [conversationId]
+        if let groupId = marmotGroupId(conversationId) {
+            ids.insert(groupId)
+            ids.insert(Self.marmotIDPrefix + groupId)
+            for group in directMarmotGroups(matchingGroupId: groupId) {
+                ids.insert(group.id)
+                ids.insert(marmotConvId(forGroup: group.id))
+            }
+        }
+        if let mapped = marmotGroupIdsByConversationId[conversationId] {
+            ids.insert(mapped)
+            ids.insert(Self.marmotIDPrefix + mapped)
+        }
+        // Mesh fingerprint alias of the same peer.
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: conversationId)) {
+            ids.insert(fp)
+            if let mapped = marmotGroupIdsByConversationId[fp] {
+                ids.insert(mapped)
+                ids.insert(Self.marmotIDPrefix + mapped)
+            }
+        }
+        NotificationService.shared.clearNotifications(forConversationIds: ids)
     }
 
     func pop() {

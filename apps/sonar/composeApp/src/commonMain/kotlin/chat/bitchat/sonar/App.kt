@@ -115,6 +115,7 @@ import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
@@ -161,6 +162,37 @@ object SonarLifecycle {
         pendingSharedTexts.clear()
         queued.forEach(handler)
     }
+
+    @Volatile private var onOpenConversation: ((String) -> Unit)? = null
+    private val pendingOpenConversations = mutableListOf<String>()
+
+    fun submitOpenConversation(conversationId: String) {
+        val id = conversationId.trim()
+        if (id.isEmpty()) return
+        val handler = onOpenConversation
+        if (handler != null) {
+            handler(id)
+        } else {
+            // Dedupe: cold-start / locked taps may retry the same id.
+            pendingOpenConversations.removeAll { it == id }
+            pendingOpenConversations.add(id)
+        }
+    }
+
+    fun installOpenConversationHandler(handler: (String) -> Unit) {
+        onOpenConversation = handler
+        val queued = pendingOpenConversations.toList()
+        pendingOpenConversations.clear()
+        queued.forEach(handler)
+    }
+
+    /** Drop the live handler so later taps re-enter [pendingOpenConversations]
+     *  until a live composition owns them again (Activity recreate / lock). */
+    fun clearOpenConversationHandler(handler: ((String) -> Unit)? = null) {
+        if (handler == null || onOpenConversation === handler) {
+            onOpenConversation = null
+        }
+    }
 }
 
 @Composable
@@ -172,12 +204,32 @@ fun App(
     val state = remember { SonarAppState(scope) }
     DisposableEffect(state) {
         MeshRadio.setPeerUpdateListener(state::onMeshPeersChanged)
-        onDispose { MeshRadio.setPeerUpdateListener(null) }
+        onDispose {
+            MeshRadio.setPeerUpdateListener(null)
+            SonarLifecycle.clearOpenConversationHandler()
+        }
     }
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
+    }
+    // Notification taps must wait for a coherent local chat list so folded
+    // group → mesh remapping and openChat paint from real rows. Clear the
+    // handler whenever this effect leaves (lock / dispose / recreate) so taps
+    // re-queue instead of hitting a dead SonarAppState.
+    LaunchedEffect(state, state.onboarded, state.locked, state.homeMessagesHydrated) {
+        if (!state.onboarded || state.locked || !state.homeMessagesHydrated) {
+            SonarLifecycle.clearOpenConversationHandler()
+            return@LaunchedEffect
+        }
+        val handler: (String) -> Unit = { state.openConversationFromNotification(it) }
+        try {
+            SonarLifecycle.installOpenConversationHandler(handler)
+            awaitCancellation()
+        } finally {
+            SonarLifecycle.clearOpenConversationHandler(handler)
+        }
     }
     LaunchedEffect(state.onboarded) {
         if (state.onboarded) state.boot()

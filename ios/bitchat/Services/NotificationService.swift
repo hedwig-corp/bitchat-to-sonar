@@ -19,6 +19,33 @@ enum SonarNotificationSound {
     case ble
 }
 
+/// UserInfo / identifier keys shared by Sonar local notifications and the
+/// tap handoff in `NotificationDelegate`.
+enum SonarNotificationKeys {
+    static let conversationId = "sonarConversationId"
+    static let peerID = "peerID"
+}
+
+/// Pure helpers for which delivered notifications belong to a conversation.
+enum SonarNotificationHandoff {
+    static func conversationId(from userInfo: [AnyHashable: Any]) -> String? {
+        if let id = userInfo[SonarNotificationKeys.conversationId] as? String,
+           !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return id
+        }
+        if let peerID = userInfo[SonarNotificationKeys.peerID] as? String,
+           !peerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return peerID
+        }
+        return nil
+    }
+
+    static func matches(userInfo: [AnyHashable: Any], conversationIds: Set<String>) -> Bool {
+        guard let id = conversationId(from: userInfo) else { return false }
+        return conversationIds.contains(id)
+    }
+}
+
 final class NotificationService {
     static let shared = NotificationService()
     private static let standardNotificationSound = UNNotificationSound(
@@ -103,7 +130,11 @@ final class NotificationService {
         let title = "New Sonar message"
         let body = "Open Sonar to read it."
         let identifier = "private-\(UUID().uuidString)"
-        let userInfo = ["peerID": peerID.id, "senderName": sender]
+        let userInfo: [String: Any] = [
+            SonarNotificationKeys.peerID: peerID.id,
+            SonarNotificationKeys.conversationId: peerID.id,
+            "senderName": sender,
+        ]
 
         sendLocalNotification(
             title: title,
@@ -136,5 +167,36 @@ final class NotificationService {
             interruptionLevel: .timeSensitive,
             sound: .ble
         )
+    }
+
+    /// Remove delivered (and pending) notifications that belong to any of the
+    /// given conversation ids — used when the user opens that chat.
+    func clearNotifications(forConversationIds conversationIds: Set<String>) {
+        guard !isRunningTests else { return }
+        let targets = Set(conversationIds.filter { !$0.isEmpty })
+        guard !targets.isEmpty else { return }
+        let center = UNUserNotificationCenter.current()
+        center.getDeliveredNotifications { delivered in
+            let match = delivered.compactMap { notif -> String? in
+                SonarNotificationHandoff.matches(
+                    userInfo: notif.request.content.userInfo,
+                    conversationIds: targets
+                ) ? notif.request.identifier : nil
+            }
+            if !match.isEmpty {
+                center.removeDeliveredNotifications(withIdentifiers: match)
+            }
+        }
+        center.getPendingNotificationRequests { pending in
+            let match = pending.compactMap { req -> String? in
+                SonarNotificationHandoff.matches(
+                    userInfo: req.content.userInfo,
+                    conversationIds: targets
+                ) ? req.identifier : nil
+            }
+            if !match.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: match)
+            }
+        }
     }
 }

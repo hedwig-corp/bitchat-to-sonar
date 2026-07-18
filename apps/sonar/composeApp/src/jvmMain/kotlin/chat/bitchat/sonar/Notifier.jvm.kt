@@ -3,19 +3,28 @@ package chat.bitchat.sonar
 import java.awt.Color
 import java.awt.SystemTray
 import java.awt.TrayIcon
+import java.awt.event.ActionListener
 import java.awt.image.BufferedImage
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import javax.sound.sampled.AudioSystem
 
 /**
  * Desktop (JVM) `actual`: incoming-message notifications via the AWT system tray
  * (the desktop twin of Android's notification channel). Falls back to a no-op
  * where the tray is unsupported (e.g. headless or some Linux desktops).
+ *
+ * Platform gap vs Android/iOS: AWT `displayMessage` balloons cannot carry a
+ * per-notification PendingIntent. Tap handoff is best-effort — clicking the
+ * tray icon opens the most recent notified conversation via
+ * [SonarLifecycle.submitOpenConversation]. Balloons themselves are ephemeral,
+ * so [clearConversations] is a no-op.
  */
 actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
+    private val lastConversationId = AtomicReference<String?>(null)
     private val soundGeneration = AtomicLong()
     private val soundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "sonar-notification-sound").apply { isDaemon = true }
@@ -37,7 +46,14 @@ actual object Notifier {
     actual fun ensureChannel() {
         if (trayIcon != null || !SystemTray.isSupported()) return
         runCatching {
-            val icon = TrayIcon(trayImage(), "Sonar").apply { isImageAutoSize = true }
+            val icon = TrayIcon(trayImage(), "Sonar").apply {
+                isImageAutoSize = true
+                addActionListener(
+                    ActionListener {
+                        lastConversationId.get()?.let(SonarLifecycle::submitOpenConversation)
+                    },
+                )
+            }
             SystemTray.getSystemTray().add(icon)
             trayIcon = icon
         }
@@ -53,11 +69,30 @@ actual object Notifier {
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
-    actual fun notify(id: Int, title: String, body: String, sound: SonarNotificationSound) {
+    actual fun notify(
+        id: Int,
+        title: String,
+        body: String,
+        sound: SonarNotificationSound,
+        conversationId: String?,
+    ) {
+        if (!conversationId.isNullOrBlank()) {
+            lastConversationId.set(conversationId)
+        }
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
             .onFailure { sonarLog("Notifier", "Failed to display desktop notification: ${it.message}") }
         playNotificationSound(sound)
+    }
+
+    actual fun clearConversations(conversationIds: Collection<String>) {
+        // AWT balloons are ephemeral — nothing durable to dismiss. Drop the
+        // last-tap target when every related id is cleared so a later tray
+        // click cannot reopen a just-read conversation by accident.
+        val cleared = conversationIds.filter { it.isNotBlank() }.toSet()
+        if (cleared.isEmpty()) return
+        val last = lastConversationId.get()
+        if (last != null && last in cleared) lastConversationId.compareAndSet(last, null)
     }
 
     private fun playNotificationSound(sound: SonarNotificationSound) {
