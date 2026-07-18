@@ -114,8 +114,10 @@ Website download (`web/src/lib/links.js`) points at the **phone** APK.
 
 1. **Missing NDK** — `core/build-android.sh` fails with “set ANDROID_NDK_HOME”.
    Install an NDK via SDK Manager and export `ANDROID_NDK_HOME`.
-2. **Empty wallet** — no `breez.apiKey` / `BREEZ_API_KEY`; chat works, payments
-   do not.
+2. **Empty / missing Breez key** — debug may omit `breez.apiKey` /
+   `BREEZ_API_KEY`: chat and nsec restore still work, Settings Balance shows
+   **Unavailable**. Release `assembleRelease` / `bundleRelease` **refuse** to
+   build without the key (so alpha/Zapstore APKs cannot ship a dead wallet).
 3. **Huge APK** — you built universal (or an old unfiltered release). Use default
    `assembleRelease` for phones-only.
 4. **Emulator is x86_64** — debug is arm64-only; use an **arm64** system image

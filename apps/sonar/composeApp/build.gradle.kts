@@ -439,14 +439,20 @@ dependencies {
     baselineProfile(project(":baselineprofile"))
 }
 
-// Alpha / Zapstore phone APKs must ship with a Breez key or every restore shows
-// a dead Lightning wallet. Debug may omit the key for CI unit/UI tests.
+// Alpha / Zapstore phone APKs (and future Play AABs) must ship with a Breez key
+// or every restore shows a dead Lightning wallet. Debug may omit the key for CI
+// unit/UI tests. Match packaging tasks only — not intermediate bundleRelease*
+// Classes/Resources helpers.
 tasks.matching {
-    it.name.startsWith("assemble") && it.name.contains("Release", ignoreCase = true)
+    val n = it.name
+    (n.startsWith("assemble") && n.contains("Release", ignoreCase = true)) ||
+        n == "bundleRelease" ||
+        (n.startsWith("bundle") && n.endsWith("Release") &&
+            !n.contains("Classes") && !n.contains("Resources"))
 }.configureEach {
     doFirst {
         check(breezApiKey.isNotEmpty()) {
-            "BREEZ_API_KEY is empty — refusing release assemble. " +
+            "BREEZ_API_KEY is empty — refusing release assemble/bundle. " +
                 "Set breez.apiKey in apps/sonar/local.properties or export BREEZ_API_KEY."
         }
     }

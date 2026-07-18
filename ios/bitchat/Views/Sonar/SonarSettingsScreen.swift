@@ -106,32 +106,41 @@ struct SonarSettingsScreen: View {
                     SNSettingsCard {
                         SNSettingsRow(
                             icon: .coin, tone: .gold, label: "Balance",
-                            sub: "Pays like you message — tap to pay nearby or over the internet",
+                            sub: walletBalanceSub,
                             value: walletValue,
-                            divider: true
+                            divider: walletConfigured
                         ) {
                             if case .ready = store.walletState {
                                 store.push(.walletActivity)
-                            } else {
+                            } else if walletConfigured {
                                 walletSheet = true
                             }
                         }
-                        // Show balance in fiat (default) or bitcoin (sats).
-                        SNSettingsRow(
-                            icon: .coin, tone: .gold, label: "Show balance in",
-                            value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
-                            divider: true
-                        ) {
-                            store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                        if walletConfigured {
+                            // Show balance in fiat (default) or bitcoin (sats).
+                            SNSettingsRow(
+                                icon: .coin, tone: .gold, label: "Show balance in",
+                                value: store.displayMode == "fiat" ? "Money" : "Bitcoin",
+                                divider: true
+                            ) {
+                                store.setDisplayMode(store.displayMode == "fiat" ? "bitcoin" : "fiat")
+                            }
+                            // Currency for the fiat display.
+                            SNSettingsRow(
+                                icon: .coin, tone: .gold, label: "Currency",
+                                value: store.displayCurrency,
+                                divider: false
+                            ) {
+                                currencySheet = true
+                            }
                         }
-                        // Currency for the fiat display.
-                        SNSettingsRow(
-                            icon: .coin, tone: .gold, label: "Currency",
-                            value: store.displayCurrency,
-                            divider: false
-                        ) {
-                            currencySheet = true
-                        }
+                    }
+                    if !walletConfigured {
+                        Text("This build has no Breez API key, so Lightning stays off. Chat and restore still work.")
+                            .font(SonarTheme.uiFont(size: 12))
+                            .foregroundColor(SonarTheme.text3)
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, 4)
                     }
 
                     SNSectionLabel("Privacy & safety")
@@ -271,13 +280,26 @@ struct SonarSettingsScreen: View {
         #endif
     }
 
+    /// Key present (setting up or ready) — not a missing-Breez-key build.
+    private var walletConfigured: Bool {
+        if case .notConfigured = store.walletState { return false }
+        return true
+    }
+
+    private var walletBalanceSub: String {
+        walletConfigured
+            ? "Pays like you message — tap to pay nearby or over the internet"
+            : "Lightning wallet unavailable in this build"
+    }
+
     /// Real balance when the wallet is ready, in the chosen display unit;
-    /// honest affordance otherwise.
+    /// honest affordance otherwise. Keyless builds say Unavailable (Compose parity),
+    /// not "Set up" — there is nothing the user can configure in-app.
     private var walletValue: String {
         switch store.walletState {
         case .ready(let balance): return store.money(balance)
         case .settingUp: return "Setting up\u{2026}"
-        case .notConfigured: return "Set up"
+        case .notConfigured: return "Unavailable"
         }
     }
 

@@ -281,6 +281,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = DA5644925338B8189B035657 /* Build configuration list for PBXNativeTarget "bitchat_macOS" */;
 			buildPhases = (
+				A15C0DE100000000000000B8 /* Require Breez API key for Release */,
 				137ABE739BF20ACDDF8CC605 /* Sources */,
 				0214973A876129753D39EB47 /* Resources */,
 				31F6FDADA63050361C14F3A1 /* Frameworks */,
@@ -378,6 +379,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 53EADEF7546F94DDF82271B9 /* Build configuration list for PBXNativeTarget "bitchat_iOS" */;
 			buildPhases = (
+				A15C0DE100000000000000B7 /* Require Breez API key for Release */,
 				4E49E34F00154C051AE90FED /* Sources */,
 				CD6E8F32BC38357473954F97 /* Resources */,
 				B5A5CC493FFB3D8966548140 /* Frameworks */,
@@ -516,6 +518,28 @@
 				"fi",
 				"",
 			);
+		};
+		A15C0DE100000000000000B7 /* Require Breez API key for Release */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			inputPaths = (
+			);
+			name = "Require Breez API key for Release";
+			outputPaths = (
+			);
+			shellPath = /bin/sh;
+			shellScript = "set -e\n# Debug may omit BREEZ_API_KEY (Settings shows Unavailable). Release / TestFlight must ship with it — same fail-closed contract as Android assembleRelease.\nif [ \"${CONFIGURATION}\" != \"Release\" ]; then\n  exit 0\nfi\nKEY=\"$(printf '%s' \"${BREEZ_API_KEY}\" | tr -d '[:space:]')\"\nif [ -z \"${KEY}\" ]; then\n  echo \"error: BREEZ_API_KEY is empty — refusing Release build. Set it in ios/Configs/Local.xcconfig or inject via CI.\"\n  exit 1\nfi\n";
+		};
+		A15C0DE100000000000000B8 /* Require Breez API key for Release */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			inputPaths = (
+			);
+			name = "Require Breez API key for Release";
+			outputPaths = (
+			);
+			shellPath = /bin/sh;
+			shellScript = "set -e\n# Debug may omit BREEZ_API_KEY (Settings shows Unavailable). Release / TestFlight must ship with it — same fail-closed contract as Android assembleRelease.\nif [ \"${CONFIGURATION}\" != \"Release\" ]; then\n  exit 0\nfi\nKEY=\"$(printf '%s' \"${BREEZ_API_KEY}\" | tr -d '[:space:]')\"\nif [ -z \"${KEY}\" ]; then\n  echo \"error: BREEZ_API_KEY is empty — refusing Release build. Set it in ios/Configs/Local.xcconfig or inject via CI.\"\n  exit 1\nfi\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

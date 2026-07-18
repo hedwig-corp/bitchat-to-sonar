@@ -86,8 +86,11 @@ The Breez API key is injected via build settings → Info.plist:
   ```
 
 `WalletBridgeService.setupIfNeeded()` reads the key from Info.plist at
-runtime; when empty the service stays `.notConfigured` (wallet UI hides)
-and throws `WalletBridgeError.missingAPIKey`.
+runtime; when empty the service stays `.notConfigured`, Settings Balance
+shows **Unavailable** (Compose parity), and setup throws
+`WalletBridgeError.missingAPIKey`. Debug may omit the key; Release app
+targets refuse to build when it is empty (Xcode Run Script on
+`bitchat_iOS` / `bitchat_macOS`).
 
 ## App facade usage
 
