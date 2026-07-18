@@ -5032,7 +5032,7 @@ final class SonarAppStore: ObservableObject {
                             pay: pay
                         ))
                     case .notPay:
-                        let mediaItem = meshMediaItem(m.content)
+                        let mediaItem = meshMediaItem(m.content, conversationId: id)
                         let meshSticker = meshParseStickerContent(content: m.content).map {
                             MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
                         }
@@ -5131,7 +5131,7 @@ final class SonarAppStore: ObservableObject {
             case .notPay:
                 // BLE-mesh media (bitchat file transfer) arrives as an
                 // "[image] <name>" marker with the file already on disk.
-                let mediaItem = meshMediaItem(m.content)
+                let mediaItem = meshMediaItem(m.content, conversationId: id)
                 let meshSticker = meshParseStickerContent(content: m.content).map {
                     MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
                 }
@@ -6711,7 +6711,10 @@ final class SonarAppStore: ObservableObject {
 
     /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
     /// item with the local on-disk path, if the file exists.
-    private func meshMediaItem(_ content: String) -> SNMediaItem? {
+    /// BLE-mesh media has no Marmot group; [conversationId] is the DM/chat id
+    /// and doubles as `SNMediaItem.groupId` so voice playback queue/rate/delete
+    /// stop can match the active item (empty groupId would miss the chat).
+    private func meshMediaItem(_ content: String, conversationId: String) -> SNMediaItem? {
         let kinds: [(prefix: String, mime: String, dirs: [String])] = [
             ("[image] ", "image/jpeg", ["images/incoming", "images/outgoing"]),
             ("[voice] ", "audio/mp4", ["voicenotes/incoming", "voicenotes/outgoing"]),
@@ -6733,7 +6736,7 @@ final class SonarAppStore: ObservableObject {
                     url: "",
                     mime: k.mime,
                     filename: safe,
-                    groupId: "",
+                    groupId: conversationId,
                     localPath: path,
                     width: bounds?.0,
                     height: bounds?.1

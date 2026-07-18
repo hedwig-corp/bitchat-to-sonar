@@ -4185,6 +4185,9 @@ private fun VoiceWaveform(
             0.22f + (v and 15u).toInt() / 15f * 0.78f
         }
     }
+    // pointerInput(seed) keeps the same gesture coroutine across recompositions —
+    // always read the latest onSeek so PlayAt → seek doesn't keep the idle closure.
+    val currentOnSeek by rememberUpdatedState(onSeek)
     var widthPx by remember { mutableStateOf(0f) }
     Row(
         modifier
@@ -4194,12 +4197,12 @@ private fun VoiceWaveform(
                     Modifier.pointerInput(seed) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
-                            if (widthPx > 0f) onSeek((down.position.x / widthPx).coerceIn(0f, 1f))
+                            if (widthPx > 0f) currentOnSeek((down.position.x / widthPx).coerceIn(0f, 1f))
                             var pressed = true
                             while (pressed) {
                                 val ev = awaitPointerEvent()
                                 val ch = ev.changes.firstOrNull { it.id == down.id } ?: ev.changes.first()
-                                if (widthPx > 0f) onSeek((ch.position.x / widthPx).coerceIn(0f, 1f))
+                                if (widthPx > 0f) currentOnSeek((ch.position.x / widthPx).coerceIn(0f, 1f))
                                 if (!ch.pressed) pressed = false
                             }
                         }
