@@ -775,6 +775,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Send announce with new nickname to all peers
         meshService.sendBroadcastAnnounce()
     }
+
+    /// Clear the device-bound nickname when replacing the account via nsec
+    /// restore. The restored identity's kind-0 on relays is authoritative;
+    /// keeping the previous account's nick would publish over it.
+    func clearNicknameForAccountRestore() {
+        nickname = ""
+        userDefaults.removeObject(forKey: nicknameKey)
+        if !meshService.myPeerID.isEmpty {
+            meshService.setNickname("")
+        }
+    }
     
     func validateAndSaveNickname() {
         // Trim whitespace from nickname

@@ -1269,6 +1269,11 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
+        // Adopt own kind-0 into local Profile state before the connect-path
+        // republish (nsec restore clears the device-bound nick/handle).
+        marmot.onOwnProfileFetched = { [weak self] profile in
+            self?.adoptOwnKind0Profile(profile)
+        }
         marmot.$groups
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.resolvePendingSecureChats() }
@@ -1291,6 +1296,8 @@ final class SonarAppStore: ObservableObject {
                 guard let self, connected else { return }
                 // Relay-dependent work starts only after the delayed background
                 // attach, never as a side effect of publishing the local Home.
+                // MarmotChatModel already hydrated + published on connect; only
+                // republish when we still have a non-blank local nick.
                 self.marmot.publishProfile(name: self.chatViewModel.nickname)
                 self.adoptClaimedHandleIfNeeded()
                 self.ensureCallStarted()
@@ -1829,7 +1836,35 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
+        coreClaimedHandle = nil
+        handleClaimState = .idle
+        // Previous account's nickname must not survive into the restored
+        // identity — kind-0 on relays is authoritative after hydrate.
+        chatViewModel.clearNicknameForAccountRestore()
         objectWillChange.send()
+    }
+
+    /// Apply a fetched own kind-0 into local nickname / handle prefs.
+    /// Mirrors Compose `hydrateOwnProfileFromRelays` adoption.
+    private func adoptOwnKind0Profile(_ profile: MarmotService.Profile) {
+        let plan = OwnProfileHydration.plan(
+            localNickname: chatViewModel.nickname,
+            localBip353: bip353,
+            localClaimedHandle: coreClaimedHandle,
+            remoteName: profile.bestName,
+            remoteNip05: profile.nip05
+        )
+        if let name = plan.nicknameToAdopt, !name.isEmpty {
+            chatViewModel.nickname = name
+            chatViewModel.saveNickname()
+        }
+        if let address = plan.nip05ToAdopt, !address.isEmpty {
+            setBip353(address)
+            coreClaimedHandle = coreClaimedHandle ?? address
+            if handleClaimState == .idle {
+                handleClaimState = .claimed(address)
+            }
+        }
     }
 
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
