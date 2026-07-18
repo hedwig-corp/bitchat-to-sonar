@@ -252,6 +252,10 @@ final class MarmotChatModel: ObservableObject {
     /// Called on the main actor after a restore reclaim seeds the core sidecar.
     /// Set by SonarAppStore — do not mark `coreClaimedHandle` before this.
     var onOwnHandleSidecarSeeded: ((String) -> Void)?
+    /// After the first own-kind-0 fetch this process, handle-less accounts can
+    /// skip the RTT on later reconnects. Sonar-domain prefs without a sidecar
+    /// still re-enter so reclaim can retry.
+    private var didFetchOwnProfileThisSession = false
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
@@ -1627,13 +1631,27 @@ final class MarmotChatModel: ObservableObject {
         let localBip = localBip353Provider?() ?? ""
         let domain = handleDomainProvider?() ?? defaultHandleDomain()
         let claimedNow = await service.claimedHandle()
-        if !OwnProfileHydration.needsRelayFetch(
+        let needsFetch = OwnProfileHydration.needsRelayFetch(
             localNickname: localNick,
             localBip353: localBip,
             localClaimedHandle: claimedNow,
             handleDomain: domain
-        ) {
+        )
+        if !needsFetch {
             return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
+        // Handle-less accounts only need one own-profile fetch per process to
+        // learn whether relays hold a nip05. Keep retrying when a Sonar-domain
+        // pref still lacks a sidecar (reclaim may have failed earlier).
+        let bipTrimmed = localBip.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sonarMissingSidecar = !bipTrimmed.isEmpty
+            && bipTrimmed.lowercased().hasSuffix("@\(domain.lowercased())")
+            && (claimedNow?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        if didFetchOwnProfileThisSession, !localNick.isEmpty, !sonarMissingSidecar {
+            return OwnProfileHydration.canPublishOwnProfile(
                 localBip353: localBip,
                 coreClaimedHandle: claimedNow
             )
@@ -1647,11 +1665,13 @@ final class MarmotChatModel: ObservableObject {
             )
         }
         guard let profile = try? await service.fetchProfile(npub: me) else {
+            // Do not set didFetchOwnProfileThisSession — a miss should retry.
             return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
                 localBip353: localBip,
                 coreClaimedHandle: claimedNow
             )
         }
+        didFetchOwnProfileThisSession = true
         let key = SNMarmotProfileCache.canonicalKey(me)
         await MainActor.run {
             profilesByNpub[key] = profile

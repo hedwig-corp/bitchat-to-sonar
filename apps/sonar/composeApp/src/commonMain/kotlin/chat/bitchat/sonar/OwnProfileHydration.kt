@@ -61,10 +61,11 @@ fun planOwnProfileHydration(
     val effectiveNick = (adoptNick ?: nick).trim()
     // Sidecar-backed publish can preserve nip05 only when absent, already
     // claimed to the same address, or reclaimable at the Sonar registrar.
+    // Callers must still wait for claim success (`handleSeeded`) before emit.
     val nip05SafeToPublish = when {
         remoteNip05 == null -> true
         claimed != null && claimed.equals(remoteNip05, ignoreCase = true) -> true
-        isSonarNip05 && claimed == null -> true
+        isSonarNip05 && claimed == null && handleLocal != null -> true
         else -> false
     }
     return OwnProfileHydrationPlan(
@@ -93,9 +94,13 @@ fun canPublishOwnProfile(
 /**
  * Whether connect-path hydration must hit relays for our own kind-0.
  *
- * Skip the RTT when local nick is present and either there is no handle pref,
- * the core sidecar is already seeded, or the pref is an external domain we
- * cannot reclaim into the sidecar (fetching every connect would not help).
+ * Fetch when:
+ * - local nick is blank (restore / cleared prefs), or
+ * - no core sidecar and no handle pref (unknown whether relays hold `nip05`), or
+ * - a Sonar-domain handle pref exists without a sidecar (needs reclaim).
+ *
+ * Skip when the sidecar is already seeded, or the pref is an external domain
+ * we cannot reclaim into the sidecar (publish is already gated off).
  */
 fun needsOwnProfileRelayFetch(
     localNickname: String,
@@ -104,9 +109,11 @@ fun needsOwnProfileRelayFetch(
     handleDomain: String,
 ): Boolean {
     if (localNickname.trim().isEmpty()) return true
-    val bip = localBip353.trim()
-    if (bip.isEmpty()) return false
     if (!localClaimedHandle.isNullOrBlank()) return false
+    val bip = localBip353.trim()
+    // No local handle record and no sidecar: relays may still hold a nip05.
+    // Publishing without fetching would omit it and wipe the replaceable event.
+    if (bip.isEmpty()) return true
     val domain = handleDomain.trim().lowercase()
     return bip.substringAfter('@', "").equals(domain, ignoreCase = true)
 }

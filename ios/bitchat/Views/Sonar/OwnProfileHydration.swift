@@ -53,12 +53,13 @@ enum OwnProfileHydration {
             handleLocal = nil
         }
         let effectiveNick = (adoptNick ?? nick).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Callers must still wait for claim success before emit when reclaiming.
         let nip05SafeToPublish: Bool = {
             guard let remoteNip05Valid else { return true }
             if let claimedValid, claimedValid.caseInsensitiveCompare(remoteNip05Valid) == .orderedSame {
                 return true
             }
-            if isSonarNip05, claimedValid == nil { return true }
+            if isSonarNip05, claimedValid == nil, handleLocal != nil { return true }
             return false
         }()
         return OwnProfileHydrationPlan(
@@ -85,8 +86,10 @@ enum OwnProfileHydration {
     }
 
     /// Whether connect-path hydration must hit relays for our own kind-0.
-    /// Skip the RTT when local state is already coherent (or the handle pref is
-    /// an external domain we cannot reclaim into the sidecar).
+    /// Fetch when nick is blank, when there is no sidecar and no handle pref
+    /// (unknown remote nip05), or when a Sonar-domain pref lacks a sidecar.
+    /// Skip when the sidecar is seeded, or the pref is an external domain we
+    /// cannot reclaim (publish is already gated off).
     static func needsRelayFetch(
         localNickname: String,
         localBip353: String,
@@ -95,11 +98,12 @@ enum OwnProfileHydration {
     ) -> Bool {
         let nick = localNickname.trimmingCharacters(in: .whitespacesAndNewlines)
         if nick.isEmpty { return true }
-        let bip = localBip353.trimmingCharacters(in: .whitespacesAndNewlines)
-        if bip.isEmpty { return false }
         let claimed = localClaimedHandle?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !claimed.isEmpty { return false }
+        let bip = localBip353.trimmingCharacters(in: .whitespacesAndNewlines)
+        // No local handle record and no sidecar: relays may still hold a nip05.
+        if bip.isEmpty { return true }
         let domain = handleDomain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let bipDomain = String(bip.split(separator: "@").dropFirst().first ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)

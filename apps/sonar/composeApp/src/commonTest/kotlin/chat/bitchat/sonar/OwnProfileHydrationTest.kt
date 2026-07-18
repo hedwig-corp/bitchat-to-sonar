@@ -115,7 +115,8 @@ class OwnProfileHydrationTest {
     @Test
     fun needsRelayFetchOnlyWhenRestoreSymptomsPresent() {
         assertTrue(needsOwnProfileRelayFetch("", "", null, domain))
-        assertFalse(needsOwnProfileRelayFetch("Alice", "", null, domain))
+        // Nick present but no handle pref/sidecar: must fetch — relays may hold nip05.
+        assertTrue(needsOwnProfileRelayFetch("Alice", "", null, domain))
         assertFalse(
             needsOwnProfileRelayFetch(
                 "Alice",

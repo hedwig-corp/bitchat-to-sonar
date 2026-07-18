@@ -129,8 +129,9 @@ struct OwnProfileHydrationTests {
                 handleDomain: domain
             )
         )
+        // Nick present but no handle pref/sidecar: must fetch — relays may hold nip05.
         #expect(
-            !OwnProfileHydration.needsRelayFetch(
+            OwnProfileHydration.needsRelayFetch(
                 localNickname: "Alice",
                 localBip353: "",
                 localClaimedHandle: nil,

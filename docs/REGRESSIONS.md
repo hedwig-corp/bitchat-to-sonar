@@ -312,7 +312,7 @@ invalidation for verified peer/profile changes.
 - *Keep iOS `$relayConnected` republish beside Marmot connect-path publish.* Second writer could emit without sidecar `nip05`.
 - *Treat `handleLocalToClaim == null` alone as publish-safe.* External `nip05` then published without sidecar and wiped the remote field.
 
-**Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI.
+**Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
 ## Unguarded
 
