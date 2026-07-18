@@ -25,6 +25,7 @@
 		A15C0DE200000000000000C4 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C2 /* TranscriptEngine */; };
 		A15C0DE200000000000000C5 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C3 /* TranscriptEngine */; };
 		A15C0DE200000000000000C6 /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C7 /* TranscriptEngine */; };
+		A15C0DE200000000000000CA /* TranscriptEngine in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE200000000000000C9 /* TranscriptEngine */; };
 		A6E3E5702E77036A0032EA8A /* BitLogger in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3E56F2E77036A0032EA8A /* BitLogger */; };
 		A6E3E5722E7703760032EA8A /* BitLogger in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3E5712E7703760032EA8A /* BitLogger */; };
 		A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA7E2E7706720032EA8A /* Tor */; };
@@ -226,6 +227,12 @@
 				A15C0DE200000000000000C6 /* TranscriptEngine in Frameworks */,
 			);
 		};
+		A15C0DE200000000000000CB /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			files = (
+				A15C0DE200000000000000CA /* TranscriptEngine in Frameworks */,
+			);
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -339,6 +346,7 @@
 			buildPhases = (
 				5C22AA7B9ACC5A861445C769 /* Sources */,
 				C5E027A42ECCDFD700BD6012 /* Resources */,
+				A15C0DE200000000000000CB /* Frameworks */,
 			);
 			buildRules = (
 			);
@@ -349,6 +357,9 @@
 				A6E32D412E762EAE0032EA8A /* bitchatTests */,
 			);
 			name = bitchatTests_macOS;
+			packageProductDependencies = (
+				A15C0DE200000000000000C9 /* TranscriptEngine */,
+			);
 			productName = bitchatTests_macOS;
 			productReference = 03C57F452B55FD0FD8F51421 /* bitchatTests_macOS.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -1220,6 +1231,10 @@
 			productName = TranscriptEngine;
 		};
 		A15C0DE200000000000000C7 /* TranscriptEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TranscriptEngine;
+		};
+		A15C0DE200000000000000C9 /* TranscriptEngine */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = TranscriptEngine;
 		};
