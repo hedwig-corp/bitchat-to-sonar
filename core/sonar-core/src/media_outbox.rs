@@ -355,7 +355,7 @@ impl MediaOutbox {
                 return Err(error.into());
             }
             let source = MediaUploadSource {
-                source_file: format!("{request_id}-{index}.source"),
+                source_file: source_file(request_id.as_str(), index),
                 source_nonce,
                 source_hash: Sha256::digest(data).into(),
                 source_size: data.len() as u64,
@@ -776,7 +776,19 @@ pub(crate) fn wipe_media_outbox_for_db(db_path: &Path) -> Result<()> {
 }
 
 fn upload_blob_file(request_id: &str, index: usize, nonce: &[u8; 12]) -> String {
-    format!("{request_id}-{index}-{}.blob", hex::encode(nonce))
+    format!(
+        "{}-{index}-{}.blob",
+        request_file_stem(request_id),
+        hex::encode(nonce)
+    )
+}
+
+fn source_file(request_id: &str, index: usize) -> String {
+    format!("{}-{index}.source", request_file_stem(request_id))
+}
+
+fn request_file_stem(request_id: &str) -> String {
+    hex::encode(Sha256::digest(request_id.as_bytes()))
 }
 
 fn source_aad(request_id: &str, index: usize) -> Vec<u8> {
@@ -988,6 +1000,37 @@ mod tests {
         assert!(!source_file.exists());
         let manifest = fs::read(media_outbox_dir_for_db(&db).join(MANIFEST_FILE)).unwrap();
         assert!(!String::from_utf8_lossy(&manifest).contains("caption"));
+    }
+
+    #[test]
+    fn request_ids_cannot_escape_the_media_outbox_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let mut outbox = MediaOutbox::open(&db, [31_u8; 32]).unwrap();
+        let request_id = "../outside/nested";
+
+        outbox
+            .enqueue(
+                request_id.into(),
+                "group".into(),
+                String::new(),
+                "https://blossom.example".into(),
+                10,
+                vec![queued(1)],
+            )
+            .unwrap();
+
+        let job = outbox.job(request_id).unwrap();
+        let media_dir = media_outbox_dir_for_db(&db);
+        for file in [
+            job.sources[0].source_file.as_str(),
+            job.items[0].blob_file.as_str(),
+        ] {
+            assert!(!file.contains('/'));
+            assert!(!file.contains(".."));
+            assert_eq!(media_dir.join(file).parent(), Some(media_dir.as_path()));
+            assert!(media_dir.join(file).exists());
+        }
     }
 
     #[test]

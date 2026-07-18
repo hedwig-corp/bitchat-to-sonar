@@ -308,6 +308,17 @@ final class MarmotService: @unchecked Sendable {
     /// mutation, never for a relay quorum fetch.
     private let drainQueue = DispatchQueue(label: "chat.bitchat.marmot-drain", qos: .userInitiated)
 
+    /// Long-running media encryption/uploads use leased node snapshots on a
+    /// concurrent lane. They must not occupy `workQueue`: relay reconnect
+    /// installs the relay-backed node there, and a scarce-link upload can run
+    /// for minutes while the durable core outbox waits for that installation.
+    /// The shared core bounds media concurrency and serializes MLS mutation.
+    private let mediaQueue = DispatchQueue(
+        label: "chat.bitchat.marmot-media-send",
+        qos: .utility,
+        attributes: .concurrent
+    )
+
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
     /// they are safe to run in parallel with each other (and alongside writes
@@ -717,8 +728,8 @@ final class MarmotService: @unchecked Sendable {
         serverUrl: String = "",
         requestId: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMediaRetryable(
+        try await mediaLane {
+            try $0.sendMediaRetryable(
                 groupIdHex: groupId,
                 data: data,
                 filename: filename,
@@ -748,8 +759,8 @@ final class MarmotService: @unchecked Sendable {
         serverUrl: String = "",
         requestId: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMediaMultiRetryable(
+        try await mediaLane {
+            try $0.sendMediaMultiRetryable(
                 groupIdHex: groupId,
                 items: items.map {
                     MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
@@ -1473,6 +1484,12 @@ final class MarmotService: @unchecked Sendable {
     /// `workQueue` with blocking `syncForce` (see `drainQueue` doc).
     private func drainLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: drainQueue, body)
+    }
+
+    /// Media work is lifecycle-leased like reads/sends but runs independently
+    /// from relay node installation on `workQueue`.
+    private func mediaLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: mediaQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
