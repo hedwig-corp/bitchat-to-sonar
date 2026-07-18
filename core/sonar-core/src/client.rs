@@ -38,6 +38,10 @@ use crate::marmot::{
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
+use crate::pre_route_outbox::{
+    pre_route_outbox_path_for_db, shared_pre_route_outbox, PendingGroupCreation, PreRouteMessage,
+    PreRouteOutbox,
+};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
@@ -107,6 +111,9 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
+const SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX: &str = "sonar.direct-dm-operation.v1:";
+const SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX: &str = "sonar.group-operation.v1:";
+const MAX_GROUP_OPERATION_ID_BYTES: usize = 512;
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -865,6 +872,14 @@ fn should_fetch_group_messages_on_sync(is_live: bool, force: bool, since_secs: u
     force && since_secs > 0
 }
 
+fn should_replace_group_subscription(
+    force: bool,
+    current: &HashSet<String>,
+    desired: &HashSet<String>,
+) -> bool {
+    force || current != desired
+}
+
 /// Push into a live buffer with half-drop overflow. Returns true if a drop ran.
 fn push_live_buffer<T>(buf: &mut Vec<T>, item: T, cap: usize) -> bool {
     let mut dropped = false;
@@ -1349,6 +1364,14 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
+    /// Encrypted, bounded host handoff for sends created before an MLS route
+    /// exists. Unlike the relay outbox, these records are still plaintext and
+    /// therefore use a key derived from the SQLCipher database key.
+    pre_route_outbox: Arc<Mutex<PreRouteOutbox>>,
+    /// Serializes durable group start/cancel operations. A host can cancel a
+    /// pending row while its blocking FFI start is still unwinding; without
+    /// this gate the start could recreate a checkpoint after cancellation.
+    group_operation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1460,6 +1483,8 @@ impl SonarClient {
     ) -> Result<Self> {
         let db_path = db_path.as_ref();
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
+        let pre_route_outbox =
+            shared_pre_route_outbox(Some(pre_route_outbox_path_for_db(db_path)), Some(db_key))?;
         let index_path = index_db_path_for_db(db_path);
         let index = match ConversationIndex::open(&index_path, db_key) {
             Ok(idx) => Some(idx),
@@ -1475,6 +1500,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            pre_route_outbox,
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             StickerCache::for_db(db_path)?,
@@ -1501,6 +1527,7 @@ impl SonarClient {
             false,
             None,
             None,
+            shared_pre_route_outbox(None, None)?,
             None,
             None,
             StickerCache::disabled(),
@@ -1516,6 +1543,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        pre_route_outbox: Arc<Mutex<PreRouteOutbox>>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         sticker_cache: StickerCache,
@@ -1886,6 +1914,8 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
+            pre_route_outbox,
+            group_operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -2281,6 +2311,157 @@ impl SonarClient {
         self.publish_group_creation(creation).await
     }
 
+    /// Start a multi-member group for a durable host operation. The stable
+    /// operation id is hashed into the group metadata, allowing replay after a
+    /// process death to find the route created by an earlier completed call
+    /// instead of creating a duplicate group.
+    pub async fn start_group_idempotent(
+        &self,
+        members: Vec<PublicKey>,
+        name: &str,
+        operation_id: &str,
+    ) -> Result<GroupId> {
+        let _operation_guard = self.group_operation_gate.lock().await;
+        let description = group_operation_description(operation_id)?;
+        self.start_group_idempotent_locked(members, name, operation_id, description, None, true)
+            .await
+    }
+
+    /// Create or resume one operation-marked group. The caller must hold
+    /// `group_operation_gate` so creation, Welcome replay, and cancellation
+    /// cannot cross. `fallback_group` lets direct-message setup reuse an older
+    /// completed `sonar.direct-dm.v1` route only after recovery has ruled out an
+    /// operation-marked group left at a crash boundary.
+    async fn start_group_idempotent_locked(
+        &self,
+        members: Vec<PublicKey>,
+        name: &str,
+        operation_id: &str,
+        description: String,
+        fallback_group: Option<GroupId>,
+        require_name_match: bool,
+    ) -> Result<GroupId> {
+        let cancellation_pending = self
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(&description)
+            .is_some_and(|checkpoint| checkpoint.cancelled);
+        if cancellation_pending {
+            self.finish_cancelled_group_operation(operation_id, &description)
+                .await?;
+            return Err(Error::InvalidInput("group operation was cancelled".into()));
+        }
+        if let Some(group_id) =
+            self.find_group_for_operation(&members, name, &description, require_name_match)?
+        {
+            if let Some(group_id) = self
+                .resume_idempotent_group_creation(&description, group_id)
+                .await?
+            {
+                return Ok(group_id);
+            }
+        }
+        if let Some(group_id) = fallback_group {
+            return Ok(group_id);
+        }
+        let key_packages = self.fetch_key_packages_for_members(members).await?;
+        {
+            let mut journal = self.pre_route_outbox.lock().unwrap();
+            match journal.pending_group_creation(&description) {
+                None => journal.save_pending_group_creation(PendingGroupCreation {
+                    operation_description: description.clone(),
+                    group_id_hex: None,
+                    welcome_event_jsons: Vec::new(),
+                    cancelled: false,
+                })?,
+                Some(checkpoint) if checkpoint.group_id_hex.is_none() => {}
+                Some(_) => {
+                    return Err(Error::Storage(
+                        "group creation recovery checkpoint has no matching local group".into(),
+                    ))
+                }
+            }
+        }
+        let creation = self.engine.create_group_with_description(
+            name,
+            &description,
+            key_packages,
+            self.relays.clone(),
+        )?;
+        self.publish_idempotent_group_creation(creation, &description)
+            .await
+    }
+
+    /// Resume the only safe states for an existing durable group operation.
+    /// MDK leaves the initial creation commit pending until every Welcome has
+    /// been published. Recovery is about proving whether every recipient
+    /// observed that route before merging the creator's pending commit:
+    /// an intent-only checkpoint means publication never began and recreation
+    /// is safe; a full checkpoint is republished by stable event id; no
+    /// checkpoint means the operation completed and cleaned up before restart.
+    async fn resume_idempotent_group_creation(
+        &self,
+        operation_description: &str,
+        group_id: GroupId,
+    ) -> Result<Option<GroupId>> {
+        let recovery = self
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(operation_description);
+        let Some(recovery) = recovery else {
+            self.finalize_group_creation(group_id.clone()).await;
+            return Ok(Some(group_id));
+        };
+        let Some(recovery_group_id_hex) = recovery.group_id_hex.as_deref() else {
+            // The intent is fsynced before MDK creates the group, and the full
+            // Welcome checkpoint replaces it before the first publish. Seeing
+            // intent + group therefore proves a crash in that unpublished gap.
+            self.engine.delete_group(&group_id)?;
+            return Ok(None);
+        };
+        if recovery_group_id_hex != hex::encode(group_id.as_slice()) {
+            return Err(Error::Storage(
+                "group creation recovery checkpoint targets another group".into(),
+            ));
+        }
+        self.publish_pending_group_creation(recovery)
+            .await
+            .map(Some)
+    }
+
+    fn find_group_for_operation(
+        &self,
+        members: &[PublicKey],
+        name: &str,
+        description: &str,
+        require_name_match: bool,
+    ) -> Result<Option<GroupId>> {
+        let expected_members: HashSet<_> = members
+            .iter()
+            .copied()
+            .chain(std::iter::once(self.identity().public_key()))
+            .collect();
+        for group in self.engine.groups()? {
+            if group.description != description {
+                continue;
+            }
+            let actual_members: HashSet<_> = self
+                .engine
+                .members(&group.mls_group_id)?
+                .into_iter()
+                .collect();
+            if (require_name_match && group.name != name) || actual_members != expected_members {
+                return Err(Error::InvalidInput(
+                    "group operation id was reused with different group details".into(),
+                ));
+            }
+            return Ok(Some(group.mls_group_id));
+        }
+        Ok(None)
+    }
+
     /// Start a 1:1 DM group with `peer`: fetch their KeyPackage, create the MLS
     /// group, and deliver the gift-wrapped welcome.
     ///
@@ -2292,17 +2473,19 @@ impl SonarClient {
                 "direct message requires another member".into(),
             ));
         }
-        if let Some(existing) = self.find_dm_group_with(&peer)? {
-            return Ok(existing);
-        }
-        let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
-        let creation = self.engine.create_group_with_description(
+        let _operation_guard = self.group_operation_gate.lock().await;
+        let operation_id = peer.to_hex();
+        let description = direct_message_operation_description(&peer);
+        let fallback_group = self.find_dm_group_with(&peer)?;
+        self.start_group_idempotent_locked(
+            vec![peer],
             name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            key_packages,
-            self.relays.clone(),
-        )?;
-        self.publish_group_creation(creation).await
+            &operation_id,
+            description,
+            fallback_group,
+            false,
+        )
+        .await
     }
 
     /// Scan active groups for an existing 1:1 DM with `peer`.
@@ -2365,6 +2548,82 @@ impl SonarClient {
         }
 
         self.engine.merge_pending_commit(&group_id)?;
+        self.finalize_group_creation(group_id.clone()).await;
+        Ok(group_id)
+    }
+
+    /// Persist every signed Welcome before publishing the first one. This
+    /// closes the crash gap where MDK exposes a staged group locally but a
+    /// replay no longer has the Welcome payloads required to finish creation.
+    async fn publish_idempotent_group_creation(
+        &self,
+        creation: GroupCreation,
+        operation_description: &str,
+    ) -> Result<GroupId> {
+        let group_id = creation.group.mls_group_id;
+        let mut welcome_event_jsons = Vec::with_capacity(creation.welcomes.len());
+        for (member, rumor) in creation.welcomes {
+            match self.engine.gift_wrap_welcome(&member, rumor).await {
+                Ok(wrapped) => welcome_event_jsons.push(wrapped.as_json()),
+                Err(err) => {
+                    self.discard_unpublished_group_creation(&group_id);
+                    return Err(err);
+                }
+            }
+        }
+        let recovery = PendingGroupCreation {
+            operation_description: operation_description.to_string(),
+            group_id_hex: Some(hex::encode(group_id.as_slice())),
+            welcome_event_jsons,
+            cancelled: false,
+        };
+        if let Err(err) = self
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(recovery.clone())
+        {
+            self.discard_unpublished_group_creation(&group_id);
+            return Err(err);
+        }
+        self.publish_pending_group_creation(recovery).await
+    }
+
+    async fn publish_pending_group_creation(
+        &self,
+        recovery: PendingGroupCreation,
+    ) -> Result<GroupId> {
+        let group_id_hex = recovery.group_id_hex.as_deref().ok_or_else(|| {
+            Error::Storage("group creation recovery checkpoint has no group id".into())
+        })?;
+        let group_id = parse_group_id_hex(group_id_hex)?;
+        for event_json in &recovery.welcome_event_jsons {
+            let event = Event::from_json(event_json)
+                .map_err(|err| Error::Storage(format!("group Welcome recovery decode: {err}")))?;
+            self.publish_marmot_event(&event, "group welcome recovery")
+                .await?;
+        }
+        // Match the non-idempotent creation path: only advance the creator's
+        // MLS epoch after every stable Welcome has reached a relay. The full
+        // checkpoint remains durable until both this merge and cleanup finish,
+        // so a crash can safely republish the same signed event ids.
+        self.engine.merge_pending_commit(&group_id)?;
+        self.finalize_group_creation(group_id.clone()).await;
+        if let Err(err) = self
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .complete_pending_group_creation(&recovery.operation_description)
+        {
+            // The group is committed and usable. A stale encrypted checkpoint
+            // is harmless and the next idempotent replay republishes the same
+            // signed event ids before trying cleanup again.
+            tracing::debug!(%err, "could not remove completed group recovery checkpoint");
+        }
+        Ok(group_id)
+    }
+
+    async fn finalize_group_creation(&self, group_id: GroupId) {
         let name = self
             .engine
             .groups()
@@ -2381,7 +2640,6 @@ impl SonarClient {
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
         }
-        Ok(group_id)
     }
 
     fn discard_unpublished_group_creation(&self, group_id: &GroupId) {
@@ -2609,6 +2867,44 @@ impl SonarClient {
     /// existing group history and widen the live subscription.
     pub async fn accept_group_invite(&self, welcome_id: &EventId) -> Result<GroupId> {
         let group_id = self.engine.accept_group_invite(welcome_id)?;
+        self.finish_group_invite_accept(group_id).await
+    }
+
+    /// Accept an invite idempotently using the MLS group id persisted beside
+    /// the host's pending send. If the accept committed before a process death,
+    /// replay returns the already-active group instead of treating the vanished
+    /// Welcome as an unrecoverable error.
+    pub async fn accept_group_invite_idempotent(
+        &self,
+        welcome_id: &EventId,
+        expected_group_id: &GroupId,
+    ) -> Result<GroupId> {
+        if self
+            .engine
+            .groups()?
+            .iter()
+            .any(|group| &group.mls_group_id == expected_group_id)
+        {
+            return self
+                .finish_group_invite_accept(expected_group_id.clone())
+                .await;
+        }
+        let invite = self
+            .engine
+            .pending_group_invites()?
+            .into_iter()
+            .find(|invite| &invite.id == welcome_id)
+            .ok_or_else(|| Error::InvalidInput(format!("unknown group invite {welcome_id}")))?;
+        if &invite.group_id != expected_group_id {
+            return Err(Error::InvalidInput(
+                "group invite id was reused with a different group".into(),
+            ));
+        }
+        let group_id = self.engine.accept_group_invite(welcome_id)?;
+        self.finish_group_invite_accept(group_id).await
+    }
+
+    async fn finish_group_invite_accept(&self, group_id: GroupId) -> Result<GroupId> {
         if let Some(group) = self
             .engine
             .groups()?
@@ -3483,6 +3779,73 @@ impl SonarClient {
         self.retry_outbox().await;
     }
 
+    /// Persist one host-owned send before its White Noise route exists. The
+    /// record is encrypted at rest and enqueue is idempotent by stable `id`.
+    pub fn enqueue_pre_route_message(&self, message: PreRouteMessage) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().enqueue(message)
+    }
+
+    /// Snapshot pending pre-route work in insertion order. This is a local-only
+    /// read; hosts may call it during startup without waiting for relay sync.
+    pub fn pre_route_messages(&self) -> Vec<PreRouteMessage> {
+        self.pre_route_outbox.lock().unwrap().messages()
+    }
+
+    /// Remove a pre-route record only after the replacement core send has been
+    /// accepted into the normal local message/outbox path.
+    pub fn complete_pre_route_message(&self, id: &str) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().remove(id)
+    }
+
+    /// Persist the concrete MLS group selected during route setup before the
+    /// host submits the journaled content to the regular send path.
+    pub fn resolve_pre_route_message(&self, id: &str, group_id: &str) -> Result<()> {
+        self.pre_route_outbox
+            .lock()
+            .unwrap()
+            .resolve_route(id, group_id)
+    }
+
+    /// Clear host-owned pre-route work when the user explicitly erases chats.
+    pub fn clear_pre_route_messages(&self) -> Result<()> {
+        self.pre_route_outbox.lock().unwrap().clear()
+    }
+
+    /// Cancel a durable host group operation after the user explicitly deletes
+    /// its pending row. Cancellation is checkpointed before MLS deletion; the
+    /// encrypted marker and sentinel remain until cleanup finishes atomically.
+    pub async fn discard_pre_route_group_operation(&self, operation_id: &str) -> Result<()> {
+        let _operation_guard = self.group_operation_gate.lock().await;
+        let description = group_operation_description(operation_id)?;
+        self.pre_route_outbox
+            .lock()
+            .unwrap()
+            .mark_pending_group_operation_cancelled(&description)?;
+        self.finish_cancelled_group_operation(operation_id, &description)
+            .await
+    }
+
+    async fn finish_cancelled_group_operation(
+        &self,
+        operation_id: &str,
+        description: &str,
+    ) -> Result<()> {
+        let group_ids: Vec<_> = self
+            .engine
+            .groups()?
+            .into_iter()
+            .filter(|group| group.description == description)
+            .map(|group| group.mls_group_id)
+            .collect();
+        for group_id in group_ids {
+            self.delete_group(&group_id).await?;
+        }
+        self.pre_route_outbox
+            .lock()
+            .unwrap()
+            .discard_pending_group_operation(operation_id, description)
+    }
+
     /// Retry one failed outgoing message using the exact encrypted event stored
     /// in the durable outbox. This never creates a second local transcript row
     /// or advances MLS state; it only republishes the original wrapper event.
@@ -3981,8 +4344,9 @@ impl SonarClient {
             .subscribe_with_id(SubscriptionId::new(SUB_MARMOT_WELCOMES), wraps, None)
             .await?;
         tracing::info!(since_secs, "marmot welcomes subscription opened");
+        self.subscribe_group_messages(true).await?;
         *self.live_marmot_enabled.lock().unwrap() = true;
-        self.subscribe_group_messages().await
+        Ok(())
     }
 
     /// (Re)subscribe the kind-445 tail to the CURRENT group set, using the
@@ -3990,7 +4354,7 @@ impl SonarClient {
     /// REPLACES the filter, so calling this after a welcome adds a group widens
     /// the subscription. History for a newly-added group is fetched separately
     /// by `backfill_group`.
-    async fn subscribe_group_messages(&self) -> Result<()> {
+    async fn subscribe_group_messages(&self, force: bool) -> Result<()> {
         let group_ids = self.current_group_ids()?;
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
 
@@ -4009,7 +4373,7 @@ impl SonarClient {
 
         {
             let current = self.marmot_group_subscriptions.lock().unwrap();
-            if *current == group_ids {
+            if !should_replace_group_subscription(force, &current, &group_ids) {
                 return Ok(());
             }
         }
@@ -4195,7 +4559,7 @@ impl SonarClient {
         if !is_live {
             return Ok(());
         }
-        self.subscribe_group_messages().await
+        self.subscribe_group_messages(false).await
     }
 
     /// Prefer catch-up for the open chat.
@@ -4236,7 +4600,7 @@ impl SonarClient {
     /// bounded per-chat repair fetch for existing installs, so callers must keep
     /// it on a background/IO queue and never in the local-first chat-open path.
     pub async fn ensure_subscriptions(&self) -> Result<()> {
-        if !*self.live_marmot_enabled.lock().unwrap() {
+        if self.relays.is_empty() {
             return Ok(());
         }
         // P2: hosts call this every 25-60s. Avoid thrashing welcome/group REQs
@@ -5754,6 +6118,35 @@ fn require_relay_success(
     )))
 }
 
+fn group_operation_description(operation_id: &str) -> Result<String> {
+    let operation_id = operation_id.trim();
+    if operation_id.is_empty() || operation_id.len() > MAX_GROUP_OPERATION_ID_BYTES {
+        return Err(Error::InvalidInput(
+            "group operation id is empty or too large".into(),
+        ));
+    }
+    Ok(format!(
+        "{SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX}{}",
+        sha256_hex(operation_id.as_bytes())
+    ))
+}
+
+fn direct_message_operation_description(peer: &PublicKey) -> String {
+    format!(
+        "{SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX}{}",
+        sha256_hex(peer.to_hex().as_bytes())
+    )
+}
+
+fn parse_group_id_hex(group_id_hex: &str) -> Result<GroupId> {
+    let bytes = hex::decode(group_id_hex)
+        .map_err(|err| Error::Storage(format!("group recovery id decode: {err}")))?;
+    if bytes.is_empty() {
+        return Err(Error::Storage("group recovery id is empty".into()));
+    }
+    Ok(GroupId::from_slice(&bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5766,6 +6159,30 @@ mod tests {
         fn is_cancelled(&self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn group_operation_description_is_stable_and_does_not_expose_host_id() {
+        let description = group_operation_description("marmot-group-pending:private-host-id")
+            .expect("valid operation id");
+        assert!(description.starts_with(SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX));
+        assert!(!description.contains("private-host-id"));
+        assert_eq!(
+            description,
+            group_operation_description("marmot-group-pending:private-host-id").unwrap()
+        );
+        assert!(group_operation_description(" ").is_err());
+    }
+
+    #[test]
+    fn direct_message_operation_description_is_stable_and_private() {
+        let peer = Keys::generate().public_key();
+        let peer_hex = peer.to_hex();
+        let description = direct_message_operation_description(&peer);
+
+        assert!(description.starts_with(SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX));
+        assert!(!description.contains(&peer_hex));
+        assert_eq!(description, direct_message_operation_description(&peer));
     }
 
     #[tokio::test]
@@ -6928,6 +7345,20 @@ mod tests {
     }
 
     #[test]
+    fn forced_subscription_repair_replaces_unchanged_group_filter() {
+        let groups = HashSet::from(["group-a".to_string(), "group-b".to_string()]);
+        assert!(should_replace_group_subscription(true, &groups, &groups));
+        assert!(!should_replace_group_subscription(false, &groups, &groups));
+
+        let widened = HashSet::from([
+            "group-a".to_string(),
+            "group-b".to_string(),
+            "group-c".to_string(),
+        ]);
+        assert!(should_replace_group_subscription(false, &groups, &widened));
+    }
+
+    #[test]
     fn forced_sync_fetches_group_messages_even_when_live() {
         // The live tail's since floor never reaches further back than
         // LIVE_GROUP_TAIL_SECS, so a foreground/push sync_force after a long
@@ -7325,5 +7756,466 @@ mod tests {
             vec![expected],
             "pending invite must notify the conversation listener exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_group_operation_finds_the_existing_local_route() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let members = vec![carol.identity().public_key(), dave.identity().public_key()];
+        let operation_id = "stable-host-operation";
+        let description = group_operation_description(operation_id).unwrap();
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Recovery group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays).unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.engine.merge_pending_commit(&group_id).unwrap();
+
+        assert_eq!(
+            bob.start_group_idempotent(members, "Recovery group", operation_id)
+                .await
+                .unwrap(),
+            group_id
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_group_operation_discards_group_left_at_intent_checkpoint() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let description = group_operation_description("crash-before-checkpoint").unwrap();
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Recovery group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays).unwrap(),
+                ],
+                Vec::new(),
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: None,
+                welcome_event_jsons: Vec::new(),
+                cancelled: false,
+            })
+            .unwrap();
+        bob.engine
+            .create_text_message(&group_id, "MDK already merged creation")
+            .unwrap();
+
+        let recovered = bob
+            .resume_idempotent_group_creation(&description, group_id)
+            .await
+            .unwrap();
+
+        assert!(recovered.is_none());
+        assert!(bob.engine.groups().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_group_operation_replays_partial_welcomes_after_restart() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let db_key = [0x5au8; 32];
+        let identity = Identity::generate();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let members = vec![carol.identity().public_key(), dave.identity().public_key()];
+        let operation_id = "restart-after-first-welcome";
+        let description = group_operation_description(operation_id).unwrap();
+
+        let bob = SonarClient::connect(identity.clone(), vec![relay_url.clone()], &db_path, db_key)
+            .await
+            .unwrap();
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Recovery group",
+                &description,
+                vec![
+                    carol.key_package_event(vec![relay_url.clone()]).unwrap(),
+                    dave.key_package_event(vec![relay_url.clone()]).unwrap(),
+                ],
+                vec![relay_url.clone()],
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let mut wrapped = Vec::new();
+        for (member, rumor) in creation.welcomes {
+            wrapped.push(bob.engine.gift_wrap_welcome(&member, rumor).await.unwrap());
+        }
+        assert_eq!(wrapped.len(), 2);
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                welcome_event_jsons: wrapped.iter().map(|event| event.as_json()).collect(),
+                cancelled: false,
+            })
+            .unwrap();
+
+        // Model a crash after only the first recipient's signed Welcome reached
+        // the relay. The durable replay republishes both identical events, which
+        // is idempotent for the first recipient and completes the second.
+        bob.publish_marmot_event(&wrapped[0], "partial group recovery test")
+            .await
+            .unwrap();
+        bob.engine
+            .create_text_message(&group_id, "creator route already usable")
+            .unwrap();
+        drop(bob);
+
+        let restarted = SonarClient::connect(identity, vec![relay_url], &db_path, db_key)
+            .await
+            .unwrap();
+        let recovered = restarted
+            .start_group_idempotent(members.clone(), "Recovery group", operation_id)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered, group_id);
+        let recovered_members = restarted.engine.members(&group_id).unwrap();
+        assert!(members
+            .iter()
+            .all(|member| recovered_members.contains(member)));
+        restarted
+            .engine
+            .create_text_message(&group_id, "usable after recovery")
+            .unwrap();
+        assert!(restarted
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(&description)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_direct_operation_replays_unpublished_welcome_after_restart() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let db_key = [0x6bu8; 32];
+        let identity = Identity::generate();
+        let peer = MarmotEngine::in_memory(Identity::generate());
+        let peer_pubkey = peer.identity().public_key();
+        let description = direct_message_operation_description(&peer_pubkey);
+
+        let creator =
+            SonarClient::connect(identity.clone(), vec![relay_url.clone()], &db_path, db_key)
+                .await
+                .unwrap();
+        let creation = creator
+            .engine
+            .create_group_with_description(
+                "",
+                &description,
+                vec![peer.key_package_event(vec![relay_url.clone()]).unwrap()],
+                vec![relay_url.clone()],
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let (member, rumor) = creation.welcomes.into_iter().next().unwrap();
+        let wrapped = creator
+            .engine
+            .gift_wrap_welcome(&member, rumor)
+            .await
+            .unwrap();
+        creator
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                welcome_event_jsons: vec![wrapped.as_json()],
+                cancelled: false,
+            })
+            .unwrap();
+
+        // Model process death after MDK exposed the local route and the signed
+        // Welcome was checkpointed, but before any relay accepted that Welcome.
+        drop(creator);
+
+        let restarted = SonarClient::connect(identity, vec![relay_url], &db_path, db_key)
+            .await
+            .unwrap();
+        let recovered = restarted.start_dm(peer_pubkey, "").await.unwrap();
+
+        assert_eq!(recovered, group_id);
+        assert!(restarted
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(&description)
+            .is_none());
+        restarted
+            .engine
+            .create_text_message(&group_id, "queued content remains readable")
+            .unwrap();
+        assert!(matches!(
+            peer.process_incoming(&wrapped).await.unwrap(),
+            Incoming::GroupUpdated(recovered_group) if recovered_group == group_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn discarding_durable_group_operation_removes_local_group_and_checkpoint() {
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let operation_id = "cancelled-pending-group";
+        let description = group_operation_description(operation_id).unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Cancelled group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays,
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: None,
+                welcome_event_jsons: Vec::new(),
+                cancelled: false,
+            })
+            .unwrap();
+        bob.enqueue_pre_route_message(PreRouteMessage {
+            id: "cancelled-group-sentinel".into(),
+            route_kind: crate::pre_route_outbox::GROUP_OPERATION_ROUTE_KIND.into(),
+            route_id: operation_id.into(),
+            route_context: "metadata".into(),
+            content: String::new(),
+            created_at_secs: 1,
+        })
+        .unwrap();
+
+        bob.discard_pre_route_group_operation(operation_id)
+            .await
+            .unwrap();
+
+        assert!(bob.engine.groups().unwrap().is_empty());
+        assert!(bob.pre_route_messages().is_empty());
+        assert_eq!(
+            bob.pre_route_outbox
+                .lock()
+                .unwrap()
+                .pending_group_creation(&description),
+            None
+        );
+        assert!(bob.engine.create_text_message(&group_id, "gone").is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_group_operation_finishes_cleanup_after_group_delete_crash() {
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let dave = MarmotEngine::in_memory(Identity::generate());
+        let members = vec![carol.identity().public_key(), dave.identity().public_key()];
+        let operation_id = "cancelled-after-group-delete";
+        let description = group_operation_description(operation_id).unwrap();
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let creation = bob
+            .engine
+            .create_group_with_description(
+                "Cancelled group",
+                &description,
+                vec![
+                    carol.key_package_event(relays.clone()).unwrap(),
+                    dave.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays,
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                welcome_event_jsons: vec!["{}".into()],
+                cancelled: false,
+            })
+            .unwrap();
+        bob.enqueue_pre_route_message(PreRouteMessage {
+            id: "cancelled-group-sentinel".into(),
+            route_kind: crate::pre_route_outbox::GROUP_OPERATION_ROUTE_KIND.into(),
+            route_id: operation_id.into(),
+            route_context: "metadata".into(),
+            content: String::new(),
+            created_at_secs: 1,
+        })
+        .unwrap();
+
+        // Model a process death after the durable cancellation marker and MLS
+        // deletion, but before the marker + sentinel manifest cleanup.
+        bob.pre_route_outbox
+            .lock()
+            .unwrap()
+            .mark_pending_group_operation_cancelled(&description)
+            .unwrap();
+        bob.engine.delete_group(&group_id).unwrap();
+
+        let error = bob
+            .start_group_idempotent(members, "Cancelled group", operation_id)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, Error::InvalidInput(_)));
+        assert!(bob.engine.groups().unwrap().is_empty());
+        assert!(bob.pre_route_messages().is_empty());
+        assert_eq!(
+            bob.pre_route_outbox
+                .lock()
+                .unwrap()
+                .pending_group_creation(&description),
+            None
+        );
+    }
+
+    #[test]
+    fn client_wipe_removes_pre_route_sidecar_and_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let pre_route = pre_route_outbox_path_for_db(&db);
+        let pre_route_name = pre_route.file_name().unwrap().to_string_lossy();
+        let pre_route_tmp = pre_route.with_file_name(format!("{pre_route_name}.tmp"));
+        for path in [&db, &pre_route, &pre_route_tmp] {
+            std::fs::write(path, b"wipe me").unwrap();
+        }
+
+        SonarClient::wipe_database(&db).unwrap();
+
+        assert!(!db.exists());
+        assert!(!pre_route.exists());
+        assert!(!pre_route_tmp.exists());
+    }
+
+    #[tokio::test]
+    async fn durable_group_start_and_discard_share_one_operation_gate() {
+        let bob = Arc::new(
+            SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+                .await
+                .unwrap(),
+        );
+        let held = bob.group_operation_gate.lock().await;
+
+        let cancelling = {
+            let bob = Arc::clone(&bob);
+            tokio::spawn(async move {
+                bob.discard_pre_route_group_operation("serialized-operation")
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!cancelling.is_finished());
+        drop(held);
+        cancelling.await.unwrap().unwrap();
+
+        let held = bob.group_operation_gate.lock().await;
+        let starting = {
+            let bob = Arc::clone(&bob);
+            tokio::spawn(async move {
+                bob.start_group_idempotent(
+                    vec![Identity::generate().public_key()],
+                    "Serialized group",
+                    "serialized-operation",
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!starting.is_finished());
+        drop(held);
+        assert!(starting.await.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_invite_accept_is_idempotent_after_welcome_is_consumed() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .unwrap();
+        let creation = alice
+            .create_group(
+                "Recovery invite",
+                vec![
+                    bob.engine.key_package_event(relays.clone()).unwrap(),
+                    carol.key_package_event(relays.clone()).unwrap(),
+                ],
+                relays,
+            )
+            .unwrap();
+        let (bob_pubkey, bob_welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(pubkey, _)| *pubkey == bob.identity().public_key())
+            .unwrap();
+        let wrapped = alice
+            .gift_wrap_welcome(&bob_pubkey, bob_welcome)
+            .await
+            .unwrap();
+        bob.process_marmot_events([wrapped], "durable invite test")
+            .await;
+        let invite = bob.pending_group_invites().unwrap().pop().unwrap();
+
+        let first = bob
+            .accept_group_invite_idempotent(&invite.id, &invite.group_id)
+            .await
+            .unwrap();
+        let replayed = bob
+            .accept_group_invite_idempotent(&invite.id, &invite.group_id)
+            .await
+            .unwrap();
+
+        assert_eq!(first, replayed);
+        assert_eq!(bob.engine.groups().unwrap().len(), 1);
     }
 }

@@ -18,6 +18,12 @@ extension ChatViewModel {
             && !content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
     }
 
+    nonisolated static func shouldMarkPrivateMessageFailed(
+        after result: PrivateMessageRoutingResult
+    ) -> Bool {
+        result == .rejected
+    }
+
     // MARK: - Private Chat Sending
 
     /// Sends an encrypted private message to a specific peer.
@@ -50,12 +56,8 @@ extension ChatViewModel {
         
         // Determine routing method and recipient nickname
         guard let peerKeyData = peerID.noiseKey ?? Data(hexString: peerID.id) else { return }
-        let isConnected = meshService.isPeerConnected(peerID)
-        let isReachable = meshService.isPeerReachable(peerID)
         let favoriteStatus = FavoritesPersistenceService.shared.getFavoriteStatus(for: peerKeyData)
             ?? FavoritesPersistenceService.shared.getFavoriteStatus(forPeerID: peerID)
-        let isMutualFavorite = favoriteStatus?.isMutual ?? false
-        let hasNostrKey = favoriteStatus?.peerNostrPublicKey != nil
         
         // Get nickname from various sources
         let recipientNickname: String
@@ -94,27 +96,36 @@ extension ChatViewModel {
         // Trigger UI update for sent message
         objectWillChange.send()
         
-        // Send via appropriate transport (BLE if connected/reachable, else Nostr when possible)
-        if isConnected || isReachable || (isMutualFavorite && hasNostrKey) {
-            messageRouter.sendPrivate(content, to: peerID, recipientNickname: recipientNickname, messageID: messageID)
-            // Optimistically mark as sent for both transports; delivery/read will update subsequently
-            if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                privateChats[peerID]?[idx].deliveryStatus = .sent
-            }
-        } else {
-            // Update delivery status to failed
-            if let index = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
-                privateChats[peerID]?[index].deliveryStatus = .failed(
-                    reason: String(localized: "content.delivery.reason.unreachable", comment: "Failure reason when a peer is unreachable")
-                )
-            }
-            addSystemMessage(
-                String(
-                    format: String(localized: "system.dm.unreachable", comment: "System message when a recipient is unreachable"),
-                    locale: .current,
-                    recipientNickname
-                )
+        // The router owns reachability and the durable offline queue. Calling it
+        // unconditionally keeps a fully-offline local echo pending for replay.
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let result = await messageRouter.sendPrivate(
+                content,
+                to: peerID,
+                recipientNickname: recipientNickname,
+                messageID: messageID
             )
+            if result == .routed {
+                // Optimistically mark as sent for both transports; delivery/read will update subsequently
+                if let idx = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                    privateChats[peerID]?[idx].deliveryStatus = .sent
+                }
+            } else if Self.shouldMarkPrivateMessageFailed(after: result) {
+                // Update delivery status to failed
+                if let index = privateChats[peerID]?.firstIndex(where: { $0.id == messageID }) {
+                    privateChats[peerID]?[index].deliveryStatus = .failed(
+                        reason: String(localized: "content.delivery.reason.unreachable", comment: "Failure reason when a peer is unreachable")
+                    )
+                }
+                addSystemMessage(
+                    String(
+                        format: String(localized: "system.dm.unreachable", comment: "System message when a recipient is unreachable"),
+                        locale: .current,
+                        recipientNickname
+                    )
+                )
+            }
         }
     }
     

@@ -472,6 +472,40 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    func enqueuePreRouteMessage(
+        id: String,
+        routeKind: String,
+        routeId: String,
+        routeContext: String,
+        content: String,
+        createdAtSecs: UInt64
+    ) async throws {
+        try await service.enqueuePreRouteMessage(
+            id: id,
+            routeKind: routeKind,
+            routeId: routeId,
+            routeContext: routeContext,
+            content: content,
+            createdAtSecs: createdAtSecs
+        )
+    }
+
+    func preRouteMessages() -> [PreRouteMessageInfo] {
+        service.preRouteMessages()
+    }
+
+    func completePreRouteMessage(id: String) async throws {
+        try await service.completePreRouteMessage(id: id)
+    }
+
+    func resolvePreRouteMessage(id: String, groupId: String) async throws {
+        try await service.resolvePreRouteMessage(id: id, groupId: groupId)
+    }
+
+    func clearPreRouteMessages() {
+        service.clearPreRouteMessages()
+    }
+
     func prepareIdentityForOnboarding() async -> Bool {
         if npub != nil || service.isConnected() { return true }
         guard !busy else { return false }
@@ -3072,12 +3106,21 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
-    func startGroup(name: String, members: [String]) async throws -> String {
+    func startGroup(name: String, members: [String], operationId: String? = nil) async throws -> String {
         let cleanMembers = Array(Set(members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty })).sorted()
         guard cleanMembers.count >= 2 else {
             throw MarmotService.ServiceError.invalidInput("add at least two people")
         }
-        let id = try await service.startGroup(with: cleanMembers, name: name)
+        let id: String
+        if let operationId {
+            id = try await service.startGroupIdempotent(
+                with: cleanMembers,
+                name: name,
+                operationId: operationId
+            )
+        } else {
+            id = try await service.startGroup(with: cleanMembers, name: name)
+        }
         await loadLocal()
         return id
     }
@@ -3114,13 +3157,38 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func acceptGroupInvite(_ invite: MarmotService.GroupInvite) async throws -> String {
-        let id = try await service.acceptGroupInvite(invite.id)
+        try await acceptGroupInvite(inviteId: invite.id, expectedGroupId: invite.groupId)
+    }
+
+    func acceptGroupInvite(inviteId: String, expectedGroupId: String) async throws -> String {
+        let id = try await service.acceptGroupInviteIdempotent(
+            inviteId,
+            expectedGroupId: expectedGroupId
+        )
         await loadLocal()
         return id
     }
 
+    func discardPreRouteGroupOperation(operationId: String) async throws {
+        try await service.discardPreRouteGroupOperation(operationId: operationId)
+        await loadLocal()
+    }
+
     func declineGroupInvite(_ invite: MarmotService.GroupInvite) async throws {
-        try await service.declineGroupInvite(invite.id)
+        try await declineGroupInvite(inviteId: invite.id)
+    }
+
+    func declineGroupInvite(inviteId: String) async throws {
+        try await service.declineGroupInvite(inviteId)
+        await loadLocal()
+    }
+
+    func pendingGroupInviteIds() async throws -> Set<String> {
+        Set(try await service.pendingGroupInvites().map(\.id))
+    }
+
+    func deleteGroupChecked(_ groupId: String) async throws {
+        try await service.deleteGroup(groupId: groupId)
         await loadLocal()
     }
 

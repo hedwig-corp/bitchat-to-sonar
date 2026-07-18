@@ -431,8 +431,10 @@ struct SonarHomeScreen: View {
                     let name = groupNameDraft
                     guard members.count >= 2 else { return }
                     composeSheet = false
-                    if let id = store.startGroup(name: name, members: members) {
-                        store.push(.dm(id))
+                    Task { @MainActor in
+                        if let id = await store.startGroup(name: name, members: members) {
+                            store.push(.dm(id))
+                        }
                     }
                 }
             }
@@ -462,9 +464,10 @@ struct SonarHomeScreen: View {
                 .frame(maxWidth: .infinity)
             SNPrimaryButton(label: "Accept") {
                 let invite = invite
-                pendingInvite = nil
-                let id = store.acceptGroupInvite(invite)
-                store.push(.dm(id))
+                if let id = store.acceptGroupInvite(invite) {
+                    pendingInvite = nil
+                    store.push(.dm(id))
+                }
             }
             Button {
                 let invite = invite

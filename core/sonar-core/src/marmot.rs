@@ -29,6 +29,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
+use crate::pre_route_outbox::pre_route_outbox_path_for_db;
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -1361,7 +1362,58 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
+    let pre_route_outbox = pre_route_outbox_path_for_db(base);
+    let pre_route_name = pre_route_outbox
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sonar-pre-route-outbox");
+    paths.push(pre_route_outbox.with_file_name(format!("{pre_route_name}.tmp")));
+    paths.push(pre_route_outbox);
     paths
+}
+
+#[cfg(test)]
+mod wipe_tests {
+    use super::{sidecar_paths, MarmotEngine};
+
+    #[test]
+    fn wipe_removes_encrypted_pre_route_journal_and_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let paths = sidecar_paths(&db);
+        for path in &paths {
+            std::fs::write(path, b"test").unwrap();
+        }
+
+        MarmotEngine::wipe(&db).unwrap();
+
+        assert!(paths.iter().all(|path| !path.exists()));
+    }
+}
+
+#[cfg(test)]
+mod commit_recovery_tests {
+    use super::{Identity, MarmotEngine, RelayUrl};
+
+    #[test]
+    fn merge_pending_commit_is_idempotent_after_group_creation() {
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").unwrap()];
+        let bob_key_package = bob.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("idempotent merge", vec![bob_key_package], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+
+        alice.merge_pending_commit(&group_id).unwrap();
+        alice
+            .merge_pending_commit(&group_id)
+            .expect("recovery may safely replay an already-merged commit");
+        alice
+            .create_text_message(&group_id, "group remains usable")
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

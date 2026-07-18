@@ -121,6 +121,18 @@ actual object SonarCore {
         requireNode().startGroup(members.map { it.trim() }.filter { it.isNotEmpty() }, name.trim())
     }
 
+    actual suspend fun startGroupIdempotent(
+        members: List<String>,
+        name: String,
+        operationId: String,
+    ): String = withContext(Dispatchers.IO) {
+        requireNode().startGroupIdempotent(
+            members.map { it.trim() }.filter { it.isNotEmpty() },
+            name.trim(),
+            operationId,
+        )
+    }
+
     actual suspend fun pendingGroupInvites(): List<SonarGroupInvite> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.pendingGroupInvites().map {
@@ -138,6 +150,13 @@ actual object SonarCore {
 
     actual suspend fun acceptGroupInvite(inviteId: String): String = withContext(Dispatchers.IO) {
         requireNode().acceptGroupInvite(inviteId)
+    }
+
+    actual suspend fun acceptGroupInviteIdempotent(
+        inviteId: String,
+        expectedGroupId: String,
+    ): String = withContext(Dispatchers.IO) {
+        requireNode().acceptGroupInviteIdempotent(inviteId, expectedGroupId)
     }
 
     actual suspend fun declineGroupInvite(inviteId: String) = withContext(Dispatchers.IO) {
@@ -518,6 +537,49 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun enqueuePreRouteMessage(message: SonarPreRouteMessage) = withContext(Dispatchers.IO) {
+        requireNode().enqueuePreRouteMessage(
+            uniffi.sonar_ffi.PreRouteMessageInfo(
+                id = message.id,
+                routeKind = message.routeKind,
+                routeId = message.routeId,
+                routeContext = message.routeContext,
+                content = message.content,
+                createdAtSecs = message.createdAtSecs.toULong(),
+            )
+        )
+    }
+
+    actual suspend fun preRouteMessages(): List<SonarPreRouteMessage> = withContext(Dispatchers.IO) {
+        node?.preRouteMessages().orEmpty().map {
+            SonarPreRouteMessage(
+                id = it.id,
+                routeKind = it.routeKind,
+                routeId = it.routeId,
+                routeContext = it.routeContext,
+                content = it.content,
+                createdAtSecs = it.createdAtSecs.toLong(),
+            )
+        }
+    }
+
+    actual suspend fun completePreRouteMessage(id: String) = withContext(Dispatchers.IO) {
+        requireNode().completePreRouteMessage(id)
+    }
+
+    actual suspend fun resolvePreRouteMessage(id: String, groupId: String) = withContext(Dispatchers.IO) {
+        requireNode().resolvePreRouteMessage(id, groupId)
+    }
+
+    actual suspend fun discardPreRouteGroupOperation(operationId: String) = withContext(Dispatchers.IO) {
+        requireNode().discardPreRouteGroupOperation(operationId)
+    }
+
+    actual suspend fun clearPreRouteMessages() = withContext(Dispatchers.IO) {
+        node?.clearPreRouteMessages()
+        Unit
+    }
+
     actual suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean =
         withContext(Dispatchers.IO) {
             // Honor the "park up to timeoutSecs" contract even with no node
@@ -837,8 +899,7 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        requireNode().deleteGroup(chatId)
     }
 
     // ── Push token registration (MIP-05) ──

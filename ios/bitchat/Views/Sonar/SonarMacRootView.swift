@@ -269,8 +269,9 @@ private struct SonarMacSidebar: View {
                         ForEach(store.marmot.pendingGroupInvites, id: \.id) { invite in
                             let title = invite.groupName.isEmpty ? "Group chat" : invite.groupName
                             MacPaletteRow(icon: .people, title: title, sub: "\(invite.memberCount) members · invite") {
-                                let id = store.acceptGroupInvite(invite)
-                                selection = .dm(id)
+                                if let id = store.acceptGroupInvite(invite) {
+                                    selection = .dm(id)
+                                }
                             }
                             .contextMenu {
                                 Button(role: .destructive) {
@@ -2034,9 +2035,11 @@ private struct MacCommandPalette: View {
         let name = groupNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         let members = mergedNpubs(pasted: parsedNpubs(from: groupMembersDraft), selected: selectedGroupNpubs)
         guard !name.isEmpty, members.count >= 2 else { return }
-        if let id = store.startGroup(name: name, members: members) {
-            selection = .dm(id)
-            isPresented = false
+        Task { @MainActor in
+            if let id = await store.startGroup(name: name, members: members) {
+                selection = .dm(id)
+                isPresented = false
+            }
         }
     }
 

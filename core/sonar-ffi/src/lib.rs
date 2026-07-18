@@ -20,6 +20,7 @@ use sonar_core::notification::{
     render_notification as core_render_notification, NotificationKind, NotificationRenderInput,
 };
 use sonar_core::GroupId;
+use sonar_core::PreRouteMessage;
 
 uniffi::setup_scaffolding!();
 
@@ -209,6 +210,30 @@ pub struct GroupInfo {
     pub id_hex: String,
     pub name: String,
     pub member_npubs: Vec<String>,
+}
+
+/// Encrypted-at-rest host handoff for a send created before an MLS route.
+#[derive(Clone, uniffi::Record)]
+pub struct PreRouteMessageInfo {
+    pub id: String,
+    pub route_kind: String,
+    pub route_id: String,
+    pub route_context: String,
+    pub content: String,
+    pub created_at_secs: u64,
+}
+
+impl From<PreRouteMessage> for PreRouteMessageInfo {
+    fn from(message: PreRouteMessage) -> Self {
+        Self {
+            id: message.id,
+            route_kind: message.route_kind,
+            route_id: message.route_id,
+            route_context: message.route_context,
+            content: message.content,
+            created_at_secs: message.created_at_secs,
+        }
+    }
 }
 
 /// FFI-friendly pending group invite summary.
@@ -721,6 +746,22 @@ impl SonarNode {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Start a multi-member group idempotently for a durable host operation.
+    pub fn start_group_idempotent(
+        &self,
+        members: Vec<String>,
+        name: String,
+        operation_id: String,
+    ) -> FfiResult<String> {
+        let members = parse_pubkeys(members, "member pubkey")?;
+        let group_id = self.runtime.block_on(self.client.start_group_idempotent(
+            members,
+            &name,
+            &operation_id,
+        ))?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
     /// Add members to an existing group.
     pub fn add_group_members(&self, group_id_hex: String, members: Vec<String>) -> FfiResult<()> {
         let group_id = parse_group_id(&group_id_hex)?;
@@ -782,6 +823,21 @@ impl SonarNode {
         let group_id = self
             .runtime
             .block_on(self.client.accept_group_invite(&invite_id))?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Accept a pending group invite idempotently using its expected MLS group.
+    pub fn accept_group_invite_idempotent(
+        &self,
+        invite_id_hex: String,
+        expected_group_id_hex: String,
+    ) -> FfiResult<String> {
+        let invite_id = parse_event_id(&invite_id_hex)?;
+        let expected_group_id = parse_group_id(&expected_group_id_hex)?;
+        let group_id = self.runtime.block_on(
+            self.client
+                .accept_group_invite_idempotent(&invite_id, &expected_group_id),
+        )?;
         Ok(hex::encode(group_id.as_slice()))
     }
 
@@ -974,6 +1030,57 @@ impl SonarNode {
     /// during relay connect are not stranded until app restart.
     pub fn retry_outbox(&self) -> FfiResult<()> {
         self.runtime.block_on(self.client.reload_outbox_and_retry());
+        Ok(())
+    }
+
+    /// Journal a send before route setup. Idempotent when the same stable id
+    /// and payload are supplied again.
+    pub fn enqueue_pre_route_message(&self, message: PreRouteMessageInfo) -> FfiResult<()> {
+        self.client.enqueue_pre_route_message(PreRouteMessage {
+            id: message.id,
+            route_kind: message.route_kind,
+            route_id: message.route_id,
+            route_context: message.route_context,
+            content: message.content,
+            created_at_secs: message.created_at_secs,
+        })?;
+        Ok(())
+    }
+
+    /// Local-only snapshot used by both hosts to resume route setup after a
+    /// process restart. Does not contact relays or touch MLS state.
+    pub fn pre_route_messages(&self) -> Vec<PreRouteMessageInfo> {
+        self.client
+            .pre_route_messages()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Acknowledge one journal entry only after the replacement send is owned
+    /// by the normal encrypted local message/outbox path.
+    pub fn complete_pre_route_message(&self, id: String) -> FfiResult<()> {
+        self.client.complete_pre_route_message(&id)?;
+        Ok(())
+    }
+
+    /// Checkpoint the concrete MLS group before replay. Repeating the same
+    /// checkpoint is safe and process restart resumes directly into this group.
+    pub fn resolve_pre_route_message(&self, id: String, group_id: String) -> FfiResult<()> {
+        self.client.resolve_pre_route_message(&id, &group_id)?;
+        Ok(())
+    }
+
+    pub fn clear_pre_route_messages(&self) -> FfiResult<()> {
+        self.client.clear_pre_route_messages()?;
+        Ok(())
+    }
+
+    /// Cancel a pending host group operation and remove any local marker group,
+    /// encrypted operation sentinel, and Welcome recovery checkpoint.
+    pub fn discard_pre_route_group_operation(&self, operation_id: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.discard_pre_route_group_operation(&operation_id))?;
         Ok(())
     }
 

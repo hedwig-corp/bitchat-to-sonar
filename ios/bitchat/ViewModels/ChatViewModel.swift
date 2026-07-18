@@ -508,7 +508,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         // Initialize Nostr relay manager regardless of Tor readiness; connection is controlled elsewhere
         nostrRelayManager = NostrRelayManager.shared
         // Attempt to flush any queued outbox (mesh/Nostr routing will gate appropriately)
-        messageRouter.flushAllOutbox()
+        Task { @MainActor in
+            await messageRouter.flushAllOutbox()
+        }
         // End startup phase after a short delay
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(TransportConfig.uiStartupPhaseDurationSeconds * 1_000_000_000))
@@ -1656,7 +1658,14 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 switch sessionState {
                 case .established:
                     // Send the message directly without going through sendPrivateMessage to avoid local echo
-                    messageRouter.sendPrivate(screenshotMessage, to: peerID, recipientNickname: peerNickname, messageID: UUID().uuidString)
+                    Task { @MainActor in
+                        await messageRouter.sendPrivate(
+                            screenshotMessage,
+                            to: peerID,
+                            recipientNickname: peerNickname,
+                            messageID: UUID().uuidString
+                        )
+                    }
                 case  .none, .failed, .handshakeQueued, .handshaking:
                     // Don't send screenshot notification if no session exists
                     SecureLogger.debug("Skipping screenshot notification to \(peerID) - no established session", category: .security)
@@ -3362,7 +3371,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             }
 
             // Flush any queued messages for this peer via router
-            messageRouter.flushOutbox(for: peerID)
+            await messageRouter.flushOutbox(for: peerID)
         }
     }
     

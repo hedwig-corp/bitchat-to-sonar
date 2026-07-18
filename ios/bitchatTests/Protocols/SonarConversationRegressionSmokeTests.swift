@@ -18,6 +18,41 @@ struct SonarConversationRegressionSmokeTests {
     }
 
     @Test
+    func recoveredGroupCancellationIsRetiredInsteadOfShownAsFailed() {
+        #expect(SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.invalidInput("group operation was cancelled")
+        ))
+        #expect(SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.core("invalid input: group operation was cancelled")
+        ))
+        #expect(!SonarAppStore.isRecoveredGroupCancellation(
+            MarmotService.ServiceError.core("relay temporarily unavailable")
+        ))
+    }
+
+    @Test
+    func pendingInviteCancellationDeclinesWelcomeBeforeItCanResurface() {
+        let inviteId = "welcome-event"
+        let groupId = "expected-group"
+
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: groupId,
+            pendingInviteIds: Set([inviteId])
+        ) == .declineInvite(inviteId))
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: groupId,
+            pendingInviteIds: []
+        ) == .deleteGroup(groupId))
+        #expect(SonarAppStore.pendingInviteCancellationAction(
+            inviteId: inviteId,
+            expectedGroupId: nil,
+            pendingInviteIds: []
+        ) == nil)
+    }
+
+    @Test
     func saraAndVincenzoRemainSeparateCryptographicConversations() {
         let own = npub(1)
         let sara = npub(2)
@@ -178,6 +213,16 @@ struct SonarConversationRegressionSmokeTests {
             via: .internet,
             state: "Couldn't send"
         )))
+    }
+
+    @Test
+    func preRouteRowsUseAndRecognizeThePlaintextRetryIdentity() {
+        let id = snPendingRetryMessageID()
+
+        #expect(id.hasPrefix("echo-"))
+        #expect(snIsPendingRetryMessageID(id))
+        #expect(snIsPendingRetryMessageID("pre-route-legacy"))
+        #expect(!snIsPendingRetryMessageID("core-message"))
     }
 
     @Test

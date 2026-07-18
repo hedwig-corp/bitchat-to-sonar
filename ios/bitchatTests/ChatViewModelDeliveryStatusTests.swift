@@ -33,6 +33,13 @@ private func makeTestableViewModel() -> (viewModel: ChatViewModel, transport: Mo
 
 struct ChatViewModelDeliveryStatusTests {
 
+    @Test
+    func offlineRoutingOnlyFailsWhenDurableQueueRejectsTheMessage() {
+        #expect(ChatViewModel.shouldMarkPrivateMessageFailed(after: .routed) == false)
+        #expect(ChatViewModel.shouldMarkPrivateMessageFailed(after: .queued) == false)
+        #expect(ChatViewModel.shouldMarkPrivateMessageFailed(after: .rejected))
+    }
+
     // MARK: - Status Transition Tests
 
     @Test @MainActor

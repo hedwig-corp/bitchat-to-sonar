@@ -87,7 +87,104 @@ private const val PENDING_MARMOT_CHAT_PREFIX = "npub:"
 private const val PENDING_MARMOT_GROUP_PREFIX = "group-pending:"
 private const val PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT = 100
 private const val PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT = 100
+private const val PRE_ROUTE_DIRECT_NPUB = "direct-npub"
+internal const val PRE_ROUTE_GROUP_CREATE = "group-create"
+internal const val PRE_ROUTE_GROUP_INVITE = "group-invite"
+internal const val PRE_ROUTE_GROUP_OPERATION = "group-operation"
+private const val PRE_ROUTE_GROUP_OPERATION_ID_PREFIX = "group-operation:"
+internal const val RECOVERED_GROUP_CANCELLATION = "group operation was cancelled"
+private const val PRE_ROUTE_PEER = "peer"
+private const val PRE_ROUTE_MARMOT_GROUP = "marmot-group"
 internal const val BLE_DISCOVER_NEW_PEOPLE_PREF = "bleDiscoverNewPeople"
+
+internal fun encodePreRouteContext(parts: List<String>): String =
+    parts.joinToString(":") { part ->
+        part.encodeToByteArray().joinToString("") { byte ->
+            byte.toUByte().toString(16).padStart(2, '0')
+        }
+    }
+
+internal fun isRecoveredGroupCancellation(message: String?): Boolean =
+    message?.contains(RECOVERED_GROUP_CANCELLATION) == true
+
+internal fun decodePreRouteContext(context: String): List<String>? =
+    if (context.isEmpty()) emptyList() else runCatching {
+        context.split(':').map { hex ->
+            require(hex.length % 2 == 0)
+            ByteArray(hex.length / 2) { index ->
+                val offset = index * 2
+                val high = hex[offset].digitToInt(16)
+                val low = hex[offset + 1].digitToInt(16)
+                ((high shl 4) or low).toByte()
+            }.decodeToString()
+        }
+    }.getOrNull()
+
+/** Choose the transcript that owns a checkpoint after route setup completed.
+ * Group setup contexts are encoded recovery metadata, not chat ids. Mesh
+ * conversations keep their explicit host chat id so BLE/relay legs stay
+ * folded into one transcript. */
+internal fun resolvedPreRouteChatId(routeId: String, routeContext: String): String =
+    routeContext.takeIf { context ->
+        context.isNotBlank() &&
+            !context.startsWith(PENDING_MARMOT_CHAT_PREFIX) &&
+            !context.startsWith(PENDING_MARMOT_GROUP_PREFIX) &&
+            decodePreRouteContext(context) == null
+    } ?: routeId
+
+internal data class PreRouteGroupRestorePlan(
+    val name: String,
+    val members: List<String>,
+    val inviteId: String?,
+    val inviteGroupId: String?,
+    val restoreMessage: Boolean,
+)
+
+internal data class PendingInviteCancellationAction(
+    val inviteIdToDecline: String? = null,
+    val groupIdToDelete: String? = null,
+)
+
+internal fun pendingInviteCancellationAction(
+    inviteId: String,
+    expectedGroupId: String?,
+    pendingInviteIds: Set<String>,
+): PendingInviteCancellationAction? = when {
+    inviteId in pendingInviteIds -> PendingInviteCancellationAction(inviteIdToDecline = inviteId)
+    expectedGroupId != null -> PendingInviteCancellationAction(groupIdToDelete = expectedGroupId)
+    else -> null
+}
+
+internal fun preRouteGroupRestorePlan(routeKind: String, routeContext: String): PreRouteGroupRestorePlan? {
+    val parts = decodePreRouteContext(routeContext) ?: return null
+    return when (routeKind) {
+        PRE_ROUTE_GROUP_OPERATION -> when (parts.firstOrNull()) {
+            "create" -> PreRouteGroupRestorePlan(
+                name = parts.getOrNull(1).orEmpty().ifBlank { "Group chat" },
+                members = parts.drop(2),
+                inviteId = null,
+                inviteGroupId = null,
+                restoreMessage = false,
+            )
+            else -> null
+        }
+        PRE_ROUTE_GROUP_CREATE -> PreRouteGroupRestorePlan(
+            name = parts.firstOrNull().orEmpty().ifBlank { "Group chat" },
+            members = parts.drop(1),
+            inviteId = null,
+            inviteGroupId = null,
+            restoreMessage = true,
+        )
+        PRE_ROUTE_GROUP_INVITE -> PreRouteGroupRestorePlan(
+            name = parts.firstOrNull().orEmpty().ifBlank { "Group chat" },
+            members = emptyList(),
+            inviteId = parts.getOrNull(1)?.takeIf { it.isNotBlank() },
+            inviteGroupId = parts.getOrNull(2)?.takeIf { it.isNotBlank() },
+            restoreMessage = true,
+        )
+        else -> null
+    }
+}
 
 internal fun shouldScanForNearbyPayments(
     isNearbyVisible: Boolean,
@@ -887,6 +984,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotGroups = emptyMap()
             pendingDirectMarmotSends.clear()
             pendingMarmotGroupSends.clear()
+            pendingMarmotSends.clear()
+            resolvedMarmotSends.clear()
             outbox.clear()
             MessageStore.wipe()
             // Redact all visible/account-bound host state before the fallible
@@ -938,7 +1037,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); resolvedMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
@@ -3265,7 +3364,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelPendingMarmotGroupSetups()
 
                 MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); resolvedMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
@@ -3914,6 +4013,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         runCatching { refreshChats() }
         runCatching { recomputeConversations() }
         drainPendingInviteTokens()
+        resumePreRouteMessages()
         requestHousekeeping()
     }
 
@@ -4001,6 +4101,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             try {
                 npub = SonarCore.start()
                 SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
+                restorePreRouteMessages()
                 localCoreReady = true
                 refreshChats()
                 recomputeConversations()
@@ -4488,8 +4589,47 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Delete a 1:1 Marmot chat locally, or leave a multi-member Marmot group. */
     fun deleteMarmotChat(chatId: String) {
-        if (isPendingMarmotGroup(chatId)) {
-            toast = "Group is still setting up."
+        if (isPendingSecureChat(chatId)) {
+            val pendingNpub = pendingMarmotNpub(chatId)?.let(::canonicalNpubHex)
+            val pendingGroup = pendingMarmotGroups[chatId]
+            pendingNpub?.let {
+                pendingDirectMarmotSends.remove(it)
+                cancelPendingMarmotSetup(chatId, it)
+            }
+            pendingMarmotGroupSends.remove(chatId)
+            val cancelledGroupSetup = cancelPendingMarmotGroupSetup(chatId)
+            pendingMarmotChatNpubs = pendingMarmotChatNpubs - chatId
+            pendingMarmotGroups = pendingMarmotGroups - chatId
+            pendingSendEchoes.remove(chatId)
+            if ((stack.lastOrNull() as? Screen.Chat)?.id == chatId && stack.size > 1) {
+                endTranscriptSession()
+                stack = stack.dropLast(1)
+                restoreRevealedChatOrClear()
+            }
+            scope.launch {
+                if (pendingGroup != null) {
+                    cancelledGroupSetup?.join()
+                    val discard = if (pendingGroup.inviteId == null) {
+                        runCatching { SonarCore.discardPreRouteGroupOperation(chatId) }
+                    } else {
+                        runCatching {
+                            val action = pendingInviteCancellationAction(
+                                inviteId = pendingGroup.inviteId,
+                                expectedGroupId = pendingGroup.inviteGroupId,
+                                pendingInviteIds = SonarCore.pendingGroupInvites().mapTo(mutableSetOf()) { it.id },
+                            ) ?: error("group invite is no longer available")
+                            action.inviteIdToDecline?.let { SonarCore.declineGroupInvite(it) }
+                            action.groupIdToDelete?.let { SonarCore.deleteChat(it) }
+                        }
+                    }
+                    discard
+                        .onFailure {
+                            toast = "couldn't discard group setup: ${it.message}"
+                            return@launch
+                        }
+                }
+                discardPreRouteMessages(setOf(chatId))
+            }
             return
         }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
@@ -4513,6 +4653,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             try {
+                discardPreRouteMessages(deleteIdSet)
+                deleteIds.forEach { resolvedMarmotSends.remove(it) }
                 if (isGroup) {
                     SonarCore.leaveGroup(chatId)
                 } else {
@@ -4570,6 +4712,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         scope.launch {
             aliases.forEach { MessageStore.deleteMeshDm(it) }
+            discardPreRouteMessages(
+                (aliases + aliases.map(::meshChatId) + foldedGroupIdsToDelete).toSet()
+            )
+            foldedGroupIdsToDelete.forEach { resolvedMarmotSends.remove(it) }
             foldedGroups.forEach { group ->
                 runCatching { SonarCore.deleteChat(group.id) }
                     .onFailure { toast = "couldn't delete chat: ${it.message}" }
@@ -4692,7 +4838,6 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failPendingMarmotChat(npubHex: String, pendingChatId: String, setupToken: Long? = null): Boolean {
         if (!isActivePendingMarmotSetup(pendingChatId, pendingMarmotChatNpubs[pendingChatId]?.peerNpub, setupToken)) return false
-        pendingDirectMarmotSends.remove(npubHex)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
         }
@@ -4705,30 +4850,81 @@ class SonarAppState(private val scope: CoroutineScope) {
         val npubHex = canonicalNpubHex(peerNpub) ?: return
         val echo = createSendEcho(chatId, text)
         messages = (messages + echo).sortedBy { it.tsSecs }
-        val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-        queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
-        if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
-            val dropped = queue.removeAt(0)
-            failSendEcho(dropped.pendingChatId, dropped.echoId)
-            toast = "Still setting up this chat — wait before sending more."
+        scope.launch {
+            if (!journalPreRoute(
+                    id = echo.id,
+                    routeKind = PRE_ROUTE_DIRECT_NPUB,
+                    routeId = npubHex,
+                    routeContext = chatId,
+                    content = text,
+                    createdAtSecs = echo.tsSecs,
+                )) {
+                failSendEcho(chatId, echo.id)
+                return@launch
+            }
+            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+            queue.add(PendingDirectMarmotSend(chatId, text, echo.id))
+            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(dropped.pendingChatId, dropped.echoId)
+                toast = "Still setting up this chat — wait before sending more."
+            }
+            startPendingMarmotChat(peerNpub, chatId)
         }
-        startPendingMarmotChat(peerNpub, chatId)
     }
 
     private suspend fun flushPendingDirectMarmot(npubHex: String, chatId: String) {
         val queued = pendingDirectMarmotSends.remove(npubHex).orEmpty()
         for (send in queued) {
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
-                .onSuccess { clearSendEcho(chatId, send.echoId) }
-                .onFailure {
+            val checkpoint = runCatching { SonarCore.resolvePreRouteMessage(send.echoId, chatId) }
+            if (checkpoint.isFailure) {
+                pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(send)
+                failSendEcho(chatId, send.echoId)
+                toast = "Couldn't save the secure route. Try again."
+                continue
+            }
+            val sent = runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            if (sent.isSuccess) {
+                if (completeAcceptedPreRouteMessage(send.echoId)) {
+                    clearSendEcho(chatId, send.echoId)
+                } else {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
                 }
+            } else {
+                queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                failSendEcho(chatId, send.echoId)
+                toast = "send failed: ${sent.exceptionOrNull()?.message}"
+            }
         }
     }
 
     private fun pendingMarmotGroupId(seed: String = randomMeshId()): String =
         PENDING_MARMOT_GROUP_PREFIX + seed
+
+    private fun pendingGroupOperationSentinelId(pendingChatId: String): String =
+        PRE_ROUTE_GROUP_OPERATION_ID_PREFIX + pendingChatId
+
+    private fun encodedPreRouteGroupOperationContext(pending: PendingMarmotGroup): String? =
+        pending.takeIf { it.inviteId == null }
+            ?.let { encodePreRouteContext(listOf("create", it.name) + it.members) }
+
+    private suspend fun journalPendingGroupOperation(
+        pendingChatId: String,
+        pending: PendingMarmotGroup,
+    ): Boolean {
+        val context = encodedPreRouteGroupOperationContext(pending) ?: run {
+            toast = "Couldn't save the group setup. Try again."
+            return false
+        }
+        return journalPreRoute(
+            id = pendingGroupOperationSentinelId(pendingChatId),
+            routeKind = PRE_ROUTE_GROUP_OPERATION,
+            routeId = pendingChatId,
+            routeContext = context,
+            content = "",
+            createdAtSecs = pending.createdAtSecs,
+        )
+    }
 
     private fun openPendingMarmotGroup(pendingId: String, pending: PendingMarmotGroup) {
         pendingMarmotGroups = pendingMarmotGroups + (pendingId to pending)
@@ -4744,9 +4940,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         val setupJob = scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
-                val chatId = SonarCore.startGroup(pending.members, pending.name)
+                val chatId = SonarCore.startGroupIdempotent(
+                    pending.members,
+                    pending.name,
+                    pendingChatId,
+                )
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
+                if (isRecoveredGroupCancellation(t.message)) {
+                    pendingMarmotGroups = pendingMarmotGroups - pendingChatId
+                    pendingMarmotGroupSends.remove(pendingChatId)
+                    pendingSendEchoes.remove(pendingChatId)
+                    return@launch
+                }
                 if (failPendingMarmotGroup(pendingChatId, setupToken)) {
                     toast = "couldn’t create group: ${t.message}"
                 }
@@ -4757,13 +4963,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotGroupSetupJobs[pendingChatId] = setupJob
     }
 
-    private fun startPendingMarmotGroupAccept(pendingChatId: String, inviteId: String) {
+    private fun startPendingMarmotGroupAccept(
+        pendingChatId: String,
+        inviteId: String,
+        expectedGroupId: String,
+    ) {
         if (pendingMarmotGroupSetupJobs.containsKey(pendingChatId)) return
         val setupToken = nextPendingMarmotGroupSetupToken(pendingChatId)
         val setupJob = scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
-                val chatId = SonarCore.acceptGroupInvite(inviteId)
+                val chatId = SonarCore.acceptGroupInviteIdempotent(inviteId, expectedGroupId)
                 finishPendingMarmotGroup(pendingChatId, chatId, setupToken = setupToken)
             } catch (t: Throwable) {
                 if (failPendingMarmotGroup(pendingChatId, setupToken)) {
@@ -4785,6 +4995,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pending = pendingMarmotGroups[pendingChatId] ?: return
         if (!isActivePendingMarmotGroupSetup(pendingChatId, setupToken)) return
         if (setupToken == null) cancelPendingMarmotGroupSetup(pendingChatId)
+        runCatching {
+            SonarCore.completePreRouteMessage(pendingGroupOperationSentinelId(pendingChatId))
+        }
         pendingMarmotGroups = pendingMarmotGroups - pendingChatId
         refreshChats()
         val chat = chats.firstOrNull { it.id == chatId }
@@ -4809,42 +5022,72 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun failPendingMarmotGroup(pendingChatId: String, setupToken: Long? = null): Boolean {
         if (!isActivePendingMarmotGroupSetup(pendingChatId, setupToken)) return false
-        pendingMarmotGroups = pendingMarmotGroups - pendingChatId
-        pendingMarmotGroupSends.remove(pendingChatId)
         pendingSendEchoes[pendingChatId].orEmpty().map { it.id }.forEach { echoId ->
             failSendEcho(pendingChatId, echoId)
-        }
-        pendingSendEchoes.remove(pendingChatId)
-        if ((screen as? Screen.Chat)?.id == pendingChatId && stack.size > 1) {
-            endTranscriptSession()
-            stack = stack.dropLast(1)
-            restoreRevealedChatOrClear()
         }
         return true
     }
 
     private fun sendPendingMarmotGroup(chatId: String, text: String) {
-        if (!isPendingMarmotGroup(chatId)) return
+        val pending = pendingMarmotGroups[chatId] ?: return
         val echo = createSendEcho(chatId, text)
         messages = (messages + echo).sortedBy { it.tsSecs }
-        val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
-        queue.add(PendingMarmotGroupSend(text, echo.id))
-        if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
-            val dropped = queue.removeAt(0)
-            failSendEcho(chatId, dropped.echoId)
-            toast = "Still setting up this group — wait before sending more."
+        val routeKind = if (pending.inviteId == null) PRE_ROUTE_GROUP_CREATE else PRE_ROUTE_GROUP_INVITE
+        val context = if (pending.inviteId == null) {
+            encodePreRouteContext(listOf(pending.name) + pending.members)
+        } else {
+            val groupId = pending.inviteGroupId?.takeIf { it.isNotBlank() }
+            if (groupId == null) {
+                failSendEcho(chatId, echo.id)
+                toast = "The group invite is no longer available."
+                return
+            }
+            encodePreRouteContext(listOf(pending.name, pending.inviteId, groupId))
+        }
+        scope.launch {
+            if (!journalPreRoute(
+                    id = echo.id,
+                    routeKind = routeKind,
+                    routeId = chatId,
+                    routeContext = context,
+                    content = text,
+                    createdAtSecs = echo.tsSecs,
+                )) {
+                failSendEcho(chatId, echo.id)
+                return@launch
+            }
+            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+            queue.add(PendingMarmotGroupSend(text, echo.id))
+            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                val dropped = queue.removeAt(0)
+                failSendEcho(chatId, dropped.echoId)
+                toast = "Still setting up this group — wait before sending more."
+            }
         }
     }
 
     private suspend fun flushPendingMarmotGroupSends(pendingChatId: String, chatId: String) {
         val queued = pendingMarmotGroupSends.remove(pendingChatId).orEmpty()
         for (send in queued) {
-            runCatching { sendQueuedMarmotContent(chatId, send.text) }
-                .onSuccess { clearSendEcho(chatId, send.echoId) }
-                .onFailure {
+            val checkpoint = runCatching { SonarCore.resolvePreRouteMessage(send.echoId, chatId) }
+            if (checkpoint.isFailure) {
+                pendingMarmotGroupSends.getOrPut(pendingChatId) { mutableListOf() }.add(send)
+                failSendEcho(chatId, send.echoId)
+                toast = "Couldn't save the secure route. Try again."
+                continue
+            }
+            val sent = runCatching { sendQueuedMarmotContent(chatId, send.text) }
+            if (sent.isSuccess) {
+                if (completeAcceptedPreRouteMessage(send.echoId)) {
+                    clearSendEcho(chatId, send.echoId)
+                } else {
                     failSendEcho(chatId, send.echoId)
-                    toast = "send failed: ${it.message}"
                 }
+            } else {
+                queueResolvedMarmotSend(chatId, send.echoId, send.text, chatId)
+                failSendEcho(chatId, send.echoId)
+                toast = "send failed: ${sent.exceptionOrNull()?.message}"
+            }
         }
     }
 
@@ -5349,28 +5592,64 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "This message is no longer available to retry."
                 return
             }
-            val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
-            queue.removeAll { it.echoId == echoId }
-            queue.add(PendingDirectMarmotSend(chatId, content, echoId))
-            if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
-                val dropped = queue.removeAt(0)
-                failSendEcho(dropped.pendingChatId, dropped.echoId)
-                toast = "Still setting up this chat — wait before retrying more."
+            scope.launch {
+                if (!journalPreRoute(
+                        id = echoId,
+                        routeKind = PRE_ROUTE_DIRECT_NPUB,
+                        routeId = npubHex,
+                        routeContext = chatId,
+                        content = content,
+                        createdAtSecs = retrying.tsSecs,
+                    )) {
+                    failSendEcho(chatId, echoId)
+                    return@launch
+                }
+                val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+                queue.removeAll { it.echoId == echoId }
+                queue.add(PendingDirectMarmotSend(chatId, content, echoId))
+                if (queue.size > PENDING_MARMOT_DIRECT_SEND_QUEUE_LIMIT) {
+                    val dropped = queue.removeAt(0)
+                    failSendEcho(dropped.pendingChatId, dropped.echoId)
+                    toast = "Still setting up this chat — wait before retrying more."
+                }
+                startPendingMarmotChat(pendingNpub, chatId)
             }
-            startPendingMarmotChat(pendingNpub, chatId)
             return
         }
 
         if (isPendingMarmotGroup(chatId)) {
-            val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
-            queue.removeAll { it.echoId == echoId }
-            queue.add(PendingMarmotGroupSend(content, echoId))
-            if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
-                val dropped = queue.removeAt(0)
-                failSendEcho(chatId, dropped.echoId)
-                toast = "Still setting up this group — wait before retrying more."
+            val pending = pendingMarmotGroups[chatId] ?: return
+            val routeKind = if (pending.inviteId == null) PRE_ROUTE_GROUP_CREATE else PRE_ROUTE_GROUP_INVITE
+            val context = if (pending.inviteId == null) {
+                encodePreRouteContext(listOf(pending.name) + pending.members)
+            } else {
+                val groupId = pending.inviteGroupId?.takeIf { it.isNotBlank() }
+                if (groupId == null) {
+                    failSendEcho(chatId, echoId)
+                    toast = "The group invite is no longer available."
+                    return
+                }
+                encodePreRouteContext(listOf(pending.name, pending.inviteId, groupId))
             }
-            startPendingMarmotGroupCreation(chatId)
+            scope.launch {
+                if (!journalPreRoute(echoId, routeKind, chatId, context, content, retrying.tsSecs)) {
+                    failSendEcho(chatId, echoId)
+                    return@launch
+                }
+                val queue = pendingMarmotGroupSends.getOrPut(chatId) { mutableListOf() }
+                queue.removeAll { it.echoId == echoId }
+                queue.add(PendingMarmotGroupSend(content, echoId))
+                if (queue.size > PENDING_MARMOT_GROUP_SEND_QUEUE_LIMIT) {
+                    val dropped = queue.removeAt(0)
+                    failSendEcho(chatId, dropped.echoId)
+                    toast = "Still setting up this group — wait before retrying more."
+                }
+                if (pending.inviteId != null && pending.inviteGroupId != null) {
+                    startPendingMarmotGroupAccept(chatId, pending.inviteId, pending.inviteGroupId)
+                } else if (pending.inviteId == null) {
+                    startPendingMarmotGroupCreation(chatId)
+                }
+            }
             return
         }
 
@@ -5379,6 +5658,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             scope.launch {
                 try {
                     sendQueuedMarmotContent(groupId, content)
+                    if (!completeAcceptedPreRouteMessage(echoId)) {
+                        failSendEcho(chatId, echoId)
+                        return@launch
+                    }
                     val generation = transcriptGeneration
                     val published = if (isMeshChat(chatId)) {
                         marmotMessagesForPeer(meshPeerId(chatId), chatId, generation)
@@ -6896,10 +7179,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this contact before sending."
             return
         }
-        if (outbox.contains(peerId)) {
-            enqueueOutbox(peerId, text)
-            flushOutbox(peerId)
-            toast = "Message queued and will send in order."
+        if (outbox.contains(peerId) || pendingOutboxJournalWrites.getOrElse(peerId) { 0 } > 0) {
+            enqueueOutbox(peerId, text) {
+                flushOutbox(peerId)
+                toast = "Message queued and will send in order."
+            }
             return
         }
         liveMeshRoutePeerId(peerId)?.let { route -> sendMesh(route, text); return }
@@ -6909,15 +7193,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                 shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text)
                 canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, text)
                 else -> {
-                    enqueueOutbox(peerId, text)
-                    toast = "Out of range — add each other as favorites to continue over Nostr."
+                    enqueueOutbox(peerId, text) {
+                        flushOutbox(peerId)
+                        toast = "Out of range — add each other as favorites to continue over Nostr."
+                    }
                 }
             }
             return
         }
         // Neither BLE mesh link nor npub available — queue for later delivery.
-        enqueueOutbox(peerId, text)
-        toast = "Out of range — message queued and will send automatically."
+        enqueueOutbox(peerId, text) {
+            flushOutbox(peerId)
+            toast = "Out of range — message queued and will send automatically."
+        }
     }
 
     /** ☎CALL signaling uses the lowest-latency route available for the SAME Sonar
@@ -7145,7 +7433,10 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Texts queued for a Sonar peer (keyed by npub hex) while their White Noise
      *  group is created on the first out-of-range send. Flushed by
      *  [flushPendingMarmot] once the group appears in [chats]. */
-    private val pendingMarmotSends = mutableMapOf<String, MutableList<String>>()
+    private data class PendingMarmotRouteSend(val id: String, val text: String, val chatId: String?)
+    private data class ResolvedMarmotSend(val id: String, val text: String, val chatId: String?)
+    private val pendingMarmotSends = mutableMapOf<String, MutableList<PendingMarmotRouteSend>>()
+    private val resolvedMarmotSends = mutableMapOf<String, MutableList<ResolvedMarmotSend>>()
     private val startingMarmotChats = mutableSetOf<String>()
     private val pendingMarmotSetupJobs = mutableMapOf<String, Job>()
     private val pendingMarmotSetupTokens = mutableMapOf<String, Long>()
@@ -7158,6 +7449,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         val name: String,
         val members: List<String>,
         val createdAtSecs: Long,
+        val inviteId: String? = null,
+        val inviteGroupId: String? = null,
     )
     private data class PendingDirectMarmotSend(
         val pendingChatId: String,
@@ -7170,9 +7463,156 @@ class SonarAppState(private val scope: CoroutineScope) {
     )
     private val pendingDirectMarmotSends = mutableMapOf<String, MutableList<PendingDirectMarmotSend>>()
     private val pendingMarmotGroupSends = mutableMapOf<String, MutableList<PendingMarmotGroupSend>>()
+    private val preRouteJournalMutex = Mutex()
     private val pendingMarmotGroupSetupJobs = mutableMapOf<String, Job>()
     private val pendingMarmotGroupSetupTokens = mutableMapOf<String, Long>()
     private var pendingMarmotGroupSetupNonce = 0L
+    private var journalingGroupCreation = false
+
+    private suspend fun journalPreRoute(
+        id: String,
+        routeKind: String,
+        routeId: String,
+        routeContext: String,
+        content: String,
+        createdAtSecs: Long,
+    ): Boolean = preRouteJournalMutex.withLock {
+        runCatching {
+            SonarCore.enqueuePreRouteMessage(
+                SonarPreRouteMessage(
+                    id = id,
+                    routeKind = routeKind,
+                    routeId = routeId,
+                    routeContext = routeContext,
+                    content = content,
+                    createdAtSecs = createdAtSecs,
+                )
+            )
+        }.onFailure {
+            toast = "Couldn't save the outgoing message. Try again."
+        }.isSuccess
+    }
+
+    /** Only retire a retry echo after the accepted send and its pre-route
+     * journal cleanup are both durable. */
+    private suspend fun completeAcceptedPreRouteMessage(id: String): Boolean =
+        runCatching { SonarCore.completePreRouteMessage(id) }
+            .onFailure { toast = "Message was saved locally, but retry cleanup failed." }
+            .isSuccess
+
+    private suspend fun discardPreRouteMessages(routeKeys: Set<String>) {
+        if (routeKeys.isEmpty()) return
+        for (record in SonarCore.preRouteMessages()) {
+            if (record.routeId in routeKeys || record.routeContext in routeKeys) {
+                runCatching { SonarCore.completePreRouteMessage(record.id) }
+            }
+        }
+    }
+
+    private fun restoredPreRouteEcho(
+        chatId: String,
+        record: SonarPreRouteMessage,
+        state: String = "Sending",
+    ) {
+        if (pendingSendEchoes[chatId].orEmpty().any { it.id == record.id }) return
+        val echo = privateDmMessage(
+            id = record.id,
+            senderNpub = npub,
+            text = record.content,
+            mine = true,
+            tsSecs = record.createdAtSecs,
+            viaInternet = true,
+            state = state,
+        )
+        pendingSendEchoes.getOrPut(chatId) { mutableListOf() }.add(echo)
+        previouslyPublishedMessageIdsByEcho[record.id] = emptySet()
+    }
+
+    private suspend fun restorePreRouteMessages() {
+        for (record in SonarCore.preRouteMessages()) {
+            when (record.routeKind) {
+                PRE_ROUTE_DIRECT_NPUB -> {
+                    val npubHex = canonicalNpubHex(record.routeId) ?: continue
+                    val pendingId = record.routeContext
+                    if (pendingId.startsWith(PENDING_MARMOT_CHAT_PREFIX)) {
+                        putPendingMarmotChat(pendingId, record.routeId)
+                        restoredPreRouteEcho(pendingId, record)
+                        val queue = pendingDirectMarmotSends.getOrPut(npubHex) { mutableListOf() }
+                        if (queue.none { it.echoId == record.id }) {
+                            queue += PendingDirectMarmotSend(pendingId, record.content, record.id)
+                        }
+                    } else {
+                        val queue = pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }
+                        if (queue.none { it.id == record.id }) {
+                            queue += PendingMarmotRouteSend(record.id, record.content, record.routeContext.ifBlank { null })
+                        }
+                    }
+                }
+                PRE_ROUTE_GROUP_OPERATION, PRE_ROUTE_GROUP_CREATE, PRE_ROUTE_GROUP_INVITE -> {
+                    val plan = preRouteGroupRestorePlan(record.routeKind, record.routeContext) ?: continue
+                    if (!pendingMarmotGroups.containsKey(record.routeId)) {
+                        pendingMarmotGroups = pendingMarmotGroups + (
+                            record.routeId to PendingMarmotGroup(
+                                name = plan.name,
+                                members = plan.members,
+                                createdAtSecs = record.createdAtSecs,
+                                inviteId = plan.inviteId,
+                                inviteGroupId = plan.inviteGroupId,
+                            )
+                            )
+                    }
+                    if (!plan.restoreMessage) continue
+                    restoredPreRouteEcho(record.routeId, record)
+                    val queue = pendingMarmotGroupSends.getOrPut(record.routeId) { mutableListOf() }
+                    if (queue.none { it.echoId == record.id }) {
+                        queue += PendingMarmotGroupSend(record.content, record.id)
+                    }
+                }
+                PRE_ROUTE_PEER -> outbox.restore(
+                    QueuedMessage(
+                        content = record.content,
+                        peerId = record.routeId,
+                        messageId = record.id,
+                        timestampSecs = record.createdAtSecs,
+                    )
+                )
+                PRE_ROUTE_MARMOT_GROUP -> {
+                    val chatId = resolvedPreRouteChatId(record.routeId, record.routeContext)
+                    // The normal local outbox may already own this send and
+                    // only journal cleanup may have failed. Never auto-replay
+                    // a fresh MLS message id after restart; let the user decide
+                    // whether to retry the surfaced uncertain delivery.
+                    restoredPreRouteEcho(chatId, record, state = "Couldn't send")
+                }
+            }
+        }
+    }
+
+    private fun resumePreRouteMessages() {
+        for ((pendingId, pending) in pendingMarmotChatNpubs) {
+            startPendingMarmotChat(pending.peerNpub, pendingId)
+        }
+        for ((pendingId, pending) in pendingMarmotGroups) {
+            if (pending.inviteId != null) {
+                val expectedGroupId = pending.inviteGroupId
+                    ?: groupInvites.firstOrNull { it.id == pending.inviteId }?.groupId
+                if (expectedGroupId != null) {
+                    startPendingMarmotGroupAccept(pendingId, pending.inviteId, expectedGroupId)
+                }
+            } else {
+                startPendingMarmotGroupCreation(pendingId)
+            }
+        }
+        for (npubHex in pendingMarmotSends.keys) {
+            if (marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) != null) {
+                flushPendingMarmot()
+            } else {
+                startBackgroundMarmotRoute(npubHex)
+            }
+        }
+        flushResolvedMarmotSends()
+        flushAllOutbox()
+    }
 
     private fun nextPendingMarmotSetupToken(pendingChatId: String): Long {
         val token = ++pendingMarmotSetupNonce
@@ -7227,9 +7667,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         pendingMarmotGroupSetupJobs.remove(pendingChatId)
     }
 
-    private fun cancelPendingMarmotGroupSetup(pendingChatId: String) {
-        pendingMarmotGroupSetupJobs.remove(pendingChatId)?.cancel()
+    private fun cancelPendingMarmotGroupSetup(pendingChatId: String): Job? {
+        val job = pendingMarmotGroupSetupJobs.remove(pendingChatId)
+        job?.cancel()
         pendingMarmotGroupSetupTokens.remove(pendingChatId)
+        return job
     }
 
     private fun cancelPendingMarmotGroupSetups() {
@@ -7244,6 +7686,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     // automatically when the peer reconnects over BLE or their npub is learned.
     private val outbox = SonarOutbox()
     private val flushingOutboxPeers = mutableSetOf<String>()
+    private val pendingOutboxJournalWrites = mutableMapOf<String, Int>()
 
     /** Continue a Sonar-peer conversation over White Noise (Marmot) when out of
      *  Bluetooth range, creating the 1:1 group on first send (mirrors iOS
@@ -7268,16 +7711,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val npubHex = npubRaw.toHexLower()
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(text)
-        toast = "Out of range — continuing over White Noise…"
-        if (!startingMarmotChats.add(npubHex)) return
+        val id = randomMeshId()
+        val createdAt = SonarClock.nowSecs()
         scope.launch {
-            try {
-                if (!awaitRelayConnection()) return@launch
-                SonarCore.startChat(npubHex) // start_dm accepts a hex pubkey
-                refreshChats(); flushPendingMarmot(); flushOutbox(peerId); refreshOpenDm(peerId)
-            } catch (e: Throwable) { toast = "couldn’t start secure chat: ${e.message}" }
-            finally { startingMarmotChats.remove(npubHex) }
+            if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), text, createdAt)) return@launch
+            pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, text, meshChatId(peerId)))
+            toast = "Out of range — continuing over White Noise…"
+            startBackgroundMarmotRoute(npubHex, peerId)
         }
     }
 
@@ -7307,14 +7747,28 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val npubHex = npubRaw.toHexLower()
         val encoded = meshStickerContent(packCoordinate, sticker.shortcode, sticker.sha256)
-        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(encoded)
-        toast = "Out of range — continuing over White Noise…"
+        val id = randomMeshId()
+        val createdAt = SonarClock.nowSecs()
+        scope.launch {
+            if (!journalPreRoute(id, PRE_ROUTE_DIRECT_NPUB, npubHex, meshChatId(peerId), encoded, createdAt)) return@launch
+            pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(PendingMarmotRouteSend(id, encoded, meshChatId(peerId)))
+            toast = "Out of range — continuing over White Noise…"
+            startBackgroundMarmotRoute(npubHex, peerId)
+        }
+    }
+
+    private fun startBackgroundMarmotRoute(npubHex: String, peerId: String? = null) {
         if (!startingMarmotChats.add(npubHex)) return
         scope.launch {
             try {
                 if (!awaitRelayConnection()) return@launch
                 SonarCore.startChat(npubHex)
-                refreshChats(); flushPendingMarmot(); refreshOpenDm(peerId)
+                refreshChats()
+                flushPendingMarmot()
+                if (peerId != null) {
+                    flushOutbox(peerId)
+                    refreshOpenDm(peerId)
+                }
             } catch (e: Throwable) { toast = "couldn't start secure chat: ${e.message}" }
             finally { startingMarmotChats.remove(npubHex) }
         }
@@ -7322,13 +7776,50 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun flushPendingMarmot() {
         if (pendingMarmotSends.isEmpty()) return
-        for ((npubHex, texts) in pendingMarmotSends.toMap()) {
+        for ((npubHex, sends) in pendingMarmotSends.toMap()) {
             if (socialState.isBlockedNostr(npubHex)) continue
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
             scope.launch {
-                for (tx in texts) {
-                    runCatching { sendQueuedMarmotContent(group.id, tx) }
+                for (send in sends) {
+                    if (runCatching { SonarCore.resolvePreRouteMessage(send.id, group.id) }.isFailure) {
+                        pendingMarmotSends.getOrPut(npubHex) { mutableListOf() }.add(send)
+                        continue
+                    }
+                    val sent = runCatching { sendQueuedMarmotContent(group.id, send.text) }
+                    if (sent.isSuccess) {
+                        completeAcceptedPreRouteMessage(send.id)
+                    } else {
+                        queueResolvedMarmotSend(group.id, send.id, send.text, send.chatId)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun queueResolvedMarmotSend(groupId: String, id: String, text: String, chatId: String?) {
+        val queue = resolvedMarmotSends.getOrPut(groupId) { mutableListOf() }
+        if (queue.none { it.id == id }) queue += ResolvedMarmotSend(id, text, chatId)
+    }
+
+    /** Replay only after local paint. The checkpointed group makes this
+     * idempotent across process death: route/group creation is never repeated. */
+    private fun flushResolvedMarmotSends() {
+        for ((groupId, sends) in resolvedMarmotSends.toMap()) {
+            resolvedMarmotSends.remove(groupId)
+            scope.launch {
+                for (send in sends) {
+                    val sent = runCatching { sendQueuedMarmotContent(groupId, send.text) }
+                    if (sent.isSuccess) {
+                        if (completeAcceptedPreRouteMessage(send.id)) {
+                            send.chatId?.let { clearSendEcho(it, send.id) }
+                        } else {
+                            send.chatId?.let { failSendEcho(it, send.id) }
+                        }
+                    } else {
+                        queueResolvedMarmotSend(groupId, send.id, send.text, send.chatId)
+                        send.chatId?.let { failSendEcho(it, send.id) }
+                    }
                 }
             }
         }
@@ -7338,75 +7829,101 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /** Queue a message for [peerId] when no transport is available. Enforces
      *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
-    private fun enqueueOutbox(peerId: String, text: String) {
-        val result = outbox.enqueue(peerId, text, randomMeshId(), SonarClock.nowSecs())
-        result.evicted?.let { evicted ->
-            sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
-        }
-        sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
-    }
-
-    /** Try to deliver all queued messages for [peerId]. Expired messages (>24h)
-     *  are silently dropped. Messages that still can't be sent remain queued. */
-    private fun flushOutbox(peerId: String) {
-        if (!outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
+    private fun enqueueOutbox(peerId: String, text: String, onQueued: () -> Unit = {}) {
+        val id = randomMeshId()
+        val createdAt = SonarClock.nowSecs()
+        pendingOutboxJournalWrites[peerId] = pendingOutboxJournalWrites.getOrElse(peerId) { 0 } + 1
         scope.launch {
             try {
-                flushOutboxNow(peerId)
+                if (!journalPreRoute(id, PRE_ROUTE_PEER, peerId, "", text, createdAt)) return@launch
+                val result = outbox.enqueue(peerId, text, id, createdAt)
+                result.evicted?.let { evicted ->
+                    runCatching { SonarCore.completePreRouteMessage(evicted.messageId) }
+                    sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
+                }
+                sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
+                onQueued()
             } finally {
-                flushingOutboxPeers.remove(peerId)
+                val remaining = pendingOutboxJournalWrites.getOrElse(peerId) { 1 } - 1
+                if (remaining == 0) pendingOutboxJournalWrites.remove(peerId)
+                else pendingOutboxJournalWrites[peerId] = remaining
             }
         }
     }
 
-    private suspend fun flushOutboxNow(peerId: String) {
+    /** Try to deliver all queued messages for [peerId]. Messages that still
+     *  can't be sent remain queued until delivery or explicit eviction. */
+    private fun flushOutbox(peerId: String) {
+        if (!outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
+        scope.launch {
+            var shouldContinue = false
+            try {
+                shouldContinue = flushOutboxNow(peerId)
+            } finally {
+                flushingOutboxPeers.remove(peerId)
+            }
+            if (shouldContinue) flushOutbox(peerId)
+        }
+    }
+
+    private suspend fun flushOutboxNow(peerId: String): Boolean {
         val queue = outbox.snapshot(peerId)
-        if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
+        if (queue.isEmpty()) return false
         if (isMeshContactBlocked(peerId)) {
             sonarLog("SonarOutbox", "paused blocked outbox peer=${peerId.take(10)}…")
-            return
+            return false
         }
-        val now = SonarClock.nowSecs()
         val remaining = mutableListOf<QueuedMessage>()
         var marmotGroupId: String? = null
 
         sonarLog("SonarOutbox", "flushing ${queue.size} message(s) for ${peerId.take(10)}…")
 
         for ((index, msg) in queue.withIndex()) {
-            // TTL check: drop messages older than 24 hours.
-            if (outbox.isExpired(msg, now)) {
-                sonarLog("SonarOutbox", "expired id=${msg.messageId.take(8)}… age=${now - msg.timestampSecs}s")
-                continue
-            }
             // Try to send via the best available transport.
-            val routePeerId = liveMeshRoutePeerId(peerId)
-            val delivered = if (routePeerId != null) {
-                sendMesh(routePeerId, msg.content)
+            val delivered = if (msg.awaitingCleanup) {
+                true
             } else {
-                val raw = npubRawFor(peerId)
-                if (raw != null) {
-                    when {
-                        shouldUseMarmotRoute(peerId, raw) -> {
-                            val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
-                            marmotGroupId = groupId
-                            groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
-                        }
-                        canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
-                        else -> false
-                    }
+                val routePeerId = liveMeshRoutePeerId(peerId)
+                if (routePeerId != null) {
+                    sendMesh(routePeerId, msg.content)
                 } else {
-                    false
+                    val raw = npubRawFor(peerId)
+                    if (raw != null) {
+                        when {
+                            shouldUseMarmotRoute(peerId, raw) -> {
+                                val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
+                                marmotGroupId = groupId
+                                if (groupId == null || runCatching {
+                                        SonarCore.resolvePreRouteMessage(msg.messageId, groupId)
+                                    }.isFailure
+                                ) {
+                                    false
+                                } else {
+                                    sendOutboxOverMarmot(peerId, groupId, msg.content)
+                                }
+                            }
+                            canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
+                            else -> false
+                        }
+                    } else {
+                        false
+                    }
                 }
             }
             if (!delivered) {
-                remaining.addAll(outbox.remainingAfterFailure(queue, index, now))
+                remaining.addAll(outbox.remainingAfterFailure(queue, index))
                 sonarLog("SonarOutbox", "kept ${remaining.size} message(s) queued for ${peerId.take(10)}…")
+                break
+            }
+            if (runCatching { SonarCore.completePreRouteMessage(msg.messageId) }.isFailure) {
+                remaining.addAll(outbox.remainingAfterCleanupFailure(queue, index))
+                sonarLog("SonarOutbox", "kept delivered id=${msg.messageId.take(8)}… until journal cleanup succeeds")
                 break
             }
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
         }
 
-        outbox.finishFlush(peerId, queue.size, remaining)
+        return outbox.finishFlush(peerId, queue, remaining)
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {
@@ -7489,14 +8006,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Add at least two people"
             return
         }
+        if (journalingGroupCreation) return
+        journalingGroupCreation = true
         val pendingChatId = pendingMarmotGroupId()
         val pending = PendingMarmotGroup(
             name = cleanName,
             members = cleanMembers,
             createdAtSecs = SonarClock.nowSecs(),
         )
-        openPendingMarmotGroup(pendingChatId, pending)
-        startPendingMarmotGroupCreation(pendingChatId)
+        scope.launch {
+            try {
+                if (!journalPendingGroupOperation(pendingChatId, pending)) return@launch
+                openPendingMarmotGroup(pendingChatId, pending)
+                startPendingMarmotGroupCreation(pendingChatId)
+            } finally {
+                journalingGroupCreation = false
+            }
+        }
     }
 
     fun addGroupMembers(chatId: String, members: List<String>) {
@@ -7655,10 +8181,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             name = invite.groupName.ifBlank { "Group chat" },
             members = emptyList(),
             createdAtSecs = SonarClock.nowSecs(),
+            inviteId = inviteId,
+            inviteGroupId = invite.groupId,
         )
         groupInvites = groupInvites.filterNot { it.id == inviteId }
         openPendingMarmotGroup(pendingChatId, pending)
-        startPendingMarmotGroupAccept(pendingChatId, inviteId)
+        startPendingMarmotGroupAccept(pendingChatId, inviteId, invite.groupId)
     }
 
     fun declineGroupInvite(inviteId: String) {
@@ -8795,6 +9323,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // wall-clock cadence (was every 4 s / every 60 s on the old tick).
                 if (SonarCore.isRelayConnected()) {
                     runCatching { SonarCore.ensureSubscriptions() }
+                    resumePreRouteMessages()
                     if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
                         runCatching { SonarCore.sync() }
                     }
@@ -8992,6 +9521,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     runCatching { SonarCore.drainPendingMarmot() }
                 } else {
                     runCatching { SonarCore.ensureSubscriptions() }
+                    resumePreRouteMessages()
                 }
             }
         }

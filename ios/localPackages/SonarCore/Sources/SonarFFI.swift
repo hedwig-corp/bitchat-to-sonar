@@ -1398,6 +1398,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func acceptGroupInvite(inviteIdHex: String) throws  -> String
 
     /**
+     * Accept a pending group invite idempotently using its expected MLS group.
+     */
+    func acceptGroupInviteIdempotent(inviteIdHex: String, expectedGroupIdHex: String) throws  -> String
+
+    /**
      * Acknowledge direct NIP-17 DMs only after the host persisted or consumed
      * the drained records.
      */
@@ -1500,6 +1505,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     func clearConversationChangeListener()
 
+    func clearPreRouteMessages() throws
+
+    /**
+     * Acknowledge one journal entry only after the replacement send is owned
+     * by the normal encrypted local message/outbox path.
+     */
+    func completePreRouteMessage(id: String) throws
+
     func conversationSummaries()  -> [ConversationSummaryInfo]
 
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
@@ -1519,6 +1532,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func deleteGroup(groupIdHex: String) throws
 
     /**
+     * Cancel a pending host group operation and remove any local marker group,
+     * encrypted operation sentinel, and Welcome recovery checkpoint.
+     */
+    func discardPreRouteGroupOperation(operationId: String) throws
+
+    /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
     func drainDirectDms()  -> [DirectDmInfo]
@@ -1529,6 +1548,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * MUST run on the host's serialized engine queue.
      */
     func drainPendingMarmot() throws  -> [DrainNotificationInfo]
+
+    /**
+     * Journal a send before route setup. Idempotent when the same stable id
+     * and payload are supplied again.
+     */
+    func enqueuePreRouteMessage(message: PreRouteMessageInfo) throws
 
     /**
      * Re-subscribe with the current watermark and group set to self-heal
@@ -1631,6 +1656,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func pendingJoinRequests(groupIdHex: String) throws  -> [JoinRequestInfo]
 
     /**
+     * Local-only snapshot used by both hosts to resume route setup after a
+     * process restart. Does not contact relays or touch MLS state.
+     */
+    func preRouteMessages()  -> [PreRouteMessageInfo]
+
+    /**
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -1708,6 +1739,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func resolveHandle(input: String) throws  -> ResolvedHandleInfo
 
     /**
+     * Checkpoint the concrete MLS group before replay. Repeating the same
+     * checkpoint is safe and process restart resumes directly into this group.
+     */
+    func resolvePreRouteMessage(id: String, groupId: String) throws
+
+    /**
      * Retry one failed outgoing message from the durable local outbox. The
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
@@ -1781,6 +1818,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
      */
     func startGroup(members: [String], name: String) throws  -> String
+
+    /**
+     * Start a multi-member group idempotently for a durable host operation.
+     */
+    func startGroupIdempotent(members: [String], name: String, operationId: String) throws  -> String
 
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
@@ -1909,6 +1951,19 @@ open func acceptGroupInvite(inviteIdHex: String)throws  -> String  {
     uniffi_sonar_ffi_fn_method_sonarnode_accept_group_invite(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(inviteIdHex),$0
+    )
+})
+}
+
+    /**
+     * Accept a pending group invite idempotently using its expected MLS group.
+     */
+open func acceptGroupInviteIdempotent(inviteIdHex: String, expectedGroupIdHex: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_accept_group_invite_idempotent(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(inviteIdHex),
+        FfiConverterString.lower(expectedGroupIdHex),$0
     )
 })
 }
@@ -2130,6 +2185,25 @@ open func clearConversationChangeListener()  {try! rustCall() {
 }
 }
 
+open func clearPreRouteMessages()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_clear_pre_route_messages(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
+     * Acknowledge one journal entry only after the replacement send is owned
+     * by the normal encrypted local message/outbox path.
+     */
+open func completePreRouteMessage(id: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_complete_pre_route_message(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),$0
+    )
+}
+}
+
 open func conversationSummaries() -> [ConversationSummaryInfo]  {
     return try!  FfiConverterSequenceTypeConversationSummaryInfo.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_conversation_summaries(
@@ -2182,6 +2256,18 @@ open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConv
 }
 
     /**
+     * Cancel a pending host group operation and remove any local marker group,
+     * encrypted operation sentinel, and Welcome recovery checkpoint.
+     */
+open func discardPreRouteGroupOperation(operationId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_discard_pre_route_group_operation(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(operationId),$0
+    )
+}
+}
+
+    /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
 open func drainDirectDms() -> [DirectDmInfo]  {
@@ -2203,6 +2289,18 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+
+    /**
+     * Journal a send before route setup. Idempotent when the same stable id
+     * and payload are supplied again.
+     */
+open func enqueuePreRouteMessage(message: PreRouteMessageInfo)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_enqueue_pre_route_message(
+            self.uniffiCloneHandle(),
+        FfiConverterTypePreRouteMessageInfo_lower(message),$0
+    )
+}
 }
 
     /**
@@ -2452,6 +2550,18 @@ open func pendingJoinRequests(groupIdHex: String)throws  -> [JoinRequestInfo]  {
 }
 
     /**
+     * Local-only snapshot used by both hosts to resume route setup after a
+     * process restart. Does not contact relays or touch MLS state.
+     */
+open func preRouteMessages() -> [PreRouteMessageInfo]  {
+    return try!  FfiConverterSequenceTypePreRouteMessageInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_pre_route_messages(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Prefer catch-up for the open chat. Pass the MLS group id hex (same id
      * hosts use for send_text / messages). Empty clears. Local-first: does not
      * block paint or send. Core maps MLS to nostr group id for the catch-up queue.
@@ -2608,6 +2718,19 @@ open func resolveHandle(input: String)throws  -> ResolvedHandleInfo  {
         FfiConverterString.lower(input),$0
     )
 })
+}
+
+    /**
+     * Checkpoint the concrete MLS group before replay. Repeating the same
+     * checkpoint is safe and process restart resumes directly into this group.
+     */
+open func resolvePreRouteMessage(id: String, groupId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_resolve_pre_route_message(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(id),
+        FfiConverterString.lower(groupId),$0
+    )
+}
 }
 
     /**
@@ -2783,6 +2906,20 @@ open func startGroup(members: [String], name: String)throws  -> String  {
             self.uniffiCloneHandle(),
         FfiConverterSequenceString.lower(members),
         FfiConverterString.lower(name),$0
+    )
+})
+}
+
+    /**
+     * Start a multi-member group idempotently for a durable host operation.
+     */
+open func startGroupIdempotent(members: [String], name: String, operationId: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_start_group_idempotent(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(members),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(operationId),$0
     )
 })
 }
@@ -4419,6 +4556,79 @@ public func FfiConverterTypeNoiseKeypairHex_lift(_ buf: RustBuffer) throws -> No
 #endif
 public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> RustBuffer {
     return FfiConverterTypeNoiseKeypairHex.lower(value)
+}
+
+
+/**
+ * Encrypted-at-rest host handoff for a send created before an MLS route.
+ */
+public struct PreRouteMessageInfo: Equatable, Hashable {
+    public var id: String
+    public var routeKind: String
+    public var routeId: String
+    public var routeContext: String
+    public var content: String
+    public var createdAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: String, routeKind: String, routeId: String, routeContext: String, content: String, createdAtSecs: UInt64) {
+        self.id = id
+        self.routeKind = routeKind
+        self.routeId = routeId
+        self.routeContext = routeContext
+        self.content = content
+        self.createdAtSecs = createdAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PreRouteMessageInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePreRouteMessageInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PreRouteMessageInfo {
+        return
+            try PreRouteMessageInfo(
+                id: FfiConverterString.read(from: &buf),
+                routeKind: FfiConverterString.read(from: &buf),
+                routeId: FfiConverterString.read(from: &buf),
+                routeContext: FfiConverterString.read(from: &buf),
+                content: FfiConverterString.read(from: &buf),
+                createdAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PreRouteMessageInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.id, into: &buf)
+        FfiConverterString.write(value.routeKind, into: &buf)
+        FfiConverterString.write(value.routeId, into: &buf)
+        FfiConverterString.write(value.routeContext, into: &buf)
+        FfiConverterString.write(value.content, into: &buf)
+        FfiConverterUInt64.write(value.createdAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePreRouteMessageInfo_lift(_ buf: RustBuffer) throws -> PreRouteMessageInfo {
+    return try FfiConverterTypePreRouteMessageInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePreRouteMessageInfo_lower(_ value: PreRouteMessageInfo) -> RustBuffer {
+    return FfiConverterTypePreRouteMessageInfo.lower(value)
 }
 
 
@@ -7003,6 +7213,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypePreRouteMessageInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [PreRouteMessageInfo]
+
+    public static func write(_ value: [PreRouteMessageInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePreRouteMessageInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PreRouteMessageInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PreRouteMessageInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePreRouteMessageInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [RecentMessagePageInfo]
 
@@ -7701,6 +7936,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_accept_group_invite() != 50359) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_accept_group_invite_idempotent() != 55514) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_acknowledge_direct_dms() != 3185) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7752,6 +7990,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_conversation_change_listener() != 59668) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_pre_route_messages() != 48685) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_complete_pre_route_message() != 25690) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7767,10 +8011,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_discard_pre_route_group_operation() != 1236) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_direct_dms() != 64423) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_enqueue_pre_route_message() != 26785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
@@ -7833,6 +8083,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_join_requests() != 43500) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_pre_route_messages() != 53012) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_prefer_catchup_group() != 37980) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7867,6 +8120,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_resolve_handle() != 13801) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_resolve_pre_route_message() != 64565) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
@@ -7906,6 +8162,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group() != 41815) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group_idempotent() != 25197) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 34432) {

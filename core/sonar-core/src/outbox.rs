@@ -16,7 +16,7 @@ use crate::{Error, Result};
 
 pub(crate) const OUTBOX_STATE_FILE_SUFFIX: &str = ".sonar-outbox.json";
 const OUTBOX_STATE_VERSION: u32 = 1;
-const OUTBOX_RETRY_ATTEMPT_LIMIT: u32 = 20;
+const MAX_AUTOMATIC_RETRY_DELAY_SECS: u64 = 30;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct OutboxStateDisk {
@@ -184,7 +184,17 @@ impl OutboxState {
             if !matches!(entry.state, DeliveryState::Pending | DeliveryState::Failed) {
                 continue;
             }
-            if entry.attempts >= OUTBOX_RETRY_ATTEMPT_LIMIT {
+            // A wall-clock correction must not strand a durable send behind a
+            // timestamp that is now days or months in the future. Rebase it
+            // onto the current clock and preserve only the bounded backoff.
+            if entry.updated_at_secs > now_secs {
+                entry.updated_at_secs = now_secs;
+                self.dirty = true;
+            }
+            let retry_at = entry
+                .updated_at_secs
+                .saturating_add(automatic_retry_delay_secs(entry.attempts));
+            if entry.attempts > 0 && now_secs < retry_at {
                 continue;
             }
             let event = Event::from_json(&entry.event_json)
@@ -231,6 +241,15 @@ impl OutboxState {
         self.dirty = false;
         Ok(())
     }
+}
+
+fn automatic_retry_delay_secs(attempts: u32) -> u64 {
+    if attempts == 0 {
+        return 0;
+    }
+    1u64.checked_shl(attempts.saturating_sub(1).min(31))
+        .unwrap_or(u64::MAX)
+        .min(MAX_AUTOMATIC_RETRY_DELAY_SECS)
 }
 
 pub(crate) fn outbox_state_path_for_db(db_path: &Path) -> PathBuf {
@@ -365,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_retry_resets_failed_entry_and_attempt_budget() {
+    fn manual_retry_resets_failed_entry_and_backoff() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("outbox.json");
         let mut outbox = OutboxState::load(Some(path.clone()));
@@ -382,7 +401,7 @@ mod tests {
                 1,
             )
             .expect("mark pending");
-        for attempt in 0..OUTBOX_RETRY_ATTEMPT_LIMIT {
+        for attempt in 0..20 {
             outbox
                 .mark_failed_by_message_id("message", format!("offline {attempt}"), 2)
                 .expect("mark failed");
@@ -393,17 +412,13 @@ mod tests {
             .expect("manual retry");
         assert_eq!(source_group, "group");
         assert_eq!(retried.id, event.id);
-        assert_eq!(
-            outbox.status_for_message("message"),
-            Some(DeliveryState::Pending)
-        );
 
         outbox
             .mark_failed_by_message_id("message", "still offline".into(), 4)
             .expect("mark failed after retry");
         let retryable = outbox
             .retryable_events(5, &HashSet::from(["group".to_string()]))
-            .expect("automatic retry budget was reset");
+            .expect("manual retry reset backoff");
         assert_eq!(retryable.len(), 1);
 
         let reloaded = OutboxState::load(Some(path));
@@ -411,5 +426,98 @@ mod tests {
             reloaded.status_for_message("message"),
             Some(DeliveryState::Pending)
         );
+    }
+
+    #[test]
+    fn automatic_retry_does_not_exhaust_during_prolonged_outage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+            )
+            .expect("mark pending");
+        for attempt in 0..100 {
+            outbox
+                .mark_failed_by_message_id("message", format!("offline {attempt}"), 2)
+                .expect("mark failed");
+        }
+
+        let active = HashSet::from(["group".to_string()]);
+        assert!(outbox
+            .retryable_events(3, &active)
+            .expect("backoff remains bounded")
+            .is_empty());
+
+        let retryable = outbox
+            .retryable_events(32, &active)
+            .expect("automatic retry remains available after a prolonged outage");
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].2.id, event.id);
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn automatic_retry_rebases_future_timestamp_after_clock_correction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                10_000,
+            )
+            .expect("mark pending");
+        outbox
+            .mark_failed_by_message_id("message", "offline".into(), 10_000)
+            .expect("mark failed");
+
+        let active = HashSet::from(["group".to_string()]);
+        assert!(outbox
+            .retryable_events(100, &active)
+            .expect("future timestamp is rebased")
+            .is_empty());
+        let retryable = outbox
+            .retryable_events(101, &active)
+            .expect("bounded retry becomes due");
+        assert_eq!(retryable.len(), 1);
+        assert_eq!(retryable[0].2.id, event.id);
+
+        let reloaded = OutboxState::load(Some(path));
+        assert_eq!(
+            reloaded.status_for_message("message"),
+            Some(DeliveryState::Pending)
+        );
+    }
+
+    #[test]
+    fn automatic_retry_uses_exponential_backoff() {
+        assert_eq!(automatic_retry_delay_secs(0), 0);
+        assert_eq!(automatic_retry_delay_secs(1), 1);
+        assert_eq!(automatic_retry_delay_secs(2), 2);
+        assert_eq!(automatic_retry_delay_secs(5), 16);
+        assert_eq!(automatic_retry_delay_secs(6), 30);
+        assert_eq!(automatic_retry_delay_secs(u32::MAX), 30);
     }
 }

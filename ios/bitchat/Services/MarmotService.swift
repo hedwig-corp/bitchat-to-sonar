@@ -292,13 +292,14 @@ final class MarmotService: @unchecked Sendable {
     /// Android: lifecycle serialization only; sync/drain hop independently.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
-    /// Serial send lane for text/sticker sends: they must stay ordered with
-    /// each other, but must never FIFO-queue behind sync relay quorum
-    /// fetches on `workQueue` (each can park it for a 10s timeout — the
-    /// documented 6.6s p95 / 19.3s max send dispatch tail). The core engine
-    /// serializes MLS mutations internally (`MarmotEngine::write_lock`), so a
-    /// send here runs concurrently with an in-flight sync and waits at most
-    /// for one in-flight MLS mutation, never for a relay fetch.
+    /// Serial send lane for text/sticker sends and tiny pre-route journal
+    /// writes: they must stay ordered with each other, but must never FIFO-queue
+    /// behind sync/drain relay quorum fetches on `workQueue` (each can park it
+    /// for a 10s timeout — the documented 6.6s p95 / 19.3s max send dispatch
+    /// tail). The core engine serializes MLS mutations internally
+    /// (`MarmotEngine::write_lock`), so a send here runs concurrently with an
+    /// in-flight sync and waits at most for one in-flight MLS mutation, never
+    /// for a relay fetch.
     private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
 
     /// Serial receive/drain lane (Android `Dispatchers.IO` parity for drain).
@@ -489,6 +490,61 @@ final class MarmotService: @unchecked Sendable {
         await readOnlyNonThrowing({ try? $0.syncStateSnapshotJson() }, default: nil)
     }
 
+    /// Tiny local-only write used on the send path before a White Noise route
+    /// exists. The core encrypts + fsyncs the bounded record with a key derived
+    /// from the SQLCipher key; no relay or MLS work runs here.
+    func enqueuePreRouteMessage(
+        id: String,
+        routeKind: String,
+        routeId: String,
+        routeContext: String,
+        content: String,
+        createdAtSecs: UInt64
+    ) async throws {
+        try await sendLane { node in
+            try node.enqueuePreRouteMessage(message: PreRouteMessageInfo(
+                id: id,
+                routeKind: routeKind,
+                routeId: routeId,
+                routeContext: routeContext,
+                content: content,
+                createdAtSecs: createdAtSecs
+            ))
+        }
+    }
+
+    func preRouteMessages() -> [PreRouteMessageInfo] {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        return current?.preRouteMessages() ?? []
+    }
+
+    func completePreRouteMessage(id: String) async throws {
+        try await sendLane { node in
+            try node.completePreRouteMessage(id: id)
+        }
+    }
+
+    func resolvePreRouteMessage(id: String, groupId: String) async throws {
+        try await sendLane { node in
+            try node.resolvePreRouteMessage(id: id, groupId: groupId)
+        }
+    }
+
+    func discardPreRouteGroupOperation(operationId: String) async throws {
+        try await run {
+            try $0.requireNode().discardPreRouteGroupOperation(operationId: operationId)
+        }
+    }
+
+    func clearPreRouteMessages() {
+        nodeLock.lock()
+        let current = node
+        nodeLock.unlock()
+        try? current?.clearPreRouteMessages()
+    }
+
     // MARK: - Marmot operations
 
     /// Publish our MLS KeyPackage (kind 30443) so peers can invite us.
@@ -617,6 +673,20 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    func startGroupIdempotent(
+        with members: [String],
+        name: String,
+        operationId: String
+    ) async throws -> String {
+        try await run {
+            try $0.requireNode().startGroupIdempotent(
+                members: members.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty },
+                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+                operationId: operationId
+            )
+        }
+    }
+
     /// Pending multi-member group invites awaiting explicit user action.
     func pendingGroupInvites() async throws -> [GroupInvite] {
         try await readOnly {
@@ -637,6 +707,15 @@ final class MarmotService: @unchecked Sendable {
     /// Accept a pending group invite. Returns the group id (hex).
     func acceptGroupInvite(_ inviteId: String) async throws -> String {
         try await run { try $0.requireNode().acceptGroupInvite(inviteIdHex: inviteId) }
+    }
+
+    func acceptGroupInviteIdempotent(_ inviteId: String, expectedGroupId: String) async throws -> String {
+        try await run {
+            try $0.requireNode().acceptGroupInviteIdempotent(
+                inviteIdHex: inviteId,
+                expectedGroupIdHex: expectedGroupId
+            )
+        }
     }
 
     /// Decline a pending group invite.
@@ -1458,9 +1537,10 @@ final class MarmotService: @unchecked Sendable {
         try await leasedNodeOperation(on: readQueue, body)
     }
 
-    /// Text/sticker sends on the dedicated serial send lane. Same leased node
-    /// snapshot as `readOnly`; MLS-mutation ordering against sync/drain is the
-    /// core engine's `write_lock` responsibility.
+    /// Text/sticker sends and bounded local journal writes on the dedicated
+    /// serial send lane. Same leased node snapshot as `readOnly`;
+    /// MLS-mutation ordering against sync/drain is the core engine's
+    /// `write_lock` responsibility.
     private func sendLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: sendQueue, body)
     }
