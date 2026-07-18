@@ -95,6 +95,8 @@ struct SonarMessageBubbleView: View {
                     .foregroundColor(SonarTheme.accentDeep)
                     .buttonStyle(.plain)
                     .padding(.horizontal, 6)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
 
                 if !lightningLinks.isEmpty || !cashuLinks.isEmpty {

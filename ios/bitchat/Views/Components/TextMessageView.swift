@@ -47,6 +47,9 @@ struct TextMessageView: View {
                 }
                 .font(.bitchatSystem(size: 11, weight: .medium, design: .monospaced))
                 .foregroundColor(Color.blue)
+                .buttonStyle(.plain)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
                 .padding(.top, 4)
             }
 

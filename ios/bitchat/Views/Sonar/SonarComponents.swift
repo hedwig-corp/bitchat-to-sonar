@@ -703,6 +703,11 @@ struct SNMsgBubble: View {
                 .buttonStyle(.plain)
                 .frame(minHeight: 44)
                 .padding(.horizontal, 6)
+                // Plain buttons only hit-test their label content: without an
+                // explicit contentShape the 44pt min-height area is dead, and
+                // on the last bubble the text-selection gesture above swallows
+                // the tap. Claim the whole padded area for the button.
+                .contentShape(Rectangle())
             }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
