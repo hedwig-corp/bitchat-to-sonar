@@ -38,11 +38,11 @@ Use `TranscriptHostScaffold` + `TranscriptScrollPolicy.resolveOpenAction(...)`.
 
 Sample: `SampleTranscriptApp` in `:transcript-engine-sample`.
 
-Golden contract (canonical): `packages/transcript-engine-policy/golden/open-action.json`.
-CI diffs that file against the SPM copy at
-`ios/localPackages/TranscriptEngine/Tests/Resources/open-action.json` — edit the
-canonical file and copy, do not diverge. Asserted in `:transcript-engine-policy:check`
-and `swift test` for TranscriptEngine.
+Golden contracts (canonical): `packages/transcript-engine-policy/golden/{open-action,inset-follow}.json`.
+CI diffs those files against SPM copies under
+`ios/localPackages/TranscriptEngine/Tests/Resources/` — edit the canonical files
+and copy, do not diverge. Asserted in `:transcript-engine-policy:check`,
+`swift test`, and iOS Simulator `xcodebuild test` for TranscriptEngine.
 
 ## Swift (UIKit / SwiftUI)
 

@@ -1,0 +1,41 @@
+{
+  "description": "Shared inset-follow contract (R-009) — KMP and SPM hosts must agree on pin / lockstep / ignore.",
+  "cases": [
+    {
+      "name": "at_tail_pins",
+      "input": {
+        "wasAtTail": true,
+        "userScrolling": false,
+        "isPrepending": false
+      },
+      "expected": "Pin"
+    },
+    {
+      "name": "away_from_tail_locksteps",
+      "input": {
+        "wasAtTail": false,
+        "userScrolling": false,
+        "isPrepending": false
+      },
+      "expected": "Lockstep"
+    },
+    {
+      "name": "user_scrolling_ignores",
+      "input": {
+        "wasAtTail": true,
+        "userScrolling": true,
+        "isPrepending": false
+      },
+      "expected": "Ignore"
+    },
+    {
+      "name": "prepending_ignores",
+      "input": {
+        "wasAtTail": true,
+        "userScrolling": false,
+        "isPrepending": true
+      },
+      "expected": "Ignore"
+    }
+  ]
+}

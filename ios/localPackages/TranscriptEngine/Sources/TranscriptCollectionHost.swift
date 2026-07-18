@@ -86,7 +86,9 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.composer = composer
     }
 
-    public func makeUIViewController(context: Context) -> TranscriptCollectionHostViewController<Composer> {
+    /// Type-erased to `UIViewController` so the concrete host VC stays package-internal
+    /// (keeps latch/coalesce/layout out of the public semver surface).
+    public func makeUIViewController(context: Context) -> UIViewController {
         let vc = TranscriptCollectionHostViewController(
             composer: composer,
             callbacks: callbacks,
@@ -106,12 +108,12 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         return vc
     }
 
-    public func updateUIViewController(
-        _ uiViewController: TranscriptCollectionHostViewController<Composer>,
-        context: Context
-    ) {
-        uiViewController.updateComposer(composer())
-        uiViewController.apply(
+    public func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+        guard let vc = uiViewController as? TranscriptCollectionHostViewController<Composer> else {
+            return
+        }
+        vc.updateComposer(composer())
+        vc.apply(
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
@@ -140,7 +142,8 @@ private struct TranscriptComposerRootView<Composer: View>: View {
 
 // MARK: - View controller
 
-public final class TranscriptCollectionHostViewController<Composer: View>: UIViewController,
+/// Package-internal host. Apps integrate via [`TranscriptCollectionHostView`].
+final class TranscriptCollectionHostViewController<Composer: View>: UIViewController,
     UICollectionViewDelegateFlowLayout
 {
     private let collectionView: UICollectionView
@@ -180,7 +183,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
     private let heightCache = TranscriptRowHeightCache()
     private var appliedHeightKeys: [TranscriptDayRow: String] = [:]
 
-    public init(
+    init(
         composer: () -> Composer,
         callbacks: TranscriptCollectionHostCallbacks,
         heightKey: @escaping (TranscriptDayRow) -> String,
@@ -204,7 +207,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         super.init(nibName: nil, bundle: nil)
     }
 
-    public func updateComposer(_ composer: Composer) {
+    func updateComposer(_ composer: Composer) {
         composerStore.composer = composer
     }
 
@@ -217,7 +220,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
-    public override func viewDidLoad() {
+    override func viewDidLoad() {
         super.viewDidLoad()
         applyTranscriptBackground()
 
@@ -283,7 +286,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         }
     }
 
-    public override func viewDidLayoutSubviews() {
+    override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         let width = collectionView.bounds.width
         if width > 0, heightCache.updateWidth(width) {
@@ -292,7 +295,7 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
         updateOwnedInsetsFromChrome()
     }
 
-    public func apply(
+    func apply(
         entries: [TranscriptHostEntry],
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
