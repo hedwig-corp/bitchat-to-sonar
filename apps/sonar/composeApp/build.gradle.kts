@@ -296,8 +296,8 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 10
-        versionName = "0.1-alpha.10"
+        versionCode = 11
+        versionName = "0.1-alpha.11"
         buildConfigField("String", "BREEZ_API_KEY", "\"$breezApiKey\"")
         val lp = Properties().apply {
             val f = rootProject.file("local.properties")
