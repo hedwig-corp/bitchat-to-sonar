@@ -807,10 +807,12 @@ private struct MacConversationPane: View {
 
     private var dmSubtitle: String {
         let prefix = verified ? "Verified - " : ""
-        if peer.inRange {
+        // Transport is source of truth: never claim Bluetooth nearby while the
+        // composer is already routing over White Noise / internet.
+        if transport == .mesh {
             return prefix + "Nearby - Bluetooth"
         }
-        return prefix + (transport == .internet ? "Via internet" : "Waiting for Bluetooth")
+        return prefix + "Via internet"
     }
 
     @ViewBuilder private var banner: some View {
@@ -820,7 +822,7 @@ private struct MacConversationPane: View {
             SNBanner(icon: .shieldCheck, tone: .enc, bold: "Verified", rest: " - you confirmed \(peer.name)'s safety number")
         } else if isMultiMemberMarmot {
             SNBanner(icon: .lock, tone: .enc, bold: "End-to-end encrypted", rest: " - only group members can read this")
-        } else if transport == .internet && !peer.inRange {
+        } else if transport == .internet {
             SNBanner(icon: .globe, tone: .net, bold: "Out of Bluetooth range", rest: " - encrypted over the internet instead")
         } else {
             SNBanner(icon: .lock, tone: .enc, bold: "End-to-end encrypted", rest: " - only you and \(peer.name) can read this") {
@@ -3178,10 +3180,11 @@ private struct MacDMDetailRail: View {
     private var peer: SNPeerItem { store.peerItem(peerId) }
     private var verifyInfo: SNVerifyInfo { store.verifyInfo(for: peerId) }
     private var verified: Bool { store.isVerified(peerId) }
+    private var transport: SNVia { store.dmTransport(peerId) }
 
     var body: some View {
         VStack(spacing: 12) {
-            SonarAvatar(name: peer.name, size: 76, presence: peer.inRange)
+            SonarAvatar(name: peer.name, size: 76, presence: transport == .mesh)
             HStack(spacing: 6) {
                 Text(peer.name)
                     .font(SonarTheme.uiFont(size: 19, weight: .heavy))
@@ -3195,7 +3198,7 @@ private struct MacDMDetailRail: View {
 
             HStack(spacing: 5) {
                 Circle()
-                    .fill(peer.inRange ? SonarTheme.accent : SonarTheme.net)
+                    .fill(transport == .mesh ? SonarTheme.accent : SonarTheme.net)
                     .frame(width: 8, height: 8)
                 Text(deliverySubtitle)
             }
@@ -3230,9 +3233,11 @@ private struct MacDMDetailRail: View {
 
             MacRailSection(title: "Delivery") {
                 VStack(alignment: .leading, spacing: 8) {
-                    MacInfoLine(icon: peer.inRange ? .mesh : .globe,
-                                title: peer.inRange ? "Nearby" : "Out of range",
-                                value: peer.inRange ? "Bluetooth mesh" : peer.detail)
+                    MacInfoLine(
+                        icon: transport == .mesh ? .mesh : .globe,
+                        title: transport == .mesh ? "Nearby" : "Out of range",
+                        value: transport == .mesh ? "Bluetooth mesh" : "Encrypted over the internet"
+                    )
                     MacInfoLine(icon: .lock,
                                 title: "Encryption",
                                 value: "End-to-end encrypted")
@@ -3251,8 +3256,8 @@ private struct MacDMDetailRail: View {
     }
 
     private var deliverySubtitle: String {
-        if peer.inRange {
-            return "\(peer.hint) - over Bluetooth"
+        if transport == .mesh {
+            return "Nearby - over Bluetooth"
         }
         return "Out of range - over the internet"
     }
