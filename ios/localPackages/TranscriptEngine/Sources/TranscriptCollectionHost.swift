@@ -25,6 +25,10 @@ public typealias TranscriptUnreadAnchorResolver = (
 /// Cell + measure hooks supplied by the host app (Sonar bubbles, sample UILabels, …).
 public struct TranscriptCollectionHostCallbacks {
     public var configureCell: (UICollectionView, UICollectionViewCell, IndexPath, TranscriptDayRow) -> Void
+    /// Sticky day header chrome. When nil, the host falls back to a plain `UILabel`.
+    /// Apps with custom pills (Sonar `SNStickyDayHeader`) must supply this so measure
+    /// (`headerHeight`) and display stay on the same object graph.
+    public var configureHeader: ((UICollectionView, UICollectionViewCell, IndexPath, String) -> Void)?
     public var itemHeight: (TranscriptDayRow, String, CGFloat) -> CGFloat
     public var headerHeight: (String, CGFloat) -> CGFloat
     public var unreadAnchorResolver: TranscriptUnreadAnchorResolver?
@@ -33,9 +37,11 @@ public struct TranscriptCollectionHostCallbacks {
         configureCell: @escaping (UICollectionView, UICollectionViewCell, IndexPath, TranscriptDayRow) -> Void,
         itemHeight: @escaping (TranscriptDayRow, String, CGFloat) -> CGFloat,
         headerHeight: @escaping (String, CGFloat) -> CGFloat,
+        configureHeader: ((UICollectionView, UICollectionViewCell, IndexPath, String) -> Void)? = nil,
         unreadAnchorResolver: TranscriptUnreadAnchorResolver? = nil
     ) {
         self.configureCell = configureCell
+        self.configureHeader = configureHeader
         self.itemHeight = itemHeight
         self.headerHeight = headerHeight
         self.unreadAnchorResolver = unreadAnchorResolver
@@ -321,6 +327,11 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
                   let section = self.dataSource?.sectionIdentifier(for: indexPath.section),
                   !section.label.isEmpty
             else { return }
+            if let configureHeader = self.callbacks.configureHeader {
+                configureHeader(self.collectionView, header, indexPath, section.label)
+                return
+            }
+            // Default sample chrome — production apps should pass configureHeader.
             header.contentConfiguration = nil
             header.contentView.subviews.forEach { $0.removeFromSuperview() }
             let label = UILabel()
@@ -466,7 +477,15 @@ public final class TranscriptCollectionHostViewController<Composer: View>: UIVie
             if unreadAnchorId == nil { unreadAnchorAbandoned = true }
             return
         }
-        unreadAnchorAbandoned = true
+        // Generic default: Nth-from-end entry id. Apps that filter mine/calls
+        // (Sonar) must supply unreadAnchorResolver — omitting it must not
+        // silently abandon UnreadDivider opens to LiveEdge.
+        let offset = max(0, entries.count - Int(unreadCountAtOpen))
+        if offset < entries.count {
+            unreadAnchorId = entries[offset].id
+        } else {
+            unreadAnchorAbandoned = true
+        }
     }
 
     private func scrollToInitialPosition() {

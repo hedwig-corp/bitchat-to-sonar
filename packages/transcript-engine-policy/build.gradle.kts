@@ -18,8 +18,11 @@ kotlin {
         commonTest.dependencies {
             implementation(kotlin("test"))
         }
+        // Canonical golden lives in golden/; wire it once (do NOT also add
+        // src/commonTest/resources — KMP already includes that path and a
+        // duplicate open-action.json breaks jvmTestProcessResources).
         val commonTest by getting {
-            resources.srcDir("src/commonTest/resources")
+            resources.srcDir("golden")
         }
     }
 }
@@ -34,5 +37,5 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    sourceSets["test"].resources.srcDir("src/commonTest/resources")
+    sourceSets["test"].resources.srcDir("golden")
 }

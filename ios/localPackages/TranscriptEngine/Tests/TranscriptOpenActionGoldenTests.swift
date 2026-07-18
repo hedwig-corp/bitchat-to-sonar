@@ -30,11 +30,10 @@ struct TranscriptOpenActionGoldenTests {
     private func expectedAction(from raw: String) -> TranscriptOpenAction {
         if raw == "LiveEdge" { return .liveEdge }
         if raw == "UnreadDivider" { return .unreadDivider }
-        if raw.hasPrefix("{") {
-            // {"Jump":"m:search"}
-            let id = raw
-                .replacingOccurrences(of: "{\"Jump\":\"", with: "")
-                .replacingOccurrences(of: "\"}", with: "")
+        if raw.hasPrefix("{"),
+           let data = raw.data(using: .utf8),
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let id = obj["Jump"] as? String {
             return .jump(id: id)
         }
         Issue.record("Unknown golden expected: \(raw)")

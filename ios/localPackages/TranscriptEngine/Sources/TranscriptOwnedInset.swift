@@ -23,6 +23,9 @@ public func transcriptFloatingComposerGap(
 }
 
 /// Legacy helper for tests that pass chrome metrics without a live frame.
+/// `safeAreaBottom` is intentionally unused — owned inset is viewport occlusion,
+/// not "bar + safe area". Prefer `transcriptOwnedBottomContentInset(collectionBoundsHeight:composerMinYInViewport:)`.
+@available(*, deprecated, message: "Use viewport-space overload; safeAreaBottom is ignored")
 public func transcriptOwnedBottomContentInset(barHeight: CGFloat, safeAreaBottom: CGFloat) -> CGFloat {
     max(0, barHeight)
 }
