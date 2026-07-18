@@ -356,7 +356,12 @@ private final class SNComposerRootStore<Composer: View>: ObservableObject {
 
 private struct SNComposerRootView<Composer: View>: View {
     @ObservedObject var store: SNComposerRootStore<Composer>
-    var body: some View { store.composer }
+    var body: some View {
+        // The UIKit container is already placed by keyboardLayoutGuide above the
+        // home indicator / IME. Suppress hosting safe-area bottom padding here
+        // so iOS 16.0–16.3 (no `safeAreaRegions`) cannot add a second band.
+        store.composer.ignoresSafeArea(.container, edges: .bottom)
+    }
 }
 
 private struct SNTranscriptCollectionRepresentable<Composer: View>: UIViewControllerRepresentable {
