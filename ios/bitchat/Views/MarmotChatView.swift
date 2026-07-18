@@ -2620,7 +2620,11 @@ final class MarmotChatModel: ObservableObject {
             if Task.isCancelled {
                 // Delete raced setup: drop the freshly created group so the next
                 // intentional startChat mints a clean MLS conversation.
-                try? await service.deleteGroup(groupId: groupId)
+                do {
+                    try await service.deleteGroup(groupId: groupId)
+                } catch {
+                    self.errorText = Self.describe(error)
+                }
                 return nil
             }
             await loadLocalPage(groupId: groupId, mode: .newestPage)
