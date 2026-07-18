@@ -759,12 +759,16 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     // MARK: - Nickname Management
     
     private func loadNickname() {
-        if let savedNickname = userDefaults.string(forKey: nicknameKey) {
-            // Trim whitespace when loading
-            nickname = savedNickname.trimmingCharacters(in: .whitespacesAndNewlines)
-        } else {
+        // A present key (including "") means "use it". Only mint anon on a true
+        // first launch when the key was never written. After nsec restore we
+        // persist "" so a relaunch before kind-0 hydrate cannot invent anonXXXX
+        // and republish over the durable relay profile.
+        let saved = userDefaults.string(forKey: nicknameKey)
+        if OwnProfileHydration.shouldMintAnonymousNickname(savedValue: saved) {
             nickname = "anon\(Int.random(in: 1000...9999))"
             saveNickname()
+        } else {
+            nickname = (saved ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
     }
     
@@ -774,6 +778,19 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         
         // Send announce with new nickname to all peers
         meshService.sendBroadcastAnnounce()
+    }
+
+    /// Clear the device-bound nickname when replacing the account via nsec
+    /// restore. The restored identity's kind-0 on relays is authoritative;
+    /// keeping the previous account's nick would publish over it.
+    /// Persist an empty string (do not remove the key) so relaunch does not
+    /// treat this as a first install and mint a random anon nick.
+    func clearNicknameForAccountRestore() {
+        nickname = ""
+        userDefaults.set("", forKey: nicknameKey)
+        if !meshService.myPeerID.isEmpty {
+            meshService.setNickname("")
+        }
     }
     
     func validateAndSaveNickname() {

@@ -239,6 +239,23 @@ final class MarmotChatModel: ObservableObject {
     /// (on the npub signal / explicit rename) and could be lost to relay or
     /// onboarding timing — leaving peers to see a raw npub instead of the name.
     var profileNameProvider: (() -> String)?
+    /// Host bip353 / handle pref for hydration planning. Set by SonarAppStore.
+    var localBip353Provider: (() -> String)?
+    /// Default Sonar handle domain (registrar). Set by SonarAppStore.
+    var handleDomainProvider: (() -> String)?
+    /// Best-effort BOLT12 offer for restore reclaim. Set by SonarAppStore.
+    var handleOfferProvider: (() async -> String?)?
+    /// Called on the main actor after our own kind-0 is fetched on relay
+    /// connect, so the host can adopt name / NIP-05 into local profile state
+    /// before any republish. Set by SonarAppStore.
+    var onOwnProfileFetched: ((MarmotService.Profile) -> Void)?
+    /// Called on the main actor after a restore reclaim seeds the core sidecar.
+    /// Set by SonarAppStore — do not mark `coreClaimedHandle` before this.
+    var onOwnHandleSidecarSeeded: ((String) -> Void)?
+    /// After the first own-kind-0 fetch this process, handle-less accounts can
+    /// skip the RTT on later reconnects. Sonar-domain prefs without a sidecar
+    /// still re-enter so reclaim can retry.
+    private var didFetchOwnProfileThisSession = false
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
@@ -707,12 +724,20 @@ final class MarmotChatModel: ObservableObject {
                 // delayed the first drain by ~50s on device (t3→t3a).
                 self.startPolling()
                 try? await self.service.publishKeyPackageBackground()
+                // After nsec restore the local nick/handle sidecars are empty.
+                // Fetch our own kind-0 first so the host can adopt name + nip05
+                // before any republish — publishing blank/stale metadata would
+                // replace the durable relay profile.
+                let safeToPublish = await self.hydrateOwnProfileFromRelays()
                 // Republish our kind-0 profile here too (not just on the npub
                 // signal / rename): the KeyPackage lands reliably on every relay
                 // connect, but the profile previously did not, so peers saw our
                 // raw npub when the opportunistic publish lost the relay /
-                // onboarding race. Keep them in lockstep.
-                if let name = self.profileNameProvider?()
+                // onboarding race. Keep them in lockstep. Never publish a blank
+                // name or before the handle sidecar is seeded (would wipe
+                // relay metadata / nip05).
+                if safeToPublish,
+                   let name = self.profileNameProvider?()
                     .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
                     try? await self.service.publishProfileBackground(name: name)
                 }
@@ -1594,6 +1619,84 @@ final class MarmotChatModel: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         Task { try? await service.publishProfileBackground(name: trimmed) }
+    }
+
+    /// Fetch our own kind-0, cache it, let the host adopt name/NIP-05, and
+    /// re-claim the handle when the core sidecar is empty so later publishes
+    /// cannot drop `nip05`. Returns whether it is safe to republish kind-0.
+    @discardableResult
+    func hydrateOwnProfileFromRelays() async -> Bool {
+        let localNick = (profileNameProvider?() ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let localBip = localBip353Provider?() ?? ""
+        let domain = handleDomainProvider?() ?? defaultHandleDomain()
+        let claimedNow = await service.claimedHandle()
+        let needsFetch = OwnProfileHydration.needsRelayFetch(
+            localNickname: localNick,
+            localBip353: localBip,
+            localClaimedHandle: claimedNow,
+            handleDomain: domain
+        )
+        if !needsFetch {
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
+        // Handle-less accounts only need one own-profile fetch per process to
+        // learn whether relays hold a nip05. Keep retrying when a Sonar-domain
+        // pref still lacks a sidecar (reclaim may have failed earlier).
+        let bipTrimmed = localBip.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sonarMissingSidecar = !bipTrimmed.isEmpty
+            && bipTrimmed.lowercased().hasSuffix("@\(domain.lowercased())")
+            && (claimedNow?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+        if didFetchOwnProfileThisSession, !localNick.isEmpty, !sonarMissingSidecar {
+            return OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
+        guard let me = npub?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !me.isEmpty
+        else {
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
+        guard let profile = try? await service.fetchProfile(npub: me) else {
+            // Do not set didFetchOwnProfileThisSession — a miss should retry.
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
+        didFetchOwnProfileThisSession = true
+        let key = SNMarmotProfileCache.canonicalKey(me)
+        await MainActor.run {
+            profilesByNpub[key] = profile
+            profileFetchedAt[key] = Date()
+            SNMarmotProfileCache.save(profilesByNpub, to: defaults)
+            onOwnProfileFetched?(profile)
+        }
+        let claimed = await service.claimedHandle()
+        let plan = OwnProfileHydration.plan(
+            localNickname: profileNameProvider?() ?? "",
+            localBip353: localBip353Provider?() ?? localBip,
+            localClaimedHandle: claimed,
+            remoteName: profile.bestName,
+            remoteNip05: profile.nip05,
+            handleDomain: domain
+        )
+        var handleSeeded = plan.handleLocalToClaim == nil
+        if let local = plan.handleLocalToClaim, !local.isEmpty {
+            let offer = await handleOfferProvider?()
+            if let address = try? await service.claimHandle(handle: local, offer: offer) {
+                handleSeeded = true
+                await MainActor.run { onOwnHandleSidecarSeeded?(address) }
+            }
+        }
+        return plan.shouldPublishNickname && handleSeeded
     }
 
     /// Claim a unified handle at the Sonar registrar (blocking network inside
