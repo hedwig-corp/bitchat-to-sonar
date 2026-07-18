@@ -62,15 +62,28 @@ export function categoryFromTopics(topics) {
 }
 
 /**
- * Format a unix timestamp (seconds) as the design's date string, e.g.
+ * Format a unix timestamp (seconds) as a locale date string, e.g.
  * "July 14, 2026". Falls back to an empty string on bad input.
  * @param {number} unixSeconds
+ * @param {string} [locale='en'] BCP-47 or site locale (`it`, `de`, …)
  * @returns {string}
  */
-export function formatBlogDate(unixSeconds) {
+export function formatBlogDate(unixSeconds, locale = 'en') {
 	if (!Number.isFinite(unixSeconds) || unixSeconds <= 0) return '';
 	try {
-		return new Date(unixSeconds * 1000).toLocaleDateString('en-US', {
+		const tag =
+			locale === 'it'
+				? 'it-IT'
+				: locale === 'de'
+					? 'de-DE'
+					: locale === 'es'
+						? 'es-ES'
+						: locale === 'pt'
+							? 'pt-BR'
+							: locale === 'fr'
+								? 'fr-FR'
+								: 'en-US';
+		return new Date(unixSeconds * 1000).toLocaleDateString(tag, {
 			month: 'long',
 			day: 'numeric',
 			year: 'numeric',
@@ -84,10 +97,24 @@ export function formatBlogDate(unixSeconds) {
 /**
  * Estimate reading time from markdown body at ~200 words/min, min 1 minute.
  * @param {string} md
+ * @param {string} [locale='en']
  * @returns {string} e.g. "8 min read"
  */
-export function estimateReadTime(md) {
+export function estimateReadTime(md, locale = 'en') {
 	const words = md.trim().split(/\s+/).filter(Boolean).length;
 	const minutes = Math.max(1, Math.round(words / 200));
-	return `${minutes} min read`;
+	switch (locale) {
+		case 'it':
+			return `${minutes} min di lettura`;
+		case 'de':
+			return `${minutes} Min. Lesezeit`;
+		case 'es':
+			return `${minutes} min de lectura`;
+		case 'pt':
+			return `${minutes} min de leitura`;
+		case 'fr':
+			return `${minutes} min de lecture`;
+		default:
+			return `${minutes} min read`;
+	}
 }

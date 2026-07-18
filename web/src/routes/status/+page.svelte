@@ -17,6 +17,7 @@
 	} from '$lib/status-data.js';
 	import { fetchStatusFromNostr, isStatusFeedConfigured } from '$lib/status-nostr.js';
 	import { fetchIncidentsFromNostr } from '$lib/status-incidents.js';
+	import { t } from '$lib/i18n/i18n.svelte.js';
 
 	/** @typedef {import('$lib/status-data.js').StatusService} StatusService */
 	/** @typedef {import('$lib/status-data.js').StatusIncident} StatusIncident */
@@ -42,7 +43,7 @@
 
 	/** @type {'waiting' | 'nostr'} */
 	let dataSource = 'waiting';
-	let updatedLabel = 'waiting for status feed';
+	let updatedLabel = t('status.waitingFeed');
 
 	/** @type {Array<{ url: string, region: string, ms: number | null, pending: boolean }>} */
 	let relayRows = relays.map((r) => ({
@@ -53,23 +54,23 @@
 	}));
 
 	let pinging = true;
-	let pingNote = 'Pinging relays over live WebSocket connections…';
+	let pingNote = t('status.pinging');
 	/** @type {number} */
 	let pingGeneration = 0;
 
 	$: worst = worstServiceState(services);
 	$: heroTitle =
 		worst === 'ok'
-			? 'All systems operational'
+			? t('status.hero.ok')
 			: worst === 'down'
-				? 'Major outage'
-				: 'Some systems degraded';
+				? t('status.hero.down')
+				: t('status.hero.warn');
 	$: heroSubDetail =
 		worst === 'ok'
 			? ''
 			: worst === 'down'
-				? 'One or more services are unavailable · '
-				: 'Some services are degraded · ';
+				? t('status.hero.detail.down')
+				: t('status.hero.detail.warn');
 
 	/**
 	 * @param {StatusService} s
@@ -86,9 +87,9 @@
 	 * @param {'ok' | 'warn' | 'down'} state
 	 */
 	function serviceLabel(state) {
-		if (state === 'down') return 'Outage';
-		if (state === 'warn') return 'Degraded';
-		return 'Operational';
+		if (state === 'down') return t('status.badge.down');
+		if (state === 'warn') return t('status.badge.warn');
+		return t('status.badge.ok');
 	}
 
 	/**
@@ -109,7 +110,7 @@
 	 */
 	function formatMs(ms, pending) {
 		if (pending || ms === null) return '…';
-		if (ms < 0) return 'timeout';
+		if (ms < 0) return t('status.timeout');
 		return `${Math.round(ms)} ms`;
 	}
 
@@ -181,7 +182,7 @@
 	async function runPings() {
 		const gen = ++pingGeneration;
 		pinging = true;
-		pingNote = 'Pinging relays over live WebSocket connections…';
+		pingNote = t('status.pinging');
 		relayRows = relayRows.map((r) => ({ ...r, pending: true, ms: null }));
 
 		const results = await Promise.all(
@@ -202,17 +203,21 @@
 		pinging = false;
 		pingNote =
 			reachable === 0
-				? `0/${relayRows.length} relays reachable from your browser just now`
-				: `${reachable}/${relayRows.length} relays reachable · median ${Math.round(median)} ms · measured from your browser just now`;
+				? t('status.ping.none', { total: relayRows.length })
+				: t('status.ping.ok', {
+						reachable,
+						total: relayRows.length,
+						ms: Math.round(median)
+					});
 	}
 
 	function refreshUpdatedLabel() {
 		const now = new Date().toUTCString().replace('GMT', 'UTC');
 		// v1 does not verify schnorr — say "status feed", not "signed feed".
 		if (dataSource === 'nostr') {
-			updatedLabel = `status feed · updated ${now}`;
+			updatedLabel = t('status.feed.updated', { when: now });
 		} else {
-			updatedLabel = 'waiting for status feed';
+			updatedLabel = t('status.waitingFeed');
 		}
 	}
 
@@ -256,7 +261,7 @@
 </script>
 
 <svelte:head>
-	<title>Sonar Status</title>
+	<title>{t('status.title')}</title>
 	<meta
 		name="description"
 		content="Live Sonar service status, public Nostr relay latency from your browser, and past incidents."
@@ -268,11 +273,11 @@
 		<div class="navin">
 			<a class="wordmark" href={homeHref}>
 				<SonarMark size={27} />
-				sonar<span class="tag">status</span>
+				sonar<span class="tag">{t('status.tag')}</span>
 			</a>
 			<div class="navlinks">
-				<a class="btn ghost" href={docsHref}>Docs</a>
-				<a class="btn ghost" href={homeHref}>Home</a>
+				<a class="btn ghost" href={docsHref}>{t('nav.docs')}</a>
+				<a class="btn ghost" href={homeHref}>{t('nav.home')}</a>
 			</div>
 		</div>
 	</nav>
@@ -306,10 +311,10 @@
 			</div>
 		</div>
 
-		<h2>Sonar services <span class="rt">{services.length} services</span></h2>
+		<h2>{t('status.services.h2')} <span class="rt">{t('status.services.count', { n: services.length })}</span></h2>
 		<div class="svc">
 			{#if services.length === 0}
-			<p class="waiting-state">Waiting for status feed data…</p>
+			<p class="waiting-state">{t('status.waitingData')}</p>
 		{:else}
 		{#each services as s (s.id)}
 				{@const state = serviceBadge(s)}
@@ -327,26 +332,26 @@
 						{/each}
 					</div>
 					<div class="barsmeta">
-						<span>90 days ago</span>
-						<span>{s.uptime.toFixed(2)}% uptime</span>
-						<span>today</span>
+						<span>{t('status.daysAgo')}</span>
+						<span>{t('status.uptime', { n: s.uptime.toFixed(2) })}</span>
+						<span>{t('status.today')}</span>
 					</div>
 				</div>
 			{/each}
 			{/if}
 		</div>
 		<div class="legend">
-			<span><span class="dot ok"></span>Operational</span>
-			<span><span class="dot warn"></span>Degraded performance</span>
-			<span><span class="dot down"></span>Outage</span>
-			<span class="legend-note">Each bar = 1 day · last 90 days (illustrative; live state from status feed when configured)</span>
+			<span><span class="dot ok"></span>{t('status.legend.ok')}</span>
+			<span><span class="dot warn"></span>{t('status.legend.warn')}</span>
+			<span><span class="dot down"></span>{t('status.legend.down')}</span>
+			<span class="legend-note">{t('status.legend.note')}</span>
 		</div>
 
 		<h2>
-			Relay network
+			{t('status.relays.h2')}
 			<span class="rt">
 				<button type="button" class="btn ghost rebtn" onclick={runPings} disabled={pinging}
-					>Re-run ping</button
+					>{t('status.rerun')}</button
 				>
 			</span>
 		</h2>
@@ -381,14 +386,12 @@
 			{pingNote}
 		</div>
 		<p class="relay-disclaimer">
-			These are Sonar’s client bootstrap relays (iOS + Android defaults), plus the official White
-			Noise relays Sonar interoperates with over Marmot. RTT is WebSocket open latency from
-			<em>your</em> browser. Geohash channels use a separate GPS relay directory.
+			{t('status.relays.disclaimer', { em: t('status.relays.note.em') })}
 		</p>
 
-		<h2>Past incidents</h2>
+		<h2>{t('status.incidents.h2')}</h2>
 		{#if incidents.length === 0}
-			<p class="empty-incidents">No incidents reported.</p>
+			<p class="empty-incidents">{t('status.incidents.empty')}</p>
 		{:else}
 			{#each incidents as inc, idx (idx)}
 				<div class="inc">
@@ -415,10 +418,10 @@
 
 	<footer>
 		<div class="wrap footin">
-			<span>Sonar Status · all times UTC</span>
+			<span>{t('status.footer')}</span>
 			<span class="subscribe"
-				><a href={subscribeHref} target="_blank" rel="noopener">Subscribe to updates</a> ·
-				<a href={docsHref}>Read the docs</a></span
+				><a href={subscribeHref} target="_blank" rel="noopener">{t('status.subscribe')}</a> ·
+				<a href={docsHref}>{t('status.readDocs')}</a></span
 			>
 		</div>
 	</footer>

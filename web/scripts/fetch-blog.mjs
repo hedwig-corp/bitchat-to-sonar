@@ -25,6 +25,31 @@ import { fetchAuthorProfile } from '../src/lib/blog-author.js';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, '../src/lib/blog-content.js');
 
+const BAKE_DEADLINE_MS = 45_000;
+
+/**
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} label
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, ms, label) {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+		promise.then(
+			(value) => {
+				clearTimeout(timer);
+				resolve(value);
+			},
+			(err) => {
+				clearTimeout(timer);
+				reject(err);
+			}
+		);
+	});
+}
+
 async function main() {
 	if (!isBlogFeedConfigured()) {
 		console.error('fetch-blog: BLOG_PUBKEY_HEX is not set in blog-data.js — skipping.');
@@ -32,13 +57,20 @@ async function main() {
 	}
 
 	console.error(`fetch-blog: querying the blog feed (marker-gated) for ${BLOG_PUBKEY_HEX.slice(0, 12)}…`);
-	const { posts: raw, source } = await fetchPostsFromNostr();
+	const { posts: raw, source } = await withTimeout(
+		fetchPostsFromNostr(),
+		BAKE_DEADLINE_MS,
+		'fetchPostsFromNostr'
+	);
 	if (source !== 'nostr' || raw.length === 0) {
 		console.error('fetch-blog: no marked posts returned — leaving blog-content.js unchanged.');
 		return;
 	}
-	const posts = raw.map(({ _ts, ...p }) => p);
-	const author = await fetchAuthorProfile();
+	// Keep `_ts` so the site can localize dates without re-parsing English strings.
+	const posts = raw;
+	const author = await withTimeout(fetchAuthorProfile(), 15_000, 'fetchAuthorProfile').catch(
+		() => null
+	);
 
 	writeFileSync(OUT, render(posts, author), 'utf8');
 	console.error(`fetch-blog: wrote ${posts.length} post(s) to src/lib/blog-content.js:`);
@@ -48,12 +80,52 @@ async function main() {
 			? `  author: ${author.name || '(no name)'}${author.picture ? ' + avatar' : ''}`
 			: '  author: no kind-0 profile found'
 	);
+
+	// Site-only locale overlays (AI when SONAR_BLOG_TRANSLATE_API_KEY is set).
+	// Best-effort; never fails the bake. Use spawn (async) so a stuck child
+	// cannot pin the Node process the way spawnSync would.
+	try {
+		const { spawn } = await import('node:child_process');
+		await new Promise((resolve) => {
+			const child = spawn(process.execPath, [resolve(HERE, 'translate-blog.mjs')], {
+				cwd: resolve(HERE, '..'),
+				stdio: 'inherit',
+				env: process.env
+			});
+			const killTimer = setTimeout(() => {
+				console.error('fetch-blog: translate-blog exceeded 60s — killing child.');
+				child.kill('SIGKILL');
+			}, 60_000);
+			child.on('exit', (code) => {
+				clearTimeout(killTimer);
+				if (code !== 0 && code !== null) {
+					console.error('fetch-blog: translate-blog exited non-zero — keeping prior overlays.');
+				}
+				resolve(undefined);
+			});
+			child.on('error', (err) => {
+				clearTimeout(killTimer);
+				console.error(`fetch-blog: translate step skipped (${err?.message ?? err})`);
+				resolve(undefined);
+			});
+		});
+	} catch (err) {
+		console.error(`fetch-blog: translate step skipped (${err?.message ?? err})`);
+	}
 }
 
-main().catch((err) => {
-	// Never fail the build over a relay/network hiccup — keep the committed copy.
-	console.error(`fetch-blog: fetch failed (${err?.message ?? err}) — leaving blog-content.js unchanged.`);
-});
+main()
+	.catch((err) => {
+		// Never fail the build over a relay/network hiccup — keep the committed copy.
+		console.error(
+			`fetch-blog: fetch failed (${err?.message ?? err}) — leaving blog-content.js unchanged.`
+		);
+	})
+	.finally(() => {
+		// Hung WebSockets can keep the event loop alive after our deadline; exit
+		// explicitly so CI/Pages never sit on this script.
+		process.exit(0);
+	});
 
 /**
  * @param {object[]} posts
@@ -74,12 +146,13 @@ function render(posts, authorProfile) {
  * @property {string} id        url-hash slug, e.g. 'why-no-accounts'
  * @property {string} title
  * @property {'Policy' | 'Design' | 'Engineering'} cat  Policy = gold, Design = indigo, else cyan
- * @property {string} date      e.g. 'July 12, 2026'
+ * @property {string} date      e.g. 'July 12, 2026' (English bake; UI re-formats via _ts)
  * @property {string} read      e.g. '6 min read'
  * @property {string} author    e.g. 'The Sonar team'
  * @property {boolean} [feature] pinned as the featured card
  * @property {string} excerpt   one-paragraph teaser shown on the cards
  * @property {string} md        body in markdown — same parser as Docs ($lib/markdown.js)
+ * @property {number} [_ts]     unix seconds for locale-aware date formatting
  */
 
 /** @type {{ posts: BlogPost[] }} */

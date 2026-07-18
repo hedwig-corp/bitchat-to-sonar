@@ -3,6 +3,7 @@
   import { base } from '$app/paths';
   import Nav from '$lib/components/Nav.svelte';
   import Footer from '$lib/components/Footer.svelte';
+  import { t } from '$lib/i18n/i18n.svelte.js';
 
   const PACK_KIND = 30031;
   const PACK_FORMAT = 'sonar-sticker-pack-v1';
@@ -28,7 +29,7 @@
   /** @type {RelayState[]} */
   let relayStates = [];
   let status = 'idle';
-  let statusText = 'Ready';
+  let statusText = t('stickers.ready');
   let copied = false;
 
   /** @type {StickerPackView | null} */
@@ -51,7 +52,7 @@
     const relayList = parseRelayList(relays);
     if (relayList.length === 0) {
       status = 'error';
-      statusText = 'Add at least one wss relay.';
+      statusText = t('stickers.needRelay');
       relayStates = [];
       packs = [];
       return;
@@ -60,22 +61,30 @@
     const filter = buildFilter(address.trim());
     if (!filter) {
       status = 'error';
-      statusText = 'Pack address must use 30031:<pubkey>:<identifier>.';
+      statusText = t('stickers.badAddress');
       relayStates = [];
       packs = [];
       return;
     }
 
     status = 'loading';
-    statusText = 'Loading sticker packs';
-    relayStates = relayList.map((relay) => ({ relay, state: 'loading', message: 'connecting' }));
+    statusText = t('stickers.loading');
+    relayStates = relayList.map((relay) => ({
+      relay,
+      state: 'loading',
+      message: t('stickers.relay.connecting')
+    }));
     copied = false;
 
     const responses = await Promise.all(relayList.map((relay) => queryRelay(relay, filter)));
     relayStates = responses.map(({ relay, state, message, events }) => ({
       relay,
       state,
-      message: message || `${events.length} event${events.length === 1 ? '' : 's'}`
+      message:
+        message ||
+        (events.length === 1
+          ? t('stickers.relay.events', { n: events.length })
+          : t('stickers.relay.eventsPlural', { n: events.length }))
     }));
 
     const byId = new Map();
@@ -99,11 +108,14 @@
 
     if (packs.length === 0) {
       status = 'empty';
-      statusText = 'No sticker packs found.';
+      statusText = t('stickers.none');
       selectedAddress = '';
     } else {
       status = 'ready';
-      statusText = `${packs.length} sticker pack${packs.length === 1 ? '' : 's'} found`;
+      statusText =
+        packs.length === 1
+          ? t('stickers.found', { n: packs.length })
+          : t('stickers.foundPlural', { n: packs.length });
       selectedAddress = address.trim() || packs[0].address;
     }
   }
@@ -213,7 +225,10 @@
       }
 
       timer = setTimeout(() => {
-        finish(events.length > 0 ? 'partial' : 'timeout', 'timeout');
+        finish(
+          events.length > 0 ? 'partial' : 'timeout',
+          t('stickers.relay.timeout')
+        );
       }, QUERY_TIMEOUT_MS);
 
       socket.addEventListener('open', () => {
@@ -237,17 +252,30 @@
           events.push(body);
         }
         if (type === 'EOSE') {
-          finish('ok', `${events.length} event${events.length === 1 ? '' : 's'}`);
+          finish(
+            'ok',
+            events.length === 1
+              ? t('stickers.relay.events', { n: events.length })
+              : t('stickers.relay.eventsPlural', { n: events.length })
+          );
         }
         if (type === 'CLOSED') {
-          finish(events.length > 0 ? 'partial' : 'closed', String(body ?? 'closed'));
+          finish(
+            events.length > 0 ? 'partial' : 'closed',
+            typeof body === 'string' && body ? body : t('stickers.relay.closed')
+          );
         }
         if (type === 'NOTICE') {
-          finish(events.length > 0 ? 'partial' : 'error', String(body ?? 'relay notice'));
+          finish(
+            events.length > 0 ? 'partial' : 'error',
+            typeof body === 'string' && body ? body : t('stickers.relay.error')
+          );
         }
       });
-      socket.addEventListener('error', () => finish('error', 'connection failed'));
-      socket.addEventListener('close', () => finish(events.length > 0 ? 'partial' : 'closed', 'closed'));
+      socket.addEventListener('error', () => finish('error', t('stickers.relay.failed')));
+      socket.addEventListener('close', () =>
+        finish(events.length > 0 ? 'partial' : 'closed', t('stickers.relay.closed'))
+      );
     });
   }
 
@@ -460,7 +488,7 @@
 </script>
 
 <svelte:head>
-  <title>Sonar Stickers</title>
+  <title>{t('stickers.title')}</title>
   <meta
     name="description"
     content="Browse Sonar sticker packs published on Nostr and hosted by Blossom."
@@ -472,12 +500,9 @@
 <main class="stickers-page">
   <section class="wrap stickers-head">
     <div>
-      <p class="label">Sonar Stickers</p>
-      <h1>Sticker packs over Nostr.</h1>
-      <p class="lede">
-        Signal-compatible packs are imported by the CLI, stored on Blossom, and published as
-        addressable Sonar sticker events.
-      </p>
+      <p class="label">{t('stickers.label')}</p>
+      <h1>{t('stickers.h1')}</h1>
+      <p class="lede">{t('stickers.lede')}</p>
     </div>
     <div class="statusbar" data-state={status}>
       <span class="status-dot"></span>
@@ -488,14 +513,14 @@
   <section class="wrap sticker-tool">
     <div class="controls" aria-label="Sticker pack query controls">
       <label>
-        <span>Pack address</span>
+        <span>{t('stickers.packAddress')}</span>
         <input bind:value={address} placeholder="30031:<pubkey>:signal-..." />
       </label>
       <label>
-        <span>Relays</span>
+        <span>{t('stickers.relays')}</span>
         <textarea bind:value={relays} rows="3"></textarea>
       </label>
-      <button class="btn primary" type="button" onclick={loadPacks}>Load</button>
+      <button class="btn primary" type="button" onclick={loadPacks}>{t('stickers.load')}</button>
     </div>
 
     <div class="relay-strip" aria-label="Relay query status">
@@ -510,7 +535,7 @@
     <div class="sticker-layout">
       <aside class="pack-list" aria-label="Sticker packs">
         {#if packs.length === 0}
-          <div class="empty">No packs loaded.</div>
+          <div class="empty">{t('stickers.empty')}</div>
         {:else}
           {#each packs as pack}
             <button
@@ -522,7 +547,7 @@
               <img src={pack.cover.url} alt={pack.cover.alt} loading="lazy" />
               <span>
                 <strong>{pack.title}</strong>
-                <small>{pack.stickers.length} stickers - {pack.shortPubkey}</small>
+                <small>{t('stickers.count', { n: pack.stickers.length })} - {pack.shortPubkey}</small>
               </span>
             </button>
           {/each}
@@ -534,7 +559,7 @@
           <header class="detail-head">
             <img src={selectedPack.cover.url} alt={selectedPack.cover.alt} loading="lazy" />
             <div>
-              <p class="label">Pack</p>
+              <p class="label">{t('stickers.pack')}</p>
               <h2>{selectedPack.title}</h2>
               {#if selectedPack.description}
                 <p>{selectedPack.description}</p>
@@ -547,7 +572,7 @@
               </div>
             </div>
             <button class="btn ghost small copy" type="button" onclick={copyPackLink}>
-              {copied ? 'Copied' : 'Copy link'}
+              {copied ? t('stickers.copied') : t('stickers.copy')}
             </button>
           </header>
 
@@ -563,7 +588,7 @@
             {/each}
           </div>
         {:else}
-          <div class="empty detail-empty">No sticker pack selected.</div>
+          <div class="empty detail-empty">{t('stickers.noneSelected')}</div>
         {/if}
       </article>
     </div>

@@ -67,6 +67,26 @@ Pushing to `main` triggers `.github/workflows/pages.yml`, which builds this
 directory and publishes `web/build` to GitHub Pages. `BASE_PATH` is set to the
 repo name for the production build.
 
+## Locales (i18n)
+
+The site picks `it` / `de` / `es` / `pt` / `fr` from `navigator.languages` on
+the client (English otherwise). There are no `/it/` URL prefixes in v1.
+
+- UI chrome + landing copy: `web/src/lib/i18n/catalog.js`
+- Locale helpers: `web/src/lib/i18n/locales.js`, `i18n.svelte.js`
+- Blog bodies: English NIP-23 stays canonical; site-only overlays live in
+  `web/src/lib/blog-translations.js` and are merged after bake / live fetch
+
+After `npm run fetch-blog`, translations refresh when
+`SONAR_BLOG_TRANSLATE_API_KEY` (OpenAI-compatible) is set; otherwise the
+committed overlays are left untouched. Never put that key in client code.
+
+```sh
+npm run test:i18n   # locale resolve + overlay smoke tests
+```
+
+Docs / status incident **bodies** stay English in v1; page chrome is translated.
+
 ## Notes
 
 - Radar sweeps and pulses respect `prefers-reduced-motion`.
