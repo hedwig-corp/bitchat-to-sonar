@@ -111,6 +111,7 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
+const SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX: &str = "sonar.direct-dm-operation.v1:";
 const SONAR_GROUP_OPERATION_DESCRIPTION_PREFIX: &str = "sonar.group-operation.v1:";
 const MAX_GROUP_OPERATION_ID_BYTES: usize = 512;
 
@@ -2322,6 +2323,24 @@ impl SonarClient {
     ) -> Result<GroupId> {
         let _operation_guard = self.group_operation_gate.lock().await;
         let description = group_operation_description(operation_id)?;
+        self.start_group_idempotent_locked(members, name, operation_id, description, None, true)
+            .await
+    }
+
+    /// Create or resume one operation-marked group. The caller must hold
+    /// `group_operation_gate` so creation, Welcome replay, and cancellation
+    /// cannot cross. `fallback_group` lets direct-message setup reuse an older
+    /// completed `sonar.direct-dm.v1` route only after recovery has ruled out an
+    /// operation-marked group left at a crash boundary.
+    async fn start_group_idempotent_locked(
+        &self,
+        members: Vec<PublicKey>,
+        name: &str,
+        operation_id: &str,
+        description: String,
+        fallback_group: Option<GroupId>,
+        require_name_match: bool,
+    ) -> Result<GroupId> {
         let cancellation_pending = self
             .pre_route_outbox
             .lock()
@@ -2333,13 +2352,18 @@ impl SonarClient {
                 .await?;
             return Err(Error::InvalidInput("group operation was cancelled".into()));
         }
-        if let Some(group_id) = self.find_group_for_operation(&members, name, &description)? {
+        if let Some(group_id) =
+            self.find_group_for_operation(&members, name, &description, require_name_match)?
+        {
             if let Some(group_id) = self
                 .resume_idempotent_group_creation(&description, group_id)
                 .await?
             {
                 return Ok(group_id);
             }
+        }
+        if let Some(group_id) = fallback_group {
+            return Ok(group_id);
         }
         let key_packages = self.fetch_key_packages_for_members(members).await?;
         {
@@ -2412,6 +2436,7 @@ impl SonarClient {
         members: &[PublicKey],
         name: &str,
         description: &str,
+        require_name_match: bool,
     ) -> Result<Option<GroupId>> {
         let expected_members: HashSet<_> = members
             .iter()
@@ -2427,7 +2452,7 @@ impl SonarClient {
                 .members(&group.mls_group_id)?
                 .into_iter()
                 .collect();
-            if group.name != name || actual_members != expected_members {
+            if (require_name_match && group.name != name) || actual_members != expected_members {
                 return Err(Error::InvalidInput(
                     "group operation id was reused with different group details".into(),
                 ));
@@ -2448,17 +2473,19 @@ impl SonarClient {
                 "direct message requires another member".into(),
             ));
         }
-        if let Some(existing) = self.find_dm_group_with(&peer)? {
-            return Ok(existing);
-        }
-        let key_packages = self.fetch_key_packages_for_members(vec![peer]).await?;
-        let creation = self.engine.create_group_with_description(
+        let _operation_guard = self.group_operation_gate.lock().await;
+        let operation_id = peer.to_hex();
+        let description = direct_message_operation_description(&peer);
+        let fallback_group = self.find_dm_group_with(&peer)?;
+        self.start_group_idempotent_locked(
+            vec![peer],
             name,
-            SONAR_DIRECT_DM_DESCRIPTION,
-            key_packages,
-            self.relays.clone(),
-        )?;
-        self.publish_group_creation(creation).await
+            &operation_id,
+            description,
+            fallback_group,
+            false,
+        )
+        .await
     }
 
     /// Scan active groups for an existing 1:1 DM with `peer`.
@@ -6104,6 +6131,13 @@ fn group_operation_description(operation_id: &str) -> Result<String> {
     ))
 }
 
+fn direct_message_operation_description(peer: &PublicKey) -> String {
+    format!(
+        "{SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX}{}",
+        sha256_hex(peer.to_hex().as_bytes())
+    )
+}
+
 fn parse_group_id_hex(group_id_hex: &str) -> Result<GroupId> {
     let bytes = hex::decode(group_id_hex)
         .map_err(|err| Error::Storage(format!("group recovery id decode: {err}")))?;
@@ -6138,6 +6172,17 @@ mod tests {
             group_operation_description("marmot-group-pending:private-host-id").unwrap()
         );
         assert!(group_operation_description(" ").is_err());
+    }
+
+    #[test]
+    fn direct_message_operation_description_is_stable_and_private() {
+        let peer = Keys::generate().public_key();
+        let peer_hex = peer.to_hex();
+        let description = direct_message_operation_description(&peer);
+
+        assert!(description.starts_with(SONAR_DIRECT_DM_OPERATION_DESCRIPTION_PREFIX));
+        assert!(!description.contains(&peer_hex));
+        assert_eq!(description, direct_message_operation_description(&peer));
     }
 
     #[tokio::test]
@@ -7872,6 +7917,76 @@ mod tests {
             .unwrap()
             .pending_group_creation(&description)
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn durable_direct_operation_replays_unpublished_welcome_after_restart() {
+        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay_url = relay.url().await;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let db_key = [0x6bu8; 32];
+        let identity = Identity::generate();
+        let peer = MarmotEngine::in_memory(Identity::generate());
+        let peer_pubkey = peer.identity().public_key();
+        let description = direct_message_operation_description(&peer_pubkey);
+
+        let creator =
+            SonarClient::connect(identity.clone(), vec![relay_url.clone()], &db_path, db_key)
+                .await
+                .unwrap();
+        let creation = creator
+            .engine
+            .create_group_with_description(
+                "",
+                &description,
+                vec![peer.key_package_event(vec![relay_url.clone()]).unwrap()],
+                vec![relay_url.clone()],
+            )
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let (member, rumor) = creation.welcomes.into_iter().next().unwrap();
+        let wrapped = creator
+            .engine
+            .gift_wrap_welcome(&member, rumor)
+            .await
+            .unwrap();
+        creator
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .save_pending_group_creation(PendingGroupCreation {
+                operation_description: description.clone(),
+                group_id_hex: Some(hex::encode(group_id.as_slice())),
+                welcome_event_jsons: vec![wrapped.as_json()],
+                cancelled: false,
+            })
+            .unwrap();
+
+        // Model process death after MDK exposed the local route and the signed
+        // Welcome was checkpointed, but before any relay accepted that Welcome.
+        drop(creator);
+
+        let restarted = SonarClient::connect(identity, vec![relay_url], &db_path, db_key)
+            .await
+            .unwrap();
+        let recovered = restarted.start_dm(peer_pubkey, "").await.unwrap();
+
+        assert_eq!(recovered, group_id);
+        assert!(restarted
+            .pre_route_outbox
+            .lock()
+            .unwrap()
+            .pending_group_creation(&description)
+            .is_none());
+        restarted
+            .engine
+            .create_text_message(&group_id, "queued content remains readable")
+            .unwrap();
+        assert!(matches!(
+            peer.process_incoming(&wrapped).await.unwrap(),
+            Incoming::GroupUpdated(recovered_group) if recovered_group == group_id
+        ));
     }
 
     #[tokio::test]
