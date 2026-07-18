@@ -224,6 +224,12 @@ internal actual fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): Thumbnail
         ThumbnailDecode(scaled.toComposeImageBitmap(), encoded)
     }.getOrNull()
 
+/** Desktop: read the file then reuse [decodeThumbnail] (no phone heap pressure). */
+internal actual fun decodeThumbnailFromPath(path: String, maxEdgePx: Int): ThumbnailDecode? =
+    runCatching { java.io.File(path).takeIf { it.isFile }?.readBytes() }
+        .getOrNull()
+        ?.let { decodeThumbnail(it, maxEdgePx) }
+
 // The stock JVM has no video decoder — the preview falls back to a generic
 // video tile (filename + play glyph) instead of a poster frame.
 actual fun decodeVideoPosterFrame(path: String): ImageBitmap? = null

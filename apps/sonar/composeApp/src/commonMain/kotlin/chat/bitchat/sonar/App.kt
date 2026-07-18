@@ -811,8 +811,71 @@ private fun ChannelHint() {
     )
 }
 
-private fun transcriptFeedKey(item: Any): String =
+internal fun transcriptFeedKey(item: Any): String =
     if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
+
+/** Flattened LazyColumn rows so day chips / unread own stable keys (Signal).
+ *  Internal (not private) so tests pin the real feed-flattening call site. */
+internal sealed interface ChatFeedListItem {
+    data class Day(val epochDay: Long, val label: String) : ChatFeedListItem
+    data object Unread : ChatFeedListItem
+    data class Row(val payload: Any, val feedIndex: Int) : ChatFeedListItem
+}
+
+internal fun chatFeedListKey(item: ChatFeedListItem): String = when (item) {
+    is ChatFeedListItem.Day -> "day:${item.epochDay}"
+    ChatFeedListItem.Unread -> "unread"
+    is ChatFeedListItem.Row -> transcriptFeedKey(item.payload)
+}
+
+internal fun buildChatFeedListItems(
+    feed: List<Any>,
+    unreadAnchorIndex: Int,
+): List<ChatFeedListItem> {
+    val out = ArrayList<ChatFeedListItem>(feed.size + 8)
+    feed.forEachIndexed { i, item ->
+        val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
+        val prevAny = feed.getOrNull(i - 1)
+        val prevTs = if (prevAny is CallRecord) prevAny.tsSecs else (prevAny as? SonarMsg)?.tsSecs
+        val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
+        if (newDay) {
+            val epochDay = localEpochDayToday() + localDayDelta(ts)
+            out += ChatFeedListItem.Day(epochDay, dayLabel(ts))
+        }
+        if (i == unreadAnchorIndex) out += ChatFeedListItem.Unread
+        out += ChatFeedListItem.Row(item, i)
+    }
+    return out
+}
+
+/** LazyColumn index for a feed row after Day/Unread items are interleaved. */
+internal fun chatFeedListIndexForFeedRow(listItems: List<ChatFeedListItem>, feedIndex: Int): Int =
+    listItems.indexOfFirst { it is ChatFeedListItem.Row && it.feedIndex == feedIndex }
+
+internal fun chatFeedListIndexForKey(listItems: List<ChatFeedListItem>, key: String): Int =
+    listItems.indexOfFirst { chatFeedListKey(it) == key }
+
+internal fun chatFeedListTailIndex(listItems: List<ChatFeedListItem>): Int =
+    listItems.indexOfLast { it is ChatFeedListItem.Row }.coerceAtLeast(0)
+
+/** Prefer the Unread chip; else the unread message row; else the live-edge row. */
+internal fun chatFeedListOpenIndex(
+    listItems: List<ChatFeedListItem>,
+    unreadFeedKey: String?,
+    unreadFeedIndex: Int,
+): Int {
+    val unreadChip = listItems.indexOfFirst { it is ChatFeedListItem.Unread }
+    if (unreadChip >= 0) return unreadChip
+    if (unreadFeedKey != null) {
+        val byKey = chatFeedListIndexForKey(listItems, unreadFeedKey)
+        if (byKey >= 0) return byKey
+    }
+    if (unreadFeedIndex >= 0) {
+        val byFeed = chatFeedListIndexForFeedRow(listItems, unreadFeedIndex)
+        if (byFeed >= 0) return byFeed
+    }
+    return chatFeedListTailIndex(listItems)
+}
 
 /** Bounds an image bubble renders within (design: .bc-msg media). */
 internal val MAX_MEDIA_BUBBLE_WIDTH = 240.dp
@@ -847,41 +910,30 @@ internal data class TranscriptTailFrame(
     val tailFullyVisible: Boolean,
     val scrolling: Boolean,
     val prepending: Boolean,
+    /** Included so Spike A chrome/IME contentPadding changes are not swallowed. */
+    val afterContentPadding: Int = 0,
 )
 
 internal enum class TranscriptTailPin { None, Snap, Animate }
 
 /**
- * Signal keeps a transcript bottom-anchored: a reader at the tail stays at the
- * tail through keyboard and layout changes. A top-anchored LazyColumn instead
- * keeps its first visible row, so the IME opening (viewport shrink) or a media
- * skeleton swapping to the taller decoded image (tail rows growing) silently
- * pushes the newest messages below the fold. This state machine watches layout
- * frames and asks for a re-anchor only when layout — not the user's scroll and
- * not a history prepend — steals a fully visible tail. [Snap] re-anchors
- * instantly (mid keyboard animation); [Animate] follows a new appended row.
+ * Production adapter over [TranscriptTailPinSession] / [TranscriptScrollPolicy].
+ * Preserves Snap / Animate / None behavior for [TranscriptTailPinning]; policy
+ * is the named API (Phase 1). Lockstep from [TranscriptScrollPolicy.decideInsetChange]
+ * is applied only by [TranscriptPhase2ScrollEffects] when the Phase 2 flag is on.
  */
 internal class TranscriptTailPinner {
-    private var wasPinned = false
-    private var lastCount = -1
+    private val session = TranscriptTailPinSession()
 
-    fun onFrame(frame: TranscriptTailFrame): TranscriptTailPin {
-        val countChanged = frame.itemCount != lastCount
-        lastCount = frame.itemCount
-        return when {
-            frame.prepending || frame.scrolling -> {
-                wasPinned = frame.tailFullyVisible
-                TranscriptTailPin.None
-            }
-            frame.tailFullyVisible -> {
-                wasPinned = true
-                TranscriptTailPin.None
-            }
-            wasPinned && frame.itemCount > 0 ->
-                if (countChanged) TranscriptTailPin.Animate else TranscriptTailPin.Snap
-            else -> TranscriptTailPin.None
-        }
-    }
+    fun onFrame(frame: TranscriptTailFrame): TranscriptTailPin =
+        TranscriptScrollPolicy.toLegacyPin(
+            session.onLayoutFrame(
+                itemCount = frame.itemCount,
+                tailFullyVisible = frame.tailFullyVisible,
+                scrolling = frame.scrolling,
+                prepending = frame.prepending,
+            ),
+        )
 }
 
 /** Pixels the tail row still hangs below the viewport's content area after a
@@ -914,6 +966,22 @@ internal suspend fun LazyListState.anchorTranscriptTail(index: Int, animate: Boo
     if (overflow > 0) scrollBy(overflow.toFloat())
 }
 
+/** True when the newest row's bottom edge is already at the viewport end —
+ *  layout proof for ending LiveEdge open recovery (not merely "last indices
+ *  visible", which can still leave overflow / mid-list under-measure). */
+internal fun LazyListState.isTranscriptTailAtLiveEdge(lastIndex: Int): Boolean {
+    if (lastIndex < 0) return true
+    val info = layoutInfo
+    val last = info.visibleItemsInfo.lastOrNull() ?: return false
+    if (last.index != lastIndex) return false
+    return transcriptTailOverflowPx(
+        lastOffset = last.offset,
+        lastSize = last.size,
+        viewportEndOffset = info.viewportEndOffset,
+        afterContentPadding = info.afterContentPadding,
+    ) == 0
+}
+
 /** Wire [TranscriptTailPinner] to a transcript list: re-anchor the newest row
  *  whenever layout (IME shrink, media growth) — not the user's scroll and not
  *  a history prepend — steals a fully visible tail. */
@@ -928,13 +996,17 @@ internal fun TranscriptTailPinning(
         snapshotFlow {
             val info = listState.layoutInfo
             val last = info.visibleItemsInfo.lastOrNull()
+            val pad = info.afterContentPadding
             TranscriptTailFrame(
                 itemCount = info.totalItemsCount,
                 viewportHeight = info.viewportSize.height,
+                // Tail is "fully visible" only when its bottom clears the
+                // owned bottom chrome (afterContentPadding), Signal-style.
                 tailFullyVisible = last != null && last.index == info.totalItemsCount - 1 &&
-                    last.offset + last.size <= info.viewportEndOffset,
+                    last.offset + last.size <= info.viewportEndOffset - pad,
                 scrolling = listState.isScrollInProgress,
                 prepending = isPrepending(),
+                afterContentPadding = pad,
             )
         }.distinctUntilChanged().collect { frame ->
             val pin = pinner.onFrame(frame)
@@ -953,6 +1025,7 @@ internal fun TranscriptTailPinning(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
@@ -1052,6 +1125,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val unreadAnchorIndex = unreadAnchorId
         ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
         ?: -1
+    val listItems = remember(feed, unreadAnchorIndex) {
+        buildChatFeedListItems(feed, unreadAnchorIndex)
+    }
+    val currentListItems by rememberUpdatedState(listItems)
     // A MESH feed is only trustworthy once the open's async local hydrate has
     // published: it paints the BLE window first and merges the White Noise leg
     // a beat later, which can add OLDER rows — shifting every index and moving
@@ -1068,20 +1145,38 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // chat (Signal parity): start the list state there so the first frame
     // never shows the wrong page and then visibly jumps.
     val listState = remember(screen.id) {
-        val anchor = unreadAnchorId
+        val feedAnchor = unreadAnchorId
             ?.let { id -> feed.indexOfFirst { transcriptFeedKey(it) == id } }
             ?.takeIf { it >= 0 }
             ?: firstUnreadTranscriptIndex(feed, state.openChatUnread[screen.id] ?: 0L)
                 .takeIf { feedCaughtUp(feed) }
             ?: -1
-        LazyListState(
-            firstVisibleItemIndex = if (anchor >= 0) anchor else feed.lastIndex.coerceAtLeast(0),
-        )
+        val items = buildChatFeedListItems(feed, feedAnchor)
+        val start = if (feedAnchor >= 0) {
+            chatFeedListOpenIndex(items, unreadAnchorId, feedAnchor)
+        } else {
+            chatFeedListTailIndex(items)
+        }
+        LazyListState(firstVisibleItemIndex = start.coerceAtLeast(0))
     }
+    // Phase 1+: name the open intent via policy (divider vs live edge).
+    // Production (flag off) still uses historical unread-count gates below.
+    // Phase 2 flagged host drives open from [TranscriptOpenAction] only.
+    val transcriptOpenAction = TranscriptScrollPolicy.resolveOpenAction(
+        unreadAnchorId = unreadAnchorId,
+        unreadCountAtOpen = state.openChatUnread[screen.id],
+    )
+    val phase2Host = SonarTranscriptPolicyHost.isEnabled()
     var isNearBottom by remember(screen.id) { mutableStateOf(true) }
     var didInitialScroll by remember(screen.id) { mutableStateOf(false) }
     var didLeaveTail by remember(screen.id) { mutableStateOf(false) }
     var isPrepending by remember(screen.id) { mutableStateOf(false) }
+    // Fully-read / provisional-live-edge open: keep re-anchoring across
+    // hydration index shifts until the newest row is actually on screen.
+    // Without this, agent DMs land mid-history after older rows prepend.
+    var needsLiveEdgeOpen by remember(screen.id) {
+        mutableStateOf(transcriptOpenAction == TranscriptOpenAction.LiveEdge)
+    }
 
     // The divider must not resurrect or re-scroll once the reader takes over.
     LaunchedEffect(screen.id, listState) {
@@ -1112,7 +1207,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         state.openChatUnreadAnchor = state.openChatUnreadAnchor + (screen.id to anchorKey)
         if (!userScrolled) {
             withFrameNanos { }
-            listState.scrollToItem(anchor)
+            val items = buildChatFeedListItems(feed, anchor)
+            listState.scrollToItem(chatFeedListOpenIndex(items, anchorKey, anchor))
         }
     }
 
@@ -1131,32 +1227,115 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // True while an unread open is still waiting for its divider row: the
     // pending anchor owns the next programmatic scroll, so tail-following must
     // not race it to the bottom when the White Noise leg merges in.
-    fun unreadAnchorPending(): Boolean =
-        (state.openChatUnread[screen.id] ?: 0L) > 0L && unreadAnchorId == null && !userScrolled
+    fun unreadAnchorPending(): Boolean {
+        val count = state.openChatUnread[screen.id]
+        if (userScrolled) return false
+        // Only settled unread (>0) without a divider owns the next scroll.
+        // Unset capture is provisional live edge (keep pinning).
+        return count != null && count > 0L && unreadAnchorId == null
+    }
     // Keyed on the feed SIZE as well as its newest row: hydration merges the
     // White Noise leg in, which can insert only OLDER rows. That leaves the
     // newest key untouched while shifting every index — the tail moves and the
     // viewport is left showing older content until something re-anchors it.
-    LaunchedEffect(screen.id, newestFeedKey, feed.size) {
+    LaunchedEffect(screen.id, newestFeedKey, feed.size, state.openChatUnread[screen.id]) {
         if (feed.isEmpty()) return@LaunchedEffect
         val hydrated = feedCaughtUp(feed)
+        // Settled unread takes over from provisional live edge. Do NOT force
+        // needsLiveEdgeOpen=true on every feed change — that re-snapped the
+        // whole list after identical hydration and looked like a rebuild.
+        if (transcriptOpenAction == TranscriptOpenAction.UnreadDivider) {
+            needsLiveEdgeOpen = false
+        }
         if (!didInitialScroll) {
-            // An unread-anchored open keeps its position; the freeze effect
-            // above owns that scroll. Only a fully-read chat pins the tail.
-            if ((state.openChatUnread[screen.id] ?: 0L) <= 0L) {
-                listState.anchorTranscriptTail(feed.lastIndex, animate = false)
+            val tailIndex = chatFeedListTailIndex(listItems)
+            if (phase2Host) {
+                // Flagged host: open from TranscriptOpenAction only (no unread-count gate).
+                when (transcriptOpenAction) {
+                    TranscriptOpenAction.LiveEdge -> {
+                        listState.anchorTranscriptTail(tailIndex, animate = false)
+                        needsLiveEdgeOpen = true
+                        didInitialScroll = true
+                    }
+                    TranscriptOpenAction.UnreadDivider -> {
+                        val feedIdx = transcriptPhase2OpenIndex(
+                            openAction = transcriptOpenAction,
+                            unreadAnchorIndex = unreadAnchorIndex,
+                            itemCount = feed.size,
+                        )
+                        // Pending unread: do not mark initial scroll or pin tail;
+                        // freeze effect resolves the divider, then we retry.
+                        if (feedIdx >= 0) {
+                            listState.scrollToItem(
+                                chatFeedListOpenIndex(listItems, unreadAnchorId, feedIdx)
+                            )
+                            needsLiveEdgeOpen = false
+                            didInitialScroll = true
+                        }
+                    }
+                    is TranscriptOpenAction.Jump -> {
+                        val jumpIdx = feed.indexOfFirst {
+                            transcriptFeedKey(it) == transcriptOpenAction.id
+                        }
+                        val feedIdx = transcriptPhase2OpenIndex(
+                            openAction = transcriptOpenAction,
+                            unreadAnchorIndex = unreadAnchorIndex,
+                            itemCount = feed.size,
+                            jumpIndex = jumpIdx,
+                        )
+                        val idx = if (jumpIdx >= 0) {
+                            chatFeedListIndexForFeedRow(listItems, jumpIdx).coerceAtLeast(0)
+                        } else {
+                            chatFeedListOpenIndex(listItems, unreadAnchorId, feedIdx)
+                        }
+                        listState.scrollToItem(idx)
+                        needsLiveEdgeOpen = false
+                        didInitialScroll = true
+                    }
+                }
+            } else {
+                // Production: unread-anchored open keeps its position; the freeze
+                // effect above owns that scroll. Fully-read / provisional live
+                // edge pins the tail once, then recovers only when layout proof fails.
+                when (transcriptOpenAction) {
+                    TranscriptOpenAction.LiveEdge -> {
+                        listState.anchorTranscriptTail(tailIndex, animate = false)
+                        needsLiveEdgeOpen = true
+                        didInitialScroll = true
+                    }
+                    TranscriptOpenAction.UnreadDivider -> {
+                        needsLiveEdgeOpen = false
+                        didInitialScroll = true
+                    }
+                    is TranscriptOpenAction.Jump -> {
+                        needsLiveEdgeOpen = false
+                        didInitialScroll = true
+                    }
+                }
             }
-            didInitialScroll = true
-        } else if (!isPrepending && !unreadAnchorPending() &&
-            // Follow the tail when the reader is already there. Until hydration
-            // completes, also follow unconditionally (unless they scrolled
-            // away): the index shift above can push the tail out of the
-            // near-bottom window before this runs.
-            (isNearBottom || (!hydrated && !userScrolled))
+        } else if (!isPrepending && !unreadAnchorPending() && !userScrolled &&
+            // Follow the tail when the reader is already there, while hydration
+            // can still shift indices, or while a fully-read open has not yet
+            // landed the newest row on screen (agent DM mid-history bug).
+            (isNearBottom || !hydrated || needsLiveEdgeOpen)
         ) {
-            // Hydration is not a new message: absorb it instantly so the open
-            // shows no motion. Animate only genuinely new post-settle rows.
-            listState.anchorTranscriptTail(feed.lastIndex, animate = hydrated)
+            val lastIndex = chatFeedListTailIndex(listItems)
+            val atLiveEdge = listState.isTranscriptTailAtLiveEdge(lastIndex)
+            if (needsLiveEdgeOpen) {
+                // Open recovery: correct only when layout is wrong; never animate.
+                // Phase 2 host also owns append/IME pin via TranscriptPhase2ScrollEffects;
+                // this branch must still recover a mistargeted fully-read open.
+                if (!atLiveEdge) {
+                    listState.anchorTranscriptTail(lastIndex, animate = false)
+                }
+                if (hydrated && listState.isTranscriptTailAtLiveEdge(lastIndex)) {
+                    needsLiveEdgeOpen = false
+                }
+            } else if (!phase2Host) {
+                // Legacy shell only: Phase 2's TranscriptPhase2ScrollEffects owns
+                // post-settle append pin / lockstep — double-anchoring here races it.
+                listState.anchorTranscriptTail(lastIndex, animate = hydrated)
+            }
         }
     }
 
@@ -1172,19 +1351,20 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             val anchor = visibleInfo.firstOrNull { it.key.toString().startsWith("m:") }
                 ?: visibleInfo.firstOrNull()
                 ?: return@collect
-            val anchorKey = anchor.key.toString()
-            val anchorOffset = anchor.offset
+            val continuity = TranscriptScrollPolicy.captureContinuityToken(
+                anchorId = anchor.key.toString(),
+                pixelOffset = anchor.offset,
+            )
             isPrepending = true
             if (!state.loadOlderMessages(screen.id)) {
                 isPrepending = false
                 return@collect
             }
             withFrameNanos { }
-            val newIndex = currentFeed.indices.firstOrNull { index ->
-                transcriptFeedKey(currentFeed[index]) == anchorKey
-            } ?: -1
+            val newIndex = chatFeedListIndexForKey(currentListItems, continuity.anchorId)
+            val offset = continuity.pixelOffset ?: 0
             if (newIndex >= 0) {
-                listState.scrollToItem(newIndex, scrollOffset = -anchorOffset)
+                listState.scrollToItem(newIndex, scrollOffset = -offset)
             }
             isPrepending = false
         }
@@ -1202,8 +1382,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             isPrepending = true
             if (state.loadNewestMessages(screen.id)) {
                 withFrameNanos { }
-                if (currentFeed.isNotEmpty()) {
-                    listState.anchorTranscriptTail(currentFeed.lastIndex, animate = false)
+                if (currentListItems.isNotEmpty()) {
+                    listState.anchorTranscriptTail(
+                        chatFeedListTailIndex(currentListItems),
+                        animate = false,
+                    )
                 }
                 didLeaveTail = false
             }
@@ -1217,11 +1400,15 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // below the fold. Re-anchor whenever layout — not the user — steals the tail.
     // A pending unread anchor also suppresses the layout pinner: the White
     // Noise merge growing the item count must jump to the divider, not the tail.
-    TranscriptTailPinning(
-        listState,
-        key = screen.id,
-        isPrepending = { isPrepending || unreadAnchorPending() },
-    )
+    // Phase 2 host owns scroll effects (full-height + owned bottom pad + Lockstep).
+    // Production TranscriptTailPinning maps Lockstep→None. Spike A is not a ChatScreen swap.
+    if (!phase2Host) {
+        TranscriptTailPinning(
+            listState,
+            key = screen.id,
+            isPrepending = { isPrepending || unreadAnchorPending() },
+        )
+    }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
@@ -1253,202 +1440,97 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         state.sendDroppedAttachments(screen.id, files)
     }
 
-    Box(
-        Modifier.fillMaxSize().fileDropTarget(
-            enabled = state.canPrepareMedia(screen.id),
-            maxTotalBytes = attachmentLimit,
-        ) { dropped ->
-            if ((state.screen as? Screen.Chat)?.id != screen.id) return@fileDropTarget
-            state.sendDroppedAttachments(screen.id, dropped)
-        }
-    ) {
-    Column(Modifier.fillMaxSize()) {
-        // bc-header.hl (DM, screens.jsx NavHeader): back · avatar 36 (+presence) ·
-        // name 17/700 + shield · lock + "Nearby · Bluetooth"/"Via internet" ·
-        // phone/videocam trailing, with a bottom hairline.
-        Column {
-            Row(
-                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+    @Composable
+    fun ChatFeedList(listModifier: Modifier, bottomPad: Dp) {
+        // BoxWithConstraints (once, not per row) gives the .bc-msg max-width: 78%.
+        BoxWithConstraints(listModifier) {
+            val bubbleMax = maxWidth * 0.78f
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                state = listState,
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = bottomPad)
             ) {
-                SNIconButton(SNIconName.Back, onClick = { state.back() })
-                Row(
-                    Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
-                        if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
-                        else state.push(Screen.ContactProfile(screen.id, peerName))
-                    },
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    SonarAvatar(peerName, 36.dp, presence = if (inRange) true else null)
-                    Column(Modifier.weight(1f)) {
-                        // bc-hname: 17 / 700 / -0.01em.
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                peerName, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold,
-                                letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false)
-                            )
-                            if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 15.dp, s.green, weight = 2.1f) }
-                        }
-                        Spacer(Modifier.height(1.dp))
-                        // bc-hsub: 12 text2 — 'Verified · ' + Nearby·Bluetooth /
-                        // Offline — will send later / Via internet (screens.jsx DMScreen).
-                        val subTransport = when {
-                            sendOverMesh -> "Nearby · Bluetooth"
-                            isMeshRoute && !inRange && !hasAccount -> "Offline — will send later"
-                            else -> "Via internet"
-                        }
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                (if (verified) "Verified · " else "") + subTransport,
-                                color = s.text2, fontSize = 12.sp,
-                                maxLines = 1, overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    }
-                }
-                // Audio + video call buttons (iOS SonarDMScreen parity). Calls are
-                // Sonar-only and use live BLE when available, otherwise White
-                // Noise signaling for that peer.
-                if (state.canCall(screen.id)) {
-                    SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
-                        state.placeCall(screen.id, peerName, video = false)
-                    }
-                    SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
-                        state.placeCall(screen.id, peerName, video = true)
-                    }
-                }
-            }
-            Box(Modifier.fillMaxWidth().height(1.dp).background(s.hairline))
-        }
-
-        if (isMeshRoute && !inRange) {
-            if (hasAccount) {
-                // Design DMScreen out-of-range banner (verbatim copy) + Verify action.
-                chat.bitchat.sonar.ui.SNBanner(
-                    icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
-                    bold = "Out of Bluetooth range", rest = " — encrypted over the internet instead",
-                    actionLabel = "Verify", onAction = { verifySheet = true }
-                )
-            } else {
-                chat.bitchat.sonar.ui.SNBanner(
-                    icon = SNIconName.Mesh, tone = chat.bitchat.sonar.ui.SNBannerTone.Neutral,
-                    bold = "Out of range", rest = " — messages will wait until you meet again"
-                )
-            }
-        } else if (verified) {
-            chat.bitchat.sonar.ui.SNBanner(
-                icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-                bold = "Verified", rest = " — you confirmed $peerName’s safety number"
-            )
-        } else if (isGroup) {
-            chat.bitchat.sonar.ui.SNBanner(
-                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-                bold = "End-to-end encrypted", rest = " — only group members can read this"
-            )
-        } else {
-            chat.bitchat.sonar.ui.SNBanner(
-                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
-                bold = "End-to-end encrypted", rest = " — only you and $peerName can read this",
-                actionLabel = "Verify", onAction = { verifySheet = true }
-            )
-        }
-
-        if (feed.isEmpty()) {
-            Box(Modifier.weight(1f).fillMaxWidth()) {
-                chat.bitchat.sonar.ui.SNEmptyState(
-                    icon = SNIconName.Lock,
-                    title = "Say hi to $peerName",
-                    desc = if (isGroup) {
-                        "Messages here are end-to-end encrypted. Only group members can read them."
-                    } else {
-                        "Messages here are end-to-end encrypted. Only the two of you can read them."
-                    }
-                )
-            }
-        } else {
-            // BoxWithConstraints (once, not per row) gives the .bc-msg max-width: 78%.
-            BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
-                val bubbleMax = maxWidth * 0.78f
-                LazyColumn(
-                    Modifier.fillMaxSize(),
-                    state = listState,
-                    contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 10.dp)
-                ) {
-                    itemsIndexed(
-                        feed,
-                        // Call IDs and message IDs remain stable when history is prepended.
-                        key = { _, it -> transcriptFeedKey(it) }
-                    ) { i, item ->
-                        val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
-                        val prevAny = feed.getOrNull(i - 1)
-                        val prevTs = if (prevAny is CallRecord) prevAny.tsSecs else (prevAny as? SonarMsg)?.tsSecs
-                        // bc-datechip — "Today"/"Yesterday"/weekday/date when the local day flips.
-                        val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
-                        if (newDay) DateChip(dayLabel(ts))
-                        // Signal-style unread marker above the oldest unread row.
-                        if (i == unreadAnchorIndex) UnreadDivider()
-                        if (item is CallRecord) {
-                            CallLogRow(item)
-                        } else {
-                            val m = item as SonarMsg
-                            // Colour each bubble by the leg it travelled: mesh route + this
-                            // message went over mesh ⇒ cyan; otherwise indigo (internet).
-                            val msgMesh = isMeshRoute && !m.viaInternet
-                            // Design cont rule: same author + same side, previous item is a
-                            // plain/media message (pay + call logs break the grouping).
-                            val prevMsg = prevAny as? SonarMsg
-                            val cont = !newDay && prevMsg != null && prevMsg.mine == m.mine &&
-                                prevMsg.senderNpub == m.senderNpub &&
-                                PayLine.decode(prevMsg.content) !is PayLine.Pay
-                            val pay = PayLine.decode(m.content) as? PayLine.Pay
-                            val failedSend = sonarCanRetryMessage(m)
-                            if (pay != null) {
-                                val status = run { state.payVersion; state.payStatus(pay.uuid) }
-                                PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
-                            } else if (m.media.isNotEmpty()) {
-                                MediaBubble(
-                                    m,
-                                    state,
-                                    screen.id,
-                                    mesh = msgMesh,
-                                    author = if (cont) null else state.groupAuthorName(m, isGroup),
-                                    cont = cont,
-                                    showState = m.mine && (i == feed.lastIndex || failedSend),
-                                    onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
-                                    maxBubbleWidth = bubbleMax,
-                                    onOpen = { mediaViewer = it },
-                                    onOpenAlbum = { items, idx -> mediaGallery = items to idx }
-                                )
-                            } else if (m.stickerRef != null) {
-                                StickerBubble(
-                                    m,
-                                    state = state,
-                                    mesh = msgMesh,
-                                    author = if (cont) null else state.groupAuthorName(m, isGroup),
-                                    showState = m.mine && (i == feed.lastIndex || failedSend),
-                                    onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
-                                    onTap = { coord -> previewPackCoordinate = coord },
-                                )
-                            } else MessageBubble(
-                                m,
-                                msgMesh,
-                                author = if (cont) null else state.groupAuthorName(m, isGroup),
-                                cont = cont,
-                                showState = m.mine && (i == feed.lastIndex || failedSend),
-                                onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
-                                maxBubbleWidth = bubbleMax,
-                            )
+                    // Signal-style sticky day markers: each Day item is a
+                    // stickyHeader so the current day pins while its rows
+                    // scroll. Emission order matches `listItems` exactly —
+                    // every entry still occupies one lazy index, so the
+                    // continuity/open index math is unchanged.
+                    listItems.forEach { listItem ->
+                        when (listItem) {
+                            is ChatFeedListItem.Day -> stickyHeader(
+                                key = chatFeedListKey(listItem)
+                            ) { StickyDayHeader(listItem.label) }
+                            ChatFeedListItem.Unread -> item(
+                                key = chatFeedListKey(listItem)
+                            ) { UnreadDivider() }
+                            is ChatFeedListItem.Row -> item(
+                                key = chatFeedListKey(listItem)
+                            ) {
+                                val item = listItem.payload
+                                val feedIndex = listItem.feedIndex
+                                val prevAny = feed.getOrNull(feedIndex - 1)
+                                val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
+                                val prevTs = if (prevAny is CallRecord) prevAny.tsSecs
+                                    else (prevAny as? SonarMsg)?.tsSecs
+                                val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
+                                if (item is CallRecord) {
+                                    CallLogRow(item)
+                                } else {
+                                    val m = item as SonarMsg
+                                    val msgMesh = isMeshRoute && !m.viaInternet
+                                    // Contiguity from adjacent feed message rows only.
+                                    val prevMsg = prevAny as? SonarMsg
+                                    val cont = !newDay && prevMsg != null && prevMsg.mine == m.mine &&
+                                        prevMsg.senderNpub == m.senderNpub &&
+                                        PayLine.decode(prevMsg.content) !is PayLine.Pay
+                                    val pay = PayLine.decode(m.content) as? PayLine.Pay
+                                    val failedSend = sonarCanRetryMessage(m)
+                                    if (pay != null) {
+                                        val status = run { state.payVersion; state.payStatus(pay.uuid) }
+                                        PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
+                                    } else if (m.media.isNotEmpty()) {
+                                        MediaBubble(
+                                            m,
+                                            state,
+                                            screen.id,
+                                            mesh = msgMesh,
+                                            author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                            cont = cont,
+                                            showState = m.mine && (feedIndex == feed.lastIndex || failedSend),
+                                            onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
+                                            maxBubbleWidth = bubbleMax,
+                                            onOpen = { mediaViewer = it },
+                                            onOpenAlbum = { items, idx -> mediaGallery = items to idx }
+                                        )
+                                    } else if (m.stickerRef != null) {
+                                        StickerBubble(
+                                            m,
+                                            state = state,
+                                            mesh = msgMesh,
+                                            author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                            showState = m.mine && (feedIndex == feed.lastIndex || failedSend),
+                                            onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
+                                            onTap = { coord -> previewPackCoordinate = coord },
+                                        )
+                                    } else MessageBubble(
+                                        m,
+                                        msgMesh,
+                                        author = if (cont) null else state.groupAuthorName(m, isGroup),
+                                        cont = cont,
+                                        showState = m.mine && (feedIndex == feed.lastIndex || failedSend),
+                                        onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
+                                        maxBubbleWidth = bubbleMax,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-            }
         }
+    }
 
+    @Composable
+    fun ChatBottomChrome() {
         if (draft.startsWith("/")) SlashHints(draft) { draft = it }
         if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
             onEmoji = { draft += it },
@@ -1591,6 +1673,143 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     contentAlignment = Alignment.Center
                 ) { SNIcon(SNIconName.Send, 17.dp, sendFg, weight = 2.3f) }
             }
+        }
+    }
+
+    Box(
+        Modifier.fillMaxSize().fileDropTarget(
+            enabled = state.canPrepareMedia(screen.id),
+            maxTotalBytes = attachmentLimit,
+        ) { dropped ->
+            if ((state.screen as? Screen.Chat)?.id != screen.id) return@fileDropTarget
+            state.sendDroppedAttachments(screen.id, dropped)
+        }
+    ) {
+    Column(Modifier.fillMaxSize()) {
+        // bc-header.hl (DM, screens.jsx NavHeader): back · avatar 36 (+presence) ·
+        // name 17/700 + shield · lock + "Nearby · Bluetooth"/"Via internet" ·
+        // phone/videocam trailing, with a bottom hairline.
+        Column {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SNIconButton(SNIconName.Back, onClick = { state.back() })
+                Row(
+                    Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).clickable(enabled = canManageGroup || !isGroup) {
+                        if (canManageGroup) state.push(Screen.GroupInfo(screen.id))
+                        else state.push(Screen.ContactProfile(screen.id, peerName))
+                    },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    SonarAvatar(peerName, 36.dp, presence = if (inRange) true else null)
+                    Column(Modifier.weight(1f)) {
+                        // bc-hname: 17 / 700 / -0.01em.
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                peerName, color = s.text, fontSize = 17.sp, fontWeight = FontWeight.Bold,
+                                letterSpacing = (-0.17).sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
+                            if (verified) { Spacer(Modifier.width(5.dp)); SNIcon(SNIconName.ShieldCheck, 15.dp, s.green, weight = 2.1f) }
+                        }
+                        Spacer(Modifier.height(1.dp))
+                        // bc-hsub: 12 text2 — 'Verified · ' + Nearby·Bluetooth /
+                        // Offline — will send later / Via internet (screens.jsx DMScreen).
+                        val subTransport = when {
+                            sendOverMesh -> "Nearby · Bluetooth"
+                            isMeshRoute && !inRange && !hasAccount -> "Offline — will send later"
+                            else -> "Via internet"
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                (if (verified) "Verified · " else "") + subTransport,
+                                color = s.text2, fontSize = 12.sp,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+                // Audio + video call buttons (iOS SonarDMScreen parity). Calls are
+                // Sonar-only and use live BLE when available, otherwise White
+                // Noise signaling for that peer.
+                if (state.canCall(screen.id)) {
+                    SNIconButton(SNIconName.Phone, size = 20.dp, weight = 2f, tint = s.text2) {
+                        state.placeCall(screen.id, peerName, video = false)
+                    }
+                    SNIconButton(SNIconName.Videocam, size = 21.dp, weight = 2f, tint = s.text2) {
+                        state.placeCall(screen.id, peerName, video = true)
+                    }
+                }
+            }
+            Box(Modifier.fillMaxWidth().height(1.dp).background(s.hairline))
+        }
+
+        if (isMeshRoute && !inRange) {
+            if (hasAccount) {
+                // Design DMScreen out-of-range banner (verbatim copy) + Verify action.
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Globe, tone = chat.bitchat.sonar.ui.SNBannerTone.Net,
+                    bold = "Out of Bluetooth range", rest = " — encrypted over the internet instead",
+                    actionLabel = "Verify", onAction = { verifySheet = true }
+                )
+            } else {
+                chat.bitchat.sonar.ui.SNBanner(
+                    icon = SNIconName.Mesh, tone = chat.bitchat.sonar.ui.SNBannerTone.Neutral,
+                    bold = "Out of range", rest = " — messages will wait until you meet again"
+                )
+            }
+        } else if (verified) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.ShieldCheck, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "Verified", rest = " — you confirmed $peerName’s safety number"
+            )
+        } else if (isGroup) {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only group members can read this"
+            )
+        } else {
+            chat.bitchat.sonar.ui.SNBanner(
+                icon = SNIconName.Lock, tone = chat.bitchat.sonar.ui.SNBannerTone.Enc,
+                bold = "End-to-end encrypted", rest = " — only you and $peerName can read this",
+                actionLabel = "Verify", onAction = { verifySheet = true }
+            )
+        }
+
+        if (feed.isEmpty()) {
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                chat.bitchat.sonar.ui.SNEmptyState(
+                    icon = SNIconName.Lock,
+                    title = "Say hi to $peerName",
+                    desc = if (isGroup) {
+                        "Messages here are end-to-end encrypted. Only group members can read them."
+                    } else {
+                        "Messages here are end-to-end encrypted. Only the two of you can read them."
+                    }
+                )
+            }
+            ChatBottomChrome()
+        } else if (phase2Host) {
+            // Phase 2: owned pad + IME overlay; Pin+Lockstep; top-align (not reverseLayout).
+            TranscriptPhase2HostScaffold(
+                listState = listState,
+                listKey = screen.id,
+                isPrepending = { isPrepending || unreadAnchorPending() },
+                suppressPin = { unreadAnchorPending() },
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                listContent = { bottomInset ->
+                    ChatFeedList(Modifier.fillMaxSize(), bottomInset)
+                },
+                bottomContent = { ChatBottomChrome() },
+            )
+        } else {
+            ChatFeedList(Modifier.weight(1f).fillMaxWidth(), 10.dp)
+            ChatBottomChrome()
         }
     }
     mediaViewer?.let { media ->
@@ -2172,6 +2391,26 @@ private fun DateChip(label: String) {
     }
 }
 
+/** Floating day pill for sticky transcript headers (Signal's sticky date
+ *  header): pinned while its day scrolls, so it needs its own capsule
+ *  background instead of DateChip's transparent inline text. */
+@Composable
+private fun StickyDayHeader(label: String) {
+    val s = sonar
+    Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
+        Text(
+            label,
+            color = s.text2,
+            fontSize = 11.5.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .clip(RoundedCornerShape(11.dp))
+                .background(s.surface2.copy(alpha = 0.94f))
+                .padding(horizontal = 11.dp, vertical = 4.dp),
+        )
+    }
+}
+
 /** Signal-style unread marker: hairlines around a centered label, attached
  *  above the oldest unread row captured at chat-open time. */
 @Composable
@@ -2504,19 +2743,25 @@ private fun MediaBubble(
             // box MediaImage will occupy once decoded, so it holds its place
             // before any bytes arrive. Dimension-less media keeps the skeleton.
             val density = LocalDensity.current
+            // Always reserve a stable box (Signal-Android ThumbnailView EXACT
+            // measure). Missing MIP-04 dims use the max bubble so decode never
+            // grows a 216×150 placeholder and rebuilds the list.
             val reservedSize = remember(media.width, media.height, maxBubbleWidth, density) {
+                val maxW = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth)
                 val w = media.width ?: 0
                 val h = media.height ?: 0
                 if (w > 0 && h > 0) with(density) {
                     mediaBubbleFittedSize(
                         intrinsic = DpSize(w.toDp(), h.toDp()),
-                        maxWidth = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth),
+                        maxWidth = maxW,
                         maxHeight = MAX_MEDIA_BUBBLE_HEIGHT,
                     )
-                } else null
+                } else {
+                    DpSize(maxW, MAX_MEDIA_BUBBLE_HEIGHT)
+                }
             }
             Box(
-                (if (reservedSize != null) Modifier.size(reservedSize) else Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth)))
+                Modifier.size(reservedSize)
                     .clip(bubbleShape).background(s.surface2)
                     .clickable {
                         when (transfer.phase) {
@@ -2528,16 +2773,13 @@ private fun MediaBubble(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                val placeholderModifier =
-                    if (reservedSize != null) Modifier.fillMaxSize()
-                    else Modifier.size(width = 216.dp, height = 150.dp)
+                val placeholderModifier = Modifier.fillMaxSize()
                 when {
                     decoded?.gifBytes != null -> {
                         MediaImage(
                             bytes = decoded.gifBytes,
                             isGif = true,
-                            modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
-                                .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
+                            modifier = Modifier.fillMaxSize()
                         )
                         GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
                         // media-chip: glass time + via pill bottom-right.
@@ -2548,8 +2790,7 @@ private fun MediaBubble(
                             decoded.bitmap,
                             contentDescription = null,
                             contentScale = ContentScale.Fit,
-                            modifier = Modifier.widthIn(max = minOf(MAX_MEDIA_BUBBLE_WIDTH, maxBubbleWidth))
-                                .heightIn(max = MAX_MEDIA_BUBBLE_HEIGHT)
+                            modifier = Modifier.fillMaxSize()
                         )
                         // media-chip: glass time + via pill bottom-right.
                         MediaMetaChip(m.tsSecs, mesh, Modifier.align(Alignment.BottomEnd).padding(8.dp))
@@ -2861,12 +3102,12 @@ private sealed interface TranscriptMediaLoad {
 
 /**
  * Load + decode a transcript image once, off the UI thread, and keep the result
- * in [MediaImageMemoryCache] (Signal ThumbnailView parity). A cache hit paints
- * on the FIRST frame of a reopened chat — no skeleton, no re-read, no re-decode.
+ * in [MediaImageMemoryCache].
  *
- * Three tiers, cheapest first: decoded pixels in memory → a downscaled
- * thumbnail on disk ([MediaThumbnailDiskCache], survives process death) → the
- * original attachment, decoded bounded and thumbnailed for next time.
+ * Mirrors Signal-Android `ThumbnailView` / `V2ConversationItemThumbnail`:
+ * memory hit → RESOURCE-sized disk thumb → **file-path sampled decode**
+ * (never a full attachment `ByteArray` on the list path). GIFs still need
+ * original bytes to animate. Fullscreen uses a separate viewer decode.
  */
 @Composable
 private fun rememberTranscriptMediaLoad(
@@ -2875,18 +3116,23 @@ private fun rememberTranscriptMediaLoad(
     media: SonarMedia,
     transfer: MediaTransferState,
 ): TranscriptMediaLoad {
-    val cached = remember(media.url) { MediaImageMemoryCache.get(media.url) }
+    // Prefer memory cache on every entry so localPath churn cannot clear Ready.
+    val cached = MediaImageMemoryCache.get(media.url)
     val load by androidx.compose.runtime.produceState<TranscriptMediaLoad>(
         cached?.let { TranscriptMediaLoad.Ready(it) } ?: TranscriptMediaLoad.Loading,
-        media.url, chatId, transfer.localPath,
+        media.url, chatId, transfer.phase, transfer.localPath,
     ) {
+        MediaImageMemoryCache.get(media.url)?.let {
+            value = TranscriptMediaLoad.Ready(it)
+            return@produceState
+        }
         if (value is TranscriptMediaLoad.Ready) return@produceState
         if (transfer.phase != MediaTransferPhase.Available) {
             value = TranscriptMediaLoad.Loading
             return@produceState
         }
         // A GIF needs its original bytes to animate, so it has no thumbnail
-        // tier — the disk hit below is for static images only.
+        // tier — the disk / path hits below are for static images only.
         val animates = media.isGif
         if (!animates) {
             val thumb = withContext(Dispatchers.Default) {
@@ -2894,6 +3140,19 @@ private fun rememberTranscriptMediaLoad(
             }
             if (thumb != null) {
                 val decoded = DecodedTranscriptMedia(bitmap = thumb.bitmap, gifBytes = null)
+                MediaImageMemoryCache.put(media.url, decoded)
+                value = TranscriptMediaLoad.Ready(decoded)
+                return@produceState
+            }
+            // Signal-Android: Glide loads DecryptableUri from disk with
+            // override(bubbleW, bubbleH) — sample the file, do not read-all.
+            val path = transfer.localPath ?: MediaCache.finalPath(media.url)
+            val fromPath = withContext(Dispatchers.Default) {
+                decodeThumbnailFromPath(path, TRANSCRIPT_THUMB_MAX_EDGE_PX)
+            }
+            if (fromPath != null) {
+                fromPath.encoded?.let { MediaThumbnailDiskCache.store(media.url, it) }
+                val decoded = DecodedTranscriptMedia(bitmap = fromPath.bitmap, gifBytes = null)
                 MediaImageMemoryCache.put(media.url, decoded)
                 value = TranscriptMediaLoad.Ready(decoded)
                 return@produceState
@@ -3601,12 +3860,12 @@ internal fun rowTimeLabel(tsSecs: Long): String {
 }
 
 /** bc-datechip label: Today / Yesterday / weekday / date. */
-private fun dayLabel(tsSecs: Long): String {
+internal fun dayLabel(tsSecs: Long): String {
     val delta = localDayDelta(tsSecs)
     return when {
-        delta >= 0L -> "Today"
+        delta == 0L -> "Today"
         delta == -1L -> "Yesterday"
-        delta >= -6L -> weekdayName(localEpochDayToday() + delta)
+        delta in -6L..-2L -> weekdayName(localEpochDayToday() + delta)
         else -> shortDate(localEpochDayToday() + delta)
     }
 }

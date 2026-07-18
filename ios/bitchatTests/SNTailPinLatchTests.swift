@@ -105,6 +105,15 @@ struct SNTailPinLatchTests {
         #expect(shortChat == -50)
     }
 
+    /// Spike A owns bottom inset as barHeight − safeArea (Signal
+    /// `updateContentInsets`); production sibling-composer path stays 0.
+    @Test
+    func spikeAOwnedBottomInsetTracksBarMinusSafeArea() {
+        #expect(snSpikeAOwnedBottomContentInset(barHeight: 336, safeAreaBottom: 34) == 302)
+        #expect(snSpikeAOwnedBottomContentInset(barHeight: 20, safeAreaBottom: 34) == 0)
+        #expect(snOwnedTranscriptBottomContentInset(automaticBottomInset: 336) == 0)
+    }
+
     /// Composer is a sibling ⇒ owned bottom inset is always 0. Fully-read
     /// opens use a bottom scroll anchor; unread opens must not.
     @Test
@@ -138,6 +147,67 @@ struct SNTailPinLatchTests {
                 topInset: 0,
                 bottomInset: 0
             ) == 1300
+        )
+    }
+
+    /// Alpha.11 still opened fully-read DMs mid-history: one async `scrollTo`
+    /// lost to LazyVStack under-measure and the latch never re-snapped.
+    /// Keep recovering until the live-edge sentinel lands (or the user scrolls).
+    @Test
+    func fullyReadOpenResnapsUntilLiveEdgeLands() {
+        #expect(
+            snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: true,
+                needsLiveEdgeOpen: true,
+                hasLeftBottom: false,
+                userScrolling: false,
+                hasTailRow: true
+            )
+        )
+        #expect(
+            !snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: true,
+                needsLiveEdgeOpen: false,
+                hasLeftBottom: false,
+                userScrolling: false,
+                hasTailRow: true
+            )
+        )
+        #expect(
+            !snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: true,
+                needsLiveEdgeOpen: true,
+                hasLeftBottom: true,
+                userScrolling: false,
+                hasTailRow: true
+            )
+        )
+        #expect(
+            !snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: true,
+                needsLiveEdgeOpen: true,
+                hasLeftBottom: false,
+                userScrolling: true,
+                hasTailRow: true
+            )
+        )
+        #expect(
+            !snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: false,
+                needsLiveEdgeOpen: true,
+                hasLeftBottom: false,
+                userScrolling: false,
+                hasTailRow: true
+            )
+        )
+        #expect(
+            !snShouldResnapFullyReadOpen(
+                usesBottomScrollAnchor: true,
+                needsLiveEdgeOpen: true,
+                hasLeftBottom: false,
+                userScrolling: false,
+                hasTailRow: false
+            )
         )
     }
 

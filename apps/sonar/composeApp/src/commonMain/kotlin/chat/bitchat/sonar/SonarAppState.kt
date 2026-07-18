@@ -893,7 +893,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // durable wipe. A filesystem error must never leave old chats or
             // sticker bytes painted after credentials have been cleared.
             stack = listOf(Screen.Home)
-            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList()
+            chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear()
             clearChatSnapshot()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
@@ -949,6 +949,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
+            retainedTranscriptByChat.clear()
+            transcriptWindows.clear()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -978,6 +980,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     var messages by mutableStateOf<List<SonarMsg>>(emptyList())
         private set
 
+    /**
+     * Last painted transcript per chat (Signal-Android keeps adapter contents
+     * across leave/reopen). Reopen paints this synchronously *before* [push]
+     * so ChatScreen's first frame is never an empty/home leftover rebuild.
+     */
+    private val retainedTranscriptByChat = mutableMapOf<String, List<SonarMsg>>()
+
     /** One bounded canonical DB window per folded Marmot source group. */
     private data class TranscriptGroupWindow(
         val rows: List<SonarMsg>,
@@ -1000,6 +1009,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation == transcriptGeneration &&
             activeTranscriptChatId == chatId &&
             (screen as? Screen.Chat)?.id == chatId
+
+    /** Session still owned while the first local page loads *before* [push]. */
+    private fun isActiveTranscriptGeneration(chatId: String, generation: Long): Boolean =
+        generation == transcriptGeneration && activeTranscriptChatId == chatId
 
     private fun beginTranscriptSession(chatId: String): Long {
         transcriptGeneration += 1
@@ -1108,19 +1121,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun captureOpenChatUnread(chatId: String) {
         val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
-        openChatUnread = if (unreadAtOpen > 0L) {
-            openChatUnread + (chatId to unreadAtOpen)
-        } else {
-            openChatUnread - chatId
-        }
+        // Always publish a settled value (including 0). Missing key means
+        // capture has not run — hosts must not coerce that to live-edge.
+        openChatUnread = openChatUnread + (chatId to unreadAtOpen)
     }
 
     /** Give up on a pending unread divider for this open: the transcript is
      *  fully hydrated but no anchor row is placeable (e.g. every unread event
-     *  is a filtered control line). Clears the pending state so tail
-     *  following resumes. */
+     *  is a filtered control line). Settles to 0 so open policy becomes
+     *  live-edge and tail following resumes. */
     fun retireOpenChatUnread(chatId: String) {
-        openChatUnread = openChatUnread - chatId
+        openChatUnread = openChatUnread + (chatId to 0L)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
     }
 
@@ -2125,10 +2136,80 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Local cursor reads race navigation. A late page from chat A must not
         // overwrite chat B's render state after the user switches screens.
         if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
-        val visible = visibleMessagesForChat(chatId, source)
-        messages = visible
+        publishOpenTranscript(chatId, visibleMessagesForChat(chatId, source), processCalls)
+    }
+
+    /**
+     * Publish the open transcript only when paint-relevant rows change.
+     * Identical hydration pages (snapshot → DB → fresh) must not rewrite
+     * [messages] — that forces a LazyColumn rebuild Signal-Android never shows.
+     */
+    private fun publishOpenTranscript(
+        chatId: String,
+        visible: List<SonarMsg>,
+        processCalls: Boolean = false,
+    ) {
+        if ((screen as? Screen.Chat)?.id != chatId || activeTranscriptChatId != chatId) return
+        if (!sameTranscriptPaint(messages, visible)) {
+            messages = visible
+        }
+        retainOpenTranscript(chatId, visible)
         processPayLines(chatId, visible)
         if (processCalls) processCallLines(chatId, visible)
+    }
+
+    private fun retainOpenTranscript(chatId: String, rows: List<SonarMsg>) {
+        if (rows.isEmpty()) {
+            retainedTranscriptByChat.remove(chatId)
+        } else {
+            retainedTranscriptByChat[chatId] = rows
+        }
+    }
+
+    /** Drop leave/reopen paint cache when a conversation is deleted or erased. */
+    private fun discardRetainedTranscript(chatId: String) {
+        retainedTranscriptByChat.remove(chatId)
+        transcriptWindows.remove(chatId)
+    }
+
+    /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
+    private fun firstOpenTranscriptPaint(chatId: String, snapshotPaint: List<SonarMsg>): List<SonarMsg> {
+        val retained = retainedTranscriptByChat[chatId]
+        return when {
+            retained != null && retained.isNotEmpty() -> retained
+            else -> snapshotPaint
+        }
+    }
+
+    /**
+     * Signal-Android list bind: warm disk thumbs into [MediaImageMemoryCache]
+     * so the first composed frame paints pixels instead of blank surfaces.
+     * Only reads already-sized thumb files — never full attachment bytes.
+     */
+    private fun warmOpenTranscriptThumbs(rows: List<SonarMsg>) {
+        val urls = rows.asReversed()
+            .asSequence()
+            .flatMap { it.media.asSequence() }
+            .filter { it.isImage && !it.isGif }
+            .map { it.url }
+            .distinct()
+            .take(12)
+            .filter { MediaImageMemoryCache.get(it) == null }
+            .toList()
+        if (urls.isEmpty()) return
+        scope.launch(Dispatchers.Default) {
+            for (url in urls) {
+                val thumb = MediaThumbnailDiskCache.load(url) ?: continue
+                withContext(Dispatchers.Main) {
+                    if (MediaImageMemoryCache.get(url) == null) {
+                        MediaImageMemoryCache.put(
+                            url,
+                            DecodedTranscriptMedia(bitmap = thumb.bitmap, gifBytes = null),
+                        )
+                    }
+                }
+            }
+        }
     }
 
     private fun visibleChannelMessages(source: List<SonarChannelMsg>): List<SonarChannelMsg> =
@@ -3204,7 +3285,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
                 verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
                 verifiedChatIds.clear(); verifiedVersion++
-                chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); channelMsgs = emptyList()
+                chats = emptyList(); chatSnapshotMessagesByChat = emptyMap(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); groupInvites = emptyList(); messages = emptyList(); retainedTranscriptByChat.clear(); channelMsgs = emptyList()
                 clearChatSnapshot()
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
@@ -3977,13 +4058,15 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun openChat(chat: SonarChat) {
-        push(Screen.Chat(chat.id, chatTitle(chat)))
+        // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
+        // empty home leftover messages, then rebuild when the page lands.
         val generation = beginTranscriptSession(chat.id)
         resolveMarmotGroupId(chat.id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
         pendingMarmotNpub(chat.id)?.let { pendingNpub ->
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            push(Screen.Chat(chat.id, chatTitle(chat)))
             ensureProfile(pendingNpub)
             ensureSonarDescriptor(pendingNpub)
             startPendingMarmotChat(pendingNpub, chat.id)
@@ -3991,49 +4074,60 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         if (isPendingMarmotGroup(chat.id)) {
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
+            push(Screen.Chat(chat.id, chatTitle(chat)))
             return
         }
         val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id)
         clearTranscriptHydrated(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
-        // Local-first paint (Signal-Comparable Performance Rule): show the
-        // cached snapshot synchronously so the transcript never opens empty;
-        // the bounded DB page + media/echo merge below replaces it async.
-        // boundedTranscriptRows applies the same (tsSecs, id) display order as
-        // that async page, so equal-second rows don't swap after first paint.
-        messages = visibleMessagesForChat(
-            chat.id,
-            withSendEchoes(
-                chat.id,
-                boundedTranscriptRows(
-                    chatSnapshotMessagesByChat[chat.id].orEmpty(),
-                    TRANSCRIPT_PAGE_SIZE,
-                    pinnedToOlderEdge = false,
-                ),
-            ),
-        )
+        val title = chatTitle(chat)
+
+        // Reopen: retained paint is already the last leave frame — push now.
+        retainedTranscriptByChat[chat.id]?.takeIf { it.isNotEmpty() }?.let { retained ->
+            messages = retained
+            warmOpenTranscriptThumbs(messages)
+            push(Screen.Chat(chat.id, title))
+            scope.launch {
+                for (readId in readChatIds) {
+                    runCatching { SonarCore.markConversationRead(readId) }
+                }
+                val local = withSendEchoes(
+                    chat.id,
+                    mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)),
+                )
+                val visibleLocal = visibleMessagesForChat(chat.id, local)
+                if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
+                publishOpenTranscript(chat.id, visibleLocal)
+                for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
+                runCatching { refreshChats() }
+                if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
+            }
+            return
+        }
+
+        // First open (Signal-Android): load the bounded local page *before*
+        // ChatScreen mounts. Snapshot→async replace was the rebuild flash.
+        // Home stays up for the local read; Chat's frame 0 is the final page.
         scope.launch {
+            val local = withSendEchoes(
+                chat.id,
+                mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)),
+            )
+            if (!isActiveTranscriptGeneration(chat.id, generation)) return@launch
+            val visibleLocal = visibleMessagesForChat(chat.id, local)
+            messages = visibleLocal
+            retainOpenTranscript(chat.id, visibleLocal)
+            warmOpenTranscriptThumbs(visibleLocal)
+            push(Screen.Chat(chat.id, title))
+            if (isCurrentTranscriptSession(chat.id, generation)) {
+                markTranscriptHydrated(chat.id)
+            }
             for (readId in readChatIds) {
                 runCatching { SonarCore.markConversationRead(readId) }
             }
-            val local = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)))
-            val visibleLocal = visibleMessagesForChat(chat.id, local)
-            if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
-            messages = visibleLocal
-            processPayLines(chat.id, visibleLocal)
             for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
-            if (isCurrentTranscriptSession(chat.id, generation)) {
-                val fresh = withSendEchoes(chat.id, mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)))
-                if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
-                val visibleFresh = visibleMessagesForChat(chat.id, fresh)
-                messages = visibleFresh
-                processPayLines(chat.id, visibleFresh)
-            }
-            // Both publishes above replace the snapshot first paint: hydration,
-            // not new messages. Later feed changes may animate.
-            if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
         }
     }
 
@@ -4045,43 +4139,47 @@ class SonarAppState(private val scope: CoroutineScope) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
-        push(Screen.Chat(id, name, pay))
         captureOpenChatUnread(id)
         clearTranscriptHydrated(id)
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
         }
-        // Complete local-first paint (Signal-Comparable Performance Rule): a
-        // mesh chat folds a BLE leg and a White Noise leg. Painting only the
-        // BLE window here would land the transcript on the BLE tail and then
-        // visibly jump when the async White Noise merge appends its (newer)
-        // rows — the exact open-scroll a pure Marmot chat never shows, because
-        // its snapshot is already complete. Seed the White Noise leg from the
-        // same cached conversation snapshot the chat-list preview uses so the
-        // first frame already holds the newest rows; the async refresh below
-        // then replaces it with the full DB read.
-        val wnSnapshot = meshWhiteNoiseSeed(id)
-        messages = visibleMessagesForChat(
-            id,
-            refreshConversationRows(
-                refreshMeshTranscriptWindow(canonicalPeerId) + wnSnapshot,
-                id,
-                generation,
-            ),
-        ) // bounded local-first mesh view
-        processPayLines(id, messages)
+
+        // Reopen: retained leave paint → push now; hydrate quietly.
+        retainedTranscriptByChat[id]?.takeIf { it.isNotEmpty() }?.let { retained ->
+            messages = retained
+            processPayLines(id, messages)
+            warmOpenTranscriptThumbs(messages)
+            push(Screen.Chat(id, name, pay))
+            scope.launch {
+                refreshOpenDm(canonicalPeerId)
+                refreshChats()
+                refreshOpenDm(canonicalPeerId)
+                if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+            }
+            return
+        }
+
+        // First open: merge mesh + White Noise local page before Chat mounts
+        // so frame 0 is not a seed that later jumps when WN merges.
         scope.launch {
-            refreshOpenDm(canonicalPeerId) // hydrate local Marmot transcript before chat list refresh
-            refreshChats()
-            // Reconcile the open transcript after chat-list refresh may discover
-            // the peer's Marmot group mapping.
-            refreshOpenDm(canonicalPeerId)
-            // Every publish above is hydration of a partial first paint (the BLE
-            // window merging with the White Noise leg), so the transcript must
-            // absorb them instantly. Only now do later feed changes mean real
-            // new messages, which may animate.
+            val mesh = refreshMeshTranscriptWindow(canonicalPeerId)
+            val wn = marmotMessagesForPeer(canonicalPeerId, id, generation)
+            if (!isActiveTranscriptGeneration(id, generation)) return@launch
+            val bounded = refreshConversationRows(mesh + wn, id, generation)
+            val visible = visibleMessagesForChat(
+                id,
+                withSendEchoes(id, mergePendingMediaUploads(id, bounded)),
+            )
+            if (!isActiveTranscriptGeneration(id, generation)) return@launch
+            messages = visible
+            retainOpenTranscript(id, visible)
+            processPayLines(id, visible)
+            warmOpenTranscriptThumbs(visible)
+            push(Screen.Chat(id, name, pay))
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+            refreshChats()
         }
     }
 
@@ -4152,7 +4250,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // paint is already complete (see openDm) — otherwise back-revealing
             // a mesh chat repeats the BLE-tail-then-jump on every navigation.
             val wnSnapshot = meshWhiteNoiseSeed(chat.id)
-            messages = visibleMessagesForChat(
+            val seedPaint = visibleMessagesForChat(
                 chat.id,
                 refreshConversationRows(
                     refreshMeshTranscriptWindow(peerId) + wnSnapshot,
@@ -4160,6 +4258,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     generation,
                 ),
             )
+            messages = firstOpenTranscriptPaint(chat.id, seedPaint)
+            retainOpenTranscript(chat.id, messages)
+            warmOpenTranscriptThumbs(messages)
             scope.launch {
                 refreshOpenDm(peerId)
                 if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
@@ -4170,7 +4271,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = visibleMessagesForChat(chat.id, withSendEchoes(chat.id, emptyList()))
             return
         }
-        messages = visibleMessagesForChat(
+        val snapshotPaint = visibleMessagesForChat(
             chat.id,
             withSendEchoes(
                 chat.id,
@@ -4181,6 +4282,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ),
             ),
         )
+        messages = firstOpenTranscriptPaint(chat.id, snapshotPaint)
+        retainOpenTranscript(chat.id, messages)
+        warmOpenTranscriptThumbs(messages)
         scope.launch {
             val local = withSendEchoes(
                 chat.id,
@@ -4205,13 +4309,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun back() {
         cleanupPreviewTempFiles()
         val popped = stack.lastOrNull()
-        if (stack.size > 1) stack = stack.dropLast(1)
-        // The unread divider lives while its chat is on the stack; leaving the
-        // chat retires it so a later reopen (already marked read) starts clean.
+        // Keep the leave paint so the next open of this chat is frame-0 ready
+        // (Signal adapter retention), before we clear the live [messages] list.
         (popped as? Screen.Chat)?.let {
+            retainOpenTranscript(it.id, messages)
             openChatUnread = openChatUnread - it.id
             openChatUnreadAnchor = openChatUnreadAnchor - it.id
         }
+        if (stack.size > 1) stack = stack.dropLast(1)
         restoreRevealedChatOrClear()
         scope.launch { refreshChats() }
     }
@@ -4252,6 +4357,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notificationLatestSecs.remove(id)
             stagedChangedPages.remove(id)
             failedChangedPageReads.remove(id)
+            discardRetainedTranscript(id)
         }
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
@@ -4289,7 +4395,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         aliases.forEach { alias ->
             meshChats.remove(alias)
             meshChatNames.remove(alias)
+            discardRetainedTranscript(meshChatId(alias))
         }
+        discardRetainedTranscript(chatId)
         meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
             chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
@@ -4302,6 +4410,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 stagedChangedPages.remove(it)
                 failedChangedPageReads.remove(it)
                 unreadByChat = unreadByChat - it
+                discardRetainedTranscript(it)
             }
             persistGroupFolds()
             clearChatSnapshot()
@@ -6458,32 +6567,46 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    fun mediaTransferState(media: SonarMedia): MediaTransferState =
-        mediaTransfers[media.url] ?: MediaTransferState.NotDownloaded
+    fun mediaTransferState(media: SonarMedia): MediaTransferState {
+        mediaTransfers[media.url]?.let { return it }
+        // Synthesise Available from disk without writing mediaTransfers —
+        // same as iOS mediaTransferState + existingMediaURL. Publishing every
+        // local hit on bubble appear rebuilds the transcript during open.
+        val path = MediaCache.finalPath(media.url)
+        if (MediaCache.existsSync(path)) return MediaTransferState.available(path)
+        return MediaTransferState.NotDownloaded
+    }
 
     /** True once [prepareMedia] or a download has produced a definite phase for
      *  this attachment. An un-probed attachment also reads NotDownloaded, but
      *  should render a quiet placeholder — not the download skeleton — until
-     *  the local-cache check lands. */
+     *  the local-cache check lands. Local disk hits synthesised by
+     *  [mediaTransferState] do not count as "known" in the map (and already
+     *  paint as Available, so they never need the download skeleton). */
     fun mediaTransferKnown(media: SonarMedia): Boolean = mediaTransfers.containsKey(media.url)
 
-    /** Check persistent state off-main, then optionally apply media auto-download
-     * policy. Documents and videos pass false and remain tap-to-download. */
+    /** Hydrate local transfer state without network work when the file is on
+     * disk; optionally auto-download images. Documents/videos pass false.
+     *
+     * Disk hits skip observable writes (nil / Available) — [mediaTransferState]
+     * already synthesises Available. Only Downloading/Failed recover into the
+     * map. Signal avoids open-time transfer-state churn the same way. */
     fun prepareMedia(chatId: String, media: SonarMedia, autoDownload: Boolean) {
         val key = media.url
         if (mediaTransfers[key]?.phase == MediaTransferPhase.Downloading) return
-        scope.launch {
-            val finalPath = MediaCache.finalPath(key)
-            if (MediaCache.exists(finalPath)) {
+        val finalPath = MediaCache.finalPath(key)
+        if (MediaCache.existsSync(finalPath)) {
+            if (shouldPublishDiskHit(mediaTransfers[key]?.phase)) {
                 setMediaTransfer(key, MediaTransferState.available(finalPath))
-            } else if (autoDownload || mediaCache[key] != null) {
-                requestMediaDownload(chatId, media)
-            } else {
-                // Record the probe miss so the UI can distinguish "definitely
-                // remote" (download affordance) from "not checked yet" (quiet).
-                setMediaTransfer(key, MediaTransferState.NotDownloaded)
             }
+            return
         }
+        if (autoDownload || mediaCache[key] != null) {
+            requestMediaDownload(chatId, media)
+        }
+        // Probe miss: leave the map unset. mediaTransferState stays
+        // NotDownloaded; the chip/skeleton treat unknown vs known via
+        // mediaTransferKnown (images auto-download instead).
     }
 
     fun requestMediaDownload(chatId: String, media: SonarMedia) {
@@ -6495,12 +6618,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         mediaDownloadGenerations[key] = generation
         setMediaTransfer(key, MediaTransferState.downloading(null))
 
+        // Signal-Android TransferControlView throttles PartProgressEvent ~100ms
+        // so download ticks do not invalidate the whole conversation list.
+        var lastProgressPublishMs = 0L
         val control = MediaDownloadControl { received, total ->
             scope.launch {
                 if (mediaDownloadGenerations[key] != generation) return@launch
                 val progress = total?.takeIf { it > 0uL }?.let {
                     (received.toDouble() / it.toDouble()).toFloat().coerceIn(0f, 1f)
                 }
+                val now = SonarClock.nowMillis()
+                val terminal = progress != null && progress >= 0.99f
+                if (!terminal && now - lastProgressPublishMs < 100L) return@launch
+                lastProgressPublishMs = now
                 setMediaTransfer(key, MediaTransferState.downloading(progress))
             }
         }
@@ -6535,6 +6665,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (mediaDownloadGenerations[key] == generation) {
                     setMediaTransfer(key, MediaTransferState.available(finalPath))
                     mediaCache[key]?.takeIf { it.size > 1024 * 1024 }?.let { mediaCache.remove(key) }
+                    if (!media.isGif) {
+                        scope.launch { warmTranscriptThumbnail(key, finalPath) }
+                    }
                 }
             } catch (_: CancellationException) {
                 if (mediaDownloadGenerations[key] == generation) {
@@ -6571,6 +6704,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun setMediaTransfer(key: String, state: MediaTransferState) {
         if (mediaTransfers[key] == state) return
         mediaTransfers = mediaTransfers + (key to state)
+    }
+
+    /** Best-effort: write a transcript thumbnail beside the attachment so cold
+     * open binds ~1kpx pixels. Uses path-sampled decode (Signal-Android Glide
+     * RESOURCE cache shape) — never reads the full attachment into a ByteArray. */
+    private suspend fun warmTranscriptThumbnail(url: String, path: String) {
+        val thumbPath = MediaCache.thumbnailPath(url)
+        if (MediaCache.exists(thumbPath)) return
+        val thumb = withContext(Dispatchers.Default) {
+            decodeThumbnailFromPath(path, TRANSCRIPT_THUMB_MAX_EDGE_PX)
+        } ?: return
+        thumb.encoded?.let { MediaThumbnailDiskCache.store(url, it) }
     }
 
     private fun cancelAllMediaDownloads() {
@@ -7839,8 +7984,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val bounded = refreshConversationRows(mesh + wn, chatId, generation)
         val merged = withSendEchoes(chatId, mergePendingMediaUploads(chatId, bounded))
         val visible = visibleMessagesForChat(chatId, merged)
-        messages = visible
-        processPayLines(chatId, visible)
+        publishOpenTranscript(chatId, visible)
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }

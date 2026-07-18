@@ -47,4 +47,15 @@ class MediaDownloadTest {
         assertEquals(1f, state.progress)
         assertEquals("/private/media/receipt", state.localPath)
     }
+
+    @Test
+    fun diskHitOnlyPublishesWhenRecoveringBadPhase() {
+        // Nil / Available: synthesise from filesystem, do not churn mediaTransfers.
+        assertFalse(shouldPublishDiskHit(null))
+        assertFalse(shouldPublishDiskHit(MediaTransferPhase.Available))
+        assertFalse(shouldPublishDiskHit(MediaTransferPhase.NotDownloaded))
+        // Downloading / Failed: recover into Available so the UI drops overlays.
+        assertTrue(shouldPublishDiskHit(MediaTransferPhase.Downloading))
+        assertTrue(shouldPublishDiskHit(MediaTransferPhase.Failed))
+    }
 }

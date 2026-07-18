@@ -5,12 +5,11 @@ import androidx.compose.ui.graphics.ImageBitmap
 /**
  * Longest edge, in pixels, a transcript thumbnail is decoded to.
  *
- * A bubble is ~260dp wide, so ~1024px still oversamples on a 3x phone and
- * leaves headroom for the full-screen viewer to reuse the same thumbnail while
- * the original loads. Signal bounds transcript thumbnails the same way rather
- * than decoding attachments at capture resolution: a 12MP phone photo is 48MB
- * as ARGB_8888 — one such decode blows the whole 48MB memory budget and can OOM
- * a low-end device, while its 1024px thumbnail is ~3MB.
+ * Signal-Android sizes list thumbs to the media bubble (~240×320dp) via
+ * Glide `.override(w,h)` in `V2ConversationItemThumbnail` / `ThumbnailView`.
+ * ~1024px covers a 3x phone bubble with headroom and matches our Compose
+ * `MAX_MEDIA_BUBBLE_*` ceiling. Never decode capture resolution into the list:
+ * a 12MP ARGB_8888 bitmap is ~48MB and can OOM; a 1024px thumb is ~3MB.
  */
 internal const val TRANSCRIPT_THUMB_MAX_EDGE_PX = 1024
 
@@ -32,6 +31,13 @@ internal class ThumbnailDecode(
  * image — callers fall back to a file chip.
  */
 internal expect fun decodeThumbnail(bytes: ByteArray, maxEdgePx: Int): ThumbnailDecode?
+
+/**
+ * Signal-Android list path: sample from a file URI/path (Glide `DecryptableUri`
+ * + `inSampleSize` / downsample) without allocating a full plaintext
+ * [ByteArray] of the attachment. Prefer this for transcript cells.
+ */
+internal expect fun decodeThumbnailFromPath(path: String, maxEdgePx: Int): ThumbnailDecode?
 
 /**
  * Disk-backed downscaled thumbnails (Signal parity), layered on top of the

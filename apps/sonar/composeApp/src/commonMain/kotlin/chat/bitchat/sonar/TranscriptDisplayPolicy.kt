@@ -71,6 +71,33 @@ internal fun mergeTranscriptRows(
 }
 
 /**
+ * True when replacing the open transcript with [next] would not change what
+ * the list paints (Signal-Android DiffUtil no-op). Open hydration often
+ * re-reads the same bounded page — assigning a new list identity still
+ * rebuilds LazyColumn and looks like the chat was torn down.
+ *
+ * Compares paint-relevant fields only: id order, content, delivery state,
+ * timestamp, and full [SonarMedia] values (URL alone is not enough — MIP-04
+ * dims / mime / filename change reserved bubble geometry).
+ */
+internal fun sameTranscriptPaint(current: List<SonarMsg>, next: List<SonarMsg>): Boolean {
+    if (current.size != next.size) return false
+    for (i in current.indices) {
+        val a = current[i]
+        val b = next[i]
+        if (a.id != b.id) return false
+        if (a.content != b.content) return false
+        if (a.state != b.state) return false
+        if (a.tsSecs != b.tsSecs) return false
+        if (a.mine != b.mine) return false
+        if (a.viaInternet != b.viaInternet) return false
+        if (a.media != b.media) return false
+        if (a.stickerRef != b.stickerRef) return false
+    }
+    return true
+}
+
+/**
  * Refresh a live window from the newest edge. A reader pinned in older history
  * receives edits to retained rows without having unseen tail rows evict their
  * current anchor; reopening the conversation starts at the tail again.

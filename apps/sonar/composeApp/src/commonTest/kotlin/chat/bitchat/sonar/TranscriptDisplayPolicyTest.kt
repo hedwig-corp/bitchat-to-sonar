@@ -78,6 +78,51 @@ class TranscriptDisplayPolicyTest {
     }
 
     @Test
+    fun sameTranscriptPaint_identicalHydrationPage_isNoOp() {
+        val page = listOf(message("a", 1), message("b", 2, content = "hi"))
+        assertTrue(sameTranscriptPaint(page, page.map { it.copy() }))
+        assertTrue(
+            sameTranscriptPaint(page, listOf(message("a", 1), message("b", 2, content = "hi"))),
+            "open hydration must not rebuild LazyColumn when the bounded page is unchanged",
+        )
+    }
+
+    @Test
+    fun sameTranscriptPaint_detectsPaintRelevantChanges() {
+        val base = listOf(message("a", 1), message("b", 2))
+        assertFalse(sameTranscriptPaint(base, listOf(message("a", 1))))
+        assertFalse(sameTranscriptPaint(base, listOf(message("a", 1), message("c", 2))))
+        assertFalse(sameTranscriptPaint(base, listOf(message("a", 1), message("b", 2, content = "changed"))))
+        assertFalse(sameTranscriptPaint(base, listOf(message("a", 1), message("b", 2, state = "Accepted"))))
+        val withMedia = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/1", "image/jpeg", "a.jpg", 10, 10, null)),
+            ),
+        )
+        val otherMedia = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/2", "image/jpeg", "a.jpg", 10, 10, null)),
+            ),
+        )
+        assertFalse(sameTranscriptPaint(withMedia, otherMedia))
+        val sameUrlNewDims = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/1", "image/jpeg", "a.jpg", 1200, 900, null)),
+            ),
+        )
+        assertFalse(
+            sameTranscriptPaint(withMedia, sameUrlNewDims),
+            "MIP-04 dim arrival must republish — reserved bubble geometry changed",
+        )
+        val sameUrlNewMime = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/1", "image/gif", "a.gif", 10, 10, null)),
+            ),
+        )
+        assertFalse(sameTranscriptPaint(withMedia, sameUrlNewMime))
+    }
+
+    @Test
     fun mergeCapsAtNewest500Rows() {
         val merged = mergeTranscriptRows(
             existing = emptyList(),

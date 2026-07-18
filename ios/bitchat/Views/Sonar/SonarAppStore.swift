@@ -3886,6 +3886,12 @@ final class SonarAppStore: ObservableObject {
     /// must not invalidate the store. Entries are released on `closedDM`.
     private var conversationViewStates: [String: ConversationViewState] = [:]
 
+    /// Drop leave/reopen paint cache when a conversation is deleted or erased.
+    private func discardRetainedConversation(_ id: String) {
+        conversationViewStates.removeValue(forKey: id)
+    }
+
+
     /// The precomputed transcript for one conversation. Returns the same
     /// instance across body evaluations so `@ObservedObject` subscriptions
     /// stay stable while the chat is open.
@@ -5773,10 +5779,20 @@ final class SonarAppStore: ObservableObject {
 
     /// Hydrate the local state without network work. Visual/audio attachments
     /// may opt into automatic download; generic files remain tap-to-download.
+    ///
+    /// When the file is already on disk, skip `@Published` writes —
+    /// `mediaTransferState` already synthesises `.available` from the
+    /// filesystem. Republishing on every bubble appear rebuilds the whole
+    /// transcript during chat open (Signal avoids this churn).
     func prepareMedia(_ item: SNMediaItem, autoDownload: Bool) {
         let key = Self.mediaKey(item)
         if let url = existingMediaURL(item) {
-            mediaTransferStates[key] = .available(url)
+            switch mediaTransferStates[key]?.phase {
+            case .downloading, .failed:
+                mediaTransferStates[key] = .available(url)
+            default:
+                break // nil / .available: no @Published churn
+            }
             return
         }
         if autoDownload || mediaImageCache[key] != nil {
@@ -6015,24 +6031,31 @@ final class SonarAppStore: ObservableObject {
     /// tail. The published `unreadByGroup` map lags a cold launch, so a map
     /// miss falls back to reading the core conversation index directly; that
     /// read races openedDM's read-marking, but read-marking only runs after
-    /// the local hydrate completes, so the summaries read lands first — and a
-    /// lost race just degrades to today's open-at-tail behavior.
+    /// the local hydrate completes, so the summaries read lands first.
+    ///
+    /// Always publishes a settled value (including `0`). While the key is
+    /// absent, `SNMsgList` must not treat the open as fully-read (`?? 0` was
+    /// the alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
-        guard let groupId else { return }
+        guard let groupId else {
+            unreadCountAtOpenByDM[id] = 0
+            return
+        }
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        let hasCachedEntry = ids.contains { marmot.unreadByGroup[$0] != nil }
         let cached = ids.reduce(UInt64(0)) { $0 + (marmot.unreadByGroup[$1] ?? 0) }
-        if cached > 0 {
+        if hasCachedEntry || cached > 0 {
             unreadCountAtOpenByDM[id] = cached
             return
         }
         Task { [weak self] in
             guard let self else { return }
             let unread = await self.marmot.unreadCount(forGroups: ids)
-            if unread > 0 { self.unreadCountAtOpenByDM[id] = unread }
+            self.unreadCountAtOpenByDM[id] = unread
         }
     }
 
@@ -6048,6 +6071,61 @@ final class SonarAppStore: ObservableObject {
         let groups = directMarmotGroups(matchingGroupId: groupId)
         let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
         return ids.compactMap { marmot.conversationSummariesByGroup[$0]?.latestAt }.max()
+    }
+
+    /// Generations cancel a superseded first-open Task when the user taps another chat.
+    private var dmOpenGenerations: [String: UUID] = [:]
+
+    /// True when a local newest page (or retained ConversationViewState) can
+    /// paint without awaiting disk — Compose `retainedTranscriptByChat` reopen.
+    private func dmHasLocalTranscriptPaint(_ id: String, marmotGroupId knownMarmotGroupId: String?) -> Bool {
+        if let retained = conversationViewStates[id], !retained.messages.isEmpty { return true }
+        if cachedMeshMessageCount(id) > 0 { return true }
+        let groupId = knownMarmotGroupId
+            ?? marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else { return false }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        let ids = groups.isEmpty ? [groupId] : groups.map(\.id)
+        return ids.contains { !(marmot.messagesByGroup[$0] ?? []).isEmpty }
+    }
+
+    /// Navigate into a DM after the local newest page is ready (Compose
+    /// `openChat` parity). First open awaits `loadLocalWhenConnected` before
+    /// present; reopen uses retained leave paint and hydrates in the background.
+    /// Pass `present` on Mac (selection) instead of the default `push(.dm)`.
+    func openDM(
+        _ id: String,
+        marmotGroupId knownMarmotGroupId: String? = nil,
+        present: (() -> Void)? = nil
+    ) {
+        let presentDM = present ?? { self.push(.dm(id)) }
+        if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
+            openedDM(id, marmotGroupId: knownMarmotGroupId)
+            presentDM()
+            return
+        }
+        if dmHasLocalTranscriptPaint(id, marmotGroupId: knownMarmotGroupId) {
+            openedDM(id, marmotGroupId: knownMarmotGroupId)
+            presentDM()
+            return
+        }
+        let generation = UUID()
+        dmOpenGenerations[id] = generation
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.openedDM(id, marmotGroupId: knownMarmotGroupId)
+            let warmupKey = knownMarmotGroupId
+                ?? self.marmotGroupId(id)
+                ?? id
+            if let task = self.openingDMTasks[warmupKey] {
+                await task.value
+            }
+            guard self.dmOpenGenerations[id] == generation else { return }
+            self.dmOpenGenerations[id] = nil
+            self.conversationViewState(id).rebuildNow()
+            presentDM()
+        }
     }
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
@@ -6181,11 +6259,10 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
-        // Drop the precomputed render state: closed chats must not keep
-        // rebuilding on every store invalidation. A view still holding the
-        // object keeps working (it owns its subscription); this only stops
-        // caching it for reuse.
-        conversationViewStates[id] = nil
+        // Keep ConversationViewState for Signal-style reopen paint (Compose
+        // retainedTranscriptByChat). Wipe/erase clears the map. Unsubscribe
+        // from store invalidation would still rebuild — acceptable for smoke;
+        // the leave paint avoids first-frame empty → hydrate flash.
         // NB: do NOT stop the Marmot subscription loop here — it now runs for as
         // long as we're connected (started in performConnect) so welcomes +
         // messages keep arriving live in the background list, not only while a
@@ -6213,8 +6290,7 @@ final class SonarAppStore: ObservableObject {
         guard let pendingId = pendingMarmotChatId(for: clean) else { return nil }
         if let group = marmotGroup(forNpub: clean) {
             let id = Self.marmotIDPrefix + group.id
-            openedDM(id, marmotGroupId: group.id)
-            push(.dm(id))
+            openDM(id, marmotGroupId: group.id)
             return id
         }
         pendingMarmotChats[pendingId] = pendingMarmotChats[pendingId] ?? SNPendingMarmotChat(npub: clean, createdAt: Date())
@@ -6530,8 +6606,7 @@ final class SonarAppStore: ObservableObject {
     /// Radar "Send sats": open the DM with the PaySheet already up.
     func quickPay(_ id: String) {
         pendingPayPeer = id
-        openedDM(id)
-        push(.dm(id))
+        openDM(id)
     }
 
     /// Consumed by the DM screen on appear (one-shot).
@@ -7194,6 +7269,7 @@ final class SonarAppStore: ObservableObject {
     /// Noise leg (delete both). Multi-member Marmot groups publish a leave
     /// proposal; other deletes are local-only.
     func deleteChat(_ id: String) {
+        discardRetainedConversation(id)
         if isPendingSecureChat(id) {
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
@@ -7211,7 +7287,10 @@ final class SonarAppStore: ObservableObject {
             // resurface after the next refresh.
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
             let groupIds = matching.isEmpty ? [groupId] : matching
-            for gid in groupIds { forgetMarmotGroupMappings(forGroupId: gid) }
+            for gid in groupIds {
+                discardRetainedConversation(gid)
+                forgetMarmotGroupMappings(forGroupId: gid)
+            }
             Task {
                 if shouldLeave {
                     await marmot.leaveGroup(groupId)
@@ -7225,7 +7304,10 @@ final class SonarAppStore: ObservableObject {
             // ...and every folded White Noise leg, if this peer has any.
             if let profile = resolvedSonarProfile(id) {
                 let groups = marmotGroups(forNpub: profile.npub)
-                for g in groups { forgetMarmotGroupMappings(forGroupId: g.id) }
+                for g in groups {
+                    discardRetainedConversation(g.id)
+                    forgetMarmotGroupMappings(forGroupId: g.id)
+                }
                 if !groups.isEmpty {
                     Task { for g in groups { await marmot.deleteGroup(g.id) } }
                 }
@@ -7250,6 +7332,7 @@ final class SonarAppStore: ObservableObject {
     func eraseAllChats() {
         path = []
         unreadCountAtOpenByDM.removeAll()
+        conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
         // White Noise / Marmot groups: wipe the encrypted DB then reconnect

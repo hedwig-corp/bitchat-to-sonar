@@ -112,6 +112,42 @@ struct SonarDMScreenContent: View {
         ((isMarmot || isSonar) ? "Sonar" : "bitchat") + " · end-to-end encrypted"
     }
 
+    @ViewBuilder
+    private var dmComposer: some View {
+        SNComposer(
+            placeholder: "Message \(peer.name)" + (transport == .internet ? " · via internet" : ""),
+            transport: transport,
+            onSend: { text in
+                // Delivery must never wait on a historical-window reset or
+                // its unrelated metadata reads. Move back to the live edge
+                // independently after the send has entered the local-first
+                // transport/outbox path.
+                store.sendDm(peerId, text)
+                Task { @MainActor in
+                    await convo.loadNewestIfNeeded()
+                }
+            },
+            onPlus: { sheet = true },
+            onCommand: { cmd in
+                store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
+            },
+            onSticker: { sticker, coord in
+                store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
+                Task { @MainActor in
+                    await convo.loadNewestIfNeeded()
+                }
+            },
+            loadStickerPack: { author, identifier, relays in
+                await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
+            },
+            loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
+            fetchInstalledPacks: { await store.fetchInstalledPacks() },
+            cachedStickerPacks: { store.cachedStickerPacks() },
+            voiceEnabled: store.canSendMedia(peerId),
+            onVoice: { store.sendVoiceNote(peerId, url: $0) }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             SNNavHeader(onBack: { store.pop() }, content: {
@@ -158,6 +194,35 @@ struct SonarDMScreenContent: View {
                         ? "Messages here are end-to-end encrypted. Only group members can read them."
                         : "Messages here are end-to-end encrypted. Only the two of you can read them."
                 )
+                dmComposer
+            } else if SNTranscriptCollectionHostFlag.isEnabled {
+                // Production Signal engine (Phase 3 cutover, default ON):
+                // full-height collection + keyboardLayoutGuide composer +
+                // owned insets + pre-measured cells + sticky day headers.
+                // SNMsgList below is the kill-switch fallback.
+                SNTranscriptCollectionHost(
+                    msgs: msgs,
+                    showAuthors: isMultiMemberMarmot,
+                    peerName: peer.name,
+                    money: { store.money($0) },
+                    fiatText: { store.moneySatsLine($0) },
+                    mediaPipeline: SNMediaPipeline(
+                        state: { store.mediaTransferState($0) },
+                        prepare: { store.prepareMedia($0, autoDownload: $1) },
+                        request: { store.requestMediaDownload($0) },
+                        cancel: { store.cancelMediaDownload($0) },
+                        loadLocal: { await store.mediaData($0) }
+                    ),
+                    loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
+                    onTapPack: { previewPackCoordinate = $0 },
+                    onRetry: { store.retryDm(peerId, message: $0) },
+                    loadOlder: { await convo.loadOlder() },
+                    loadNewest: { await convo.loadNewestIfNeeded() },
+                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
+                    expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                ) {
+                    dmComposer
+                }
             } else {
                 SNMsgList(
                     msgs: msgs,
@@ -178,44 +243,13 @@ struct SonarDMScreenContent: View {
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     // Captured by push() at navigation time, before this screen
-                    // (and openedDM's read-marking) existed.
-                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId] ?? 0,
+                    // (and openedDM's read-marking) existed. Nil = unset —
+                    // do not coerce to 0 (false live-edge chase).
+                    unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                     expectedNewestDate: store.expectedNewestMessageDate(peerId)
                 )
+                dmComposer
             }
-
-            SNComposer(
-                placeholder: "Message \(peer.name)" + (transport == .internet ? " · via internet" : ""),
-                transport: transport,
-                onSend: { text in
-                    // Delivery must never wait on a historical-window reset or
-                    // its unrelated metadata reads. Move back to the live edge
-                    // independently after the send has entered the local-first
-                    // transport/outbox path.
-                    store.sendDm(peerId, text)
-                    Task { @MainActor in
-                        await convo.loadNewestIfNeeded()
-                    }
-                },
-                onPlus: { sheet = true },
-                onCommand: { cmd in
-                    store.onCommand(.init(type: .dm, id: peerId, target: peer.name), cmd)
-                },
-                onSticker: { sticker, coord in
-                    store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
-                    Task { @MainActor in
-                        await convo.loadNewestIfNeeded()
-                    }
-                },
-                loadStickerPack: { author, identifier, relays in
-                    await store.stickerPack(authorPubkeyHex: author, identifier: identifier, relayUrls: relays)
-                },
-                loadStickerImage: { await store.stickerImageData(url: $0, expectedSha256: $1) },
-                fetchInstalledPacks: { await store.fetchInstalledPacks() },
-                cachedStickerPacks: { store.cachedStickerPacks() },
-                voiceEnabled: store.canSendMedia(peerId),
-                onVoice: { store.sendVoiceNote(peerId, url: $0) }
-            )
         }
         .background(SonarTheme.bg.ignoresSafeArea())
         .overlay {

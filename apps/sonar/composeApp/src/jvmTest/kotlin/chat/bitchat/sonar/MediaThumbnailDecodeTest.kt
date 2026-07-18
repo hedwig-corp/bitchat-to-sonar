@@ -80,4 +80,21 @@ class MediaThumbnailDecodeTest {
         assertNull(decodeThumbnail("not an image".encodeToByteArray(), TRANSCRIPT_THUMB_MAX_EDGE_PX))
         assertNull(decodeThumbnail(ByteArray(0), TRANSCRIPT_THUMB_MAX_EDGE_PX))
     }
+
+    @Test
+    fun pathDecodeMatchesByteDecodeBound() {
+        // Signal-Android list path samples from a file URI; desktop actual reads
+        // then reuses decodeThumbnail — pin the same bound contract.
+        val source = encodedImage(2400, 1600)
+        val file = kotlin.io.path.createTempFile(prefix = "sonar-thumb-", suffix = ".png").toFile()
+        try {
+            file.writeBytes(source)
+            val fromPath = assertNotNull(
+                decodeThumbnailFromPath(file.absolutePath, TRANSCRIPT_THUMB_MAX_EDGE_PX),
+            )
+            assertEquals(TRANSCRIPT_THUMB_MAX_EDGE_PX, maxOf(fromPath.bitmap.width, fromPath.bitmap.height))
+        } finally {
+            file.delete()
+        }
+    }
 }
