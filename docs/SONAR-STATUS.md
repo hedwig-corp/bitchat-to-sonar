@@ -214,7 +214,7 @@ Goal: every row on `/status` should eventually mean "we ran a check", not
 | `relays` | WebSocket open RTT to client default + White Noise interop relays | **Done** — `probe_relay_ws` | None |
 | `dm` | KeyPackage publish + fetch own package from bootstrap relays via `sonar-core` | **Done** — `chat::probe_marmot_keypackage` (`--chat-probe`) | **Dedicated probe nsec** (`SONAR_STATUS_PROBE_NSEC`) — not the publisher key |
 | `groups` | 5-agent MLS group via Hermes task (A→B or multi-member) | **Done** (Hermes `groups-probe.sh`) | Probe nsec(s) |
-| `media` | Blossom reachability: HTTP HEAD `DEFAULT_BLOSSOM_SERVER` | **Done** | None |
+| `media` | Blossom upload bench: BUD-02 PUT+GET on `DEFAULT_BLOSSOM_SERVER` vs candidate(s) (default `https://push.sonar.hedwig.sh`); HEAD-only if no probe nsec | **Done** | Probe nsec for upload mode (`SONAR_STATUS_PROBE_NSEC`) |
 | `stickers` | REQ kind 30031 on bootstrap relays, count visible packs | **Done** | None |
 | `push` | HTTP GET transponder health (and optionally sandbox) | `--http` / `SONAR_STATUS_HTTP` | None if health is public |
 | `payments` | HTTP GET Breez NDS / notify health if exposed; else mark `unknown` and omit row | `--http` | None |
@@ -246,9 +246,12 @@ is reported on `id: "relays"`; product rows appear only when their probe runs.
 3. **Done:** Marmot KeyPackage round-trip → service `dm` via `--chat-probe` +
    dedicated probe nsec (`core/sonar-status/src/chat.rs`).
 4. **Next:** A→B text canary (two probe identities) for stronger E2E `dm` / `groups`.
-5. **Next:** `probe_sticker_index` + Blossom HEAD (no chat identity).
+5. **Done:** sticker index probe + Blossom upload bench (primary
+   `DEFAULT_BLOSSOM_SERVER` vs candidate `https://push.sonar.hedwig.sh`).
 6. **Optional:** store daily uptime samples to drive real 90-day bars (replace
    `syntheticHistory`).
+7. **Next (ops):** allow BUD-02 uploads on `push.sonar.hedwig.sh` (today 403),
+   then switch app `DEFAULT_BLOSSOM_SERVER` once candidate upload latency wins.
 
 ### Local verify
 

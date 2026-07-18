@@ -5374,6 +5374,7 @@ dependencies = [
  "futures-util",
  "hex",
  "nostr",
+ "nostr-blossom",
  "nostr-sdk",
  "reqwest 0.12.28",
  "serde",

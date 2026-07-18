@@ -31,7 +31,9 @@ use ::url::Url;
 
 use chat::{load_probe_secret, probe_marmot_keypackage, ChatProbeReport};
 use groups::{load_groups_result, payments_coming_soon, GroupsProbeResult};
-use media::{probe_blossom, MediaProbeReport};
+use media::{
+    default_blossom_compare, probe_blossom_servers, MediaProbeReport,
+};
 use stickers::{probe_sticker_index, StickerProbeReport};
 use schema::{
     website_view, IncidentLevel, IncidentUpdate, ServiceState, StatusIncident, StatusPayload,
@@ -159,12 +161,16 @@ struct ProbeArgs {
     /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
     #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
     sticker_probe: bool,
-    /// Run Blossom media reachability probe (HTTP HEAD).
+    /// Run Blossom media probe (BUD-02 upload when probe nsec is set; else HEAD).
     #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
     media_probe: bool,
-    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    /// Primary Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Extra Blossom servers to compare against the primary (comma-separated).
+    /// Defaults to https://push.sonar.hedwig.sh when unset.
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
+    blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.
     #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
     groups_result: Option<PathBuf>,
@@ -221,12 +227,16 @@ struct PublishArgs {
     /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
     #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
     sticker_probe: bool,
-    /// Run Blossom media reachability probe (HTTP HEAD).
+    /// Run Blossom media probe (BUD-02 upload when probe nsec is set; else HEAD).
     #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
     media_probe: bool,
-    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    /// Primary Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Extra Blossom servers to compare against the primary (comma-separated).
+    /// Defaults to https://push.sonar.hedwig.sh when unset.
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
+    blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.
     #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
     groups_result: Option<PathBuf>,
@@ -270,6 +280,7 @@ struct ProbeOptions {
     sticker_probe: bool,
     media_probe: bool,
     blossom_server: Option<String>,
+    blossom_compare: Option<String>,
     groups_result: Option<PathBuf>,
     payments_coming_soon: bool,
 }
@@ -299,6 +310,7 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                blossom_compare: args.blossom_compare,
                 groups_result: args.groups_result,
                 payments_coming_soon: args.payments_coming_soon,
             };
@@ -330,6 +342,7 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                blossom_compare: args.blossom_compare,
                 groups_result: args.groups_result,
                 payments_coming_soon: args.payments_coming_soon,
             };
@@ -516,7 +529,19 @@ async fn build_payload(
             .blossom_server
             .as_deref()
             .unwrap_or(sonar_core::client::DEFAULT_BLOSSOM_SERVER);
-        Some(probe_blossom(server).await)
+        let compare = match opts.blossom_compare.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => parse_list(Some(raw), &[]),
+            _ => default_blossom_compare(),
+        };
+        // Prefer the dedicated probe identity for BUD-02 auth. If the operator
+        // enabled media without a probe nsec, fall back to HEAD-only.
+        let probe_secret = load_probe_secret(
+            opts.probe_nsec.as_deref(),
+            opts.probe_nsec_file.as_ref(),
+            "SONAR_STATUS_PROBE_NSEC",
+        )
+        .ok();
+        Some(probe_blossom_servers(server, &compare, probe_secret.as_deref()).await)
     } else {
         None
     };

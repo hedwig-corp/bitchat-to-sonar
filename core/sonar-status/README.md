@@ -100,10 +100,31 @@ REQs kind 30031 on bootstrap relays, counts visible sticker packs. No nsec neede
 
 ### Blossom media probe
 
-HTTP HEADs the Blossom server to verify reachability and measure latency. No nsec needed.
+Compares the app default Blossom server (`DEFAULT_BLOSSOM_SERVER`, today
+`https://nostr.download`) against candidate hosts (default
+`https://push.sonar.hedwig.sh`) and publishes the timings on the `media` status
+row.
+
+- With a probe nsec: BUD-02 upload + GET + best-effort delete of a ~4 KiB canary
+  (this is the latency that matters for media send).
+- Without a probe nsec: HTTP HEAD/GET reachability only.
 
 ```bash
 export SONAR_STATUS_STICKER_PROBE=1
 export SONAR_STATUS_MEDIA_PROBE=1
+export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
+# optional override:
+# export SONAR_STATUS_BLOSSOM_SERVER=https://nostr.download
+# export SONAR_STATUS_BLOSSOM_COMPARE=https://push.sonar.hedwig.sh
 ./scripts/status/publish.sh
 ```
+
+The service description looks like:
+
+```text
+primary nostr.download upload 180 ms · get 90 ms · candidate push.sonar.hedwig.sh fail: 403 Forbidden
+```
+
+Service state follows the **primary** (app default) only — a failing candidate
+is shown in the description so ops can see when Hedwig Blossom is ready to
+become the default, without marking Media Messages down.
