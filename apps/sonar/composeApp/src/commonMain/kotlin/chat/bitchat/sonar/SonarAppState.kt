@@ -3285,6 +3285,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCache()
                 socialState = SonarSocialState(); persistSocialState()
                 bip353 = ""; SonarCore.saveBlob("bip353", "")
+                coreClaimedHandle = null
+                handleClaimState = HandleClaimState.Idle
+                // Drop the previous account's nickname. The restored identity's
+                // kind-0 on relays is authoritative; publishing the old nick
+                // would clobber it. hydrateOwnProfileFromRelays() fills this
+                // after relay connect.
+                SonarCore.setNickname("")
+                nick = ""
                 meshBroadcast = emptyList(); meshDmRows = emptyList()
                 verifiedChatIds.forEach { SonarCore.saveBlob("verified.$it", "") }
                 verifiedChatIds.clear(); verifiedVersion++
@@ -3350,8 +3358,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.setNickname(value)
         nick = value
         refreshMeshIdentity()
-        // Re-publish our kind-0 profile so peers see the new name.
-        if (SonarCore.isRelayConnected()) scope.launch { runCatching { SonarCore.publishProfile(value) } }
+        // Re-publish our kind-0 profile so peers see the new name — but never
+        // when a local handle pref exists without the core sidecar. That emit
+        // would omit `nip05` and replace the durable kind-0 after restore.
+        if (SonarCore.isRelayConnected()) scope.launch {
+            val claimed = coreClaimedHandle ?: SonarCore.claimedHandle()
+            if (!canPublishOwnProfile(bip353, claimed)) return@launch
+            runCatching { SonarCore.publishProfile(value) }
+        }
     }
 
     // ── Local notifications (fire on new incoming message while backgrounded) ──
@@ -3881,7 +3895,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.installConversationListener()
         collectConversationChanges()
         startMarmotWakeLoop()
-        scope.launch { runCatching { SonarCore.publishProfile(nick) } }
+        // Fetch own kind-0 before any publish: after nsec restore the local
+        // nick/handle sidecars are empty, and publishing blank/stale metadata
+        // would replace the durable relay profile.
+        scope.launch {
+            if (hydrateOwnProfileFromRelays() && nick.isNotBlank()) {
+                runCatching { SonarCore.publishProfile(nick) }
+            }
+        }
         scope.launch { publishSonarDescriptorIfNeeded(force = true) }
         updateBleDiscoveryPolicy()
         refreshKnownContactDescriptors(clearMisses = true)
@@ -3894,6 +3915,68 @@ class SonarAppState(private val scope: CoroutineScope) {
         runCatching { recomputeConversations() }
         drainPendingInviteTokens()
         requestHousekeeping()
+    }
+
+    /**
+     * Pull our own kind-0 from relays into local profile state. Used after
+     * nsec restore (and whenever local nick/handle prefs were lost) so the
+     * Profile screen shows the durable name + NIP-05 instead of a blank/"you"
+     * placeholder. Re-claims the handle when the core sidecar is empty so a
+     * later publish cannot drop `nip05`.
+     *
+     * @return true when it is safe to republish kind-0 (non-blank nick, and
+     *   either no remote nip05 needed seeding or the sidecar was re-claimed).
+     */
+    private suspend fun hydrateOwnProfileFromRelays(): Boolean {
+        val claimedNow = coreClaimedHandle ?: SonarCore.claimedHandle()
+        if (!needsOwnProfileRelayFetch(nick, bip353, claimedNow, handleDomain)) {
+            return nick.isNotBlank() && canPublishOwnProfile(bip353, claimedNow)
+        }
+        val me = npub.takeIf { it.isNotBlank() } ?: return nick.isNotBlank()
+        val profile = runCatching { SonarCore.fetchProfile(me) }.getOrNull()
+        if (profile == null) return nick.isNotBlank() && canPublishOwnProfile(bip353, claimedNow)
+        val key = canonicalProfileKey(me)
+        val updated = profilesByNpub + (key to profile)
+        profilesByNpub = normalizedProfileCache(updated)
+        profileFetchedAt[key] = SonarClock.nowSecs()
+        persistProfileCache()
+
+        val plan = planOwnProfileHydration(
+            localNickname = nick,
+            localBip353 = bip353,
+            localClaimedHandle = coreClaimedHandle ?: SonarCore.claimedHandle(),
+            remote = profile,
+            handleDomain = handleDomain,
+        )
+        plan.nicknameToAdopt?.let { name ->
+            SonarCore.setNickname(name)
+            nick = name
+            refreshMeshIdentity()
+        }
+        // Mirror remote nip05 into prefs for Profile UI only — do not mark the
+        // core claim / registrar seal until claimHandle actually seeds the sidecar.
+        plan.nip05ToAdopt?.let { address -> updateBip353(address) }
+        var handleSeeded = plan.handleLocalToClaim == null
+        plan.handleLocalToClaim?.let { local ->
+            // Prefer a wallet offer when ready so restore reclaim also seeds
+            // BIP-353 payment DNS (chat-only claim is still valid if not).
+            val offer = if (walletState is WalletState.Ready) {
+                runCatching { WalletBridge.createOffer() }.getOrNull()
+            } else null
+            runCatching { SonarCore.claimHandle(local, offer) }
+                .onSuccess { address ->
+                    coreClaimedHandle = address
+                    handleSeeded = true
+                    if (offer != null) lastClaimedOffer = offer
+                    if (bip353.isBlank()) updateBip353(address)
+                    if (handleClaimState is HandleClaimState.Idle) {
+                        handleClaimState = HandleClaimState.Claimed(address)
+                    }
+                }
+        }
+        // Skip publish when a remote nip05 still has no sidecar — a replaceable
+        // kind-0 without nip05 would wipe the durable handle on relays.
+        return plan.shouldPublishNickname && handleSeeded
     }
 
     fun boot() {
