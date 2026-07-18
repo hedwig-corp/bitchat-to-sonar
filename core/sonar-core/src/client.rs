@@ -137,7 +137,9 @@ static HANDLE_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .timeout(Duration::from_secs(20))
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        // Never fall back to `Client::new()` — that re-enables redirects and
+        // undoes the SSRF hardening for attacker-controlled NIP-05 hosts.
+        .expect("HANDLE_HTTP_CLIENT: reqwest builder failed")
 });
 
 /// Read a response body with a hard size cap. The NIP-05 host is whatever

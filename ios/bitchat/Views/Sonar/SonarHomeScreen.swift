@@ -760,6 +760,8 @@ struct SNSearchSheetContent: View {
         if canStartSecureChat {
             store.startSecureChat(npub: trimmedQuery)
             onClose()
+        } else if canStartHandleChat {
+            resolveHandleAndStartChat()
         } else if let channel = filteredChannels.first {
             openChannel(channel)
         } else if let dm = filteredDMs.first {

@@ -12,7 +12,7 @@
 // them to storage and DNS.
 
 import type { Env } from "./index";
-import { upsertTxtRecord } from "./dns";
+import { deleteTxtRecords, upsertTxtRecord } from "./dns";
 
 /** One pubkey may squat at most this many handles. */
 export const MAX_HANDLES_PER_PUBKEY = 3;
@@ -136,7 +136,11 @@ export class HandleRegistry implements DurableObject {
     const url = new URL(request.url);
     try {
       if (request.method === "POST" && url.pathname === "/rate-limit") {
-        return this.handleRateLimit(await request.json<{ ip: string }>());
+        // Read-modify-write on the rate row races across concurrent DO
+        // deliveries the same way /register does — serialize so the 5/60s
+        // cap can't be bypassed by parallel same-IP requests.
+        const body = await request.json<{ ip: string }>();
+        return await this.state.blockConcurrencyWhile(async () => this.handleRateLimit(body));
       }
       if (request.method === "POST" && url.pathname === "/register") {
         // Registration performs an external DNS fetch mid-flight, and DO
@@ -243,8 +247,11 @@ export class HandleRegistry implements DurableObject {
 
     // DNS first, persist second: if the upstream write fails we return 502
     // and leave the record exactly as it was, so the registry never claims
-    // an offer that DNS doesn't serve. (For a first-time claim that also
-    // means the handle stays unclaimed — the client simply retries.)
+    // an offer that DNS doesn't serve. If the SQLite commit then fails, we
+    // compensate (delete the new TXT, or restore the previous offer) so an
+    // unclaimed/stale handle never keeps serving a payable destination.
+    const recordName = `${handle}.user._bitcoin-payment.${this.env.BIP353_DOMAIN}`;
+    let dnsWroteOffer: string | null = null;
     if (offer !== null) {
       // Defense-in-depth: the Worker already ran OFFER_RE, but the DNS TXT
       // write is the one irreversible fund-relevant side effect — re-assert
@@ -255,7 +262,6 @@ export class HandleRegistry implements DurableObject {
       if (!this.env.CF_DNS_TOKEN) {
         return json({ error: "dns_not_configured" }, 502);
       }
-      const recordName = `${handle}.user._bitcoin-payment.${this.env.BIP353_DOMAIN}`;
       const dns = await upsertTxtRecord({
         zoneId: this.env.ZONE_ID,
         apiToken: this.env.CF_DNS_TOKEN,
@@ -265,28 +271,54 @@ export class HandleRegistry implements DurableObject {
       if (!dns.ok) {
         return json({ error: "dns_update_failed", detail: dns.error }, 502);
       }
+      dnsWroteOffer = offer;
     }
 
     const now = Math.floor(Date.now() / 1000);
-    if (decision.action === "create") {
-      this.sql.exec(
-        "INSERT INTO handles (handle, pubkey, offer, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        handle,
-        pubkey,
-        offer,
-        createdAt,
-        now,
-      );
-    } else {
-      // COALESCE keeps an existing offer alive when a re-register (e.g. a
-      // chat-only refresh) arrives without one.
-      this.sql.exec(
-        "UPDATE handles SET offer = COALESCE(?, offer), created_at = ?, updated_at = ? WHERE handle = ?",
-        offer,
-        createdAt,
-        now,
-        handle,
-      );
+    try {
+      if (decision.action === "create") {
+        this.sql.exec(
+          "INSERT INTO handles (handle, pubkey, offer, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+          handle,
+          pubkey,
+          offer,
+          createdAt,
+          now,
+        );
+      } else {
+        // COALESCE keeps an existing offer alive when a re-register (e.g. a
+        // chat-only refresh) arrives without one.
+        this.sql.exec(
+          "UPDATE handles SET offer = COALESCE(?, offer), created_at = ?, updated_at = ? WHERE handle = ?",
+          offer,
+          createdAt,
+          now,
+          handle,
+        );
+      }
+    } catch {
+      if (dnsWroteOffer !== null && this.env.CF_DNS_TOKEN) {
+        const previousOffer = existingRow?.offer ?? null;
+        if (previousOffer) {
+          // Owner update: put the prior offer back so DNS matches the row
+          // that still exists (or will after the client retries).
+          await upsertTxtRecord({
+            zoneId: this.env.ZONE_ID,
+            apiToken: this.env.CF_DNS_TOKEN,
+            name: recordName,
+            content: `bitcoin:?lno=${previousOffer}`,
+          });
+        } else {
+          // First-time claim (or chat-only row with no prior offer): drop
+          // the orphan TXT so the handle stays unclaimed AND unpaid.
+          await deleteTxtRecords({
+            zoneId: this.env.ZONE_ID,
+            apiToken: this.env.CF_DNS_TOKEN,
+            name: recordName,
+          });
+        }
+      }
+      return json({ error: "persist_failed" }, 500);
     }
 
     const hasOffer = offer !== null || (existingRow?.offer ?? null) !== null;

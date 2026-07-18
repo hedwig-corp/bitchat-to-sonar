@@ -165,7 +165,11 @@ fn is_valid_domain(s: &str) -> bool {
     if s.starts_with('[') || labels.last().is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit())) {
         return false;
     }
-    const INTERNAL_SUFFIXES: [&str; 5] = ["local", "internal", "localdomain", "home.arpa", "lan"];
+    // Include `localhost` as a suffix so `foo.localhost` (loopback on most
+    // resolvers) is rejected — bare `localhost` alone already fails the
+    // "must contain a dot" check above.
+    const INTERNAL_SUFFIXES: [&str; 6] =
+        ["local", "internal", "localdomain", "home.arpa", "lan", "localhost"];
     if labels.first().is_some_and(|l| *l == "localhost")
         || INTERNAL_SUFFIXES
             .iter()
@@ -380,6 +384,7 @@ mod tests {
             "router.lan",
             "box.home.arpa",
             "host.localdomain",
+            "foo.localhost",
         ] {
             assert!(
                 parse_handle_input(&format!("alice@{bad}"), DEFAULT_HANDLE_DOMAIN).is_err(),

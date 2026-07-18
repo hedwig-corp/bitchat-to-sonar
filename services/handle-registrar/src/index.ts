@@ -165,28 +165,34 @@ async function handleRegister(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleNostrJson(url: URL, env: Env): Promise<Response> {
-  const headers = { "cache-control": "public, max-age=60" };
+  // Positive hits may be edge-cached briefly; empty maps must not — a
+  // pre-claim miss cached for 60s would make a just-registered handle look
+  // unregistered to verify_nip05 / resolve_handle.
+  const positiveHeaders = { "cache-control": "public, max-age=60" };
+  const negativeHeaders = { "cache-control": "no-store" };
   const name = normalizeHandle(url.searchParams.get("name") ?? "");
 
   if (name === "") {
-    return json({ names: {} }, 200, headers);
+    return json({ names: {} }, 200, negativeHeaders);
   }
   // "_" is the NIP-05 root identity for the bare domain; only serve it when
   // the operator explicitly configured one.
   if (name === "_") {
-    return json(env.ROOT_PUBKEY ? { names: { _: env.ROOT_PUBKEY } } : { names: {} }, 200, headers);
+    return env.ROOT_PUBKEY
+      ? json({ names: { _: env.ROOT_PUBKEY } }, 200, positiveHeaders)
+      : json({ names: {} }, 200, negativeHeaders);
   }
   // Unknown or malformed names are an empty map, not an error — NIP-05
   // clients treat any non-200 as a hard failure.
   if (!HANDLE_REGEX.test(name)) {
-    return json({ names: {} }, 200, headers);
+    return json({ names: {} }, 200, negativeHeaders);
   }
 
   const lookup = await doLookup(env, name);
   if (!lookup.found || lookup.pubkey === null) {
-    return json({ names: {} }, 200, headers);
+    return json({ names: {} }, 200, negativeHeaders);
   }
-  return json({ names: { [name]: lookup.pubkey } }, 200, headers);
+  return json({ names: { [name]: lookup.pubkey } }, 200, positiveHeaders);
 }
 
 async function handleResolve(rawHandle: string, env: Env): Promise<Response> {

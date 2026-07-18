@@ -2,7 +2,7 @@
 // failure summarization with an injected fetch — no network, no runtime.
 
 import { describe, expect, it } from "vitest";
-import { upsertTxtRecord } from "../src/dns";
+import { deleteTxtRecords, upsertTxtRecord } from "../src/dns";
 
 const PARAMS = {
   zoneId: "zone123",
@@ -69,6 +69,48 @@ describe("upsertTxtRecord", () => {
     expect(result).toEqual({ ok: true, recordId: "existing42" });
     expect(calls[1]?.method).toBe("PUT");
     expect(calls[1]?.url).toContain("/dns_records/existing42");
+  });
+
+  it("deletes sibling TXT records after writing the primary", async () => {
+    const calls: Call[] = [];
+    const result = await upsertTxtRecord({
+      ...PARAMS,
+      fetchImpl: fakeFetch(
+        [
+          cfJson({
+            success: true,
+            result: [{ id: "keep" }, { id: "stale-a" }, { id: "stale-b" }],
+          }),
+          cfJson({ success: true, result: { id: "keep" } }),
+          cfJson({ success: true, result: {} }),
+          cfJson({ success: true, result: {} }),
+        ],
+        calls,
+      ),
+    });
+    expect(result).toEqual({ ok: true, recordId: "keep" });
+    expect(calls.map((c) => c.method)).toEqual(["GET", "PUT", "DELETE", "DELETE"]);
+    expect(calls[2]?.url).toContain("/dns_records/stale-a");
+    expect(calls[3]?.url).toContain("/dns_records/stale-b");
+  });
+
+  it("deleteTxtRecords removes every TXT at the name", async () => {
+    const calls: Call[] = [];
+    const result = await deleteTxtRecords({
+      zoneId: PARAMS.zoneId,
+      apiToken: PARAMS.apiToken,
+      name: PARAMS.name,
+      fetchImpl: fakeFetch(
+        [
+          cfJson({ success: true, result: [{ id: "a" }, { id: "b" }] }),
+          cfJson({ success: true, result: {} }),
+          cfJson({ success: true, result: {} }),
+        ],
+        calls,
+      ),
+    });
+    expect(result).toEqual({ ok: true, deleted: 2 });
+    expect(calls.map((c) => c.method)).toEqual(["GET", "DELETE", "DELETE"]);
   });
 
   it("summarizes API failures without echoing the response wholesale", async () => {

@@ -1939,6 +1939,8 @@ private struct MacCommandPalette: View {
     private func chooseFirstResult() {
         if canStartSecureChatFromQuery {
             startSecureChat(with: trimmedQuery)
+        } else if canStartHandleChatFromQuery {
+            resolveHandleAndStartChat()
         } else if normalizedQuery.isEmpty {
             choose(.radar)
         } else if let command = filteredCommands.first {

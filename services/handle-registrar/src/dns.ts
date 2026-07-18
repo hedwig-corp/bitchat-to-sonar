@@ -44,10 +44,57 @@ async function readEnvelope(res: Response): Promise<CfApiEnvelope | null> {
   }
 }
 
+export interface TxtDeleteParams {
+  zoneId: string;
+  apiToken: string;
+  name: string;
+  fetchImpl?: typeof fetch;
+}
+
+export type TxtDeleteResult = { ok: true; deleted: number } | { ok: false; error: string };
+
+async function listTxtRecordIds(
+  f: typeof fetch,
+  base: string,
+  name: string,
+  headers: Record<string, string>,
+): Promise<{ ok: true; ids: string[] } | { ok: false; error: string }> {
+  // Paginate so sibling TXT RRs (manual edits / prior bugs) are never left
+  // behind — BIP-353 allows exactly one payment-instruction record.
+  const ids: string[] = [];
+  let page = 1;
+  for (;;) {
+    let listRes: Response;
+    let listBody: CfApiEnvelope | null;
+    try {
+      listRes = await f(
+        `${base}?type=TXT&name=${encodeURIComponent(name)}&per_page=100&page=${page}`,
+        { headers },
+      );
+      listBody = await readEnvelope(listRes);
+    } catch {
+      return { ok: false, error: "cloudflare_api_unreachable" };
+    }
+    if (!listRes.ok || listBody?.success !== true) {
+      return { ok: false, error: summarizeFailure(listRes.status, listBody) };
+    }
+    const results = Array.isArray(listBody.result) ? listBody.result : [];
+    for (const row of results) {
+      const id = (row as { id?: unknown })?.id;
+      if (typeof id === "string") ids.push(id);
+    }
+    if (results.length < 100) break;
+    page += 1;
+    if (page > 20) break; // hard stop — a payment name should never need this
+  }
+  return { ok: true, ids };
+}
+
 /**
  * Find-existing-then-update-else-create for a single TXT record. BIP-353
  * allows exactly one TXT record at the payment-instruction name, so an
- * existing record is always overwritten rather than appended to.
+ * existing record is always overwritten rather than appended to. Extra
+ * sibling TXT RRs at the same name are deleted after the write.
  */
 export async function upsertTxtRecord(params: TxtUpsertParams): Promise<TxtUpsertResult> {
   const f = params.fetchImpl ?? fetch;
@@ -65,22 +112,10 @@ export async function upsertTxtRecord(params: TxtUpsertParams): Promise<TxtUpser
     ttl: params.ttl ?? DEFAULT_TTL,
   };
 
-  let existingId: string | null = null;
-  try {
-    const listRes = await f(
-      `${base}?type=TXT&name=${encodeURIComponent(params.name)}&per_page=1`,
-      { headers },
-    );
-    const listBody = await readEnvelope(listRes);
-    if (!listRes.ok || listBody?.success !== true) {
-      return { ok: false, error: summarizeFailure(listRes.status, listBody) };
-    }
-    const results = Array.isArray(listBody.result) ? listBody.result : [];
-    const first = results[0] as { id?: unknown } | undefined;
-    if (first && typeof first.id === "string") existingId = first.id;
-  } catch {
-    return { ok: false, error: "cloudflare_api_unreachable" };
-  }
+  const listed = await listTxtRecordIds(f, base, params.name, headers);
+  if (!listed.ok) return listed;
+  const existingId = listed.ids[0] ?? null;
+  const siblingIds = listed.ids.slice(1);
 
   try {
     const writeRes = await f(existingId ? `${base}/${existingId}` : base, {
@@ -92,9 +127,47 @@ export async function upsertTxtRecord(params: TxtUpsertParams): Promise<TxtUpser
     if (!writeRes.ok || writeBody?.success !== true) {
       return { ok: false, error: summarizeFailure(writeRes.status, writeBody) };
     }
+    // Drop any leftover siblings so resolvers can't pick a stale offer.
+    for (const id of siblingIds) {
+      try {
+        await f(`${base}/${id}`, { method: "DELETE", headers });
+      } catch {
+        // Best-effort: the primary record already has the new content.
+      }
+    }
     const result = writeBody.result as { id?: unknown } | undefined;
-    return { ok: true, recordId: typeof result?.id === "string" ? result.id : "" };
+    return { ok: true, recordId: typeof result?.id === "string" ? result.id : existingId ?? "" };
   } catch {
     return { ok: false, error: "cloudflare_api_unreachable" };
   }
+}
+
+/**
+ * Delete every TXT record at `name`. Used to compensate when a DNS write
+ * landed but the registry row commit failed — otherwise an unclaimed handle
+ * can keep serving a payable BIP-353 destination.
+ */
+export async function deleteTxtRecords(params: TxtDeleteParams): Promise<TxtDeleteResult> {
+  const f = params.fetchImpl ?? fetch;
+  const base = `${API_BASE}/zones/${encodeURIComponent(params.zoneId)}/dns_records`;
+  const headers = {
+    authorization: `Bearer ${params.apiToken}`,
+    "content-type": "application/json",
+  };
+  const listed = await listTxtRecordIds(f, base, params.name, headers);
+  if (!listed.ok) return listed;
+  let deleted = 0;
+  for (const id of listed.ids) {
+    try {
+      const res = await f(`${base}/${id}`, { method: "DELETE", headers });
+      const body = await readEnvelope(res);
+      if (!res.ok || body?.success !== true) {
+        return { ok: false, error: summarizeFailure(res.status, body) };
+      }
+      deleted += 1;
+    } catch {
+      return { ok: false, error: "cloudflare_api_unreachable" };
+    }
+  }
+  return { ok: true, deleted };
 }
