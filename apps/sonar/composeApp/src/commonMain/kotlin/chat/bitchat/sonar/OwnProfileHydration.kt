@@ -8,6 +8,9 @@ package chat.bitchat.sonar
  * the durable copy lives on relays as kind-0. Hosts must fetch that event
  * before republishing, or an empty/stale local nick will clobber the remote
  * profile (including `nip05`).
+ *
+ * `publish_profile` only attaches `nip05` from the core sidecar, so a remote
+ * handle that cannot be re-seeded there must never trigger a republish.
  */
 data class OwnProfileHydrationPlan(
     /** Non-null when the local nickname should be replaced by the remote name. */
@@ -15,11 +18,15 @@ data class OwnProfileHydrationPlan(
     /** Non-null when prefs should mirror the remote `nip05` address. */
     val nip05ToAdopt: String?,
     /**
-     * Local part to re-claim at the registrar so the core sidecar is seeded
-     * and later kind-0 publishes keep `nip05`. Null when already claimed.
+     * Local part to re-claim at the Sonar registrar so the core sidecar is seeded
+     * and later kind-0 publishes keep `nip05`. Null when already claimed, or when
+     * remote `nip05` is not on [handleDomain].
      */
     val handleLocalToClaim: String?,
-    /** False when publishing would send a blank name and wipe relay metadata. */
+    /**
+     * False when publishing would send a blank name, or would omit/replace a
+     * remote `nip05` the sidecar cannot preserve.
+     */
     val shouldPublishNickname: Boolean,
 )
 
@@ -28,7 +35,9 @@ fun planOwnProfileHydration(
     localBip353: String,
     localClaimedHandle: String?,
     remote: SonarProfile?,
+    handleDomain: String,
 ): OwnProfileHydrationPlan {
+    val domain = handleDomain.trim().lowercase()
     val remoteName = remote?.bestName?.takeIf { it.isNotBlank() }
     val remoteNip05 = remote?.nip05
         ?.trim()
@@ -41,17 +50,28 @@ fun planOwnProfileHydration(
         localBip353.isNotBlank() -> null
         else -> remoteNip05
     }
+    val isSonarNip05 = remoteNip05 != null &&
+        remoteNip05.substringAfter('@').equals(domain, ignoreCase = true)
     val handleLocal = when {
         claimed != null -> null
         remoteNip05 == null -> null
+        !isSonarNip05 -> null
         else -> remoteNip05.substringBefore('@').trim().takeIf { it.isNotBlank() }
     }
     val effectiveNick = (adoptNick ?: nick).trim()
+    // Sidecar-backed publish can preserve nip05 only when absent, already
+    // claimed to the same address, or reclaimable at the Sonar registrar.
+    val nip05SafeToPublish = when {
+        remoteNip05 == null -> true
+        claimed != null && claimed.equals(remoteNip05, ignoreCase = true) -> true
+        isSonarNip05 && claimed == null -> true
+        else -> false
+    }
     return OwnProfileHydrationPlan(
         nicknameToAdopt = adoptNick,
         nip05ToAdopt = adoptNip05,
         handleLocalToClaim = handleLocal,
-        shouldPublishNickname = effectiveNick.isNotBlank(),
+        shouldPublishNickname = effectiveNick.isNotBlank() && nip05SafeToPublish,
     )
 }
 
@@ -68,4 +88,25 @@ fun canPublishOwnProfile(
 ): Boolean {
     if (localBip353.isBlank()) return true
     return !coreClaimedHandle.isNullOrBlank()
+}
+
+/**
+ * Whether connect-path hydration must hit relays for our own kind-0.
+ *
+ * Skip the RTT when local nick is present and either there is no handle pref,
+ * the core sidecar is already seeded, or the pref is an external domain we
+ * cannot reclaim into the sidecar (fetching every connect would not help).
+ */
+fun needsOwnProfileRelayFetch(
+    localNickname: String,
+    localBip353: String,
+    localClaimedHandle: String?,
+    handleDomain: String,
+): Boolean {
+    if (localNickname.trim().isEmpty()) return true
+    val bip = localBip353.trim()
+    if (bip.isEmpty()) return false
+    if (!localClaimedHandle.isNullOrBlank()) return false
+    val domain = handleDomain.trim().lowercase()
+    return bip.substringAfter('@', "").equals(domain, ignoreCase = true)
 }

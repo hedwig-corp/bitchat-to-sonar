@@ -239,10 +239,19 @@ final class MarmotChatModel: ObservableObject {
     /// (on the npub signal / explicit rename) and could be lost to relay or
     /// onboarding timing — leaving peers to see a raw npub instead of the name.
     var profileNameProvider: (() -> String)?
+    /// Host bip353 / handle pref for hydration planning. Set by SonarAppStore.
+    var localBip353Provider: (() -> String)?
+    /// Default Sonar handle domain (registrar). Set by SonarAppStore.
+    var handleDomainProvider: (() -> String)?
+    /// Best-effort BOLT12 offer for restore reclaim. Set by SonarAppStore.
+    var handleOfferProvider: (() async -> String?)?
     /// Called on the main actor after our own kind-0 is fetched on relay
     /// connect, so the host can adopt name / NIP-05 into local profile state
     /// before any republish. Set by SonarAppStore.
     var onOwnProfileFetched: ((MarmotService.Profile) -> Void)?
+    /// Called on the main actor after a restore reclaim seeds the core sidecar.
+    /// Set by SonarAppStore — do not mark `coreClaimedHandle` before this.
+    var onOwnHandleSidecarSeeded: ((String) -> Void)?
     @Published var groups: [MarmotService.MarmotGroup] = []
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
@@ -1615,11 +1624,33 @@ final class MarmotChatModel: ObservableObject {
     func hydrateOwnProfileFromRelays() async -> Bool {
         let localNick = (profileNameProvider?() ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let localBip = localBip353Provider?() ?? ""
+        let domain = handleDomainProvider?() ?? defaultHandleDomain()
+        let claimedNow = await service.claimedHandle()
+        if !OwnProfileHydration.needsRelayFetch(
+            localNickname: localNick,
+            localBip353: localBip,
+            localClaimedHandle: claimedNow,
+            handleDomain: domain
+        ) {
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
         guard let me = npub?
             .trimmingCharacters(in: .whitespacesAndNewlines), !me.isEmpty
-        else { return !localNick.isEmpty }
+        else {
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
+        }
         guard let profile = try? await service.fetchProfile(npub: me) else {
-            return !localNick.isEmpty
+            return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
+                localBip353: localBip,
+                coreClaimedHandle: claimedNow
+            )
         }
         let key = SNMarmotProfileCache.canonicalKey(me)
         await MainActor.run {
@@ -1631,15 +1662,18 @@ final class MarmotChatModel: ObservableObject {
         let claimed = await service.claimedHandle()
         let plan = OwnProfileHydration.plan(
             localNickname: profileNameProvider?() ?? "",
-            localBip353: "",
+            localBip353: localBip353Provider?() ?? localBip,
             localClaimedHandle: claimed,
             remoteName: profile.bestName,
-            remoteNip05: profile.nip05
+            remoteNip05: profile.nip05,
+            handleDomain: domain
         )
         var handleSeeded = plan.handleLocalToClaim == nil
         if let local = plan.handleLocalToClaim, !local.isEmpty {
-            if (try? await service.claimHandle(handle: local, offer: nil)) != nil {
+            let offer = await handleOfferProvider?()
+            if let address = try? await service.claimHandle(handle: local, offer: offer) {
                 handleSeeded = true
+                await MainActor.run { onOwnHandleSidecarSeeded?(address) }
             }
         }
         return plan.shouldPublishNickname && handleSeeded

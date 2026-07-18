@@ -1269,10 +1269,19 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
+        marmot.localBip353Provider = { [weak self] in self?.bip353 ?? "" }
+        marmot.handleDomainProvider = { Self.handleDomain }
+        marmot.handleOfferProvider = { [weak self] in
+            guard let self, case .ready = self.walletState else { return nil }
+            return try? await self.wallet.createOffer()
+        }
         // Adopt own kind-0 into local Profile state before the connect-path
         // republish (nsec restore clears the device-bound nick/handle).
         marmot.onOwnProfileFetched = { [weak self] profile in
             self?.adoptOwnKind0Profile(profile)
+        }
+        marmot.onOwnHandleSidecarSeeded = { [weak self] address in
+            self?.noteOwnHandleSidecarSeeded(address)
         }
         marmot.$groups
             .receive(on: DispatchQueue.main)
@@ -1859,13 +1868,16 @@ final class SonarAppStore: ObservableObject {
 
     /// Apply a fetched own kind-0 into local nickname / handle prefs.
     /// Mirrors Compose `hydrateOwnProfileFromRelays` adoption.
+    /// Does not mark `coreClaimedHandle` — that waits on registrar claim success
+    /// via `noteOwnHandleSidecarSeeded`.
     private func adoptOwnKind0Profile(_ profile: MarmotService.Profile) {
         let plan = OwnProfileHydration.plan(
             localNickname: chatViewModel.nickname,
             localBip353: bip353,
             localClaimedHandle: coreClaimedHandle,
             remoteName: profile.bestName,
-            remoteNip05: profile.nip05
+            remoteNip05: profile.nip05,
+            handleDomain: Self.handleDomain
         )
         if let name = plan.nicknameToAdopt, !name.isEmpty {
             chatViewModel.nickname = name
@@ -1873,10 +1885,20 @@ final class SonarAppStore: ObservableObject {
         }
         if let address = plan.nip05ToAdopt, !address.isEmpty {
             setBip353(address)
-            coreClaimedHandle = coreClaimedHandle ?? address
-            if handleClaimState == .idle {
-                handleClaimState = .claimed(address)
-            }
+        }
+    }
+
+    /// Core sidecar was re-seeded after restore reclaim — safe to show the
+    /// registrar seal and treat the address as claim-backed.
+    private func noteOwnHandleSidecarSeeded(_ address: String) {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        coreClaimedHandle = trimmed
+        if bip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            setBip353(trimmed)
+        }
+        if handleClaimState == .idle {
+            handleClaimState = .claimed(trimmed)
         }
     }
 

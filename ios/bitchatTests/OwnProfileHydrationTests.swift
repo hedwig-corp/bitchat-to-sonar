@@ -1,83 +1,110 @@
-import XCTest
+import Testing
 @testable import bitchat
 
-final class OwnProfileHydrationTests: XCTestCase {
-    func testRestoreWithBlankLocalStateAdoptsKind0NameAndHandle() {
+struct OwnProfileHydrationTests {
+    private let domain = "sonarprivacy.xyz"
+
+    @Test
+    func restoreWithBlankLocalStateAdoptsKind0NameAndHandle() {
         let plan = OwnProfileHydration.plan(
             localNickname: "",
             localBip353: "",
             localClaimedHandle: nil,
             remoteName: "Alice",
-            remoteNip05: "alice@sonarprivacy.xyz"
+            remoteNip05: "alice@sonarprivacy.xyz",
+            handleDomain: domain
         )
-        XCTAssertEqual(plan.nicknameToAdopt, "Alice")
-        XCTAssertEqual(plan.nip05ToAdopt, "alice@sonarprivacy.xyz")
-        XCTAssertEqual(plan.handleLocalToClaim, "alice")
-        XCTAssertTrue(plan.shouldPublishNickname)
+        #expect(plan.nicknameToAdopt == "Alice")
+        #expect(plan.nip05ToAdopt == "alice@sonarprivacy.xyz")
+        #expect(plan.handleLocalToClaim == "alice")
+        #expect(plan.shouldPublishNickname)
     }
 
-    func testBlankLocalWithoutRemoteMustNotPublish() {
+    @Test
+    func blankLocalWithoutRemoteMustNotPublish() {
         let plan = OwnProfileHydration.plan(
             localNickname: "  ",
             localBip353: "",
             localClaimedHandle: nil,
             remoteName: nil,
-            remoteNip05: nil
+            remoteNip05: nil,
+            handleDomain: domain
         )
-        XCTAssertNil(plan.nicknameToAdopt)
-        XCTAssertNil(plan.nip05ToAdopt)
-        XCTAssertNil(plan.handleLocalToClaim)
-        XCTAssertFalse(plan.shouldPublishNickname)
+        #expect(plan.nicknameToAdopt == nil)
+        #expect(plan.nip05ToAdopt == nil)
+        #expect(plan.handleLocalToClaim == nil)
+        #expect(!plan.shouldPublishNickname)
     }
 
-    func testExistingLocalNicknameIsNotOverwrittenByRemote() {
+    @Test
+    func existingLocalNicknameIsNotOverwrittenByRemote() {
         let plan = OwnProfileHydration.plan(
             localNickname: "local-nick",
             localBip353: "",
             localClaimedHandle: nil,
             remoteName: "Alice",
-            remoteNip05: "alice@sonarprivacy.xyz"
+            remoteNip05: "alice@sonarprivacy.xyz",
+            handleDomain: domain
         )
-        XCTAssertNil(plan.nicknameToAdopt)
-        XCTAssertEqual(plan.nip05ToAdopt, "alice@sonarprivacy.xyz")
-        XCTAssertEqual(plan.handleLocalToClaim, "alice")
-        XCTAssertTrue(plan.shouldPublishNickname)
+        #expect(plan.nicknameToAdopt == nil)
+        #expect(plan.nip05ToAdopt == "alice@sonarprivacy.xyz")
+        #expect(plan.handleLocalToClaim == "alice")
+        #expect(plan.shouldPublishNickname)
     }
 
-    func testAlreadyClaimedHandleSkipsReclaimAndPrefMirror() {
+    @Test
+    func alreadyClaimedHandleSkipsReclaimAndPrefMirror() {
         let plan = OwnProfileHydration.plan(
             localNickname: "Alice",
             localBip353: "alice@sonarprivacy.xyz",
             localClaimedHandle: "alice@sonarprivacy.xyz",
             remoteName: "Alice",
-            remoteNip05: "alice@sonarprivacy.xyz"
+            remoteNip05: "alice@sonarprivacy.xyz",
+            handleDomain: domain
         )
-        XCTAssertNil(plan.nicknameToAdopt)
-        XCTAssertNil(plan.nip05ToAdopt)
-        XCTAssertNil(plan.handleLocalToClaim)
-        XCTAssertTrue(plan.shouldPublishNickname)
+        #expect(plan.nicknameToAdopt == nil)
+        #expect(plan.nip05ToAdopt == nil)
+        #expect(plan.handleLocalToClaim == nil)
+        #expect(plan.shouldPublishNickname)
     }
 
-    func testRenameMustNotPublishWhenHandlePrefLacksCoreSidecar() {
-        XCTAssertFalse(
-            OwnProfileHydration.canPublishOwnProfile(
+    @Test
+    func externalNip05MustNotReclaimOrPublish() {
+        let plan = OwnProfileHydration.plan(
+            localNickname: "",
+            localBip353: "",
+            localClaimedHandle: nil,
+            remoteName: "Alice",
+            remoteNip05: "alice@example.com",
+            handleDomain: domain
+        )
+        #expect(plan.nicknameToAdopt == "Alice")
+        #expect(plan.nip05ToAdopt == "alice@example.com")
+        #expect(plan.handleLocalToClaim == nil)
+        #expect(!plan.shouldPublishNickname)
+    }
+
+    @Test
+    func renameMustNotPublishWhenHandlePrefLacksCoreSidecar() {
+        #expect(
+            !OwnProfileHydration.canPublishOwnProfile(
                 localBip353: "alice@sonarprivacy.xyz",
                 coreClaimedHandle: nil
             )
         )
-        XCTAssertFalse(
-            OwnProfileHydration.canPublishOwnProfile(
+        #expect(
+            !OwnProfileHydration.canPublishOwnProfile(
                 localBip353: "alice@sonarprivacy.xyz",
                 coreClaimedHandle: "  "
             )
         )
-        XCTAssertTrue(
+        #expect(
             OwnProfileHydration.canPublishOwnProfile(
                 localBip353: "alice@sonarprivacy.xyz",
                 coreClaimedHandle: "alice@sonarprivacy.xyz"
             )
         )
-        XCTAssertTrue(
+        #expect(
             OwnProfileHydration.canPublishOwnProfile(
                 localBip353: "",
                 coreClaimedHandle: nil
@@ -85,9 +112,54 @@ final class OwnProfileHydrationTests: XCTestCase {
         )
     }
 
-    func testRestoreClearedNicknameMustNotMintAnonymousOnRelaunch() {
-        XCTAssertTrue(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: nil))
-        XCTAssertFalse(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: ""))
-        XCTAssertFalse(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: "Alice"))
+    @Test
+    func restoreClearedNicknameMustNotMintAnonymousOnRelaunch() {
+        #expect(OwnProfileHydration.shouldMintAnonymousNickname(savedValue: nil))
+        #expect(!OwnProfileHydration.shouldMintAnonymousNickname(savedValue: ""))
+        #expect(!OwnProfileHydration.shouldMintAnonymousNickname(savedValue: "Alice"))
+    }
+
+    @Test
+    func needsRelayFetchOnlyWhenRestoreSymptomsPresent() {
+        #expect(
+            OwnProfileHydration.needsRelayFetch(
+                localNickname: "",
+                localBip353: "",
+                localClaimedHandle: nil,
+                handleDomain: domain
+            )
+        )
+        #expect(
+            !OwnProfileHydration.needsRelayFetch(
+                localNickname: "Alice",
+                localBip353: "",
+                localClaimedHandle: nil,
+                handleDomain: domain
+            )
+        )
+        #expect(
+            !OwnProfileHydration.needsRelayFetch(
+                localNickname: "Alice",
+                localBip353: "alice@sonarprivacy.xyz",
+                localClaimedHandle: "alice@sonarprivacy.xyz",
+                handleDomain: domain
+            )
+        )
+        #expect(
+            OwnProfileHydration.needsRelayFetch(
+                localNickname: "Alice",
+                localBip353: "alice@sonarprivacy.xyz",
+                localClaimedHandle: nil,
+                handleDomain: domain
+            )
+        )
+        #expect(
+            !OwnProfileHydration.needsRelayFetch(
+                localNickname: "Alice",
+                localBip353: "alice@example.com",
+                localClaimedHandle: nil,
+                handleDomain: domain
+            )
+        )
     }
 }

@@ -2,6 +2,9 @@ import Foundation
 
 /// Plan for adopting our own kind-0 (NIP-01) profile into local account state
 /// after nsec restore / lost prefs. Mirrors Compose `OwnProfileHydration.kt`.
+///
+/// `publish_profile` only attaches `nip05` from the core sidecar, so a remote
+/// handle that cannot be re-seeded there must never trigger a republish.
 struct OwnProfileHydrationPlan: Equatable {
     let nicknameToAdopt: String?
     let nip05ToAdopt: String?
@@ -15,8 +18,10 @@ enum OwnProfileHydration {
         localBip353: String,
         localClaimedHandle: String?,
         remoteName: String?,
-        remoteNip05: String?
+        remoteNip05: String?,
+        handleDomain: String
     ) -> OwnProfileHydrationPlan {
+        let domain = handleDomain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let nick = localNickname.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = remoteName?.trimmingCharacters(in: .whitespacesAndNewlines)
         let nip05 = remoteNip05?
@@ -32,8 +37,15 @@ enum OwnProfileHydration {
         } else {
             adoptNip05 = nil
         }
+        let isSonarNip05: Bool = {
+            guard let remoteNip05Valid else { return false }
+            let remoteDomain = String(remoteNip05Valid.split(separator: "@").dropFirst().first ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return !domain.isEmpty && remoteDomain == domain
+        }()
         let handleLocal: String?
-        if claimedValid == nil, let remoteNip05Valid {
+        if claimedValid == nil, let remoteNip05Valid, isSonarNip05 {
             let local = String(remoteNip05Valid.split(separator: "@").first ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             handleLocal = local.isEmpty ? nil : local
@@ -41,11 +53,19 @@ enum OwnProfileHydration {
             handleLocal = nil
         }
         let effectiveNick = (adoptNick ?? nick).trimmingCharacters(in: .whitespacesAndNewlines)
+        let nip05SafeToPublish: Bool = {
+            guard let remoteNip05Valid else { return true }
+            if let claimedValid, claimedValid.caseInsensitiveCompare(remoteNip05Valid) == .orderedSame {
+                return true
+            }
+            if isSonarNip05, claimedValid == nil { return true }
+            return false
+        }()
         return OwnProfileHydrationPlan(
             nicknameToAdopt: adoptNick,
             nip05ToAdopt: adoptNip05,
             handleLocalToClaim: handleLocal,
-            shouldPublishNickname: !effectiveNick.isEmpty
+            shouldPublishNickname: !effectiveNick.isEmpty && nip05SafeToPublish
         )
     }
 
@@ -62,6 +82,29 @@ enum OwnProfileHydration {
         let claimed = coreClaimedHandle?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return !claimed.isEmpty
+    }
+
+    /// Whether connect-path hydration must hit relays for our own kind-0.
+    /// Skip the RTT when local state is already coherent (or the handle pref is
+    /// an external domain we cannot reclaim into the sidecar).
+    static func needsRelayFetch(
+        localNickname: String,
+        localBip353: String,
+        localClaimedHandle: String?,
+        handleDomain: String
+    ) -> Bool {
+        let nick = localNickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        if nick.isEmpty { return true }
+        let bip = localBip353.trimmingCharacters(in: .whitespacesAndNewlines)
+        if bip.isEmpty { return false }
+        let claimed = localClaimedHandle?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !claimed.isEmpty { return false }
+        let domain = handleDomain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let bipDomain = String(bip.split(separator: "@").dropFirst().first ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return !domain.isEmpty && bipDomain == domain
     }
 
     /// Missing key = first launch (mint anon). Present key including "" =

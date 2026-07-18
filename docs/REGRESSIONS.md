@@ -289,6 +289,31 @@ invalidation for verified peer/profile changes.
 
 **Platform gap:** Compose `LazyColumn` is still top-anchored for short feeds (no `reverseLayout` / fill-height bottom arrangement). Same empty-band class of bug may exist there; follow-up is a Compose short-transcript bottom align that keeps unread-anchor opens intact.
 
+---
+
+## R-010 — nsec restore must not wipe durable kind-0 `nip05`
+
+**Invariant:** After nsec restore (or lost local nick/handle prefs), the app must fetch own kind-0 before any opportunistic republish; it must never publish blank/stale metadata, never mint `anonXXXX` over a cleared nick, never reclaim a non-Sonar `nip05` at the registrar, and never emit kind-0 when remote `nip05` cannot be preserved in the core sidecar.
+
+**Breaks as:** Profile shows blank/"you" after restore; relaunch invents `anon####` and replaces the durable relay profile; external `alice@example.com` becomes `alice@sonarprivacy.xyz` (or is omitted) on the next connect-path publish.
+
+**Why:** Kind-0 is a replaceable event. `publish_profile` only attaches `nip05` from the core handle sidecar. Local nickname/handle prefs are device-bound and wiped on restore, so hydrate-before-publish and Sonar-domain-only reclaim are load-bearing.
+
+**Call sites:** iOS `MarmotChatView.swift::hydrateOwnProfileFromRelays`, `SonarAppStore.adoptOwnKind0Profile` / `noteOwnHandleSidecarSeeded`, `ChatViewModel.clearNicknameForAccountRestore`; Compose `SonarAppState.hydrateOwnProfileFromRelays`
+
+**Guarded by:** `OwnProfileHydrationTest.externalNip05MustNotReclaimOrPublish`
+
+**Also guarded by:** `OwnProfileHydrationTest.restoreWithBlankLocalStateAdoptsKind0NameAndHandle`, `OwnProfileHydrationTest.blankLocalWithoutRemoteMustNotPublish`, `OwnProfileHydrationTest.renameMustNotPublishWhenHandlePrefLacksCoreSidecar`, `OwnProfileHydrationTest.needsRelayFetchOnlyWhenRestoreSymptomsPresent`, `OwnProfileHydrationTests.externalNip05MustNotReclaimOrPublish`, `OwnProfileHydrationTests.restoreClearedNicknameMustNotMintAnonymousOnRelaunch`
+
+**History:** #342 hydrate-before-publish → still wiped via `$relayConnected` / anon mint / external reclaim → tightened publish gate + empty-nick sentinel + Sonar-domain reclaim.
+
+**Rejected:**
+- *Delete nickname prefs key on restore.* Relaunch treated missing key as first install and minted `anonXXXX`.
+- *Keep iOS `$relayConnected` republish beside Marmot connect-path publish.* Second writer could emit without sidecar `nip05`.
+- *Treat `handleLocalToClaim == null` alone as publish-safe.* External `nip05` then published without sidecar and wiped the remote field.
+
+**Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

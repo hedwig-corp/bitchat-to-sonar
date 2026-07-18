@@ -3928,9 +3928,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *   either no remote nip05 needed seeding or the sidecar was re-claimed).
      */
     private suspend fun hydrateOwnProfileFromRelays(): Boolean {
+        val claimedNow = coreClaimedHandle ?: SonarCore.claimedHandle()
+        if (!needsOwnProfileRelayFetch(nick, bip353, claimedNow, handleDomain)) {
+            return nick.isNotBlank() && canPublishOwnProfile(bip353, claimedNow)
+        }
         val me = npub.takeIf { it.isNotBlank() } ?: return nick.isNotBlank()
         val profile = runCatching { SonarCore.fetchProfile(me) }.getOrNull()
-        if (profile == null) return nick.isNotBlank()
+        if (profile == null) return nick.isNotBlank() && canPublishOwnProfile(bip353, claimedNow)
         val key = canonicalProfileKey(me)
         val updated = profilesByNpub + (key to profile)
         profilesByNpub = normalizedProfileCache(updated)
@@ -3942,24 +3946,28 @@ class SonarAppState(private val scope: CoroutineScope) {
             localBip353 = bip353,
             localClaimedHandle = coreClaimedHandle ?: SonarCore.claimedHandle(),
             remote = profile,
+            handleDomain = handleDomain,
         )
         plan.nicknameToAdopt?.let { name ->
             SonarCore.setNickname(name)
             nick = name
             refreshMeshIdentity()
         }
-        plan.nip05ToAdopt?.let { address ->
-            updateBip353(address)
-            if (handleClaimState is HandleClaimState.Idle) {
-                handleClaimState = HandleClaimState.Claimed(address)
-            }
-        }
+        // Mirror remote nip05 into prefs for Profile UI only — do not mark the
+        // core claim / registrar seal until claimHandle actually seeds the sidecar.
+        plan.nip05ToAdopt?.let { address -> updateBip353(address) }
         var handleSeeded = plan.handleLocalToClaim == null
         plan.handleLocalToClaim?.let { local ->
-            runCatching { SonarCore.claimHandle(local, null) }
+            // Prefer a wallet offer when ready so restore reclaim also seeds
+            // BIP-353 payment DNS (chat-only claim is still valid if not).
+            val offer = if (walletState is WalletState.Ready) {
+                runCatching { WalletBridge.createOffer() }.getOrNull()
+            } else null
+            runCatching { SonarCore.claimHandle(local, offer) }
                 .onSuccess { address ->
                     coreClaimedHandle = address
                     handleSeeded = true
+                    if (offer != null) lastClaimedOffer = offer
                     if (bip353.isBlank()) updateBip353(address)
                     if (handleClaimState is HandleClaimState.Idle) {
                         handleClaimState = HandleClaimState.Claimed(address)

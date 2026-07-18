@@ -7,6 +7,7 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class OwnProfileHydrationTest {
+    private val domain = "sonarprivacy.xyz"
     private val remote = SonarProfile(
         name = "alice",
         displayName = "Alice",
@@ -22,6 +23,7 @@ class OwnProfileHydrationTest {
             localBip353 = "",
             localClaimedHandle = null,
             remote = remote,
+            handleDomain = domain,
         )
         assertEquals("Alice", plan.nicknameToAdopt)
         assertEquals("alice@sonarprivacy.xyz", plan.nip05ToAdopt)
@@ -36,6 +38,7 @@ class OwnProfileHydrationTest {
             localBip353 = "",
             localClaimedHandle = null,
             remote = null,
+            handleDomain = domain,
         )
         assertNull(plan.nicknameToAdopt)
         assertNull(plan.nip05ToAdopt)
@@ -50,6 +53,7 @@ class OwnProfileHydrationTest {
             localBip353 = "",
             localClaimedHandle = null,
             remote = remote,
+            handleDomain = domain,
         )
         assertNull(plan.nicknameToAdopt)
         assertEquals("alice@sonarprivacy.xyz", plan.nip05ToAdopt)
@@ -64,6 +68,7 @@ class OwnProfileHydrationTest {
             localBip353 = "alice@sonarprivacy.xyz",
             localClaimedHandle = "alice@sonarprivacy.xyz",
             remote = remote,
+            handleDomain = domain,
         )
         assertNull(plan.nicknameToAdopt)
         assertNull(plan.nip05ToAdopt)
@@ -78,9 +83,25 @@ class OwnProfileHydrationTest {
             localBip353 = "",
             localClaimedHandle = null,
             remote = SonarProfile("bob", null, null, null, null),
+            handleDomain = domain,
         )
         assertEquals("bob", plan.nicknameToAdopt)
         assertTrue(plan.shouldPublishNickname)
+    }
+
+    @Test
+    fun externalNip05MustNotReclaimOrPublish() {
+        val plan = planOwnProfileHydration(
+            localNickname = "",
+            localBip353 = "",
+            localClaimedHandle = null,
+            remote = SonarProfile("Alice", null, null, null, "alice@example.com"),
+            handleDomain = domain,
+        )
+        assertEquals("Alice", plan.nicknameToAdopt)
+        assertEquals("alice@example.com", plan.nip05ToAdopt)
+        assertNull(plan.handleLocalToClaim)
+        assertFalse(plan.shouldPublishNickname)
     }
 
     @Test
@@ -89,5 +110,26 @@ class OwnProfileHydrationTest {
         assertFalse(canPublishOwnProfile("alice@sonarprivacy.xyz", "  "))
         assertTrue(canPublishOwnProfile("alice@sonarprivacy.xyz", "alice@sonarprivacy.xyz"))
         assertTrue(canPublishOwnProfile("", null))
+    }
+
+    @Test
+    fun needsRelayFetchOnlyWhenRestoreSymptomsPresent() {
+        assertTrue(needsOwnProfileRelayFetch("", "", null, domain))
+        assertFalse(needsOwnProfileRelayFetch("Alice", "", null, domain))
+        assertFalse(
+            needsOwnProfileRelayFetch(
+                "Alice",
+                "alice@sonarprivacy.xyz",
+                "alice@sonarprivacy.xyz",
+                domain,
+            ),
+        )
+        assertTrue(
+            needsOwnProfileRelayFetch("Alice", "alice@sonarprivacy.xyz", null, domain),
+        )
+        // External handle pref can never seed the sidecar — skip the RTT.
+        assertFalse(
+            needsOwnProfileRelayFetch("Alice", "alice@example.com", null, domain),
+        )
     }
 }
