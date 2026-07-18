@@ -6825,6 +6825,8 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Open a conversation from a notification tap (local or private-message).
+    /// Uses the local-first `openDM` path (await newest page before present) and
+    /// refuses stale ids that no longer resolve to a live local conversation.
     func openConversationFromNotification(_ conversationId: String) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
@@ -6832,7 +6834,46 @@ final class SonarAppStore: ObservableObject {
             clearNotificationsForConversation(id)
             return
         }
-        push(.dm(id))
+        guard let target = resolveNotificationConversation(id) else {
+            // Deleted / left / never-hydrated — clear the shade, stay on Home.
+            clearNotificationsForConversation(id)
+            return
+        }
+        openDM(target.id, marmotGroupId: target.marmotGroupId)
+    }
+
+    /// Map a notification conversation id onto a current local DM row / pending
+    /// chat / live Marmot group. Nil means the tap target is gone.
+    private func resolveNotificationConversation(
+        _ id: String
+    ) -> (id: String, marmotGroupId: String?)? {
+        if let row = dmRows.first(where: {
+            $0.id == id || conversationsMatchForNotification($0.id, id)
+        }) {
+            return (row.id, row.marmotGroupId)
+        }
+        if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
+            return (id, nil)
+        }
+        if let groupId = marmotGroupId(id),
+           marmot.groups.contains(where: { $0.id == groupId }) {
+            if let row = dmRows.first(where: {
+                $0.marmotGroupId == groupId || conversationsMatchForNotification($0.id, id)
+            }) {
+                return (row.id, groupId)
+            }
+            return (Self.marmotIDPrefix + groupId, groupId)
+        }
+        // Mesh / bitchat private chat that still has local state.
+        if !id.hasPrefix(Self.marmotIDPrefix) {
+            let peerID = PeerID(str: id)
+            let hasPrivate = chatViewModel.privateChats[peerID] != nil
+                || chatViewModel.unifiedPeerService.getPeer(by: peerID) != nil
+            if hasPrivate {
+                return (id, marmotGroupId(id))
+            }
+        }
+        return nil
     }
 
     /// True when both ids name the same DM under fold / fingerprint aliases.
