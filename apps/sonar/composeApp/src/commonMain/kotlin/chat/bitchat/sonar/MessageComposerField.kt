@@ -50,9 +50,10 @@ internal fun MessageComposerTextField(
         modifier = modifier.then(
             if (enterSends) {
                 Modifier.onPreviewKeyEvent { event ->
+                    val isEnter = event.key == Key.Enter || event.key == Key.NumPadEnter
                     if (
                         event.type == KeyEventType.KeyDown &&
-                        event.key == Key.Enter &&
+                        isEnter &&
                         !event.isShiftPressed
                     ) {
                         onSend?.invoke()

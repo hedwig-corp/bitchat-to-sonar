@@ -54,6 +54,34 @@ class MessageComposerFieldUiTest {
     }
 
     @Test
+    fun numPadEnterAlsoSendsDraftOnDesktopComposer() = runComposeUiTest {
+        var text by mutableStateOf("")
+        var sent: String? = null
+        setContent {
+            MessageComposerTextField(
+                value = text,
+                onValueChange = { text = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                modifier = Modifier.testTag("message-composer"),
+                onSend = {
+                    sent = text
+                    text = ""
+                },
+            )
+        }
+
+        onNodeWithTag("message-composer").performClick()
+        onNodeWithTag("message-composer").performTextInput("from numpad")
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.NumPadEnter) }
+
+        runOnIdle {
+            assertEquals("from numpad", sent)
+            assertEquals("", text)
+        }
+    }
+
+    @Test
     fun returnKeyInsertsNewlineWhenDesktopSendDisabled() = runComposeUiTest {
         var text by mutableStateOf("")
         setContent {

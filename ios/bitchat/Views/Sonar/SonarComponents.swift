@@ -3872,7 +3872,11 @@ struct SNMessageComposerField: View {
             .submitLabel(.send)
             // Vertical TextField on macOS often neither inserts a newline nor
             // fires onSubmit for bare Return — claim the key for send.
-            .onKeyPress(.return) {
+            .onKeyPress(.return) { press in
+                // Shift/Option+Return stay available for newline until #334.
+                if press.modifiers.contains(.shift) || press.modifiers.contains(.option) {
+                    return .ignored
+                }
                 onSend?()
                 return .handled
             }
