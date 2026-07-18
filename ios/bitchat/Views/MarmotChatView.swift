@@ -1516,13 +1516,18 @@ final class MarmotChatModel: ObservableObject {
     /// threads and the UI repaints from `conversationChanged`.
     ///
     /// Production shape:
-    /// 1. Drain + paint on the dedicated receive lane first.
-    /// 2. If the live buffer already delivered: return those notifications for
-    ///    titled push; run single-flight `syncForce` in the background.
-    /// 3. If empty (socket was dead): await that same single-flight and merge
-    ///    its drain with any notifications the polling loop stole on
-    ///    `drainQueue` while `syncForce` was in flight (see
-    ///    `pushWakeDrainBuffer`). Mid-fetch, polling still paints the UI.
+    /// 1. Drain + paint on the dedicated receive lane first (UI can update
+    ///    via `loadLocalSummaries` / polling while sync still runs).
+    /// 2. Always await single-flight `syncForce` before returning — callers
+    ///    (`SonarPushProcessor`) end the background wake when this returns, so
+    ///    gap recovery must finish inside the granted window even when the live
+    ///    buffer already had events. Merge with anything the polling loop
+    ///    stole on `drainQueue` while `syncForce` was in flight (see
+    ///    `pushWakeDrainBuffer`) — that drain is a separate buffer fill, so
+    ///    live events already consumed above cannot reappear in it.
+    /// 3. Mid-fetch, `drainQueue` still lets the polling loop paint the chat UI
+    ///    from live events. Foreground resume uses `refreshAfterForeground`,
+    ///    which fire-and-forgets gap recovery instead of blocking first paint.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1533,20 +1538,19 @@ final class MarmotChatModel: ObservableObject {
         let live = (try? await service.drainPending()) ?? []
         await loadLocalSummaries()
 
-        if !live.isEmpty {
-            _ = ensureGapRecovery()
-            return live
-        }
-
-        // Empty live buffer: collect anything polling drains during syncForce
-        // so titled push notifications are not lost to the UI-only path.
+        // Always await single-flight gap recovery before returning — the push
+        // processor ends the background wake window when this call returns,
+        // so recovery must finish inside the granted window even when the
+        // live buffer already delivered events. Collect anything polling
+        // drains during syncForce so titled push notifications are not lost.
         beginPushWakeDrainCapture()
         defer { endPushWakeDrainCapture() }
-        let fromGap = await ensureGapRecovery().value
+        let recovered = await ensureGapRecovery().value
         let stolen = takePushWakeDrainBuffer()
-        if stolen.isEmpty { return fromGap }
-        if fromGap.isEmpty { return stolen }
-        return fromGap + stolen
+        var notifications = live
+        if !recovered.isEmpty { notifications += recovered }
+        if !stolen.isEmpty { notifications += stolen }
+        return notifications
     }
 
     private func beginPushWakeDrainCapture() {

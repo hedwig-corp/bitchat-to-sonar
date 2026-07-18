@@ -4764,8 +4764,7 @@ final class SonarAppStore: ObservableObject {
             plaintextSha256: sticker.sha256
         )
         queuePendingMeshMarmotSend(text: encoded, npub: npub)
-        marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        startSecureMeshMarmotChat(npub: npub)
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -4775,8 +4774,7 @@ final class SonarAppStore: ObservableObject {
         }
         queuePendingMeshMarmotSend(text: text, npub: npub)
         showToast("Out of range — continuing over White Noise…")
-        marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        startSecureMeshMarmotChat(npub: npub)
     }
 
     /// Paint a Sending echo on the open mesh conversation immediately, then
@@ -4784,20 +4782,50 @@ final class SonarAppStore: ObservableObject {
     private func queuePendingMeshMarmotSend(text: String, npub: String) {
         let clean = SNMarmotProfileCache.canonicalKey(npub)
         let chatId = currentDMId ?? sonarPeerKey(forNpub: clean)
-        let messageId: String
         if let chatId {
             let message = pendingMarmotEcho(text: text, createdAt: Date())
             pendingMarmotMessagesByChat[chatId, default: []].append(message)
-            messageId = message.id
             objectWillChange.send()
             pendingMarmotSends[clean, default: []].append(
-                SNPendingMarmotSend(chatId: chatId, text: text, messageId: messageId)
+                SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id)
             )
         } else {
             pendingMarmotSends[clean, default: []].append(
                 SNPendingMarmotSend(chatId: "", text: text, messageId: "")
             )
         }
+    }
+
+    /// Create the White Noise group for an out-of-range mesh DM. On failure,
+    /// mark queued mesh echoes `Couldn't send` (Compose `failPendingMeshMarmotSends`).
+    private func startSecureMeshMarmotChat(npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        marmot.connectIfNeeded()
+        Task { @MainActor in
+            let groupId = await marmot.startChatReturningId(with: clean)
+            if groupId == nil {
+                failPendingMeshMarmotSends(npub: clean)
+                if let err = marmot.errorText, !err.isEmpty {
+                    showToast(err)
+                } else {
+                    showToast("couldn't start secure chat")
+                }
+            }
+            // Success: `marmot.$groups` sink calls `flushPendingMarmotSends`.
+        }
+    }
+
+    private func failPendingMeshMarmotSends(npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let sends = pendingMarmotSends.removeValue(forKey: clean) ?? []
+        guard !sends.isEmpty else { return }
+        for send in sends where !send.chatId.isEmpty && !send.messageId.isEmpty {
+            guard let idx = pendingMarmotMessagesByChat[send.chatId]?.firstIndex(where: { $0.id == send.messageId }),
+                  let original = pendingMarmotMessagesByChat[send.chatId]?[idx]
+            else { continue }
+            pendingMarmotMessagesByChat[send.chatId]?[idx] = failedPendingMessage(original)
+        }
+        objectWillChange.send()
     }
 
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
@@ -5146,23 +5174,22 @@ final class SonarAppStore: ObservableObject {
         for (npub, sends) in pendingMarmotSends {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for send in sends {
-                // Group-side optimistic first, then drop the mesh pending echo so
-                // dmMsgs never has a frame with neither bubble.
-                if let ref = meshParseStickerContent(content: send.text) {
-                    marmot.sendSticker(
-                        groupId: group.id,
-                        packCoordinate: ref.packCoordinate,
-                        shortcode: ref.shortcode,
-                        plaintextSha256: ref.plaintextSha256
-                    )
-                } else {
-                    marmot.send(send.text, to: group.id)
-                }
-                if !send.chatId.isEmpty, !send.messageId.isEmpty {
-                    pendingMarmotMessagesByChat[send.chatId]?.removeAll { $0.id == send.messageId }
-                    if pendingMarmotMessagesByChat[send.chatId]?.isEmpty == true {
-                        pendingMarmotMessagesByChat[send.chatId] = nil
+            Task { @MainActor in
+                for send in sends {
+                    // Await the real send outcome before dropping the mesh echo.
+                    // `marmot.send` alone returns after appending a group-side
+                    // optimistic; if that async path fails, discarding the mesh
+                    // echo early left no retryable bubble.
+                    let ok = await sendQueuedMarmotContent(send.text, to: group.id)
+                    guard !send.chatId.isEmpty, !send.messageId.isEmpty else { continue }
+                    if ok {
+                        pendingMarmotMessagesByChat[send.chatId]?.removeAll { $0.id == send.messageId }
+                        if pendingMarmotMessagesByChat[send.chatId]?.isEmpty == true {
+                            pendingMarmotMessagesByChat[send.chatId] = nil
+                        }
+                    } else if let idx = pendingMarmotMessagesByChat[send.chatId]?.firstIndex(where: { $0.id == send.messageId }),
+                              let original = pendingMarmotMessagesByChat[send.chatId]?[idx] {
+                        pendingMarmotMessagesByChat[send.chatId]?[idx] = failedPendingMessage(original)
                     }
                     objectWillChange.send()
                 }
