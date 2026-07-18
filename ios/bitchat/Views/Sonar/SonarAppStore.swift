@@ -6817,25 +6817,35 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Whether the given conversation is the top DM route (used to suppress
-    /// banners while that chat is already open).
+    /// banners while that chat is already open). Matches fold / fingerprint
+    /// aliases of the same person, not only exact string equality.
     func isConversationOpen(_ conversationId: String) -> Bool {
-        currentDMId == conversationId
+        guard let openId = currentDMId else { return false }
+        return conversationsMatchForNotification(openId, conversationId)
     }
 
     /// Open a conversation from a notification tap (local or private-message).
     func openConversationFromNotification(_ conversationId: String) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
-        if currentDMId == id {
-            clearNotificationsForConversation(id)
-            return
-        }
-        // Avoid stacking duplicate DM routes for the same conversation.
-        if case .dm(let openId)? = path.last, openId == id {
+        if isConversationOpen(id) {
             clearNotificationsForConversation(id)
             return
         }
         push(.dm(id))
+    }
+
+    /// True when both ids name the same DM under fold / fingerprint aliases.
+    private func conversationsMatchForNotification(_ left: String, _ right: String) -> Bool {
+        if left == right { return true }
+        if let leftGroup = marmotGroupId(left),
+           let rightGroup = marmotGroupId(right),
+           leftGroup == rightGroup {
+            return true
+        }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: left)), fp == right { return true }
+        if let fp = chatViewModel.getFingerprint(for: PeerID(str: right)), fp == left { return true }
+        return false
     }
 
     /// Dismiss OS notifications that were posted for this conversation (and

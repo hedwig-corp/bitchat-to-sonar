@@ -43,4 +43,10 @@ struct SonarNotificationHandoffTests {
         #expect(!SonarNotificationHandoff.matches(userInfo: userInfo, conversationIds: ["chat-b"]))
         #expect(!SonarNotificationHandoff.matches(userInfo: [:], conversationIds: ["chat-a"]))
     }
+
+    @Test func blankConversationIdIsIgnored() {
+        #expect(SonarNotificationHandoff.conversationId(from: [
+            SonarNotificationKeys.conversationId: "\n\t",
+        ]) == nil)
+    }
 }

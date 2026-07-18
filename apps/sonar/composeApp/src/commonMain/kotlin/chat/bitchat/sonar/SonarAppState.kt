@@ -3671,46 +3671,38 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Open the conversation named by a notification tap. Resolves folded
      * White Noise groups onto their mesh home-row id so the user lands on the
      * same transcript the notification was posted for.
+     *
+     * Unknown ids never invent a blank chat screen: refresh once and retry,
+     * otherwise stay on Home and clear the shade entry.
      */
     fun openConversationFromNotification(conversationId: String) {
         val id = conversationId.trim()
         if (id.isEmpty()) return
-        foldedGroupPeerIds[id]?.let { peerId ->
-            openDm(peerId, meshPeerName(peerId))
-            return
-        }
-        chats.firstOrNull { it.id == id }?.let { chat ->
-            if (chat.id in foldedGroupIds) {
-                foldedGroupPeerIds[chat.id]?.let { peerId ->
-                    openDm(peerId, meshPeerName(peerId))
-                    return
-                }
-            }
-            openChat(chat)
-            return
-        }
-        if (isMeshChat(id)) {
-            openDm(meshPeerId(id), meshPeerName(meshPeerId(id)))
-            return
-        }
-        // Unknown / not yet in the local snapshot — still navigate so the tap
-        // is not a dead end; catch-up can hydrate the transcript afterwards.
-        push(Screen.Chat(id, "Chat"))
-        clearNotificationsForChat(id)
-        captureOpenChatUnread(id)
-        clearTranscriptHydrated(id)
-        beginTranscriptSession(id)
+        if (openResolvedNotificationTarget(id)) return
         scope.launch {
-            runCatching { SonarCore.markConversationRead(id) }
             runCatching { refreshChats() }
-            if ((screen as? Screen.Chat)?.id == id) {
-                setCurrentVisibleMessages(
-                    id,
-                    withSendEchoes(id, mergePendingMediaUploads(id, marmotMessagesPageForChat(id))),
-                    processCalls = true,
-                )
+            if (openResolvedNotificationTarget(id)) return@launch
+            clearNotificationsForChat(id)
+            toast = "That chat isn’t ready yet — try again from Messages."
+        }
+    }
+
+    private fun openResolvedNotificationTarget(conversationId: String): Boolean {
+        val target = SonarNotificationHandoff.resolveOpenTarget(
+            conversationId = conversationId,
+            knownChatIds = chats.mapTo(hashSetOf()) { it.id },
+            foldedGroupPeerIds = foldedGroupPeerIds,
+            foldedGroupIds = foldedGroupIds,
+        ) ?: return false
+        when (target) {
+            is SonarNotificationOpenTarget.MeshPeer ->
+                openDm(target.peerId, meshPeerName(target.peerId))
+            is SonarNotificationOpenTarget.Chat -> {
+                val chat = chats.firstOrNull { it.id == target.chatId } ?: return false
+                openChat(chat)
             }
         }
+        return true
     }
 
     /** Notify from pages already fetched by the incremental call/pay scan.
