@@ -2370,12 +2370,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun isMultiMemberChat(chatId: String): Boolean =
-        if (isPendingMarmotChat(chatId)) false
+        if (isNoteToSelfChat(chatId) || isPendingMarmotChat(chatId)) false
         else if (isPendingMarmotGroup(chatId)) true
         else chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
     fun canManageGroup(chatId: String): Boolean =
-        !isPendingMarmotGroup(chatId) &&
+        !isNoteToSelfChat(chatId) &&
+            !isPendingMarmotGroup(chatId) &&
             chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
 
     fun hasDirectPaymentRoute(chatId: String): Boolean {
@@ -3752,7 +3753,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 unread = !isNoteToSelfChat(chat, noteToSelfGroupId) &&
                     ids.sumOf { unreadByChat[it] ?: 0L } > 0,
                 pending = pending && !isNoteToSelfChat(chat, noteToSelfGroupId),
-                multiMember = isMultiMemberChat(chat.id),
+                multiMember = !isNoteToSelfChat(chat, noteToSelfGroupId) &&
+                    isMultiMemberChat(chat.id),
             )
         }
     }

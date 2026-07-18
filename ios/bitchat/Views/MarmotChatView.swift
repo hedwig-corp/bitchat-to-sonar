@@ -3789,8 +3789,8 @@ final class MarmotChatModel: ObservableObject {
 
     /// Short label for a 1:1 group: the other member's npub prefix.
     func isNoteToSelf(_ group: MarmotService.MarmotGroup) -> Bool {
-        if let noteToSelfGroupId, group.id == noteToSelfGroupId { return true }
-        return group.name == "Note to Self" && otherMembers(in: group).isEmpty
+        guard let noteToSelfGroupId else { return false }
+        return group.id == noteToSelfGroupId
     }
 
     func title(for group: MarmotService.MarmotGroup) -> String {

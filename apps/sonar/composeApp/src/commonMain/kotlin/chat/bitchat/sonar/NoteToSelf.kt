@@ -19,8 +19,7 @@ internal fun isNoteToSelfChatId(chatId: String, noteToSelfGroupId: String?): Boo
         (noteToSelfGroupId != null && chatId == noteToSelfGroupId)
 
 internal fun isNoteToSelfChat(chat: SonarChat, noteToSelfGroupId: String?): Boolean =
-    isNoteToSelfChatId(chat.id, noteToSelfGroupId) ||
-        (chat.name == NOTE_TO_SELF_TITLE && chat.members.size <= 1)
+    isNoteToSelfChatId(chat.id, noteToSelfGroupId)
 
 /**
  * Pin Note to Self at the top of the home message list (Signal-style), then
