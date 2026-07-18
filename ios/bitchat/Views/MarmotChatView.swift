@@ -281,6 +281,12 @@ final class MarmotChatModel: ObservableObject {
     /// Generation for `gapRecoveryTask` so a finishing older task cannot clear
     /// a newer in-flight recovery.
     private var gapRecoveryGeneration: UInt64 = 0
+    /// While a push `refresh()` awaits gap recovery, polling drains that win
+    /// the `drainQueue` race park their notification metadata here so
+    /// `SonarPushProcessor` still gets titled local notifications (destructive
+    /// drain is single-consume). Cleared when the waiter collects them.
+    private var pushWakeDrainActive = false
+    private var pushWakeDrainBuffer: [DrainNotificationInfo] = []
     private var relayBusy = false
     #if DEBUG
     /// SONAR_BENCH: one-shot guards for the post-connect "first wake" (T3b) and
@@ -1488,10 +1494,10 @@ final class MarmotChatModel: ObservableObject {
     /// 1. Drain + paint on the dedicated receive lane first.
     /// 2. If the live buffer already delivered: return those notifications for
     ///    titled push; run single-flight `syncForce` in the background.
-    /// 3. If empty (socket was dead): await that same single-flight and use
-    ///    **its** drained notifications (do not drain again — sync-path
-    ///    notifications are consumed once). Mid-fetch, `drainQueue` still lets
-    ///    the polling loop paint the chat UI from live events.
+    /// 3. If empty (socket was dead): await that same single-flight and merge
+    ///    its drain with any notifications the polling loop stole on
+    ///    `drainQueue` while `syncForce` was in flight (see
+    ///    `pushWakeDrainBuffer`). Mid-fetch, polling still paints the UI.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1507,9 +1513,39 @@ final class MarmotChatModel: ObservableObject {
             return live
         }
 
-        // Empty live buffer: gap recovery owns syncForce + the one drain that
-        // surfaces parked sync-path notifications for the push processor.
-        return await ensureGapRecovery().value
+        // Empty live buffer: collect anything polling drains during syncForce
+        // so titled push notifications are not lost to the UI-only path.
+        beginPushWakeDrainCapture()
+        defer { endPushWakeDrainCapture() }
+        let fromGap = await ensureGapRecovery().value
+        let stolen = takePushWakeDrainBuffer()
+        if stolen.isEmpty { return fromGap }
+        if fromGap.isEmpty { return stolen }
+        return fromGap + stolen
+    }
+
+    private func beginPushWakeDrainCapture() {
+        pushWakeDrainActive = true
+        pushWakeDrainBuffer = []
+    }
+
+    private func endPushWakeDrainCapture() {
+        pushWakeDrainActive = false
+        pushWakeDrainBuffer = []
+    }
+
+    private func takePushWakeDrainBuffer() -> [DrainNotificationInfo] {
+        let buffered = pushWakeDrainBuffer
+        pushWakeDrainBuffer = []
+        return buffered
+    }
+
+    /// Forward drain metadata to an in-flight push `refresh()` waiter. Polling
+    /// and gap recovery both call this so a `drainQueue` race cannot drop
+    /// titled-notification payloads on the floor.
+    private func noteDrainedForPushWake(_ notifications: [DrainNotificationInfo]) {
+        guard pushWakeDrainActive, !notifications.isEmpty else { return }
+        pushWakeDrainBuffer.append(contentsOf: notifications)
     }
 
     /// Single-flight forced gap recovery. Shared by push wake and foreground
@@ -2693,6 +2729,10 @@ final class MarmotChatModel: ObservableObject {
                 #endif
                 if woke {
                     let notifications = (try? await self.service.drainPending()) ?? []
+                    // If a push refresh is awaiting gap recovery, keep the
+                    // notification metadata for SonarPushProcessor — drain is
+                    // destructive and this path only paints the UI.
+                    self.noteDrainedForPushWake(notifications)
                     #if DEBUG
                     // SONAR_BENCH: first post-connect event burst applied to local
                     // storage (T4) — the cold-start relay sync has produced data.
@@ -2839,6 +2879,7 @@ final class MarmotChatModel: ObservableObject {
         gapRecoveryGeneration &+= 1
         gapRecoveryTask?.cancel()
         gapRecoveryTask = nil
+        endPushWakeDrainCapture()
     }
 
     private func clearIdentityScopedState() {
