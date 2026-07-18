@@ -18,12 +18,15 @@ final class MessageRouter {
         let nickname: String
         let messageID: String
         let timestamp: Date
+        var awaitingCleanup = false
     }
 
     private var outbox: [PeerID: [QueuedMessage]] = [:]
     private var pendingQueueWrites: [PeerID: Int] = [:]
+    private var flushingOutboxPeers: Set<PeerID> = []
+    private var outboxGeneration: UInt = 0
     private var persistQueuedMessage: ((PeerID, String, String, String, Date) async -> Bool)?
-    private var completeQueuedMessage: ((String) -> Void)?
+    private var completeQueuedMessage: ((String) async -> Bool)?
 
     // Outbox limits to prevent unbounded memory growth
     private static let maxMessagesPerPeer = 100
@@ -41,7 +44,7 @@ final class MessageRouter {
             if let data = note.userInfo?["peerPublicKey"] as? Data {
                 let peerID = PeerID(publicKey: data)
                 Task { @MainActor in
-                    self.flushOutbox(for: peerID)
+                    await self.flushOutbox(for: peerID)
                 }
             }
             // Handle key updates
@@ -49,7 +52,7 @@ final class MessageRouter {
                let _ = note.userInfo?["isKeyUpdate"] as? Bool {
                 let peerID = PeerID(publicKey: newKey)
                 Task { @MainActor in
-                    self.flushOutbox(for: peerID)
+                    await self.flushOutbox(for: peerID)
                 }
             }
         }
@@ -72,7 +75,7 @@ final class MessageRouter {
     /// local startup and replay happens later in the background.
     func configureDurableOutbox(
         persist: @escaping (PeerID, String, String, String, Date) async -> Bool,
-        complete: @escaping (String) -> Void
+        complete: @escaping (String) async -> Bool
     ) {
         persistQueuedMessage = persist
         completeQueuedMessage = complete
@@ -114,7 +117,7 @@ final class MessageRouter {
             )
             // Drain the older durable backlog whenever possible even if this
             // newest row was rejected by persistence.
-            flushOutbox(for: peerID)
+            await flushOutbox(for: peerID)
             return result
         }
         if let transport = reachableTransport(for: peerID) {
@@ -129,7 +132,7 @@ final class MessageRouter {
             messageID: messageID
         )
         // Reachability may have changed while the durable write was in flight.
-        flushOutbox(for: peerID)
+        await flushOutbox(for: peerID)
         return result
     }
 
@@ -162,7 +165,9 @@ final class MessageRouter {
         // Enforce per-peer size limit with FIFO eviction
         if let count = outbox[peerID]?.count, count > Self.maxMessagesPerPeer {
             let evicted = outbox[peerID]?.removeFirst()
-            if let id = evicted?.messageID { completeQueuedMessage?(id) }
+            if let id = evicted?.messageID, let completeQueuedMessage {
+                _ = await completeQueuedMessage(id)
+            }
             SecureLogger.warning("📤 Outbox overflow for \(peerID.id.prefix(8))… - evicted oldest message: \(evicted?.messageID.prefix(8) ?? "?")…", category: .session)
         }
 
@@ -196,39 +201,90 @@ final class MessageRouter {
 
     // MARK: - Outbox Management
 
-    func flushOutbox(for peerID: PeerID) {
-        guard let queued = outbox[peerID], !queued.isEmpty else { return }
+    func flushOutbox(for peerID: PeerID) async {
+        guard !flushingOutboxPeers.contains(peerID),
+              let queued = outbox[peerID],
+              !queued.isEmpty
+        else { return }
+        flushingOutboxPeers.insert(peerID)
+        defer { flushingOutboxPeers.remove(peerID) }
+        let generation = outboxGeneration
         SecureLogger.debug("Flushing outbox for \(peerID.id.prefix(8))… count=\(queued.count)", category: .session)
 
         var remaining: [QueuedMessage] = []
 
-        for message in queued {
-            if let transport = reachableTransport(for: peerID) {
+        for (index, queuedMessage) in queued.enumerated() {
+            var message = queuedMessage
+            if !message.awaitingCleanup, let transport = reachableTransport(for: peerID) {
                 SecureLogger.debug("Outbox -> \(type(of: transport)) for \(peerID.id.prefix(8))… id=\(message.messageID.prefix(8))…", category: .session)
                 transport.sendPrivateMessage(message.content, to: peerID, recipientNickname: message.nickname, messageID: message.messageID)
-                completeQueuedMessage?(message.messageID)
-            } else {
+                message.awaitingCleanup = true
+            } else if !message.awaitingCleanup {
+                remaining.append(contentsOf: queued[index...])
+                break
+            }
+
+            guard let completeQueuedMessage,
+                  await completeQueuedMessage(message.messageID)
+            else {
+                // The transport already accepted this stable message id. Keep
+                // the row, but retry deletion only — never send it again in
+                // this process while durable cleanup is pending.
                 remaining.append(message)
+                remaining.append(contentsOf: queued.dropFirst(index + 1))
+                break
             }
         }
 
-        if remaining.isEmpty {
+        // Awaiting durable cleanup yields the main actor. Preserve messages
+        // queued during that suspension, while allowing a newer explicit
+        // clear/wipe to win over this stale flush snapshot.
+        guard generation == outboxGeneration else { return }
+        let snapshotIDs = Set(queued.map(\.messageID))
+        let appended = outbox[peerID, default: []].filter { !snapshotIDs.contains($0.messageID) }
+        let next = remaining + appended
+        if next.isEmpty {
             outbox.removeValue(forKey: peerID)
         } else {
-            outbox[peerID] = remaining
+            outbox[peerID] = next
         }
-    }
-
-    func flushAllOutbox() {
-        for key in Array(outbox.keys) { flushOutbox(for: key) }
-    }
-
-    func clearOutbox(completingDurable: Bool = true) {
-        if completingDurable {
-            for messages in outbox.values {
-                for message in messages { completeQueuedMessage?(message.messageID) }
+        if remaining.isEmpty, !appended.isEmpty {
+            Task { @MainActor [weak self] in
+                await self?.flushOutbox(for: peerID)
             }
         }
+    }
+
+    func flushAllOutbox() async {
+        for key in Array(outbox.keys) { await flushOutbox(for: key) }
+    }
+
+    func discardOutbox() {
+        outboxGeneration &+= 1
         outbox = [:]
+    }
+
+    func clearOutbox() async {
+        outboxGeneration &+= 1
+        let generation = outboxGeneration
+        let snapshot = outbox
+        var retained: [PeerID: [QueuedMessage]] = [:]
+        for (peerID, messages) in snapshot {
+            for message in messages {
+                if let completeQueuedMessage,
+                   await completeQueuedMessage(message.messageID) == false {
+                    retained[peerID, default: []].append(message)
+                }
+            }
+        }
+        guard generation == outboxGeneration else { return }
+        let snapshotIDs = Set(snapshot.values.flatMap { $0 }.map(\.messageID))
+        var next = outbox.mapValues { messages in
+            messages.filter { !snapshotIDs.contains($0.messageID) }
+        }.filter { !$0.value.isEmpty }
+        for (peerID, messages) in retained {
+            next[peerID, default: []].append(contentsOf: messages)
+        }
+        outbox = next
     }
 }

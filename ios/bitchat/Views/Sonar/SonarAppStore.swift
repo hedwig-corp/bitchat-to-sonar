@@ -1246,8 +1246,11 @@ final class SonarAppStore: ObservableObject {
                 }
             },
             complete: { messageID in
-                Task {
-                    try? await marmot.completePreRouteMessage(id: messageID)
+                do {
+                    try await marmot.completePreRouteMessage(id: messageID)
+                    return true
+                } catch {
+                    return false
                 }
             }
         )
@@ -4761,7 +4764,7 @@ final class SonarAppStore: ObservableObject {
             }
         }
         flushResolvedMarmotSends()
-        chatViewModel.messageRouter.flushAllOutbox()
+        Task { await chatViewModel.messageRouter.flushAllOutbox() }
     }
 
     func dmTransport(_ id: String) -> SNVia {
@@ -8018,7 +8021,7 @@ final class SonarAppStore: ObservableObject {
         // with the SAME identity so new secure chats still work.
         Task { await marmot.eraseChatsKeepIdentity() }
         // Drop queued sends + pay-scan state that referenced the erased chats.
-        chatViewModel.messageRouter.clearOutbox(completingDurable: false)
+        chatViewModel.messageRouter.discardOutbox()
         marmot.clearPreRouteMessages()
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -8142,7 +8145,7 @@ final class SonarAppStore: ObservableObject {
         refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
         resolvedMarmotSends = [:]
-        chatViewModel.messageRouter.clearOutbox(completingDurable: false)
+        chatViewModel.messageRouter.discardOutbox()
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]
         pendingMarmotMessagesByChat = [:]

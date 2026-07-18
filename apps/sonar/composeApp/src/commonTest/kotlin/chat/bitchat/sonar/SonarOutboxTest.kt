@@ -31,7 +31,7 @@ class SonarOutboxTest {
         val snapshot = outbox.snapshot("peer-1")
 
         val remaining = outbox.remainingAfterFailure(snapshot, failedIndex = 2)
-        outbox.finishFlush("peer-1", snapshotSize = snapshot.size, remaining = remaining)
+        outbox.finishFlush("peer-1", snapshot = snapshot, remaining = remaining)
 
         assertEquals(listOf("failed", "later", "old-after-failure"), outbox.snapshot("peer-1").map { it.content })
     }
@@ -43,7 +43,7 @@ class SonarOutboxTest {
         outbox.enqueue("peer-1", "two", "id-2", timestampSecs = 2)
         val snapshot = outbox.snapshot("peer-1")
 
-        outbox.finishFlush("peer-1", snapshotSize = snapshot.size, remaining = emptyList())
+        outbox.finishFlush("peer-1", snapshot = snapshot, remaining = emptyList())
 
         assertFalse(outbox.contains("peer-1"))
     }
@@ -56,9 +56,23 @@ class SonarOutboxTest {
         val snapshot = outbox.snapshot("peer-1")
 
         outbox.enqueue("peer-1", "three", "id-3", timestampSecs = 3)
-        outbox.finishFlush("peer-1", snapshotSize = snapshot.size, remaining = emptyList())
+        outbox.finishFlush("peer-1", snapshot = snapshot, remaining = emptyList())
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
+    }
+
+    @Test
+    fun finishFlushPreservesMessageAppendedWhenFullQueueEvictsSnapshotHead() {
+        val outbox = SonarOutbox(maxPerPeer = 3)
+        outbox.enqueue("peer-1", "one", "id-1", timestampSecs = 1)
+        outbox.enqueue("peer-1", "two", "id-2", timestampSecs = 2)
+        outbox.enqueue("peer-1", "three", "id-3", timestampSecs = 3)
+        val snapshot = outbox.snapshot("peer-1")
+
+        outbox.enqueue("peer-1", "four", "id-4", timestampSecs = 4)
+        outbox.finishFlush("peer-1", snapshot = snapshot, remaining = emptyList())
+
+        assertEquals(listOf("four"), outbox.snapshot("peer-1").map { it.content })
     }
 
     @Test
@@ -72,6 +86,20 @@ class SonarOutboxTest {
         outbox.restore(later)
 
         assertEquals(listOf("id-1", "id-2"), outbox.snapshot("peer-1").map { it.messageId })
+    }
+
+    @Test
+    fun cleanupFailureKeepsDeliveredRowWithoutResendingFlagAndPreservesTail() {
+        val outbox = SonarOutbox()
+        outbox.enqueue("peer", "first", "id-1", 1)
+        outbox.enqueue("peer", "second", "id-2", 2)
+        val snapshot = outbox.snapshot("peer")
+
+        val remaining = outbox.remainingAfterCleanupFailure(snapshot, 0)
+
+        assertEquals(listOf("id-1", "id-2"), remaining.map { it.messageId })
+        assertEquals(true, remaining.first().awaitingCleanup)
+        assertEquals(false, remaining.last().awaitingCleanup)
     }
 
     @Test

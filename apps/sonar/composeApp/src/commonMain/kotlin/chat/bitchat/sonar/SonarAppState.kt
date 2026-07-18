@@ -7815,20 +7815,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun flushOutbox(peerId: String) {
         if (!outbox.contains(peerId) || !flushingOutboxPeers.add(peerId)) return
         scope.launch {
+            var shouldContinue = false
             try {
-                flushOutboxNow(peerId)
+                shouldContinue = flushOutboxNow(peerId)
             } finally {
                 flushingOutboxPeers.remove(peerId)
             }
+            if (shouldContinue) flushOutbox(peerId)
         }
     }
 
-    private suspend fun flushOutboxNow(peerId: String) {
+    private suspend fun flushOutboxNow(peerId: String): Boolean {
         val queue = outbox.snapshot(peerId)
-        if (queue.isEmpty()) { outbox.finishFlush(peerId, 0, emptyList()); return }
+        if (queue.isEmpty()) return false
         if (isMeshContactBlocked(peerId)) {
             sonarLog("SonarOutbox", "paused blocked outbox peer=${peerId.take(10)}…")
-            return
+            return false
         }
         val remaining = mutableListOf<QueuedMessage>()
         var marmotGroupId: String? = null
@@ -7837,23 +7839,34 @@ class SonarAppState(private val scope: CoroutineScope) {
 
         for ((index, msg) in queue.withIndex()) {
             // Try to send via the best available transport.
-            val routePeerId = liveMeshRoutePeerId(peerId)
-            val delivered = if (routePeerId != null) {
-                sendMesh(routePeerId, msg.content)
+            val delivered = if (msg.awaitingCleanup) {
+                true
             } else {
-                val raw = npubRawFor(peerId)
-                if (raw != null) {
-                    when {
-                        shouldUseMarmotRoute(peerId, raw) -> {
-                            val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
-                            marmotGroupId = groupId
-                            groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
-                        }
-                        canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
-                        else -> false
-                    }
+                val routePeerId = liveMeshRoutePeerId(peerId)
+                if (routePeerId != null) {
+                    sendMesh(routePeerId, msg.content)
                 } else {
-                    false
+                    val raw = npubRawFor(peerId)
+                    if (raw != null) {
+                        when {
+                            shouldUseMarmotRoute(peerId, raw) -> {
+                                val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
+                                marmotGroupId = groupId
+                                if (groupId == null || runCatching {
+                                        SonarCore.resolvePreRouteMessage(msg.messageId, groupId)
+                                    }.isFailure
+                                ) {
+                                    false
+                                } else {
+                                    sendOutboxOverMarmot(peerId, groupId, msg.content)
+                                }
+                            }
+                            canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
+                            else -> false
+                        }
+                    } else {
+                        false
+                    }
                 }
             }
             if (!delivered) {
@@ -7861,11 +7874,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 sonarLog("SonarOutbox", "kept ${remaining.size} message(s) queued for ${peerId.take(10)}…")
                 break
             }
-            runCatching { SonarCore.completePreRouteMessage(msg.messageId) }
+            if (runCatching { SonarCore.completePreRouteMessage(msg.messageId) }.isFailure) {
+                remaining.addAll(outbox.remainingAfterCleanupFailure(queue, index))
+                sonarLog("SonarOutbox", "kept delivered id=${msg.messageId.take(8)}… until journal cleanup succeeds")
+                break
+            }
             sonarLog("SonarOutbox", "delivered id=${msg.messageId.take(8)}… to ${peerId.take(10)}…")
         }
 
-        outbox.finishFlush(peerId, queue.size, remaining)
+        return outbox.finishFlush(peerId, queue, remaining)
     }
 
     private suspend fun ensureMarmotGroupForOutbox(peerId: String, npubRaw: ByteArray): String? {

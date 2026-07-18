@@ -7,6 +7,7 @@ internal data class QueuedMessage(
     val peerId: String,
     val messageId: String,
     val timestampSecs: Long,
+    val awaitingCleanup: Boolean = false,
 )
 
 internal data class OutboxEnqueueResult(
@@ -56,9 +57,17 @@ internal class SonarOutbox(
     fun remainingAfterFailure(snapshot: List<QueuedMessage>, failedIndex: Int): List<QueuedMessage> =
         snapshot.drop(failedIndex)
 
-    fun finishFlush(peerId: String, snapshotSize: Int, remaining: List<QueuedMessage>) {
-        val appended = queues[peerId].orEmpty().drop(snapshotSize)
+    fun remainingAfterCleanupFailure(
+        snapshot: List<QueuedMessage>,
+        failedIndex: Int,
+    ): List<QueuedMessage> =
+        listOf(snapshot[failedIndex].copy(awaitingCleanup = true)) + snapshot.drop(failedIndex + 1)
+
+    fun finishFlush(peerId: String, snapshot: List<QueuedMessage>, remaining: List<QueuedMessage>): Boolean {
+        val snapshotIds = snapshot.mapTo(mutableSetOf()) { it.messageId }
+        val appended = queues[peerId].orEmpty().filterNot { it.messageId in snapshotIds }
         val next = (remaining + appended).toMutableList()
         if (next.isEmpty()) queues.remove(peerId) else queues[peerId] = next
+        return remaining.isEmpty() && appended.isNotEmpty()
     }
 }

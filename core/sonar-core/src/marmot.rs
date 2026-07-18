@@ -29,7 +29,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
-use crate::pre_route_outbox::PRE_ROUTE_OUTBOX_FILE_SUFFIX;
+use crate::pre_route_outbox::pre_route_outbox_path_for_db;
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -1356,14 +1356,19 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
-        PRE_ROUTE_OUTBOX_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
-    paths.push(base.with_file_name(format!("{name}{PRE_ROUTE_OUTBOX_FILE_SUFFIX}.tmp")));
+    let pre_route_outbox = pre_route_outbox_path_for_db(base);
+    let pre_route_name = pre_route_outbox
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("sonar-pre-route-outbox");
+    paths.push(pre_route_outbox.with_file_name(format!("{pre_route_name}.tmp")));
+    paths.push(pre_route_outbox);
     paths
 }
 
