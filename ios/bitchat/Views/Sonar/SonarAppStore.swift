@@ -6774,6 +6774,15 @@ final class SonarAppStore: ObservableObject {
             if let folded = self.foldedConversationId(forMarmotGroupId: sourceId) {
                 return folded
             }
+            // Standalone Marmot chats use `marmot:<groupId>` in UI + deleteChat;
+            // keep voice logical ids on that same key so stop-on-delete matches.
+            let isMarmotSource =
+                self.marmot.groups.contains(where: { $0.id == sourceId })
+                || (!sourceId.hasPrefix(Self.marmotIDPrefix)
+                    && self.marmot.messagesByGroup[sourceId] != nil)
+            if isMarmotSource {
+                return self.marmotConvId(forGroup: sourceId)
+            }
             return sourceId
         }
         VoiceNotePlaybackController.shared.configure(
@@ -8701,8 +8710,16 @@ final class SonarAppStore: ObservableObject {
         // Stop voice if the active note belongs to this logical conversation
         // (or any folded source mapped under it) before local media is removed.
         VoiceNotePlaybackController.shared.stopIfActiveItem(
-            matching: { item in
-                item.logicalConversationId == id || item.sourceConversationId == id
+            matching: { [weak self] item in
+                guard let self else { return false }
+                if item.logicalConversationId == id || item.sourceConversationId == id {
+                    return true
+                }
+                // Prefixed chat id vs raw group id on the media item.
+                if let gid = self.marmotGroupId(id), item.sourceConversationId == gid {
+                    return true
+                }
+                return false
             },
             reason: .deleted
         )
@@ -9059,7 +9076,18 @@ extension SonarAppStore {
     /// logical conversation. Never hits relay or scans full history.
     @MainActor
     func localVoicePlaybackCandidates(logicalConversationId: String) -> [VoicePlaybackItem] {
-        let rows = conversationViewState(logicalConversationId).messages
+        // Prefer the open transcript cache. Never call `conversationViewState`
+        // here — that would recreate + subscribe a closed chat just for queue
+        // lookups after the user left (zombie rebuilds until process exit).
+        let rows: [SNMessage]
+        if let existing = conversationViewStates[logicalConversationId] {
+            rows = existing.messages
+        } else {
+            rows = dmMsgs(
+                logicalConversationId,
+                limit: TransportConfig.sonarTranscriptPageCount
+            )
+        }
         var out: [VoicePlaybackItem] = []
         for message in rows {
             for (index, media) in message.media.enumerated() where media.mime.hasPrefix("audio/") {
