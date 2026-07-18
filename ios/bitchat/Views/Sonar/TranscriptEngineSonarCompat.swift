@@ -64,3 +64,61 @@ public func snTranscriptDaySections(
         now: now
     )
 }
+
+// MARK: - Owned inset (R-009 viewport-space math lives in TranscriptEngine)
+
+public func snCollectionHostOwnedBottomContentInset(
+    collectionBoundsHeight: CGFloat,
+    composerMinYInViewport: CGFloat
+) -> CGFloat {
+    transcriptOwnedBottomContentInset(
+        collectionBoundsHeight: collectionBoundsHeight,
+        composerMinYInViewport: composerMinYInViewport
+    )
+}
+
+public func snCollectionHostFloatingComposerGap(
+    keyboardOcclusionHeight: CGFloat,
+    swiftUIKeyboardAvoidanceActive: Bool
+) -> CGFloat {
+    transcriptFloatingComposerGap(
+        keyboardOcclusionHeight: keyboardOcclusionHeight,
+        swiftUIKeyboardAvoidanceActive: swiftUIKeyboardAvoidanceActive
+    )
+}
+
+public func snCollectionHostOwnedBottomContentInset(barHeight: CGFloat, safeAreaBottom: CGFloat) -> CGFloat {
+    transcriptOwnedBottomContentInset(barHeight: barHeight, safeAreaBottom: safeAreaBottom)
+}
+
+public func snScrollToBottomOfLoadWindowOffsetY(
+    boundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    topInset: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat {
+    transcriptScrollToBottomOfLoadWindowOffsetY(
+        boundsHeight: boundsHeight,
+        contentHeight: contentHeight,
+        topInset: topInset,
+        bottomInset: bottomInset
+    )
+}
+
+public func snRestingOffsetOvershootCorrection(
+    offsetY: CGFloat,
+    boundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    topInset: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat? {
+    transcriptRestingOffsetOvershootCorrection(
+        offsetY: offsetY,
+        boundsHeight: boundsHeight,
+        contentHeight: contentHeight,
+        topInset: topInset,
+        bottomInset: bottomInset
+    )
+}
+
+public typealias SNTailRevision = TranscriptTailRevision

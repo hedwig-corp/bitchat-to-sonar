@@ -718,13 +718,8 @@ struct SNMediaPipeline {
     )
 }
 
-/// O(1) identity for transcript changes that can affect the live edge. A
-/// bounded window can replace its tail without changing count, so both fields
-/// are required; intermediate row identities do not change tail-following.
-struct SNTailRevision: Equatable {
-    let itemCount: Int
-    let tailID: String?
-}
+/// O(1) identity for transcript changes that can affect the live edge.
+/// Defined in TranscriptEngine; Sonar keeps the SN* name via TranscriptEngineSonarCompat.
 
 /// Reference-semantic height scratchpad. Mutating `last` does not invalidate
 /// SwiftUI the way `@State CGFloat` would, so keyboard animation can update
@@ -743,26 +738,8 @@ enum SNUserScrollActivity: Equatable {
     case towardTail
 }
 
-/// Signal `updateContentInsets` non-pinned branch: a reader away from the
-/// tail is shifted in lockstep with the inset change, clamped to the content
-/// bounds (`(oldYOffset + insetChange).clamp(minYOffset, safeContentHeight)`),
-/// with `maxContentOffsetY` using `max()` so a short chat rests top-aligned.
-/// UIKit performs the lockstep itself for safe-area-driven insets; what the
-/// SwiftUI stack lacks is the clamp — after keyboard dismiss the offset can
-/// rest past the new maximum, leaving a keyboard-sized blank band under the
-/// last message. Returns the corrected offset, or nil when already at rest
-/// within bounds.
-func snRestingOffsetOvershootCorrection(
-    offsetY: CGFloat,
-    boundsHeight: CGFloat,
-    contentHeight: CGFloat,
-    topInset: CGFloat,
-    bottomInset: CGFloat
-) -> CGFloat? {
-    let minY = -topInset
-    let maxY = max(minY, contentHeight + bottomInset - boundsHeight)
-    return offsetY > maxY + 1 ? maxY : nil
-}
+/// Signal `updateContentInsets` non-pinned branch — implemented in TranscriptEngine
+/// (`transcriptRestingOffsetOvershootCorrection` / `snRestingOffsetOvershootCorrection` shim).
 
 /// Signal owns the conversation scroll view's bottom inset itself
 /// (`newInsets.bottom = bottomBarContainer.frame.height - safeAreaInsets.bottom`)
@@ -779,16 +756,8 @@ func snOwnedTranscriptBottomContentInset(
     return 0
 }
 
-/// Signal `scrollToBottomOfLoadWindow`: `contentOffset.y = maxContentOffsetY`.
-func snScrollToBottomOfLoadWindowOffsetY(
-    boundsHeight: CGFloat,
-    contentHeight: CGFloat,
-    topInset: CGFloat,
-    bottomInset: CGFloat
-) -> CGFloat {
-    let minY = -topInset
-    return max(minY, contentHeight + bottomInset - boundsHeight)
-}
+/// Signal `scrollToBottomOfLoadWindow` — implemented in TranscriptEngine
+/// (`transcriptScrollToBottomOfLoadWindowOffsetY` / `snScrollToBottomOfLoadWindowOffsetY` shim).
 
 /// iOS 17+ / macOS 14+: start (and keep) the scroll view at the live edge —
 /// Signal `scrollToInitialPosition` → `scrollToBottomOfLoadWindow` for

@@ -32,6 +32,8 @@ include(":composeApp")
 include(":baselineprofile")
 include(":transcript-engine-policy")
 include(":transcript-engine-compose")
+include(":transcript-engine-sample")
 
 project(":transcript-engine-policy").projectDir = file("../../packages/transcript-engine-policy")
 project(":transcript-engine-compose").projectDir = file("../../packages/transcript-engine-compose")
+project(":transcript-engine-sample").projectDir = file("../../packages/transcript-engine-sample")

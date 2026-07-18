@@ -13,16 +13,26 @@ let package = Package(
             name: "TranscriptEngine",
             targets: ["TranscriptEngine"]
         ),
+        .library(
+            name: "SampleChat",
+            targets: ["SampleChat"]
+        ),
     ],
     targets: [
         .target(
             name: "TranscriptEngine",
             path: "Sources"
         ),
+        .target(
+            name: "SampleChat",
+            dependencies: ["TranscriptEngine"],
+            path: "Examples/SampleChat"
+        ),
         .testTarget(
             name: "TranscriptEngineTests",
             dependencies: ["TranscriptEngine"],
-            path: "Tests"
+            path: "Tests",
+            resources: [.process("Resources")]
         ),
     ]
 )
