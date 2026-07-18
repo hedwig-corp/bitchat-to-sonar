@@ -77,7 +77,8 @@ internal fun mergeTranscriptRows(
  * rebuilds LazyColumn and looks like the chat was torn down.
  *
  * Compares paint-relevant fields only: id order, content, delivery state,
- * timestamp, and media URLs.
+ * timestamp, and full [SonarMedia] values (URL alone is not enough — MIP-04
+ * dims / mime / filename change reserved bubble geometry).
  */
 internal fun sameTranscriptPaint(current: List<SonarMsg>, next: List<SonarMsg>): Boolean {
     if (current.size != next.size) return false
@@ -90,10 +91,7 @@ internal fun sameTranscriptPaint(current: List<SonarMsg>, next: List<SonarMsg>):
         if (a.tsSecs != b.tsSecs) return false
         if (a.mine != b.mine) return false
         if (a.viaInternet != b.viaInternet) return false
-        if (a.media.size != b.media.size) return false
-        for (j in a.media.indices) {
-            if (a.media[j].url != b.media[j].url) return false
-        }
+        if (a.media != b.media) return false
         if (a.stickerRef != b.stickerRef) return false
     }
     return true

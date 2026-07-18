@@ -105,6 +105,21 @@ class TranscriptDisplayPolicyTest {
             ),
         )
         assertFalse(sameTranscriptPaint(withMedia, otherMedia))
+        val sameUrlNewDims = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/1", "image/jpeg", "a.jpg", 1200, 900, null)),
+            ),
+        )
+        assertFalse(
+            sameTranscriptPaint(withMedia, sameUrlNewDims),
+            "MIP-04 dim arrival must republish — reserved bubble geometry changed",
+        )
+        val sameUrlNewMime = listOf(
+            message("a", 1).copy(
+                media = listOf(SonarMedia("https://m/1", "image/gif", "a.gif", 10, 10, null)),
+            ),
+        )
+        assertFalse(sameTranscriptPaint(withMedia, sameUrlNewMime))
     }
 
     @Test

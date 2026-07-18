@@ -3886,6 +3886,12 @@ final class SonarAppStore: ObservableObject {
     /// must not invalidate the store. Entries are released on `closedDM`.
     private var conversationViewStates: [String: ConversationViewState] = [:]
 
+    /// Drop leave/reopen paint cache when a conversation is deleted or erased.
+    private func discardRetainedConversation(_ id: String) {
+        conversationViewStates.removeValue(forKey: id)
+    }
+
+
     /// The precomputed transcript for one conversation. Returns the same
     /// instance across body evaluations so `@ObservedObject` subscriptions
     /// stay stable while the chat is open.
@@ -7263,6 +7269,7 @@ final class SonarAppStore: ObservableObject {
     /// Noise leg (delete both). Multi-member Marmot groups publish a leave
     /// proposal; other deletes are local-only.
     func deleteChat(_ id: String) {
+        discardRetainedConversation(id)
         if isPendingSecureChat(id) {
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
@@ -7280,7 +7287,10 @@ final class SonarAppStore: ObservableObject {
             // resurface after the next refresh.
             let matching = shouldLeave ? [] : directMarmotGroups(matchingGroupId: groupId).map(\.id)
             let groupIds = matching.isEmpty ? [groupId] : matching
-            for gid in groupIds { forgetMarmotGroupMappings(forGroupId: gid) }
+            for gid in groupIds {
+                discardRetainedConversation(gid)
+                forgetMarmotGroupMappings(forGroupId: gid)
+            }
             Task {
                 if shouldLeave {
                     await marmot.leaveGroup(groupId)
@@ -7294,7 +7304,10 @@ final class SonarAppStore: ObservableObject {
             // ...and every folded White Noise leg, if this peer has any.
             if let profile = resolvedSonarProfile(id) {
                 let groups = marmotGroups(forNpub: profile.npub)
-                for g in groups { forgetMarmotGroupMappings(forGroupId: g.id) }
+                for g in groups {
+                    discardRetainedConversation(g.id)
+                    forgetMarmotGroupMappings(forGroupId: g.id)
+                }
                 if !groups.isEmpty {
                     Task { for g in groups { await marmot.deleteGroup(g.id) } }
                 }
@@ -7319,6 +7332,7 @@ final class SonarAppStore: ObservableObject {
     func eraseAllChats() {
         path = []
         unreadCountAtOpenByDM.removeAll()
+        conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
         // White Noise / Marmot groups: wipe the encrypted DB then reconnect

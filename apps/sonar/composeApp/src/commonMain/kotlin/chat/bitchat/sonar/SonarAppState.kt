@@ -949,6 +949,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
             messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
+            retainedTranscriptByChat.clear()
+            transcriptWindows.clear()
             lastWnGroups = -1; lastWnMsgs = -1
             // ⚡PAY coins live inside the erased chats — reset the ledger. The
             // Lightning wallet seed/balance is separate and is NOT touched.
@@ -2162,6 +2164,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         } else {
             retainedTranscriptByChat[chatId] = rows
         }
+    }
+
+    /** Drop leave/reopen paint cache when a conversation is deleted or erased. */
+    private fun discardRetainedTranscript(chatId: String) {
+        retainedTranscriptByChat.remove(chatId)
+        transcriptWindows.remove(chatId)
     }
 
     /** Prefer last leave paint, else snapshot — never open on empty when we can avoid it. */
@@ -4349,6 +4357,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             notificationLatestSecs.remove(id)
             stagedChangedPages.remove(id)
             failedChangedPageReads.remove(id)
+            discardRetainedTranscript(id)
         }
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
@@ -4386,7 +4395,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         aliases.forEach { alias ->
             meshChats.remove(alias)
             meshChatNames.remove(alias)
+            discardRetainedTranscript(meshChatId(alias))
         }
+        discardRetainedTranscript(chatId)
         meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
         if (foldedGroupIdsToDelete.isNotEmpty()) {
             chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
@@ -4399,6 +4410,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 stagedChangedPages.remove(it)
                 failedChangedPageReads.remove(it)
                 unreadByChat = unreadByChat - it
+                discardRetainedTranscript(it)
             }
             persistGroupFolds()
             clearChatSnapshot()
