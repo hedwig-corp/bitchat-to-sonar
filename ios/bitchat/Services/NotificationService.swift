@@ -114,11 +114,18 @@ final class NotificationService {
         message: String,
         sound: SonarNotificationSound = .standard
     ) {
-        let title = "You were mentioned"
-        let body = "Open Sonar to read it."
-        let identifier = "mention-\(UUID().uuidString)"
+        guard let routed = Self.routedMentionNotification(
+            sender: sender,
+            message: message,
+            prefs: SonarNotificationPreferenceStore.loadMerged()
+        ) else { return }
 
-        sendLocalNotification(title: title, body: body, identifier: identifier, sound: sound)
+        sendLocalNotification(
+            title: routed.title,
+            body: routed.body,
+            identifier: routed.identifier,
+            sound: sound
+        )
     }
 
     func sendPrivateMessageNotification(
@@ -127,21 +134,81 @@ final class NotificationService {
         peerID: PeerID,
         sound: SonarNotificationSound = .standard
     ) {
-        let title = "New Sonar message"
-        let body = "Open Sonar to read it."
-        let identifier = "private-\(UUID().uuidString)"
-        let userInfo: [String: Any] = [
-            SonarNotificationKeys.peerID: peerID.id,
-            SonarNotificationKeys.conversationId: peerID.id,
-            "senderName": sender,
-        ]
+        // Callers pass the real sender + body; never discard them for a
+        // hard-coded privacy fallback. The router applies Show names /
+        // Message preview (and the master Notifications toggle).
+        guard let routed = Self.routedPrivateMessageNotification(
+            sender: sender,
+            message: message,
+            peerID: peerID.id,
+            prefs: SonarNotificationPreferenceStore.loadMerged()
+        ) else { return }
 
+        // Identifier is `private-sonar-message-<peerID>` (replace-per-peer),
+        // not a per-message UUID. Multiple unread mesh DMs from the same peer
+        // update one banner — intentional lock-screen coalescing.
         sendLocalNotification(
-            title: title,
-            body: body,
-            identifier: identifier,
-            userInfo: userInfo,
+            title: routed.title,
+            body: routed.body,
+            identifier: routed.identifier,
+            userInfo: routed.userInfo,
             sound: sound
+        )
+    }
+
+    /// Mesh private-message routing seam used by `sendPrivateMessageNotification`.
+    /// Tests pin this so a hard-coded privacy fallback cannot land without failing.
+    static func routedPrivateMessageNotification(
+        sender: String,
+        message: String,
+        peerID: String,
+        prefs: SonarLocalNotificationPrefs
+    ) -> SonarLocalNotification? {
+        var userInfo: [String: Any] = [
+            SonarNotificationKeys.peerID: peerID,
+            SonarNotificationKeys.conversationId: peerID,
+        ]
+        if prefs.showNames {
+            userInfo["senderName"] = sender
+        }
+        guard let routed = SonarLocalNotificationRouter.make(
+            idKey: peerID,
+            kind: .message,
+            conversationTitle: sender,
+            senderName: sender,
+            preview: message,
+            prefs: prefs,
+            userInfo: userInfo
+        ) else { return nil }
+        // Keep the `private-` prefix — NotificationDelegate routes taps by it.
+        return SonarLocalNotification(
+            title: routed.title,
+            body: routed.body,
+            identifier: "private-\(routed.identifier)",
+            userInfo: routed.userInfo
+        )
+    }
+
+    /// Mesh mention routing seam used by `sendMentionNotification`.
+    static func routedMentionNotification(
+        sender: String,
+        message: String,
+        prefs: SonarLocalNotificationPrefs,
+        idKey: String = UUID().uuidString
+    ) -> SonarLocalNotification? {
+        guard let routed = SonarLocalNotificationRouter.make(
+            idKey: idKey,
+            kind: .mention,
+            conversationTitle: sender,
+            senderName: sender,
+            preview: message,
+            prefs: prefs
+        ) else { return nil }
+        return SonarLocalNotification(
+            title: routed.title,
+            body: routed.body,
+            identifier: "mention-\(routed.identifier)",
+            userInfo: routed.userInfo
         )
     }
     

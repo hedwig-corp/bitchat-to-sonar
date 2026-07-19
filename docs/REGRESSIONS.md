@@ -346,6 +346,33 @@ the send echo was cleared before the canonical row merged.
 - *Navigating the open mesh chat onto the raw Marmot group id after `startChat`.*
   Splits one person into two conversations (R-003).
 
+## R-012 — Notification privacy settings must shape local copy
+
+**Invariant:** When Notifications are enabled, the Show names and Message preview toggles must control whether sender/group labels and message text appear in user-visible local notifications. Hard-coding the private fallback (`New Sonar message` / `Open Sonar to read it.`) while callers pass real sender/body is a regression.
+
+**Breaks as:** Settings show names/preview on, but every mesh/mention (and push-wake) banner stays anonymous and content-free.
+
+**Why:** PR #58 routed push through the core renderer for privacy, then also replaced `NotificationService.sendPrivateMessageNotification` / `sendMentionNotification` with always-private placeholders — discarding the arguments callers already pass. The toggles wrote to UserDefaults but those paths never read them.
+
+**Call sites:**
+- iOS `NotificationService.swift` (mesh/mention) → `SonarLocalNotificationRouter` + `SonarNotificationPreferenceStore`
+- iOS `SonarPushProcessor.swift` (Transponder wake) → unread conversation summaries + same router/prefs
+- iOS `SonarAppStore.swift` (process-alive Marmot) already used the router
+- Compose `SonarNotificationRouter` / `SonarPushProcessingService` (parity reference)
+
+**Guarded by:** `SonarNotificationPrefsTests.privateMessageRespectsPreviewOptIn`
+
+**Also guarded by:** `SonarNotificationPrefsTests.mentionSeamRespectsPreviewOptIn`, `SonarNotificationPrefsTests.privateMessageRespectsDefaultPrivacy`, `SonarNotificationPrefsTests.privateMessageRespectsNamesOff`, `SonarNotificationPrefsTests.disabledSuppresses`, `SonarNotificationPrefsTests.nsePlaceholderMatchesIdentityNotCopy`, `SonarNotificationPrefsTests.nsePlaceholderWipeRespectsWakeSnapshot`, `SonarNotificationPrefsTests.unreadDeltaRequiresHydratedBaseline`, `SonarNotificationPrefsTests.unreadDeltaSkipsUnchangedStale`, `SonarNotificationPrefsTests.drainPreviewMatchesTruncation`, `SonarNotificationRouterTest.previewsRequireOptIn` (Compose)
+
+**Not guarded:** killed-app NSE rich rendering — the extension still has no App Group Marmot DB (#146 / #152), so force-quit banners stay generic until catch-up lands; `SonarPushProcessor` replaces them when the app is woken. That `sendPrivateMessageNotification` / `sendMentionNotification` still call the routed seams (no UNUserNotificationCenter spy). Push-wake ownership span / live catch-up generation need a constructible `MarmotChatModel` / `SonarAppStore`. iOS tests do not run in CI.
+
+**History:** #58 / #144 introduced the core renderer and privacy toggles → mesh helpers were left on hard-coded private copy → #152 filed the symptom → this fix wires mesh + push-wake through the router/prefs (Android #297 already rendered from unread summaries).
+
+**Rejected:**
+- *Always-private local copy "for privacy".* That ignores the user's explicit Show names / Message preview opt-in and makes the Settings toggles lie.
+- *Full NSE Marmot catch-up in this change.* Correct long-term (#146) but needs App Group DB migration; out of scope for restoring settings respect on the paths that already have decrypted local state.
+
+
 ---
 
 ## Unguarded
