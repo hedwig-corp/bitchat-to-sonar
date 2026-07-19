@@ -1682,8 +1682,16 @@ final class SonarAppStore: ObservableObject {
         toastDismissTask = Task.detached { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
             guard let self, !Task.isCancelled else { return }
-            self.toastSession.clear(ifEpoch: epoch)
-            self.toast = self.toastSession.text
+            // Epoch owns the session; also require the published toast still
+            // matches what we showed so a later showToast/showStickyToast
+            // is not wiped ~1.6s later by a stale dismiss.
+            guard self.toastSession.epoch == epoch else { return }
+            if self.toast == text {
+                self.toastSession.clear(ifEpoch: epoch)
+                self.toast = nil
+            } else {
+                self.toastSession.clear(ifEpoch: epoch)
+            }
         }
     }
 
@@ -1694,15 +1702,6 @@ final class SonarAppStore: ObservableObject {
         toastDismissTask = nil
         toastSession.showSticky(text)
         toast = toastSession.text
-    }
-
-    /// Drop any visible toast and invalidate pending dismissals.
-    @MainActor
-    private func clearToast() {
-        toastDismissTask?.cancel()
-        toastDismissTask = nil
-        toastSession.reset()
-        toast = nil
     }
 
     func toggleMode() {
@@ -1778,7 +1777,7 @@ final class SonarAppStore: ObservableObject {
         Task { @MainActor in
             rename(nick)
             guard await marmot.prepareIdentityForOnboarding() else {
-                toast = "Couldn't save your account key. Try again."
+                showToast("Couldn't save your account key. Try again.")
                 return
             }
             onboarded = true
@@ -1886,12 +1885,17 @@ final class SonarAppStore: ObservableObject {
         do {
             try await marmot.backupAccount()
             showToast(String(localized: "Chat backup uploaded"))
-        } catch is CancellationError {
-            clearToast()
         } catch {
+            // Backup intentionally runs to completion (continuation + close/reconnect
+            // must not leave the node closed). Re-entry throws "already in progress"
+            // — suppress the misleading offline toast; the in-flight backup owns UX.
+            let msg = error.localizedDescription
+            if msg.contains("backup already in progress") {
+                return
+            }
             showToast(String(localized: "Backup failed — try again when online"))
             SecureLogger.warning(
-                "⚠️ Account backup failed: \(error.localizedDescription)",
+                "⚠️ Account backup failed: \(msg)",
                 category: .session
             )
         }
@@ -2226,9 +2230,9 @@ final class SonarAppStore: ObservableObject {
         Task {
             do {
                 try await marmot.requestJoinViaLink(token: token)
-                await MainActor.run { toast = "Join request sent" }
+                await MainActor.run { showToast("Join request sent") }
             } catch {
-                await MainActor.run { toast = "Couldn't join: \(error.localizedDescription)" }
+                await MainActor.run { showToast("Couldn't join: \(error.localizedDescription)") }
             }
         }
     }
@@ -7914,7 +7918,7 @@ final class SonarAppStore: ObservableObject {
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
         if !walletWipeComplete {
-            toast = "Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account."
+            showToast("Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account.")
         }
     }
 

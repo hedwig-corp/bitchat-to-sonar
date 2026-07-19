@@ -40,4 +40,24 @@ struct SNToastSessionTests {
         session.clear(ifEpoch: stale)
         #expect(session.text == nil)
     }
+
+    @Test
+    func dismissMustNotClobberUnrelatedPublishedToast() {
+        // Mirrors SonarAppStore.showToast dismiss: clear session on epoch match,
+        // but only nil the published toast when it still equals the shown text.
+        var session = SNToastSession()
+        let epoch = session.show("Chat backup uploaded")
+        var published: String? = "Chat backup uploaded"
+        published = "Join request sent" // legacy/direct writer mid-flight
+        if session.epoch == epoch {
+            if published == "Chat backup uploaded" {
+                session.clear(ifEpoch: epoch)
+                published = nil
+            } else {
+                session.clear(ifEpoch: epoch)
+            }
+        }
+        #expect(published == "Join request sent")
+        #expect(session.text == nil)
+    }
 }
