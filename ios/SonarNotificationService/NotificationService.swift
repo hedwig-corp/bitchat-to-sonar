@@ -267,6 +267,9 @@ class NotificationService: SDKNotificationService {
             content.interruptionLevel = .active
         }
         var userInfo = content.userInfo
+        // Decorated copy is no longer a privacy placeholder — clear the marker
+        // so the app wake path does not wipe a already-titled NSE banner.
+        userInfo.removeValue(forKey: "sonar.nsePlaceholder")
         if !notification.groupIdHex.isEmpty {
             userInfo[conversationIdKey] = marmotConversationPrefix + notification.groupIdHex
         }
@@ -434,10 +437,18 @@ class NotificationService: SDKNotificationService {
     }
 
     private static func configureTransponderNotification(_ content: UNMutableNotificationContent) {
-        content.title = "New Sonar message"
+        // Placeholder until hydrate decorates (or the app replaces this banner).
+        // Mark with sonar.nsePlaceholder so SonarPushProcessor can remove THIS
+        // banner by identity — never by matching title/body (those strings are
+        // also the router's privacy fallback when Show names + preview are off).
+        let showNames = notificationPrefs().showNames
+        content.title = showNames ? "New Sonar message" : "Sonar"
         content.body = "Open Sonar to read it."
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
+        var info = content.userInfo
+        info["sonar.nsePlaceholder"] = true
+        content.userInfo = info
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active
         }

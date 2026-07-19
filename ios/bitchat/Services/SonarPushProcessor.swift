@@ -262,6 +262,12 @@ enum SonarPushProcessor {
                 notif.groupName,
                 notif.contentPreview,
             ].joined(separator: "|")
+            let conversationId = notif.groupIdHex.isEmpty
+                ? nil
+                : "marmot:" + notif.groupIdHex
+            let userInfo: [String: Any] = conversationId.map {
+                [SonarNotificationKeys.conversationId: $0]
+            } ?? [:]
 
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: idKey,
@@ -270,13 +276,15 @@ enum SonarPushProcessor {
                 senderName: senderName,
                 groupName: groupName,
                 preview: notif.contentPreview.isEmpty ? nil : notif.contentPreview,
-                prefs: prefs
+                prefs: prefs,
+                userInfo: userInfo
             ) else { continue }
 
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
-                identifier: routed.identifier
+                identifier: routed.identifier,
+                userInfo: routed.userInfo
             )
             // Correlate to local message IDs (handles truncated drain previews).
             marmot.notePushWakeNotified(drain: notif)
@@ -342,6 +350,13 @@ enum SonarPushProcessor {
                 return summary.name
             }()
 
+            let conversationId = summary.groupIdHex.isEmpty
+                ? nil
+                : "marmot:" + summary.groupIdHex
+            let userInfo: [String: Any] = conversationId.map {
+                [SonarNotificationKeys.conversationId: $0]
+            } ?? [:]
+
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: summary.groupIdHex,
                 kind: kind,
@@ -350,13 +365,15 @@ enum SonarPushProcessor {
                 groupName: groupName,
                 preview: summary.latestContent.isEmpty ? nil : summary.latestContent,
                 prefs: prefs,
-                unreadCount: summary.unreadCount
+                unreadCount: summary.unreadCount,
+                userInfo: userInfo
             ) else { continue }
 
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
-                identifier: routed.identifier
+                identifier: routed.identifier,
+                userInfo: routed.userInfo
             )
             marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)
             notified += 1
