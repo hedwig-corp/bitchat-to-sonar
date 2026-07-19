@@ -1506,6 +1506,7 @@ mod tests {
             group_name: "g".to_owned(),
             wait_for_ack: false,
             ack_timeout_secs: None,
+            push_settle_secs: 0,
         }
     }
 
