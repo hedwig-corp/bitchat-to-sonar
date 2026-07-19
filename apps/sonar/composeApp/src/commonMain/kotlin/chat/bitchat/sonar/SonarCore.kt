@@ -680,6 +680,10 @@ expect object SonarCore {
      *  Local read. */
     suspend fun hasOutstandingRecoveryBeacon(): Boolean
 
+    /** Publish a recovery beacon after nsec restore. Call after KeyPackage
+     *  publish on the restore path only — never on fresh onboarding. */
+    suspend fun publishRecoveryBeaconBackground()
+
     /** JSON snapshot of relay/sync state (relay statuses, sync watermark,
      *  per-group catch-up floors) for the Diagnostics screen and the exported
      *  debug bundle. No message content or key material. Null before [start]. */

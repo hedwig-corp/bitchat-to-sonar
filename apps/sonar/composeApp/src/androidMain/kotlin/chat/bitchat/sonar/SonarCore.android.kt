@@ -111,6 +111,12 @@ actual object SonarCore {
             previousNode?.close()
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
+            // Restore path only: importIdentity arms this flag so we announce
+            // MLS state loss after the fresh KeyPackage exists. Fresh onboarding
+            // must never arm it (outstanding-beacon auto-accepts group invites).
+            if (consumePendingRecoveryBeaconAnnounce()) {
+                runCatching { connected.publishRecoveryBeaconBackground() }
+            }
             npub
         }
     }
@@ -637,6 +643,22 @@ actual object SonarCore {
         runCatching { n.hasOutstandingRecoveryBeacon() }.getOrDefault(false)
     }
 
+    actual suspend fun publishRecoveryBeaconBackground() = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext
+        n.publishRecoveryBeaconBackground()
+    }
+
+    private fun armPendingRecoveryBeaconAnnounce() {
+        prefs().edit().putBoolean("recovery.announcePending", true).apply()
+    }
+
+    private fun consumePendingRecoveryBeaconAnnounce(): Boolean {
+        val prefs = prefs()
+        if (!prefs.getBoolean("recovery.announcePending", false)) return false
+        prefs.edit().putBoolean("recovery.announcePending", false).apply()
+        return true
+    }
+
     // ── Diagnostics (Settings → Diagnostics) ──
 
     private fun coreLogDirectory(): File =
@@ -859,6 +881,11 @@ actual object SonarCore {
                     pubkeyHex = identity.pubkeyHex()
                     tryRestoreAccountBackupLocked(identity, marmotDir).also {
                         lastImportBackupOutcomeValue = it
+                        // Blossom restore brings MLS state back — skip the
+                        // recovery beacon. nsec-only (Missing/Failed) needs it.
+                        if (it != AccountBackupRestoreOutcome.Restored) {
+                            armPendingRecoveryBeaconAnnounce()
+                        }
                     }
                     npub
                 } catch (importError: Throwable) {

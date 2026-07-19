@@ -595,6 +595,14 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().publishKeyPackageBackground() }
     }
 
+    /// Publish a recovery beacon after nsec restore (never on fresh onboarding).
+    /// Call after `publishKeyPackageBackground()` so the beacon's `k` tag can
+    /// point at the fresh KeyPackage. Arms outstanding-beacon auto-accept for
+    /// multi-member re-invites.
+    func publishRecoveryBeaconBackground() async throws {
+        try await run { try $0.requireNode().publishRecoveryBeaconBackground() }
+    }
+
     /// Publish our kind-0 Nostr profile (NIP-01) so peers can show our name
     /// instead of a raw npub. `name` becomes both name + display_name.
     func publishProfile(name: String, about: String? = nil, picture: String? = nil) async throws {

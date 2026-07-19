@@ -2493,21 +2493,13 @@ impl SonarClient {
                 tracing::warn!(%err, "background KeyPackage publish failed");
             }
         });
-        // After a fresh KeyPackage exists, announce recovery ONLY when our local
-        // MLS store has no groups. That is either a fresh onboarding (harmless —
-        // no peer is watching this npub yet) or an nsec restore that lost local
-        // state (exactly the case surviving peers must heal). An existing user
-        // with groups never beacons, so an ordinary relay reconnect can never
-        // trigger a spurious conversation reset on a peer.
-        let store_empty = self.engine.groups().map(|g| g.is_empty()).unwrap_or(false);
-        if store_empty {
-            if let Err(err) = self
-                .publish_recovery_beacon_background_with_kp(Some(kp_event_id))
-                .await
-            {
-                tracing::warn!(%err, "background recovery beacon publish failed");
-            }
-        }
+        // Recovery beacons are NOT published here. An empty MLS store alone
+        // cannot distinguish fresh onboarding from an nsec restore, and a
+        // beacon sets the outstanding-auto-accept flag — which would silently
+        // accept multi-member group invites on a brand-new install. Hosts call
+        // `publish_recovery_beacon_background` from the restore path (and e2e
+        // tests call `publish_recovery_beacon` explicitly) after the fresh
+        // KeyPackage event id is recorded above.
         Ok(())
     }
 

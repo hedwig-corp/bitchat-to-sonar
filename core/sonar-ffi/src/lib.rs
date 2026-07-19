@@ -1218,6 +1218,17 @@ impl SonarNode {
             .collect())
     }
 
+    /// Publish a signed recovery beacon (kind 30447) in the background.
+    /// Hosts call this from the nsec-restore path AFTER
+    /// `publish_key_package_background`, never from ordinary reconnect or
+    /// fresh onboarding — the outstanding-beacon flag auto-accepts group
+    /// re-invites and must not be armed on a brand-new install.
+    pub fn publish_recovery_beacon_background(&self) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.publish_recovery_beacon_background())?;
+        Ok(())
+    }
+
     /// Drain healed-conversation notices produced by the recovery beacon flow.
     /// Hosts call this after a conversation refresh / drain and render a "chat
     /// was reset" system row for each, folding the new group into the same

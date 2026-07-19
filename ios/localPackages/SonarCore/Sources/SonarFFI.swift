@@ -1696,6 +1696,15 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func publishProfileBackground(name: String, about: String?, picture: String?)
 
     /**
+     * Publish a signed recovery beacon (kind 30447) in the background.
+     * Hosts call this from the nsec-restore path AFTER
+     * `publish_key_package_background`, never from ordinary reconnect or
+     * fresh onboarding — the outstanding-beacon flag auto-accepts group
+     * re-invites and must not be armed on a brand-new install.
+     */
+    func publishRecoveryBeaconBackground() throws
+
+    /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
      */
@@ -2629,6 +2638,20 @@ open func publishProfileBackground(name: String, about: String?, picture: String
         FfiConverterString.lower(name),
         FfiConverterOptionString.lower(about),
         FfiConverterOptionString.lower(picture),$0
+    )
+}
+}
+
+    /**
+     * Publish a signed recovery beacon (kind 30447) in the background.
+     * Hosts call this from the nsec-restore path AFTER
+     * `publish_key_package_background`, never from ordinary reconnect or
+     * fresh onboarding — the outstanding-beacon flag auto-accepts group
+     * re-invites and must not be armed on a brand-new install.
+     */
+open func publishRecoveryBeaconBackground()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_publish_recovery_beacon_background(
+            self.uniffiCloneHandle(),$0
     )
 }
 }
@@ -8413,6 +8436,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile_background() != 18973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_recovery_beacon_background() != 59380) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
