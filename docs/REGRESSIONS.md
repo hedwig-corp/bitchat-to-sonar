@@ -424,7 +424,7 @@ the send echo was cleared before the canonical row merged.
 - *Ignore beacons using `created_at <= last_inbound_from` (`<=`).* A beacon published in the same second as the last inbound message (common in tests and fast restores) would be wrongly treated as stale and never heal; use strict `<` for staleness, `<=` only for the processed-watermark replay guard.
 - *Rejoin the old MLS group.* MDK returns `NotImplemented` for external commits/ReInit; not possible on the current MDK rev.
 
-**Not guarded:** Multi-member admin re-add (`readd_member_via_recovery` / `is_recovery_executor`) has code but no dedicated e2e yet — the concurrent-admin dedup and offline-executor grace retry are unpinned. Live-path (kind-30447 subscription + `drain_pending_marmot` buffer) heal is exercised only via the sync path in tests; the app-side reset-notice UI on both platforms is unpinned (needs a constructible `SonarAppState` / `SonarAppStore`, the same gap noted below). History transfer to the restored device (5B) is out of scope.
+**Not guarded:** Multi-member admin re-add (`readd_member_via_recovery` / `is_recovery_executor`) has code (including a one-shot add retry after remove) but no dedicated e2e yet — the concurrent-admin dedup and offline-executor grace retry are unpinned. Live-path (kind-30447 subscription + `drain_pending_marmot` buffer) heal is exercised only via the sync path in tests; the app-side reset-notice UI on both platforms is unpinned (needs a constructible `SonarAppState` / `SonarAppStore`, the same gap noted below). History transfer to the restored device (5B) is out of scope.
 
 
 ## Unguarded

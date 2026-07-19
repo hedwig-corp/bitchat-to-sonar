@@ -3150,14 +3150,27 @@ impl SonarClient {
 
     /// Deterministic multi-member re-add: remove the stale member, then re-add
     /// with a fresh KeyPackage. Both are ordinary membership commits (gated by
-    /// `membership_gate` inside the client methods).
+    /// `membership_gate` inside the client methods). If the add fails after a
+    /// successful remove, retry the add once — otherwise the restored member
+    /// would be expelled with no automatic recovery (a later beacon is ignored
+    /// because they are no longer in the roster).
     async fn readd_member_via_recovery(
         &self,
         group_id: &GroupId,
         member: &PublicKey,
     ) -> Result<()> {
         self.remove_group_members(group_id, vec![*member]).await?;
-        self.add_group_members(group_id, vec![*member]).await?;
+        match self.add_group_members(group_id, vec![*member]).await {
+            Ok(()) => {}
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    peer = %member.to_hex(),
+                    "recovery re-add failed after remove; retrying once"
+                );
+                self.add_group_members(group_id, vec![*member]).await?;
+            }
+        }
         self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
         Ok(())
     }

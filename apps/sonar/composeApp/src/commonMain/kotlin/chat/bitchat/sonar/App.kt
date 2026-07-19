@@ -1053,7 +1053,7 @@ internal fun buildChatFeedListItems(
     feed.forEachIndexed { i, item ->
         val ts = transcriptFeedTsSecs(item)
         val prevAny = feed.getOrNull(i - 1)
-        val prevTs = if (prevAny is CallRecord) prevAny.tsSecs else (prevAny as? SonarMsg)?.tsSecs
+        val prevTs = prevAny?.let(::transcriptFeedTsSecs)
         val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
         if (newDay) {
             val epochDay = localEpochDayToday() + localDayDelta(ts)
