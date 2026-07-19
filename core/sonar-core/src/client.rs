@@ -1355,7 +1355,12 @@ impl RelayFetchOutcome {
 /// fire rich local notifications (sender name + preview).
 #[derive(Clone, Debug)]
 pub struct DrainNotification {
+    /// Chat message / event id hex — hosts key notification dedup on this (R-004).
+    pub message_id_hex: String,
     pub sender_pubkey: String,
+    /// MLS group id hex — hosts use this for notification tap handoff
+    /// (`marmot:<hex>` conversation id).
+    pub group_id_hex: String,
     pub group_name: String,
     pub content_preview: String,
 }
@@ -1437,6 +1442,22 @@ impl Profile {
     }
 }
 
+/// Restores the pre-wake sync-state snapshot and clears the freeze flag on
+/// drop — including panic / early-return paths inside a push wake.
+struct FrozenWakeGuard<'a> {
+    client: &'a SonarClient,
+    snapshot: Option<SyncState>,
+}
+
+impl Drop for FrozenWakeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            self.client.restore_sync_state_after_frozen_wake(snapshot);
+        }
+        self.client.set_sync_watermark_frozen(false);
+    }
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1451,6 +1472,12 @@ pub struct SonarClient {
     /// restart catch-up conservative: a failed event can be replayed later
     /// instead of being skipped by an advanced watermark.
     sync_state: Arc<Mutex<SyncState>>,
+    /// When true (Notification Service Extension push wake), skip durable
+    /// watermark advances. Messages still decrypt into the store; the next
+    /// durable session re-fetches any gap a short wake may have missed.
+    /// Matches White Noise iOS `cursorPersistence: .frozen`.
+    /// Shared `Arc` so deferred bookkeeping threads observe the same flag.
+    sync_watermark_frozen: Arc<AtomicBool>,
     /// Durable local delivery metadata for Signal-style outgoing text sends.
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
@@ -2024,6 +2051,7 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             sync_state,
+            sync_watermark_frozen: Arc::new(AtomicBool::new(false)),
             outbox_state,
             media_staging,
             media_upload_inflight,
@@ -2831,6 +2859,7 @@ impl SonarClient {
     ) {
         let conversation_index = self.conversation_index.clone();
         let sync_state = self.sync_state.clone();
+        let sync_watermark_frozen = self.sync_watermark_frozen.clone();
         let event_id_hex = event_id.to_hex();
         std::thread::spawn(move || {
             if let Some(ref idx) = conversation_index {
@@ -2850,6 +2879,12 @@ impl SonarClient {
             {
                 let mut state = sync_state.lock().unwrap();
                 state.mark_processed_id(event_id_hex);
+                if sync_watermark_frozen.load(Ordering::Relaxed) {
+                    tracing::debug!(
+                        "deferred sync-state persist skipped (frozen cursor / push wake)"
+                    );
+                    return;
+                }
                 if let Err(e) = state.save_if_dirty() {
                     tracing::debug!(%e, "deferred sync-state persist failed");
                 }
@@ -5344,15 +5379,86 @@ impl SonarClient {
     }
 
     fn save_sync_state(&self) -> Result<()> {
+        if self.sync_watermark_frozen.load(Ordering::Relaxed) {
+            tracing::debug!("sync state save skipped (frozen cursor / push wake)");
+            return Ok(());
+        }
         self.sync_state.lock().unwrap().save_if_dirty()
     }
 
     fn advance_sync_watermark(&self, watermark_secs: u64) -> Result<()> {
+        if self.sync_watermark_frozen.load(Ordering::Relaxed) {
+            tracing::debug!(
+                watermark_secs,
+                "sync watermark advance skipped (frozen cursor / push wake)"
+            );
+            return Ok(());
+        }
         {
             let mut state = self.sync_state.lock().unwrap();
             state.advance_watermark(watermark_secs);
         }
         self.save_sync_state()
+    }
+
+    /// Freeze durable sync-state writes until cleared. Prefer
+    /// [`Self::collect_notifications_after_wake`], which scopes freeze→unfreeze
+    /// and restores in-memory sync state so a long-lived host cannot persist a
+    /// wake-time rewind/processed set after the wake returns.
+    pub fn set_sync_watermark_frozen(&self, frozen: bool) {
+        self.sync_watermark_frozen.store(frozen, Ordering::Relaxed);
+    }
+
+    fn snapshot_sync_state_for_frozen_wake(&self) -> SyncState {
+        let state = self.sync_state.lock().unwrap();
+        SyncState {
+            path: state.path.clone(),
+            watermark_secs: state.watermark_secs,
+            processed_event_ids: state.processed_event_ids.clone(),
+            processed_event_order: state.processed_event_order.clone(),
+            dirty: state.dirty,
+        }
+    }
+
+    fn restore_sync_state_after_frozen_wake(&self, snapshot: SyncState) {
+        let mut state = self.sync_state.lock().unwrap();
+        state.watermark_secs = snapshot.watermark_secs;
+        state.processed_event_ids = snapshot.processed_event_ids;
+        state.processed_event_order = snapshot.processed_event_order;
+        state.dirty = snapshot.dirty;
+    }
+
+    /// White Noise–shaped push wake: force gap recovery under a frozen
+    /// watermark, then drain notifications for local banner decoration.
+    /// `max_wait` bounds the sync; drain still runs so partial progress surfaces.
+    /// Durable sync-state is never written while frozen; in-memory mutations are
+    /// discarded when the wake returns so the durable cursor stays put.
+    pub async fn collect_notifications_after_wake(
+        &self,
+        max_wait: std::time::Duration,
+    ) -> Result<Vec<DrainNotification>> {
+        let snapshot = self.snapshot_sync_state_for_frozen_wake();
+        self.set_sync_watermark_frozen(true);
+        let drain_result = {
+            let _unfreeze = FrozenWakeGuard {
+                client: self,
+                snapshot: Some(snapshot),
+            };
+            match tokio::time::timeout(max_wait, self.sync_force()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "collect_notifications_after_wake sync_force failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        wait_ms = max_wait.as_millis() as u64,
+                        "collect_notifications_after_wake sync_force timed out"
+                    );
+                }
+            }
+            self.drain_pending_marmot().await
+        };
+        drain_result
     }
 
     fn rewind_sync_watermark_for_retry(&self, event_secs: u64) -> Result<()> {
@@ -5701,7 +5807,9 @@ impl SonarClient {
                             message.content.clone()
                         };
                         notifications.push(DrainNotification {
+                            message_id_hex: message.id.to_hex(),
                             sender_pubkey: message.sender.to_string(),
+                            group_id_hex: hex::encode(message.group_id.as_slice()),
                             group_name: cached_name.unwrap_or("").to_string(),
                             content_preview: preview,
                         });
@@ -8050,7 +8158,9 @@ mod tests {
 
     fn test_notification(preview: &str) -> DrainNotification {
         DrainNotification {
+            message_id_hex: format!("mid-{}", preview),
             sender_pubkey: "npub-test".to_string(),
+            group_id_hex: "aa".to_string(),
             group_name: "group".to_string(),
             content_preview: preview.to_string(),
         }
@@ -8129,6 +8239,98 @@ mod tests {
         state.rewind_for_retry(900);
 
         assert_eq!(state.watermark_secs(), 900 - SYNC_OVERLAP_SECS);
+    }
+
+    #[tokio::test]
+    async fn frozen_push_wake_does_not_advance_durable_watermark() {
+        let identity = Identity::generate();
+        let client = SonarClient::connect_in_memory(identity, vec![])
+            .await
+            .expect("in-memory client");
+        {
+            let mut state = client.sync_state.lock().unwrap();
+            state.advance_watermark(1_700_000_000);
+        }
+        let before = client.sync_watermark_secs();
+        assert_eq!(before, 1_700_000_000);
+
+        let drained = client
+            .collect_notifications_after_wake(Duration::from_millis(50))
+            .await
+            .expect("wake drain");
+        assert!(drained.is_empty());
+        assert_eq!(
+            client.sync_watermark_secs(),
+            before,
+            "NSE/push wake must not advance the durable sync watermark"
+        );
+        assert!(
+            !client.sync_watermark_frozen.load(Ordering::Relaxed),
+            "freeze must be scoped to the wake"
+        );
+    }
+
+    #[tokio::test]
+    async fn frozen_push_wake_skips_durable_sync_state_disk_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("marmot.sqlite");
+        let key = [7u8; 32];
+        let client = SonarClient::connect(Identity::generate(), vec![], &db, key)
+            .await
+            .expect("persistent client");
+        {
+            let mut state = client.sync_state.lock().unwrap();
+            state.advance_watermark(1_700_000_000);
+        }
+        client.save_sync_state().expect("persist watermark");
+        let sync_path = sync_state_path_for_db(&db);
+        let before_bytes = fs::read(&sync_path).expect("read sync state before wake");
+        let before_wm = client.sync_watermark_secs();
+        let event_id = EventId::from_slice(&[9u8; 32]).expect("event id");
+
+        client.set_sync_watermark_frozen(true);
+        client.mark_sync_event_processed(&event_id);
+        client
+            .rewind_sync_watermark_for_retry(1_699_000_000)
+            .expect("rewind while frozen");
+        assert!(
+            client.sync_watermark_secs() < before_wm,
+            "in-memory rewind still applies during the wake"
+        );
+        assert!(
+            client
+                .sync_state
+                .lock()
+                .unwrap()
+                .has_processed(&event_id.to_hex())
+        );
+        assert_eq!(
+            fs::read(&sync_path).expect("read sync state while frozen"),
+            before_bytes,
+            "frozen wake must not persist rewind/processed-ids"
+        );
+        // Simulate discarding wake-local mutations (as collect_notifications does).
+        {
+            let mut state = client.sync_state.lock().unwrap();
+            state.watermark_secs = before_wm;
+            state.processed_event_ids.clear();
+            state.processed_event_order.clear();
+            state.dirty = false;
+        }
+        client.set_sync_watermark_frozen(false);
+
+        let drained = client
+            .collect_notifications_after_wake(Duration::from_millis(50))
+            .await
+            .expect("wake drain");
+        assert!(drained.is_empty());
+        assert_eq!(client.sync_watermark_secs(), before_wm);
+        assert_eq!(
+            fs::read(&sync_path).expect("read sync state after wake"),
+            before_bytes,
+            "wake must leave the on-disk sync cursor unchanged"
+        );
+        assert!(!client.sync_watermark_frozen.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

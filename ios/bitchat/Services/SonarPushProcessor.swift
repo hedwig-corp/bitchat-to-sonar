@@ -256,27 +256,42 @@ enum SonarPushProcessor {
             }
             let groupName = notif.groupName.isEmpty ? nil : notif.groupName
             let conversationTitle = groupName ?? senderName
-            // Stable-ish id so a retrying wake replaces rather than stacking.
-            let idKey = [
-                notif.senderNpub,
-                notif.groupName,
-                notif.contentPreview,
-            ].joined(separator: "|")
+            // R-004: prefer message id; fall back to content-stable key only when
+            // core omitted id (should not happen for real drains).
+            let idKey = notif.messageIdHex.isEmpty
+                ? [
+                    notif.senderNpub,
+                    notif.groupName,
+                    notif.contentPreview,
+                ].joined(separator: "|")
+                : notif.messageIdHex
+            let conversationId = notif.groupIdHex.isEmpty
+                ? nil
+                : "marmot:" + notif.groupIdHex
+            var userInfo: [String: Any] = [:]
+            if let conversationId {
+                userInfo[SonarNotificationKeys.conversationId] = conversationId
+            }
+            if !notif.messageIdHex.isEmpty {
+                userInfo["sonar.messageId"] = notif.messageIdHex
+            }
 
             guard let routed = SonarLocalNotificationRouter.make(
-                idKey: idKey,
+                idKey: idKey.isEmpty ? UUID().uuidString : idKey,
                 kind: kind,
                 conversationTitle: conversationTitle,
                 senderName: senderName,
                 groupName: groupName,
                 preview: notif.contentPreview.isEmpty ? nil : notif.contentPreview,
-                prefs: prefs
+                prefs: prefs,
+                userInfo: userInfo
             ) else { continue }
 
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
-                identifier: routed.identifier
+                identifier: routed.identifier,
+                userInfo: routed.userInfo
             )
             // Correlate to local message IDs (handles truncated drain previews).
             marmot.notePushWakeNotified(drain: notif)
@@ -342,6 +357,13 @@ enum SonarPushProcessor {
                 return summary.name
             }()
 
+            let conversationId = summary.groupIdHex.isEmpty
+                ? nil
+                : "marmot:" + summary.groupIdHex
+            let userInfo: [String: Any] = conversationId.map {
+                [SonarNotificationKeys.conversationId: $0]
+            } ?? [:]
+
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: summary.groupIdHex,
                 kind: kind,
@@ -350,13 +372,15 @@ enum SonarPushProcessor {
                 groupName: groupName,
                 preview: summary.latestContent.isEmpty ? nil : summary.latestContent,
                 prefs: prefs,
-                unreadCount: summary.unreadCount
+                unreadCount: summary.unreadCount,
+                userInfo: userInfo
             ) else { continue }
 
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
-                identifier: routed.identifier
+                identifier: routed.identifier,
+                userInfo: routed.userInfo
             )
             marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)
             notified += 1

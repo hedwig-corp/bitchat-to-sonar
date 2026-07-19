@@ -8,5 +8,10 @@
 	<array>
 		<string>$(APP_GROUP_ID)</string>
 	</array>
+	<key>keychain-access-groups</key>
+	<array>
+		<!-- Must match main app — NSE reads marmot-nsec / marmot-db-key here. -->
+		<string>$(AppIdentifierPrefix)sh.hedwig.sonar</string>
+	</array>
 </dict>
 </plist>

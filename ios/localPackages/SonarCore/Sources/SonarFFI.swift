@@ -1505,6 +1505,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     func clearConversationChangeListener()
 
+    /**
+     * Notification Service Extension / push-wake entry point: bounded
+     * `sync_force` under a frozen watermark, then drain notifications for
+     * local banner decoration. Partial progress still returns drained rows.
+     */
+    func collectNotificationsAfterWake(maxWaitMs: UInt64) throws  -> [DrainNotificationInfo]
+
     func conversationSummaries()  -> [ConversationSummaryInfo]
 
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
@@ -1796,6 +1803,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func sendText(groupIdHex: String, text: String) throws
 
     func setConversationChangeListener(listener: ConversationChangeListener)
+
+    /**
+     * Freeze durable sync-watermark advances (White Noise NSE
+     * `cursorPersistence: .frozen`). Push-wake catch-up still decrypts into
+     * the store; the next durable session re-fetches any missed gap.
+     */
+    func setSyncWatermarkFrozen(frozen: Bool)
 
     /**
      * Start a 1:1 DM group with `peer` (npub or hex pubkey). Fetches their
@@ -2165,6 +2179,20 @@ open func clearConversationChangeListener()  {try! rustCall() {
             self.uniffiCloneHandle(),$0
     )
 }
+}
+
+    /**
+     * Notification Service Extension / push-wake entry point: bounded
+     * `sync_force` under a frozen watermark, then drain notifications for
+     * local banner decoration. Partial progress still returns drained rows.
+     */
+open func collectNotificationsAfterWake(maxWaitMs: UInt64)throws  -> [DrainNotificationInfo]  {
+    return try  FfiConverterSequenceTypeDrainNotificationInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_collect_notifications_after_wake(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(maxWaitMs),$0
+    )
+})
 }
 
 open func conversationSummaries() -> [ConversationSummaryInfo]  {
@@ -2851,6 +2879,19 @@ open func setConversationChangeListener(listener: ConversationChangeListener)  {
     uniffi_sonar_ffi_fn_method_sonarnode_set_conversation_change_listener(
             self.uniffiCloneHandle(),
         FfiConverterCallbackInterfaceConversationChangeListener_lower(listener),$0
+    )
+}
+}
+
+    /**
+     * Freeze durable sync-watermark advances (White Noise NSE
+     * `cursorPersistence: .frozen`). Push-wake catch-up still decrypts into
+     * the store; the next durable session re-fetches any missed gap.
+     */
+open func setSyncWatermarkFrozen(frozen: Bool)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_set_sync_watermark_frozen(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(frozen),$0
     )
 }
 }
@@ -3544,14 +3585,18 @@ public func FfiConverterTypeDirectDmInfo_lower(_ value: DirectDmInfo) -> RustBuf
  * fire rich local notifications (sender name + preview).
  */
 public struct DrainNotificationInfo: Equatable, Hashable {
+    public var messageIdHex: String
     public var senderNpub: String
+    public var groupIdHex: String
     public var groupName: String
     public var contentPreview: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(senderNpub: String, groupName: String, contentPreview: String) {
+    public init(messageIdHex: String, senderNpub: String, groupIdHex: String, groupName: String, contentPreview: String) {
+        self.messageIdHex = messageIdHex
         self.senderNpub = senderNpub
+        self.groupIdHex = groupIdHex
         self.groupName = groupName
         self.contentPreview = contentPreview
     }
@@ -3572,14 +3617,18 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DrainNotificationInfo {
         return
             try DrainNotificationInfo(
+                messageIdHex: FfiConverterString.read(from: &buf),
                 senderNpub: FfiConverterString.read(from: &buf),
+                groupIdHex: FfiConverterString.read(from: &buf),
                 groupName: FfiConverterString.read(from: &buf),
                 contentPreview: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: DrainNotificationInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageIdHex, into: &buf)
         FfiConverterString.write(value.senderNpub, into: &buf)
+        FfiConverterString.write(value.groupIdHex, into: &buf)
         FfiConverterString.write(value.groupName, into: &buf)
         FfiConverterString.write(value.contentPreview, into: &buf)
     }
@@ -8186,6 +8235,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_clear_conversation_change_listener() != 59668) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_collect_notifications_after_wake() != 17254) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8346,6 +8398,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_set_conversation_change_listener() != 62940) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_set_sync_watermark_frozen() != 9593) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_dm() != 11780) {

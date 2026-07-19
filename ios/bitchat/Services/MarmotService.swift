@@ -361,6 +361,11 @@ final class MarmotService: @unchecked Sendable {
     private var node: SonarNode?
     private var relayConnected = false
     private var sessionGeneration: UInt64 = 0
+    #if os(iOS)
+    /// Cross-process exclusive lock — held while `node` is open so the NSE
+    /// cannot open the shared SQLCipher store concurrently.
+    private var storeLock: MarmotStoreLock?
+    #endif
 
     init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
         self.relayUrls = relayUrls
@@ -389,12 +394,25 @@ final class MarmotService: @unchecked Sendable {
             return (identity, service.sessionGeneration)
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
-        let (node, nodeLease) = try await connectNode(
-            identity: identity,
-            relayUrls: relayUrls,
-            dbPath: dbPath,
-            dbKeyHex: dbKeyHex
-        )
+        #if os(iOS)
+        // Reuse connectLocal's lock when present — a second blocking flock on a
+        // new fd deadlocks the same process on Darwin (EWOULDBLOCK / hang).
+        let storeLockHold = try await prepareStoreLockForConnect()
+        #endif
+        let (node, nodeLease): (SonarNode, NodeLifecycleLease)
+        do {
+            (node, nodeLease) = try await connectNode(
+                identity: identity,
+                relayUrls: relayUrls,
+                dbPath: dbPath,
+                dbKeyHex: dbKeyHex
+            )
+        } catch {
+            #if os(iOS)
+            abandonStoreLockHold(storeLockHold)
+            #endif
+            throw error
+        }
         defer { nodeLease.release() }
         let installed = await runNonThrowing { service in
             guard service.sessionGeneration == generation,
@@ -406,6 +424,9 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = true
+            #if os(iOS)
+            service.installStoreLockHold(storeLockHold)
+            #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
             #if os(iOS)
@@ -414,6 +435,9 @@ final class MarmotService: @unchecked Sendable {
             return true
         }
         guard installed else {
+            #if os(iOS)
+            abandonStoreLockHold(storeLockHold)
+            #endif
             throw ServiceError.cancelled
         }
         try await run { try $0.requireNode().retryOutbox() }
@@ -437,16 +461,30 @@ final class MarmotService: @unchecked Sendable {
             }
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             SonarDiagnostics.installCoreLoggingIfNeeded()
-            let node = try SonarNode.connect(
-                identity: identity,
-                relayUrls: [],
-                dbPath: dbPath,
-                dbKeyHex: dbKeyHex
-            )
+            #if os(iOS)
+            let storeLockHold = try service.prepareStoreLockForConnectSync()
+            #endif
+            let node: SonarNode
+            do {
+                node = try SonarNode.connect(
+                    identity: identity,
+                    relayUrls: [],
+                    dbPath: dbPath,
+                    dbKeyHex: dbKeyHex
+                )
+            } catch {
+                #if os(iOS)
+                service.abandonStoreLockHold(storeLockHold)
+                #endif
+                throw error
+            }
             service.identity = identity
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = false
+            #if os(iOS)
+            service.installStoreLockHold(storeLockHold)
+            #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
             #if os(iOS)
@@ -1117,8 +1155,6 @@ final class MarmotService: @unchecked Sendable {
     /// reopens; wiped by `wipeDatabase()` on panic.
     private static let dbKeychainService = "chat.bitchat.sonar.messages"
     private static let dbKeychainKey = "marmot-db-key"
-    private static let dbDirName = "sonar-marmot"
-    private static let dbFileName = "marmot.sqlite"
 
     #if os(iOS)
     /// Data-Protection class for the SQLite store. Deliberately
@@ -1192,20 +1228,17 @@ final class MarmotService: @unchecked Sendable {
     }
     #endif
 
-    /// Absolute path of the encrypted Marmot database. The parent dir and any
-    /// existing DB files are pinned to `dbFileProtection` so the store stays
-    /// readable during locked background work (see `dbFileProtection`).
+    /// Absolute path of the encrypted Marmot database. On iOS this lives in the
+    /// App Group container (shared with the Notification Service Extension);
+    /// macOS keeps Application Support. Parent dir and existing DB files are
+    /// pinned to `dbFileProtection` so the store stays readable during locked
+    /// background work (see `dbFileProtection`).
     private static func databaseURL() throws -> URL {
-        let base = try FileManager.default.url(
-            for: .applicationSupportDirectory, in: .userDomainMask,
-            appropriateFor: nil, create: true
-        )
-        let dir = base.appendingPathComponent(dbDirName, isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dir = try MarmotAppGroupStore.databaseDirectory()
         #if os(iOS)
         applyDatabaseProtection(to: dir)
         #endif
-        return dir.appendingPathComponent(dbFileName)
+        return dir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
     }
 
     /// (path, 64-char hex key). Generates and persists a fresh key the first time.
@@ -1288,8 +1321,21 @@ final class MarmotService: @unchecked Sendable {
 
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
+    /// Resolves wipe targets from fixed App Group + legacy roots — never via
+    /// `databaseURL()` / `databaseDirectory()` (those migrate before open).
     func wipeDatabase() async throws {
-        let url = try Self.databaseURL()
+        var wipePaths: [String] = []
+        if let shared = MarmotAppGroupStore.existingSharedDatabaseURL() {
+            wipePaths.append(shared.path)
+        }
+        #if os(iOS)
+        if let legacyDir = MarmotAppGroupStore.legacyApplicationSupportDirectory() {
+            let legacyDb = legacyDir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
+            if FileManager.default.fileExists(atPath: legacyDb.path) {
+                wipePaths.append(legacyDb.path)
+            }
+        }
+        #endif
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)
@@ -1299,6 +1345,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeClosing = true
             service.node = nil
             service.relayConnected = false
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = nil
+            #endif
             service.nodeLock.unlock()
             service.identity = nil
             return ()
@@ -1317,7 +1367,17 @@ final class MarmotService: @unchecked Sendable {
                 service.nodeClosing = false
                 service.nodeLock.unlock()
             }
-            try wipeMarmotDatabase(dbPath: url.path)
+            for path in wipePaths {
+                try wipeMarmotDatabase(dbPath: path)
+            }
+            // Drop directory roots (sidecars, empty dirs) without remigrating.
+            // Must succeed before Keychain db-key delete — a surviving store with
+            // a missing key is unrecoverable.
+            do {
+                try MarmotAppGroupStore.removeAllStoreFiles()
+            } catch {
+                throw ServiceError.core(error.localizedDescription)
+            }
             guard KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey) else {
                 throw ServiceError.core("failed to delete Marmot database key")
             }
@@ -1340,6 +1400,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeClosing = true
             service.node = nil
             service.relayConnected = false
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = nil
+            #endif
             service.nodeLock.unlock()
             return ()
         }
@@ -1550,6 +1614,50 @@ final class MarmotService: @unchecked Sendable {
             }
         }
     }
+
+    #if os(iOS)
+    /// Either reuses the lock already held (connectLocal → connect) or acquires
+    /// a fresh exclusive lock. Never blocking-flocks a second fd against ourselves.
+    private enum StoreLockHold {
+        case reused
+        case fresh(MarmotStoreLock)
+    }
+
+    private func prepareStoreLockForConnect() async throws -> StoreLockHold {
+        try await run { try $0.prepareStoreLockForConnectSync() }
+    }
+
+    private func prepareStoreLockForConnectSync() throws -> StoreLockHold {
+        nodeLock.lock()
+        if storeLock != nil {
+            nodeLock.unlock()
+            return .reused
+        }
+        nodeLock.unlock()
+        return .fresh(try MarmotStoreLock.acquireExclusive())
+    }
+
+    private func installStoreLockHold(_ hold: StoreLockHold) {
+        // Caller must hold `nodeLock` when installing a fresh lock.
+        switch hold {
+        case .reused:
+            break
+        case .fresh(let lock):
+            storeLock?.release()
+            storeLock = lock
+        }
+    }
+
+    private func abandonStoreLockHold(_ hold: StoreLockHold) {
+        switch hold {
+        case .reused:
+            // Prior connectLocal lock stays on `storeLock`.
+            break
+        case .fresh(let lock):
+            lock.release()
+        }
+    }
+    #endif
 
     private func connectNode(
         identity: SonarIdentity,

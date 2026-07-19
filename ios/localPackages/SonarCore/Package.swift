@@ -43,6 +43,10 @@ let package = Package(
                 // system_configuration crates) calls SystemConfiguration. Same
                 // static-lib gotcha — the framework link isn't propagated.
                 .linkedFramework("SystemConfiguration"),
+                // netdev's iOS path monitor uses Network.framework (`nw_*`). The
+                // main app often picks this up transitively; the NSE links
+                // SonarCore alone and needs the framework declared here.
+                .linkedFramework("Network"),
             ]
         ),
         // Binary framework containing the Rust static library + C headers.
