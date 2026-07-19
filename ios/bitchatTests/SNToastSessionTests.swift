@@ -30,4 +30,14 @@ struct SNToastSessionTests {
         session.clear(ifEpoch: done)
         #expect(session.text == nil)
     }
+
+    @Test
+    func resetClearsAndInvalidatesPendingDismiss() {
+        var session = SNToastSession()
+        let stale = session.show("Chat backup uploaded")
+        session.reset()
+        #expect(session.text == nil)
+        session.clear(ifEpoch: stale)
+        #expect(session.text == nil)
+    }
 }

@@ -39,4 +39,16 @@ struct MarmotAccountBackupFlowTests {
         #expect(!outcome.shouldSurfaceUploadFailure)
         #expect(!outcome.shouldSurfaceReconnectFailure)
     }
+
+    @Test
+    func uploadSuccessWithFailedReconnectSurfacesReconnectError() {
+        // iOS differs from Compose here on purpose: Compose swallows boot()
+        // failure after a successful upload; we still tell the user reconnect
+        // failed so they don't think chats are live when the node stayed closed.
+        let outcome = MarmotAccountBackupFlow.outcome(
+            uploadSucceeded: true,
+            reconnected: false
+        )
+        #expect(outcome.shouldSurfaceReconnectFailure)
+    }
 }

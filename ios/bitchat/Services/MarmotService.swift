@@ -1311,16 +1311,11 @@ final class MarmotService: @unchecked Sendable {
         // Close before databaseConfig: that path runs restore reconcile/rename
         // and must not race a live SQLCipher handle.
         await closeNode(keepClosed: true)
-        let (dbPath, dbKeyHex): (String, String)
-        do {
-            (dbPath, dbKeyHex) = try Self.databaseConfig()
-        } catch {
-            await clearNodeClosingFence()
-            throw error
-        }
+        // Keychain/fs reconcile must not block MainActor either — hop with FFI.
         do {
             let info = try await runAccountBackupFFI {
-                try backupAccountToBlossom(
+                let (dbPath, dbKeyHex) = try Self.databaseConfig()
+                return try backupAccountToBlossom(
                     nsec: nsec,
                     dbPath: dbPath,
                     dbKeyHex: dbKeyHex,

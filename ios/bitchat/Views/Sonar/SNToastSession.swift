@@ -32,4 +32,10 @@ struct SNToastSession: Equatable {
         guard epoch == expected else { return }
         text = nil
     }
+
+    /// Invalidate pending dismissals and drop visible text.
+    mutating func reset() {
+        epoch &+= 1
+        text = nil
+    }
 }

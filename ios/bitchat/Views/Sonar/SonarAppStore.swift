@@ -653,6 +653,8 @@ final class SonarAppStore: ObservableObject {
     @Published var toast: String? = nil
     /// Invalidates in-flight toast dismissals when a newer toast is shown.
     private var toastSession = SNToastSession()
+    /// Replaced on each `showToast` so rapid toasts don't pile sleeping tasks.
+    private var toastDismissTask: Task<Void, Never>?
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
     @Published private(set) var discoverNewPeople: Bool
@@ -1674,10 +1676,12 @@ final class SonarAppStore: ObservableObject {
         toast = toastSession.text
         // Detached so a cancelled Settings `Task { await backupAccountNow() }`
         // (navigation pop / view refresh) cannot cancel the dismiss and leave
-        // "Chat backup uploaded" stuck on screen forever.
-        Task.detached { @MainActor [weak self] in
+        // "Chat backup uploaded" stuck on screen forever. Cancel the previous
+        // dismiss task so we don't accumulate sleepers on rapid toasts.
+        toastDismissTask?.cancel()
+        toastDismissTask = Task.detached { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
-            guard let self else { return }
+            guard let self, !Task.isCancelled else { return }
             self.toastSession.clear(ifEpoch: epoch)
             self.toast = self.toastSession.text
         }
@@ -1686,8 +1690,19 @@ final class SonarAppStore: ObservableObject {
     /// Progress toast that stays until replaced by `showToast` / another sticky.
     @MainActor
     private func showStickyToast(_ text: String) {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
         toastSession.showSticky(text)
         toast = toastSession.text
+    }
+
+    /// Drop any visible toast and invalidate pending dismissals.
+    @MainActor
+    private func clearToast() {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        toastSession.reset()
+        toast = nil
     }
 
     func toggleMode() {
@@ -1851,11 +1866,11 @@ final class SonarAppStore: ObservableObject {
         path = []
         switch backupOutcome {
         case .restored:
-            toast = String(localized: "Account restored — chats recovered from backup")
+            showToast(String(localized: "Account restored — chats recovered from backup"))
         case .missing:
-            toast = String(localized: "Account restored — chats start empty until you back up")
+            showToast(String(localized: "Account restored — chats start empty until you back up"))
         case .failed:
-            toast = String(localized: "Account restored — chat backup restore failed; try again when online")
+            showToast(String(localized: "Account restored — chat backup restore failed; try again when online"))
         }
     }
 
@@ -1865,10 +1880,14 @@ final class SonarAppStore: ObservableObject {
         // Sticky progress (no auto-dismiss) — a timed dismiss racing the long
         // upload was leaving the completion toast uncleared when the parent
         // Task was cancelled, or colliding with the result toast epoch.
+        // Platform gap (Compose): no progress string yet — iOS-only UX; track
+        // parity when Compose Settings backup grows a progress toast.
         showStickyToast(String(localized: "Backing up chats…"))
         do {
             try await marmot.backupAccount()
             showToast(String(localized: "Chat backup uploaded"))
+        } catch is CancellationError {
+            clearToast()
         } catch {
             showToast(String(localized: "Backup failed — try again when online"))
             SecureLogger.warning(
