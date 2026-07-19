@@ -10,8 +10,12 @@ haptic, and leaves a persisted system row in the history on both iOS and Android
 
 **Constraints**
 
-- Cross-Platform Feature Rule: core + Android + iOS in the same change (user-confirmed,
-  overrides the standing "no iOS/macOS for now" preference for this feature).
+- Cross-Platform Feature Rule: core + Android + iOS (+ Compose Desktop via `commonMain`)
+  in the same change (user-confirmed, overrides the standing "no iOS/macOS for now"
+  preference for this feature). Compose Desktop gets mute + nudge send/receive from
+  shared UI; in-app buzz is a documented no-op there (no haptic hardware — tray
+  notification uses the trill sound instead). Native macOS (`SonarMacRootView`) must
+  expose the same nudge/mute affordances as iOS.
 - Signal-Comparable Performance Rule: sending a trill must not block on relay connect;
   it goes through the same local-echo + background-publish path as a normal send.
 - Chat-type rule (`docs/CHAT-TYPES.md`): must work for BOTH pure Marmot chats and
@@ -19,11 +23,16 @@ haptic, and leaves a persisted system row in the history on both iOS and Android
   separate mesh codec + Marmot kind for exactly this reason.
 - Design fidelity (`design-handoffs-reproduce-not-reskin`): reproduce the Claude Design
   prototype 1:1, do not invent UI. The design ships a `nudge` icon (bell + motion arcs).
-- Abuse guards required: sender cooldown **and** receiver throttle **and** per-chat mute.
-  Note: **per-chat mute does not exist in Sonar today** — see "Silence semantics" below.
-  It is a new vertical slice, not a toggle on existing infrastructure.
-- Notification intensity: in-app full (shake + haptic + bell); background/killed gets a
+- Abuse guards required (concrete windows — platforms must not diverge):
+  - **Sender cooldown:** 8 s per chat after send (UI/monotonic clock, in-memory OK).
+  - **Receiver alert throttle:** 8 s per chat (monotonic, in-memory). Excess trills
+    still write the row; at most one audible alert per window.
+  - **Per-chat mute:** general mute with Signal-style durations — see Silence semantics.
+  Note: **per-chat mute does not exist in Sonar today**. It is a new vertical slice,
+  folded into this feature (not a follow-up).
+- Notification intensity: in-app full (shake + haptic + bell); background gets a
   normal notification with a distinct trill sound. **No** critical-alert / DND bypass.
+  Killed-iOS is a tracked gap — see success criteria.
 
 **Non-goals**
 
@@ -37,10 +46,14 @@ haptic, and leaves a persisted system row in the history on both iOS and Android
 - A trill sent from Android arrives on iOS (and vice versa) in a Marmot chat and in a
   mesh-folded chat, rendering as a centered system row on both.
 - Receiving with the chat open: transcript shakes, haptic fires, bell plays.
-- Receiving backgrounded: one notification with the trill sound. Receiving killed:
-  same, via the existing push wakeup path.
-- Spamming the button sends at most one trill per cooldown window; a peer that ignores
-  the cooldown gets collapsed receiver-side.
+- Receiving backgrounded (process alive): one notification with the trill sound.
+- Receiving killed on iOS: **tracked gap** — Transponder NSE pushes are plaintext-free
+  (`NotificationService.swift` `configureTransponderNotification`) and cannot classify
+  or mute-suppress today, so the generic "New Sonar message" banner/sound is acceptable
+  for v1. Foreground + background-drain paths must still classify and use the trill
+  sound. Follow-up: privacy-preserving category marker on the push payload.
+- Spamming the button sends at most one trill per **8 s** cooldown window; a peer that
+  ignores the cooldown gets at most one audible alert per **8 s** receiver window.
 - Muting a chat suppresses sound/haptic/shake but still writes the row.
 - A trill from a blocked peer produces nothing at all — no row, no alert.
 - Guarded by a core round-trip test + a codec test per platform + a mute-suppression test.
@@ -245,33 +258,28 @@ suppression + test → (2) codec pair + platform tests → (3) per-chat mute ver
 
 Effort revised **M → L** once per-chat mute is included.
 
-## Open decision: mute sequencing
+## Decided: mute sequencing
 
-Per-chat mute is its own vertical slice across core + both apps. Either:
-
-- **(a) Fold mute into this PR.** Recommended. Shipping a trill with no way to silence
-  it is precisely the failure mode the abuse guards exist to prevent. Larger PR.
-- **(b) Land trill first with `isMuted` hardcoded false**, mute as the immediate
-  follow-up. Smaller reviewable steps, but leaves a window where the feature is
-  unsilenceable — and per the Regression Invariant Rule, "follow-up" slices that gate
-  safety have a poor track record of landing promptly.
-
-**Not yet decided by the user.** Resolve before planning.
+**Fold mute into the trill vertical slice.** Option (b) (land trill first with
+`isMuted` hardcoded false) is rejected — shipping an unsilenceable nudge is the
+abuse-guard failure mode this feature exists to prevent. Per-chat mute ships in the
+same change across core hosts (Android + iOS + Compose Desktop shared UI).
 
 ## Open questions
 
 - Does the remote design actually specify trill UI (send affordance, system-row copy,
   shake animation), or only ship the icon? Resolve by syncing the bundle first — this
   gates step 0 and could change the UI plan.
-- Group chats: does a trill notify every member, or is it DM-only for v1? Leaning
-  DM + small groups, with the same per-chat mute applying.
 - Android has **no haptics anywhere** in the Compose app today (only
   `Notifier.android.kt` touches vibration). The trill introduces the first in-app haptic
   — worth a tiny shared abstraction rather than a one-off call.
 - Should the mesh leg trill at all when the peer is out of BLE range, or fall back to
   the Marmot leg? Follow whatever `sendDmAuto` already decides.
 - Does per-chat mute need to sync across a user's linked devices (PR #195 second MLS
-  leaf), or is it local-only per install? Local-only is far cheaper; Signal syncs it.
-  Leaning local-only for v1 with a documented gap.
+  leaf), or is it local-only per install? **Decided for v1: local-only**, with a
+  documented gap (Signal syncs it).
 - Should a muted chat still show an unread badge for a trill, or is the row silent
-  until opened? Leaning badge — the row exists, so the chat is genuinely unread.
+  until opened? **Decided: badge** — the row exists, so the chat is genuinely unread.
+
+**Settled scope (not open):** DMs **and** groups are in scope (`sendNudge` /
+`sendNudgeGroup`); public geohash channels are out.
