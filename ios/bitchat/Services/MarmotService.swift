@@ -1304,6 +1304,19 @@ final class MarmotService: @unchecked Sendable {
     /// Compose already hops to `Dispatchers.IO`; mirror that here.
     @discardableResult
     func uploadAccountBackup(blossomServer: String? = nil) async throws -> AccountBackupUploadInfo {
+        accountBackupLock.lock()
+        if accountBackupInFlight {
+            accountBackupLock.unlock()
+            throw ServiceError.backupAlreadyInProgress
+        }
+        accountBackupInFlight = true
+        accountBackupLock.unlock()
+        defer {
+            accountBackupLock.lock()
+            accountBackupInFlight = false
+            accountBackupLock.unlock()
+        }
+
         let nsec = try await run { service -> String in
             guard let nsec = service.identity?.nsec() else {
                 throw ServiceError.core("no identity to back up")
@@ -1313,11 +1326,9 @@ final class MarmotService: @unchecked Sendable {
         // Close before databaseConfig: that path runs restore reconcile/rename
         // and must not race a live SQLCipher handle.
         await closeNode(keepClosed: true)
-        // Keychain/fs reconcile must not block MainActor either — hop with FFI.
-        // `databaseConfig` throws `ServiceError` only (never `SonarFfiError`);
-        // keep it outside the FFI catch so mapFfi cannot reshape its errors.
+        // Keychain/fs reconcile must not block MainActor — host hop (no mapFfi).
         do {
-            let config = try await runAccountBackupFFI {
+            let config = try await runAccountBackupHostWork {
                 try Self.databaseConfig()
             }
             let info = try await runAccountBackupFFI {
@@ -1421,6 +1432,23 @@ final class MarmotService: @unchecked Sendable {
         label: "chat.bitchat.marmot-account-backup",
         qos: .userInitiated
     )
+    private let accountBackupLock = NSLock()
+    private var accountBackupInFlight = false
+
+    /// Hop Keychain/fs work off MainActor without FFI error remapping.
+    private func runAccountBackupHostWork<T: Sendable>(
+        _ body: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            accountBackupQueue.async {
+                do {
+                    continuation.resume(returning: try body())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
 
     private func runAccountBackupFFI<T: Sendable>(
         _ body: @escaping @Sendable () throws -> T

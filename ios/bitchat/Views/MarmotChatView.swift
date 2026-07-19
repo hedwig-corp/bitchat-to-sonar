@@ -722,7 +722,12 @@ final class MarmotChatModel: ObservableObject {
         busy = true
         defer { busy = false }
         stopPolling()
-        await awaitRelayIdleForBackup()
+        if !(await awaitRelayIdleForBackup()) {
+            SecureLogger.warning(
+                "⚠️ Account backup proceeding while relay still busy after drain timeout",
+                category: .session
+            )
+        }
 
         var uploadError: Error?
         do {
@@ -754,12 +759,16 @@ final class MarmotChatModel: ObservableObject {
 
     /// Best-effort drain of an in-flight relay attach before `closeNode` +
     /// WAL checkpoint (Compose cancels and joins relay jobs before FFI).
-    private func awaitRelayIdleForBackup(timeoutSeconds: Double = 3) async {
+    /// Returns `false` when the timeout elapsed while `relayBusy` stayed true
+    /// (caller still proceeds — closeNode fences new attach — but logs).
+    @discardableResult
+    private func awaitRelayIdleForBackup(timeoutSeconds: Double = 3) async -> Bool {
         let start = Date()
         while relayBusy && Date().timeIntervalSince(start) < timeoutSeconds {
-            if Task.isCancelled { return }
+            if Task.isCancelled { return !relayBusy }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
+        return !relayBusy
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
