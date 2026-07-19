@@ -243,6 +243,8 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
     let sub: Sub
     var time: String = ""
     var unread: Bool = false
+    /// Muted chat: a bell-slash replaces the unread dot.
+    var muted: Bool = false
     var divider: Bool = true
     let action: () -> Void
 
@@ -251,6 +253,7 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
         verified: Bool = false,
         time: String = "",
         unread: Bool = false,
+        muted: Bool = false,
         divider: Bool = true,
         action: @escaping () -> Void,
         @ViewBuilder avatar: () -> Avatar,
@@ -260,6 +263,7 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
         self.verified = verified
         self.time = time
         self.unread = unread
+        self.muted = muted
         self.divider = divider
         self.action = action
         self.avatar = avatar()
@@ -292,7 +296,10 @@ struct SNConvRow<Avatar: View, Sub: View>: View {
                             .font(SonarTheme.uiFont(size: 12))
                             .foregroundColor(SonarTheme.text3)
                     }
-                    if unread {
+                    if muted {
+                        SNIcon(name: .bellOff, size: 14, weight: 2)
+                            .foregroundColor(SonarTheme.text3)
+                    } else if unread {
                         Circle()
                             .fill(SonarTheme.accent)
                             .frame(width: 11, height: 11)
@@ -1548,6 +1555,8 @@ struct SNMsgList: View {
                             Group {
                             if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
+                            } else if m.trill {
+                                SNNudgeRow(m: m, peerName: peerName, group: showAuthors)
                             } else if m.pay != nil {
                                 SNPayBubble(
                                     m: m,
@@ -1903,6 +1912,53 @@ struct SNUnreadDivider: View {
                 .frame(height: 1)
         }
         .padding(.vertical, 8)
+    }
+}
+
+// MARK: - Nudge row (components.jsx NudgeMsg / theme.css .bc-nudgemsg)
+
+/// Centered pill for a ⚡TRILL nudge (docs/SONAR-TRILL.md): accent-soft
+/// capsule, nudge bell (wiggle on appear), copy per direction:
+/// mine "You sent a nudge"; theirs "<peer/author> nudged you — 👋".
+struct SNNudgeRow: View {
+    let m: SNMessage
+    let peerName: String
+    /// Multi-member group: attribute the nudge to the message author.
+    let group: Bool
+
+    @State private var wiggle = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var label: String {
+        if m.mine { return "You sent a nudge" }
+        let who = group ? (m.author ?? peerName) : peerName
+        return "\(who) nudged you \u{2014} 👋"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            SNIcon(name: .bell, size: 14, weight: 2.2)
+                .foregroundColor(SonarTheme.accentDeep)
+                .rotationEffect(.degrees(wiggle ? 0 : -16))
+            Text(verbatim: label)
+                .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                .foregroundColor(SonarTheme.accentDeep)
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 7)
+        .background(Capsule().fill(SonarTheme.accentSoft))
+        .frame(maxWidth: .infinity)
+        .padding(.top, 9)
+        .padding(.horizontal, 20)
+        .onAppear {
+            if reduceMotion {
+                wiggle = true
+            } else {
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.35)) {
+                    wiggle = true
+                }
+            }
+        }
     }
 }
 
@@ -4227,7 +4283,10 @@ struct SNMessageComposerField: View {
             .submitLabel(.send)
             // Vertical TextField on macOS often neither inserts a newline nor
             // fires onSubmit for bare Return — claim the key for send.
-            .onKeyPress(.return) { press in
+            // NB: the `keys:` overload is the one whose action receives the
+            // KeyPress (the KeyEquivalent overload takes a zero-arg closure
+            // and did not compile — the unnoticed macOS break).
+            .onKeyPress(keys: [.return]) { press in
                 // Shift/Option+Return stay available for newline until #334.
                 if press.modifiers.contains(.shift) || press.modifiers.contains(.option) {
                     return .ignored
@@ -4312,10 +4371,12 @@ struct SNActionRow: View {
     var gold: Bool = false
     let label: String
     var desc: String?
+    /// Dimmed, non-tappable state (e.g. nudge sender cooldown).
+    var disabled: Bool = false
     let action: () -> Void
 
     var body: some View {
-        Button(action: action) {
+        Button(action: { if !disabled { action() } }) {
             HStack(spacing: 13) {
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .fill(gold ? SonarTheme.goldSoft : SonarTheme.accentSoft)
@@ -4342,6 +4403,7 @@ struct SNActionRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(SNRowPressStyle(cornerRadius: 14))
+        .opacity(disabled ? 0.45 : 1)
     }
 }
 

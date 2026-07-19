@@ -243,10 +243,26 @@ enum SonarPushProcessor {
                 switch sonarNotificationClassifyContent(content: notif.contentPreview) {
                 case .call: return .call
                 case .payment: return .payment
+                case .trill: return .trill
                 default: return .message
                 }
             }()
             if kind == .call { continue }
+            // Per-chat mute. The drain payload carries no group id, so a
+            // muted DM is matched by sender npub; muted GROUPS are only
+            // caught by the summary path below (documented gap).
+            if notif.groupName.isEmpty, !notif.senderNpub.isEmpty,
+               SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
+                continue
+            }
+            // Receiver trill throttle: one alert per chat per window; excess
+            // trills stay row-only (no silent banner — matches Android).
+            var sound: SonarNotificationSound = .standard
+            if kind == .trill {
+                let throttleKey = notif.groupName.isEmpty ? notif.senderNpub : notif.groupName
+                guard SonarTrillThrottle.shared.admit(chatKey: throttleKey) else { continue }
+                sound = .trill
+            }
 
             let senderName: String?
             if prefs.showNames, !notif.senderNpub.isEmpty {
@@ -291,7 +307,8 @@ enum SonarPushProcessor {
                 title: routed.title,
                 body: routed.body,
                 identifier: routed.identifier,
-                userInfo: routed.userInfo
+                userInfo: routed.userInfo,
+                sound: sound
             )
             // Correlate to local message IDs (handles truncated drain previews).
             marmot.notePushWakeNotified(drain: notif)
@@ -338,10 +355,19 @@ enum SonarPushProcessor {
                 switch sonarNotificationClassifyContent(content: summary.latestContent) {
                 case .call: return .call
                 case .payment: return .payment
+                case .trill: return .trill
                 default: return .message
                 }
             }()
             if kind == .call { continue }
+            // Per-chat mute: unread still accrues, no banner.
+            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) { continue }
+            // Receiver trill throttle: excess trills stay row-only.
+            var sound: SonarNotificationSound = .standard
+            if kind == .trill {
+                guard SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) else { continue }
+                sound = .trill
+            }
 
             let senderName: String?
             if prefs.showNames, !summary.latestSenderNpub.isEmpty {
@@ -380,7 +406,8 @@ enum SonarPushProcessor {
                 title: routed.title,
                 body: routed.body,
                 identifier: routed.identifier,
-                userInfo: routed.userInfo
+                userInfo: routed.userInfo,
+                sound: sound
             )
             marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)
             notified += 1

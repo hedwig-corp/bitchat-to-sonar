@@ -22,6 +22,7 @@ struct SonarHomeScreen: View {
 
     @State private var wipeAsk = false
     @State private var pendingDelete: SNDMRow?
+    @State private var muteRow: SNDMRow?
     @State private var connSheet = false
     @State private var searchSheet = false
     @State private var composeSheet = false
@@ -109,6 +110,17 @@ struct SonarHomeScreen: View {
         ) {
             if let invite = pendingInvite {
                 groupInviteContent(invite)
+            }
+        }
+        .snSheet(
+            isPresented: Binding(
+                get: { muteRow != nil },
+                set: { if !$0 { muteRow = nil } }
+            ),
+            title: muteRow.map { "Mute \($0.title)" }
+        ) {
+            if let row = muteRow {
+                muteContent(row)
             }
         }
         .onChange(of: composeSheet) { open in
@@ -231,6 +243,7 @@ struct SonarHomeScreen: View {
                         verified: d.verified,
                         time: d.time,
                         unread: d.unread,
+                        muted: d.muted,
                         divider: i < rows.count - 1,
                         action: {
                             store.openDM(d.id, marmotGroupId: d.marmotGroupId)
@@ -239,6 +252,9 @@ struct SonarHomeScreen: View {
                         sub: { SNLockedPreview(preview: d.preview) }
                     )
                     .contextMenu {
+                        Button { muteRow = d } label: {
+                            Label(d.muted ? "Muted" : "Mute", systemImage: d.muted ? "bell.slash.fill" : "bell.slash")
+                        }
                         if !store.isPendingSecureChat(d.id) {
                             Button(role: .destructive) { pendingDelete = d } label: {
                                 Label(store.isMultiMemberMarmotGroupId(d.id) ? "Leave group" : "Delete chat", systemImage: "trash")
@@ -262,6 +278,48 @@ struct SonarHomeScreen: View {
             } else {
                 Text("This removes the conversation from this device only. The other person isn't notified.")
             }
+        }
+    }
+
+    // ── Mute sheet (design MuteSheet): durations or the muted state ──
+    @ViewBuilder
+    private func muteContent(_ row: SNDMRow) -> some View {
+        if store.isChatMuted(row.id) {
+            VStack(spacing: 0) {
+                HStack(spacing: 9) {
+                    SNIcon(name: .bellOff, size: 18, weight: 2)
+                        .foregroundColor(SonarTheme.text2)
+                    Text("Muted")
+                        .font(SonarTheme.uiFont(size: 16, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                    Spacer(minLength: 0)
+                }
+                .padding(EdgeInsets(top: 11, leading: 10, bottom: 3, trailing: 10))
+                Text("You won't get notifications for this conversation.")
+                    .font(SonarTheme.uiFont(size: 13.5))
+                    .foregroundColor(SonarTheme.text2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(EdgeInsets(top: 0, leading: 10, bottom: 8, trailing: 10))
+                SNActionRow(icon: .bell, label: "Unmute", desc: "Turn notifications back on") {
+                    store.unmuteChat(row.id)
+                    muteRow = nil
+                }
+            }
+        } else {
+            VStack(spacing: 0) {
+                muteOption(row, label: "1 hour", duration: 3600)
+                muteOption(row, label: "8 hours", duration: 8 * 3600)
+                muteOption(row, label: "1 day", duration: 24 * 3600)
+                muteOption(row, label: "1 week", duration: 7 * 24 * 3600)
+                muteOption(row, label: "Until I turn it back on", duration: nil)
+            }
+        }
+    }
+
+    private func muteOption(_ row: SNDMRow, label: String, duration: TimeInterval?) -> some View {
+        SNActionRow(icon: .bellOff, label: label) {
+            store.muteChat(row.id, for: duration)
+            muteRow = nil
         }
     }
 
@@ -436,7 +494,9 @@ struct SonarHomeScreen: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(verbatim: showSuffix || (!trimmed.contains("@") && !trimmed.hasPrefix("npub1"))
                                     ? trimmed
-                                    : (trimmed.contains("@") ? String(trimmed.split(separator: "@").first ?? trimmed) : trimmed))
+                                    : (trimmed.contains("@")
+                                        ? (trimmed.split(separator: "@").first.map(String.init) ?? trimmed)
+                                        : trimmed))
                                     .font(SonarTheme.uiFont(size: 16, weight: .semibold))
                                     .foregroundColor(SonarTheme.text)
                                 Text(verbatim: previewAddress)

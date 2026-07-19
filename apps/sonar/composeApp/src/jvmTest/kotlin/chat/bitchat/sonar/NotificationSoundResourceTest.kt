@@ -17,6 +17,7 @@ class NotificationSoundResourceTest {
         listOf(
             "/sonar_notification.wav" to 1.593469f,
             "/sonar_ble_notification.wav" to 1.032018f,
+            "/sonar_trill.wav" to 0.5f,
         ).forEach { (resourceName, expectedDurationSecs) ->
             assertDecodableAndLoudEnough(resourceName, expectedDurationSecs)
         }

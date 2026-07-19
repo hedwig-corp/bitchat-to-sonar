@@ -264,6 +264,8 @@ struct SNCollectionHostMessageRow: View {
         Group {
             if let call = m.call {
                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
+            } else if m.trill {
+                SNNudgeRow(m: m, peerName: peerName, group: showAuthor || m.author != nil)
             } else if m.pay != nil {
                 SNPayBubble(
                     m: m,

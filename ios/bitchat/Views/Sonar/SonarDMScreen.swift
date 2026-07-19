@@ -315,6 +315,24 @@ struct SonarDMScreenContent: View {
                         pickPhoto = true
                     }
                 }
+                // MSN-style nudge (docs/SONAR-TRILL.md). DMs and Marmot groups
+                // only — public geohash channels have no nudge action.
+                SNActionRow(
+                    icon: .bell,
+                    label: "Nudge",
+                    desc: store.canSendTrill(peerId)
+                        ? (isMultiMemberMarmot
+                            ? "Buzz everyone to get their attention"
+                            : "Buzz \(peer.name)'s screen to get their attention")
+                        : "You just sent a nudge — give it a moment",
+                    disabled: !store.canSendTrill(peerId)
+                ) {
+                    sheet = false
+                    store.sendTrill(peerId)
+                    Task { @MainActor in
+                        await convo.loadNewestIfNeeded()
+                    }
+                }
                 if store.canPrepareMedia(peerId) {
                     SNActionRow(icon: .data, label: "Send file", desc: "PDFs, documents, and other files") {
                         sheet = false

@@ -337,7 +337,7 @@ data class MeshDmRow(val peerId: String, val name: String, val preview: String, 
 /** A local contact that can be invited into a Marmot group. */
 data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
 
-private fun messagePreview(content: String, stickerRef: SonarStickerRef? = null, media: List<SonarMedia> = emptyList()): String {
+internal fun messagePreview(content: String, stickerRef: SonarStickerRef? = null, media: List<SonarMedia> = emptyList()): String {
     media.firstOrNull()?.let {
         return when {
             it.mimeType.startsWith("image/") -> "Image"
@@ -350,6 +350,7 @@ private fun messagePreview(content: String, stickerRef: SonarStickerRef? = null,
     if (content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null) {
         return "Voice call"
     }
+    if (TrillLine.isTrillLine(content)) return "Nudge"
     return if (PayLine.decode(content) != null) "₿ Payment" else content
 }
 
@@ -914,6 +915,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+            mutedUntilByChat = emptyMap() // blob dies with SonarCore.wipe()
             bip353 = ""
             callLogs.clear(); callVersion++
             resetCallState()
@@ -3721,6 +3723,130 @@ class SonarAppState(private val scope: CoroutineScope) {
             showPaymentAmount = true,
         )
 
+    // ── Per-chat mute (docs/SONAR-TRILL.md) ──
+    // chatId → mute-until epoch seconds (MUTE_FOREVER_SECS = until turned back
+    // on). Local to the install; rows and unread counts keep accruing — only
+    // alerts (notification/sound/haptic/shake) are suppressed.
+    var mutedUntilByChat by mutableStateOf(decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY)))
+        private set
+
+    private fun persistMutes() {
+        SonarCore.saveBlob(MUTE_BLOB_KEY, encodeMuteMap(mutedUntilByChat))
+    }
+
+    /** All ids a chat's alerts can arrive under (mirrors the folded-id set used
+     *  by [clearNotificationsForChat]): the row id itself, duplicate direct
+     *  groups, folded White Noise groups, and the mesh row of a folded group. */
+    private fun muteIdsFor(chatId: String): Set<String> = buildSet {
+        add(chatId)
+        addAll(directMarmotChatIds(chatId))
+        addAll(transcriptGroupIds(chatId))
+        foldedGroupPeerIds[chatId]?.let { add(meshChatId(it)) }
+        if (isMeshChat(chatId)) {
+            meshPeerAliases(meshPeerId(chatId)).forEach { add(meshChatId(it)) }
+        }
+    }
+
+    /** Pure read (safe on the render path): expired mutes read as unmuted and
+     *  are pruned lazily by the mutating paths, never here. */
+    fun isChatMuted(chatId: String): Boolean {
+        val mutes = mutedUntilByChat
+        if (mutes.isEmpty()) return false
+        val now = SonarClock.nowSecs()
+        if (isMutedAt(mutes[chatId], now)) return true
+        return muteIdsFor(chatId).any { isMutedAt(mutes[it], now) }
+    }
+
+    /** Mute [chatId] for [durationSecs] (null = until turned back on). The
+     *  whole folded-id set is stored so id-only readers — notably the
+     *  killed-app push-wake drain, which cannot resolve folding — match the
+     *  mute by direct lookup. */
+    fun muteChat(chatId: String, durationSecs: Long?) {
+        val now = SonarClock.nowSecs()
+        val until = muteUntilFor(durationSecs, now)
+        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) +
+            muteIdsFor(chatId).associateWith { until }
+        persistMutes()
+    }
+
+    fun unmuteChat(chatId: String) {
+        val now = SonarClock.nowSecs()
+        mutedUntilByChat = withExpiredMutesCleared(mutedUntilByChat, now) - muteIdsFor(chatId)
+        persistMutes()
+    }
+
+    // ── Trill (nudge) — docs/SONAR-TRILL.md ──
+    /** Bumped when a received (or sent) trill should shake the app content;
+     *  observed by TrillShakeHost in App.kt. */
+    var trillShakeTick by mutableStateOf(0L)
+        private set
+
+    // Sender cooldown (monotonic ms): the nudge action is disabled for 8 s per
+    // chat after sending — MSN's own guard.
+    private var trillCooldownUntilMs by mutableStateOf<Map<String, Long>>(emptyMap())
+
+    // Receiver alert throttle: one buzz/notification per chat per 8 s window.
+    private val trillAlertThrottle = TrillAlertThrottle()
+
+    fun canSendTrill(chatId: String): Boolean =
+        SonarClock.monotonicMillis() >= (trillCooldownUntilMs[chatId] ?: 0L)
+
+    /** Send a nudge through the exact same path a text message takes (local
+     *  echo, transport auto-pick, outbox). The sender's own send also triggers
+     *  the local buzz effect (design parity). */
+    fun sendTrill(chatId: String) {
+        if (!canSendTrill(chatId)) return
+        // Mirror send()'s blocked-contact guard before burning the cooldown or
+        // buzzing locally — otherwise a blocked nudge locks the button for 8s
+        // and shakes the sender while never leaving the device.
+        if (isContactBlocked(chatId)) {
+            toast = "Unblock to send a nudge"
+            return
+        }
+        trillCooldownUntilMs = trillCooldownUntilMs +
+            (chatId to SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS)
+        send(chatId, TrillLine(randomTrillId()).encoded())
+        triggerTrillBuzz()
+    }
+
+    /** Shake + bell + haptic. Never called from composition — only from send
+     *  actions and receive callbacks. The shake itself honors reduce-motion in
+     *  TrillShakeHost; TrillEffects dispatches sound/haptic off-thread. */
+    private fun triggerTrillBuzz() {
+        // Never disturb an active call's audio session or UI (iOS parity).
+        if (activeCall != null) return
+        trillShakeTick++
+        TrillEffects.buzz()
+    }
+
+    /** One incoming trill worth alerting for landed in [idKey]. Applies the
+     *  silence ladder (docs/SONAR-TRILL.md): blocked was dropped at ingest,
+     *  muted alerts nothing, throttled trills stay silent rows; then foreground
+     *  buzzes and background posts the distinct trill notification. */
+    private fun onTrillReceived(
+        idKey: String,
+        conversationTitle: String?,
+        content: String,
+        senderName: String?,
+        groupName: String? = null,
+    ) {
+        if (isChatMuted(idKey)) return
+        if (!trillAlertThrottle.tryAlert(idKey, SonarClock.monotonicMillis())) return
+        if (foreground) {
+            triggerTrillBuzz()
+        } else {
+            notifyIncoming(
+                idKey = idKey,
+                conversationTitle = conversationTitle,
+                content = content,
+                forcedKind = SonarNotificationKind.Trill,
+                senderName = senderName,
+                groupName = groupName,
+                sound = SonarNotificationSound.Trill,
+            )
+        }
+    }
+
     private fun isCallNotificationContent(content: String): Boolean =
         content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null
 
@@ -3735,6 +3861,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         sound: SonarNotificationSound = SonarNotificationSound.Default,
     ) {
         if (foreground) return
+        // Muted chats never notify (any kind); rows and unread still accrue.
+        if (isChatMuted(idKey)) return
         val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
         val notification = SonarNotificationRouter.build(
             idKey = idKey,
@@ -3750,7 +3878,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             id = notification.id,
             title = notification.title,
             body = notification.body,
-            sound = sound,
+            // A trill always rings with its distinct bell, whichever path
+            // classified it.
+            sound = if (kind == SonarNotificationKind.Trill) SonarNotificationSound.Trill else sound,
             conversationId = idKey,
         )
     }
@@ -3875,7 +4005,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         summaryByChat: Map<String, SonarConversationSummary>,
     ) {
         var newestIncoming: SonarMsg? = null
+        var newestTrill: SonarMsg? = null
         val isOpen = openChatId != null && openChatId in suppressIds
+        fun newer(candidate: SonarMsg, current: SonarMsg?): Boolean =
+            current == null || candidate.tsSecs > current.tsSecs ||
+                (candidate.tsSecs == current.tsSecs && candidate.id > current.id)
         for (chatId in scanIds) {
             val page = changedPages[chatId] ?: continue
             val candidate = newestUnseenIncoming(
@@ -3884,7 +4018,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 previousLatestSecs = notificationLatestSecs[chatId],
                 isOpen = isOpen,
                 allowsMessage = { message ->
-                    socialState.allowsChatMessage(chatId, message.senderNpub, message.mine)
+                    !TrillLine.isTrillLine(message.content) &&
+                        socialState.allowsChatMessage(chatId, message.senderNpub, message.mine)
+                },
+            )
+            // A trill buzzes for ANY chat, including the open one, so its scan
+            // ignores the open-chat suppression (throttle/mute gate the alert).
+            val trillCandidate = newestUnseenIncoming(
+                messages = page,
+                seenMessageIds = notificationSeenMessageIds[chatId].orEmpty(),
+                previousLatestSecs = notificationLatestSecs[chatId],
+                isOpen = false,
+                allowsMessage = { message ->
+                    TrillLine.isTrillLine(message.content) &&
+                        socialState.allowsChatMessage(chatId, message.senderNpub, message.mine)
                 },
             )
             rememberNotificationPage(
@@ -3892,22 +4039,31 @@ class SonarAppState(private val scope: CoroutineScope) {
                 page = page,
                 observedLatestSecs = summaryByChat[chatId]?.latestAtSecs ?: 0L,
             )
-            if (candidate != null && (newestIncoming == null ||
-                    candidate.tsSecs > newestIncoming!!.tsSecs ||
-                    (candidate.tsSecs == newestIncoming!!.tsSecs && candidate.id > newestIncoming!!.id))
-            ) {
+            if (candidate != null && newer(candidate, newestIncoming)) {
                 newestIncoming = candidate
             }
+            if (trillCandidate != null && newer(trillCandidate, newestTrill)) {
+                newestTrill = trillCandidate
+            }
         }
-        if (newestIncoming != null) {
-            val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+        val groupName = c.name.takeIf { c.members.size > 2 && it.isNotBlank() }
+        newestIncoming?.let { incoming ->
             notifyIncoming(
                 idKey = idKey,
                 conversationTitle = title,
-                content = newestIncoming.content,
-                senderName = notificationSenderName(c, newestIncoming),
+                content = incoming.content,
+                senderName = notificationSenderName(c, incoming),
                 groupName = groupName,
                 unreadCount = unreadForChat(idKey).coerceAtLeast(1L),
+            )
+        }
+        newestTrill?.let { trill ->
+            onTrillReceived(
+                idKey = idKey,
+                conversationTitle = title,
+                content = trill.content,
+                senderName = notificationSenderName(c, trill),
+                groupName = groupName,
             )
         }
     }
@@ -8615,8 +8771,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats[m.peerId] = meshChats[m.peerId].orEmpty() + msg
             processPayLines(chatId, listOf(msg))
             touched += m.peerId
-            val preview = if (stickerRef != null) "Sticker" else m.text
             val sender = meshPeerName(m.peerId)
+            if (stickerRef == null && TrillLine.isTrillLine(m.text)) {
+                // The row is already appended above; a trill alerts through its
+                // own funnel (foreground buzz / background trill notification,
+                // mute + 8 s receiver throttle applied).
+                onTrillReceived(
+                    idKey = chatId,
+                    conversationTitle = sender,
+                    content = m.text,
+                    senderName = sender,
+                )
+                continue
+            }
+            val preview = if (stickerRef != null) "Sticker" else m.text
             notifyIncoming(
                 idKey = chatId,
                 conversationTitle = sender,
@@ -8687,6 +8855,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             processPayLines(chatId, listOf(msg))
             touched += peerId
             ackEventIds += m.eventId
+            if (msg.stickerRef == null && TrillLine.isTrillLine(m.content)) {
+                val sender = meshPeerName(peerId)
+                onTrillReceived(
+                    idKey = chatId,
+                    conversationTitle = sender,
+                    content = m.content,
+                    senderName = sender,
+                )
+                continue
+            }
             val preview = if (msg.stickerRef != null) "Sticker" else m.content
             notifyIncoming(chatId, meshPeerName(peerId), preview)
         }

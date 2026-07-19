@@ -18,7 +18,7 @@ import SwiftUI
 enum SNIconName: String {
     case back, chevron, lock, plus, send, search, pin, people, mesh, globe
     case check, shield, shieldCheck, x, smile, navArrow, dice, slash, rings
-    case pencil, key, inbox, arrowOut, faceid, drive, data, list, moon, bell
+    case pencil, key, inbox, arrowOut, faceid, drive, data, list, moon, bell, bellOff
     case trash, info, compose, coin, bolt, mic
     // Calls (call.jsx): phone/videocam start a call; the in-call controls.
     case phone, videocam, phoneDown, micOff, videoOff, speaker, cameraFlip
@@ -117,6 +117,12 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
     .bell: [
         .path("M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"),
         .path("M10 18.8a2.1 2.1 0 0 0 4 0"),
+    ],
+    // Muted chat: the bell with a diagonal strike-through.
+    .bellOff: [
+        .path("M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"),
+        .path("M10 18.8a2.1 2.1 0 0 0 4 0"),
+        .path("M5 3.5l14 17"),
     ],
     .trash: [
         .path("M5 7h14M10 7V5.6A1.6 1.6 0 0 1 11.6 4h.8A1.6 1.6 0 0 1 14 5.6V7"),

@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import chat.bitchat.sonar.MUTE_BLOB_KEY
 import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.PROFILE_CACHE_BLOB_KEY
 import chat.bitchat.sonar.SonarConversationSummary
@@ -16,9 +17,12 @@ import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
 import chat.bitchat.sonar.SonarNotificationRouter
+import chat.bitchat.sonar.SonarNotificationSound
 import chat.bitchat.sonar.SonarProfile
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.decodeMuteMap
 import chat.bitchat.sonar.decodeProfileCache
+import chat.bitchat.sonar.isMutedAt
 import chat.bitchat.sonar.resolvePushSenderName
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
@@ -142,8 +146,16 @@ class SonarPushProcessingService : Service() {
             if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
             else emptyMap()
 
+        // Per-chat mute is honored on the killed-app drain too: rows and unread
+        // counts still accrued in local storage — only the banner is skipped.
+        // muteChat persists the whole folded-id set, so a direct group-id
+        // lookup is sufficient here.
+        val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
+        val nowSecs = System.currentTimeMillis() / 1000
+
         var notified = 0
         for (summary in unread) {
+            if (isMutedAt(mutes[summary.groupIdHex], nowSecs)) continue
             val kind = SonarNotificationRouter.classifyContent(
                 summary.latestContent,
                 isCallControl = { SonarCore.callParseControl(it) != null },
@@ -172,6 +184,12 @@ class SonarPushProcessingService : Service() {
                     id = notif.id,
                     title = notif.title,
                     body = notif.body,
+                    // A trill rings its distinct bell on background drains too.
+                    sound = if (kind == SonarNotificationKind.Trill) {
+                        SonarNotificationSound.Trill
+                    } else {
+                        SonarNotificationSound.Default
+                    },
                     conversationId = summary.groupIdHex,
                 )
                 notified++

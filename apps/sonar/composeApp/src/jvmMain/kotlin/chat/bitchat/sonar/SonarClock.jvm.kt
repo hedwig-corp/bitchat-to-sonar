@@ -11,6 +11,8 @@ actual object SonarClock {
 
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
+    actual fun monotonicMillis(): Long = System.nanoTime() / 1_000_000
+
     actual fun hourMinute(epochSecs: Long): String =
         SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(epochSecs * 1000))
 }

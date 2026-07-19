@@ -15,6 +15,7 @@ extension ChatViewModel {
 
     nonisolated static func shouldSendGenericPrivateMessageNotification(for content: String) -> Bool {
         SonarPayMessage.decode(content) == nil
+            && !SonarTrillMessage.isTrillLine(content)
             && !content.drop(while: \.isWhitespace).hasPrefix("☎CALL")
     }
 

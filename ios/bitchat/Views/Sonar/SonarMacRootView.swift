@@ -883,6 +883,23 @@ private struct MacConversationPane: View {
                     openPaySheetOrWallet()
                 }
             }
+            if !isChannel {
+                // MSN-style nudge (docs/SONAR-TRILL.md). Same affordance as iOS
+                // SonarDMScreen — DMs and Marmot groups; public channels excluded.
+                SNActionRow(
+                    icon: .bell,
+                    label: "Nudge",
+                    desc: store.canSendTrill(id)
+                        ? (isMultiMemberMarmot
+                            ? "Buzz everyone to get their attention"
+                            : "Buzz \(peer.name)'s screen to get their attention")
+                        : "You just sent a nudge — give it a moment",
+                    disabled: !store.canSendTrill(id)
+                ) {
+                    actionSheet = false
+                    store.sendTrill(id)
+                }
+            }
             if !isChannel, store.canPrepareMedia(id) {
                 SNActionRow(icon: .drive, label: "Send photo, video, or audio", desc: "Encrypted end-to-end") {
                     actionSheet = false

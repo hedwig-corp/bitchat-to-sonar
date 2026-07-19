@@ -1117,6 +1117,7 @@ private fun SonarNotificationKind.toFfi(): uniffi.sonar_ffi.SonarNotificationKin
         SonarNotificationKind.Message -> uniffi.sonar_ffi.SonarNotificationKindInfo.MESSAGE
         SonarNotificationKind.Payment -> uniffi.sonar_ffi.SonarNotificationKindInfo.PAYMENT
         SonarNotificationKind.Call -> uniffi.sonar_ffi.SonarNotificationKindInfo.CALL
+        SonarNotificationKind.Trill -> uniffi.sonar_ffi.SonarNotificationKindInfo.TRILL
         SonarNotificationKind.Invite -> uniffi.sonar_ffi.SonarNotificationKindInfo.INVITE
         SonarNotificationKind.Mention -> uniffi.sonar_ffi.SonarNotificationKindInfo.MENTION
         SonarNotificationKind.Geohash -> uniffi.sonar_ffi.SonarNotificationKindInfo.GEOHASH
@@ -1128,6 +1129,7 @@ private fun uniffi.sonar_ffi.SonarNotificationKindInfo.toCommon(): SonarNotifica
         uniffi.sonar_ffi.SonarNotificationKindInfo.MESSAGE -> SonarNotificationKind.Message
         uniffi.sonar_ffi.SonarNotificationKindInfo.PAYMENT -> SonarNotificationKind.Payment
         uniffi.sonar_ffi.SonarNotificationKindInfo.CALL -> SonarNotificationKind.Call
+        uniffi.sonar_ffi.SonarNotificationKindInfo.TRILL -> SonarNotificationKind.Trill
         uniffi.sonar_ffi.SonarNotificationKindInfo.INVITE -> SonarNotificationKind.Invite
         uniffi.sonar_ffi.SonarNotificationKindInfo.MENTION -> SonarNotificationKind.Mention
         uniffi.sonar_ffi.SonarNotificationKindInfo.GEOHASH -> SonarNotificationKind.Geohash

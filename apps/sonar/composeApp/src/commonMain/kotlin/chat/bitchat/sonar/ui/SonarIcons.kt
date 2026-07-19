@@ -42,6 +42,8 @@ enum class SNIconName {
     // eyeOff, importKey, inbox, faceid, drive, data, arrowOut.
     ListGlyph, Bell, Copy, Share, Eye, EyeOff, ImportKey, Inbox, FaceId,
     Drive, Data, ArrowOut,
+    // Muted-chat glyph: the Bell with a strike-through (design bellOff).
+    BellOff,
 }
 
 private sealed interface Shape {
@@ -115,6 +117,11 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Bell to listOf(
         Shape.P("M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"),
         Shape.P("M10 18.8a2.1 2.1 0 0 0 4 0"),
+    ),
+    SNIconName.BellOff to listOf(
+        Shape.P("M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z"),
+        Shape.P("M10 18.8a2.1 2.1 0 0 0 4 0"),
+        Shape.P("M4.5 4.5l15 15"),
     ),
     SNIconName.Copy to listOf(
         Shape.P("M11.1 8.5h5.8a2.6 2.6 0 0 1 2.6 2.6v5.8a2.6 2.6 0 0 1-2.6 2.6h-5.8a2.6 2.6 0 0 1-2.6-2.6v-5.8a2.6 2.6 0 0 1 2.6-2.6z"),

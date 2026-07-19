@@ -275,7 +275,11 @@ fun App(
                 LocalStateLaunchSurface()
             } else {
                 Box(Modifier.statusBarsPadding().navigationBarsPadding().imePadding()) {
-                    SonarScreenHost(state)
+                    // Trill (nudge) shake: any received/sent trill shakes the
+                    // whole app content, whichever screen is on top.
+                    TrillShakeHost(state.trillShakeTick) {
+                        SonarScreenHost(state)
+                    }
                 }
             }
         }
@@ -335,6 +339,8 @@ private fun HomeScreen(state: SonarAppState) {
     var connSheet by remember { mutableStateOf(false) }
     var wipeAsk by remember { mutableStateOf(false) }
     var titleTaps by remember { mutableStateOf(0) }
+    var pendingRowActions by remember { mutableStateOf<DeleteTarget?>(null) }
+    var pendingMute by remember { mutableStateOf<DeleteTarget?>(null) }
     var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
     var pendingInvite by remember { mutableStateOf<SonarGroupInvite?>(null) }
     val meshCount = state.meshPeers.size
@@ -463,8 +469,9 @@ private fun HomeScreen(state: SonarAppState) {
                                     avatar = { SonarAvatar(mesh.name, 52.dp, presence = state.dmInRange(mesh.peerId)) },
                                     title = mesh.name, sub = mesh.preview, lock = false,
                                     time = rowTimeLabel(mesh.tsSecs),
+                                    muted = state.isChatMuted("mesh:" + mesh.peerId),
                                     divider = homeRow.listKey != lastRowKey,
-                                    onLongClick = { pendingDelete = DeleteTarget(mesh.peerId, mesh.name, isMesh = true, isGroup = false) },
+                                    onLongClick = { pendingRowActions = DeleteTarget(mesh.peerId, mesh.name, isMesh = true, isGroup = false) },
                                 ) { state.openDm(mesh.peerId, mesh.name) }
                             }
                             is HomeMessageRow.Marmot -> {
@@ -480,9 +487,10 @@ private fun HomeScreen(state: SonarAppState) {
                                     time = if (row.tsSecs > 0L) rowTimeLabel(row.tsSecs) else "",
                                     verified = row.verified,
                                     unread = row.unread,
+                                    muted = state.isChatMuted(chat.id),
                                     divider = homeRow.listKey != lastRowKey,
                                     onLongClick = if (row.pending) null else {
-                                        { pendingDelete = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
+                                        { pendingRowActions = DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember) }
                                     },
                                 ) { state.openChat(chat) }
                             }
@@ -529,6 +537,26 @@ private fun HomeScreen(state: SonarAppState) {
             onClose = { pendingInvite = null }
         )
     }
+    pendingRowActions?.let { t ->
+        ChatRowActionsSheet(
+            name = t.name,
+            isGroup = t.isGroup,
+            muted = state.isChatMuted(muteChatIdFor(t)),
+            onMute = { pendingRowActions = null; pendingMute = t },
+            onDelete = { pendingRowActions = null; pendingDelete = t },
+            onClose = { pendingRowActions = null }
+        )
+    }
+    pendingMute?.let { t ->
+        val muteId = muteChatIdFor(t)
+        MuteSheet(
+            name = t.name,
+            muted = state.isChatMuted(muteId),
+            onMute = { durationSecs -> state.muteChat(muteId, durationSecs); pendingMute = null },
+            onUnmute = { state.unmuteChat(muteId); pendingMute = null },
+            onClose = { pendingMute = null }
+        )
+    }
     pendingDelete?.let { t ->
         DeleteChatSheet(
             name = t.name,
@@ -542,6 +570,11 @@ private fun HomeScreen(state: SonarAppState) {
     }
     state.toast?.let { ToastBar(it) { state.toast = null } }
 }
+
+/** The id mute state is keyed on: the same conversation id notifications use
+ *  (`mesh:<peerId>` for a mesh-folded row, the group id for a Marmot chat). */
+private fun muteChatIdFor(t: DeleteTarget): String =
+    if (t.isMesh) "mesh:" + t.id else t.id
 
 private fun channelName(geohash: String): String =
     if (geohash.equals("mesh", true)) "Bluetooth mesh" else "#$geohash"
@@ -628,6 +661,7 @@ private fun ConvRow(
     lock: Boolean = false,
     verified: Boolean = false,
     unread: Boolean = false,
+    muted: Boolean = false,
     divider: Boolean = true,
     onLongClick: (() -> Unit)? = null,
     onClick: () -> Unit,
@@ -664,11 +698,14 @@ private fun ConvRow(
                 }
             }
             // bc-rowend: time (12 text3) over the 11dp accent unread dot, gap 5.
-            if (!time.isNullOrEmpty() || unread) {
+            // A muted chat swaps the dot for a bell-off glyph (unread still
+            // accrues internally, the dot is just suppressed).
+            if (!time.isNullOrEmpty() || unread || muted) {
                 Spacer(Modifier.width(8.dp))
                 Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(5.dp)) {
                     if (!time.isNullOrEmpty()) Text(time, color = s.text3, fontSize = 12.sp)
-                    if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
+                    if (muted) SNIcon(SNIconName.BellOff, 14.dp, s.text3, weight = 2f)
+                    else if (unread) Box(Modifier.size(11.dp).clip(CircleShape).background(s.accent))
                 }
             }
         }
@@ -730,6 +767,102 @@ private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit
                 )
                 Spacer(Modifier.height(16.dp))
                 SNPrimaryButton(if (isGroup) "Leave group" else "Delete chat", net = false) { onDelete() }
+                Spacer(Modifier.height(8.dp))
+                Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
+                    Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
+    }
+}
+
+/** Long-press actions for a home chat row: mute (new) + the pre-existing
+ *  delete/leave entry point, so muting does not displace deleting. */
+@Composable
+private fun ChatRowActionsSheet(
+    name: String,
+    isGroup: Boolean,
+    muted: Boolean,
+    onMute: () -> Unit,
+    onDelete: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
+                Text(name, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(8.dp))
+                if (muted) {
+                    ActionRow(SNIconName.BellOff, "Muted", "You won't get notifications for this conversation.", onMute)
+                } else {
+                    ActionRow(SNIconName.Bell, "Mute", "Silence notifications for this conversation", onMute)
+                }
+                ActionRow(
+                    SNIconName.Trash,
+                    if (isGroup) "Leave group" else "Delete chat",
+                    if (isGroup) "Send a leave update and remove it from this device" else "Remove this chat from this device only",
+                    onDelete,
+                )
+            }
+        }
+    }
+}
+
+/** Per-chat mute sheet (design MuteSheet): the duration ladder, or — when
+ *  already muted — the bell-off state with Unmute/Cancel. */
+@Composable
+private fun MuteSheet(
+    name: String,
+    muted: Boolean,
+    onMute: (Long?) -> Unit,
+    onUnmute: () -> Unit,
+    onClose: () -> Unit,
+) {
+    val s = sonar
+    Box(
+        Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
+        contentAlignment = Alignment.BottomCenter
+    ) {
+        Surface(color = s.surface, shape = RoundedCornerShape(topStart = 22.dp, topEnd = 22.dp)) {
+            Column(Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 20.dp)) {
+                if (muted) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        SNIcon(SNIconName.BellOff, 20.dp, s.text2, weight = 2f)
+                        Spacer(Modifier.width(9.dp))
+                        Text("Muted", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "You won't get notifications for this conversation.",
+                        color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(16.dp))
+                    SNPrimaryButton("Unmute") { onUnmute() }
+                } else {
+                    Text("Mute “$name”", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "New messages still arrive and count as unread — they just won't make a sound.",
+                        color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    MUTE_DURATIONS.forEach { duration ->
+                        Row(
+                            Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp))
+                                .clickable { onMute(duration.secs) }
+                                .padding(horizontal = 6.dp, vertical = 13.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            SNIcon(SNIconName.BellOff, 17.dp, s.text2, weight = 2f)
+                            Spacer(Modifier.width(11.dp))
+                            Text(duration.label, color = s.text, fontSize = 15.5.sp, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                }
                 Spacer(Modifier.height(8.dp))
                 Box(Modifier.fillMaxWidth().height(44.dp).clickable(onClick = onClose), contentAlignment = Alignment.Center) {
                     Text("Cancel", color = s.text2, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -1502,10 +1635,18 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                     val prevMsg = prevAny as? SonarMsg
                                     val cont = !newDay && prevMsg != null && prevMsg.mine == m.mine &&
                                         prevMsg.senderNpub == m.senderNpub &&
-                                        PayLine.decode(prevMsg.content) !is PayLine.Pay
+                                        PayLine.decode(prevMsg.content) !is PayLine.Pay &&
+                                        !TrillLine.isTrillLine(prevMsg.content)
                                     val pay = PayLine.decode(m.content) as? PayLine.Pay
                                     val failedSend = sonarCanRetryMessage(m)
-                                    if (pay != null) {
+                                    if (TrillLine.isTrillLine(m.content)) {
+                                        // Centered nudge pill — never the raw ⚡TRILL line.
+                                        TrillLogRow(
+                                            mine = m.mine,
+                                            who = if (m.mine) null
+                                            else state.groupAuthorName(m, isGroup) ?: peerName,
+                                        )
+                                    } else if (pay != null) {
                                         val status = run { state.payVersion; state.payStatus(pay.uuid) }
                                         PayBubble(m, pay, status, peerName, mesh = msgMesh, fiatOf = { state.fiatOrNull(it) })
                                     } else if (m.media.isNotEmpty()) {
@@ -1938,8 +2079,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         canVerify = !state.isMultiMemberChat(screen.id),
         canShareLocation = !state.isMultiMemberChat(screen.id),
         canManageGroup = canManageGroup,
+        isGroup = isGroup,
+        nudgeEnabled = state.canSendTrill(screen.id),
         onPhoto = { addSheet = false; pickPhoto() },
         onFile = { addSheet = false; pickFile() },
+        onNudge = { addSheet = false; state.sendTrill(screen.id) },
     )
     if (addPeopleSheet) GroupAddPeopleSheet(
         state = state,
@@ -1990,8 +2134,11 @@ private fun AddToMessageSheet(
     canVerify: Boolean = true,
     canShareLocation: Boolean = true,
     canManageGroup: Boolean = false,
+    isGroup: Boolean = false,
+    nudgeEnabled: Boolean = true,
     onPhoto: () -> Unit = {},
     onFile: () -> Unit = {},
+    onNudge: () -> Unit = {},
 ) {
     val s = sonar
     Box(
@@ -2013,6 +2160,18 @@ private fun AddToMessageSheet(
                     ActionRow(SNIconName.Data, "Send file", "PDFs, documents, and other files", onFile)
                 }
                 if (canSendPayment) ActionRow(SNIconName.Coin, "Send bitcoin", "Instant over Lightning", onBitcoin)
+                // MSN-style trill: disabled (not hidden) during the 8 s
+                // per-chat sender cooldown. Geohash channels never show this
+                // sheet, so the nudge stays DM/group-only by construction.
+                Box(Modifier.alpha(if (nudgeEnabled) 1f else 0.45f)) {
+                    ActionRow(
+                        SNIconName.Bell,
+                        "Nudge",
+                        if (isGroup) "Buzz everyone to get their attention"
+                        else "Buzz $peerName’s screen to get their attention",
+                        if (nudgeEnabled) onNudge else ({}),
+                    )
+                }
                 if (canShareLocation) ActionRow(SNIconName.NavArrow, "Share location", "Only $peerName will see it", onLocation)
                 if (canManageGroup) {
                     ActionRow(SNIconName.People, "Add people", "Invite local contacts or paste npubs", onAddPeople)
@@ -2487,6 +2646,70 @@ private fun UnreadDivider() {
         Text("Unread messages", color = s.text2, fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold)
         Box(Modifier.weight(1f).height(1.dp).background(s.text3.copy(alpha = 0.25f)))
     }
+}
+
+/** MSN-style nudge transcript row (design NudgeMsg / .bc-nudgemsg): centered
+ *  pill on the accent-soft background with the bell glyph wiggling on appear.
+ *  The raw ⚡TRILL wire line is never rendered. */
+@Composable
+private fun TrillLogRow(mine: Boolean, who: String?) {
+    val s = sonar
+    val label = if (mine) "You sent a nudge" else "${who ?: "Someone"} nudged you — 👋"
+    val wiggle = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(Unit) {
+        if (TrillEffects.reduceMotionEnabled()) return@LaunchedEffect
+        // Bell wiggle on appear: quick alternating rotation that settles.
+        for (deg in listOf(-16f, 14f, -10f, 7f, -4f, 0f)) {
+            wiggle.animateTo(deg, tween(55, easing = LinearEasing))
+        }
+    }
+    Box(Modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = Alignment.Center) {
+        Row(
+            Modifier.clip(RoundedCornerShape(999.dp)).background(s.accentSoft)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Box(Modifier.graphicsLayer { rotationZ = wiggle.value }) {
+                SNIcon(SNIconName.Bell, 15.dp, s.accentDeep, weight = 2.1f)
+            }
+            Text(label, color = s.text, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+/** Whole-app viewport shake for an incoming (or just-sent) trill — the design's
+ *  bcShake choreography: 620 ms, translate ±7-9 dp with ±1° rotation on the
+ *  cubic-bezier(.36,.07,.19,.97) curve. Honors the platform reduce-motion
+ *  setting (sound/haptic still fire from TrillEffects). */
+@Composable
+internal fun TrillShakeHost(shakeTick: Long, content: @Composable () -> Unit) {
+    val density = LocalDensity.current
+    val translate = remember { androidx.compose.animation.core.Animatable(0f) }
+    LaunchedEffect(shakeTick) {
+        if (shakeTick == 0L) return@LaunchedEffect
+        if (TrillEffects.reduceMotionEnabled()) return@LaunchedEffect
+        val easing = androidx.compose.animation.core.CubicBezierEasing(0.36f, 0.07f, 0.19f, 0.97f)
+        val steps = listOf(-9f, 8f, -8f, 9f, -7f, 7f, 0f)
+        val stepMs = 620 / steps.size
+        translate.snapTo(0f)
+        for (target in steps) {
+            translate.animateTo(
+                with(density) { target.dp.toPx() },
+                tween(stepMs, easing = easing),
+            )
+        }
+        translate.snapTo(0f)
+    }
+    Box(
+        Modifier.graphicsLayer {
+            translationX = translate.value
+            // ±1° rotation proportional to the ±9 dp travel.
+            rotationZ = if (translate.value == 0f) 0f else {
+                (translate.value / with(density) { 9.dp.toPx() }).coerceIn(-1f, 1f)
+            }
+        }
+    ) { content() }
 }
 
 @Composable
