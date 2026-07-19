@@ -146,4 +146,22 @@ struct SonarNSEDecoratePolicyTests {
             ) == false
         )
     }
+
+    @Test("unread fallback prefers tips that still have preview text")
+    func preferTipsWithPreview() {
+        let ids = ["aaa", "bbb", "ccc"]
+        let previews = ["aaa": "", "bbb": "hello", "ccc": "  "]
+        #expect(
+            SonarNSEDecoratePolicy.preferTipsWithPreview(
+                groupIdHexes: ids,
+                previewByGroupIdHex: previews
+            ) == ["bbb"]
+        )
+        #expect(
+            SonarNSEDecoratePolicy.preferTipsWithPreview(
+                groupIdHexes: ids,
+                previewByGroupIdHex: ["aaa": "", "bbb": "", "ccc": ""]
+            ) == ids
+        )
+    }
 }

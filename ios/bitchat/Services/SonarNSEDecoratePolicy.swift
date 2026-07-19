@@ -153,6 +153,21 @@ enum SonarNSEDecoratePolicy {
         return matched.isEmpty ? groupIdHexes : matched
     }
 
+    /// Among candidate unread tips (already hint-filtered), prefer rows that
+    /// still carry preview text. Otherwise the lock screen shows a resolved
+    /// alias with the privacy body ("Open Sonar to read it.") — the
+    /// "Vincenzo Palazzo generic" report.
+    static func preferTipsWithPreview(
+        groupIdHexes: [String],
+        previewByGroupIdHex: [String: String]
+    ) -> [String] {
+        let withPreview = groupIdHexes.filter { id in
+            let preview = previewByGroupIdHex[id] ?? previewByGroupIdHex[id.lowercased()] ?? ""
+            return !preview.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return withPreview.isEmpty ? groupIdHexes : withPreview
+    }
+
     static func hintGroupIdHex(from userInfo: [AnyHashable: Any]) -> String? {
         let keys = ["group_id", "groupId", "group_id_hex", "gid", "conversation_id"]
         for key in keys {

@@ -281,7 +281,7 @@ class NotificationService: SDKNotificationService {
                 drained = fromUnread
             }
         }
-        return drained
+        return Self.enrichEmptyContentPreviews(drained, node: node)
     }
 
     /// Build banner rows from local unread conversation summaries (newest tip only).
@@ -296,7 +296,15 @@ class NotificationService: SDKNotificationService {
             groupIdHexes: unread.map(\.groupIdHex),
             hintGroupIdHex: hintGroupIdHex
         )
-        let allowed = Set(allowedIds.map { $0.lowercased() })
+        let previewById = Dictionary(
+            unread.map { ($0.groupIdHex, $0.latestContent) },
+            uniquingKeysWith: { _, newer in newer }
+        )
+        let preferredIds = SonarNSEDecoratePolicy.preferTipsWithPreview(
+            groupIdHexes: allowedIds,
+            previewByGroupIdHex: previewById
+        )
+        let allowed = Set(preferredIds.map { $0.lowercased() })
         return Array(
             unread
                 .filter { allowed.contains($0.groupIdHex.lowercased()) }
@@ -311,6 +319,34 @@ class NotificationService: SDKNotificationService {
                     )
                 }
         )
+    }
+
+    /// When wake drain returns a tip with an empty preview (common when the
+    /// row was indexed before content landed), fill from the conversation
+    /// summary for the same group so showPreview banners are not generic.
+    private static func enrichEmptyContentPreviews(
+        _ notifications: [DrainNotificationInfo],
+        node: SonarNode
+    ) -> [DrainNotificationInfo] {
+        let summaries = node.conversationSummaries()
+        return notifications.map { note in
+            let trimmed = note.contentPreview.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.isEmpty else { return note }
+            let group = note.groupIdHex.lowercased()
+            guard let summary = summaries.first(where: {
+                $0.groupIdHex.lowercased() == group
+            }) else { return note }
+            let fromSummary = summary.latestContent
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !fromSummary.isEmpty else { return note }
+            return DrainNotificationInfo(
+                messageIdHex: note.messageIdHex,
+                senderNpub: note.senderNpub.isEmpty ? summary.latestSenderNpub : note.senderNpub,
+                groupIdHex: note.groupIdHex,
+                groupName: note.groupName.isEmpty ? summary.name : note.groupName,
+                contentPreview: fromSummary
+            )
+        }
     }
 
     private func releaseMarmotWakeNode() {
