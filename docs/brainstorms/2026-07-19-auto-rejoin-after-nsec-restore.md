@@ -66,6 +66,11 @@
 
 **Approach A.** It composes entirely from primitives that exist today (addressable signed events, fresh KeyPackage, welcome flow, duplicate-1:1 folding, R-011 delete semantics), satisfies 3C's signed-trigger requirement for free via nostr signatures, and degrades gracefully — peers that don't understand the beacon just ignore it and the manual R-011 path still works. Design the beacon kind + semantics as a one-page draft MIP alongside the implementation (1C).
 
+## Device test queue
+
+Manual two-device validation is **not done yet** — tracked in
+https://github.com/hedwig-corp/bitchat-to-sonar/issues/374 (PR #369).
+
 ## Open questions
 
 - Kind number + MIP text: coordinate with Marmot before burning a kind; use an experimental kind behind a feature flag until then.
