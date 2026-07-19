@@ -551,15 +551,14 @@ final class MarmotService: @unchecked Sendable {
 
     private func snapshotIdentity() -> SonarIdentity? {
         identityLock.lock()
-        let id = identity
-        identityLock.unlock()
-        return id
+        defer { identityLock.unlock() }
+        return identity
     }
 
     private func setIdentity(_ newValue: SonarIdentity?) {
         identityLock.lock()
+        defer { identityLock.unlock() }
         identity = newValue
-        identityLock.unlock()
     }
 
     /// JSON snapshot of relay/sync state (relay statuses, sync watermark,

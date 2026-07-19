@@ -1879,10 +1879,9 @@ final class SonarAppStore: ObservableObject {
     /// sheet (self-custody). Prefers the durable keychain copy (Compose
     /// `identityNsec` parity) so the sheet never waits on Marmot sync.
     func exportNsec() async -> String? {
-        if let nsec = SonarAccountKeyExport.nsecFromKeychain(keychain) {
-            return nsec
+        await SonarAccountKeyExport.exportNsec(keychain: keychain) {
+            await marmot.exportNsec()
         }
-        return await marmot.exportNsec()
     }
 
     // MARK: - Diagnostics (Settings → Diagnostics)

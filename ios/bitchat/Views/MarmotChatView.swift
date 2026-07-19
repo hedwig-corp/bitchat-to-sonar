@@ -733,10 +733,9 @@ final class MarmotChatModel: ObservableObject {
     /// self-custody escape hatch. Prefers keychain (Compose secrets parity)
     /// so callers never wait on Marmot `workQueue` sync/connect.
     func exportNsec() async -> String? {
-        if let nsec = SonarAccountKeyExport.nsecFromKeychain(keychain) {
-            return nsec
+        await SonarAccountKeyExport.exportNsec(keychain: keychain) {
+            await service.exportNsec()
         }
-        return await service.exportNsec()
     }
 
     /// Relay/sync diagnostics snapshot JSON for the Diagnostics screen and

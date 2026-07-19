@@ -27,4 +27,17 @@ enum SonarAccountKeyExport {
             return nil
         }
     }
+
+    /// Call-site preference used by Settings export: keychain first, then the
+    /// in-memory Marmot identity. A keychain hit must not invoke `engineExport`
+    /// (that path used to park behind sync on `workQueue`).
+    static func exportNsec(
+        keychain: KeychainManagerProtocol,
+        engineExport: () async -> String?
+    ) async -> String? {
+        if let nsec = nsecFromKeychain(keychain) {
+            return nsec
+        }
+        return await engineExport()
+    }
 }
