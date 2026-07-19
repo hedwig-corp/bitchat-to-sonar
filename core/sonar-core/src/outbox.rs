@@ -188,11 +188,21 @@ impl OutboxState {
         let event = Event::from_json(&entry.event_json)
             .map_err(|e| Error::Storage(format!("outbox event decode: {e}")))?;
         let group_id_hex = entry.group_id_hex.clone();
+        let previous_error = entry.last_error.clone();
         entry.state = DeliveryState::Pending;
         entry.updated_at_secs = now_secs;
         entry.last_error = None;
         self.dirty = true;
-        self.save_if_dirty()?;
+        if let Err(err) = self.save_if_dirty() {
+            // Roll back so a disk error cannot strand the row as Pending
+            // (invisible to later prepare_auto_retry / Failed UI).
+            if let Some(entry) = self.entries.get_mut(message_id_hex) {
+                entry.state = DeliveryState::Failed;
+                entry.last_error = previous_error;
+                self.dirty = true;
+            }
+            return Err(err);
+        }
         Ok(Some((group_id_hex, event)))
     }
 
@@ -464,6 +474,42 @@ mod tests {
         assert_eq!(outbox_auto_retry_delay_secs(4), 16);
         assert_eq!(outbox_auto_retry_delay_secs(5), 30);
         assert_eq!(outbox_auto_retry_delay_secs(20), 30);
+    }
+
+    #[test]
+    fn prepare_auto_retry_rolls_back_on_save_failure() {
+        // Detached outbox: save is a no-op success. Use a path whose parent
+        // cannot be created so save_if_dirty fails after mutation.
+        let path = PathBuf::from("/dev/null/definitely-not-a-dir/outbox.json");
+        let mut outbox = OutboxState::load(Some(path));
+        let event = EventBuilder::new(Kind::TextNote, "encrypted payload")
+            .sign_with_keys(&Keys::generate())
+            .expect("signed event");
+        // Bypass save by marking with path=None first, then reattach a bad path.
+        outbox.path = None;
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                event.id.to_hex(),
+                event.as_json(),
+                1,
+            )
+            .expect("mark pending in memory");
+        outbox
+            .mark_failed_by_message_id("message", "offline".into(), 2)
+            .expect("mark failed");
+        outbox.path = Some(PathBuf::from("/dev/null/definitely-not-a-dir/outbox.json"));
+        outbox.dirty = false;
+        // Force dirty via prepare — save should fail and leave Failed.
+        let err = outbox
+            .prepare_auto_retry("message", 3)
+            .expect_err("save must fail");
+        let _ = err;
+        assert_eq!(
+            outbox.status_for_message("message"),
+            Some(DeliveryState::Failed)
+        );
     }
 
     #[test]

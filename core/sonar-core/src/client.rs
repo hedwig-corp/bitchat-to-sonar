@@ -3893,6 +3893,9 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
+        // Count the send before spawn so hosts that gate catch-up / shutdown on
+        // `send_inflight == 0` cannot observe a gap between return and task start.
+        send_inflight.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             message_id = %message_id_hex,
             event_id = %event.id.to_hex(),
@@ -3903,6 +3906,7 @@ impl SonarClient {
             let mut publish_result_tx = Some(publish_result_tx);
             let mut event = event;
             let mut group_id_hex = group_id_hex;
+            let mut inflight_held = true;
             // One task owns the publish + core auto-retry loop so a transient
             // outage self-heals without waiting for host idle
             // `ensure_subscriptions` (which never runs while the chat keeps
@@ -3911,7 +3915,10 @@ impl SonarClient {
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
                     break;
                 }
-                send_inflight.fetch_add(1, Ordering::Relaxed);
+                if !inflight_held {
+                    send_inflight.fetch_add(1, Ordering::Relaxed);
+                    inflight_held = true;
+                }
                 let publish_started = Instant::now();
                 let event_id_hex = event.id.to_hex();
                 let notify = {
@@ -3979,8 +3986,9 @@ impl SonarClient {
                         Err(err) => failures.push(err),
                     }
                 }
-                send_inflight.fetch_sub(1, Ordering::Relaxed);
                 if acked {
+                    send_inflight.fetch_sub(1, Ordering::Relaxed);
+                    inflight_held = false;
                     break;
                 }
                 // The channel closed without a single OK: every relay failed.
@@ -4030,6 +4038,8 @@ impl SonarClient {
                 );
                 // Release send_inflight across the backoff so historical
                 // catch-up is not blocked for the full retry sleep.
+                send_inflight.fetch_sub(1, Ordering::Relaxed);
+                inflight_held = false;
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
                 if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
                     break;
@@ -4043,7 +4053,11 @@ impl SonarClient {
                         group_id_hex = next_group_id_hex;
                         event = next_event;
                         // Pending again — host paints "Sending" while we retry.
-                        notify();
+                        // Same message_id always maps to the same MLS group;
+                        // rebuild notify with the (possibly refreshed) id.
+                        if let Some(listener) = change_listener.lock().unwrap().clone() {
+                            listener.on_conversation_changed(group_id_hex.clone());
+                        }
                     }
                     Ok(None) => break,
                     Err(err) => {
@@ -4055,6 +4069,9 @@ impl SonarClient {
                         break;
                     }
                 }
+            }
+            if inflight_held {
+                send_inflight.fetch_sub(1, Ordering::Relaxed);
             }
         });
         publish_result_rx

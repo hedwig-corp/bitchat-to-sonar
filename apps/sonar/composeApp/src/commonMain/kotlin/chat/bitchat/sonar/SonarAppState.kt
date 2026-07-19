@@ -9355,6 +9355,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun stopMarmotWakeLoop() {
         marmotWakeJob?.cancel()
         marmotWakeJob = null
+        // New account / wipe must not inherit the previous session's throttle.
+        lastOutboxRetrySecs = 0L
     }
 
     private suspend fun retryOutboxIfDue() {
@@ -9365,7 +9367,15 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         lastOutboxRetrySecs = now
-        runCatching { SonarCore.retryOutbox() }
+        try {
+            SonarCore.retryOutbox()
+        } catch (e: CancellationException) {
+            // Do not consume the throttle slot for a cancelled attempt.
+            lastOutboxRetrySecs = 0L
+            throw e
+        } catch (_: Throwable) {
+            // Best-effort flush; core auto-retry still owns Failed rows.
+        }
     }
 
     /** BLE mesh is the real-time rail for calls, so it must not wait for the

@@ -3427,6 +3427,7 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        lastOutboxRetryAt = nil
         // Latch core cancel before clearing the Task slot so an in-flight quiet
         // resume on mediaLane observes cancel (observer=None otherwise ignores
         // Task.cancel). Do not nil the slot until the task finishes — same
