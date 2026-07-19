@@ -63,17 +63,18 @@ public enum TranscriptScrollPolicy {
         if let jumpId {
             return .jump(id: jumpId)
         }
-        if usesBottomScrollAnchor(
-            unreadAnchorId: unreadAnchorId,
-            unreadCountAtOpen: unreadCountAtOpen,
-            unreadAnchorAbandoned: unreadAnchorAbandoned
-        ) {
-            return .liveEdge
-        }
-        if let unreadCountAtOpen, unreadCountAtOpen > 0, !unreadAnchorAbandoned {
+        // Mirror KMP `resolveOpenAction`: null count is provisional live edge
+        // only when no frozen anchor; a retained unreadAnchorId keeps UnreadDivider
+        // so hosts can re-anchor when the settled count lands.
+        if unreadCountAtOpen == nil {
+            if unreadAnchorId == nil && !unreadAnchorAbandoned {
+                return .liveEdge
+            }
             return .unreadDivider
         }
-        return .liveEdge
+        let fullyRead =
+            unreadAnchorId == nil && (unreadCountAtOpen == 0 || unreadAnchorAbandoned)
+        return fullyRead ? .liveEdge : .unreadDivider
     }
 
     public static func shouldResnapFullyReadOpen(

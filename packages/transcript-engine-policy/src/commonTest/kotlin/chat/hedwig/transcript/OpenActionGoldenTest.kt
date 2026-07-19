@@ -21,6 +21,9 @@ class OpenActionGoldenTest {
         assertCase(text, "pending_unread_divider", TranscriptOpenAction.UnreadDivider)
         assertCase(text, "abandoned_unread_live_edge", TranscriptOpenAction.LiveEdge)
         assertCase(text, "unset_capture_provisional_live_edge", TranscriptOpenAction.LiveEdge)
+        assertCase(text, "frozen_anchor_zero_count_unread_divider", TranscriptOpenAction.UnreadDivider)
+        assertCase(text, "frozen_anchor_unset_count_unread_divider", TranscriptOpenAction.UnreadDivider)
+        assertCase(text, "frozen_anchor_abandoned_keeps_divider", TranscriptOpenAction.UnreadDivider)
         assertJumpCase(text, "jump_wins", "m:search")
     }
 

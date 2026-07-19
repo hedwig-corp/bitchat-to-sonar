@@ -236,6 +236,12 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
 
         composerHost.view.translatesAutoresizingMaskIntoConstraints = false
         composerHost.view.backgroundColor = .clear
+        // Tray open/close changes composer intrinsic height; without this the
+        // hosting view does not reliably report the new size to Auto Layout
+        // (#352 — was on the pre-extract Sonar host).
+        if #available(iOS 16.0, *) {
+            composerHost.sizingOptions = .intrinsicContentSize
+        }
         if #available(iOS 16.4, *) {
             composerHost.safeAreaRegions = []
         }
@@ -305,14 +311,16 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         heightKey: ((TranscriptDayRow) -> String)? = nil,
         transcriptBackgroundColor: UIColor? = nil
     ) {
-        var renderHooksChanged = false
+        // Always refresh hook references (SwiftUI rebuilds closures every turn),
+        // but do NOT treat that as a layout invalidation — height-key diffs in
+        // applySnapshot drive reconfigure. Wiping the cache / force-reconfigure
+        // on every update thrashes contentSize during keyboard/composer growth
+        // and fights R-009 pin/lockstep.
         if let callbacks {
             self.callbacks = callbacks
-            renderHooksChanged = true
         }
         if let heightKey {
             heightKeyForItem = heightKey
-            renderHooksChanged = true
         }
         if let transcriptBackgroundColor {
             self.transcriptBackgroundColor = transcriptBackgroundColor
@@ -332,12 +340,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         let hadAnchor = unreadAnchorId != nil
         resolveUnreadAnchor()
         guard isViewLoaded, dataSource != nil else { return }
-        if renderHooksChanged {
-            // New closures may change theme / value-semantic lookups / sizing
-            // without height-key churn — force visible rows + cache refresh.
-            heightCache.removeAll()
-        }
-        applySnapshot(forceReconfigureAll: renderHooksChanged)
+        applySnapshot(forceReconfigureAll: false)
 
         let revision = TranscriptTailRevision(itemCount: entries.count, tailID: entries.last?.id)
         if !didInitialScroll {

@@ -432,7 +432,7 @@ struct SonarHomeScreen: View {
                     guard members.count >= 2 else { return }
                     composeSheet = false
                     if let id = store.startGroup(name: name, members: members) {
-                        store.push(.dm(id))
+                        store.openDM(id)
                     }
                 }
             }
@@ -464,7 +464,7 @@ struct SonarHomeScreen: View {
                 let invite = invite
                 pendingInvite = nil
                 let id = store.acceptGroupInvite(invite)
-                store.push(.dm(id))
+                store.openDM(id)
             }
             Button {
                 let invite = invite

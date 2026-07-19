@@ -179,7 +179,7 @@ struct SonarContactProfileScreen: View {
                                 return
                             }
                             if effectiveChatId != peerId {
-                                store.push(.dm(effectiveChatId))
+                                store.openDM(effectiveChatId)
                             } else {
                                 store.pop()
                             }
@@ -254,7 +254,7 @@ struct SonarContactProfileScreen: View {
                         SNSettingsCard {
                             ForEach(Array(sharedGroups.enumerated()), id: \.element.id) { i, group in
                                 Button {
-                                    store.push(.dm(group.id))
+                                    store.openDM(group.id)
                                 } label: {
                                     HStack(spacing: 12) {
                                         SonarAvatar(name: group.title, size: 36)
