@@ -3906,8 +3906,8 @@ func snPrepareComposerSend(text: String) -> String? {
     return payload.isEmpty ? nil : payload
 }
 
-/// Session-scoped per-chat draft map update. Empty text removes the entry so
-/// navigating away and back restores only real in-progress drafts.
+/// Per-chat draft map update. Empty text removes the entry so navigating away
+/// and back restores only real in-progress drafts; send clears the same way.
 func snUpdatedComposerDrafts(
     drafts: [String: String],
     chatId: String,

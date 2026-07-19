@@ -991,12 +991,15 @@ final class SonarAppStore: ObservableObject {
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
-    /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
-    /// Survives leaving a chat and returning within the same process; cleared on send.
+    /// Composer drafts keyed by chat id (DM peer/group, channel id).
+    /// Survives leave/return and process restarts via `Keys.composerDrafts`;
+    /// cleared on send, wipe, and erase.
     /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate
     /// every `SonarAppStore` observer and re-enter the UIKit transcript host
     /// (`updateUIViewController` → `applySnapshot`) while typing.
     private var composerDrafts: [String: String] = [:]
+    private var composerDraftsPersistWorkItem: DispatchWorkItem?
+    private static let composerDraftsPersistDebounce: TimeInterval = 0.3
 
     /// Boundary-only published mirror of draft non-emptiness per chat. The draft
     /// map above stays unpublished, but the composer's send/mic toggle must
@@ -1016,12 +1019,53 @@ final class SonarAppStore: ObservableObject {
         let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
         guard next != composerDrafts else { return }
         composerDrafts = next
+        // Clear-on-send must hit disk immediately so a kill before debounce
+        // cannot resurrect a sent draft; typing stays debounced.
+        scheduleComposerDraftsPersist(immediate: text.isEmpty)
     }
 
     func composerDraftBinding(for chatId: String) -> Binding<String> {
         Binding(
             get: { [weak self] in self?.composerDraft(for: chatId) ?? "" },
             set: { [weak self] in self?.setComposerDraft($0, for: chatId) }
+        )
+    }
+
+    private func scheduleComposerDraftsPersist(immediate: Bool) {
+        composerDraftsPersistWorkItem?.cancel()
+        if immediate {
+            persistComposerDrafts()
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            self?.persistComposerDrafts()
+        }
+        composerDraftsPersistWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.composerDraftsPersistDebounce,
+            execute: work
+        )
+    }
+
+    private func persistComposerDrafts() {
+        let stored = snEncodeComposerDraftsForDefaults(composerDrafts)
+        if stored.isEmpty {
+            defaults.removeObject(forKey: Keys.composerDrafts)
+        } else {
+            defaults.set(stored, forKey: Keys.composerDrafts)
+        }
+    }
+
+    private func clearComposerDrafts() {
+        composerDraftsPersistWorkItem?.cancel()
+        composerDraftsPersistWorkItem = nil
+        composerDrafts = [:]
+        defaults.removeObject(forKey: Keys.composerDrafts)
+    }
+
+    private static func loadComposerDrafts(from defaults: UserDefaults) -> [String: String] {
+        snDecodeComposerDraftsFromDefaults(
+            defaults.dictionary(forKey: Keys.composerDrafts) as? [String: String]
         )
     }
 
@@ -1538,6 +1582,7 @@ final class SonarAppStore: ObservableObject {
         #endif
         marmotVerified = (UserDefaults.standard.dictionary(forKey: Keys.marmotVerified) as? [String: Bool]) ?? [:]
         bip353 = UserDefaults.standard.string(forKey: Keys.bip353) ?? ""
+        composerDrafts = Self.loadComposerDrafts(from: defaults)
         // Drop the old prototype demo blob if it is still around.
         defaults.removeObject(forKey: Keys.legacyDemoState)
         callLogs = Self.loadCallLogs(from: defaults)
@@ -2266,6 +2311,7 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
+        clearComposerDrafts()
         coreClaimedHandle = nil
         handleClaimState = .idle
         // Previous account's nickname must not survive into the restored
@@ -8793,6 +8839,7 @@ final class SonarAppStore: ObservableObject {
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
         clearMediaDiskCache()
+        clearComposerDrafts()
         objectWillChange.send()
     }
 
@@ -8908,6 +8955,7 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
+        clearComposerDrafts()
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
         if !walletWipeComplete {

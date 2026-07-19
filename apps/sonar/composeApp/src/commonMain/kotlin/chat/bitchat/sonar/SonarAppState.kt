@@ -90,6 +90,8 @@ private const val PROFILE_SWEEP_MS = 30 * 60_000L
 private const val GROUP_FOLDS_BLOB_KEY = "sonar.groupFolds"
 private const val NPUB_BLOB_KEY = "sonar.npub"
 private const val MESH_NAMES_BLOB_KEY = "sonar.meshNames"
+/** Debounce durable draft writes so keystrokes don't hammer the blob store. */
+private const val COMPOSER_DRAFTS_PERSIST_DEBOUNCE_MS = 300L
 private const val FAVORITED_CONTROL = "[FAVORITED]"
 private const val UNFAVORITED_CONTROL = "[UNFAVORITED]"
 private const val MESH_MEDIA_URL_PREFIX = "mesh-media:"
@@ -934,6 +936,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             clearChatSnapshot()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
+            clearComposerDrafts()
             val coreWipeFailure = runCatching { SonarCore.wipe() }.exceptionOrNull()
             nick = ""; npub = ""
             localCoreReady = false; homeMessagesHydrated = false
@@ -997,6 +1000,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             PaymentActivityStore.wipe()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
+            clearComposerDrafts()
             callLogs.clear(); callVersion++
             notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
             scanWatermark.clear(); stagedChangedPages.clear(); failedChangedPageReads.clear()
@@ -2580,10 +2584,14 @@ class SonarAppState(private val scope: CoroutineScope) {
     var toast by mutableStateOf<String?>(null)
 
     /**
-     * In-memory composer drafts keyed by chat id (DM, channel, geo-DM).
-     * Survives leaving a chat and returning within the same process; cleared on send.
+     * Composer drafts keyed by chat id (DM, channel, geo-DM).
+     * Survives leave/return and process restarts via [COMPOSER_DRAFTS_BLOB_KEY];
+     * cleared on send, wipe, and erase.
      */
-    private val composerDrafts = mutableStateMapOf<String, String>()
+    private val composerDrafts = mutableStateMapOf<String, String>().apply {
+        putAll(decodeComposerDrafts(SonarCore.loadBlob(COMPOSER_DRAFTS_BLOB_KEY)))
+    }
+    private var composerDraftsPersistJob: Job? = null
 
     fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
 
@@ -2596,6 +2604,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         } else {
             composerDrafts[chatId] = next.getValue(chatId)
         }
+        // Clear-on-send must hit disk immediately so a kill before debounce
+        // cannot resurrect a sent draft; typing stays debounced.
+        scheduleComposerDraftsPersist(immediate = text.isEmpty())
+    }
+
+    private fun scheduleComposerDraftsPersist(immediate: Boolean) {
+        composerDraftsPersistJob?.cancel()
+        if (immediate) {
+            persistComposerDrafts()
+            return
+        }
+        composerDraftsPersistJob = scope.launch {
+            delay(COMPOSER_DRAFTS_PERSIST_DEBOUNCE_MS)
+            persistComposerDrafts()
+        }
+    }
+
+    private fun persistComposerDrafts() {
+        SonarCore.saveBlob(COMPOSER_DRAFTS_BLOB_KEY, encodeComposerDrafts(composerDrafts.toMap()))
+    }
+
+    private fun clearComposerDrafts() {
+        composerDraftsPersistJob?.cancel()
+        composerDraftsPersistJob = null
+        composerDrafts.clear()
+        SonarCore.saveBlob(COMPOSER_DRAFTS_BLOB_KEY, "")
     }
 
     /** "N here now" for a geohash channel (0 ⇒ unknown / nobody). */
@@ -3431,6 +3465,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 PaymentActivityStore.wipe()
                 cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
                 mediaCache.clear(); clearStickerCaches()
+                clearComposerDrafts()
                 callLogs.clear(); callVersion++
                 notificationSeenMessageIds.clear(); notificationLatestSecs.clear()
                 scanWatermark.clear()
