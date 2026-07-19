@@ -3438,6 +3438,8 @@ final class MarmotChatModel: ObservableObject {
             return "Not connected yet — try again in a moment."
         case MarmotService.ServiceError.cancelled:
             return "Operation cancelled."
+        case MarmotService.ServiceError.backupAlreadyInProgress:
+            return "Backup already in progress."
         case MarmotService.ServiceError.invalidInput(let detail):
             return "Invalid input: \(detail)"
         case MarmotService.ServiceError.core(let detail):

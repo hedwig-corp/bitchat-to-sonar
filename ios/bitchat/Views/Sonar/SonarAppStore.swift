@@ -2648,6 +2648,8 @@ final class SonarAppStore: ObservableObject {
             return "Not connected yet — try again in a moment."
         case MarmotService.ServiceError.cancelled:
             return "Claim cancelled — try again."
+        case MarmotService.ServiceError.backupAlreadyInProgress:
+            return "Backup already in progress."
         case MarmotService.ServiceError.invalidInput(let message),
              MarmotService.ServiceError.core(let message):
             detail = message
