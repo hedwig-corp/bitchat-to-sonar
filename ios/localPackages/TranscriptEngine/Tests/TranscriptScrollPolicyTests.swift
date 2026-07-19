@@ -126,4 +126,63 @@ struct TranscriptScrollPolicyTests {
             )
         )
     }
+
+    /// Collection-host open recovery must keep `needsLiveEdgeOpen` until owned
+    /// chrome has been applied — "near" against a pre-chrome maxY is not the
+    /// live edge (MsgList waits for the `sn-bottom` sentinel).
+    @Test
+    func clearLiveEdgeOpenRequiresOwnedChrome() {
+        #expect(
+            !TranscriptScrollPolicy.shouldClearLiveEdgeOpen(
+                isNearBottom: true,
+                ownedChromeApplied: false
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldClearLiveEdgeOpen(
+                isNearBottom: true,
+                ownedChromeApplied: true
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldClearLiveEdgeOpen(
+                isNearBottom: false,
+                ownedChromeApplied: true
+            )
+        )
+    }
+
+    /// Snapshot layout can fire `scrollViewDidScroll` before the live-edge
+    /// latch is armed; that must not set `hasLeftBottom` and kill resnap.
+    @Test
+    func markLeftBottomIgnoresProgrammaticLiveEdgeOpen() {
+        #expect(
+            !TranscriptScrollPolicy.shouldMarkLeftBottom(
+                needsLiveEdgeOpen: true,
+                wasPinned: false,
+                userDragging: false
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: false,
+                userDragging: false
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: true,
+                userDragging: false
+            )
+        )
+        #expect(
+            TranscriptScrollPolicy.shouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: true,
+                userDragging: true
+            )
+        )
+    }
 }

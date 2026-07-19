@@ -43,6 +43,28 @@ public func snShouldResnapFullyReadOpen(
     )
 }
 
+public func snShouldClearLiveEdgeOpen(
+    isNearBottom: Bool,
+    ownedChromeApplied: Bool
+) -> Bool {
+    TranscriptScrollPolicy.shouldClearLiveEdgeOpen(
+        isNearBottom: isNearBottom,
+        ownedChromeApplied: ownedChromeApplied
+    )
+}
+
+public func snShouldMarkLeftBottom(
+    needsLiveEdgeOpen: Bool,
+    wasPinned: Bool,
+    userDragging: Bool
+) -> Bool {
+    TranscriptScrollPolicy.shouldMarkLeftBottom(
+        needsLiveEdgeOpen: needsLiveEdgeOpen,
+        wasPinned: wasPinned,
+        userDragging: userDragging
+    )
+}
+
 public func snTranscriptShowsDayChip(previous: Date?, current: Date?, calendar: Calendar = .current) -> Bool {
     transcriptShowsDayChip(previous: previous, current: current, calendar: calendar)
 }

@@ -212,6 +212,56 @@ struct SNTailPinLatchTests {
         )
     }
 
+    /// Collection host must not end live-edge open recovery on "near bottom"
+    /// measured before owned composer chrome lands — that maxY is short of the
+    /// true live edge and leaves the last message a flick below the fold.
+    @Test
+    func clearLiveEdgeOpenRequiresOwnedChrome() {
+        #expect(
+            !snShouldClearLiveEdgeOpen(isNearBottom: true, ownedChromeApplied: false)
+        )
+        #expect(
+            snShouldClearLiveEdgeOpen(isNearBottom: true, ownedChromeApplied: true)
+        )
+        #expect(
+            !snShouldClearLiveEdgeOpen(isNearBottom: false, ownedChromeApplied: true)
+        )
+    }
+
+    /// Pre-latch `scrollViewDidScroll` during snapshot layout must not set
+    /// `hasLeftBottom` and abort `shouldResnapFullyReadOpen`.
+    @Test
+    func markLeftBottomIgnoresProgrammaticLiveEdgeOpen() {
+        #expect(
+            !snShouldMarkLeftBottom(
+                needsLiveEdgeOpen: true,
+                wasPinned: false,
+                userDragging: false
+            )
+        )
+        #expect(
+            snShouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: false,
+                userDragging: false
+            )
+        )
+        #expect(
+            !snShouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: true,
+                userDragging: false
+            )
+        )
+        #expect(
+            snShouldMarkLeftBottom(
+                needsLiveEdgeOpen: false,
+                wasPinned: true,
+                userDragging: true
+            )
+        )
+    }
+
     /// Signal captures this state before changing its collection-view inset.
     /// The keyboard notification must do the same before SwiftUI publishes
     /// the safe-area shrink or its offset clamp.

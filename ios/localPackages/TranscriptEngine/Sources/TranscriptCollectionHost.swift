@@ -301,11 +301,17 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 self.lastContentHeight = height
                 return
             }
-            self.lastContentHeight = height
-            guard !self.isUserScrolling, !self.isLoadingOlder else { return }
+            guard !self.isUserScrolling, !self.isLoadingOlder else {
+                self.lastContentHeight = height
+                return
+            }
+            // Do not advance lastContentHeight while unpinned during open —
+            // otherwise the final pre-latch size is consumed and never re-pins
+            // when needsLiveEdgeOpen / wasPinned land a turn later.
             guard self.needsLiveEdgeOpen || self.latch.wasPinned || self.isScrolledToBottom() else {
                 return
             }
+            self.lastContentHeight = height
             self.scrollToBottomOfLoadWindow(animated: false)
         }
         applySnapshot()
@@ -604,6 +610,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             }
         case .liveEdge:
             needsLiveEdgeOpen = true
+            // Fully-read open starts at the live edge; clear any leftover from
+            // a prior unread/jump open on a reused host so resnap can run.
+            hasLeftBottom = false
             latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
             DispatchQueue.main.async { [weak self] in
                 self?.resnapFullyReadOpenIfNeeded()
@@ -678,9 +687,21 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             animated: animated
         )
         latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
-        if isScrolledToBottom() {
-            needsLiveEdgeOpen = false
-        }
+        clearLiveEdgeOpenIfSettled()
+    }
+
+    /// Owned chrome has been measured at least once (`lastBarHeight` set by
+    /// `updateOwnedInsetsFromChrome`). Until then, "near bottom" is measured
+    /// against an incomplete maxY and must not end open recovery.
+    private var ownedChromeApplied: Bool { lastBarHeight > 0 }
+
+    private func clearLiveEdgeOpenIfSettled() {
+        guard needsLiveEdgeOpen else { return }
+        guard TranscriptScrollPolicy.shouldClearLiveEdgeOpen(
+            isNearBottom: isScrolledToBottom(),
+            ownedChromeApplied: ownedChromeApplied
+        ) else { return }
+        needsLiveEdgeOpen = false
     }
 
     private func isScrolledToBottom() -> Bool {
@@ -727,11 +748,11 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
 
         let captured = TranscriptScrollPolicy.captureWasAtTail(
             currentlyNearBottom: near,
-            previouslyPinned: latch.wasPinned,
+            previouslyPinned: latch.wasPinned || needsLiveEdgeOpen,
             userScrolling: userScrolling,
             isPrepending: isLoadingOlder
         )
-        if captured.wasAtTail {
+        if captured.wasAtTail || needsLiveEdgeOpen {
             latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
         } else if userScrolling {
             latch.userScrolled(isNearBottom: near)
@@ -886,7 +907,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if near {
             isUserScrolling = false
             userScrollGeneration &+= 1
-            needsLiveEdgeOpen = false
+            clearLiveEdgeOpenIfSettled()
             latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
             if hasLeftBottom, let loadNewest, !isLoadingNewest, !isLoadingOlder {
                 let anchorId = entries.last?.id ?? "transcript-bottom"
@@ -900,7 +921,11 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 }
             }
         } else {
-            if !latch.wasPinned || scrollView.isDragging || scrollView.isTracking {
+            if TranscriptScrollPolicy.shouldMarkLeftBottom(
+                needsLiveEdgeOpen: needsLiveEdgeOpen,
+                wasPinned: latch.wasPinned,
+                userDragging: scrollView.isDragging || scrollView.isTracking
+            ) {
                 hasLeftBottom = true
             }
             if scrollView.isDragging || scrollView.isTracking {
