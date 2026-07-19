@@ -582,6 +582,29 @@ impl sonar_core::client::MediaDownloadObserver for FfiMediaDownloadObserver<'_> 
     }
 }
 
+/// Progress and cancellation bridge for a Blossom media upload. Hosts keep this
+/// object alive until the blocking `send_media_*_with_progress` call exits.
+#[uniffi::export(callback_interface)]
+pub trait MediaUploadListener: Send + Sync {
+    fn on_progress(&self, client_pending_id: String, bytes_sent: u64, total_bytes: u64);
+    fn is_cancelled(&self) -> bool;
+}
+
+struct FfiMediaUploadObserver<'a> {
+    listener: &'a dyn MediaUploadListener,
+}
+
+impl sonar_core::client::MediaUploadObserver for FfiMediaUploadObserver<'_> {
+    fn on_progress(&self, client_pending_id: &str, bytes_sent: u64, total_bytes: u64) {
+        self.listener
+            .on_progress(client_pending_id.to_string(), bytes_sent, total_bytes);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.listener.is_cancelled()
+    }
+}
+
 /// FFI-friendly conversation summary from the core-owned index.
 #[derive(uniffi::Record)]
 pub struct ConversationSummaryInfo {
@@ -1347,6 +1370,94 @@ impl SonarNode {
             &server_url,
         ))?;
         Ok(())
+    }
+
+    /// Like `send_media`, with Blossom upload progress for the host optimistic
+    /// bubble identified by `client_pending_id`.
+    pub fn send_media_with_progress(
+        &self,
+        group_id_hex: String,
+        data: Vec<u8>,
+        filename: String,
+        mime: String,
+        caption: String,
+        server_url: String,
+        client_pending_id: String,
+        listener: Box<dyn MediaUploadListener>,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let observer = FfiMediaUploadObserver {
+            listener: listener.as_ref(),
+        };
+        self.runtime
+            .block_on(self.client.send_media_multi_with_progress(
+                &group_id,
+                vec![sonar_core::client::MediaUpload {
+                    data,
+                    filename,
+                    mime,
+                }],
+                &caption,
+                &server_url,
+                &client_pending_id,
+                Some(&observer),
+            ))?;
+        Ok(())
+    }
+
+    /// Like `send_media_multi`, with aggregated album upload progress.
+    pub fn send_media_multi_with_progress(
+        &self,
+        group_id_hex: String,
+        items: Vec<MediaUploadItem>,
+        caption: String,
+        server_url: String,
+        client_pending_id: String,
+        listener: Box<dyn MediaUploadListener>,
+    ) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        let uploads = items
+            .into_iter()
+            .map(|i| sonar_core::client::MediaUpload {
+                data: i.data,
+                filename: i.filename,
+                mime: i.mime,
+            })
+            .collect();
+        let observer = FfiMediaUploadObserver {
+            listener: listener.as_ref(),
+        };
+        self.runtime
+            .block_on(self.client.send_media_multi_with_progress(
+                &group_id,
+                uploads,
+                &caption,
+                &server_url,
+                &client_pending_id,
+                Some(&observer),
+            ))?;
+        Ok(())
+    }
+
+    /// Resume durable pre-Blossom media staging left by interrupted uploads.
+    /// Returns how many staged entries were attempted.
+    pub fn resume_pending_media_uploads(
+        &self,
+        listener: Box<dyn MediaUploadListener>,
+    ) -> FfiResult<u32> {
+        let observer = FfiMediaUploadObserver {
+            listener: listener.as_ref(),
+        };
+        Ok(self
+            .runtime
+            .block_on(self.client.resume_pending_media_uploads(Some(&observer)))?)
+    }
+
+    /// Resume durable staged media uploads without a progress listener.
+    pub fn resume_pending_media_uploads_quiet(&self) -> FfiResult<u32> {
+        Ok(self
+            .runtime
+            .block_on(self.client.resume_pending_media_uploads(None))?)
     }
 
     /// Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.

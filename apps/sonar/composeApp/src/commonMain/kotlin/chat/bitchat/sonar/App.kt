@@ -2779,13 +2779,23 @@ private fun MediaBubble(
             // Photo album: render a swipeable stacked-card deck (xChat-style). A
             // mixed image+audio/file message keeps the single-first rendering
             // below (so audio still gets its player).
-            MediaDeck(
-                media = m.media,
-                state = state,
-                chatId = chatId,
-                maxBubbleWidth = maxBubbleWidth,
-                onOpen = { idx -> onOpenAlbum(m.media, idx) },
-            )
+            Box(Modifier.widthIn(max = maxBubbleWidth)) {
+                MediaDeck(
+                    media = m.media,
+                    state = state,
+                    chatId = chatId,
+                    maxBubbleWidth = maxBubbleWidth,
+                    onOpen = { idx -> onOpenAlbum(m.media, idx) },
+                )
+                if (m.state == "Uploading") {
+                    MediaUploadBar(
+                        progress = m.uploadProgress ?: 0f,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 4.dp, vertical = 3.dp),
+                    )
+                }
+            }
         } else if (media.isImage) {
             val transfer = state.mediaTransferState(media)
             androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
@@ -2864,6 +2874,14 @@ private fun MediaBubble(
                 }
                 if (transfer.phase == MediaTransferPhase.Downloading) {
                     MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
+                }
+                if (m.state == "Uploading") {
+                    MediaUploadBar(
+                        progress = m.uploadProgress ?: 0f,
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 4.dp, vertical = 3.dp),
+                    )
                 }
                 if (media.isGif && decoded == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
@@ -3327,6 +3345,27 @@ private fun MediaTransferOverlay(transfer: MediaTransferState, modifier: Modifie
         contentAlignment = Alignment.Center,
     ) {
         MediaTransferProgress(transfer, 30.dp)
+    }
+}
+
+/** XChat-style thin horizontal bar under an uploading media bubble. */
+@Composable
+private fun MediaUploadBar(progress: Float, modifier: Modifier = Modifier) {
+    val s = sonar
+    val clamped = progress.coerceIn(0f, 1f)
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(3.dp)
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.28f)),
+    ) {
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(clamped.coerceAtLeast(0.02f))
+                .background(s.accent),
+        )
     }
 }
 

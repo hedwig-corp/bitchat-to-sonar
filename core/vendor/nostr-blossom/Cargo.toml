@@ -72,8 +72,18 @@ version = "0.12"
 features = [
     "json",
     "rustls-tls",
+    "stream",
 ]
 default-features = false
+
+[dependencies.bytes]
+version = "1"
+default-features = false
+
+[dependencies.futures-util]
+version = "0.3"
+default-features = false
+features = ["std"]
 
 [dependencies.serde]
 version = "1.0"

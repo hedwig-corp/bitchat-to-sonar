@@ -1648,6 +1648,17 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func resolveHandle(input: String) throws  -> ResolvedHandleInfo
 
     /**
+     * Resume durable pre-Blossom media staging left by interrupted uploads.
+     * Returns how many staged entries were attempted.
+     */
+    func resumePendingMediaUploads(listener: MediaUploadListener) throws  -> UInt32
+
+    /**
+     * Resume durable staged media uploads without a progress listener.
+     */
+    func resumePendingMediaUploadsQuiet() throws  -> UInt32
+
+    /**
      * Retry one failed outgoing message from the durable local outbox. The
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
@@ -1697,6 +1708,17 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * non-empty.
      */
     func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String) throws
+
+    /**
+     * Like `send_media_multi`, with aggregated album upload progress.
+     */
+    func sendMediaMultiWithProgress(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String, clientPendingId: String, listener: MediaUploadListener) throws
+
+    /**
+     * Like `send_media`, with Blossom upload progress for the host optimistic
+     * bubble identified by `client_pending_id`.
+     */
+    func sendMediaWithProgress(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String, clientPendingId: String, listener: MediaUploadListener) throws
 
     /**
      * Encrypt + publish a sticker message to the group.
@@ -2431,6 +2453,30 @@ open func resolveHandle(input: String)throws  -> ResolvedHandleInfo  {
 }
 
     /**
+     * Resume durable pre-Blossom media staging left by interrupted uploads.
+     * Returns how many staged entries were attempted.
+     */
+open func resumePendingMediaUploads(listener: MediaUploadListener)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_resume_pending_media_uploads(
+            self.uniffiCloneHandle(),
+        FfiConverterCallbackInterfaceMediaUploadListener_lower(listener),$0
+    )
+})
+}
+
+    /**
+     * Resume durable staged media uploads without a progress listener.
+     */
+open func resumePendingMediaUploadsQuiet()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_resume_pending_media_uploads_quiet(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Retry one failed outgoing message from the durable local outbox. The
      * original encrypted event is republished, so retry cannot duplicate the
      * plaintext transcript row or mutate MLS state a second time.
@@ -2541,6 +2587,41 @@ open func sendMediaMulti(groupIdHex: String, items: [MediaUploadItem], caption: 
         FfiConverterSequenceTypeMediaUploadItem.lower(items),
         FfiConverterString.lower(caption),
         FfiConverterString.lower(serverUrl),$0
+    )
+}
+}
+
+    /**
+     * Like `send_media_multi`, with aggregated album upload progress.
+     */
+open func sendMediaMultiWithProgress(groupIdHex: String, items: [MediaUploadItem], caption: String, serverUrl: String, clientPendingId: String, listener: MediaUploadListener)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_media_multi_with_progress(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterSequenceTypeMediaUploadItem.lower(items),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(serverUrl),
+        FfiConverterString.lower(clientPendingId),
+        FfiConverterCallbackInterfaceMediaUploadListener_lower(listener),$0
+    )
+}
+}
+
+    /**
+     * Like `send_media`, with Blossom upload progress for the host optimistic
+     * bubble identified by `client_pending_id`.
+     */
+open func sendMediaWithProgress(groupIdHex: String, data: Data, filename: String, mime: String, caption: String, serverUrl: String, clientPendingId: String, listener: MediaUploadListener)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_send_media_with_progress(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterData.lower(data),
+        FfiConverterString.lower(filename),
+        FfiConverterString.lower(mime),
+        FfiConverterString.lower(caption),
+        FfiConverterString.lower(serverUrl),
+        FfiConverterString.lower(clientPendingId),
+        FfiConverterCallbackInterfaceMediaUploadListener_lower(listener),$0
     )
 }
 }
@@ -5755,6 +5836,169 @@ public func FfiConverterCallbackInterfaceMediaDownloadListener_lower(_ v: MediaD
     return FfiConverterCallbackInterfaceMediaDownloadListener.lower(v)
 }
 
+
+
+
+/**
+ * Progress and cancellation bridge for a Blossom media upload. Hosts keep this
+ * object alive until the blocking `send_media_*_with_progress` call exits.
+ */
+public protocol MediaUploadListener: AnyObject, Sendable {
+
+    func onProgress(clientPendingId: String, bytesSent: UInt64, totalBytes: UInt64)
+
+    func isCancelled()  -> Bool
+
+}
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceMediaUploadListener {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceMediaUploadListener = UniffiVTableCallbackInterfaceMediaUploadListener(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterCallbackInterfaceMediaUploadListener.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface MediaUploadListener: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterCallbackInterfaceMediaUploadListener.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface MediaUploadListener: handle missing in uniffiClone")
+            }
+        },
+        onProgress: { (
+            uniffiHandle: UInt64,
+            clientPendingId: RustBuffer,
+            bytesSent: UInt64,
+            totalBytes: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceMediaUploadListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onProgress(
+                     clientPendingId: try FfiConverterString.lift(clientPendingId),
+                     bytesSent: try FfiConverterUInt64.lift(bytesSent),
+                     totalBytes: try FfiConverterUInt64.lift(totalBytes)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        },
+        isCancelled: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<Int8>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> Bool in
+                guard let uniffiObj = try? FfiConverterCallbackInterfaceMediaUploadListener.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.isCancelled(
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterBool.lower($0) }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceMediaUploadListener> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceMediaUploadListener>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitMediaUploadListener() {
+    uniffi_sonar_ffi_fn_init_callback_vtable_mediauploadlistener(UniffiCallbackInterfaceMediaUploadListener.vtablePtr)
+}
+
+// FfiConverter protocol for callback interfaces
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterCallbackInterfaceMediaUploadListener {
+    fileprivate static let handleMap = UniffiHandleMap<MediaUploadListener>()
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+extension FfiConverterCallbackInterfaceMediaUploadListener : FfiConverter {
+    typealias SwiftType = MediaUploadListener
+    typealias FfiType = UInt64
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lift(_ handle: UInt64) throws -> SwiftType {
+        try handleMap.get(handle: handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func lower(_ v: SwiftType) -> UInt64 {
+        return handleMap.insert(obj: v)
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public static func write(_ v: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(v))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceMediaUploadListener_lift(_ handle: UInt64) throws -> MediaUploadListener {
+    return try FfiConverterCallbackInterfaceMediaUploadListener.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterCallbackInterfaceMediaUploadListener_lower(_ v: MediaUploadListener) -> UInt64 {
+    return FfiConverterCallbackInterfaceMediaUploadListener.lower(v)
+}
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -7345,6 +7589,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_resolve_handle() != 13801) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_resume_pending_media_uploads() != 53538) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_resume_pending_media_uploads_quiet() != 56734) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -7367,6 +7617,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_multi() != 39384) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_multi_with_progress() != 25536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_send_media_with_progress() != 21692) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_sticker() != 28650) {
@@ -7453,9 +7709,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_mediadownloadlistener_is_cancelled() != 18068) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_mediauploadlistener_on_progress() != 49388) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_mediauploadlistener_is_cancelled() != 640) {
+        return InitializationResult.apiChecksumMismatch
+    }
 
     uniffiCallbackInitConversationChangeListener()
     uniffiCallbackInitMediaDownloadListener()
+    uniffiCallbackInitMediaUploadListener()
     return InitializationResult.ok
 }()
 

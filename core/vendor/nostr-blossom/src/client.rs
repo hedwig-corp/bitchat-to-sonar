@@ -1,17 +1,20 @@
 //! Implements a Blossom client for interacting with Blossom servers
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::engine::general_purpose;
 use base64::Engine;
+use bytes::Bytes;
+use futures_util::stream;
 use nostr::hashes::sha256::Hash as Sha256Hash;
 use nostr::hashes::Hash;
 use nostr::signer::NostrSigner;
 use nostr::{Event, EventBuilder, JsonUtil, PublicKey, Timestamp, Url};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::redirect::Policy;
-use reqwest::{Response, StatusCode};
+use reqwest::{Body, Response, StatusCode};
 
 use crate::bud01::{
     BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb,
@@ -87,6 +90,116 @@ impl BlossomClient {
         request = request.headers(headers);
 
         let response: Response = request.send().await?;
+
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => {
+                let descriptor: BlobDescriptor = response.json().await?;
+                Ok(descriptor)
+            }
+            _ => Err(Error::response("Failed to upload blob", response)),
+        }
+    }
+
+    /// Uploads a blob, invoking `on_progress(bytes_sent, total_bytes)` as the
+    /// request body is streamed (chunked) to the server.
+    pub async fn upload_blob_with_progress<T, F>(
+        &self,
+        data: Vec<u8>,
+        content_type: Option<String>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        mut on_progress: Option<F>,
+    ) -> Result<BlobDescriptor, Error>
+    where
+        T: NostrSigner,
+        F: FnMut(u64, u64) + Send + 'static,
+    {
+        let url: Url = self.base_url.join("upload")?;
+
+        let hash: Sha256Hash = Sha256Hash::hash(&data);
+        let file_hashes: Vec<Sha256Hash> = vec![hash];
+        let total = data.len() as u64;
+
+        if let Some(cb) = on_progress.as_mut() {
+            cb(0, total);
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&total.to_string())?,
+        );
+
+        if let Some(ct) = content_type {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(&ct)?);
+        }
+
+        if let Some(signer) = signer {
+            let default_auth = self.default_auth(
+                BlossomAuthorizationVerb::Upload,
+                "Blossom upload authorization",
+                BlossomAuthorizationScope::BlobSha256Hashes(file_hashes),
+            );
+            let final_auth = authorization_options
+                .map(|opts| Self::update_authorization_fixture(&default_auth, opts))
+                .unwrap_or(default_auth);
+            let auth_header = Self::build_auth_header(signer, &final_auth).await?;
+            headers.insert(AUTHORIZATION, auth_header);
+        }
+
+        // Stream the body in chunks so hosts can paint upload progress as the
+        // request body is polled. Progress fires from the stream path itself —
+        // no extra runtime timer dependency in this crate.
+        //
+        // Redirects are disabled: a streamed body is not replayable, so
+        // following a 3xx would fail mid-upload. BUD-02 upload endpoints
+        // answer in place; treat redirects as errors instead.
+        const CHUNK: usize = 64 * 1024;
+        let data = Arc::new(data);
+        let progress = Arc::new(Mutex::new(on_progress));
+        let data_stream = data.clone();
+        let progress_stream = progress.clone();
+        let body_stream = stream::unfold(0usize, move |offset| {
+            let data = data_stream.clone();
+            let progress = progress_stream.clone();
+            async move {
+                if offset >= data.len() {
+                    return None;
+                }
+                let end = (offset + CHUNK).min(data.len());
+                let chunk = Bytes::copy_from_slice(&data[offset..end]);
+                if let Ok(mut guard) = progress.lock() {
+                    if let Some(cb) = guard.as_mut() {
+                        cb(end as u64, total);
+                    }
+                }
+                Some((Ok::<_, std::io::Error>(chunk), end))
+            }
+        });
+        let body = Body::wrap_stream(body_stream);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let upload_client = {
+            reqwest::Client::builder()
+                .redirect(Policy::none())
+                .build()
+                .unwrap_or_else(|_| self.client.clone())
+        };
+        #[cfg(target_arch = "wasm32")]
+        let upload_client = self.client.clone();
+
+        let response: Response = upload_client
+            .put(url)
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+
+        if let Ok(mut guard) = progress.lock() {
+            if let Some(cb) = guard.as_mut() {
+                cb(total, total);
+            }
+        }
 
         match response.status() {
             StatusCode::OK | StatusCode::CREATED => {

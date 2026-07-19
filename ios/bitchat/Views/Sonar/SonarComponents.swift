@@ -2302,6 +2302,25 @@ private typealias PlatformImage = UIImage
 private typealias PlatformImage = NSImage
 #endif
 
+/// XChat-style thin horizontal bar along the bottom edge of an uploading media bubble.
+private struct SNMediaUploadBar: View {
+    let progress: Double
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.black.opacity(0.28))
+                Capsule()
+                    .fill(SonarTheme.accent)
+                    .frame(width: max(4, geo.size.width * min(1, max(0, progress))))
+            }
+        }
+        .frame(height: 3)
+        .clipShape(Capsule())
+        .allowsHitTesting(false)
+    }
+}
+
 struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
@@ -2380,6 +2399,13 @@ struct SNMediaBubble: View {
             if m.mine { Spacer(minLength: 40) }
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
                 content
+                    .overlay(alignment: .bottom) {
+                        if let progress = m.uploadProgress, m.state == "Uploading" {
+                            SNMediaUploadBar(progress: progress)
+                                .padding(.horizontal, 2)
+                                .padding(.bottom, 2)
+                        }
+                    }
                 if !m.text.isEmpty {
                     Text(verbatim: m.text)
                         .font(SonarTheme.uiFont(size: 14.5))

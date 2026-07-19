@@ -71,6 +71,9 @@ pub enum Error {
     #[error("media download cancelled")]
     MediaDownloadCancelled,
 
+    #[error("media upload cancelled")]
+    MediaUploadCancelled,
+
     #[error("no relay connected within timeout")]
     NoRelayConnected,
 

@@ -11,6 +11,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import uniffi.sonar_ffi.SonarIdentity
 import uniffi.sonar_ffi.MediaDownloadListener as FfiMediaDownloadListener
+import uniffi.sonar_ffi.MediaUploadListener as FfiMediaUploadListener
 import uniffi.sonar_ffi.SonarNode
 import uniffi.sonar_ffi.wipeMarmotDatabase
 import java.io.File
@@ -211,6 +212,33 @@ actual object SonarCore {
         requireNode().sendMedia(chatId, data, filename, mime, caption, serverUrl)
     }
 
+    actual suspend fun sendMediaWithProgress(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        caption: String,
+        clientPendingId: String,
+        listener: SonarMediaUploadListener,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendMediaWithProgress(
+            chatId,
+            data,
+            filename,
+            mime,
+            caption,
+            serverUrl,
+            clientPendingId,
+            object : FfiMediaUploadListener {
+                override fun onProgress(clientPendingId: String, bytesSent: ULong, totalBytes: ULong) =
+                    listener.onProgress(clientPendingId, bytesSent, totalBytes)
+
+                override fun isCancelled(): Boolean = listener.isCancelled()
+            },
+        )
+    }
+
     actual suspend fun sendMediaMulti(
         chatId: String,
         items: List<AlbumUpload>,
@@ -223,6 +251,33 @@ actual object SonarCore {
             caption,
             serverUrl,
         )
+    }
+
+    actual suspend fun sendMediaMultiWithProgress(
+        chatId: String,
+        items: List<AlbumUpload>,
+        caption: String,
+        clientPendingId: String,
+        listener: SonarMediaUploadListener,
+        serverUrl: String,
+    ) = withContext(Dispatchers.IO) {
+        requireNode().sendMediaMultiWithProgress(
+            chatId,
+            items.map { uniffi.sonar_ffi.MediaUploadItem(it.bytes, it.filename, it.mime) },
+            caption,
+            serverUrl,
+            clientPendingId,
+            object : FfiMediaUploadListener {
+                override fun onProgress(clientPendingId: String, bytesSent: ULong, totalBytes: ULong) =
+                    listener.onProgress(clientPendingId, bytesSent, totalBytes)
+
+                override fun isCancelled(): Boolean = listener.isCancelled()
+            },
+        )
+    }
+
+    actual suspend fun resumePendingMediaUploads(): UInt = withContext(Dispatchers.IO) {
+        requireNode().resumePendingMediaUploadsQuiet()
     }
 
     actual suspend fun sendSticker(

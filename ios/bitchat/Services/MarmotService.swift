@@ -736,6 +736,31 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Like `sendMedia`, with Blossom upload progress for the optimistic bubble.
+    func sendMediaWithProgress(
+        groupId: String,
+        data: Data,
+        filename: String,
+        mime: String,
+        caption: String,
+        clientPendingId: String,
+        listener: MediaUploadListener,
+        serverUrl: String = ""
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendMediaWithProgress(
+                groupIdHex: groupId,
+                data: data,
+                filename: filename,
+                mime: mime,
+                caption: caption,
+                serverUrl: serverUrl,
+                clientPendingId: clientPendingId,
+                listener: listener
+            )
+        }
+    }
+
     /// One attachment of an album send (one message, N attachments).
     struct MediaAlbumItem: Sendable {
         let data: Data
@@ -762,6 +787,37 @@ final class MarmotService: @unchecked Sendable {
                 caption: caption,
                 serverUrl: serverUrl
             )
+        }
+    }
+
+    /// Like `sendMediaMulti`, with aggregated album upload progress.
+    func sendMediaMultiWithProgress(
+        groupId: String,
+        items: [MediaAlbumItem],
+        caption: String,
+        clientPendingId: String,
+        listener: MediaUploadListener,
+        serverUrl: String = ""
+    ) async throws {
+        try await run {
+            try $0.requireNode().sendMediaMultiWithProgress(
+                groupIdHex: groupId,
+                items: items.map {
+                    MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
+                },
+                caption: caption,
+                serverUrl: serverUrl,
+                clientPendingId: clientPendingId,
+                listener: listener
+            )
+        }
+    }
+
+    /// Resume durable pre-Blossom media staging after disconnect/kill.
+    @discardableResult
+    func resumePendingMediaUploads() async throws -> UInt32 {
+        try await run {
+            try $0.requireNode().resumePendingMediaUploadsQuiet()
         }
     }
 

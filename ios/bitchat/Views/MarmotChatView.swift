@@ -295,6 +295,8 @@ final class MarmotChatModel: ObservableObject {
     private(set) var pushWakeNotifiedMessageIDs = Set<String>()
     /// Group IDs already covered by a push-wake banner (drain or unread-delta).
     private(set) var pushWakeNotifiedGroupIds = Set<String>()
+    /// Blossom upload progress (0...1) keyed by optimistic message id.
+    @Published var mediaUploadProgress: [String: Double] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -772,6 +774,10 @@ final class MarmotChatModel: ObservableObject {
                 // hold the serial engine queue for their per-relay OK waits and
                 // delayed the first drain by ~50s on device (t3→t3a).
                 self.startPolling()
+                // Resume durable pre-Blossom media staging (mid-upload kill /
+                // disconnect). Does not block cold start; Blossom itself does
+                // not need the relay, but publish still uses the outbox.
+                Task { try? await self.service.resumePendingMediaUploads() }
                 try? await self.service.publishKeyPackageBackground()
                 // After nsec restore the local nick/handle sidecars are empty.
                 // Fetch our own kind-0 first so the host can adopt name + nip05
@@ -2463,23 +2469,37 @@ final class MarmotChatModel: ObservableObject {
         )
         Task {
             var echoVisible = false
+            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+                Task { @MainActor in
+                    self?.mediaUploadProgress[pendingId] = fraction
+                }
+            }
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                mediaUploadProgress[echo.id] = 0
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
-                try await service.sendMedia(
-                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                // Blossom upload does not need the relay; durable staging keeps
+                // the attachment if the process dies mid-upload. Publish waits
+                // for relay via the outbox after the URL exists.
+                try await service.sendMediaWithProgress(
+                    groupId: groupId,
+                    data: data,
+                    filename: filename,
+                    mime: mime,
+                    caption: caption,
+                    clientPendingId: echo.id,
+                    listener: listener
                 )
+                mediaUploadProgress.removeValue(forKey: echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                mediaUploadProgress.removeValue(forKey: echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
@@ -2532,21 +2552,32 @@ final class MarmotChatModel: ObservableObject {
         )
         Task {
             var echoVisible = false
+            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+                Task { @MainActor in
+                    self?.mediaUploadProgress[pendingId] = fraction
+                }
+            }
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                mediaUploadProgress[echo.id] = 0
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
-                try await service.sendMediaMulti(groupId: groupId, items: items, caption: caption)
+                try await service.sendMediaMultiWithProgress(
+                    groupId: groupId,
+                    items: items,
+                    caption: caption,
+                    clientPendingId: echo.id,
+                    listener: listener
+                )
+                mediaUploadProgress.removeValue(forKey: echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                mediaUploadProgress.removeValue(forKey: echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
