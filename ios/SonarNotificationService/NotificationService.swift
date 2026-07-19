@@ -62,12 +62,14 @@ class NotificationService: SDKNotificationService {
         if Self.isTransponderPush(request.content.userInfo) {
             os_log("NSE: handling Transponder Marmot push",
                    log: Self.log, type: .info)
+            Self.recordDiagnostic("didReceive:transponder")
             self.contentHandler = contentHandler
             let content = Self.mutableContent(for: request)
             bestAttemptContent = content
             guard Self.transponderNotificationsEnabled() else {
                 os_log("NSE: suppressing Transponder notification by user preference",
                        log: Self.log, type: .info)
+                Self.recordDiagnostic("suppressed:notificationsDisabled")
                 Self.suppressTransponderNotification(content)
                 finish(with: content)
                 return
@@ -123,6 +125,7 @@ class NotificationService: SDKNotificationService {
             if notifications.isEmpty {
                 os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
                        log: Self.log, type: .info)
+                Self.recordDiagnostic("emptyDrain:keepingGeneric")
                 releaseMarmotWakeNode()
                 finish(with: content)
                 return
@@ -140,11 +143,23 @@ class NotificationService: SDKNotificationService {
             }
             os_log("NSE: Marmot wake decorated primary + %d additional",
                    log: Self.log, type: .info, extras.count)
+            Self.recordDiagnostic(
+                "decorated:showNames=\(prefs.showNames):showPreview=\(prefs.showPreview):extras=\(extras.count):title=\(content.title.prefix(48))"
+            )
             releaseMarmotWakeNode()
             finish(with: content)
         } catch {
             os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
                    log: Self.log, type: .error, String(describing: error))
+            // acquireStoreLockForWake / credential checks already stamped a
+            // precise reason — only fill in when nothing was recorded yet.
+            if Self.lastDiagnostic().isEmpty {
+                Self.recordDiagnostic("failed:\(String(describing: error))")
+            } else {
+                Self.recordDiagnostic(
+                    "\(Self.lastDiagnostic()) | catch:\(String(describing: error))"
+                )
+            }
             releaseMarmotWakeNode()
             finish(with: content)
         }
@@ -154,17 +169,19 @@ class NotificationService: SDKNotificationService {
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
     /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
     private func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
-        guard let nsec = Self.readKeychainString(account: Self.nsecKeychainKey),
-              let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey),
-              !nsec.isEmpty,
-              dbKeyHex.count == 64
-        else {
+        let nsec = Self.readKeychainString(account: Self.nsecKeychainKey)
+        let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey)
+        guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
+            Self.recordDiagnostic(
+                "missingCredentials:nsec=\(nsec != nil):dbKey=\(dbKeyHex?.count ?? -1)"
+            )
             throw NSEMarmotError.missingCredentials
         }
         let dbURL = try Self.existingMarmotDatabaseURL()
-        guard let storeLock = MarmotStoreLock.tryAcquireExclusive() else {
-            throw NSEMarmotError.storeBusy
-        }
+        // Background suspend releases the flock asynchronously (beginBackgroundTask
+        // + closeNode). Retry briefly so a Transponder wake that races the
+        // suspend path still hydrates instead of sticking on the generic banner.
+        let storeLock = try Self.acquireStoreLockForWake()
         let identity = try SonarIdentity.import(nsec: nsec)
         let node: SonarNode
         do {
@@ -183,13 +200,43 @@ class NotificationService: SDKNotificationService {
         marmotWakeStoreLock = storeLock
         wakeNodeLock.unlock()
         do {
-            let drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+            var drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+            // Mirror SonarPushProcessor unread-delta: drain can be empty when the
+            // row was already local, the concurrent app wake consumed the pending
+            // list first, or sync only advanced summaries. Prefer the newest
+            // unread conversation so the banner still gets names/preview.
+            if drained.isEmpty {
+                let fromUnread = Self.drainNotificationsFromUnreadSummaries(node)
+                if !fromUnread.isEmpty {
+                    Self.recordDiagnostic("emptyDrain:fallbackUnread count=\(fromUnread.count)")
+                    drained = fromUnread
+                }
+            }
             releaseMarmotWakeNode()
             return drained
         } catch {
             releaseMarmotWakeNode()
             throw error
         }
+    }
+
+    /// Build banner rows from local unread conversation summaries (newest first).
+    private static func drainNotificationsFromUnreadSummaries(
+        _ node: SonarNode
+    ) -> [DrainNotificationInfo] {
+        node.conversationSummaries()
+            .filter { $0.unreadCount > 0 && !$0.latestMine }
+            .sorted { $0.latestAtSecs > $1.latestAtSecs }
+            .prefix(maxAdditionalPresentations + 1)
+            .map { summary in
+                DrainNotificationInfo(
+                    messageIdHex: "",
+                    senderNpub: summary.latestSenderNpub,
+                    groupIdHex: summary.groupIdHex,
+                    groupName: summary.name,
+                    contentPreview: summary.latestContent
+                )
+            }
     }
 
     private func releaseMarmotWakeNode() {
@@ -200,12 +247,49 @@ class NotificationService: SDKNotificationService {
         wakeNodeLock.unlock()
     }
 
+    /// ~1.5s of non-blocking flock retries. Matches the common race where the
+    /// host has started `closeNode` but has not released `marmot.store.lock` yet.
+    private static func acquireStoreLockForWake() throws -> MarmotStoreLock {
+        let attempts = 40 // ~4s — covers SIGKILL teardown + closeNode background task
+        let delaySecs = 0.1
+        var last: MarmotStoreLock.TryAcquireResult = .unavailable
+        for attempt in 1...attempts {
+            let result = MarmotStoreLock.tryAcquireExclusiveResult()
+            last = result
+            if case .acquired(let lock) = result {
+                if attempt > 1 {
+                    recordDiagnostic("storeLock:acquiredAfterRetry attempt=\(attempt)")
+                }
+                return lock
+            }
+            if attempt < attempts {
+                // Blocking sleep is OK — this runs on a detached worker.
+                Thread.sleep(forTimeInterval: delaySecs)
+            }
+        }
+        switch last {
+        case .busy:
+            recordDiagnostic("storeBusy:retries=\(attempts)")
+            throw NSEMarmotError.storeBusy
+        case .unavailable:
+            recordDiagnostic("storeLockUnavailable")
+            throw NSEMarmotError.sharedDatabaseMissing
+        case .system(let err):
+            recordDiagnostic("storeLockSystem:errno=\(err)")
+            throw NSEMarmotError.storeBusy
+        case .acquired:
+            // Unreachable — loop returns on acquire.
+            throw NSEMarmotError.storeBusy
+        }
+    }
+
     /// Require an existing shared DB — never mkdir+connect into a missing path
     /// (that would mint an empty SQLCipher store and orphan Application Support history).
     private static func existingMarmotDatabaseURL() throws -> URL {
         guard let group = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupId
         ) else {
+            Self.recordDiagnostic("appGroupUnavailable")
             throw NSEMarmotError.appGroupUnavailable
         }
         let dir = group.appendingPathComponent("sonar-marmot", isDirectory: true)
@@ -213,9 +297,11 @@ class NotificationService: SDKNotificationService {
         // Refuse missing or empty placeholders — connect would mint a forked
         // SQLCipher store and orphan Application Support history.
         guard MarmotAppGroupStore.isAuthoritativeDatabaseFile(db) else {
+            Self.recordDiagnostic("sharedDatabaseMissing")
             throw NSEMarmotError.sharedDatabaseMissing
         }
         guard databaseIsBackgroundSafe(dir) else {
+            Self.recordDiagnostic("databaseLocked")
             throw NSEMarmotError.databaseLocked
         }
         return db
@@ -493,6 +579,21 @@ class NotificationService: SDKNotificationService {
             showNames: defaults?.object(forKey: showNamesKey) as? Bool ?? true,
             showPreview: defaults?.object(forKey: showPreviewKey) as? Bool ?? false
         )
+    }
+
+    /// Durable breadcrumb for device debugging when unified logs are unavailable.
+    /// Main app / `devicectl` can read `sonar.nse.lastDiagnostic` from the App Group.
+    private static let diagnosticKey = "sonar.nse.lastDiagnostic"
+
+    private static func recordDiagnostic(_ value: String) {
+        guard let defaults = UserDefaults(suiteName: appGroupId) else { return }
+        let stamped = "\(ISO8601DateFormatter().string(from: Date())) \(value)"
+        defaults.set(stamped, forKey: diagnosticKey)
+        defaults.synchronize()
+    }
+
+    private static func lastDiagnostic() -> String {
+        UserDefaults(suiteName: appGroupId)?.string(forKey: diagnosticKey) ?? ""
     }
 
     private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {

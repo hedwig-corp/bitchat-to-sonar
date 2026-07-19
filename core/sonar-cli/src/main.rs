@@ -138,13 +138,20 @@ struct SendArgs {
     /// Group name if a new 1:1 Marmot group must be created.
     #[arg(long, default_value = "Sonar agent DM")]
     group_name: String,
-    /// Keep this CLI process alive until a relay acknowledges the new message.
-    /// App sends remain local-first; this is intended for automation/smoke tests.
-    #[arg(long)]
+    /// Keep this CLI process alive until a relay acknowledges the new message
+    /// and the MIP-05 push gift-wrap has been published. Default on: process
+    /// exit otherwise cancels the background push task before Transponder sees
+    /// it (apps stay alive, so they do not need this). Pass --no-wait-for-ack
+    /// only for local-echo timing tests.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     wait_for_ack: bool,
-    /// Bound for --wait-for-ack. Defaults to 10 seconds.
-    #[arg(long, requires = "wait_for_ack")]
+    /// Bound for publish-ack wait. Defaults to 15 seconds.
+    #[arg(long)]
     ack_timeout_secs: Option<u64>,
+    /// Extra settle time after publish ACK so the MIP-05 push task can finish
+    /// publishing kind-446 to the transponder before the process exits.
+    #[arg(long, default_value_t = 3)]
+    push_settle_secs: u64,
 }
 
 /// Media kind drives the default MIME type when none is given explicitly.
@@ -325,8 +332,26 @@ struct MediaRefOut {
 async fn main() {
     // Surface relay subscription rejections and transport warnings to callers.
     // stdout remains newline-delimited JSON; diagnostics stay on stderr.
+    // Default WARN keeps stdout JSON clean; set RUST_LOG=info (or
+    // sonar_core=info) when diagnosing push-token / relay publish paths.
+    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".to_owned());
     let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::WARN)
+        .with_max_level(match filter.as_str() {
+            "trace" => tracing::Level::TRACE,
+            "debug" => tracing::Level::DEBUG,
+            "info" => tracing::Level::INFO,
+            "error" => tracing::Level::ERROR,
+            _ if filter.contains("info") || filter.contains("debug") || filter.contains("trace") => {
+                if filter.contains("trace") {
+                    tracing::Level::TRACE
+                } else if filter.contains("debug") {
+                    tracing::Level::DEBUG
+                } else {
+                    tracing::Level::INFO
+                }
+            }
+            _ => tracing::Level::WARN,
+        })
         .with_target(false)
         .with_ansi(false)
         .without_time()
@@ -484,9 +509,16 @@ async fn run(cli: Cli) -> Result<()> {
                     &client,
                     &group_id,
                     &message_ids_before,
-                    Duration::from_secs(args.ack_timeout_secs.unwrap_or(10)),
+                    Duration::from_secs(args.ack_timeout_secs.unwrap_or(15)),
                 )
                 .await?;
+                // MIP-05 push is spawned after publish ACK. Keep the Tokio
+                // runtime + relay pool alive long enough for the gift-wrap
+                // publish; exiting immediately cancels that task and the
+                // phone never receives a Transponder wake.
+                if args.push_settle_secs > 0 {
+                    tokio::time::sleep(Duration::from_secs(args.push_settle_secs)).await;
+                }
             }
             print_json(&output)?;
             Ok(())
