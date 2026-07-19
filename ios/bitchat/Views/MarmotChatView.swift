@@ -2241,13 +2241,14 @@ final class MarmotChatModel: ObservableObject {
 
     /// Durable outgoing row present for a mesh→WN flush echo (R-011).
     func hasCanonicalOutgoingMatch(groupId: String, text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let messages = messagesByGroup[groupId] ?? []
         return messages.contains { message in
             guard message.isMine,
                   !message.id.hasPrefix(Self.optimisticIDPrefix),
                   !message.id.hasPrefix(Self.failedOptimisticIDPrefix)
             else { return false }
-            return message.content == text
+            return message.content == trimmed
         }
     }
 
