@@ -271,6 +271,8 @@ final class MarmotService: @unchecked Sendable {
         case notConnected
         /// A newer session change superseded this async operation.
         case cancelled
+        /// Settings → Backup chats re-entry while an upload is already sealing.
+        case backupAlreadyInProgress
         /// Invalid caller input (bad nsec/npub/group id/relay URL).
         case invalidInput(String)
         /// Failure inside the Rust core (relay I/O, MLS, MDK...).
@@ -1312,13 +1314,17 @@ final class MarmotService: @unchecked Sendable {
         // and must not race a live SQLCipher handle.
         await closeNode(keepClosed: true)
         // Keychain/fs reconcile must not block MainActor either — hop with FFI.
+        // `databaseConfig` throws `ServiceError` only (never `SonarFfiError`);
+        // keep it outside the FFI catch so mapFfi cannot reshape its errors.
         do {
+            let config = try await runAccountBackupFFI {
+                try Self.databaseConfig()
+            }
             let info = try await runAccountBackupFFI {
-                let (dbPath, dbKeyHex) = try Self.databaseConfig()
-                return try backupAccountToBlossom(
+                try backupAccountToBlossom(
                     nsec: nsec,
-                    dbPath: dbPath,
-                    dbKeyHex: dbKeyHex,
+                    dbPath: config.0,
+                    dbKeyHex: config.1,
                     blossomServer: blossomServer
                 )
             }

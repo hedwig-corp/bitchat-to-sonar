@@ -22,10 +22,13 @@ struct SNToastSession: Equatable {
     }
 
     /// Sticky toast (e.g. "Backing up…"): bumps epoch so pending dismissals
-    /// no-op, and leaves `text` until the next `show` / `clear`.
-    mutating func showSticky(_ value: String) {
+    /// no-op, and leaves `text` until the next `show` / `clear(ifEpoch:)` /
+    /// `reset`.
+    @discardableResult
+    mutating func showSticky(_ value: String) -> UInt64 {
         epoch &+= 1
         text = value
+        return epoch
     }
 
     mutating func clear(ifEpoch expected: UInt64) {

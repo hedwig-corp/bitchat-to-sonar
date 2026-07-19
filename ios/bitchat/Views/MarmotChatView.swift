@@ -709,8 +709,9 @@ final class MarmotChatModel: ObservableObject {
     /// always `boot()`s so a failed Blossom call cannot leave the node closed
     /// (Settings tap would look dead and chats stay offline until restart).
     func backupAccount() async throws {
+        // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
-            throw MarmotService.ServiceError.core("backup already in progress")
+            throw MarmotService.ServiceError.backupAlreadyInProgress
         }
         accountBackupInFlight = true
         defer { accountBackupInFlight = false }
@@ -756,6 +757,7 @@ final class MarmotChatModel: ObservableObject {
     private func awaitRelayIdleForBackup(timeoutSeconds: Double = 3) async {
         let start = Date()
         while relayBusy && Date().timeIntervalSince(start) < timeoutSeconds {
+            if Task.isCancelled { return }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
     }

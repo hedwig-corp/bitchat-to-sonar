@@ -1885,17 +1885,13 @@ final class SonarAppStore: ObservableObject {
         do {
             try await marmot.backupAccount()
             showToast(String(localized: "Chat backup uploaded"))
+        } catch MarmotService.ServiceError.backupAlreadyInProgress {
+            // In-flight backup owns sticky/result toasts; do not clobber with failure.
+            return
         } catch {
-            // Backup intentionally runs to completion (continuation + close/reconnect
-            // must not leave the node closed). Re-entry throws "already in progress"
-            // — suppress the misleading offline toast; the in-flight backup owns UX.
-            let msg = error.localizedDescription
-            if msg.contains("backup already in progress") {
-                return
-            }
             showToast(String(localized: "Backup failed — try again when online"))
             SecureLogger.warning(
-                "⚠️ Account backup failed: \(msg)",
+                "⚠️ Account backup failed: \(error.localizedDescription)",
                 category: .session
             )
         }
