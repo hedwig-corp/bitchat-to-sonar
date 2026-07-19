@@ -13,6 +13,7 @@
 //
 
 import BreezSDKLiquid
+import Darwin
 import Foundation
 import Security
 import SonarCore
@@ -48,6 +49,8 @@ class NotificationService: SDKNotificationService {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
     private var hydrateTask: Task<Void, Never>?
+    private let wakeNodeLock = NSLock()
+    private var marmotWakeNode: SonarNode?
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -83,6 +86,10 @@ class NotificationService: SDKNotificationService {
 
     override func serviceExtensionTimeWillExpire() {
         hydrateTask?.cancel()
+        releaseMarmotWakeNode()
+        #if DEBUG
+        Self.logResidentMemory("expire")
+        #endif
         if let content = bestAttemptContent {
             Self.configureTransponderNotification(content)
             finish(with: content)
@@ -98,16 +105,22 @@ class NotificationService: SDKNotificationService {
             return
         }
         do {
-            let notifications = try await Task.detached(priority: .userInitiated) {
-                try Self.collectMarmotNotificationsAfterWake()
+            let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
+                guard let self else { return [DrainNotificationInfo]() }
+                return try self.collectMarmotNotificationsAfterWake()
             }.value
+            #if DEBUG
+            Self.logResidentMemory("after-wake")
+            #endif
             guard !Task.isCancelled else {
+                releaseMarmotWakeNode()
                 finish(with: content)
                 return
             }
             if notifications.isEmpty {
                 os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
                        log: Self.log, type: .info)
+                releaseMarmotWakeNode()
                 finish(with: content)
                 return
             }
@@ -124,52 +137,79 @@ class NotificationService: SDKNotificationService {
             }
             os_log("NSE: Marmot wake decorated primary + %d additional",
                    log: Self.log, type: .info, extras.count)
+            releaseMarmotWakeNode()
             finish(with: content)
         } catch {
             os_log("NSE: Marmot wake failed — %{public}@ — keeping generic banner",
                    log: Self.log, type: .error, String(describing: error))
+            releaseMarmotWakeNode()
             finish(with: content)
         }
     }
 
     /// Blocking UniFFI work — always call off the main actor.
-    private static func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
-        guard let nsec = readKeychainString(account: nsecKeychainKey),
-              let dbKeyHex = readKeychainString(account: dbKeychainKey),
+    /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
+    private func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
+        guard let nsec = Self.readKeychainString(account: Self.nsecKeychainKey),
+              let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey),
               !nsec.isEmpty,
               dbKeyHex.count == 64
         else {
             throw NSEMarmotError.missingCredentials
         }
-        let dbURL = try marmotDatabaseURL()
+        let dbURL = try Self.existingMarmotDatabaseURL()
         let identity = try SonarIdentity.import(nsec: nsec)
         let node = try SonarNode.connect(
             identity: identity,
-            relayUrls: defaultRelayUrls,
+            relayUrls: Self.defaultRelayUrls,
             dbPath: dbURL.path,
             dbKeyHex: dbKeyHex
         )
-        return try node.collectNotificationsAfterWake(maxWaitMs: marmotWakeWaitMs)
+        wakeNodeLock.lock()
+        marmotWakeNode = node
+        wakeNodeLock.unlock()
+        return try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
     }
 
-    private static func marmotDatabaseURL() throws -> URL {
+    private func releaseMarmotWakeNode() {
+        wakeNodeLock.lock()
+        marmotWakeNode = nil
+        wakeNodeLock.unlock()
+    }
+
+    /// Require an existing shared DB — never mkdir+connect into a missing path
+    /// (that would mint an empty SQLCipher store and orphan Application Support history).
+    private static func existingMarmotDatabaseURL() throws -> URL {
         guard let group = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupId
         ) else {
             throw NSEMarmotError.appGroupUnavailable
         }
         let dir = group.appendingPathComponent("sonar-marmot", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let protection: [FileAttributeKey: Any] = [
-            .protectionKey: FileProtectionType.completeUntilFirstUserAuthentication
-        ]
-        try? FileManager.default.setAttributes(protection, ofItemAtPath: dir.path)
         let db = dir.appendingPathComponent("marmot.sqlite")
+        guard FileManager.default.fileExists(atPath: db.path) else {
+            throw NSEMarmotError.sharedDatabaseMissing
+        }
         guard databaseIsBackgroundSafe(dir) else {
             throw NSEMarmotError.databaseLocked
         }
         return db
     }
+
+    #if DEBUG
+    private static func logResidentMemory(_ label: String) {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), rebound, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return }
+        let mb = Double(info.resident_size) / 1_048_576.0
+        os_log("NSE RSS[%{public}@]=%.1f MB", log: log, type: .info, label, mb)
+    }
+    #endif
 
     private static func apply(
         notification: DrainNotificationInfo,
@@ -421,6 +461,7 @@ private struct NSENotificationPrefs {
 private enum NSEMarmotError: Error {
     case missingCredentials
     case appGroupUnavailable
+    case sharedDatabaseMissing
     case databaseLocked
 }
 

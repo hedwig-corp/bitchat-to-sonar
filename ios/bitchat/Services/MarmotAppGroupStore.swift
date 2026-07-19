@@ -42,7 +42,8 @@ enum MarmotAppGroupStore {
             throw StoreError.appGroupUnavailable
         }
         let dir = group.appendingPathComponent(dbDirName, isDirectory: true)
-        try migrateLegacyApplicationSupportStoreIfNeeded(
+        try migrateLegacyStoreIfNeeded(
+            from: legacyApplicationSupportDirectory(fileManager: fileManager),
             into: dir,
             fileManager: fileManager
         )
@@ -66,6 +67,25 @@ enum MarmotAppGroupStore {
             .appendingPathComponent(dbFileName)
     }
 
+    /// Shared App Group DB URL only when the file already exists.
+    /// NSE must use this (or equivalent) and never create an empty SQLCipher DB.
+    static func existingSharedDatabaseURL(fileManager: FileManager = .default) -> URL? {
+        #if os(iOS)
+        guard let group = fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) else {
+            return nil
+        }
+        let db = group
+            .appendingPathComponent(dbDirName, isDirectory: true)
+            .appendingPathComponent(dbFileName)
+        guard fileManager.fileExists(atPath: db.path) else { return nil }
+        return db
+        #else
+        return try? databaseURL(fileManager: fileManager)
+        #endif
+    }
+
     /// Legacy pre-NSE path (`Application Support/sonar-marmot`).
     static func legacyApplicationSupportDirectory(
         fileManager: FileManager = .default
@@ -87,11 +107,24 @@ enum MarmotAppGroupStore {
         into sharedDir: URL,
         fileManager: FileManager = .default
     ) throws {
+        try migrateLegacyStoreIfNeeded(
+            from: legacyApplicationSupportDirectory(fileManager: fileManager),
+            into: sharedDir,
+            fileManager: fileManager
+        )
+    }
+
+    /// Testable migration: if shared DB exists, leave it alone; else move legacy.
+    static func migrateLegacyStoreIfNeeded(
+        from legacyDir: URL?,
+        into sharedDir: URL,
+        fileManager: FileManager = .default
+    ) throws {
         let sharedDb = sharedDir.appendingPathComponent(dbFileName)
         if fileManager.fileExists(atPath: sharedDb.path) {
             return
         }
-        guard let legacyDir = legacyApplicationSupportDirectory(fileManager: fileManager),
+        guard let legacyDir,
               fileManager.fileExists(atPath: legacyDir.path)
         else {
             return
@@ -127,15 +160,36 @@ enum MarmotAppGroupStore {
     }
     #endif
 
-    /// Wipe shared root and any leftover legacy Application Support directory.
+    /// Wipe shared + legacy roots by fixed paths — never call `databaseDirectory()`
+    /// (which migrates) from a wipe path.
     static func removeAllStoreFiles(fileManager: FileManager = .default) {
-        if let shared = try? databaseDirectory(fileManager: fileManager) {
-            try? fileManager.removeItem(at: shared)
-        }
+        var roots: [URL] = []
         #if os(iOS)
+        if let group = fileManager.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupId
+        ) {
+            roots.append(group.appendingPathComponent(dbDirName, isDirectory: true))
+        }
         if let legacy = legacyApplicationSupportDirectory(fileManager: fileManager) {
-            try? fileManager.removeItem(at: legacy)
+            roots.append(legacy)
+        }
+        #else
+        if let support = try? fileManager.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: false
+        ) {
+            roots.append(support.appendingPathComponent(dbDirName, isDirectory: true))
         }
         #endif
+        removeStoreRoots(roots, fileManager: fileManager)
+    }
+
+    /// Testable wipe helper: delete only the given roots when present.
+    static func removeStoreRoots(_ roots: [URL], fileManager: FileManager = .default) {
+        for root in roots where fileManager.fileExists(atPath: root.path) {
+            try? fileManager.removeItem(at: root)
+        }
     }
 }

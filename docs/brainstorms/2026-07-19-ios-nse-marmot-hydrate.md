@@ -84,6 +84,13 @@
 
 Ship as stacked PRs if needed: **P0 → P1 → P2+P3 → P4**. Do not land App Group move without wipe coverage and migration tests.
 
+## Production invariants (must hold)
+
+1. **NSE never creates the shared DB.** If `group…/sonar-marmot/marmot.sqlite` is missing, keep the generic banner. Main app owns migration from Application Support.
+2. **Frozen wake is fully non-durable for sync state.** While frozen, skip `save_sync_state` (advance/rewind/processed-ids). `collect_notifications_after_wake` snapshots memory, unfreezes, and restores so a long-lived host cannot persist wake-time cursor mutations.
+3. **Wipe deletes fixed App Group + legacy roots** without calling `databaseDirectory()` (which migrates).
+4. **Concurrent writers:** backgrounded main app + NSE can both open SQLCipher (White Noise shape). Primary force-quit path has no main-app writer; residual race is documented residual risk, not a blocker for this ship.
+
 ## Android parity note
 
 Android already hydrates on push via `SonarPushProcessingService` → `syncForce()`
