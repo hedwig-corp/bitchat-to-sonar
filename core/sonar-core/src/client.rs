@@ -3875,101 +3875,163 @@ impl SonarClient {
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
-        send_inflight.fetch_add(1, Ordering::Relaxed);
-        let publish_started = Instant::now();
-        let event_id_hex = event.id.to_hex();
         tracing::info!(
             message_id = %message_id_hex,
-            event_id = %event_id_hex,
+            event_id = %event.id.to_hex(),
             relays = relays.len(),
             "send_publish_start"
         );
         tokio::spawn(async move {
             let mut publish_result_tx = Some(publish_result_tx);
-            let notify = || {
-                if let Some(listener) = change_listener.lock().unwrap().clone() {
-                    listener.on_conversation_changed(group_id_hex.clone());
-                }
-            };
-            // First-ack wins (Signal-style): the pool's `send_event` joins ALL
-            // relays, so one dead relay delays the Sending→Sent flip by its
-            // full timeout even though the fastest relay usually acks in well
-            // under a second. Fan out one publish per Marmot relay and mark
-            // the message Sent on the FIRST OK — the remaining publishes keep
-            // running in the background for redundancy. Only when EVERY relay
-            // has failed does the message flip to failed (outbox-retryable).
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            for url in relays {
-                let nostr = nostr.clone();
-                let event = event.clone();
-                let tx = tx.clone();
-                let url_log = url.to_string();
-                tokio::spawn(async move {
-                    let started = Instant::now();
-                    let outcome = match nostr.send_event_to([url], &event).await {
-                        Ok(output) if !output.success.is_empty() => Ok(url_log),
-                        Ok(output) => Err(output
-                            .failed
-                            .values()
-                            .next()
-                            .cloned()
-                            .unwrap_or_else(|| "relay rejected event".to_string())),
-                        Err(err) => Err(err.to_string()),
-                    };
-                    let _ = tx.send((outcome, started.elapsed().as_millis() as u64));
-                });
-            }
-            drop(tx);
-            let mut failures: Vec<String> = Vec::new();
-            while let Some((outcome, _relay_ms)) = rx.recv().await {
-                match outcome {
-                    Ok(relay_url) => {
-                        let rtt_ms = publish_started.elapsed().as_millis() as u64;
-                        let _ = outbox_state
-                            .lock()
-                            .unwrap()
-                            .mark_sent_by_message_id(&message_id_hex, Timestamp::now().as_secs());
-                        tracing::info!(
-                            message_id = %message_id_hex,
-                            event_id = %event_id_hex,
-                            relay = %relay_url,
-                            rtt_ms,
-                            "send_first_ack"
-                        );
-                        if let Some(tx) = publish_result_tx.take() {
-                            let _ = tx.send(true);
+            let mut event = event;
+            let mut group_id_hex = group_id_hex;
+            // One task owns the publish + core auto-retry loop so a transient
+            // outage self-heals without waiting for host idle
+            // `ensure_subscriptions` (which never runs while the chat keeps
+            // waking the drain loop) or an app restart.
+            loop {
+                send_inflight.fetch_add(1, Ordering::Relaxed);
+                let publish_started = Instant::now();
+                let event_id_hex = event.id.to_hex();
+                let notify = {
+                    let change_listener = change_listener.clone();
+                    let group_id_hex = group_id_hex.clone();
+                    move || {
+                        if let Some(listener) = change_listener.lock().unwrap().clone() {
+                            listener.on_conversation_changed(group_id_hex.clone());
                         }
-                        notify();
-                        send_inflight.fetch_sub(1, Ordering::Relaxed);
-                        return;
                     }
-                    Err(err) => failures.push(err),
+                };
+                // First-ack wins (Signal-style): the pool's `send_event` joins ALL
+                // relays, so one dead relay delays the Sending→Sent flip by its
+                // full timeout even though the fastest relay usually acks in well
+                // under a second. Fan out one publish per Marmot relay and mark
+                // the message Sent on the FIRST OK — the remaining publishes keep
+                // running in the background for redundancy. Only when EVERY relay
+                // has failed does the message flip to failed (outbox-retryable).
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                for url in relays.iter().cloned() {
+                    let nostr = nostr.clone();
+                    let event = event.clone();
+                    let tx = tx.clone();
+                    let url_log = url.to_string();
+                    tokio::spawn(async move {
+                        let started = Instant::now();
+                        let outcome = match nostr.send_event_to([url], &event).await {
+                            Ok(output) if !output.success.is_empty() => Ok(url_log),
+                            Ok(output) => Err(output
+                                .failed
+                                .values()
+                                .next()
+                                .cloned()
+                                .unwrap_or_else(|| "relay rejected event".to_string())),
+                            Err(err) => Err(err.to_string()),
+                        };
+                        let _ = tx.send((outcome, started.elapsed().as_millis() as u64));
+                    });
+                }
+                drop(tx);
+                let mut failures: Vec<String> = Vec::new();
+                let mut acked = false;
+                while let Some((outcome, _relay_ms)) = rx.recv().await {
+                    match outcome {
+                        Ok(relay_url) => {
+                            let rtt_ms = publish_started.elapsed().as_millis() as u64;
+                            let _ = outbox_state.lock().unwrap().mark_sent_by_message_id(
+                                &message_id_hex,
+                                Timestamp::now().as_secs(),
+                            );
+                            tracing::info!(
+                                message_id = %message_id_hex,
+                                event_id = %event_id_hex,
+                                relay = %relay_url,
+                                rtt_ms,
+                                "send_first_ack"
+                            );
+                            if let Some(tx) = publish_result_tx.take() {
+                                let _ = tx.send(true);
+                            }
+                            notify();
+                            acked = true;
+                            break;
+                        }
+                        Err(err) => failures.push(err),
+                    }
+                }
+                send_inflight.fetch_sub(1, Ordering::Relaxed);
+                if acked {
+                    break;
+                }
+                // The channel closed without a single OK: every relay failed.
+                let reason = if failures.is_empty() {
+                    "no relay accepted the event".to_string()
+                } else {
+                    failures.join(", ")
+                };
+                let rtt_ms = publish_started.elapsed().as_millis() as u64;
+                tracing::warn!(
+                    message_id = %message_id_hex,
+                    event_id = %event_id_hex,
+                    rtt_ms,
+                    %reason,
+                    "send_publish_failed"
+                );
+                let attempts = outbox_state
+                    .lock()
+                    .unwrap()
+                    .mark_failed_by_message_id(
+                        &message_id_hex,
+                        reason,
+                        Timestamp::now().as_secs(),
+                    )
+                    .ok()
+                    .flatten();
+                // Surface the first failure to the host immediately (Failed +
+                // Retry). Later auto-retries flip Pending→Sent without needing
+                // a tap or app restart.
+                if let Some(tx) = publish_result_tx.take() {
+                    let _ = tx.send(false);
+                }
+                notify();
+                let Some(attempts) = attempts else {
+                    break;
+                };
+                if attempts >= crate::outbox::OUTBOX_RETRY_ATTEMPT_LIMIT {
+                    break;
+                }
+                let delay_secs = crate::outbox::outbox_auto_retry_delay_secs(attempts);
+                tracing::info!(
+                    message_id = %message_id_hex,
+                    event_id = %event_id_hex,
+                    attempts,
+                    delay_secs,
+                    "send_publish_auto_retry_scheduled"
+                );
+                // Release send_inflight across the backoff so historical
+                // catch-up is not blocked for the full retry sleep.
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
+                    &message_id_hex,
+                    Timestamp::now().as_secs(),
+                );
+                match prepared {
+                    Ok(Some((next_group_id_hex, next_event))) => {
+                        group_id_hex = next_group_id_hex;
+                        event = next_event;
+                        // Pending again — host paints "Sending" while we retry.
+                        notify();
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        tracing::debug!(
+                            message_id = %message_id_hex,
+                            %err,
+                            "send_publish_auto_retry_prepare_failed"
+                        );
+                        break;
+                    }
                 }
             }
-            // The channel closed without a single OK: every relay failed.
-            let reason = if failures.is_empty() {
-                "no relay accepted the event".to_string()
-            } else {
-                failures.join(", ")
-            };
-            let rtt_ms = publish_started.elapsed().as_millis() as u64;
-            tracing::warn!(
-                message_id = %message_id_hex,
-                event_id = %event_id_hex,
-                rtt_ms,
-                %reason,
-                "send_publish_failed"
-            );
-            let _ = outbox_state.lock().unwrap().mark_failed_by_message_id(
-                &message_id_hex,
-                reason,
-                Timestamp::now().as_secs(),
-            );
-            if let Some(tx) = publish_result_tx.take() {
-                let _ = tx.send(false);
-            }
-            notify();
-            send_inflight.fetch_sub(1, Ordering::Relaxed);
         });
         publish_result_rx
     }
@@ -5470,6 +5532,8 @@ impl SonarClient {
         // The apps use this lightweight idle path instead of `sync()`. Retry
         // the durable outbox here too so a transient outage self-heals after
         // relay reconnection even when the user does not tap the retry button.
+        // (Publish failures also schedule a core-owned backoff retry; this path
+        // covers Pending rows stranded while relays were briefly unavailable.)
         self.retry_outbox().await;
         Ok(())
     }

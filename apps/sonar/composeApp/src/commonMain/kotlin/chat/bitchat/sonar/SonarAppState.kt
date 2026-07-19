@@ -77,6 +77,8 @@ data class StickerBenchmarkRequest(
 // profile TTLs). Foreground idle CPU is set by the heartbeat cadence.
 private const val HEARTBEAT_FG_MS = 30_000L
 private const val HEARTBEAT_BG_MS = 60_000L
+/** Wake-path outbox flush throttle (iOS `outboxRetryMinIntervalSeconds` parity). */
+private const val OUTBOX_RETRY_MIN_INTERVAL_SECS = 15L
 /** Visible-Radar cadence for publishing BLE mesh + payment scan results to UI. */
 private const val NEARBY_PEER_REFRESH_MS = 1_000L
 /** Relay `sync()` cadence (was every ~60 s on the old 4 s tick). */
@@ -1229,6 +1231,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Live Marmot drain loop job (see [startMarmotWakeLoop]). Cancelled on
      *  [wipe] / account restore so a dead node cannot keep a parked waiter. */
     private var marmotWakeJob: Job? = null
+    /** Last wake-path [SonarCore.retryOutbox] (secs); see [OUTBOX_RETRY_MIN_INTERVAL_SECS]. */
+    private var lastOutboxRetrySecs: Long = 0L
     /** Relay attach is independent from local startup. Failure retries here
      * while BLE, wallet, and local database services remain usable. */
     private var relayConnectJob: Job? = null
@@ -9336,6 +9340,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (!isActive) return@launch
                 if (woke) {
                     runCatching { SonarCore.drainPendingMarmot() }
+                    // Active chats keep waking this loop, so idle
+                    // ensureSubscriptions (which also retries the outbox) may
+                    // never run. Core auto-retries after publish failure; this
+                    // covers rows stranded while relays were briefly down.
+                    retryOutboxIfDue()
                 } else {
                     runCatching { SonarCore.ensureSubscriptions() }
                 }
@@ -9346,6 +9355,17 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun stopMarmotWakeLoop() {
         marmotWakeJob?.cancel()
         marmotWakeJob = null
+    }
+
+    private suspend fun retryOutboxIfDue() {
+        val now = SonarClock.nowSecs()
+        if (lastOutboxRetrySecs != 0L &&
+            now - lastOutboxRetrySecs < OUTBOX_RETRY_MIN_INTERVAL_SECS
+        ) {
+            return
+        }
+        lastOutboxRetrySecs = now
+        runCatching { SonarCore.retryOutbox() }
     }
 
     /** BLE mesh is the real-time rail for calls, so it must not wait for the

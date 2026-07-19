@@ -231,6 +231,9 @@ final class MarmotChatModel: ObservableObject {
     private static let localSummaryPageLimit: UInt32 = 20
     private static let localSummaryGroupLimit: UInt32 = 50
     private static let relayReconnectRetryDelaySeconds: Double = 10
+    /// Throttle wake-path outbox flushes so an active chat (frequent wakes)
+    /// still retries failed sends without spamming `retryOutbox`.
+    private static let outboxRetryMinIntervalSeconds: TimeInterval = 15
 
     @Published var npub: String?
     /// Supplies the local user's current nickname so the kind-0 profile can be
@@ -312,6 +315,8 @@ final class MarmotChatModel: ObservableObject {
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
+    /// Last wake-path `retryOutbox` — see `outboxRetryMinIntervalSeconds`.
+    private var lastOutboxRetryAt: Date?
     /// Single-flight durable media resume. Core also claims per entry id; this
     /// stops stacking overlapping resume Tasks on flaky relay reconnects.
     private var mediaResumeTask: Task<Void, Never>?
@@ -3379,6 +3384,10 @@ final class MarmotChatModel: ObservableObject {
                     if !notifications.isEmpty {
                         await self.loadLocalSummaries()
                     }
+                    // Active chats keep waking this loop, so idle
+                    // `ensureSubscriptions` (which also retries the outbox) may
+                    // never run. Flush pending/failed sends on a throttle.
+                    await self.retryOutboxIfDue()
                 } else {
                     #if DEBUG
                     // SONAR_BENCH: first wait cycle resolved with no buffered events
@@ -3401,6 +3410,18 @@ final class MarmotChatModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Throttled durable-outbox flush for the wake path. Best-effort: a
+    /// transient FFI error must not tear down the drain loop.
+    private func retryOutboxIfDue() async {
+        let now = Date()
+        if let last = lastOutboxRetryAt,
+           now.timeIntervalSince(last) < Self.outboxRetryMinIntervalSeconds {
+            return
+        }
+        lastOutboxRetryAt = now
+        try? await service.retryOutbox()
     }
 
     func stopPolling() {
