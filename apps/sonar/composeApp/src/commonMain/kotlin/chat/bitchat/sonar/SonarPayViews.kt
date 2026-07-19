@@ -65,6 +65,7 @@ fun PaySheet(
     onClose: () -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     var v by remember { mutableStateOf("") }
     val sats = v.toLongOrNull() ?: 0L
     val over = sats > balanceSats

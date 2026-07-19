@@ -53,6 +53,7 @@ import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.TranscriptPolicyHostDemo
 import chat.bitchat.sonar.TranscriptSpikeBDemo
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.sonarTranscriptPolicyHostEntryVisible
 import chat.bitchat.sonar.sonarTranscriptSpikeBEntryVisible
 import kotlinx.coroutines.launch
@@ -364,6 +365,7 @@ private fun StNote(text: String) {
 @Composable
 internal fun Sheet(title: String?, onClose: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(
             interactionSource = remember { MutableInteractionSource() }, indication = null,
