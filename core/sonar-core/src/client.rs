@@ -1485,6 +1485,10 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
+    /// Bumped in [`Drop`] so long-lived outbox publish / auto-retry tasks abort
+    /// after the client is closed (node replace, wipe) instead of rewriting a
+    /// deleted outbox sidecar.
+    outbox_publish_epoch: Arc<AtomicU64>,
     /// Pre-Blossom media staging: plaintext files + sidecar so mid-upload
     /// disconnect/kill does not lose attachments.
     media_staging: Arc<Mutex<MediaStagingState>>,
@@ -1601,6 +1605,17 @@ pub struct SonarClient {
     claimed_handle: Arc<Mutex<Option<String>>>,
     /// Durable path for the claimed handle (None for in-memory sessions).
     handle_state_path: Option<PathBuf>,
+}
+
+impl Drop for SonarClient {
+    fn drop(&mut self) {
+        // Abort long-lived outbox publish / auto-retry tasks and detach the
+        // sidecar so a late `save_if_dirty` cannot recreate a wiped outbox file.
+        self.outbox_publish_epoch.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut outbox) = self.outbox_state.lock() {
+            outbox.detach();
+        }
+    }
 }
 
 impl SonarClient {
@@ -2061,6 +2076,7 @@ impl SonarClient {
             sync_state,
             sync_watermark_frozen: Arc::new(AtomicBool::new(false)),
             outbox_state,
+            outbox_publish_epoch: Arc::new(AtomicU64::new(0)),
             media_staging,
             media_upload_inflight,
             media_upload_cancel_all,
@@ -3872,6 +3888,8 @@ impl SonarClient {
         }
         let nostr = self.nostr.clone();
         let outbox_state = self.outbox_state.clone();
+        let outbox_publish_epoch = self.outbox_publish_epoch.clone();
+        let publish_epoch = outbox_publish_epoch.load(Ordering::Relaxed);
         let change_listener = self.change_listener.clone();
         let relays = self.relays.clone();
         let send_inflight = self.send_inflight.clone();
@@ -3890,6 +3908,9 @@ impl SonarClient {
             // `ensure_subscriptions` (which never runs while the chat keeps
             // waking the drain loop) or an app restart.
             loop {
+                if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
+                    break;
+                }
                 send_inflight.fetch_add(1, Ordering::Relaxed);
                 let publish_started = Instant::now();
                 let event_id_hex = event.id.to_hex();
@@ -4010,6 +4031,9 @@ impl SonarClient {
                 // Release send_inflight across the backoff so historical
                 // catch-up is not blocked for the full retry sleep.
                 tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                if outbox_publish_epoch.load(Ordering::Relaxed) != publish_epoch {
+                    break;
+                }
                 let prepared = outbox_state.lock().unwrap().prepare_auto_retry(
                     &message_id_hex,
                     Timestamp::now().as_secs(),

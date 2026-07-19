@@ -125,6 +125,15 @@ impl OutboxState {
         self.dirty = false;
     }
 
+    /// Detach from durable storage and drop in-memory rows. Used when the owning
+    /// [`crate::client::SonarClient`] is dropped so a still-running publish /
+    /// auto-retry task cannot recreate a wiped `.sonar-outbox.json` sidecar.
+    pub fn detach(&mut self) {
+        self.path = None;
+        self.entries.clear();
+        self.dirty = false;
+    }
+
     pub fn remove_group_entries(&mut self, group_id_hex: &str) -> Result<()> {
         let before = self.entries.len();
         self.entries
@@ -412,6 +421,39 @@ mod tests {
 
         let reloaded = OutboxState::load(Some(path));
         assert_eq!(reloaded.status_for_message("deleted-message"), None);
+    }
+
+    #[test]
+    fn detach_clears_entries_and_blocks_further_saves() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outbox.json");
+        let mut outbox = OutboxState::load(Some(path.clone()));
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message".into(),
+                "wrapper".into(),
+                "{}".into(),
+                1,
+            )
+            .expect("mark pending");
+        assert!(path.exists());
+
+        outbox.detach();
+        assert_eq!(outbox.status_for_message("message"), None);
+
+        // A late mark after detach must not recreate the sidecar.
+        let _ = std::fs::remove_file(&path);
+        outbox
+            .mark_pending(
+                "group".into(),
+                "message-2".into(),
+                "wrapper-2".into(),
+                "{}".into(),
+                2,
+            )
+            .expect("mark pending after detach");
+        assert!(!path.exists());
     }
 
     #[test]
