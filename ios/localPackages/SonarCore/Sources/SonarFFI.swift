@@ -3585,6 +3585,7 @@ public func FfiConverterTypeDirectDmInfo_lower(_ value: DirectDmInfo) -> RustBuf
  * fire rich local notifications (sender name + preview).
  */
 public struct DrainNotificationInfo: Equatable, Hashable {
+    public var messageIdHex: String
     public var senderNpub: String
     public var groupIdHex: String
     public var groupName: String
@@ -3592,7 +3593,8 @@ public struct DrainNotificationInfo: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(senderNpub: String, groupIdHex: String, groupName: String, contentPreview: String) {
+    public init(messageIdHex: String, senderNpub: String, groupIdHex: String, groupName: String, contentPreview: String) {
+        self.messageIdHex = messageIdHex
         self.senderNpub = senderNpub
         self.groupIdHex = groupIdHex
         self.groupName = groupName
@@ -3615,6 +3617,7 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DrainNotificationInfo {
         return
             try DrainNotificationInfo(
+                messageIdHex: FfiConverterString.read(from: &buf),
                 senderNpub: FfiConverterString.read(from: &buf),
                 groupIdHex: FfiConverterString.read(from: &buf),
                 groupName: FfiConverterString.read(from: &buf),
@@ -3623,6 +3626,7 @@ public struct FfiConverterTypeDrainNotificationInfo: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: DrainNotificationInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.messageIdHex, into: &buf)
         FfiConverterString.write(value.senderNpub, into: &buf)
         FfiConverterString.write(value.groupIdHex, into: &buf)
         FfiConverterString.write(value.groupName, into: &buf)

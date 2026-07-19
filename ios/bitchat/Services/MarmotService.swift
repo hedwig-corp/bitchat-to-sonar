@@ -1371,7 +1371,13 @@ final class MarmotService: @unchecked Sendable {
                 try wipeMarmotDatabase(dbPath: path)
             }
             // Drop directory roots (sidecars, empty dirs) without remigrating.
-            MarmotAppGroupStore.removeAllStoreFiles()
+            // Must succeed before Keychain db-key delete — a surviving store with
+            // a missing key is unrecoverable.
+            do {
+                try MarmotAppGroupStore.removeAllStoreFiles()
+            } catch {
+                throw ServiceError.core(error.localizedDescription)
+            }
             guard KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey) else {
                 throw ServiceError.core("failed to delete Marmot database key")
             }

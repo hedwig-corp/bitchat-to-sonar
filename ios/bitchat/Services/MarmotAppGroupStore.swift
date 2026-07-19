@@ -20,6 +20,7 @@ enum MarmotAppGroupStore {
     enum StoreError: Error, LocalizedError {
         case appGroupUnavailable
         case migrationFailed(String)
+        case wipeFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -27,6 +28,8 @@ enum MarmotAppGroupStore {
                 return "App Group \(appGroupId) unavailable — Marmot store cannot open safely"
             case .migrationFailed(let reason):
                 return "Marmot App Group migration failed: \(reason)"
+            case .wipeFailed(let reason):
+                return "Marmot store wipe failed: \(reason)"
             }
         }
     }
@@ -79,11 +82,29 @@ enum MarmotAppGroupStore {
         let db = group
             .appendingPathComponent(dbDirName, isDirectory: true)
             .appendingPathComponent(dbFileName)
-        guard fileManager.fileExists(atPath: db.path) else { return nil }
+        guard fileManager.fileExists(atPath: db.path),
+              isAuthoritativeDatabaseFile(db, fileManager: fileManager)
+        else {
+            return nil
+        }
         return db
         #else
         return try? databaseURL(fileManager: fileManager)
         #endif
+    }
+
+    /// True when `db` looks like a real SQLCipher store (non-empty). Zero-byte
+    /// placeholders must not block legacy migration or authorize NSE connect.
+    static func isAuthoritativeDatabaseFile(
+        _ db: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        guard let attrs = try? fileManager.attributesOfItem(atPath: db.path),
+              let size = attrs[.size] as? NSNumber
+        else {
+            return false
+        }
+        return size.intValue > 0
     }
 
     /// Legacy pre-NSE path (`Application Support/sonar-marmot`).
@@ -122,7 +143,12 @@ enum MarmotAppGroupStore {
     ) throws {
         let sharedDb = sharedDir.appendingPathComponent(dbFileName)
         if fileManager.fileExists(atPath: sharedDb.path) {
-            return
+            if isAuthoritativeDatabaseFile(sharedDb, fileManager: fileManager) {
+                return
+            }
+            // Empty placeholder (e.g. historical NSE mkdir+connect) is not
+            // authoritative — drop it so Application Support can migrate.
+            try? fileManager.removeItem(at: sharedDb)
         }
         guard let legacyDir,
               fileManager.fileExists(atPath: legacyDir.path)
@@ -161,8 +187,9 @@ enum MarmotAppGroupStore {
     #endif
 
     /// Wipe shared + legacy roots by fixed paths — never call `databaseDirectory()`
-    /// (which migrates) from a wipe path.
-    static func removeAllStoreFiles(fileManager: FileManager = .default) {
+    /// (which migrates) from a wipe path. Throws if a present root cannot be removed
+    /// so callers do not delete the Keychain DB key against a surviving store.
+    static func removeAllStoreFiles(fileManager: FileManager = .default) throws {
         var roots: [URL] = []
         #if os(iOS)
         if let group = fileManager.containerURL(
@@ -183,13 +210,22 @@ enum MarmotAppGroupStore {
             roots.append(support.appendingPathComponent(dbDirName, isDirectory: true))
         }
         #endif
-        removeStoreRoots(roots, fileManager: fileManager)
+        try removeStoreRoots(roots, fileManager: fileManager)
     }
 
     /// Testable wipe helper: delete only the given roots when present.
-    static func removeStoreRoots(_ roots: [URL], fileManager: FileManager = .default) {
+    static func removeStoreRoots(_ roots: [URL], fileManager: FileManager = .default) throws {
         for root in roots where fileManager.fileExists(atPath: root.path) {
-            try? fileManager.removeItem(at: root)
+            do {
+                try fileManager.removeItem(at: root)
+            } catch {
+                throw StoreError.wipeFailed(
+                    "failed to remove \(root.lastPathComponent): \(error.localizedDescription)"
+                )
+            }
+            if fileManager.fileExists(atPath: root.path) {
+                throw StoreError.wipeFailed("\(root.lastPathComponent) still present after remove")
+            }
         }
     }
 }

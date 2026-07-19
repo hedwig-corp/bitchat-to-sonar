@@ -256,21 +256,28 @@ enum SonarPushProcessor {
             }
             let groupName = notif.groupName.isEmpty ? nil : notif.groupName
             let conversationTitle = groupName ?? senderName
-            // Stable-ish id so a retrying wake replaces rather than stacking.
-            let idKey = [
-                notif.senderNpub,
-                notif.groupName,
-                notif.contentPreview,
-            ].joined(separator: "|")
+            // R-004: prefer message id; fall back to content-stable key only when
+            // core omitted id (should not happen for real drains).
+            let idKey = notif.messageIdHex.isEmpty
+                ? [
+                    notif.senderNpub,
+                    notif.groupName,
+                    notif.contentPreview,
+                ].joined(separator: "|")
+                : notif.messageIdHex
             let conversationId = notif.groupIdHex.isEmpty
                 ? nil
                 : "marmot:" + notif.groupIdHex
-            let userInfo: [String: Any] = conversationId.map {
-                [SonarNotificationKeys.conversationId: $0]
-            } ?? [:]
+            var userInfo: [String: Any] = [:]
+            if let conversationId {
+                userInfo[SonarNotificationKeys.conversationId] = conversationId
+            }
+            if !notif.messageIdHex.isEmpty {
+                userInfo["sonar.messageId"] = notif.messageIdHex
+            }
 
             guard let routed = SonarLocalNotificationRouter.make(
-                idKey: idKey,
+                idKey: idKey.isEmpty ? UUID().uuidString : idKey,
                 kind: kind,
                 conversationTitle: conversationTitle,
                 senderName: senderName,

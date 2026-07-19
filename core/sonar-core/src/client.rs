@@ -1355,6 +1355,8 @@ impl RelayFetchOutcome {
 /// fire rich local notifications (sender name + preview).
 #[derive(Clone, Debug)]
 pub struct DrainNotification {
+    /// Chat message / event id hex — hosts key notification dedup on this (R-004).
+    pub message_id_hex: String,
     pub sender_pubkey: String,
     /// MLS group id hex — hosts use this for notification tap handoff
     /// (`marmot:<hex>` conversation id).
@@ -5805,6 +5807,7 @@ impl SonarClient {
                             message.content.clone()
                         };
                         notifications.push(DrainNotification {
+                            message_id_hex: message.id.to_hex(),
                             sender_pubkey: message.sender.to_string(),
                             group_id_hex: hex::encode(message.group_id.as_slice()),
                             group_name: cached_name.unwrap_or("").to_string(),
@@ -8155,6 +8158,7 @@ mod tests {
 
     fn test_notification(preview: &str) -> DrainNotification {
         DrainNotification {
+            message_id_hex: format!("mid-{}", preview),
             sender_pubkey: "npub-test".to_string(),
             group_id_hex: "aa".to_string(),
             group_name: "group".to_string(),

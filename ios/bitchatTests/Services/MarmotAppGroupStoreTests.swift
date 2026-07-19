@@ -78,6 +78,39 @@ struct MarmotAppGroupStoreTests {
         #endif
     }
 
+    @Test func migrateReplacesEmptySharedPlaceholderWithLegacy() throws {
+        #if os(iOS)
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? fm.removeItem(at: root) }
+        let legacy = root.appendingPathComponent("legacy", isDirectory: true)
+        let shared = root.appendingPathComponent("shared", isDirectory: true)
+        try fm.createDirectory(at: legacy, withIntermediateDirectories: true)
+        try fm.createDirectory(at: shared, withIntermediateDirectories: true)
+        // Zero-byte placeholder must not block migration.
+        fm.createFile(
+            atPath: shared.appendingPathComponent(MarmotAppGroupStore.dbFileName).path,
+            contents: Data(),
+            attributes: nil
+        )
+        try "legacy-db".write(
+            to: legacy.appendingPathComponent(MarmotAppGroupStore.dbFileName),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        try MarmotAppGroupStore.migrateLegacyStoreIfNeeded(
+            from: legacy,
+            into: shared,
+            fileManager: fm
+        )
+
+        let sharedDb = shared.appendingPathComponent(MarmotAppGroupStore.dbFileName)
+        #expect(try String(contentsOf: sharedDb, encoding: .utf8) == "legacy-db")
+        #expect(!fm.fileExists(atPath: legacy.path))
+        #endif
+    }
+
     @Test func removeStoreRootsDeletesOnlyExistingPaths() throws {
         let fm = FileManager.default
         let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -93,7 +126,7 @@ struct MarmotAppGroupStoreTests {
             encoding: .utf8
         )
 
-        MarmotAppGroupStore.removeStoreRoots([shared, legacy, missing], fileManager: fm)
+        try MarmotAppGroupStore.removeStoreRoots([shared, legacy, missing], fileManager: fm)
 
         #expect(!fm.fileExists(atPath: shared.path))
         #expect(!fm.fileExists(atPath: legacy.path))

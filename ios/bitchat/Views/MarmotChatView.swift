@@ -1260,6 +1260,15 @@ final class MarmotChatModel: ObservableObject {
     /// Record that push wake already bannered the local rows matching a drain
     /// notification (preview may be core-truncated with `…`).
     func notePushWakeNotified(drain notif: DrainNotificationInfo) {
+        // Prefer exact message id from core (R-004) — no preview scan needed.
+        if !notif.messageIdHex.isEmpty {
+            pushWakeNotifiedMessageIDs.insert(notif.messageIdHex)
+            if !notif.groupIdHex.isEmpty {
+                pushWakeNotifiedGroupIds.insert(notif.groupIdHex)
+            }
+            return
+        }
+
         let preview = notif.contentPreview
         let hasGroupName = !notif.groupName.isEmpty
         let hasSender = !notif.senderNpub.isEmpty

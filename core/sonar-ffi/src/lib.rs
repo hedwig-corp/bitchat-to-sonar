@@ -476,6 +476,7 @@ pub struct ResolvedHandleInfo {
 /// fire rich local notifications (sender name + preview).
 #[derive(uniffi::Record)]
 pub struct DrainNotificationInfo {
+    pub message_id_hex: String,
     pub sender_npub: String,
     pub group_id_hex: String,
     pub group_name: String,
@@ -1121,6 +1122,7 @@ impl SonarNode {
         Ok(notifications
             .into_iter()
             .map(|n| DrainNotificationInfo {
+                message_id_hex: n.message_id_hex,
                 sender_npub: n.sender_pubkey,
                 group_id_hex: n.group_id_hex,
                 group_name: n.group_name,
@@ -1194,6 +1196,7 @@ impl SonarNode {
         Ok(notifications
             .into_iter()
             .map(|n| DrainNotificationInfo {
+                message_id_hex: n.message_id_hex,
                 sender_npub: n.sender_pubkey,
                 group_id_hex: n.group_id_hex,
                 group_name: n.group_name,

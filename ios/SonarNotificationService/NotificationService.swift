@@ -210,7 +210,9 @@ class NotificationService: SDKNotificationService {
         }
         let dir = group.appendingPathComponent("sonar-marmot", isDirectory: true)
         let db = dir.appendingPathComponent("marmot.sqlite")
-        guard FileManager.default.fileExists(atPath: db.path) else {
+        // Refuse missing or empty placeholders — connect would mint a forked
+        // SQLCipher store and orphan Application Support history.
+        guard MarmotAppGroupStore.isAuthoritativeDatabaseFile(db) else {
             throw NSEMarmotError.sharedDatabaseMissing
         }
         guard databaseIsBackgroundSafe(dir) else {
@@ -273,6 +275,9 @@ class NotificationService: SDKNotificationService {
         if !notification.groupIdHex.isEmpty {
             userInfo[conversationIdKey] = marmotConversationPrefix + notification.groupIdHex
         }
+        if !notification.messageIdHex.isEmpty {
+            userInfo["sonar.messageId"] = notification.messageIdHex
+        }
         content.userInfo = userInfo
     }
 
@@ -282,7 +287,11 @@ class NotificationService: SDKNotificationService {
     ) {
         let content = UNMutableNotificationContent()
         apply(notification: notification, to: content, prefs: prefs)
-        let id = "sonar-nse-\(notification.groupIdHex)-\(UUID().uuidString)"
+        // Prefer message id so UN replace + host R-004 dedup share one key.
+        let idSuffix = notification.messageIdHex.isEmpty
+            ? UUID().uuidString
+            : notification.messageIdHex
+        let id = "sonar-nse-\(idSuffix)"
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
