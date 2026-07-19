@@ -3,7 +3,9 @@
 //! Probes:
 //! - public Sonar client bootstrap relays (WebSocket open RTT)
 //! - optional HTTP health URLs
-//! - optional Marmot chat path (KeyPackage publish + fetch) when a probe nsec is set
+//! - optional Blossom media path (`--media-probe`; BUD-02 when a probe nsec is set)
+//! - optional Marmot chat path (KeyPackage publish + fetch) only with `--chat-probe`
+//!   (probe nsec alone does not enable chat)
 //!
 //! Publishes a replaceable event (kind 30078, d=sonar-status) that the marketing
 //! site (`web/src/lib/status-nostr.js`) REQs when `STATUS_PUBKEY_HEX` matches.

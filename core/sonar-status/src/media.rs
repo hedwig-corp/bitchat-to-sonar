@@ -21,11 +21,15 @@ use crate::schema::{ServiceState, StatusService};
 const MEDIA_UPLOAD_DEGRADED_MS: u64 = 5_000;
 /// Soft latency budget for HEAD-only mode (ms).
 const MEDIA_HEAD_DEGRADED_MS: u64 = 5_000;
-/// Hard timeout per server operation (HEAD or upload+get).
+/// Hard timeout per single HTTP/Blossom op (upload PUT, GET, or HEAD).
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(20);
+/// Cap on compare hosts so a bad env list cannot stretch the cron forever.
+const MAX_COMPARE_HOSTS: usize = 2;
 /// Canary payload size (~4 KiB) — enough to exercise the PUT body path without
 /// dominating cron runtime.
 const CANARY_BYTES: usize = 4_096;
+/// GET body slack over canary size (reject oversized / DoS responses).
+const CANARY_GET_MAX_BYTES: usize = CANARY_BYTES + 64;
 
 /// Previous public Blossom default — kept as the status compare target so
 /// `/status` shows Hedwig vs the old public host.
@@ -157,7 +161,11 @@ pub async fn probe_blossom_servers(
     compare: &[String],
     probe_secret: Option<&str>,
 ) -> MediaProbeReport {
-    let servers = blossom_servers_to_probe(primary, compare);
+    let mut servers = blossom_servers_to_probe(primary, compare);
+    // Keep primary + at most MAX_COMPARE_HOSTS candidates.
+    if servers.len() > 1 + MAX_COMPARE_HOSTS {
+        servers.truncate(1 + MAX_COMPARE_HOSTS);
+    }
     let mode = if probe_secret.is_some() {
         "upload"
     } else {
@@ -192,15 +200,25 @@ pub async fn probe_blossom_servers(
         None => None,
     };
 
-    let mut samples = Vec::with_capacity(servers.len());
-    for (server, is_primary) in &servers {
-        let sample = if let Some(ref keys) = keys {
-            probe_upload(server, *is_primary, keys).await
-        } else {
-            probe_head(server, *is_primary).await
-        };
-        samples.push(sample);
-    }
+    // Probe hosts concurrently so a slow compare host does not delay primary.
+    let samples = {
+        let futs: Vec<_> = servers
+            .iter()
+            .map(|(server, is_primary)| {
+                let keys = keys.clone();
+                let server = server.clone();
+                let is_primary = *is_primary;
+                async move {
+                    if let Some(ref keys) = keys {
+                        probe_upload(&server, is_primary, keys).await
+                    } else {
+                        probe_head(&server, is_primary).await
+                    }
+                }
+            })
+            .collect();
+        futures_util::future::join_all(futs).await
+    };
 
     summarize(primary, mode, samples)
 }
@@ -259,20 +277,21 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
         }
     };
 
-    let fut = client.head(&server).send();
-    match tokio::time::timeout(MEDIA_TIMEOUT, fut).await {
-        Ok(Ok(resp)) => {
-            let mut status = resp.status().as_u16();
-            let mut ok = resp.status().is_success() || resp.status().is_redirection();
-            if status == 405 || status == 404 {
-                match client.get(&server).send().await {
-                    Ok(r) => {
-                        status = r.status().as_u16();
-                        ok = r.status().is_success() || r.status().is_redirection();
-                    }
-                    Err(_) => ok = false,
-                }
-            }
+    // One deadline for HEAD and the 405/404 GET fallback.
+    let reachability = async {
+        let resp = client.head(&server).send().await?;
+        let mut status = resp.status().as_u16();
+        let mut ok = resp.status().is_success() || resp.status().is_redirection();
+        if status == 405 || status == 404 {
+            let r = client.get(&server).send().await?;
+            status = r.status().as_u16();
+            ok = r.status().is_success() || r.status().is_redirection();
+        }
+        Ok::<_, reqwest::Error>((status, ok))
+    };
+
+    match tokio::time::timeout(MEDIA_TIMEOUT, reachability).await {
+        Ok(Ok((status, ok))) => {
             let ms = t0.elapsed().as_millis() as u64;
             MediaServerSample {
                 server,
@@ -343,6 +362,47 @@ fn upload_fail(
     }
 }
 
+/// Require https + same host as the upload base (no open redirects / SSRF).
+fn validate_canary_get_url(upload_base: &Url, blob_url: &Url) -> Result<(), String> {
+    if blob_url.scheme() != "https" {
+        return Err(format!(
+            "refusing non-https descriptor.url scheme {}",
+            blob_url.scheme()
+        ));
+    }
+    let upload_host = upload_base.host_str().unwrap_or("");
+    let blob_host = blob_url.host_str().unwrap_or("");
+    if upload_host.is_empty() || blob_host != upload_host {
+        return Err(format!(
+            "descriptor.url host {blob_host:?} != upload host {upload_host:?}"
+        ));
+    }
+    Ok(())
+}
+
+async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    if let Some(len) = resp.content_length() {
+        if len as usize > max_bytes {
+            return Err(format!("GET body too large: {len} bytes"));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| format!("GET body read: {e}"))?
+    {
+        if body.len() + chunk.len() > max_bytes {
+            return Err("GET body exceeded size cap".into());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaServerSample {
     let server = server.trim_end_matches('/').to_owned();
     let base = match Url::parse(&server) {
@@ -351,6 +411,16 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
             return upload_fail(server, primary, None, None, format!("bad server url: {e}"));
         }
     };
+    if base.scheme() != "https" {
+        return upload_fail(
+            server,
+            primary,
+            None,
+            None,
+            format!("refusing non-https blossom server {}", base.scheme()),
+        );
+    }
+    let upload_base = base.clone();
 
     let data = canary_payload();
     let client = BlossomClient::new(base);
@@ -389,9 +459,17 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
     };
     let upload_ms = t_upload.elapsed().as_millis() as u64;
 
-    // Fetch the exact URL apps store (`descriptor.url`), not reconstructed
-    // `GET /{sha256}` — matches sonar-core media send / download path.
-    let http = match reqwest::Client::builder().timeout(MEDIA_TIMEOUT).build() {
+    if let Err(e) = validate_canary_get_url(&upload_base, &descriptor.url) {
+        return upload_fail(server, primary, Some(upload_ms), None, e);
+    }
+
+    // Fetch the exact URL apps store (`descriptor.url`). Hardened like
+    // sonar-core media download: https, no redirects, capped body.
+    let http = match reqwest::Client::builder()
+        .timeout(MEDIA_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             return upload_fail(
@@ -403,9 +481,13 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
             );
         }
     };
-    let blob_url = descriptor.url.to_string();
+    let blob_host = descriptor
+        .url
+        .host_str()
+        .unwrap_or("unknown")
+        .to_owned();
     let t_get = Instant::now();
-    let get = tokio::time::timeout(MEDIA_TIMEOUT, http.get(&blob_url).send()).await;
+    let get = tokio::time::timeout(MEDIA_TIMEOUT, http.get(descriptor.url.as_str()).send()).await;
     let get_ms = t_get.elapsed().as_millis() as u64;
 
     let (get_ok, get_status, get_error) = match get {
@@ -415,17 +497,17 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
                 (
                     false,
                     Some(status),
-                    Some(format!("GET {blob_url} HTTP {status}")),
+                    Some(format!("GET {blob_host} HTTP {status}")),
                 )
             } else {
-                match resp.bytes().await {
-                    Ok(bytes) if bytes.as_ref() == data.as_slice() => (true, Some(status), None),
+                match read_body_capped(resp, CANARY_GET_MAX_BYTES).await {
+                    Ok(bytes) if bytes == data => (true, Some(status), None),
                     Ok(_) => (false, Some(status), Some("GET body mismatch".into())),
-                    Err(e) => (false, Some(status), Some(format!("GET body read: {e}"))),
+                    Err(e) => (false, Some(status), Some(e)),
                 }
             }
         }
-        Ok(Err(e)) => (false, None, Some(format!("GET {blob_url} failed: {e}"))),
+        Ok(Err(e)) => (false, None, Some(format!("GET {blob_host} failed: {e}"))),
         Err(_) => (
             false,
             None,
@@ -434,15 +516,23 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
     };
 
     // Cleanup is best-effort for probe ok/state, but delete outcome is recorded.
+    let delete_budget = if get_ok {
+        Duration::from_secs(8)
+    } else {
+        Duration::from_secs(2)
+    };
     let (delete_ok, delete_error) = match tokio::time::timeout(
-        Duration::from_secs(8),
+        delete_budget,
         client.delete_blob(descriptor.sha256, None, keys),
     )
     .await
     {
         Ok(Ok(())) => (Some(true), None),
         Ok(Err(e)) => (Some(false), Some(summarize_blossom_err(&e))),
-        Err(_) => (Some(false), Some("delete timed out after 8s".into())),
+        Err(_) => (
+            Some(false),
+            Some(format!("delete timed out after {}s", delete_budget.as_secs())),
+        ),
     };
 
     MediaServerSample {
@@ -592,5 +682,21 @@ mod tests {
             short_host(&format!("{DEFAULT_BLOSSOM_SERVER}/")),
             "push.sonar.hedwig.sh"
         );
+    }
+
+    #[test]
+    fn canary_get_url_requires_https_same_host() {
+        let base = Url::parse(DEFAULT_BLOSSOM_SERVER).unwrap();
+        let ok = Url::parse(&format!(
+            "{DEFAULT_BLOSSOM_SERVER}/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ))
+        .unwrap();
+        assert!(validate_canary_get_url(&base, &ok).is_ok());
+
+        let http = Url::parse("http://push.sonar.hedwig.sh/aa").unwrap();
+        assert!(validate_canary_get_url(&base, &http).is_err());
+
+        let other = Url::parse("https://evil.example/aa").unwrap();
+        assert!(validate_canary_get_url(&base, &other).is_err());
     }
 }
