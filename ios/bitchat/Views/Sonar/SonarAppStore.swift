@@ -673,7 +673,7 @@ final class SonarAppStore: ObservableObject {
         static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
-        static let marmotNsecKeychainKey = "marmot-nsec"
+        static let marmotNsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     }
 
     #if os(iOS)

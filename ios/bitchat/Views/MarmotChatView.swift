@@ -256,7 +256,7 @@ final class MarmotChatModel: ObservableObject {
         case invalidated
     }
 
-    private static let nsecKeychainKey = "marmot-nsec"
+    private static let nsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     /// Raw encoded sticker bytes stay bounded independently from the 100 MiB
     /// disk cache. Decoded SwiftUI images have their own framework caches, so
     /// retaining hundreds of multi-megabyte Data values here only adds memory

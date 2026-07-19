@@ -64,7 +64,7 @@ enum SonarWalletDerivation {
 @MainActor
 final class BridgedWallet: SonarWalletProviding {
     /// Keychain key holding the chat identity nsec (written by MarmotChatModel).
-    private static let nsecKeychainKey = "marmot-nsec"
+    private static let nsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     private static let cleanupPendingKey = "sonar.wallet.cleanupPending"
 
     private let bridge: WalletBridgeService
