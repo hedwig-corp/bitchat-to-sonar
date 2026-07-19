@@ -96,7 +96,19 @@ class NotificationService: SDKNotificationService {
         Self.logResidentMemory("expire")
         #endif
         if let content = bestAttemptContent {
-            Self.configureTransponderNotification(content)
+            // Do NOT wipe a title/body hydrate already wrote. The previous
+            // path always re-applied the generic placeholder here, so a slow
+            // sync that finished apply-then-lost-the-race-to-expire delivered
+            // "New Sonar message" even when diagnostics said decorated.
+            let stillPlaceholder = (content.userInfo["sonar.nsePlaceholder"] as? Bool) == true
+            if stillPlaceholder {
+                Self.configureTransponderNotification(content)
+                Self.recordDiagnostic("expire:stillPlaceholder")
+            } else {
+                Self.recordDiagnostic(
+                    "expire:keepingDecorated title=\(content.title.prefix(32)) body=\(content.body.prefix(40))"
+                )
+            }
             finish(with: content)
         }
         super.serviceExtensionTimeWillExpire()
@@ -131,13 +143,15 @@ class NotificationService: SDKNotificationService {
                 return
             }
             let prefs = Self.notificationPrefs()
-            let primary = notifications[0]
+            // Drain is oldest-first (sync queue + live append). Banner the tip.
+            let ordered = Array(notifications.reversed())
+            let primary = ordered[0]
             Self.apply(
                 notification: primary,
                 to: content,
                 prefs: prefs
             )
-            let extras = Array(notifications.dropFirst().prefix(Self.maxAdditionalPresentations))
+            let extras = Array(ordered.dropFirst().prefix(Self.maxAdditionalPresentations))
             for extra in extras {
                 Self.postAdditionalLocalNotification(extra, prefs: prefs)
             }
@@ -205,13 +219,21 @@ class NotificationService: SDKNotificationService {
             // row was already local, the concurrent app wake consumed the pending
             // list first, or sync only advanced summaries. Prefer the newest
             // unread conversation so the banner still gets names/preview.
+            // Cap at one — extras from unrelated stale unreads look like spam
+            // "Sonar Notification" banners and hide the tip that just arrived.
             if drained.isEmpty {
                 let fromUnread = Self.drainNotificationsFromUnreadSummaries(node)
                 if !fromUnread.isEmpty {
-                    Self.recordDiagnostic("emptyDrain:fallbackUnread count=\(fromUnread.count)")
+                    // Stamped before decorate overwrites — proves unread path.
+                    Self.recordDiagnostic(
+                        "emptyDrain:fallbackUnread tip=\(fromUnread[0].contentPreview.prefix(48))"
+                    )
                     drained = fromUnread
                 }
             }
+            // Resolve kind-0 names while the node is still open (main-app path
+            // does the same via MarmotService.resolveSenderName).
+            drained = Self.withResolvedSenderLabels(drained, node: node)
             releaseMarmotWakeNode()
             return drained
         } catch {
@@ -220,23 +242,60 @@ class NotificationService: SDKNotificationService {
         }
     }
 
-    /// Build banner rows from local unread conversation summaries (newest first).
+    /// Build banner rows from local unread conversation summaries (newest tip only).
     private static func drainNotificationsFromUnreadSummaries(
         _ node: SonarNode
     ) -> [DrainNotificationInfo] {
-        node.conversationSummaries()
-            .filter { $0.unreadCount > 0 && !$0.latestMine }
-            .sorted { $0.latestAtSecs > $1.latestAtSecs }
-            .prefix(maxAdditionalPresentations + 1)
-            .map { summary in
-                DrainNotificationInfo(
-                    messageIdHex: "",
-                    senderNpub: summary.latestSenderNpub,
-                    groupIdHex: summary.groupIdHex,
-                    groupName: summary.name,
-                    contentPreview: summary.latestContent
-                )
-            }
+        Array(
+            node.conversationSummaries()
+                .filter { $0.unreadCount > 0 && !$0.latestMine }
+                .sorted { $0.latestAtSecs > $1.latestAtSecs }
+                .prefix(1)
+                .map { summary in
+                    DrainNotificationInfo(
+                        messageIdHex: "",
+                        senderNpub: summary.latestSenderNpub,
+                        groupIdHex: summary.groupIdHex,
+                        groupName: summary.name,
+                        contentPreview: summary.latestContent
+                    )
+                }
+        )
+    }
+
+    /// Replace raw hex/npub sender fields with kind-0 display names when known.
+    private static func withResolvedSenderLabels(
+        _ notifications: [DrainNotificationInfo],
+        node: SonarNode
+    ) -> [DrainNotificationInfo] {
+        notifications.map { note in
+            let label = resolvedSenderLabel(for: note.senderNpub, node: node)
+            guard label != note.senderNpub else { return note }
+            return DrainNotificationInfo(
+                messageIdHex: note.messageIdHex,
+                senderNpub: label,
+                groupIdHex: note.groupIdHex,
+                groupName: note.groupName,
+                contentPreview: note.contentPreview
+            )
+        }
+    }
+
+    private static func resolvedSenderLabel(for sender: String, node: SonarNode) -> String {
+        let trimmed = sender.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        if let profile = try? node.fetchProfile(npub: trimmed) {
+            let candidate = [profile.displayName, profile.name]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            if let candidate { return candidate }
+        }
+        // Hex pubkeys without a kind-0 profile read as opaque noise on the
+        // lock screen ("Sonar Notification"). Prefer a clear generic label.
+        if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
+            return "New message"
+        }
+        return shortLabel(for: trimmed)
     }
 
     private func releaseMarmotWakeNode() {
@@ -416,6 +475,11 @@ class NotificationService: SDKNotificationService {
         contentHandler = nil
         bestAttemptContent = nil
         hydrateTask = nil
+        if handler == nil {
+            Self.recordDiagnostic(
+                "finishDropped title=\(content.title.prefix(32)) (handler already consumed)"
+            )
+        }
         handler?(content)
     }
 
