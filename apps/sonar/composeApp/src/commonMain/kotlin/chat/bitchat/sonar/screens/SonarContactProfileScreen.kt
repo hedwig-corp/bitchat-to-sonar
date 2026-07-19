@@ -268,7 +268,9 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                             if (state.npubStringForPeer(id)?.let { canonicalProfileKey(it) } == npub) add(id)
                         }
                         state.meshDmRows.forEach { row ->
-                            if (state.npubStringForPeer(row.id)?.let { canonicalProfileKey(it) } == npub) add(row.id)
+                            if (state.npubStringForPeer(row.peerId)?.let { canonicalProfileKey(it) } == npub) {
+                                add(row.peerId)
+                            }
                         }
                     }
                 }.distinct()
