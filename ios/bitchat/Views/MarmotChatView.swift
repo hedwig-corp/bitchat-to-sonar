@@ -522,10 +522,30 @@ final class MarmotChatModel: ObservableObject {
     /// NSE can acquire exclusive hydrate on Transponder push. Tor/Nostr are already
     /// dormant in background; keeping the flock would leave banners stuck on the
     /// generic NSE placeholder (no `content-available` app wake on production APNs).
+    ///
+    /// Uses a background task so iOS does not freeze the process mid-closeNode —
+    /// a fire-and-forget Task alone often loses the race with Transponder NSE.
     func suspendStoreForBackground() {
+        #if os(iOS)
+        var bgTask = UIBackgroundTaskIdentifier.invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        Task { [weak self] in
+            await self?.service.closeNode()
+            if bgTask != .invalid {
+                UIApplication.shared.endBackgroundTask(bgTask)
+                bgTask = .invalid
+            }
+        }
+        #else
         Task { [weak self] in
             await self?.service.closeNode()
         }
+        #endif
     }
 
     func prepareIdentityForOnboarding() async -> Bool {
@@ -905,7 +925,7 @@ final class MarmotChatModel: ObservableObject {
                 detail = message
             case .cancelled:
                 return true
-            case .notConnected:
+            case .notConnected, .backupAlreadyInProgress:
                 return false
             }
         } else {

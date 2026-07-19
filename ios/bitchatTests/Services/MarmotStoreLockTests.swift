@@ -73,6 +73,11 @@ struct MarmotStoreLockTests {
         }
         let held = try MarmotStoreLock.acquireExclusive()
         #expect(MarmotStoreLock.tryAcquireExclusive() == nil)
+        if case .busy = MarmotStoreLock.tryAcquireExclusiveResult() {
+            // expected
+        } else {
+            Issue.record("expected .busy while exclusive held")
+        }
         // App background path: closeNode → release. NSE must then hydrate.
         held.release()
         let nse = MarmotStoreLock.tryAcquireExclusive()

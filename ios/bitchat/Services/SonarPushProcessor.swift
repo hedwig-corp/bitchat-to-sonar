@@ -155,6 +155,15 @@ enum SonarPushProcessor {
         // chat as "new" after refresh and re-alert stale threads.
         // Only trust the baseline when the local read actually succeeded —
         // a failed load leaves the cache empty and must not count as hydrated.
+        //
+        // Yield briefly so a concurrent NSE hydrate can take the App Group
+        // flock first. Production Transponder is alert+mutable-content (no
+        // content-available), but some wakes still relaunch the host — without
+        // this delay the host steals the lock and NSE stays on the generic
+        // placeholder.
+        if UIApplication.shared.applicationState != .active {
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+        }
         _ = await marmot.ensureConnected()
         let baselineHydrated = await marmot.loadLocalSummaries()
         let beforeUnread = unreadFingerprint(marmot: marmot)

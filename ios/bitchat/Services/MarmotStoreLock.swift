@@ -83,16 +83,43 @@ final class MarmotStoreLock: @unchecked Sendable {
     /// app (or another wake) already holds the store.
     static func tryAcquireExclusive(fileManager: FileManager = .default) -> MarmotStoreLock? {
         #if os(iOS)
-        guard let url = lockFileURL(fileManager: fileManager, createDirectory: false) else {
-            return nil
-        }
-        do {
-            return try openAndLock(url: url, nonBlocking: true)
-        } catch {
+        switch tryAcquireExclusiveResult(fileManager: fileManager) {
+        case .acquired(let lock):
+            return lock
+        case .busy, .unavailable, .system:
             return nil
         }
         #else
         return nil
+        #endif
+    }
+
+    /// NSE diagnostic path — distinguishes busy vs missing store vs I/O errors.
+    enum TryAcquireResult: Sendable {
+        case acquired(MarmotStoreLock)
+        case busy
+        case unavailable
+        case system(Int32)
+    }
+
+    static func tryAcquireExclusiveResult(
+        fileManager: FileManager = .default
+    ) -> TryAcquireResult {
+        #if os(iOS)
+        guard let url = lockFileURL(fileManager: fileManager, createDirectory: false) else {
+            return .unavailable
+        }
+        do {
+            return .acquired(try openAndLock(url: url, nonBlocking: true))
+        } catch StoreLockError.busy {
+            return .busy
+        } catch StoreLockError.system(let err) {
+            return .system(err)
+        } catch {
+            return .system(EIO)
+        }
+        #else
+        return .unavailable
         #endif
     }
 

@@ -1087,6 +1087,14 @@
 				INFOPLIST_FILE = SonarNotificationService/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = "$(MARKETING_VERSION)";
+				/* BreezFFI ships plain sqlite3_*; with -dead_strip that shadows
+				   libsonar_ffi's SQLCipher and NSE hydrate fails with
+				   "SQLCipher support is not active". Force the codec symbols. */
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-u,_sqlcipher_cc_setup",
+					"-Wl,-u,_sqlite3_key",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar.NotificationService;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -1113,6 +1121,11 @@
 				INFOPLIST_FILE = SonarNotificationService/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
 				MARKETING_VERSION = "$(MARKETING_VERSION)";
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"-Wl,-u,_sqlcipher_cc_setup",
+					"-Wl,-u,_sqlite3_key",
+				);
 				PRODUCT_BUNDLE_IDENTIFIER = sh.hedwig.sonar.NotificationService;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
