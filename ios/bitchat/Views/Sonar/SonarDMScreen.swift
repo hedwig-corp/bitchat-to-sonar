@@ -115,6 +115,7 @@ struct SonarDMScreenContent: View {
     @ViewBuilder
     private var dmComposer: some View {
         SNComposer(
+            text: store.composerDraftBinding(for: peerId),
             placeholder: "Message \(peer.name)" + (transport == .internet ? " · via internet" : ""),
             transport: transport,
             onSend: { text in

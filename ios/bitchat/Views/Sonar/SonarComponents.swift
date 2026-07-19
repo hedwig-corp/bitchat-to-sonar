@@ -3761,7 +3761,24 @@ func snPrepareComposerSend(text: String) -> String? {
     return payload.isEmpty ? nil : payload
 }
 
+/// Session-scoped per-chat draft map update. Empty text removes the entry so
+/// navigating away and back restores only real in-progress drafts.
+func snUpdatedComposerDrafts(
+    drafts: [String: String],
+    chatId: String,
+    text: String
+) -> [String: String] {
+    var next = drafts
+    if text.isEmpty {
+        next.removeValue(forKey: chatId)
+    } else {
+        next[chatId] = text
+    }
+    return next
+}
+
 struct SNComposer: View {
+    @Binding var text: String
     let placeholder: String
     let transport: SNVia
     let onSend: (String) -> Void
@@ -3776,7 +3793,6 @@ struct SNComposer: View {
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
 
-    @State private var text = ""
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
     @FocusState private var composerFocused: Bool

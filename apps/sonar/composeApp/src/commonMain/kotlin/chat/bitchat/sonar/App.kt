@@ -1046,7 +1046,7 @@ internal fun TranscriptTailPinning(
 private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     val scope = rememberCoroutineScope()
-    var draft by remember { mutableStateOf("") }
+    val draft = state.composerDraft(screen.id)
     var emojiTray by remember { mutableStateOf(false) }
     var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
     var paySheet by remember { mutableStateOf(false) }
@@ -1555,9 +1555,9 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // still visible. One Column root keeps tray + composer vertically stacked
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
-            if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+            if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(screen.id, it) }
             if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
-                onEmoji = { draft += it },
+                onEmoji = { state.setComposerDraft(screen.id, draft + it) },
                 onGif = { item ->
                     emojiTray = false
                     state.sendGifItem(screen.id, item)
@@ -1612,7 +1612,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                         MessageComposerTextField(
-                            value = draft, onValueChange = { draft = it },
+                            value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
                             modifier = Modifier
@@ -1632,7 +1632,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 },
                             onSend = {
                                 if (draft.isBlank()) return@MessageComposerTextField
-                                val d = draft; draft = ""
+                                val d = draft
+                                state.setComposerDraft(screen.id, "")
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                     state.send(screen.id, d)
@@ -1713,7 +1714,8 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(sendBg)
                             .clickable(enabled = sendEnabled) {
-                                val d = draft; draft = ""
+                                val d = draft
+                                state.setComposerDraft(screen.id, "")
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                     state.send(screen.id, d)
@@ -2219,7 +2221,8 @@ private fun VerifySheet(
 @Composable
 private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val s = sonar
-    var draft by remember { mutableStateOf("") }
+    val draftKey = composerDraftKeyForGeoDm(screen.geohash, screen.peerHex)
+    val draft = state.composerDraft(draftKey)
     val blocked = state.isGeoDmBlocked(screen.peerHex)
     // Open pinned at the newest row and snap (not animate) the first local fill,
     // exactly like ChatScreen: the transcript must not open at old history and
@@ -2293,21 +2296,26 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             ) {
                 if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
-                    value = draft, onValueChange = { draft = it },
+                    value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
                     modifier = Modifier.fillMaxWidth(),
                     onSend = {
                         if (draft.isBlank()) return@MessageComposerTextField
-                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, draft)
-                        draft = ""
+                        val d = draft
+                        state.setComposerDraft(draftKey, "")
+                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
                     },
                 )
             }
             Spacer(Modifier.width(8.dp))
             Box(
                 Modifier.size(34.dp).clip(CircleShape).background(if (draft.isBlank()) s.surface2 else s.netFill)
-                    .clickable(enabled = draft.isNotBlank()) { state.sendGeoDmMsg(screen.geohash, screen.peerHex, draft); draft = "" },
+                    .clickable(enabled = draft.isNotBlank()) {
+                        val d = draft
+                        state.setComposerDraft(draftKey, "")
+                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
+                    },
                 contentAlignment = Alignment.Center
             ) { SNIcon(SNIconName.Send, 17.dp, if (draft.isBlank()) s.text3 else s.onNet, weight = 2.3f) }
         }

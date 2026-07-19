@@ -725,6 +725,27 @@ final class SonarAppStore: ObservableObject {
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
+    /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
+    /// Survives leaving a chat and returning within the same process; cleared on send.
+    @Published private(set) var composerDrafts: [String: String] = [:]
+
+    func composerDraft(for chatId: String) -> String {
+        composerDrafts[chatId] ?? ""
+    }
+
+    func setComposerDraft(_ text: String, for chatId: String) {
+        let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
+        guard next != composerDrafts else { return }
+        composerDrafts = next
+    }
+
+    func composerDraftBinding(for chatId: String) -> Binding<String> {
+        Binding(
+            get: { [weak self] in self?.composerDraft(for: chatId) ?? "" },
+            set: { [weak self] in self?.setComposerDraft($0, for: chatId) }
+        )
+    }
+
     private var currentDMId: String? {
         if case .dm(let id)? = path.last { return id }
         return nil

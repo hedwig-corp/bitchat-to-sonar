@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.crypto.Bech32
@@ -2492,6 +2493,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     var presenceByGeohash by mutableStateOf<Map<String, Int>>(emptyMap())
         private set
     var toast by mutableStateOf<String?>(null)
+
+    /**
+     * In-memory composer drafts keyed by chat id (DM, channel, geo-DM).
+     * Survives leaving a chat and returning within the same process; cleared on send.
+     */
+    private val composerDrafts = mutableStateMapOf<String, String>()
+
+    fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
+
+    fun setComposerDraft(chatId: String, text: String) {
+        if (text.isEmpty()) {
+            composerDrafts.remove(chatId)
+        } else if (composerDrafts[chatId] != text) {
+            composerDrafts[chatId] = text
+        }
+    }
 
     /** "N here now" for a geohash channel (0 ⇒ unknown / nobody). */
     fun presence(geohash: String): Int = presenceByGeohash[geohash] ?: 0

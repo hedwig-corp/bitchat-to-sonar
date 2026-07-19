@@ -818,6 +818,7 @@ private struct MacConversationPane: View {
 
     private var composer: some View {
         SNComposer(
+            text: store.composerDraftBinding(for: id),
             placeholder: "Message \(isChannel ? channel.name : peer.name)" + (!isChannel && transport == .internet ? " - via internet" : ""),
             transport: transport,
             onSend: { text in
