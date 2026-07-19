@@ -64,4 +64,20 @@ struct MarmotStoreLockTests {
         }
         #endif
     }
+
+    @Test("release lets NSE tryAcquire succeed — background suspend contract")
+    func releaseUnblocksNseTryAcquire() throws {
+        #if os(iOS)
+        guard MarmotStoreLock.lockFileURL(createDirectory: true) != nil else {
+            return
+        }
+        let held = try MarmotStoreLock.acquireExclusive()
+        #expect(MarmotStoreLock.tryAcquireExclusive() == nil)
+        // App background path: closeNode → release. NSE must then hydrate.
+        held.release()
+        let nse = MarmotStoreLock.tryAcquireExclusive()
+        #expect(nse != nil)
+        nse?.release()
+        #endif
+    }
 }

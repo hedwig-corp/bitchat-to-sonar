@@ -2111,6 +2111,13 @@ final class SonarAppStore: ObservableObject {
                 walletService.suspendForBackground()
             }
         }
+        // Mirror Breez: release the Marmot SQLCipher handle + App Group flock so
+        // NSE Transponder hydrate is not stuck on `storeBusy` while we are
+        // suspended (production APNs has no content-available app wake).
+        // Foreground reconnect is driven by refreshAfterForeground / ensureConnected.
+        if !foreground {
+            marmot.suspendStoreForBackground()
+        }
         #endif
         updateNearbyScanning()
         guard changed else { return }

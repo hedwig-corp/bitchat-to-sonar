@@ -18,8 +18,9 @@
 	<string>$(APS_ENVIRONMENT)</string>
 	<key>keychain-access-groups</key>
 	<array>
+		<!-- Shared with SonarNotificationService for NSE Marmot hydrate.
+		     Team-prefixed only — Application Group IDs are not Keychain groups. -->
 		<string>$(AppIdentifierPrefix)sh.hedwig.sonar</string>
-		<string>$(APP_GROUP_ID)</string>
 	</array>
 </dict>
 </plist>

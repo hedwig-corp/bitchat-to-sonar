@@ -503,17 +503,28 @@ final class MarmotChatModel: ObservableObject {
             }
     }
 
-    /// Connect on first appearance: reuse the keychain identity if present.
-    /// A fresh identity may be created only by explicit onboarding completion.
-    /// Publishes our KeyPackage so White Noise users can start chats with us.
-    /// Lazy + idempotent: no-op once connected (npub set) or while a connect is
-    /// already in flight (busy).
+    /// Connect (or reconnect after background store release): reuse the keychain
+    /// identity if present. A fresh identity may be created only by explicit
+    /// onboarding completion. Publishes our KeyPackage so White Noise users can
+    /// start chats with us. Idempotent while connected or while a connect is
+    /// already in flight (`busy`).
     func connectIfNeeded(allowCreateIdentity: Bool = false) {
-        guard npub == nil, !busy else { return }
+        if service.isConnected() { return }
+        guard !busy else { return }
         busy = true
         Task {
             defer { busy = false }
             _ = await performConnect(allowCreateIdentity: allowCreateIdentity)
+        }
+    }
+
+    /// Drop the live Marmot node + App Group store lock before suspension so the
+    /// NSE can acquire exclusive hydrate on Transponder push. Tor/Nostr are already
+    /// dormant in background; keeping the flock would leave banners stuck on the
+    /// generic NSE placeholder (no `content-available` app wake on production APNs).
+    func suspendStoreForBackground() {
+        Task { [weak self] in
+            await self?.service.closeNode()
         }
     }
 
@@ -3405,7 +3416,9 @@ final class MarmotChatModel: ObservableObject {
         Task { [weak self] in
             _ = await resume?.value
             await MainActor.run {
-                if self?.mediaResumeTask === resume {
+                // Task is a struct — identity `===` is unavailable. Clear the
+                // slot after this resume finishes; a newer schedule replaces it.
+                if resume != nil {
                     self?.mediaResumeTask = nil
                 }
             }

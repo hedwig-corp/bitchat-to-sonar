@@ -3,8 +3,9 @@
 // bitchat + SonarNotificationService
 //
 // Cross-process exclusive lock for the shared App Group Marmot SQLCipher store.
-// Main app holds while SonarNode is open; NSE tries non-blocking and skips
-// hydrate if the lock is busy — no concurrent writers (WN/Signal shared-DB care).
+// Main app holds while SonarNode is open and releases on background (see
+// `MarmotChatModel.suspendStoreForBackground`) so the NSE can hydrate. NSE
+// tries non-blocking and skips hydrate if the lock is still busy.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>

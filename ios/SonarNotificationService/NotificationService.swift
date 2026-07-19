@@ -320,9 +320,11 @@ class NotificationService: SDKNotificationService {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
         ]
-        // Prefer the App Group access group (matches KeychainManager), then
-        // try without — never mint a replacement identity from the NSE.
-        for accessGroup in [appGroupId, nil as String?] {
+        // Shared keychain group is team-prefixed `*.sh.hedwig.sonar` (see
+        // entitlements). Main-app default access group matches that family id;
+        // the NSE default is `*.NotificationService`, so we must query the
+        // shared group explicitly. Never mint a replacement identity here.
+        for accessGroup in sharedKeychainAccessGroupCandidates() {
             var q = query
             if let accessGroup {
                 q[kSecAttrAccessGroup as String] = accessGroup
@@ -336,8 +338,18 @@ class NotificationService: SDKNotificationService {
                 return value
             }
         }
-        // Also try team-prefixed default access group via empty query (no group).
         return nil
+    }
+
+    /// Team-prefixed shared groups (Debug + Release teams) plus legacy App Group
+    /// and nil. Order: most-likely shared entitlement first.
+    private static func sharedKeychainAccessGroupCandidates() -> [String?] {
+        [
+            "ZQB239SHCM.sh.hedwig.sonar", // Debug / Local.xcconfig team
+            "L3N5LHJD5Y.sh.hedwig.sonar", // Release.xcconfig team
+            appGroupId,                   // legacy attempt (pre-entitlement fix)
+            nil,
+        ]
     }
 
     // MARK: - Breez (NDS)
@@ -506,7 +518,8 @@ private enum NSEMarmotError: Error {
     case appGroupUnavailable
     case sharedDatabaseMissing
     case databaseLocked
-    /// Main app holds `MarmotStoreLock` — skip hydrate (fail closed).
+    /// Main app still holds `MarmotStoreLock` (foreground / not yet suspended)
+    /// — skip hydrate (fail closed). After background the app releases the lock.
     case storeBusy
 }
 
