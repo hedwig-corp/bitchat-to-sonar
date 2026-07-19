@@ -51,6 +51,9 @@ class NotificationService: SDKNotificationService {
     private var hydrateTask: Task<Void, Never>?
     private let wakeNodeLock = NSLock()
     private var marmotWakeNode: SonarNode?
+    /// Held for the lifetime of `marmotWakeNode` so we never unlock before the
+    /// SQLCipher handle is dropped (goose M1).
+    private var marmotWakeStoreLock: MarmotStoreLock?
 
     override func didReceive(
         _ request: UNNotificationRequest,
@@ -162,23 +165,38 @@ class NotificationService: SDKNotificationService {
         guard let storeLock = MarmotStoreLock.tryAcquireExclusive() else {
             throw NSEMarmotError.storeBusy
         }
-        defer { storeLock.release() }
         let identity = try SonarIdentity.import(nsec: nsec)
-        let node = try SonarNode.connect(
-            identity: identity,
-            relayUrls: Self.defaultRelayUrls,
-            dbPath: dbURL.path,
-            dbKeyHex: dbKeyHex
-        )
+        let node: SonarNode
+        do {
+            node = try SonarNode.connect(
+                identity: identity,
+                relayUrls: Self.defaultRelayUrls,
+                dbPath: dbURL.path,
+                dbKeyHex: dbKeyHex
+            )
+        } catch {
+            storeLock.release()
+            throw error
+        }
         wakeNodeLock.lock()
         marmotWakeNode = node
+        marmotWakeStoreLock = storeLock
         wakeNodeLock.unlock()
-        return try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+        do {
+            let drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+            releaseMarmotWakeNode()
+            return drained
+        } catch {
+            releaseMarmotWakeNode()
+            throw error
+        }
     }
 
     private func releaseMarmotWakeNode() {
         wakeNodeLock.lock()
         marmotWakeNode = nil
+        marmotWakeStoreLock?.release()
+        marmotWakeStoreLock = nil
         wakeNodeLock.unlock()
     }
 

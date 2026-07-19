@@ -14,6 +14,10 @@ import Darwin
 import Foundation
 
 /// Advisory `flock` on `sonar-marmot/marmot.store.lock` in the App Group.
+///
+/// Darwin note: a second `LOCK_EX` on a **different fd** in the **same process**
+/// conflicts (EWOULDBLOCK). Callers must reuse an existing hold (see
+/// `MarmotService.prepareStoreLockForConnect`) instead of acquiring twice.
 final class MarmotStoreLock: @unchecked Sendable {
     static let appGroupId = "group.sh.hedwig.sonar"
     static let dbDirName = "sonar-marmot"

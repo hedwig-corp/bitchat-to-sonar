@@ -395,7 +395,9 @@ final class MarmotService: @unchecked Sendable {
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
         #if os(iOS)
-        let acquiredLock = try MarmotStoreLock.acquireExclusive()
+        // Reuse connectLocal's lock when present — a second blocking flock on a
+        // new fd deadlocks the same process on Darwin (EWOULDBLOCK / hang).
+        let storeLockHold = try await prepareStoreLockForConnect()
         #endif
         let (node, nodeLease): (SonarNode, NodeLifecycleLease)
         do {
@@ -407,7 +409,7 @@ final class MarmotService: @unchecked Sendable {
             )
         } catch {
             #if os(iOS)
-            acquiredLock.release()
+            abandonStoreLockHold(storeLockHold)
             #endif
             throw error
         }
@@ -423,8 +425,7 @@ final class MarmotService: @unchecked Sendable {
             service.node = node
             service.relayConnected = true
             #if os(iOS)
-            service.storeLock?.release()
-            service.storeLock = acquiredLock
+            service.installStoreLockHold(storeLockHold)
             #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
@@ -435,7 +436,7 @@ final class MarmotService: @unchecked Sendable {
         }
         guard installed else {
             #if os(iOS)
-            acquiredLock.release()
+            abandonStoreLockHold(storeLockHold)
             #endif
             throw ServiceError.cancelled
         }
@@ -461,7 +462,7 @@ final class MarmotService: @unchecked Sendable {
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             SonarDiagnostics.installCoreLoggingIfNeeded()
             #if os(iOS)
-            let acquiredLock = try MarmotStoreLock.acquireExclusive()
+            let storeLockHold = try service.prepareStoreLockForConnectSync()
             #endif
             let node: SonarNode
             do {
@@ -473,7 +474,7 @@ final class MarmotService: @unchecked Sendable {
                 )
             } catch {
                 #if os(iOS)
-                acquiredLock.release()
+                service.abandonStoreLockHold(storeLockHold)
                 #endif
                 throw error
             }
@@ -482,8 +483,7 @@ final class MarmotService: @unchecked Sendable {
             service.node = node
             service.relayConnected = false
             #if os(iOS)
-            service.storeLock?.release()
-            service.storeLock = acquiredLock
+            service.installStoreLockHold(storeLockHold)
             #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
@@ -1394,6 +1394,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeClosing = true
             service.node = nil
             service.relayConnected = false
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = nil
+            #endif
             service.nodeLock.unlock()
             return ()
         }
@@ -1604,6 +1608,50 @@ final class MarmotService: @unchecked Sendable {
             }
         }
     }
+
+    #if os(iOS)
+    /// Either reuses the lock already held (connectLocal → connect) or acquires
+    /// a fresh exclusive lock. Never blocking-flocks a second fd against ourselves.
+    private enum StoreLockHold {
+        case reused
+        case fresh(MarmotStoreLock)
+    }
+
+    private func prepareStoreLockForConnect() async throws -> StoreLockHold {
+        try await run { try $0.prepareStoreLockForConnectSync() }
+    }
+
+    private func prepareStoreLockForConnectSync() throws -> StoreLockHold {
+        nodeLock.lock()
+        if storeLock != nil {
+            nodeLock.unlock()
+            return .reused
+        }
+        nodeLock.unlock()
+        return .fresh(try MarmotStoreLock.acquireExclusive())
+    }
+
+    private func installStoreLockHold(_ hold: StoreLockHold) {
+        // Caller must hold `nodeLock` when installing a fresh lock.
+        switch hold {
+        case .reused:
+            break
+        case .fresh(let lock):
+            storeLock?.release()
+            storeLock = lock
+        }
+    }
+
+    private func abandonStoreLockHold(_ hold: StoreLockHold) {
+        switch hold {
+        case .reused:
+            // Prior connectLocal lock stays on `storeLock`.
+            break
+        case .fresh(let lock):
+            lock.release()
+        }
+    }
+    #endif
 
     private func connectNode(
         identity: SonarIdentity,
