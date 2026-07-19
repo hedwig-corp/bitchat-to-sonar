@@ -425,7 +425,7 @@ class NotificationService: SDKNotificationService {
         hydrateTask = nil
         if handler == nil {
             Self.recordDiagnostic(
-                "finishDropped title=\(content.title.prefix(32)) (handler already consumed)"
+                "finishDropped titleLen=\(content.title.count) (handler already consumed)"
             )
         }
         handler?(content)

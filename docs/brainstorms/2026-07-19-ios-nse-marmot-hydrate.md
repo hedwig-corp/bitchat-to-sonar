@@ -91,9 +91,12 @@ Ship as stacked PRs if needed: **P0 → P1 → P2+P3 → P4**. Do not land App G
 3. **Wipe deletes fixed App Group + legacy roots** without calling `databaseDirectory()` (which migrates).
 4. **Concurrent writers:** `MarmotStoreLock` (`flock` on `marmot.store.lock`) — main app holds while `SonarNode` is open; NSE `tryAcquire` and skips hydrate (generic banner) if busy. Force-quit releases the lock with the process so NSE can hydrate.
 
-## Android parity note
+## Android parity note (tracked gap)
 
-Android already hydrates on push via `SonarPushProcessingService` → `syncForce()`
-into the local DB before/with the notification. This iOS change closes the
-force-quit gap to that shape. No Android behavior change in this PR.
+| Platform | Status | Follow-up |
+| --- | --- | --- |
+| iOS NSE (`SonarNotificationService`) | Hydrate + decorate + host replace of `nseDecorated` (#362 / #381) | — |
+| Android host/FCM (`SonarPushProcessingService`) | Already syncs-on-push into local DB before/with notification | Confirm banner-replace / dual-banner stacking does not regress vs iOS `nseDecorated` remove-before-post; no Android code change in #381 |
+
+**Gap reason:** APNs NSE + App Group SQLCipher is iOS-only; Android already used a host FCM path. Follow-up is parity verification + any dual-banner fixes on Compose, not blocking this iOS ship.
 

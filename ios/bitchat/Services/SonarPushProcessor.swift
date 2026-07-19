@@ -8,9 +8,10 @@
 //
 // This runs from the AppDelegate's didReceiveRemoteNotification handler
 // inside the 30-second background execution window iOS provides. The NSE
-// may already have posted a generic banner for killed-app wakes; this path
-// replaces that with prefs-aware copy whenever newly drained (or newly
-// changed unread) local state is ready.
+// may already have posted a placeholder or titled (`sonar.nseDecorated`)
+// banner for killed-app wakes; this path removes those NSE-owned tips by
+// message/conversation id and posts prefs-aware named copy when newly
+// drained (or newly changed unread) local state is ready.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
