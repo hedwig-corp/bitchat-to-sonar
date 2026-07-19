@@ -30,6 +30,13 @@ let package = Package(
                 // the consuming app must link these frameworks. The Rust build
                 // emits `cargo:rustc-link-lib=framework=...` but static-lib
                 // xcframeworks don't propagate that to Xcode — declare it here.
+                //
+                // NSE note: BreezFFI also ships plain sqlite3_* symbols. With
+                // -dead_strip, those can satisfy SonarCore's sqlite imports and
+                // strip SQLCipher from libsonar_ffi — hydrate then fails with
+                // "SQLCipher support is not active". The NSE target forces
+                // `_sqlcipher_cc_setup` / `_sqlite3_key` via OTHER_LDFLAGS
+                // (see bitchat.xcodeproj SonarNotificationService).
                 .linkedFramework("Security"),
                 .linkedFramework("CoreFoundation"),
                 // cpal's CoreAudio backend (P2P call mic/speaker, behind the Rust

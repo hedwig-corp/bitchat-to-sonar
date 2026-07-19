@@ -356,21 +356,22 @@ the send echo was cleared before the canonical row merged.
 
 **Call sites:**
 - iOS `NotificationService.swift` (mesh/mention) → `SonarLocalNotificationRouter` + `SonarNotificationPreferenceStore`
-- iOS `SonarPushProcessor.swift` (Transponder wake) → unread conversation summaries + same router/prefs
+- iOS `SonarPushProcessor.swift` (Transponder wake) → unread conversation summaries + same router/prefs; replaces NSE placeholder/`nseDecorated` banners by tip identity
+- iOS `SonarNotificationService/NotificationService.swift` (killed-app Transponder NSE) → App Group Marmot SQLCipher + `SonarNSEDecoratePolicy`
 - iOS `SonarAppStore.swift` (process-alive Marmot) already used the router
 - Compose `SonarNotificationRouter` / `SonarPushProcessingService` (parity reference)
 
 **Guarded by:** `SonarNotificationPrefsTests.privateMessageRespectsPreviewOptIn`
 
-**Also guarded by:** `SonarNotificationPrefsTests.mentionSeamRespectsPreviewOptIn`, `SonarNotificationPrefsTests.privateMessageRespectsDefaultPrivacy`, `SonarNotificationPrefsTests.privateMessageRespectsNamesOff`, `SonarNotificationPrefsTests.disabledSuppresses`, `SonarNotificationPrefsTests.nsePlaceholderMatchesIdentityNotCopy`, `SonarNotificationPrefsTests.nsePlaceholderWipeRespectsWakeSnapshot`, `SonarNotificationPrefsTests.unreadDeltaRequiresHydratedBaseline`, `SonarNotificationPrefsTests.unreadDeltaSkipsUnchangedStale`, `SonarNotificationPrefsTests.drainPreviewMatchesTruncation`, `SonarNotificationRouterTest.previewsRequireOptIn` (Compose)
+**Also guarded by:** `SonarNotificationPrefsTests.mentionSeamRespectsPreviewOptIn`, `SonarNotificationPrefsTests.privateMessageRespectsDefaultPrivacy`, `SonarNotificationPrefsTests.privateMessageRespectsNamesOff`, `SonarNotificationPrefsTests.disabledSuppresses`, `SonarNotificationPrefsTests.nsePlaceholderMatchesIdentityNotCopy`, `SonarNotificationPrefsTests.nsePlaceholderWipeRespectsWakeSnapshot`, `SonarNotificationPrefsTests.nseOwnedReplaceMatchesTipIdentity`, `SonarNotificationPrefsTests.unreadDeltaRequiresHydratedBaseline`, `SonarNotificationPrefsTests.unreadDeltaSkipsUnchangedStale`, `SonarNotificationPrefsTests.drainPreviewMatchesTruncation`, `SonarNSEDecoratePolicyTests.namesOffHidesGroupAndSender`, `SonarNSEDecoratePolicyTests.previewOffHidesBody`, `SonarNSEDecoratePolicyTests.diagnosticsAreOpaque`, `SonarNSEDecoratePolicyTests.expireKeepsDecorated`, `SonarNotificationRouterTest.previewsRequireOptIn` (Compose)
 
-**Not guarded:** killed-app NSE rich rendering — the extension still has no App Group Marmot DB (#146 / #152), so force-quit banners stay generic until catch-up lands; `SonarPushProcessor` replaces them when the app is woken. That `sendPrivateMessageNotification` / `sendMentionNotification` still call the routed seams (no UNUserNotificationCenter spy). Push-wake ownership span / live catch-up generation need a constructible `MarmotChatModel` / `SonarAppStore`. iOS tests do not run in CI.
+**Not guarded:** That `sendPrivateMessageNotification` / `sendMentionNotification` still call the routed seams (no UNUserNotificationCenter spy). Push-wake ownership span / live catch-up generation need a constructible `MarmotChatModel` / `SonarAppStore`. NSE `apply()` wiring that stamps `sonar.nseDecorated` / clears `sonar.nsePlaceholder` is only indirectly covered via policy helpers — a call-site regression could keep helper tests green. iOS tests do not run in CI. Android host/FCM decorate + banner-replace parity with this NSE path is a tracked platform gap (see PR #381 / `docs/brainstorms/2026-07-19-ios-nse-marmot-hydrate.md`).
 
-**History:** #58 / #144 introduced the core renderer and privacy toggles → mesh helpers were left on hard-coded private copy → #152 filed the symptom → this fix wires mesh + push-wake through the router/prefs (Android #297 already rendered from unread summaries).
+**History:** #58 / #144 introduced the core renderer and privacy toggles → mesh helpers were left on hard-coded private copy → #152 filed the symptom → this fix wires mesh + push-wake through the router/prefs (Android #297 already rendered from unread summaries) → #362 / #381 land killed-app NSE hydrate (SQLCipher keep-symbols, flock retry, decorate policy, host replace of `nseDecorated`).
 
 **Rejected:**
 - *Always-private local copy "for privacy".* That ignores the user's explicit Show names / Message preview opt-in and makes the Settings toggles lie.
-- *Full NSE Marmot catch-up in this change.* Correct long-term (#146) but needs App Group DB migration; out of scope for restoring settings respect on the paths that already have decrypted local state.
+- *Relay `fetchProfile` inside the NSE decorate path.* Burns the ~30s extension budget and held the store lock under network I/O; names resolve on the host replace path instead.
 
 
 ---

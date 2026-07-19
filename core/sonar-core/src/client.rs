@@ -6059,15 +6059,10 @@ impl SonarClient {
                     self.upsert_index_for_message(message, cached_name);
                     changed_groups.insert(hex::encode(message.group_id.as_slice()));
                     if !message.mine {
-                        let preview = if message.content.len() > 100 {
-                            let mut end = 100;
-                            while !message.content.is_char_boundary(end) {
-                                end -= 1;
-                            }
-                            format!("{}…", &message.content[..end])
-                        } else {
-                            message.content.clone()
-                        };
+                        // Same preview as conversation index (media/sticker
+                        // labels). Raw `content` alone makes NSE banners show
+                        // alias + "Open Sonar to read it." for Photo/Sticker.
+                        let preview = truncate_notification_preview(&index_preview(message));
                         notifications.push(DrainNotification {
                             message_id_hex: message.id.to_hex(),
                             sender_pubkey: message.sender.to_string(),
@@ -7028,8 +7023,14 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
 /// arriving album never shows an empty home row.
 fn index_preview(message: &ChatMessage) -> String {
-    if !message.content.is_empty() || message.media.is_empty() {
+    if !message.content.is_empty() {
         return message.content.clone();
+    }
+    if message.sticker_ref.is_some() {
+        return "Sticker".to_owned();
+    }
+    if message.media.is_empty() {
+        return String::new();
     }
     let media = &message.media;
     if media.len() > 1 && media.iter().all(|m| m.mime_type.starts_with("image/")) {
@@ -7050,6 +7051,17 @@ fn index_preview(message: &ChatMessage) -> String {
     } else {
         first.filename.clone()
     }
+}
+
+fn truncate_notification_preview(preview: &str) -> String {
+    if preview.len() <= 100 {
+        return preview.to_owned();
+    }
+    let mut end = 100;
+    while !preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &preview[..end])
 }
 
 /// Read the value of a single-letter tag (e.g. `g`=geohash, `n`=nickname).
@@ -7466,6 +7478,14 @@ mod tests {
             "doc.pdf"
         );
         assert_eq!(index_preview(&msg("", vec![])), "");
+        let mut sticker_only = msg("", vec![]);
+        sticker_only.sticker_ref = Some(prefetch_ref("pack", "wave", 0xaa));
+        assert_eq!(index_preview(&sticker_only), "Sticker");
+        assert_eq!(truncate_notification_preview("hi"), "hi");
+        assert_eq!(
+            truncate_notification_preview(&"x".repeat(105)),
+            format!("{}…", "x".repeat(100))
+        );
     }
 
     #[test]
