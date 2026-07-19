@@ -3182,22 +3182,26 @@ impl SonarClient {
             None => self.fetch_key_package(*member).await?,
         };
         self.remove_group_members(group_id, vec![*member]).await?;
-        let _epoch = self.membership_gate.write().await;
-        let update = self.engine.add_members(group_id, vec![key_package])?;
-        match self.publish_membership_update(update).await {
-            Ok(()) => {}
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    peer = %member.to_hex(),
-                    "recovery re-add publish failed after remove; retrying once with newest KP"
-                );
-                drop(_epoch);
-                let retry_kp = self.fetch_key_package(*member).await?;
-                let _epoch = self.membership_gate.write().await;
-                let update = self.engine.add_members(group_id, vec![retry_kp])?;
-                self.publish_membership_update(update).await?;
+        // After remove is on the wire, both MLS-level add and publish must be
+        // retried with a fresh KP — either failure would otherwise leave the
+        // member expelled with no automatic recovery path.
+        let first_add = {
+            let _epoch = self.membership_gate.write().await;
+            match self.engine.add_members(group_id, vec![key_package]) {
+                Ok(update) => self.publish_membership_update(update).await,
+                Err(err) => Err(err),
             }
+        };
+        if let Err(err) = first_add {
+            tracing::warn!(
+                %err,
+                peer = %member.to_hex(),
+                "recovery re-add failed after remove; retrying once with newest KP"
+            );
+            let retry_kp = self.fetch_key_package(*member).await?;
+            let _epoch = self.membership_gate.write().await;
+            let update = self.engine.add_members(group_id, vec![retry_kp])?;
+            self.publish_membership_update(update).await?;
         }
         self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
         Ok(())
