@@ -65,6 +65,16 @@ class ComposerDraftsTest {
     }
 
     @Test
+    fun deleteChatRemovesOnlyThatDraft() {
+        // Per-chat delete must drop that key (and keep siblings) before persist.
+        val start = mapOf("dm:a" to "gone", "dm:b" to "keep")
+        assertEquals(
+            mapOf("dm:b" to "keep"),
+            updatedComposerDrafts(start, "dm:a", ""),
+        )
+    }
+
+    @Test
     fun wipeClearsPersistedDrafts() {
         // Wipe / erase persist an empty blob; hydrate must start empty.
         val prior = encodeComposerDrafts(mapOf("dm:a" to "secret draft"))

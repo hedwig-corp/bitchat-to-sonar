@@ -1063,6 +1063,14 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.composerDrafts)
     }
 
+    /// Drop one chat's durable draft so delete cannot resurrect text.
+    private func clearComposerDraft(_ chatId: String, aliases: [String] = []) {
+        let keys = ([chatId] + aliases).filter { !$0.isEmpty }
+        guard keys.contains(where: { composerDrafts[$0] != nil }) else { return }
+        for key in keys { composerDrafts[key] = nil }
+        scheduleComposerDraftsPersist(immediate: true)
+    }
+
     private static func loadComposerDrafts(from defaults: UserDefaults) -> [String: String] {
         snDecodeComposerDraftsFromDefaults(
             defaults.dictionary(forKey: Keys.composerDrafts) as? [String: String]
@@ -8689,6 +8697,7 @@ final class SonarAppStore: ObservableObject {
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
+        clearComposerDraft(id)
         if isPendingSecureChat(id) {
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
