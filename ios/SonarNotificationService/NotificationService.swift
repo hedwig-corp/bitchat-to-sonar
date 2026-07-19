@@ -131,12 +131,13 @@ class NotificationService: SDKNotificationService {
             return
         }
         do {
-            // Blocking UniFFI on a cooperative child Task (not detached) so
-            // cancel propagates; collect still owns node+lock release.
+            // Blocking UniFFI + flock retries on a detached worker so
+            // Thread.sleep does not pin a cooperative pool thread. Collect
+            // still owns node+lock release (expire must not unlock).
             let hintGroupId = SonarNSEDecoratePolicy.hintGroupIdHex(
                 from: content.userInfo
             )
-            let notifications = try await Task(priority: .userInitiated) { [weak self] in
+            let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
                 guard let self else { return [DrainNotificationInfo]() }
                 return try self.collectMarmotNotificationsAfterWake(
                     hintGroupIdHex: hintGroupId
@@ -184,12 +185,12 @@ class NotificationService: SDKNotificationService {
         } catch {
             os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
                    log: Self.log, type: .error, String(describing: error))
-            // acquireStoreLockForWake / credential checks already stamped a
-            // precise reason — only fill in when nothing was recorded yet.
+            // Opaque tag only — never persist error strings (may embed SQL /
+            // content). Prefer a prior precise stamp from credential/lock paths.
             if Self.lastDiagnostic().isEmpty {
-                Self.recordDiagnostic("failed:\(String(describing: error))")
+                Self.recordDiagnostic("failed:\(Self.opaqueErrorTag(error))")
             } else {
-                Self.recordDiagnostic("catch:\(String(describing: error))")
+                Self.recordDiagnostic("catch:\(Self.opaqueErrorTag(error))")
             }
             finish(with: content)
         }
@@ -293,8 +294,9 @@ class NotificationService: SDKNotificationService {
         wakeNodeLock.unlock()
     }
 
-    /// ~1.5s of non-blocking flock retries. Matches the common race where the
+    /// ~4s of flock retries (40 × 100ms). Matches the common race where the
     /// host has started `closeNode` but has not released `marmot.store.lock` yet.
+    /// Blocking sleep is OK — callers run this on a `Task.detached` worker.
     private static func acquireStoreLockForWake() throws -> MarmotStoreLock {
         let attempts = 40 // ~4s — covers SIGKILL teardown + closeNode background task
         let delaySecs = 0.1
@@ -309,7 +311,6 @@ class NotificationService: SDKNotificationService {
                 return lock
             }
             if attempt < attempts {
-                // Blocking sleep is OK — this runs on a detached worker.
                 Thread.sleep(forTimeInterval: delaySecs)
             }
         }
@@ -625,11 +626,26 @@ class NotificationService: SDKNotificationService {
         guard let defaults = UserDefaults(suiteName: appGroupId) else { return }
         let stamped = "\(ISO8601DateFormatter().string(from: Date())) \(value)"
         defaults.set(stamped, forKey: diagnosticKey)
-        defaults.synchronize()
     }
 
     private static func lastDiagnostic() -> String {
         UserDefaults(suiteName: appGroupId)?.string(forKey: diagnosticKey) ?? ""
+    }
+
+    /// Opaque App Group diagnostic tag — never stringify full errors (may embed
+    /// SQL / message content). Prefer typed NSEMarmotError cases.
+    private static func opaqueErrorTag(_ error: Error) -> String {
+        if let nse = error as? NSEMarmotError {
+            switch nse {
+            case .missingCredentials: return "missingCredentials"
+            case .appGroupUnavailable: return "appGroupUnavailable"
+            case .sharedDatabaseMissing: return "sharedDatabaseMissing"
+            case .databaseLocked: return "databaseLocked"
+            case .storeBusy: return "storeBusy"
+            }
+        }
+        let typeName = String(describing: type(of: error))
+        return "other:\(typeName)"
     }
 
     private static func suppressTransponderNotification(_ content: UNMutableNotificationContent) {

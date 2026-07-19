@@ -534,19 +534,33 @@ final class MarmotChatModel: ObservableObject {
     /// a fire-and-forget Task alone often loses the race with Transponder NSE.
     func suspendStoreForBackground() {
         #if os(iOS)
-        var bgTask = UIBackgroundTaskIdentifier.invalid
-        bgTask = UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-                bgTask = .invalid
+        // Box + lock so the expiration handler and closeNode completion cannot
+        // both end the same UIBackgroundTaskIdentifier (value-type capture race).
+        final class BgTaskBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var id = UIBackgroundTaskIdentifier.invalid
+            func set(_ newId: UIBackgroundTaskIdentifier) {
+                lock.lock(); id = newId; lock.unlock()
+            }
+            func endOnce() {
+                lock.lock()
+                let current = id
+                id = .invalid
+                lock.unlock()
+                if current != .invalid {
+                    UIApplication.shared.endBackgroundTask(current)
+                }
             }
         }
+        let box = BgTaskBox()
+        box.set(
+            UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
+                box.endOnce()
+            }
+        )
         Task { [weak self] in
             await self?.service.closeNode()
-            if bgTask != .invalid {
-                UIApplication.shared.endBackgroundTask(bgTask)
-                bgTask = .invalid
-            }
+            box.endOnce()
         }
         #else
         Task { [weak self] in
