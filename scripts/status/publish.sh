@@ -65,6 +65,8 @@ fi
 if [[ "${SONAR_STATUS_MEDIA_PROBE:-}" == "1" || "${SONAR_STATUS_MEDIA_PROBE:-}" == "true" ]]; then
   args+=(--media-probe)
 fi
+# Optional: SONAR_STATUS_BLOSSOM_SERVER / SONAR_STATUS_BLOSSOM_COMPARE are
+# forwarded via clap env attrs on the binary (no extra flags needed here).
 
 if [[ -n "${SONAR_STATUS_GROUPS_RESULT:-}" ]]; then
   args+=(--groups-result "$SONAR_STATUS_GROUPS_RESULT")

@@ -100,10 +100,45 @@ REQs kind 30031 on bootstrap relays, counts visible sticker packs. No nsec neede
 
 ### Blossom media probe
 
-HTTP HEADs the Blossom server to verify reachability and measure latency. No nsec needed.
+Compares the app default Blossom server (`DEFAULT_BLOSSOM_SERVER`, today
+`https://push.sonar.hedwig.sh`) against the previous public host (default
+`https://nostr.download`) and publishes the timings on the `media` status row.
+
+- With a probe nsec: BUD-02 upload + GET of the returned `descriptor.url` +
+  best-effort delete of a ~4 KiB canary (this is the latency that matters for
+  media send). Delete success/failure is recorded in probe JSON (`delete_ok`)
+  but does not flip the media service state.
+- Without a probe nsec: Media storage is published as **Degraded** (fail closed).
+  HEAD alone cannot prove authenticated MIP-04 upload works.
+
+Probe nsec enables media upload auth only. It does **not** enable the Marmot
+KeyPackage chat probe — set `SONAR_STATUS_CHAT_PROBE=1` separately when you want
+that traffic.
+
+Flipping the app default Blossom host does **not** migrate or delete blobs on
+the previous host (`nostr.download`). Existing messages keep absolute blob URLs;
+clients fetch those URLs as-is.
 
 ```bash
 export SONAR_STATUS_STICKER_PROBE=1
 export SONAR_STATUS_MEDIA_PROBE=1
+export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
+# optional: also run KeyPackage dm probe
+# export SONAR_STATUS_CHAT_PROBE=1
+# optional override:
+# export SONAR_STATUS_BLOSSOM_SERVER=https://push.sonar.hedwig.sh
+# export SONAR_STATUS_BLOSSOM_COMPARE=https://nostr.download
 ./scripts/status/publish.sh
 ```
+
+The service description looks like:
+
+```text
+Blossom storage · primary push.sonar.hedwig.sh upload 116 ms · get 35 ms · candidate nostr.download upload 135 ms · get 37 ms
+```
+
+Service state follows the **primary** (app default) only — a slower or failing
+compare host is shown in the description without marking Media storage down.
+
+Ops can dump full probe meta (including per-server `delete_ok`) with
+`sonar-status probe --media-probe --include-probe`.

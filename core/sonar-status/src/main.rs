@@ -3,7 +3,9 @@
 //! Probes:
 //! - public Sonar client bootstrap relays (WebSocket open RTT)
 //! - optional HTTP health URLs
-//! - optional Marmot chat path (KeyPackage publish + fetch) when a probe nsec is set
+//! - optional Blossom media path (`--media-probe`; BUD-02 when a probe nsec is set)
+//! - optional Marmot chat path (KeyPackage publish + fetch) only with `--chat-probe`
+//!   (probe nsec alone does not enable chat)
 //!
 //! Publishes a replaceable event (kind 30078, d=sonar-status) that the marketing
 //! site (`web/src/lib/status-nostr.js`) REQs when `STATUS_PUBKEY_HEX` matches.
@@ -31,7 +33,9 @@ use ::url::Url;
 
 use chat::{load_probe_secret, probe_marmot_keypackage, ChatProbeReport};
 use groups::{load_groups_result, payments_coming_soon, GroupsProbeResult};
-use media::{probe_blossom, MediaProbeReport};
+use media::{
+    default_blossom_compare, probe_blossom_servers, MediaProbeReport,
+};
 use stickers::{probe_sticker_index, StickerProbeReport};
 use schema::{
     website_view, IncidentLevel, IncidentUpdate, ServiceState, StatusIncident, StatusPayload,
@@ -159,18 +163,26 @@ struct ProbeArgs {
     /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
     #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
     sticker_probe: bool,
-    /// Run Blossom media reachability probe (HTTP HEAD).
+    /// Run Blossom media probe (BUD-02 upload when probe nsec is set; else HEAD).
     #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
     media_probe: bool,
-    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    /// Primary Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Extra Blossom servers to compare against the primary (comma-separated).
+    /// Defaults to https://nostr.download when unset.
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
+    blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.
     #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
     groups_result: Option<PathBuf>,
     /// Include payments row as coming soon.
     #[arg(long, env = "SONAR_STATUS_PAYMENTS_COMING_SOON")]
     payments_coming_soon: bool,
+    /// Include internal `probe` meta (media delete_ok, per-relay RTT, …).
+    /// Default output is the website view, which strips this.
+    #[arg(long)]
+    include_probe: bool,
     /// Pretty-print JSON.
     #[arg(long)]
     pretty: bool,
@@ -221,12 +233,16 @@ struct PublishArgs {
     /// Run sticker pack directory probe (REQ kind 30031 on bootstrap relays).
     #[arg(long, env = "SONAR_STATUS_STICKER_PROBE")]
     sticker_probe: bool,
-    /// Run Blossom media reachability probe (HTTP HEAD).
+    /// Run Blossom media probe (BUD-02 upload when probe nsec is set; else HEAD).
     #[arg(long, env = "SONAR_STATUS_MEDIA_PROBE")]
     media_probe: bool,
-    /// Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
+    /// Primary Blossom server to probe (defaults to sonar-core DEFAULT_BLOSSOM_SERVER).
     #[arg(long, env = "SONAR_STATUS_BLOSSOM_SERVER")]
     blossom_server: Option<String>,
+    /// Extra Blossom servers to compare against the primary (comma-separated).
+    /// Defaults to https://nostr.download when unset.
+    #[arg(long, env = "SONAR_STATUS_BLOSSOM_COMPARE")]
+    blossom_compare: Option<String>,
     /// Path to Hermes groups-probe result JSON.
     #[arg(long, env = "SONAR_STATUS_GROUPS_RESULT")]
     groups_result: Option<PathBuf>,
@@ -270,6 +286,7 @@ struct ProbeOptions {
     sticker_probe: bool,
     media_probe: bool,
     blossom_server: Option<String>,
+    blossom_compare: Option<String>,
     groups_result: Option<PathBuf>,
     payments_coming_soon: bool,
 }
@@ -287,11 +304,9 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Probe(args) => {
             let opts = ProbeOptions {
-                chat_probe: args.chat_probe
-                    || args.probe_nsec.is_some()
-                    || args.probe_nsec_file.is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                // Chat only when explicitly requested — probe nsec is also used
+                // for BUD-02 media auth and must not imply KeyPackage traffic.
+                chat_probe: args.chat_probe,
                 probe_nsec: args.probe_nsec,
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
@@ -299,6 +314,7 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                blossom_compare: args.blossom_compare,
                 groups_result: args.groups_result,
                 payments_coming_soon: args.payments_coming_soon,
             };
@@ -310,7 +326,7 @@ async fn run() -> Result<()> {
                 &opts,
             )
             .await?;
-            print_json(&payload, args.pretty)?;
+            print_json(&payload, args.pretty, args.include_probe)?;
         }
         Command::Publish(args) => {
             let keys = load_keys(args.nsec.as_deref(), args.nsec_file.as_ref())?;
@@ -318,11 +334,9 @@ async fn run() -> Result<()> {
             let whitenoise_relays = parse_list(args.whitenoise_relays.as_deref(), WHITENOISE_RELAYS);
             let publish_relays = parse_list(args.publish_relays.as_deref(), DEFAULT_PUBLISH_RELAYS);
             let opts = ProbeOptions {
-                chat_probe: args.chat_probe
-                    || args.probe_nsec.is_some()
-                    || args.probe_nsec_file.is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                // Chat only when explicitly requested — probe nsec is also used
+                // for BUD-02 media auth and must not imply KeyPackage traffic.
+                chat_probe: args.chat_probe,
                 probe_nsec: args.probe_nsec,
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
@@ -330,6 +344,7 @@ async fn run() -> Result<()> {
                 sticker_probe: args.sticker_probe,
                 media_probe: args.media_probe,
                 blossom_server: args.blossom_server,
+                blossom_compare: args.blossom_compare,
                 groups_result: args.groups_result,
                 payments_coming_soon: args.payments_coming_soon,
             };
@@ -433,12 +448,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn print_json(payload: &StatusPayload, pretty: bool) -> Result<()> {
-    let view = website_view(payload);
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+fn print_json(payload: &StatusPayload, pretty: bool, include_probe: bool) -> Result<()> {
+    let value = if include_probe {
+        serde_json::to_value(payload)?
     } else {
-        println!("{}", serde_json::to_string(&view)?);
+        serde_json::to_value(&website_view(payload))?
+    };
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", serde_json::to_string(&value)?);
     }
     Ok(())
 }
@@ -516,7 +535,22 @@ async fn build_payload(
             .blossom_server
             .as_deref()
             .unwrap_or(sonar_core::client::DEFAULT_BLOSSOM_SERVER);
-        Some(probe_blossom(server).await)
+        let compare = match opts.blossom_compare.as_deref() {
+            Some(raw) if !raw.trim().is_empty() => parse_list(Some(raw), &[]),
+            _ => default_blossom_compare(),
+        };
+        // BUD-02 auth is required for a meaningful Media storage row. HEAD-only
+        // must not publish Ok — it cannot prove MIP-04 upload works.
+        match load_probe_secret(
+            opts.probe_nsec.as_deref(),
+            opts.probe_nsec_file.as_ref(),
+            "SONAR_STATUS_PROBE_NSEC",
+        ) {
+            Ok(secret) => {
+                Some(probe_blossom_servers(server, &compare, Some(secret.as_str())).await)
+            }
+            Err(e) => Some(media::media_probe_requires_nsec(server, &e)),
+        }
     } else {
         None
     };

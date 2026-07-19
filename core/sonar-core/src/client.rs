@@ -54,14 +54,22 @@ use crate::{Error, Result};
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
-/// primal.net returns HTTP 415 for Marmot ciphertext uploads (even with
-/// `application/octet-stream`); nostr.download accepts them (201 Created).
-pub const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
+/// Hedwig Blossom (`push.sonar.hedwig.sh`) accepts Marmot ciphertext as
+/// `application/octet-stream` (201) and wins upload latency vs the previous
+/// public default (`nostr.download`) in the status media bench. Prefer
+/// `https://blossom.sonar.hedwig.sh` once that DNS name is live.
+///
+/// Changing this constant only redirects **new** uploads. It does not migrate
+/// or delete historical blobs: messages store absolute `descriptor.url` values,
+/// and [`SonarClient::fetch_media`] downloads those URLs directly — so existing
+/// `https://nostr.download/...` (or any prior host) attachments keep working
+/// for as long as that host retains the objects.
+pub const DEFAULT_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
 
 /// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
 /// validate the request body's media type, so encrypted blobs must use the
 /// generic binary MIME even though the encrypted imeta keeps the source MIME.
-const ENCRYPTED_BLOB_MIME_TYPE: &str = "application/octet-stream";
+pub const ENCRYPTED_BLOB_MIME_TYPE: &str = "application/octet-stream";
 
 /// One attachment for an album send (see [`SonarClient::send_media_multi`]).
 /// Raw plaintext bytes plus the source filename and MIME; each item is
