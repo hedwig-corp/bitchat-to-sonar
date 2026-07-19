@@ -220,7 +220,8 @@ struct SonarDMScreenContent: View {
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
-                    expectedNewestDate: store.expectedNewestMessageDate(peerId)
+                    expectedNewestDate: store.expectedNewestMessageDate(peerId),
+                    jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId]
                 ) {
                     dmComposer
                 }

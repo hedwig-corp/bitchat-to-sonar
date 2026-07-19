@@ -57,11 +57,16 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     let callbacks: TranscriptCollectionHostCallbacks
     var unreadCountAtOpen: UInt64?
     var expectedNewestDate: Date?
+    /// When set, open-action Jump wins over unread/live-edge (search / deep link).
+    var jumpMessageId: String?
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
     /// Host / collection / composer chrome background. Defaults to system; apps
     /// with branded transcript chrome (Sonar `SonarTheme.bg`) pass their color.
     var transcriptBackgroundColor: UIColor
+    /// Runs on the UIKit update path before `apply` — use for app render-context
+    /// sync so SwiftUI `body` stays side-effect free.
+    var prepareForUpdate: (() -> Void)?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -70,9 +75,11 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         callbacks: TranscriptCollectionHostCallbacks,
         unreadCountAtOpen: UInt64? = nil,
         expectedNewestDate: Date? = nil,
+        jumpMessageId: String? = nil,
         loadOlder: (() async -> Bool)? = nil,
         loadNewest: (() async -> Void)? = nil,
         transcriptBackgroundColor: UIColor = .systemBackground,
+        prepareForUpdate: (() -> Void)? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -80,15 +87,18 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.callbacks = callbacks
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
+        self.jumpMessageId = jumpMessageId
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
         self.transcriptBackgroundColor = transcriptBackgroundColor
+        self.prepareForUpdate = prepareForUpdate
         self.composer = composer
     }
 
     /// Type-erased to `UIViewController` so the concrete host VC stays package-internal
     /// (keeps latch/coalesce/layout out of the public semver surface).
     public func makeUIViewController(context: Context) -> UIViewController {
+        prepareForUpdate?()
         let vc = TranscriptCollectionHostViewController(
             composer: composer,
             callbacks: callbacks,
@@ -99,6 +109,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            jumpMessageId: jumpMessageId,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -112,11 +123,13 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         guard let vc = uiViewController as? TranscriptCollectionHostViewController<Composer> else {
             return
         }
+        prepareForUpdate?()
         vc.updateComposer(composer())
         vc.apply(
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            jumpMessageId: jumpMessageId,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -163,6 +176,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var loadNewest: (() async -> Void)?
     private var unreadCountAtOpen: UInt64?
     private var expectedNewestDate: Date?
+    private var jumpMessageId: String?
 
     private var unreadAnchorId: String?
     private var unreadAnchorAbandoned = false
@@ -314,6 +328,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         entries: [TranscriptHostEntry],
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
+        jumpMessageId: String? = nil,
         loadOlder: (() async -> Bool)?,
         loadNewest: (() async -> Void)?,
         callbacks: TranscriptCollectionHostCallbacks? = nil,
@@ -340,9 +355,11 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             tailID: self.entries.last?.id
         )
         let previousUnread = self.unreadCountAtOpen
+        let previousJump = self.jumpMessageId
         self.entries = entries
         self.unreadCountAtOpen = unreadCountAtOpen
         self.expectedNewestDate = expectedNewestDate
+        self.jumpMessageId = jumpMessageId
         self.loadOlder = loadOlder
         self.loadNewest = loadNewest
 
@@ -355,6 +372,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         if !didInitialScroll {
             scrollToInitialPosition()
             didInitialScroll = true
+        } else if previousJump != jumpMessageId, jumpMessageId != nil {
+            applyOpenAction(transcriptOpenAction)
         } else if !hadAnchor, unreadAnchorId != nil {
             applyOpenAction(.unreadDivider)
         } else if previousUnread != unreadCountAtOpen {
@@ -540,7 +559,8 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         TranscriptScrollPolicy.openAction(
             unreadAnchorId: unreadAnchorId,
             unreadCountAtOpen: unreadCountAtOpen,
-            unreadAnchorAbandoned: unreadAnchorAbandoned
+            unreadAnchorAbandoned: unreadAnchorAbandoned,
+            jumpId: jumpMessageId
         )
     }
 

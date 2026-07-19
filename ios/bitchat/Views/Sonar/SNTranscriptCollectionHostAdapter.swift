@@ -198,32 +198,39 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
     let expectedNewestDate: Date?
+    /// Search / deep-link jump target; wins over unread/live-edge open (#372).
+    var jumpMessageId: String? = nil
     @ViewBuilder var composer: () -> Composer
 
     @StateObject private var renderContext = SNTranscriptHostRenderContext()
 
     var body: some View {
-        let _ = renderContext.sync(
-            msgs: msgs,
-            showAuthors: showAuthors,
-            peerName: peerName,
-            money: money,
-            fiatText: fiatText,
-            onTapAuthor: onTapAuthor,
-            mediaPipeline: mediaPipeline,
-            loadSticker: loadSticker,
-            onTapPack: onTapPack,
-            onRetry: onRetry
-        )
+        // Keep sync off the SwiftUI body path — `prepareForUpdate` runs inside
+        // `make`/`updateUIViewController` before `apply`.
         TranscriptCollectionHostView(
             entries: msgs.map { TranscriptHostEntry(id: $0.id, date: $0.sortDate) },
             heightKey: { renderContext.heightKey(for: $0) },
             callbacks: renderContext.makeCallbacks(),
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            jumpMessageId: jumpMessageId,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             transcriptBackgroundColor: UIColor(SonarTheme.bg),
+            prepareForUpdate: {
+                renderContext.sync(
+                    msgs: msgs,
+                    showAuthors: showAuthors,
+                    peerName: peerName,
+                    money: money,
+                    fiatText: fiatText,
+                    onTapAuthor: onTapAuthor,
+                    mediaPipeline: mediaPipeline,
+                    loadSticker: loadSticker,
+                    onTapPack: onTapPack,
+                    onRetry: onRetry
+                )
+            },
             composer: composer
         )
     }

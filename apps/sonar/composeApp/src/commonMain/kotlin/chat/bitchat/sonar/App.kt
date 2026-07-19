@@ -1181,6 +1181,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val transcriptOpenAction = TranscriptScrollPolicy.resolveOpenAction(
         unreadAnchorId = unreadAnchorId,
         unreadCountAtOpen = state.openChatUnread[screen.id],
+        jumpMessageId = state.openChatJumpMessageId[screen.id],
     )
     val phase2Host = SonarTranscriptPolicyHost.isEnabled()
     var isNearBottom by remember(screen.id) { mutableStateOf(true) }

@@ -87,6 +87,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
     var expectedNewestDate: Date? = nil
+    /// Search / deep-link jump; see #372 for Sonar search wiring.
+    var jumpMessageId: String? = nil
     @ViewBuilder var composer: () -> Composer
 
     var body: some View {
@@ -110,6 +112,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
+            jumpMessageId: jumpMessageId,
             composer: composer
         )
         .ignoresSafeArea(.keyboard, edges: .bottom)
