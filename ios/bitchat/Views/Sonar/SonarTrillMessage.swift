@@ -75,8 +75,8 @@ struct SonarTrillMessage: Equatable {
 /// a trill never produces less than a persisted row, and never more than
 /// the chat's notification level already allows.
 enum SonarTrillAlert: Equatable {
-    /// Row only (blocked upstream, pre-launch replay, muted chat, or a
-    /// throttled trill while the app is foregrounded).
+    /// Row only (blocked upstream, pre-launch replay, muted chat, or
+    /// throttled inside the 8s receiver window).
     case suppress
     /// Foreground: whole-view shake + bell + haptic.
     case buzz
