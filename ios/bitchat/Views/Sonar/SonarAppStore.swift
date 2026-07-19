@@ -651,6 +651,8 @@ final class SonarAppStore: ObservableObject {
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
     @Published var toast: String? = nil
+    /// Invalidates in-flight toast dismissals when a newer toast is shown.
+    private var toastSession = SNToastSession()
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
     @Published private(set) var discoverNewPeople: Bool
@@ -1668,11 +1670,24 @@ final class SonarAppStore: ObservableObject {
 
     @MainActor
     func showToast(_ text: String) {
-        toast = text
-        Task { @MainActor in
+        let epoch = toastSession.show(text)
+        toast = toastSession.text
+        // Detached so a cancelled Settings `Task { await backupAccountNow() }`
+        // (navigation pop / view refresh) cannot cancel the dismiss and leave
+        // "Chat backup uploaded" stuck on screen forever.
+        Task.detached { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
-            if toast == text { toast = nil }
+            guard let self else { return }
+            self.toastSession.clear(ifEpoch: epoch)
+            self.toast = self.toastSession.text
         }
+    }
+
+    /// Progress toast that stays until replaced by `showToast` / another sticky.
+    @MainActor
+    private func showStickyToast(_ text: String) {
+        toastSession.showSticky(text)
+        toast = toastSession.text
     }
 
     func toggleMode() {
@@ -1847,9 +1862,10 @@ final class SonarAppStore: ObservableObject {
     /// Settings → Backup chats: encrypt Marmot DB+key with nsec and upload to
     /// Blossom so delete→reinstall→paste nsec can recover history.
     func backupAccountNow() async {
-        // Immediate feedback — the seal+upload path can take seconds and used
-        // to run on the MainActor with no toast until completion.
-        showToast(String(localized: "Backing up chats…"))
+        // Sticky progress (no auto-dismiss) — a timed dismiss racing the long
+        // upload was leaving the completion toast uncleared when the parent
+        // Task was cancelled, or colliding with the result toast epoch.
+        showStickyToast(String(localized: "Backing up chats…"))
         do {
             try await marmot.backupAccount()
             showToast(String(localized: "Chat backup uploaded"))
