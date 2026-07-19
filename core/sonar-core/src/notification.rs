@@ -5,6 +5,7 @@ pub enum NotificationKind {
     Message,
     Payment,
     Call,
+    Trill,
     Invite,
     Mention,
     Geohash,
@@ -40,7 +41,37 @@ pub fn classify_content(content: &str) -> NotificationKind {
     if is_payment_control_line(content) {
         return NotificationKind::Payment;
     }
+    if parse_trill_line(content).is_some() {
+        return NotificationKind::Trill;
+    }
     NotificationKind::Message
+}
+
+/// A parsed `⚡TRILL|1|<id>` nudge line (spec: docs/SONAR-TRILL.md). The id is
+/// a sender-generated token so the same trill can be recognised if it arrives
+/// on both the mesh and Marmot legs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrillLine {
+    pub trill_id: String,
+}
+
+/// Parse a `⚡TRILL` nudge line. Version locked to 1, no trailing fields;
+/// anything else is not a trill line (renders as plain text on old clients).
+pub fn parse_trill_line(content: &str) -> Option<TrillLine> {
+    let mut parts = content.split('|');
+    if parts.next()? != "⚡TRILL" {
+        return None;
+    }
+    if parts.next()? != "1" {
+        return None;
+    }
+    let id = parts.next()?;
+    if !valid_control_id(id) || parts.next().is_some() {
+        return None;
+    }
+    Some(TrillLine {
+        trill_id: id.to_string(),
+    })
 }
 
 /// A parsed `⚡PAY|1|<id>|<sats>` receipt line (spec: docs/SONAR-PAYMENTS.md).
@@ -164,6 +195,12 @@ fn title(kind: NotificationKind, label: Option<&str>, group: Option<&str>) -> St
             Some(sender) => format!("Incoming call from {sender}"),
             None => "Incoming Sonar call".to_string(),
         },
+        NotificationKind::Trill => match (label, group) {
+            (Some(sender), Some(group)) => format!("{sender} nudged {group}"),
+            (Some(sender), None) => format!("{sender} nudged you"),
+            (None, Some(group)) => format!("Nudge in {group}"),
+            (None, None) => "Someone nudged you".to_string(),
+        },
         NotificationKind::Invite => match label {
             Some(sender) => format!("Invite from {sender}"),
             None => "New Sonar invite".to_string(),
@@ -219,6 +256,7 @@ fn body(
             }
         }
         NotificationKind::Call => "Tap to answer.".to_string(),
+        NotificationKind::Trill => "👋 They want your attention.".to_string(),
         NotificationKind::Invite => match group {
             Some(group) => format!("Open Sonar to review the invite to {group}."),
             None => "Open Sonar to review the invite.".to_string(),
@@ -283,6 +321,12 @@ fn format_sats(sats: u64) -> String {
 }
 
 fn valid_payment_id(id: &str) -> bool {
+    valid_control_id(id)
+}
+
+/// Shared id shape for control lines (`⚡PAY`, `⚡TRILL`): hex-or-dash, 1-64
+/// bytes, matching the validators the mesh codecs already enforce.
+fn valid_control_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
@@ -369,6 +413,50 @@ mod tests {
         assert_eq!(n.title, "Payment from Alice");
         assert_eq!(n.body, "Open Sonar to view the payment.");
         assert_eq!(n.payment_sats, None);
+    }
+
+    #[test]
+    fn classifies_trill_and_rejects_malformed() {
+        assert_eq!(
+            classify_content("⚡TRILL|1|abc-123"),
+            NotificationKind::Trill
+        );
+        // Wrong version, missing id, trailing field, bad id chars → plain text.
+        assert_eq!(classify_content("⚡TRILL|2|abc"), NotificationKind::Message);
+        assert_eq!(classify_content("⚡TRILL|1"), NotificationKind::Message);
+        assert_eq!(
+            classify_content("⚡TRILL|1|abc|extra"),
+            NotificationKind::Message
+        );
+        assert_eq!(
+            classify_content("⚡TRILL|1|not hex!"),
+            NotificationKind::Message
+        );
+        assert_eq!(parse_trill_line("⚡TRILL|1|deadbeef").unwrap().trill_id, "deadbeef");
+    }
+
+    #[test]
+    fn trill_does_not_expose_raw_control_text() {
+        let mut req = input("⚡TRILL|1|deadbeef");
+        req.show_preview = true;
+        let n = render_notification(req).unwrap();
+        assert_eq!(n.kind, NotificationKind::Trill);
+        assert_eq!(n.title, "Alice nudged you");
+        assert_eq!(n.body, "👋 They want your attention.");
+    }
+
+    #[test]
+    fn trill_group_and_anonymous_titles() {
+        let mut req = input("⚡TRILL|1|deadbeef");
+        req.group_name = Some("Lake Days".to_string());
+        let n = render_notification(req).unwrap();
+        assert_eq!(n.title, "Alice nudged Lake Days");
+
+        let mut req = input("⚡TRILL|1|deadbeef");
+        req.show_names = false;
+        let n = render_notification(req).unwrap();
+        assert_eq!(n.title, "Someone nudged you");
+        assert_eq!(n.body, "👋 They want your attention.");
     }
 
     #[test]
