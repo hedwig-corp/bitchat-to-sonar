@@ -1106,9 +1106,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
 
     /**
-     * Group ids the host has marked read (or is viewing). Summary refresh must
-     * not restore their badges while `markConversationRead` is still in flight.
-     * Entries drop once core summaries confirm `unread_count == 0`.
+     * In-flight mark-read suppress only. Summary refresh must not restore
+     * badges while `markConversationRead` is still running. Viewing suppress
+     * is applied ephemerally in [applyUnreadCounts] from the open chat id —
+     * never stored here (storing it let prune keep failed marks forever).
      */
     private val unreadSuppressGroupIds = linkedSetOf<String>()
 
@@ -9124,22 +9125,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
-        // Keep suppressing the open transcript's groups for the whole view
-        // session, even before the first markGroupsRead lands.
+        // Viewing suppress is session-scoped and must NOT enter
+        // unreadSuppressGroupIds. Prune keeps still-unread in-flight ids; if
+        // openIds were folded into that set, a failed mark while viewing would
+        // leave the group suppressed forever after the user leaves (goose/glm
+        // NO-GO on #383). iOS keeps the same split via viewingUnreadGroupIds.
         val openIds = (screen as? Screen.Chat)?.id
             ?.let { transcriptGroupIds(it) }
             .orEmpty()
-        unreadSuppressGroupIds.addAll(openIds)
-        val nextSuppress = pruneConfirmedUnreadSuppressions(
+            .toSet()
+        val pruned = pruneConfirmedUnreadSuppressions(
             unreadSuppressGroupIds.toSet(),
             summaries,
-        ).toMutableSet()
-        // Re-add open groups after prune so a viewing session never loses
-        // suppression mid-refresh (new arrivals bump unread_count again).
-        nextSuppress.addAll(openIds)
+        )
         unreadSuppressGroupIds.clear()
-        unreadSuppressGroupIds.addAll(nextSuppress)
-        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds)
+        unreadSuppressGroupIds.addAll(pruned)
+        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds + openIds)
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight

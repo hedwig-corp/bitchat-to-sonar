@@ -66,4 +66,27 @@ class UnreadCountsTest {
             unreadCountsFromSummaries(summaries, afterRelease + openSession),
         )
     }
+
+    @Test
+    fun viewingSuppressMustNotStickAfterLeaveWhenMarkFailed() {
+        // openIds are display-only. After leave they must not remain in the
+        // prune-managed in-flight set, or a failed mark hides the badge forever.
+        val summaries = listOf(summary("g-failed", 2))
+        val inFlightAfterMarkRelease = emptySet<String>()
+        val openIdsWhileViewing = setOf("g-failed")
+        assertEquals(
+            emptyMap(),
+            unreadCountsFromSummaries(summaries, inFlightAfterMarkRelease + openIdsWhileViewing),
+        )
+        val openIdsAfterLeave = emptySet<String>()
+        assertEquals(
+            mapOf("g-failed" to 2L),
+            unreadCountsFromSummaries(summaries, inFlightAfterMarkRelease + openIdsAfterLeave),
+        )
+        // Prune must also not resurrect a viewing id into in-flight suppress.
+        assertEquals(
+            emptySet(),
+            pruneConfirmedUnreadSuppressions(inFlightAfterMarkRelease, summaries),
+        )
+    }
 }

@@ -1982,12 +1982,11 @@ final class MarmotChatModel: ObservableObject {
             // Viewing suppress still covers an open DM; without this release a
             // failed/raced mark could hide real unread for the rest of the process.
             unreadSuppressGroupIds.remove(groupId)
-            let summaries = await service.conversationSummaries()
-            // readOnlyNonThrowing defaults to [] on failure — skip so we do not
-            // wipe every unread badge until the next successful summary load.
-            if !summaries.isEmpty {
-                publishUnread(from: summaries)
-            }
+            // Always reconcile. `readOnlyNonThrowing` maps FFI failure to [],
+            // which clears badges until the next successful summary load — the
+            // same self-correcting window as Compose's null-vs-empty split, and
+            // required so an empty inbox still drops stale dots.
+            publishUnread(from: await service.conversationSummaries())
         }
     }
 
