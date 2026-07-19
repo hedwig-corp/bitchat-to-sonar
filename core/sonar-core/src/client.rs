@@ -3402,18 +3402,54 @@ impl SonarClient {
     }
 
     /// Authoritative installed-list read for install/uninstall mutations.
-    /// Requires a successful relay query — publish needs the network anyway, and
-    /// falling back to a possibly-stale local list can sign a wiped set.
+    ///
+    /// A successful kind-10031 event updates the durable cache. An empty relay
+    /// answer is treated as a miss when a local snapshot already exists (same
+    /// class as background refresh) so we never `remember([], now)` and poison
+    /// the created_at fence. Never-published accounts still start from `[]`.
     async fn fetch_installed_packs_for_mutation(&self) -> Result<Vec<PackAddress>> {
-        let (packs, created_at) = self.fetch_installed_packs_from_relays().await?;
-        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
-        if let Err(err) = self
-            .sticker_cache
-            .remember_installed_packs(&packs, created_at)
-        {
-            tracing::debug!(%err, "sticker installed-packs cache write failed");
+        let filter = Filter::new()
+            .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
+            .author(self.identity().public_key())
+            .limit(1);
+        let relays: Vec<String> = self.relays.iter().map(|u| u.to_string()).collect();
+        let timeout = Duration::from_secs(10);
+        let events = self
+            .nostr
+            .fetch_events_from(relays, filter, timeout)
+            .await?;
+        match events.into_iter().next() {
+            Some(event) => {
+                let created_at = event.created_at.as_secs();
+                let packs = parse_installed_pack_list(&event)
+                    .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?
+                    .packs;
+                self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
+                if let Err(err) = self
+                    .sticker_cache
+                    .remember_installed_packs(&packs, created_at)
+                {
+                    tracing::debug!(%err, "sticker installed-packs cache write failed");
+                }
+                Ok(packs)
+            }
+            None => match self.sticker_cache.read_installed_packs() {
+                Ok(Some(packs)) => {
+                    tracing::debug!(
+                        "installed pack list relay returned no event; using local list for mutation"
+                    );
+                    Ok(packs)
+                }
+                Ok(None) => Ok(Vec::new()),
+                Err(cache_err) => {
+                    tracing::debug!(
+                        err = %cache_err,
+                        "installed pack list local read failed during mutation"
+                    );
+                    Ok(Vec::new())
+                }
+            },
         }
-        Ok(packs)
     }
 
     fn spawn_installed_packs_refresh(&self) {
@@ -3486,7 +3522,16 @@ impl SonarClient {
         self.nostr.send_event_builder(builder).await?;
         // Invalidate any in-flight background refresh before durable write.
         self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
-        let created_at = Timestamp::now().as_secs();
+        let local_created_at = self
+            .sticker_cache
+            .read_installed_packs_snapshot()
+            .ok()
+            .flatten()
+            .map(|snapshot| snapshot.created_at)
+            .unwrap_or(0);
+        let created_at = Timestamp::now()
+            .as_secs()
+            .max(local_created_at.saturating_add(1));
         if let Err(err) = self
             .sticker_cache
             .remember_installed_packs(&list.packs, created_at)

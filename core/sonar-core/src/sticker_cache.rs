@@ -227,7 +227,9 @@ impl StickerCache {
             return Ok(false);
         }
         if let Some(snapshot) = read_installed_packs_snapshot(root)? {
-            if created_at < snapshot.created_at {
+            // Strictly newer only — equal timestamps must not replace a local
+            // publish that advanced created_at in the same second.
+            if created_at <= snapshot.created_at {
                 return Ok(false);
             }
         }
@@ -1090,9 +1092,12 @@ mod tests {
             Some([pack.clone()].as_slice())
         );
 
-        // Equal/newer refresh may replace.
-        assert!(cache
+        // Equal timestamp must not replace; strictly newer may.
+        assert!(!cache
             .apply_refreshed_installed_packs(&[], 100)
+            .unwrap());
+        assert!(cache
+            .apply_refreshed_installed_packs(&[], 101)
             .unwrap());
         assert_eq!(
             cache.read_installed_packs().unwrap().as_deref(),
