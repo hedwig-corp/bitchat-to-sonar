@@ -219,7 +219,7 @@ function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure }) {
 
   if (find) {
     return (
-      <Sheet onClose={onClose} title="Find someone">
+      <Sheet onClose={onClose} title="New discussion">
         <p className="bc-verifycopy" style={{ paddingTop: 2 }}>
           Type a Sonar username — just <b>vincenzo</b> for a @{SONAR_HOME} account, or a full address like <b>vincenzo@stacker.news</b> for another provider. You can also paste a raw npub.
         </p>

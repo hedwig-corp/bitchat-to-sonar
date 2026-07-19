@@ -40,9 +40,11 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SonarAnnounce
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -255,28 +257,32 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                 Spacer(Modifier.height(12.dp))
             }
 
-            // Mesh BIP-353 first (chat id + any live/linked peer id for this
-            // npub), then verified kind-0 NIP-05 only — never an unverified claim.
+            // Mesh BIP-353 first (only when announce npub matches this contact),
+            // then verified kind-0 NIP-05 only — never an unverified claim.
             val paymentAddress = remember(
-                screen.chatId, effectiveChatId, peerNpub, state.sonarPeerProfiles, state.meshDmRows, nip05, nip05Verified
+                screen.chatId, effectiveChatId, peerNpub, state.sonarPeerProfiles, nip05, nip05Verified
             ) {
+                val contact = peerNpub
+                fun announceNpubKey(profile: SonarAnnounce): String? =
+                    Bech32.encode("npub", profile.npub)?.let { canonicalProfileKey(it) }
+                fun bipBoundToContact(id: String): String? {
+                    if (contact == null) return null
+                    val profile = state.sonarProfile(id) ?: return null
+                    if (announceNpubKey(profile) != contact) return null
+                    return profile.bip353?.takeIf { it.isNotBlank() }
+                }
                 val peerIds = buildList {
                     if (screen.chatId.startsWith("mesh:")) add(screen.chatId.removePrefix("mesh:"))
                     if (effectiveChatId.startsWith("mesh:")) add(effectiveChatId.removePrefix("mesh:"))
-                    peerNpub?.let { npub ->
-                        state.sonarPeerProfiles.keys.forEach { id ->
-                            if (state.npubStringForPeer(id)?.let { canonicalProfileKey(it) } == npub) add(id)
-                        }
-                        state.meshDmRows.forEach { row ->
-                            if (state.npubStringForPeer(row.peerId)?.let { canonicalProfileKey(it) } == npub) {
-                                add(row.peerId)
-                            }
-                        }
+                    // One pass over live announces — avoid scanning meshDmRows + Bech32 per row.
+                    if (contact != null) {
+                        state.sonarPeerProfiles.entries.firstOrNull { (_, ann) ->
+                            announceNpubKey(ann) == contact
+                        }?.key?.let { add(it) }
                     }
                 }.distinct()
-                peerIds.firstNotNullOfOrNull { id ->
-                    state.sonarProfile(id)?.bip353?.takeIf { it.isNotBlank() }
-                } ?: nip05?.takeIf { '@' in it && nip05Verified == true }
+                peerIds.firstNotNullOfOrNull(::bipBoundToContact)
+                    ?: nip05?.takeIf { '@' in it && nip05Verified == true }
             }
             if (paymentAddress != null) {
                 SNSectionLabel("Payment address")

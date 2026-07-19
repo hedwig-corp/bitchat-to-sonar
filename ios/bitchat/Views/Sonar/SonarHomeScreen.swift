@@ -34,6 +34,7 @@ struct SonarHomeScreen: View {
     @State private var findMiss = false
     /// Bumped on draft edit / Back so in-flight lookups cannot apply stale results.
     @State private var findLookupGeneration = 0
+    @State private var findLookupTask: Task<Void, Never>?
     @State private var findStartError: String?
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
@@ -390,6 +391,8 @@ struct SonarHomeScreen: View {
                     .autocorrectionDisabled()
                     #endif
                     .onChange(of: findDraft) { _ in
+                        findLookupTask?.cancel()
+                        findLookupTask = nil
                         findNpub = nil
                         findMiss = false
                         findResolving = false
@@ -472,6 +475,8 @@ struct SonarHomeScreen: View {
                         }
                     }
                     SNGhostButton(label: "Back") {
+                        findLookupTask?.cancel()
+                        findLookupTask = nil
                         findLookupGeneration &+= 1
                         findUsername = false
                         findDraft = ""
@@ -514,15 +519,17 @@ struct SonarHomeScreen: View {
             return
         }
         guard MarmotService.handleLooksValid(trimmed) else { return }
+        findLookupTask?.cancel()
         findLookupGeneration &+= 1
         let generation = findLookupGeneration
         findResolving = true
         findMiss = false
         findNpub = nil
-        Task { @MainActor in
+        findLookupTask = Task { @MainActor in
             let npub = await store.resolveHandleForChat(trimmed)
-            guard generation == findLookupGeneration else { return }
+            guard !Task.isCancelled, generation == findLookupGeneration else { return }
             findResolving = false
+            findLookupTask = nil
             if let npub {
                 findNpub = npub
             } else {

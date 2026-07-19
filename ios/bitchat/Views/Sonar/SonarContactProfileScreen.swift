@@ -104,8 +104,10 @@ struct SonarContactProfileScreen: View {
         return address
     }
 
-    /// Mesh BIP-353 first, then verified kind-0 NIP-05 (never an unverified claim).
+    /// Mesh BIP-353 first (only when the announce npub matches this contact),
+    /// then verified kind-0 NIP-05 (never an unverified claim).
     private var paymentAddress: String? {
+        let contactNpub = SNMarmotProfileCache.canonicalKey(resolvedNpub)
         // When opened from an npub (e.g. group member) with an existing Marmot
         // DM, `effectiveChatId` is the group id — still probe the mesh peer key
         // so an announced BIP-353 is not dropped.
@@ -115,13 +117,16 @@ struct SonarContactProfileScreen: View {
         }
         var seen = Set<String>()
         for id in candidates where seen.insert(id).inserted {
-            if let bip = store.sonarProfile(id)?.bip353?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
+            guard let profile = store.sonarProfile(id) else { continue }
+            // Bind payment string to this contact — never copy a stale/wrong announce.
+            guard SNMarmotProfileCache.canonicalKey(profile.npub) == contactNpub else { continue }
+            if let bip = profile.bip353?.trimmingCharacters(in: .whitespacesAndNewlines),
                !bip.isEmpty {
                 return bip
             }
         }
-        if let nip05 = nip05Address, nip05.contains("@"), nip05Verified[nip05] == true {
+        let nip05Key = "\(contactNpub)|\(nip05Address ?? "")"
+        if let nip05 = nip05Address, nip05.contains("@"), nip05Verified[nip05Key] == true {
             return nip05
         }
         return nil
@@ -146,10 +151,12 @@ struct SonarContactProfileScreen: View {
     private func verifyHandleIfNeeded() {
         guard let address = nip05Address else { return }
         let npub = resolvedNpub
-        guard !npub.isEmpty, nip05Checks.insert(address).inserted else { return }
+        guard !npub.isEmpty else { return }
+        let cacheKey = "\(SNMarmotProfileCache.canonicalKey(npub))|\(address)"
+        guard nip05Checks.insert(cacheKey).inserted else { return }
         Task { @MainActor in
             guard let ok = try? await store.marmot.verifyNip05(address: address, npub: npub) else { return }
-            nip05Verified[address] = ok
+            nip05Verified[cacheKey] = ok
         }
     }
 

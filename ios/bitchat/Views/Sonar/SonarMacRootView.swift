@@ -1706,6 +1706,7 @@ private struct MacCommandPalette: View {
     @State private var findNpub: String?
     @State private var findMiss = false
     @State private var findLookupGeneration = 0
+    @State private var findLookupTask: Task<Void, Never>?
     @State private var findStartError: String?
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
@@ -1782,6 +1783,8 @@ private struct MacCommandPalette: View {
                                 draft: Binding(
                                     get: { findDraft },
                                     set: {
+                                        findLookupTask?.cancel()
+                                        findLookupTask = nil
                                         findDraft = $0
                                         findNpub = nil
                                         findMiss = false
@@ -1806,6 +1809,8 @@ private struct MacCommandPalette: View {
                                     }
                                 },
                                 onBack: {
+                                    findLookupTask?.cancel()
+                                    findLookupTask = nil
                                     findLookupGeneration &+= 1
                                     findUsernameEntry = false
                                     findDraft = ""
@@ -2017,15 +2022,17 @@ private struct MacCommandPalette: View {
             return
         }
         guard MarmotService.handleLooksValid(trimmed) else { return }
+        findLookupTask?.cancel()
         findLookupGeneration &+= 1
         let generation = findLookupGeneration
         findResolving = true
         findMiss = false
         findNpub = nil
-        Task { @MainActor in
+        findLookupTask = Task { @MainActor in
             let npub = await store.resolveHandleForChat(trimmed)
-            guard generation == findLookupGeneration else { return }
+            guard !Task.isCancelled, generation == findLookupGeneration else { return }
             findResolving = false
+            findLookupTask = nil
             if let npub {
                 findNpub = npub
             } else {
@@ -2101,8 +2108,12 @@ private struct MacCommandPalette: View {
                 return
             }
             resolvingHandle = false
-            if let npub {
-                store.startSecureChat(npub: npub)
+            guard let npub else {
+                handleMissQuery = handle
+                return
+            }
+            // Match the New-discussion card: only dismiss when local chat open succeeds.
+            if store.startSecureChat(npub: npub) != nil {
                 isPresented = false
             } else {
                 handleMissQuery = handle
