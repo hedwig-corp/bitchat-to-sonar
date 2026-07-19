@@ -296,7 +296,11 @@ final class MarmotChatModel: ObservableObject {
     /// Group IDs already covered by a push-wake banner (drain or unread-delta).
     private(set) var pushWakeNotifiedGroupIds = Set<String>()
     /// Blossom upload progress (0...1) keyed by optimistic message id.
-    @Published var mediaUploadProgress: [String: Double] = [:]
+    /// Prefer reading [`mediaUploadProgressSource`] from bubbles — collection
+    /// host cells do not rebuild on progress-only changes.
+    @Published private(set) var mediaUploadProgress: [String: Double] = [:]
+    /// Observable progress map for live upload bars (Compose-style).
+    let mediaUploadProgressSource = SNMediaUploadProgressSource()
     /// In-flight upload listeners keyed by optimistic message id (tap-to-cancel).
     private var mediaUploadListeners: [String: SNMediaUploadListener] = [:]
 
@@ -768,14 +772,28 @@ final class MarmotChatModel: ObservableObject {
 
     private func clearMediaUploadListener(_ id: String) {
         mediaUploadListeners.removeValue(forKey: id)
-        mediaUploadProgress.removeValue(forKey: id)
+        noteMediaUploadProgress(id, nil)
+    }
+
+    private func noteMediaUploadProgress(_ id: String, _ fraction: Double?) {
+        if let fraction {
+            mediaUploadProgressSource.note(id: id, fraction: fraction)
+            var next = mediaUploadProgress
+            next[id] = fraction
+            mediaUploadProgress = next
+        } else {
+            mediaUploadProgressSource.clear(id: id)
+            var next = mediaUploadProgress
+            next.removeValue(forKey: id)
+            mediaUploadProgress = next
+        }
     }
 
     /// Cancel an in-flight Blossom upload for the optimistic bubble [pendingId].
     /// Drops the optimistic row immediately; core abandons Blossom + staging.
     func cancelMediaUpload(pendingId: String) {
         mediaUploadListeners[pendingId]?.cancel()
-        mediaUploadProgress.removeValue(forKey: pendingId)
+        noteMediaUploadProgress(pendingId, nil)
         for (groupId, pending) in pendingOptimistic {
             guard pending.contains(where: { $0.id == pendingId }) else { continue }
             discardOptimistic(id: pendingId, from: groupId)
@@ -2528,7 +2546,7 @@ final class MarmotChatModel: ObservableObject {
             var echoVisible = false
             let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
                 Task { @MainActor in
-                    self?.mediaUploadProgress[pendingId] = fraction
+                    self?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
             registerMediaUploadListener(echo.id, listener)
@@ -2537,7 +2555,7 @@ final class MarmotChatModel: ObservableObject {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                mediaUploadProgress[echo.id] = 0
+                noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
@@ -2615,7 +2633,7 @@ final class MarmotChatModel: ObservableObject {
             var echoVisible = false
             let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
                 Task { @MainActor in
-                    self?.mediaUploadProgress[pendingId] = fraction
+                    self?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
             registerMediaUploadListener(echo.id, listener)
@@ -2624,7 +2642,7 @@ final class MarmotChatModel: ObservableObject {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                mediaUploadProgress[echo.id] = 0
+                noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()

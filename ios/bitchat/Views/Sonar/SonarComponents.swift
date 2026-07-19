@@ -1324,6 +1324,8 @@ struct SNMsgList: View {
     var onRetry: ((SNMessage) -> Void)? = nil
     /// Cancel an in-flight Blossom upload for an optimistic media bubble.
     var onCancelUpload: ((SNMessage) -> Void)? = nil
+    /// Live Blossom upload fractions (collection-host / Compose parity).
+    var uploadProgressSource: SNMediaUploadProgressSource? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
@@ -1563,6 +1565,7 @@ struct SNMsgList: View {
                                     showState: showDeliveryState,
                                     onRetry: canRetry ? { onRetry?(m) } : nil,
                                     onCancelUpload: m.state == "Uploading" ? { onCancelUpload?(m) } : nil,
+                                    uploadProgressSource: uploadProgressSource,
                                     pipeline: mediaPipeline
                                 )
                             } else if m.stickerRef != nil {
@@ -2328,12 +2331,29 @@ private struct SNMediaUploadBar: View {
     }
 }
 
+/// Observes the live progress map so UICollectionView cells advance without a
+/// heightKey-driven reconfigure (progress is not part of that key).
+private struct SNLiveMediaUploadBar: View {
+    @ObservedObject var source: SNMediaUploadProgressSource
+    let messageId: String
+    var fallback: Double? = nil
+    var onCancel: (() -> Void)? = nil
+
+    var body: some View {
+        if let progress = source.fractions[messageId] ?? fallback {
+            SNMediaUploadBar(progress: progress, onCancel: onCancel)
+        }
+    }
+}
+
 struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
     var showState: Bool = false
     var onRetry: (() -> Void)? = nil
     var onCancelUpload: (() -> Void)? = nil
+    /// Live progress map; preferred over baked `m.uploadProgress` for cells.
+    var uploadProgressSource: SNMediaUploadProgressSource? = nil
     var pipeline: SNMediaPipeline = .unavailable
 
     @State private var bytes: Data?
@@ -2408,10 +2428,21 @@ struct SNMediaBubble: View {
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
                 content
                     .overlay(alignment: .bottom) {
-                        if let progress = m.uploadProgress, m.state == "Uploading" {
-                            SNMediaUploadBar(progress: progress, onCancel: onCancelUpload)
-                                .padding(.horizontal, 2)
-                                .padding(.bottom, 2)
+                        if m.state == "Uploading" {
+                            Group {
+                                if let source = uploadProgressSource {
+                                    SNLiveMediaUploadBar(
+                                        source: source,
+                                        messageId: m.id,
+                                        fallback: m.uploadProgress,
+                                        onCancel: onCancelUpload
+                                    )
+                                } else if let progress = m.uploadProgress {
+                                    SNMediaUploadBar(progress: progress, onCancel: onCancelUpload)
+                                }
+                            }
+                            .padding(.horizontal, 2)
+                            .padding(.bottom, 2)
                         }
                     }
                 if !m.text.isEmpty {

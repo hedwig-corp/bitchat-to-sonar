@@ -470,6 +470,32 @@ private final class SNMediaDownloadListener: MediaDownloadListener, @unchecked S
     }
 }
 
+/// Live Blossom upload fractions keyed by optimistic message id.
+///
+/// Collection-host cells only reconfigure when the transcript `heightKey`
+/// changes — progress is intentionally excluded from that key (bar height is
+/// constant). Bubbles therefore observe this object directly (Compose
+/// `mediaUploadFraction` parity) instead of waiting for a cell rebuild.
+@MainActor
+final class SNMediaUploadProgressSource: ObservableObject {
+    @Published private(set) var fractions: [String: Double] = [:]
+
+    func note(id: String, fraction: Double) {
+        // Assign a new dictionary — in-place subscript mutation does not
+        // reliably fire `@Published` / `objectWillChange`.
+        var next = fractions
+        next[id] = fraction
+        fractions = next
+    }
+
+    func clear(id: String) {
+        guard fractions[id] != nil else { return }
+        var next = fractions
+        next.removeValue(forKey: id)
+        fractions = next
+    }
+}
+
 /// Bridges UniFFI upload progress into the optimistic media bubble bar.
 final class SNMediaUploadListener: MediaUploadListener, @unchecked Sendable {
     private let lock = NSLock()
