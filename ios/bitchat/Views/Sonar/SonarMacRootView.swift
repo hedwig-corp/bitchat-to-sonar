@@ -2077,8 +2077,12 @@ private struct MacCommandPalette: View {
     }
 
     private func startSecureChat(with npub: String) {
-        guard npub.hasPrefix("npub1") else { return }
-        store.startSecureChat(npub: npub)
+        let trimmed = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let decoded = try? Bech32.decode(trimmed),
+              decoded.hrp == "npub",
+              decoded.data.count == 32
+        else { return }
+        guard store.startSecureChat(npub: trimmed) != nil else { return }
         isPresented = false
     }
 

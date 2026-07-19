@@ -255,21 +255,25 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                 Spacer(Modifier.height(12.dp))
             }
 
-            // Mesh BIP-353 first (O(1) peer ids, then memoized scan), then
-            // verified kind-0 NIP-05 only — never an unverified claim.
+            // Mesh BIP-353 first (chat id + any live/linked peer id for this
+            // npub), then verified kind-0 NIP-05 only — never an unverified claim.
             val paymentAddress = remember(
-                screen.chatId, effectiveChatId, peerNpub, state.sonarPeerProfiles, nip05, nip05Verified
+                screen.chatId, effectiveChatId, peerNpub, state.sonarPeerProfiles, state.meshDmRows, nip05, nip05Verified
             ) {
                 val peerIds = buildList {
                     if (screen.chatId.startsWith("mesh:")) add(screen.chatId.removePrefix("mesh:"))
                     if (effectiveChatId.startsWith("mesh:")) add(effectiveChatId.removePrefix("mesh:"))
+                    peerNpub?.let { npub ->
+                        state.sonarPeerProfiles.keys.forEach { id ->
+                            if (state.npubStringForPeer(id)?.let { canonicalProfileKey(it) } == npub) add(id)
+                        }
+                        state.meshDmRows.forEach { row ->
+                            if (state.npubStringForPeer(row.id)?.let { canonicalProfileKey(it) } == npub) add(row.id)
+                        }
+                    }
                 }.distinct()
                 peerIds.firstNotNullOfOrNull { id ->
                     state.sonarProfile(id)?.bip353?.takeIf { it.isNotBlank() }
-                } ?: peerNpub?.let { npub ->
-                    state.sonarPeerProfiles.entries.firstOrNull { (id, _) ->
-                        state.npubStringForPeer(id)?.let { canonicalProfileKey(it) } == npub
-                    }?.value?.bip353?.takeIf { !it.isNullOrBlank() }
                 } ?: nip05?.takeIf { '@' in it && nip05Verified == true }
             }
             if (paymentAddress != null) {
