@@ -1322,6 +1322,8 @@ struct SNMsgList: View {
     var onTapPack: ((String) -> Void)? = nil
     /// Retry one failed outgoing message without rebuilding the transcript.
     var onRetry: ((SNMessage) -> Void)? = nil
+    /// Cancel an in-flight Blossom upload for an optimistic media bubble.
+    var onCancelUpload: ((SNMessage) -> Void)? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
@@ -1560,6 +1562,7 @@ struct SNMsgList: View {
                                     maxBubbleWidth: geo.size.width * 0.72,
                                     showState: showDeliveryState,
                                     onRetry: canRetry ? { onRetry?(m) } : nil,
+                                    onCancelUpload: m.state == "Uploading" ? { onCancelUpload?(m) } : nil,
                                     pipeline: mediaPipeline
                                 )
                             } else if m.stickerRef != nil {
@@ -2303,8 +2306,10 @@ private typealias PlatformImage = NSImage
 #endif
 
 /// XChat-style thin horizontal bar along the bottom edge of an uploading media bubble.
+/// Tap cancels when [onCancel] is set.
 private struct SNMediaUploadBar: View {
     let progress: Double
+    var onCancel: (() -> Void)? = nil
 
     var body: some View {
         GeometryReader { geo in
@@ -2317,7 +2322,9 @@ private struct SNMediaUploadBar: View {
         }
         .frame(height: 3)
         .clipShape(Capsule())
-        .allowsHitTesting(false)
+        .contentShape(Capsule())
+        .onTapGesture { onCancel?() }
+        .allowsHitTesting(onCancel != nil)
     }
 }
 
@@ -2326,6 +2333,7 @@ struct SNMediaBubble: View {
     let maxBubbleWidth: CGFloat
     var showState: Bool = false
     var onRetry: (() -> Void)? = nil
+    var onCancelUpload: (() -> Void)? = nil
     var pipeline: SNMediaPipeline = .unavailable
 
     @State private var bytes: Data?
@@ -2401,7 +2409,7 @@ struct SNMediaBubble: View {
                 content
                     .overlay(alignment: .bottom) {
                         if let progress = m.uploadProgress, m.state == "Uploading" {
-                            SNMediaUploadBar(progress: progress)
+                            SNMediaUploadBar(progress: progress, onCancel: onCancelUpload)
                                 .padding(.horizontal, 2)
                                 .padding(.bottom, 2)
                         }

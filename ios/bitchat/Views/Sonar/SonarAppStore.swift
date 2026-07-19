@@ -4654,6 +4654,11 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
     }
 
+    /// Cancel an in-flight Blossom upload for an optimistic media bubble.
+    func cancelMediaUpload(_ message: SNMessage) {
+        marmot.cancelMediaUpload(pendingId: message.id)
+    }
+
     /// Signal-style retry for one failed outgoing row. Durable Marmot rows
     /// republish the original encrypted event; platform-local setup/media rows
     /// reuse the content already retained for that exact bubble.

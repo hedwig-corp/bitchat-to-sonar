@@ -297,6 +297,8 @@ final class MarmotChatModel: ObservableObject {
     private(set) var pushWakeNotifiedGroupIds = Set<String>()
     /// Blossom upload progress (0...1) keyed by optimistic message id.
     @Published var mediaUploadProgress: [String: Double] = [:]
+    /// In-flight upload listeners keyed by optimistic message id (tap-to-cancel).
+    private var mediaUploadListeners: [String: SNMediaUploadListener] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
@@ -757,6 +759,45 @@ final class MarmotChatModel: ObservableObject {
             guard let self else { return }
             try? await self.service.resumePendingMediaUploads()
         }
+    }
+
+    private func registerMediaUploadListener(_ id: String, _ listener: SNMediaUploadListener) {
+        mediaUploadListeners[id]?.cancel()
+        mediaUploadListeners[id] = listener
+    }
+
+    private func clearMediaUploadListener(_ id: String) {
+        mediaUploadListeners.removeValue(forKey: id)
+        mediaUploadProgress.removeValue(forKey: id)
+    }
+
+    /// Cancel an in-flight Blossom upload for the optimistic bubble [pendingId].
+    /// Drops the optimistic row immediately; core abandons Blossom + staging.
+    func cancelMediaUpload(pendingId: String) {
+        mediaUploadListeners[pendingId]?.cancel()
+        mediaUploadProgress.removeValue(forKey: pendingId)
+        for (groupId, pending) in pendingOptimistic {
+            guard pending.contains(where: { $0.id == pendingId }) else { continue }
+            discardOptimistic(id: pendingId, from: groupId)
+            break
+        }
+    }
+
+    private static func isMediaUploadCancelled(_ error: Error) -> Bool {
+        let detail: String
+        if let service = error as? MarmotService.ServiceError {
+            switch service {
+            case .core(let message), .invalidInput(let message):
+                detail = message
+            case .cancelled:
+                return true
+            case .notConnected:
+                return false
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return detail.localizedCaseInsensitiveContains("upload cancelled")
     }
 
     private func connectRelaysIfNeeded() {
@@ -2490,6 +2531,7 @@ final class MarmotChatModel: ObservableObject {
                     self?.mediaUploadProgress[pendingId] = fraction
                 }
             }
+            registerMediaUploadListener(echo.id, listener)
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
@@ -2511,12 +2553,15 @@ final class MarmotChatModel: ObservableObject {
                     clientPendingId: echo.id,
                     listener: listener
                 )
-                mediaUploadProgress.removeValue(forKey: echo.id)
+                clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
-                mediaUploadProgress.removeValue(forKey: echo.id)
+                clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
+                if Self.isMediaUploadCancelled(error) {
+                    return
+                }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -2573,6 +2618,7 @@ final class MarmotChatModel: ObservableObject {
                     self?.mediaUploadProgress[pendingId] = fraction
                 }
             }
+            registerMediaUploadListener(echo.id, listener)
             do {
                 guard await ensureConnected() else {
                     throw MarmotService.ServiceError.notConnected
@@ -2589,12 +2635,15 @@ final class MarmotChatModel: ObservableObject {
                     clientPendingId: echo.id,
                     listener: listener
                 )
-                mediaUploadProgress.removeValue(forKey: echo.id)
+                clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
-                mediaUploadProgress.removeValue(forKey: echo.id)
+                clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
+                if Self.isMediaUploadCancelled(error) {
+                    return
+                }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,

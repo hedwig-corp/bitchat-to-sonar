@@ -2789,7 +2789,8 @@ private fun MediaBubble(
                 )
                 if (m.state == "Uploading") {
                     MediaUploadBar(
-                        progress = m.uploadProgress ?: 0f,
+                        progress = state.mediaUploadFraction(m.id) ?: m.uploadProgress ?: 0f,
+                        onCancel = { state.cancelMediaUpload(m.id) },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(horizontal = 4.dp, vertical = 3.dp),
@@ -2877,7 +2878,8 @@ private fun MediaBubble(
                 }
                 if (m.state == "Uploading") {
                     MediaUploadBar(
-                        progress = m.uploadProgress ?: 0f,
+                        progress = state.mediaUploadFraction(m.id) ?: m.uploadProgress ?: 0f,
+                        onCancel = { state.cancelMediaUpload(m.id) },
                         modifier = Modifier
                             .align(Alignment.BottomCenter)
                             .padding(horizontal = 4.dp, vertical = 3.dp),
@@ -3348,9 +3350,13 @@ private fun MediaTransferOverlay(transfer: MediaTransferState, modifier: Modifie
     }
 }
 
-/** XChat-style thin horizontal bar under an uploading media bubble. */
+/** XChat-style thin horizontal bar under an uploading media bubble. Tap cancels. */
 @Composable
-private fun MediaUploadBar(progress: Float, modifier: Modifier = Modifier) {
+private fun MediaUploadBar(
+    progress: Float,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
     val s = sonar
     val clamped = progress.coerceIn(0f, 1f)
     Box(
@@ -3358,7 +3364,8 @@ private fun MediaUploadBar(progress: Float, modifier: Modifier = Modifier) {
             .fillMaxWidth()
             .height(3.dp)
             .clip(RoundedCornerShape(50))
-            .background(Color.Black.copy(alpha = 0.28f)),
+            .background(Color.Black.copy(alpha = 0.28f))
+            .clickable(onClick = onCancel),
     ) {
         Box(
             Modifier

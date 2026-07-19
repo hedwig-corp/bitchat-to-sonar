@@ -3993,16 +3993,15 @@ impl SonarClient {
             .complete_staged_media_upload(&entry_id, group_id, observer)
             .await
         {
-            Ok(()) => {
-                let _ = self.media_staging.lock().unwrap().remove(&entry_id);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => {
-                let _ = self.media_staging.lock().unwrap().mark_failed(
-                    &entry_id,
-                    err.to_string(),
-                    Timestamp::now().as_secs(),
-                );
+                // Cancel is intentional abandon — drop the sidecar so cold start
+                // does not keep a Failed row until TTL.
+                if matches!(err, Error::MediaUploadCancelled) {
+                    self.staging_remove(&entry_id).await;
+                } else {
+                    self.staging_mark_failed(&entry_id, err.to_string()).await;
+                }
                 Err(err)
             }
         }
@@ -4025,10 +4024,13 @@ impl SonarClient {
             .await
             .map_err(|e| Error::Storage(format!("media staging resume prep join: {e}")))??;
         }
+        let mut attempted = 0u32;
+        // Finish Committed rows that crashed after the local event existed but
+        // before outbox durability — never re-encrypt/re-upload.
+        attempted += self.resume_committed_media_outbox().await?;
         // Only auto-resume in-flight uploads. Failed rows require an explicit
         // host retry so cold start cannot resurrect abandoned / cancelled sends.
         let ids = self.media_staging.lock().unwrap().resumable_ids();
-        let mut attempted = 0u32;
         for id in ids {
             let Some(_claim) = self.try_claim_media_upload(&id) else {
                 // Another send/resume already owns this entry.
@@ -4085,15 +4087,12 @@ impl SonarClient {
                 .complete_staged_media_upload(&id, &group_id, observer)
                 .await
             {
-                Ok(()) => {
-                    let _ = self.media_staging.lock().unwrap().remove(&id);
+                Ok(()) => {}
+                Err(Error::MediaUploadCancelled) => {
+                    self.staging_remove(&id).await;
                 }
                 Err(err) => {
-                    let _ = self.media_staging.lock().unwrap().mark_failed(
-                        &id,
-                        err.to_string(),
-                        Timestamp::now().as_secs(),
-                    );
+                    self.staging_mark_failed(&id, err.to_string()).await;
                 }
             }
         }
@@ -4111,6 +4110,119 @@ impl SonarClient {
             inflight: self.media_upload_inflight.clone(),
             entry_id: entry_id.to_string(),
         })
+    }
+
+    /// Recover Committed staging rows that still hold an outbox payload
+    /// (crash between `mark_committed_for_publish` and remove).
+    async fn resume_committed_media_outbox(&self) -> Result<u32> {
+        let ids = self.media_staging.lock().unwrap().committed_recovery_ids();
+        let mut attempted = 0u32;
+        for id in ids {
+            let Some(_claim) = self.try_claim_media_upload(&id) else {
+                continue;
+            };
+            attempted += 1;
+            let recovery = {
+                let staging = self.media_staging.lock().unwrap();
+                let Some(entry) = staging.get(&id) else {
+                    continue;
+                };
+                (
+                    entry.group_id_hex.clone(),
+                    entry.committed_message_id_hex.clone(),
+                    entry.committed_event_id_hex.clone(),
+                    entry.committed_event_json.clone(),
+                )
+            };
+            let (group_id_hex, Some(message_id_hex), Some(event_id_hex), Some(event_json)) =
+                recovery
+            else {
+                let staging = self.media_staging.clone();
+                let id = id.clone();
+                let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id))
+                    .await;
+                continue;
+            };
+            let event = match Event::from_json(&event_json) {
+                Ok(event) => event,
+                Err(err) => {
+                    let staging = self.media_staging.clone();
+                    let id = id.clone();
+                    let msg = format!("committed media outbox decode: {err}");
+                    let now = Timestamp::now().as_secs();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        staging.lock().unwrap().mark_failed(&id, msg, now)
+                    })
+                    .await;
+                    continue;
+                }
+            };
+            if let Err(err) = self.outbox_state.lock().unwrap().mark_pending(
+                group_id_hex.clone(),
+                message_id_hex.clone(),
+                event_id_hex,
+                event_json,
+                Timestamp::now().as_secs(),
+            ) {
+                let staging = self.media_staging.clone();
+                let id = id.clone();
+                let msg = err.to_string();
+                let now = Timestamp::now().as_secs();
+                let _ = tokio::task::spawn_blocking(move || {
+                    staging.lock().unwrap().mark_failed(&id, msg, now)
+                })
+                .await;
+                continue;
+            }
+            let staging = self.media_staging.clone();
+            let remove_id = id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                staging.lock().unwrap().remove(&remove_id)
+            })
+            .await;
+            let _ = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
+            self.notify_conversation_changed(&group_id_hex);
+        }
+        Ok(attempted)
+    }
+
+    async fn staging_remove(&self, entry_id: &str) {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
+    }
+
+    async fn staging_mark_failed(&self, entry_id: &str, error: String) {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let now = Timestamp::now().as_secs();
+        let _ = tokio::task::spawn_blocking(move || {
+            staging.lock().unwrap().mark_failed(&entry_id, error, now)
+        })
+        .await;
+    }
+
+    async fn staging_mark_committed_for_publish(
+        &self,
+        entry_id: &str,
+        message_id_hex: String,
+        event_id_hex: String,
+        event_json: String,
+    ) -> Result<()> {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let now = Timestamp::now().as_secs();
+        tokio::task::spawn_blocking(move || {
+            staging.lock().unwrap().mark_committed_for_publish(
+                &entry_id,
+                message_id_hex,
+                event_id_hex,
+                event_json,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("media staging commit join: {e}")))?
     }
 
     /// Encrypt + upload staged plaintext, then publish via the durable outbox.
@@ -4247,13 +4359,6 @@ impl SonarClient {
             let (index, url) = result?;
             urls[index] = url;
         }
-        let aggregate: u64 = item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-        let _ = self.media_staging.lock().unwrap().update_progress(
-            entry_id,
-            aggregate.min(album_total),
-            Timestamp::now().as_secs(),
-            true,
-        );
         if media_upload_cancelled(observer) {
             return Err(Error::MediaUploadCancelled);
         }
@@ -4278,18 +4383,24 @@ impl SonarClient {
         };
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
-        self.mark_outbox_pending(group_id, &message, &event)?;
-        // Flip to Committed *before* remove so a crash after outbox durability
-        // cannot leave an Uploading row that resume would re-publish as a new
-        // event. retry_outbox owns the single publish path from here.
-        let _ = self.media_staging.lock().unwrap().mark_committed(
-            entry_id,
-            Timestamp::now().as_secs(),
-        );
-        let _ = self.media_staging.lock().unwrap().remove(entry_id);
+        let message_id_hex = message.id.to_hex();
         let event_id = event.id;
+        let event_id_hex = event_id.to_hex();
+        let event_json = event.as_json();
+        // Durable Committed+payload *before* outbox so a crash cannot leave an
+        // Uploading row (which would re-upload into a second kind-445). Resume
+        // recovers Committed payloads via outbox-only publish.
+        self.staging_mark_committed_for_publish(
+            entry_id,
+            message_id_hex.clone(),
+            event_id_hex,
+            event_json.clone(),
+        )
+        .await?;
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        self.staging_remove(entry_id).await;
         let publish_ack =
-            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+            self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);

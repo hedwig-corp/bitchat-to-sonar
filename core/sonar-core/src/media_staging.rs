@@ -43,8 +43,8 @@ fn is_safe_relative_path(path: &str) -> bool {
 pub(crate) enum MediaStagingStatus {
     Uploading,
     Failed,
-    /// Outbox already owns publish. Never auto-resume — a crash after
-    /// `mark_outbox_pending` must not create a second kind-445.
+    /// Local media event exists; upload must not re-run. May still carry an
+    /// outbox recovery payload until `mark_outbox_pending` + remove finish.
     Committed,
 }
 
@@ -71,6 +71,14 @@ pub(crate) struct StagedMediaEntry {
     pub last_error: Option<String>,
     pub bytes_sent: u64,
     pub total_bytes: u64,
+    /// Set when flipping to [`MediaStagingStatus::Committed`] so a crash before
+    /// `mark_outbox_pending` can finish publish without creating a new event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_message_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_event_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_event_json: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -232,6 +240,9 @@ impl MediaStagingState {
             last_error: None,
             bytes_sent: 0,
             total_bytes,
+            committed_message_id_hex: None,
+            committed_event_id_hex: None,
+            committed_event_json: None,
         };
         self.entries.insert(id, entry);
         self.dirty = true;
@@ -288,16 +299,44 @@ impl MediaStagingState {
         self.save_if_dirty()
     }
 
-    /// Outbox row is durable — never auto-resume this entry again.
-    pub fn mark_committed(&mut self, id: &str, now_secs: u64) -> Result<()> {
+    /// Local transcript row + encrypted wrapper exist. Never re-upload; keep a
+    /// recovery payload until the outbox row is written and staging is removed.
+    pub fn mark_committed_for_publish(
+        &mut self,
+        id: &str,
+        message_id_hex: String,
+        event_id_hex: String,
+        event_json: String,
+        now_secs: u64,
+    ) -> Result<()> {
         let Some(entry) = self.entries.get_mut(id) else {
             return Ok(());
         };
         entry.state = MediaStagingStatus::Committed;
         entry.last_error = None;
         entry.updated_at_secs = now_secs;
+        entry.committed_message_id_hex = Some(message_id_hex);
+        entry.committed_event_id_hex = Some(event_id_hex);
+        entry.committed_event_json = Some(event_json);
         self.dirty = true;
         self.save_if_dirty()
+    }
+
+    /// Committed rows that still carry an outbox recovery payload.
+    pub fn committed_recovery_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.state == MediaStagingStatus::Committed
+                    && entry.committed_message_id_hex.is_some()
+                    && entry.committed_event_id_hex.is_some()
+                    && entry.committed_event_json.is_some()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
     }
 
     pub fn remove(&mut self, id: &str) -> Result<()> {
@@ -366,17 +405,20 @@ impl MediaStagingState {
         self.dirty = false;
     }
 
-    /// Drop Committed rows immediately and Failed rows older than
-    /// [`FAILED_STAGING_TTL_SECS`].
+    /// Drop Failed rows older than [`FAILED_STAGING_TTL_SECS`], and orphan
+    /// Committed rows that have no outbox recovery payload (legacy / already
+    /// published). Keep Committed+payload for [`Self::committed_recovery_ids`].
     pub fn purge_expired_failed(&mut self, now_secs: u64) -> Result<()> {
         let expired: Vec<String> = self
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.state == MediaStagingStatus::Committed
-                    || (entry.state == MediaStagingStatus::Failed
-                        && now_secs.saturating_sub(entry.updated_at_secs)
-                            >= FAILED_STAGING_TTL_SECS)
+                let orphan_committed = entry.state == MediaStagingStatus::Committed
+                    && (entry.committed_message_id_hex.is_none()
+                        || entry.committed_event_json.is_none());
+                let old_failed = entry.state == MediaStagingStatus::Failed
+                    && now_secs.saturating_sub(entry.updated_at_secs) >= FAILED_STAGING_TTL_SECS;
+                orphan_committed || old_failed
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -558,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn committed_is_not_resumable_and_is_purged() {
+    fn committed_with_payload_is_not_resumable_and_survives_purge() {
         let mut staging = MediaStagingState::load(None, None);
         staging
             .stage(
@@ -571,10 +613,44 @@ mod tests {
                 1,
             )
             .expect("stage");
-        staging.mark_committed("c", 2).expect("commit");
+        staging
+            .mark_committed_for_publish(
+                "c",
+                "msg".into(),
+                "evt".into(),
+                "{\"id\":\"evt\"}".into(),
+                2,
+            )
+            .expect("commit");
         assert!(staging.resumable_ids().is_empty());
+        assert_eq!(staging.committed_recovery_ids(), vec!["c".to_string()]);
         staging.purge_expired_failed(2).expect("purge");
+        assert!(staging.get("c").is_some(), "recovery payload must survive");
+        staging.remove("c").expect("remove");
         assert!(staging.get("c").is_none());
+    }
+
+    #[test]
+    fn orphan_committed_without_payload_is_purged() {
+        let mut staging = MediaStagingState::load(None, None);
+        staging
+            .stage(
+                "orphan".into(),
+                "orphan".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("a.jpg".into(), "image/jpeg".into(), b"x".to_vec())],
+                1,
+            )
+            .expect("stage");
+        {
+            let entry = staging.entries.get_mut("orphan").expect("entry");
+            entry.state = MediaStagingStatus::Committed;
+        }
+        staging.dirty = true;
+        staging.purge_expired_failed(2).expect("purge");
+        assert!(staging.get("orphan").is_none());
     }
 
     #[test]
@@ -657,6 +733,9 @@ mod tests {
                 last_error: None,
                 bytes_sent: 0,
                 total_bytes: 1,
+                committed_message_id_hex: None,
+                committed_event_id_hex: None,
+                committed_event_json: None,
             }],
         };
         fs::write(
