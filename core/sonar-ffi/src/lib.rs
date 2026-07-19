@@ -483,6 +483,18 @@ pub struct DrainNotificationInfo {
     pub content_preview: String,
 }
 
+/// A healed 1:1 conversation surfaced by the recovery beacon flow. Hosts render
+/// a "chat was reset" system row and fold the new group into the same
+/// conversation as the retired one. Ids are MLS group id hex (same id space as
+/// `GroupInfo.id_hex` / `messages`).
+#[derive(uniffi::Record)]
+pub struct ConversationResetInfo {
+    pub peer_pubkey_hex: String,
+    pub old_group_id_hex: String,
+    pub new_group_id_hex: String,
+    pub at_secs: u64,
+}
+
 #[derive(uniffi::Enum)]
 pub enum SonarNotificationKindInfo {
     Message,
@@ -1204,6 +1216,29 @@ impl SonarNode {
                 content_preview: n.content_preview,
             })
             .collect())
+    }
+
+    /// Drain healed-conversation notices produced by the recovery beacon flow.
+    /// Hosts call this after a conversation refresh / drain and render a "chat
+    /// was reset" system row for each, folding the new group into the same
+    /// conversation as the retired one. Local read — never touches the network.
+    pub fn drain_conversation_resets(&self) -> Vec<ConversationResetInfo> {
+        self.client
+            .drain_conversation_resets()
+            .into_iter()
+            .map(|r| ConversationResetInfo {
+                peer_pubkey_hex: r.peer_pubkey_hex,
+                old_group_id_hex: r.old_group_id_hex,
+                new_group_id_hex: r.new_group_id_hex,
+                at_secs: r.at_secs,
+            })
+            .collect()
+    }
+
+    /// True while a locally published recovery beacon is outstanding (i.e. we
+    /// restored from nsec and are waiting for a surviving peer to re-invite us).
+    pub fn has_outstanding_recovery_beacon(&self) -> bool {
+        self.client.has_outstanding_recovery_beacon()
     }
 
     /// All groups this identity belongs to.

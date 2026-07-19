@@ -80,6 +80,17 @@ final class MarmotService: @unchecked Sendable {
         let memberNpubs: [String]
     }
 
+    /// A healed 1:1 conversation from the recovery beacon flow: after a peer
+    /// restored from nsec, the old MLS group was retired and a fresh one
+    /// created. Hosts fold `newGroupId` into the same conversation as
+    /// `oldGroupId` and show a "chat was reset" system row.
+    struct MarmotConversationReset: Sendable, Equatable {
+        let peerPubkeyHex: String
+        let oldGroupId: String
+        let newGroupId: String
+        let atSecs: UInt64
+    }
+
     struct GroupInvite: Sendable, Equatable {
         /// Hex kind-444 welcome event id; pass it to accept/decline.
         let id: String
@@ -1090,6 +1101,28 @@ final class MarmotService: @unchecked Sendable {
     @discardableResult
     func drainPending() async throws -> [DrainNotificationInfo] {
         try await drainLane { try $0.drainPendingMarmot() }
+    }
+
+    /// Drain healed-conversation notices produced by the recovery beacon flow.
+    /// Local read — no network. Hosts render a "chat was reset" row per entry
+    /// and fold the new group into the same conversation as the retired one.
+    func drainConversationResets() async -> [MarmotConversationReset] {
+        await readOnlyNonThrowing({ node in
+            node.drainConversationResets().map {
+                MarmotConversationReset(
+                    peerPubkeyHex: $0.peerPubkeyHex,
+                    oldGroupId: $0.oldGroupIdHex,
+                    newGroupId: $0.newGroupIdHex,
+                    atSecs: $0.atSecs
+                )
+            }
+        }, default: [])
+    }
+
+    /// True while a locally published recovery beacon is outstanding (we
+    /// restored from nsec and are waiting for a surviving peer to re-invite us).
+    func hasOutstandingRecoveryBeacon() async -> Bool {
+        await readOnlyNonThrowing({ $0.hasOutstandingRecoveryBeacon() }, default: false)
     }
 
     /// All Marmot groups the identity belongs to.

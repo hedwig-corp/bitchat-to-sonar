@@ -402,6 +402,30 @@ the send echo was cleared before the canonical row merged.
 
 ---
 
+## R-012 — A recovery beacon heals an existing chat exactly once, and never on an ordinary reconnect
+
+**Invariant:** A kind-30447 recovery beacon (published after nsec restore) may re-invite its author into a FRESH group ONLY when (a) the survivor already shares a group with that author, (b) the beacon has not been processed before for that author (`created_at <= processed`), and (c) the beacon is not older than the newest decrypted inbound message from that author (`created_at < last_inbound_from`). Processing it retires the old 1:1 group, creates one new group, and emits exactly one `ConversationReset`; DM reuse then folds into the healed group. A client with existing local groups must NOT publish a beacon (only an empty local store — fresh onboarding or a real restore — beacons), so an ordinary relay reconnect can never reset a peer's chat.
+
+**Breaks as:** After a peer restores from nsec, messages silently never flow again (no heal) — or, the opposite failure, every launch/reconnect republishes a beacon and peers reset the conversation repeatedly (ratchet churn, duplicate groups); or a replayed/out-of-order beacon spawns a second group + a duplicate "chat was reset" row.
+
+**Why:** MDK has no external-commit/ReInit rejoin, so recovery is always *new group + welcome via a fresh KeyPackage*. Auto-resetting a ratchet is an attack/abuse surface; the member-scope + replay + staleness guards and the empty-store publish gate are load-bearing, and the beacon must never gate chat open/paint (it runs after local-first work in `sync()` and off the notification collector on the live path).
+
+**Call sites:** core `client.rs::handle_recovery_beacon` / `fetch_and_process_recovery_beacons` / `heal_dm_via_recovery` / `publish_key_package_background` (empty-store gate) / `find_dm_group_with` (retired skip); `recovery.rs::RecoveryState::is_beacon_replayed_or_stale`. Apps surface the notice: iOS `MarmotService`/`SonarAppStore`; Compose `SonarCore`/`SonarAppState`.
+
+**Guarded by:** `recovery_beacon_heals_dm_after_local_wipe` (core e2e, `sonar-core/tests/recovery_beacon.rs`) — fails if the heal, retirement, reset notice, or fold does not happen.
+
+**Also guarded by:** `recovery_beacon_replay_is_idempotent` (core e2e — replayed/re-fetched beacon must not create a second group or reset), and `recovery::tests::replay_guard_ignores_processed_and_stale_beacons` (unit — the replay/staleness predicate).
+
+**History:** feat(marmot) auto-rejoin-after-nsec-restore — first landing.
+
+**Rejected:**
+- *Publish the beacon on every KeyPackage republish (every connect).* Peers with a live chat would reset on each of the restorer's reconnects; gated on empty local store instead.
+- *Ignore beacons using `created_at <= last_inbound_from` (`<=`).* A beacon published in the same second as the last inbound message (common in tests and fast restores) would be wrongly treated as stale and never heal; use strict `<` for staleness, `<=` only for the processed-watermark replay guard.
+- *Rejoin the old MLS group.* MDK returns `NotImplemented` for external commits/ReInit; not possible on the current MDK rev.
+
+**Not guarded:** Multi-member admin re-add (`readd_member_via_recovery` / `is_recovery_executor`) has code but no dedicated e2e yet — the concurrent-admin dedup and offline-executor grace retry are unpinned. Live-path (kind-30447 subscription + `drain_pending_marmot` buffer) heal is exercised only via the sync path in tests; the app-side reset-notice UI on both platforms is unpinned (needs a constructible `SonarAppState` / `SonarAppStore`, the same gap noted below). History transfer to the restored device (5B) is out of scope.
+
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

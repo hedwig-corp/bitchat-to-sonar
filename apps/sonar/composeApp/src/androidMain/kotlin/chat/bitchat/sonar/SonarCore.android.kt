@@ -617,6 +617,26 @@ actual object SonarCore {
         runCatching { n.drainPendingMarmot().size }.getOrDefault(0)
     }
 
+    actual suspend fun drainConversationResets(): List<SonarConversationReset> =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext emptyList()
+            runCatching {
+                n.drainConversationResets().map {
+                    SonarConversationReset(
+                        peerPubkeyHex = it.peerPubkeyHex,
+                        oldGroupIdHex = it.oldGroupIdHex,
+                        newGroupIdHex = it.newGroupIdHex,
+                        atSecs = it.atSecs.toLong(),
+                    )
+                }
+            }.getOrDefault(emptyList())
+        }
+
+    actual suspend fun hasOutstandingRecoveryBeacon(): Boolean = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext false
+        runCatching { n.hasOutstandingRecoveryBeacon() }.getOrDefault(false)
+    }
+
     // ── Diagnostics (Settings → Diagnostics) ──
 
     private fun coreLogDirectory(): File =

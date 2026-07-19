@@ -254,6 +254,27 @@ private fun CallFeed(hue: Float, modifier: Modifier = Modifier) {
     )
 }
 
+/** Recovery-beacon heal notice shown inline in the transcript. */
+data class ChatResetNotice(
+    val id: String,
+    val tsSecs: Long,
+)
+
+@Composable
+fun ChatResetNoticeRow(notice: ChatResetNotice) {
+    val s = sonar
+    Box(Modifier.fillMaxWidth().padding(vertical = 5.dp), contentAlignment = Alignment.Center) {
+        Row(
+            Modifier.clip(RoundedCornerShape(14.dp)).background(s.surface2).padding(horizontal = 14.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(9.dp)
+        ) {
+            Text("Chat was reset", color = s.text2, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Text(SonarClock.hourMinute(notice.tsSecs), color = s.text3, fontSize = 11.5.sp)
+        }
+    }
+}
+
 /** Mocked in-chat call record (design: call.jsx CallLog + theme.css .call-log). */
 @Composable
 fun CallLogRow(rec: CallRecord) {

@@ -1531,6 +1531,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func deleteGroup(groupIdHex: String) throws
 
     /**
+     * Drain healed-conversation notices produced by the recovery beacon flow.
+     * Hosts call this after a conversation refresh / drain and render a "chat
+     * was reset" system row for each, folding the new group into the same
+     * conversation as the retired one. Local read — never touches the network.
+     */
+    func drainConversationResets()  -> [ConversationResetInfo]
+
+    /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
     func drainDirectDms()  -> [DirectDmInfo]
@@ -1606,6 +1614,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * All groups this identity belongs to.
      */
     func groups() throws  -> [GroupInfo]
+
+    /**
+     * True while a locally published recovery beacon is outstanding (i.e. we
+     * restored from nsec and are waiting for a surviving peer to re-invite us).
+     */
+    func hasOutstandingRecoveryBeacon()  -> Bool
 
     func installStickerPack(coordinate: String) throws
 
@@ -2247,6 +2261,20 @@ open func deleteGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConv
 }
 
     /**
+     * Drain healed-conversation notices produced by the recovery beacon flow.
+     * Hosts call this after a conversation refresh / drain and render a "chat
+     * was reset" system row for each, folding the new group into the same
+     * conversation as the retired one. Local read — never touches the network.
+     */
+open func drainConversationResets() -> [ConversationResetInfo]  {
+    return try!  FfiConverterSequenceTypeConversationResetInfo.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_drain_conversation_resets(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Drain account-level direct NIP-17 DMs received since the last drain.
      */
 open func drainDirectDms() -> [DirectDmInfo]  {
@@ -2419,6 +2447,18 @@ open func geohashPresenceCount(geohash: String)throws  -> UInt32  {
 open func groups()throws  -> [GroupInfo]  {
     return try  FfiConverterSequenceTypeGroupInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_groups(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
+     * True while a locally published recovery beacon is outstanding (i.e. we
+     * restored from nsec and are waiting for a surviving peer to re-invite us).
+     */
+open func hasOutstandingRecoveryBeacon() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_has_outstanding_recovery_beacon(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -7129,6 +7169,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeConversationResetInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ConversationResetInfo]
+
+    public static func write(_ value: [ConversationResetInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeConversationResetInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ConversationResetInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ConversationResetInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeConversationResetInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationSummaryInfo]
 
@@ -8260,6 +8325,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_delete_group() != 40442) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_conversation_resets() != 31603) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_direct_dms() != 64423) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8300,6 +8368,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_groups() != 48990) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_has_outstanding_recovery_beacon() != 62243) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {

@@ -959,6 +959,11 @@ final class SonarAppStore: ObservableObject {
     /// dmMsgs use). Persisted locally so the transcript keeps completed/missed
     /// call rows across relaunches.
     @Published private(set) var callLogs: [String: [SNCallRecord]] = [:]
+    /// Healed-conversation notices from the recovery beacon flow, keyed by the
+    /// NEW MLS group id. A transcript whose group id is present here shows a
+    /// "chat was reset" system row and folds in the retired leg. Populated by
+    /// `refreshConversationResets()` after Marmot group changes.
+    @Published private(set) var conversationResets: [String: MarmotService.MarmotConversationReset] = [:]
     /// Conversations currently checking their bounded local DB transcript. While
     /// this is set, the DM screen must not show a "new empty chat" state yet.
     @Published private(set) var localHydratingDMs: Set<String> = []
@@ -1658,6 +1663,9 @@ final class SonarAppStore: ObservableObject {
                 DispatchQueue.main.async { [weak self] in
                     self?.flushPendingMarmotSends()
                 }
+                // A group change may be a recovery heal (old DM retired, fresh
+                // group joined); surface any "chat was reset" notices.
+                self.refreshConversationResets()
             }
             .store(in: &cancellables)
 
@@ -2552,6 +2560,26 @@ final class SonarAppStore: ObservableObject {
         let queued = pendingInviteLinks
         pendingInviteLinks.removeAll()
         for token in queued { submitInviteLink(token) }
+    }
+
+    /// Fold any healed-conversation notices from the recovery beacon flow into
+    /// `conversationResets`, keyed by the new MLS group id. The core already
+    /// fired its conversation-changed signal for the healed chat, so the chat
+    /// list repaints on its own; this only records the "chat was reset" marker.
+    private func refreshConversationResets() {
+        Task { [weak self] in
+            guard let self else { return }
+            let resets = await self.marmot.drainConversationResets()
+            guard !resets.isEmpty else { return }
+            await MainActor.run {
+                for reset in resets {
+                    // Index under both ids so a still-open old-group chat and the
+                    // healed new-group chat both resolve the same notice.
+                    self.conversationResets[reset.newGroupId] = reset
+                    self.conversationResets[reset.oldGroupId] = reset
+                }
+            }
+        }
     }
 
     /// Marmot (White Noise) npub once the secure-chat service connected.
@@ -5203,12 +5231,41 @@ final class SonarAppStore: ObservableObject {
             limit: limit,
             newestOffset: paymentNewestOffset
         )
-        return mergeCallLogs(
+        let withCalls = mergeCallLogs(
             into: dated,
             id: id,
             limit: limit,
             newestOffset: callNewestOffset
         )
+        return mergeConversationResets(into: withCalls, id: id)
+    }
+
+    /// Inject a Signal-style "chat was reset" system row when core drained a
+    /// recovery-beacon heal for this conversation's current MLS group.
+    private func mergeConversationResets(into messages: [SNMessage], id: String) -> [SNMessage] {
+        let groupId = marmotGroupId(id)
+        let reset = groupId.flatMap { conversationResets[$0] }
+            ?? conversationResets[id]
+        guard let reset else { return messages }
+        let at = Date(timeIntervalSince1970: TimeInterval(reset.atSecs))
+        let notice = SNMessage(
+            id: "sonar-reset-\(reset.newGroupId)",
+            text: "",
+            time: Self.clock(at),
+            sortDate: at,
+            transcriptSourceID: SNConversationTranscriptSource.recoveryResetID,
+            systemNotice: "Chat was reset"
+        )
+        var combined = messages
+        if !combined.contains(where: { $0.id == notice.id }) {
+            combined.append(notice)
+        }
+        return combined.sorted {
+            let a = $0.sortDate ?? .distantPast
+            let b = $1.sortDate ?? .distantPast
+            if a == b { return $0.id < $1.id }
+            return a < b
+        }
     }
 
     /// Fold local call records for `id` into the transcript chronologically

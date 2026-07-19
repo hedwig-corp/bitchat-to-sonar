@@ -1019,8 +1019,17 @@ private fun ChannelHint() {
     )
 }
 
-internal fun transcriptFeedKey(item: Any): String =
-    if (item is CallRecord) "c:${item.id}" else "m:${(item as SonarMsg).id}"
+internal fun transcriptFeedKey(item: Any): String = when (item) {
+    is CallRecord -> "c:${item.id}"
+    is ChatResetNotice -> "r:${item.id}"
+    else -> "m:${(item as SonarMsg).id}"
+}
+
+internal fun transcriptFeedTsSecs(item: Any): Long = when (item) {
+    is CallRecord -> item.tsSecs
+    is ChatResetNotice -> item.tsSecs
+    else -> (item as SonarMsg).tsSecs
+}
 
 /** Flattened LazyColumn rows so day chips / unread own stable keys (Signal).
  *  Internal (not private) so tests pin the real feed-flattening call site. */
@@ -1042,7 +1051,7 @@ internal fun buildChatFeedListItems(
 ): List<ChatFeedListItem> {
     val out = ArrayList<ChatFeedListItem>(feed.size + 8)
     feed.forEachIndexed { i, item ->
-        val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
+        val ts = transcriptFeedTsSecs(item)
         val prevAny = feed.getOrNull(i - 1)
         val prevTs = if (prevAny is CallRecord) prevAny.tsSecs else (prevAny as? SonarMsg)?.tsSecs
         val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
@@ -1245,7 +1254,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // the merge sorts — per-recomposition work the render path must not repeat
     // when unrelated state (media decode, presence) invalidates the screen.
     val calls = run { state.callVersion; state.callRecords(screen.id) }
-    val feed: List<Any> = remember(state.messages, calls) {
+    val resetNotice = state.conversationResets[screen.id]?.let {
+        ChatResetNotice(id = "sonar-reset-${it.newGroupIdHex}", tsSecs = it.atSecs)
+    }
+    val feed: List<Any> = remember(state.messages, calls, resetNotice) {
         val visible = state.messages.filter {
             val p = PayLine.decode(it.content)
             // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines. The
@@ -1254,7 +1266,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                 SonarCore.callParseControl(it.content) != null
             (p == null || p is PayLine.Pay) && !isCall
         }
-        (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
+        val extras: List<Any> = buildList {
+            addAll(calls)
+            if (resetNotice != null) add(resetNotice)
+        }
+        (visible + extras).sortedBy(::transcriptFeedTsSecs)
     }
     val newestFeedKey = feed.lastOrNull()?.let(::transcriptFeedKey)
     val currentFeed by rememberUpdatedState(feed)
@@ -1635,13 +1651,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 val item = listItem.payload
                                 val feedIndex = listItem.feedIndex
                                 val prevAny = feed.getOrNull(feedIndex - 1)
-                                val ts = if (item is CallRecord) item.tsSecs else (item as SonarMsg).tsSecs
-                                val prevTs = if (prevAny is CallRecord) prevAny.tsSecs
-                                    else (prevAny as? SonarMsg)?.tsSecs
+                                val ts = transcriptFeedTsSecs(item)
+                                val prevTs = prevAny?.let(::transcriptFeedTsSecs)
                                 val newDay = prevTs == null || localDayDelta(prevTs) != localDayDelta(ts)
-                                if (item is CallRecord) {
-                                    CallLogRow(item)
-                                } else {
+                                when (item) {
+                                    is CallRecord -> CallLogRow(item)
+                                    is ChatResetNotice -> ChatResetNoticeRow(item)
+                                    else -> {
                                     val m = item as SonarMsg
                                     val msgMesh = isMeshRoute && !m.viaInternet
                                     // Contiguity from adjacent feed message rows only.
@@ -1695,6 +1711,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                         onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
                                         maxBubbleWidth = bubbleMax,
                                     )
+                                    }
                                 }
                             }
                         }

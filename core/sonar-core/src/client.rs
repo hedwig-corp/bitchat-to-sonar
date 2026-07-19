@@ -36,13 +36,16 @@ use crate::identity::Identity;
 use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
-    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+    MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, RECOVERY_BEACON_KIND, SYNC_STATE_FILE_SUFFIX,
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
     SealedMediaItem,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
+use crate::recovery::{
+    build_recovery_beacon_event, recovery_state_path_for_db, ConversationReset, RecoveryState,
+};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
 use crate::sonar_descriptor::{
     descriptor_d_tags, descriptor_events, descriptor_tags, parse_descriptor_event, SonarDescriptor,
@@ -904,6 +907,7 @@ const SYNC_OVERLAP_SECS: u64 = 5 * 60;
 /// group filter REPLACES it rather than stacking new subscriptions).
 const SUB_MARMOT_WELCOMES: &str = "sonar-marmot-welcomes";
 const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
+const SUB_MARMOT_RECOVERY: &str = "sonar-marmot-recovery";
 
 /// Hard cap on the live Marmot event buffer. The handler pushes here while the
 /// host drains via `drain_pending_marmot`; if a host has not wired draining yet
@@ -915,6 +919,10 @@ const SUB_MARMOT_GROUPS: &str = "sonar-marmot-groups";
 /// commits and vice versa (P1).
 const MARMOT_GROUP_BUFFER_CAP: usize = 768;
 const MARMOT_GIFTWRAP_BUFFER_CAP: usize = 512;
+/// Upper bound on recovery beacons fetched per sync. Beacons are addressable
+/// (one latest per author), so the member set is the real limit; this only
+/// guards a pathological author list.
+const RECOVERY_BEACON_FETCH_LIMIT: usize = 256;
 #[allow(dead_code)]
 const MARMOT_BUFFER_CAP: usize = MARMOT_GROUP_BUFFER_CAP + MARMOT_GIFTWRAP_BUFFER_CAP;
 const DIRECT_DM_BUFFER_CAP: usize = 1024;
@@ -1970,6 +1978,7 @@ impl SonarClient {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn with_engine(
         identity: Identity,
         relays: Vec<RelayUrl>,
@@ -2074,6 +2083,7 @@ impl SonarClient {
 
         let pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
+        let pending_recovery_beacons: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let marmot_notify = Arc::new(tokio::sync::Notify::new());
         let send_inflight = Arc::new(AtomicUsize::new(0));
         let membership_gate = Arc::new(tokio::sync::RwLock::new(()));
@@ -2095,6 +2105,7 @@ impl SonarClient {
         let handler_subs = geo_subscribed.clone();
         let handler_giftwraps = pending_marmot_giftwraps.clone();
         let handler_groups = pending_marmot_groups.clone();
+        let handler_recovery_beacons = pending_recovery_beacons.clone();
         let handler_notify = marmot_notify.clone();
         let handler_buffer_drops = buffer_drops_total.clone();
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
@@ -2159,7 +2170,7 @@ impl SonarClient {
                     _ => continue,
                 };
                 let kind = event.kind.as_u16();
-                if !matches!(kind, 20000 | 20001 | 1059 | 445) {
+                if !matches!(kind, 20000 | 20001 | 1059 | 445 | RECOVERY_BEACON_KIND) {
                     continue;
                 }
                 if !live_dedup.should_accept(&event.id, Instant::now()) {
@@ -2315,6 +2326,26 @@ impl SonarClient {
                         }
                         handler_notify.notify_one();
                     }
+                    RECOVERY_BEACON_KIND => {
+                        // Live recovery beacon (kind 30447) from a peer that
+                        // restored from nsec. Buffer + wake; the healing work
+                        // (retire old DM, re-invite via fresh KeyPackage) runs on
+                        // the host engine thread via drain_pending_marmot, never
+                        // in this notification collector.
+                        {
+                            let mut buf = handler_recovery_beacons.lock().unwrap();
+                            if buf.len() >= MARMOT_GROUP_BUFFER_CAP {
+                                tracing::warn!(
+                                    dropped = MARMOT_GROUP_BUFFER_CAP / 2,
+                                    "pending recovery beacon buffer overflow — dropping oldest"
+                                );
+                                buf.drain(0..MARMOT_GROUP_BUFFER_CAP / 2);
+                                handler_buffer_drops.fetch_add(1, Ordering::Relaxed);
+                            }
+                            buf.push((*event).clone());
+                        }
+                        handler_notify.notify_one();
+                    }
                     _ => {}
                 }
             }
@@ -2439,6 +2470,7 @@ impl SonarClient {
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
+        *self.last_key_package_event_id.lock().unwrap() = Some(event.id);
         self.nostr.send_event(&event).await?;
         Ok(())
     }
@@ -2453,13 +2485,89 @@ impl SonarClient {
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
+        let kp_event_id = event.id;
+        *self.last_key_package_event_id.lock().unwrap() = Some(kp_event_id);
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
                 tracing::warn!(%err, "background KeyPackage publish failed");
             }
         });
+        // After a fresh KeyPackage exists, announce recovery ONLY when our local
+        // MLS store has no groups. That is either a fresh onboarding (harmless —
+        // no peer is watching this npub yet) or an nsec restore that lost local
+        // state (exactly the case surviving peers must heal). An existing user
+        // with groups never beacons, so an ordinary relay reconnect can never
+        // trigger a spurious conversation reset on a peer.
+        let store_empty = self.engine.groups().map(|g| g.is_empty()).unwrap_or(false);
+        if store_empty {
+            if let Err(err) = self
+                .publish_recovery_beacon_background_with_kp(Some(kp_event_id))
+                .await
+            {
+                tracing::warn!(%err, "background recovery beacon publish failed");
+            }
+        }
         Ok(())
+    }
+
+    /// Publish a signed recovery beacon (kind 30447) and wait for the relay
+    /// acks. Records the outstanding beacon so incoming group welcomes
+    /// auto-accept while it is set. Callers that lost local MLS state and
+    /// restored from `nsec` use this (or the background variant) so surviving
+    /// peers re-invite them; see [`crate::recovery`].
+    pub async fn publish_recovery_beacon(&self) -> Result<()> {
+        let kp_id = *self.last_key_package_event_id.lock().unwrap();
+        let event = self.build_and_record_recovery_beacon(kp_id)?;
+        self.nostr.send_event(&event).await?;
+        Ok(())
+    }
+
+    /// Like [`Self::publish_recovery_beacon`], but the relay send is spawned,
+    /// not awaited (mirrors [`Self::publish_key_package_background`]). The beacon
+    /// is addressable and republished on demand, so a lost send self-heals.
+    pub async fn publish_recovery_beacon_background(&self) -> Result<()> {
+        let kp_id = *self.last_key_package_event_id.lock().unwrap();
+        self.publish_recovery_beacon_background_with_kp(kp_id).await
+    }
+
+    async fn publish_recovery_beacon_background_with_kp(
+        &self,
+        key_package_event_id: Option<EventId>,
+    ) -> Result<()> {
+        let event = self.build_and_record_recovery_beacon(key_package_event_id)?;
+        let nostr = self.nostr.clone();
+        tokio::spawn(async move {
+            if let Err(err) = nostr.send_event(&event).await {
+                tracing::warn!(%err, "background recovery beacon publish failed");
+            }
+        });
+        Ok(())
+    }
+
+    fn build_and_record_recovery_beacon(
+        &self,
+        key_package_event_id: Option<EventId>,
+    ) -> Result<Event> {
+        let event =
+            build_recovery_beacon_event(self.engine.identity().keys(), key_package_event_id)?;
+        self.recovery_state
+            .lock()
+            .unwrap()
+            .set_outstanding_beacon(event.created_at.as_secs())?;
+        Ok(event)
+    }
+
+    /// Undrained healed-conversation notices (host renders a "chat was reset"
+    /// system row and folds the new leg into the existing conversation row).
+    pub fn drain_conversation_resets(&self) -> Vec<ConversationReset> {
+        self.recovery_state.lock().unwrap().drain_resets()
+    }
+
+    /// True while a locally published recovery beacon is outstanding (used to
+    /// auto-accept the re-invite welcome after an nsec restore).
+    pub fn has_outstanding_recovery_beacon(&self) -> bool {
+        self.recovery_state.lock().unwrap().has_outstanding_beacon()
     }
 
     /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
@@ -2531,6 +2639,23 @@ impl SonarClient {
         events
             .into_iter()
             .next()
+            .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Fetch a SPECIFIC KeyPackage event by id, verifying it is `author`'s
+    /// kind-30443. Used by recovery healing: a beacon names the exact fresh
+    /// KeyPackage in its `k` tag, so we never welcome a stale slot that ties on
+    /// `created_at` with the newest one.
+    async fn fetch_key_package_by_id(
+        &self,
+        author: PublicKey,
+        event_id: EventId,
+    ) -> Result<Event> {
+        let filter = Filter::new().id(event_id).limit(1);
+        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        events
+            .into_iter()
+            .find(|e| e.pubkey == author && e.kind.as_u16() == KEY_PACKAGE_KIND)
             .ok_or(Error::KeyPackageNotFound(author))
     }
 
@@ -2827,11 +2952,22 @@ impl SonarClient {
         self.publish_group_creation(creation).await
     }
 
-    /// Scan active groups for an existing 1:1 DM with `peer`.
+    /// Scan active groups for an existing 1:1 DM with `peer`. Groups retired by
+    /// a recovery heal are skipped so a healed peer folds into the fresh group,
+    /// not the dead one whose ratchet the peer can no longer decrypt.
     fn find_dm_group_with(&self, peer: &PublicKey) -> Result<Option<GroupId>> {
         let groups = self.engine.groups()?;
         let me = self.identity().public_key();
         for group in groups {
+            let group_hex = hex::encode(group.mls_group_id.as_slice());
+            if self
+                .recovery_state
+                .lock()
+                .unwrap()
+                .is_dm_group_retired(&group_hex)
+            {
+                continue;
+            }
             let members = self.engine.members(&group.mls_group_id)?;
             if Self::is_reusable_dm_group(&group, &members, &me, peer) {
                 return Ok(Some(group.mls_group_id));
@@ -2852,6 +2988,229 @@ impl SonarClient {
 
         group.description == SONAR_DIRECT_DM_DESCRIPTION
             || (group.description.is_empty() && group.name.is_empty())
+    }
+
+    // ── Recovery beacon (auto-rejoin after nsec restore) ──────────────────
+
+    /// Fetch recovery beacons authored by our fellow group members and process
+    /// them. Runs on the explicit `sync()` path so in-memory/e2e sessions (no
+    /// live subscription) still heal; the live path buffers 30447 separately.
+    /// Never gates chat open/paint — it runs after the local-first work in
+    /// `sync_inner`.
+    async fn fetch_and_process_recovery_beacons(&self) -> Result<()> {
+        let me = self.identity().public_key();
+        let mut authors: HashSet<PublicKey> = HashSet::new();
+        for group in self.engine.groups()? {
+            for member in self.engine.members(&group.mls_group_id)? {
+                if member != me {
+                    authors.insert(member);
+                }
+            }
+        }
+        if authors.is_empty() {
+            return Ok(());
+        }
+        let filter = Filter::new()
+            .kind(Kind::Custom(RECOVERY_BEACON_KIND))
+            .authors(authors)
+            .limit(RECOVERY_BEACON_FETCH_LIMIT);
+        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        for event in events {
+            if let Err(err) = self.handle_recovery_beacon(&event).await {
+                tracing::debug!(%err, event_id = %event.id, "recovery beacon handling failed");
+            }
+        }
+        Ok(())
+    }
+
+    /// Act on one recovery beacon: replay/staleness guarded, member-scoped, then
+    /// per shared conversation either heal the 1:1 DM (retire old + re-invite via
+    /// fresh KeyPackage) or, for multi-member groups, run the deterministic
+    /// admin re-add. Idempotent via the durable processed-beacon watermark.
+    async fn handle_recovery_beacon(&self, event: &Event) -> Result<()> {
+        if event.kind.as_u16() != RECOVERY_BEACON_KIND {
+            return Ok(());
+        }
+        let author = event.pubkey;
+        let author_hex = author.to_hex();
+        let created_at = event.created_at.as_secs();
+
+        if self
+            .recovery_state
+            .lock()
+            .unwrap()
+            .is_beacon_replayed_or_stale(&author_hex, created_at)
+        {
+            return Ok(());
+        }
+
+        // Optional `k` tag names the exact fresh KeyPackage event id to heal
+        // through. Preferring it over `fetch_key_package` (newest) is what makes
+        // the rejoin deterministic when the restored client's KeyPackage ties on
+        // `created_at` with the pre-wipe one it replaced.
+        let hinted_key_package = event.tags.iter().find_map(|tag| {
+            let slice = tag.as_slice();
+            if slice.first().map(String::as_str) == Some("k") {
+                slice.get(1).and_then(|v| EventId::from_hex(v).ok())
+            } else {
+                None
+            }
+        });
+
+        let me = self.identity().public_key();
+        let mut shares_group = false;
+        let mut dm_group_ids: Vec<GroupId> = Vec::new();
+        let mut multi_groups: Vec<(GroupId, Vec<PublicKey>)> = Vec::new();
+        for group in self.engine.groups()? {
+            let members = self.engine.members(&group.mls_group_id)?;
+            if !members.contains(&author) {
+                continue;
+            }
+            shares_group = true;
+            let group_hex = hex::encode(group.mls_group_id.as_slice());
+            if self
+                .recovery_state
+                .lock()
+                .unwrap()
+                .is_dm_group_retired(&group_hex)
+            {
+                continue;
+            }
+            if Self::is_reusable_dm_group(&group, &members, &me, &author) {
+                dm_group_ids.push(group.mls_group_id);
+            } else if members.len() > 2 {
+                multi_groups.push((group.mls_group_id, members));
+            }
+        }
+
+        // Ignore beacons from someone we do not already share a group with: a
+        // recovery beacon only re-establishes an EXISTING relationship, never
+        // starts a new one.
+        if !shares_group {
+            return Ok(());
+        }
+
+        for old_group_id in dm_group_ids {
+            if let Err(err) = self
+                .heal_dm_via_recovery(&author, &old_group_id, hinted_key_package)
+                .await
+            {
+                tracing::warn!(%err, peer = %author_hex, "recovery DM heal failed");
+            }
+        }
+        for (group_id, members) in multi_groups {
+            if !Self::is_recovery_executor(&members, &me, &author) {
+                continue;
+            }
+            if let Err(err) = self.readd_member_via_recovery(&group_id, &author).await {
+                tracing::warn!(%err, peer = %author_hex, "recovery group re-add failed");
+            }
+        }
+
+        // Mark processed regardless of per-conversation outcome: one action per
+        // (peer, beacon.created_at) is the rate limit. A newer beacon can heal
+        // again; a duplicate/out-of-order copy is a no-op.
+        self.recovery_state
+            .lock()
+            .unwrap()
+            .mark_beacon_processed(&author_hex, created_at)?;
+        Ok(())
+    }
+
+    /// Retire the dead 1:1 group and create a fresh one via `peer`'s new
+    /// KeyPackage, then queue a `ConversationReset` for the host. Retirement
+    /// happens only AFTER the new group exists, so a failed re-invite never
+    /// strands the conversation.
+    async fn heal_dm_via_recovery(
+        &self,
+        peer: &PublicKey,
+        old_group_id: &GroupId,
+        hinted_key_package: Option<EventId>,
+    ) -> Result<()> {
+        let key_package = match hinted_key_package {
+            Some(id) => match self.fetch_key_package_by_id(*peer, id).await {
+                Ok(event) => event,
+                // The named event may not have propagated yet; fall back to the
+                // newest KeyPackage rather than stranding the heal.
+                Err(_) => self.fetch_key_package(*peer).await?,
+            },
+            None => self.fetch_key_package(*peer).await?,
+        };
+        let new_group_id = self.start_dm_with_key_package(key_package, "").await?;
+        let old_hex = hex::encode(old_group_id.as_slice());
+        let new_hex = hex::encode(new_group_id.as_slice());
+        {
+            let mut state = self.recovery_state.lock().unwrap();
+            state.retire_dm_group(&old_hex)?;
+            state.push_reset(ConversationReset {
+                peer_pubkey_hex: peer.to_hex(),
+                old_group_id_hex: old_hex,
+                new_group_id_hex: new_hex.clone(),
+                at_secs: Timestamp::now().as_secs(),
+            })?;
+        }
+        self.notify_conversation_changed(&new_hex);
+        // Narrow the live 445 tail off the retired group and widen onto the new
+        // one (no-op for in-memory/e2e sessions).
+        let _ = self.resubscribe_marmot_groups_if_live().await;
+        Ok(())
+    }
+
+    /// Deterministic multi-member re-add: remove the stale member, then re-add
+    /// with a fresh KeyPackage. Both are ordinary membership commits (gated by
+    /// `membership_gate` inside the client methods).
+    async fn readd_member_via_recovery(
+        &self,
+        group_id: &GroupId,
+        member: &PublicKey,
+    ) -> Result<()> {
+        self.remove_group_members(group_id, vec![*member]).await?;
+        self.add_group_members(group_id, vec![*member]).await?;
+        self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
+        Ok(())
+    }
+
+    /// The re-add executor is the lowest-hex member other than the restored
+    /// author. All members are admins in Sonar's group model, so this election
+    /// dedups concurrent re-adds without a receipts protocol.
+    fn is_recovery_executor(members: &[PublicKey], me: &PublicKey, author: &PublicKey) -> bool {
+        members
+            .iter()
+            .filter(|m| *m != author)
+            .min_by_key(|m| m.to_hex())
+            .map(|lowest| lowest == me)
+            .unwrap_or(false)
+    }
+
+    /// Auto-accept a group welcome that arrived while our own recovery beacon is
+    /// outstanding: it is a surviving admin re-inviting us after our nsec
+    /// restore, so it should heal silently rather than sit in the invite UI.
+    async fn auto_accept_recovery_invite(&self, group_id: &GroupId) -> Result<()> {
+        let Some(invite) = self
+            .engine
+            .pending_group_invites()?
+            .into_iter()
+            .find(|invite| &invite.group_id == group_id)
+        else {
+            return Ok(());
+        };
+        self.accept_group_invite(&invite.id).await?;
+        Ok(())
+    }
+
+    /// Clear the outstanding beacon once at least one conversation has healed
+    /// (a new group appeared). The beacon event stays published (addressable)
+    /// for late-connecting peers; only the local auto-accept flag flips.
+    fn clear_outstanding_beacon_if_healed(&self, new_group_ids: &[String]) {
+        if new_group_ids.is_empty() {
+            return;
+        }
+        let mut state = self.recovery_state.lock().unwrap();
+        if state.has_outstanding_beacon() {
+            if let Err(err) = state.clear_outstanding_beacon() {
+                tracing::debug!(%err, "failed to clear outstanding recovery beacon");
+            }
+        }
     }
 
     async fn publish_group_creation(&self, creation: GroupCreation) -> Result<GroupId> {
@@ -5433,6 +5792,17 @@ impl SonarClient {
                 }
             }
         }
+        // A welcome just accepted above may have healed a conversation we asked
+        // for via our own beacon; clear the outstanding flag so we stop
+        // auto-accepting further invites.
+        self.clear_outstanding_beacon_if_healed(&new_group_ids);
+        // Detect surviving-peer recovery beacons and re-invite them into fresh
+        // groups. This runs on the explicit sync path (the only path in-memory
+        // e2e sessions use); the live path buffers 30447 and drains it in
+        // drain_pending_marmot. Background relay work — never gates first paint.
+        if let Err(err) = self.fetch_and_process_recovery_beacons().await {
+            tracing::debug!(%err, "recovery beacon fetch failed during sync");
+        }
         // Existing installs can have group/MLS rows locally while the chat
         // transcript page is empty. Full-backfill those groups once. The scan
         // is deferred from client construction to the first sync so it does not
@@ -5539,7 +5909,36 @@ impl SonarClient {
             .await?;
         tracing::info!(since_secs, "marmot welcomes subscription opened");
         *self.live_marmot_enabled.lock().unwrap() = true;
+        if let Err(err) = self.subscribe_recovery_beacons().await {
+            tracing::debug!(%err, "marmot recovery beacon subscribe failed");
+        }
         self.subscribe_group_messages().await
+    }
+
+    /// Subscribe to recovery beacons (kind 30447) authored by our fellow group
+    /// members, so a peer's nsec-restore announcement is delivered live. Members
+    /// change rarely; this is re-run after membership changes via
+    /// `resubscribe_marmot_groups_if_live`. No-op when we share no groups.
+    async fn subscribe_recovery_beacons(&self) -> Result<()> {
+        let me = self.identity().public_key();
+        let mut authors: HashSet<PublicKey> = HashSet::new();
+        for group in self.engine.groups()? {
+            for member in self.engine.members(&group.mls_group_id)? {
+                if member != me {
+                    authors.insert(member);
+                }
+            }
+        }
+        let sub_id = SubscriptionId::new(SUB_MARMOT_RECOVERY);
+        if authors.is_empty() {
+            self.nostr.unsubscribe(&sub_id).await;
+            return Ok(());
+        }
+        let filter = Filter::new()
+            .kind(Kind::Custom(RECOVERY_BEACON_KIND))
+            .authors(authors);
+        self.nostr.subscribe_with_id(sub_id, filter, None).await?;
+        Ok(())
     }
 
     /// (Re)subscribe the kind-445 tail to the CURRENT group set, using the
@@ -5870,6 +6269,11 @@ impl SonarClient {
         let is_live = *self.live_marmot_enabled.lock().unwrap();
         if !is_live {
             return Ok(());
+        }
+        // Keep the recovery-beacon author set current as membership changes; a
+        // failure here must not block the group-message resubscribe.
+        if let Err(err) = self.subscribe_recovery_beacons().await {
+            tracing::debug!(%err, "marmot recovery beacon resubscribe failed");
         }
         self.subscribe_group_messages().await
     }
@@ -6495,6 +6899,26 @@ impl SonarClient {
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
+                    // Auto-accept a multi-member re-invite while our own recovery
+                    // beacon is outstanding: it is a surviving admin healing the
+                    // group after our nsec restore, so it should not wait in the
+                    // invite UI.
+                    if let Incoming::GroupInvitePending(group_id) = &incoming {
+                        if self.recovery_state.lock().unwrap().has_outstanding_beacon() {
+                            // Box::pin breaks the async recursion cycle
+                            // (process_marmot_events → accept → backfill →
+                            // process_marmot_events).
+                            match Box::pin(self.auto_accept_recovery_invite(group_id)).await {
+                                Ok(()) => {
+                                    changed_groups.insert(hex::encode(group_id.as_slice()));
+                                }
+                                Err(err) => tracing::debug!(
+                                    %err,
+                                    "recovery auto-accept of group invite failed"
+                                ),
+                            }
+                        }
+                    }
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
@@ -6590,6 +7014,7 @@ impl SonarClient {
     pub async fn wait_for_marmot_event(&self, timeout_secs: u64) -> bool {
         if !self.pending_marmot_giftwraps.lock().unwrap().is_empty()
             || !self.pending_marmot_groups.lock().unwrap().is_empty()
+            || !self.pending_recovery_beacons.lock().unwrap().is_empty()
         {
             return true;
         }
@@ -6623,10 +7048,16 @@ impl SonarClient {
             let mut queue = self.pending_sync_notifications.lock().unwrap();
             std::mem::take(&mut *queue)
         };
+        // Recovery beacons buffered by the live handler are healed here on the
+        // engine thread (never in the notification collector).
+        let recovery_beacons: Vec<Event> = {
+            let mut buf = self.pending_recovery_beacons.lock().unwrap();
+            std::mem::take(&mut *buf)
+        };
         let mut events: Vec<Event> = {
             let mut giftwraps = self.pending_marmot_giftwraps.lock().unwrap();
             let mut groups = self.pending_marmot_groups.lock().unwrap();
-            if giftwraps.is_empty() && groups.is_empty() {
+            if giftwraps.is_empty() && groups.is_empty() && recovery_beacons.is_empty() {
                 return Ok(notifications);
             }
             let mut out = std::mem::take(&mut *giftwraps);
@@ -6655,6 +7086,16 @@ impl SonarClient {
                 }
             }
             let _ = self.resubscribe_marmot_groups_if_live().await;
+        }
+        // A welcome accepted above (including an auto-accepted recovery re-invite)
+        // may have healed a conversation we beaconed for; drop the outstanding
+        // flag so we stop auto-accepting.
+        self.clear_outstanding_beacon_if_healed(&new_ids);
+        // Heal any surviving-peer recovery beacons buffered by the live handler.
+        for beacon in &recovery_beacons {
+            if let Err(err) = self.handle_recovery_beacon(beacon).await {
+                tracing::debug!(%err, event_id = %beacon.id, "live recovery beacon handling failed");
+            }
         }
         if let Some(secs) = process_report.oldest_retryable_secs {
             self.rewind_sync_watermark_for_retry(secs)?;

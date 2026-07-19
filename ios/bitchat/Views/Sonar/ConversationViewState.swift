@@ -20,6 +20,7 @@ struct SNConversationTranscriptSource {
     static let meshID = "$mesh"
     static let paymentActivityID = "$payment-activity"
     static let callLogID = "$call-log"
+    static let recoveryResetID = "$recovery-reset"
 
     let id: String
     let rows: [SNMessage]

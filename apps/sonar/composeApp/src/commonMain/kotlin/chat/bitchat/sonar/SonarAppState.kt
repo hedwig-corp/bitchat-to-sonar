@@ -823,6 +823,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var pendingMarmotGroups by mutableStateOf<Map<String, PendingMarmotGroup>>(emptyMap())
     var groupInvites by mutableStateOf<List<SonarGroupInvite>>(emptyList())
         private set
+    /** Healed-conversation notices from the recovery beacon flow, keyed by the
+     *  NEW MLS group id hex. A transcript whose group id is present here shows a
+     *  Signal-style "chat was reset" system row and folds in the retired leg.
+     *  Populated by [drainRecoveryConversationResets] after each Marmot drain. */
+    var conversationResets by mutableStateOf<Map<String, SonarConversationReset>>(emptyMap())
+        private set
     private val pendingInviteTokens = mutableListOf<String>()
     /** Resolved kind-0 profiles by npub — fills human names for Marmot members.
      *  Normalized on load so legacy key formats can't miss lookups (which would
@@ -9981,8 +9987,30 @@ class SonarAppState(private val scope: CoroutineScope) {
                 } else {
                     runCatching { SonarCore.ensureSubscriptions() }
                 }
+                // A drain (or sync) may have healed a conversation via a peer's
+                // recovery beacon; surface any "chat was reset" notices. Local
+                // read, never blocks the wake loop.
+                drainRecoveryConversationResets()
             }
         }
+    }
+
+    /** Fold any healed-conversation notices produced by the recovery beacon
+     *  flow into [conversationResets], keyed by the new MLS group id. The core
+     *  already fired `conversationChanged` for the healed chat, so the chat list
+     *  repaints on its own; this only records the "chat was reset" marker. */
+    private suspend fun drainRecoveryConversationResets() {
+        val resets = runCatching { SonarCore.drainConversationResets() }.getOrDefault(emptyList())
+        if (resets.isEmpty()) return
+        // Index under both ids so a still-open old-group chat and the healed
+        // new-group chat both resolve the same "chat was reset" marker.
+        val indexed = buildMap {
+            for (reset in resets) {
+                put(reset.newGroupIdHex, reset)
+                put(reset.oldGroupIdHex, reset)
+            }
+        }
+        conversationResets = conversationResets + indexed
     }
 
     private fun stopMarmotWakeLoop() {

@@ -1559,7 +1559,9 @@ struct SNMsgList: View {
                                 SNUnreadDivider().id("sn-unread")
                             }
                             Group {
-                            if let call = m.call {
+                            if let notice = m.systemNotice {
+                                SNSystemNoticeRow(text: notice, time: m.time)
+                            } else if let call = m.call {
                                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
                             } else if m.trill {
                                 SNNudgeRow(m: m, peerName: peerName, group: showAuthors)
@@ -1969,6 +1971,27 @@ struct SNNudgeRow: View {
 }
 
 // MARK: - Call log row (call.jsx CallLog / theme.css .call-log)
+
+/// Centered surface2 pill for recovery-beacon heals ("Chat was reset").
+struct SNSystemNoticeRow: View {
+    let text: String
+    let time: String
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Text(verbatim: text)
+                .font(SonarTheme.uiFont(size: 13, weight: .semibold))
+                .foregroundColor(SonarTheme.text2)
+            Text(verbatim: time)
+                .font(SonarTheme.uiFont(size: 11.5))
+                .foregroundColor(SonarTheme.text3)
+        }
+        .padding(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
+        .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+        .frame(maxWidth: .infinity, alignment: .center)
+        .padding(.top, 10)
+    }
+}
 
 /// Compact, centered surface2 pill shown inline after a call ends. Green
 /// phone/videocam glyph (red when missed), label, optional ` · {dur}`, and the

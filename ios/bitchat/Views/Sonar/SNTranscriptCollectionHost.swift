@@ -268,7 +268,9 @@ struct SNCollectionHostMessageRow: View {
         let textMax = columnWidth * 0.78
         let mediaMax = columnWidth * 0.72
         Group {
-            if let call = m.call {
+            if let notice = m.systemNotice {
+                SNSystemNoticeRow(text: notice, time: m.time)
+            } else if let call = m.call {
                 SNCallLogRow(call: call, mine: m.mine, time: m.time)
             } else if m.trill {
                 SNNudgeRow(m: m, peerName: peerName, group: showAuthor || m.author != nil)
