@@ -247,6 +247,13 @@ fun App(
             SonarLifecycle.clearOpenConversationHandler()
         }
     }
+    PlatformBackHandler(
+        enabled = state.onboarded &&
+            !state.locked &&
+            state.homeMessagesHydrated &&
+            shouldHandleSystemBack(isAtRoot = state.isHome),
+        onBack = state::back,
+    )
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.onProcessBackground = { state.onProcessBackgrounded() }
@@ -784,6 +791,7 @@ internal fun ConvRow(
 @Composable
 private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -813,6 +821,7 @@ internal data class DeleteTarget(val id: String, val name: String, val isMesh: B
 @Composable
 internal fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -940,6 +949,9 @@ internal fun MuteSheet(
 private fun ConnectivitySheet(online: Boolean, meshCount: Int, onClose: () -> Unit) {
     val s = sonar
     var showRelayStatus by remember { mutableStateOf(false) }
+    TransientBackHandler {
+        if (showRelayStatus) showRelayStatus = false else onClose()
+    }
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -1000,6 +1012,7 @@ private fun GroupInviteSheet(
 ) {
     val s = sonar
     val title = invite.groupName.ifBlank { "Group chat" }
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -2211,6 +2224,7 @@ private fun AddToMessageSheet(
     onNudge: () -> Unit = {},
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -2263,6 +2277,7 @@ private fun GroupAddPeopleSheet(state: SonarAppState, chatId: String, onClose: (
     val pasted = remember(draft, existing) { parsedNpubs(draft).filter { it !in existing } }
     val members = remember(pasted, selected) { mergedNpubs(pasted, selected) }
     val contacts = state.groupInviteContacts(excluding = existing)
+    TransientBackHandler(onClose)
 
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
@@ -2297,6 +2312,7 @@ private fun GroupAddPeopleSheet(state: SonarAppState, chatId: String, onClose: (
 private fun GroupRemovePeopleSheet(state: SonarAppState, chatId: String, onClose: () -> Unit) {
     val s = sonar
     val members = state.groupMemberContacts(chatId)
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -2388,6 +2404,7 @@ private fun VerifySheet(
     onDismiss: () -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onDismiss)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onDismiss),
         contentAlignment = Alignment.BottomCenter
@@ -2923,6 +2940,7 @@ private fun StickerBubble(
 private fun StickerPackPreviewSheet(state: SonarAppState, coordinate: String, onClose: () -> Unit) {
     val s = sonar
     val scope = rememberCoroutineScope()
+    TransientBackHandler(onClose)
     val parts = remember(coordinate) { coordinate.split(":", limit = 3) }
     var pack by remember(coordinate) { mutableStateOf<SonarStickerPack?>(null) }
     var loading by remember(coordinate) { mutableStateOf(true) }
@@ -3379,6 +3397,7 @@ private fun MediaGalleryViewer(
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    TransientBackHandler(onClose)
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(
         initialPage = startIndex.coerceIn(0, (items.size - 1).coerceAtLeast(0)),
         pageCount = { items.size }
@@ -3698,6 +3717,7 @@ private fun MediaViewer(
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
+    TransientBackHandler(onClose)
     var chrome by remember(media.url) { mutableStateOf(true) }
     var status by remember(media.url) { mutableStateOf<String?>(null) }
     var autoOpenedNative by remember(media.url, chatId) { mutableStateOf(false) }
@@ -3839,6 +3859,7 @@ private fun MediaSendPreview(
     modifier: Modifier = Modifier,
 ) {
     val s = sonar
+    TransientBackHandler(onCancel)
     val pagerState = androidx.compose.foundation.pager.rememberPagerState(pageCount = { items.size })
     Box(modifier.background(Color.Black)) {
         androidx.compose.foundation.pager.HorizontalPager(
@@ -4409,6 +4430,7 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
 @Composable
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     val scope = rememberCoroutineScope()
     var groupEntry by remember { mutableStateOf(false) }
     var findUsername by remember { mutableStateOf(false) }

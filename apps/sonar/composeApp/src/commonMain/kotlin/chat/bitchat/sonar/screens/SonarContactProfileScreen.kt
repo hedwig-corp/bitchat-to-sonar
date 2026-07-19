@@ -43,6 +43,7 @@ import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAnnounce
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.canonicalProfileKey
 import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
@@ -484,6 +485,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
 @Composable
 private fun DeleteContactChatSheet(name: String, onDelete: () -> Unit, onClose: () -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter,

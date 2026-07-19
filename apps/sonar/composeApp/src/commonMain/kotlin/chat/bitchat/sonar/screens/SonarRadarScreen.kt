@@ -46,6 +46,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.ui.SNDot
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
@@ -331,6 +332,7 @@ private fun SignalBars(filled: Int, color: Color) {
 @Composable
 private fun PeerCardShell(onClose: () -> Unit, content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().clickable(
             interactionSource = remember { MutableInteractionSource() }, indication = null,

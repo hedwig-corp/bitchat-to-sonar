@@ -72,6 +72,7 @@ fun PaySheet(
     fixedSats: Long? = null,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     var v by remember { mutableStateOf(fixedSats?.toString().orEmpty()) }
     val sats = fixedSats ?: (v.toLongOrNull() ?: 0L)
     // `v` is the keypad buffer and a fixed amount hides the keypad, so the

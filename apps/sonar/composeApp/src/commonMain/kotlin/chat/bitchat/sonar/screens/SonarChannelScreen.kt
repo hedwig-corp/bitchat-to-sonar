@@ -40,6 +40,7 @@ import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SlashHints
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChannelMsg
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.composerDraftKeyForChannel
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
@@ -206,6 +207,7 @@ private fun ChannelAuthorSheet(
     onClose: () -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
