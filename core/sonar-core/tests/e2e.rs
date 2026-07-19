@@ -259,6 +259,72 @@ async fn delete_group_removes_a_single_chat_locally() {
         .expect("idempotent re-delete");
 }
 
+/// Leave must always clear local state without awaiting leave-proposal publish —
+/// hosts serialize leave on a work queue, so hanging on relays made Delete/Leave
+/// appear stuck in the chat list.
+#[tokio::test]
+async fn leave_group_removes_local_chat() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+    let charlie = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("charlie connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    charlie
+        .publish_key_package()
+        .await
+        .expect("charlie publishes kp");
+
+    let group = alice
+        .start_group(
+            vec![bob.identity().public_key(), charlie.identity().public_key()],
+            "field team",
+        )
+        .await
+        .expect("alice starts group");
+
+    // Bob must join before leave is meaningful for a multi-member group.
+    bob.sync().await.expect("bob syncs welcome");
+    let bob_invites = bob.pending_group_invites().expect("bob invites");
+    if let Some(invite) = bob_invites.first() {
+        bob.accept_group_invite(&invite.id)
+            .await
+            .expect("bob accepts");
+    }
+
+    charlie.sync().await.expect("charlie syncs welcome");
+    let charlie_invites = charlie.pending_group_invites().expect("charlie invites");
+    if let Some(invite) = charlie_invites.first() {
+        charlie
+            .accept_group_invite(&invite.id)
+            .await
+            .expect("charlie accepts");
+    }
+
+    let leave = timeout(Duration::from_secs(5), charlie.leave_group(&group));
+    leave
+        .await
+        .expect("leave must not hang on relay")
+        .expect("charlie leaves");
+    assert_eq!(
+        charlie.groups().expect("charlie groups").len(),
+        0,
+        "leave clears local chat"
+    );
+    assert!(
+        !alice.groups().expect("alice groups").is_empty(),
+        "alice still has the group"
+    );
+}
+
 /// Two instances in the same geohash channel exchange public messages, with
 /// correct nickname tags, mine-detection, and channel isolation.
 #[tokio::test]

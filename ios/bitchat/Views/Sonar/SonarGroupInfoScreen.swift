@@ -262,10 +262,8 @@ struct SonarGroupInfoScreen: View {
                     .padding(.horizontal, 8)
                 SNPrimaryButton(label: "Leave group", danger: true) {
                     leaveSheet = false
-                    if let groupId = store.marmotGroupId(peerId) {
-                        Task { try? await store.marmot.leaveGroup(groupId) }
-                    }
-                    store.pop()
+                    // Home-row Leave path clears the DM route; pop Group info.
+                    store.deleteChat(peerId)
                     store.pop()
                 }
                 .padding(.horizontal, 8)

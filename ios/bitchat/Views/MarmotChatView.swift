@@ -3455,10 +3455,9 @@ final class MarmotChatModel: ObservableObject {
         await service.callWaitEvent(timeoutSeconds: timeoutSeconds)
     }
 
-    /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then
-    /// drop it from the in-memory state. Local-only — the peer is not notified.
-    func deleteGroup(_ groupId: String) async {
-        try? await service.deleteGroup(groupId: groupId)
+    /// Drop one group from in-memory home/transcript state immediately so Delete
+    /// / Leave paint like Compose (filter chats first) instead of waiting on FFI.
+    func dropGroupFromLocalState(_ groupId: String) {
         groups.removeAll { $0.id == groupId }
         messagesByGroup[groupId] = nil
         conversationSummariesByGroup[groupId] = nil
@@ -3467,32 +3466,44 @@ final class MarmotChatModel: ObservableObject {
         localTranscriptHasOlderByGroup[groupId] = nil
         localTranscriptLoadingGroups.remove(groupId)
         localTranscriptPreservesOlderEdgeGroups.remove(groupId)
-        profileFetches = []
-        profileFetchedAt = [:]
-        installedPackCoordinates = []
+        unreadByGroup[groupId] = nil
         SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
     }
 
-    /// Leave a multi-member Marmot group, then drop it from the in-memory state.
-    func leaveGroup(_ groupId: String) async {
+    /// Delete ONE White Noise / Marmot chat locally (messages + MLS keys), then
+    /// drop it from the in-memory state. Local-only — the peer is not notified.
+    func deleteGroup(_ groupId: String) async throws {
+        // Optimistic list paint before durable purge (core delete is local-first;
+        // still avoid waiting behind other workQueue items for first paint).
+        dropGroupFromLocalState(groupId)
+        SecureLogger.info("deleteGroup begin id=\(groupId.prefix(12))", category: .session)
         do {
-            try await service.leaveGroup(groupId)
+            try await service.deleteGroup(groupId: groupId)
+            SecureLogger.info("deleteGroup ok id=\(groupId.prefix(12))", category: .session)
         } catch {
-            errorText = Self.describe(error)
-            return
+            SecureLogger.error(error, context: "deleteGroup failed id=\(groupId.prefix(12))", category: .session)
+            throw error
         }
-        groups.removeAll { $0.id == groupId }
-        messagesByGroup[groupId] = nil
-        conversationSummariesByGroup[groupId] = nil
-        discardOptimistic(for: groupId)
-        localTranscriptCursorByGroup[groupId] = nil
-        localTranscriptHasOlderByGroup[groupId] = nil
-        localTranscriptLoadingGroups.remove(groupId)
-        localTranscriptPreservesOlderEdgeGroups.remove(groupId)
         profileFetches = []
         profileFetchedAt = [:]
         installedPackCoordinates = []
-        SNMarmotChatSnapshotCache.save(groups: groups, messagesByGroup: messagesByGroup, to: defaults)
+    }
+
+    /// Leave a multi-member Marmot group, then drop it from the in-memory state.
+    func leaveGroup(_ groupId: String) async throws {
+        dropGroupFromLocalState(groupId)
+        SecureLogger.info("leaveGroup begin id=\(groupId.prefix(12))", category: .session)
+        do {
+            try await service.leaveGroup(groupId)
+            SecureLogger.info("leaveGroup ok id=\(groupId.prefix(12))", category: .session)
+        } catch {
+            errorText = Self.describe(error)
+            SecureLogger.error(error, context: "leaveGroup failed id=\(groupId.prefix(12))", category: .session)
+            throw error
+        }
+        profileFetches = []
+        profileFetchedAt = [:]
+        installedPackCoordinates = []
     }
 
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset

@@ -7776,6 +7776,9 @@ final class SonarAppStore: ObservableObject {
     /// peer, or a Sonar peer whose conversation spans BOTH a mesh leg and a White
     /// Noise leg (delete both). Multi-member Marmot groups publish a leave
     /// proposal; other deletes are local-only.
+    ///
+    /// Optimistic: hide the row immediately (Compose filters `chats` first), then
+    /// await durable MLS purge so a stuck relay cannot keep the chat visible.
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
         if isPendingSecureChat(id) {
@@ -7788,7 +7791,15 @@ final class SonarAppStore: ObservableObject {
                 pendingDirectMarmotSends[pendingNpub] = nil
                 cancelPendingSecureChatSetup(pendingId: id, npub: pendingNpub)
             }
-        } else if let groupId = marmotGroupId(id) {
+            path.removeAll { route in
+                if case .dm(let rid) = route { return rid == id }
+                return false
+            }
+            objectWillChange.send()
+            return
+        }
+
+        if let groupId = marmotGroupId(id) {
             let shouldLeave = isMultiMemberMarmotGroupId(id)
             // A deduped direct row can represent several duplicate Marmot groups
             // for the same peer; delete the whole set so hidden duplicates don't
@@ -7798,35 +7809,64 @@ final class SonarAppStore: ObservableObject {
             for gid in groupIds {
                 discardRetainedConversation(gid)
                 forgetMarmotGroupMappings(forGroupId: gid)
+                marmot.dropGroupFromLocalState(gid)
             }
-            Task {
-                if shouldLeave {
-                    await marmot.leaveGroup(groupId)
-                } else {
-                    for gid in groupIds { await marmot.deleteGroup(gid) }
+            path.removeAll { route in
+                if case .dm(let rid) = route { return rid == id || groupIds.contains(rid) }
+                return false
+            }
+            objectWillChange.send()
+            Task { @MainActor in
+                do {
+                    if shouldLeave {
+                        try await marmot.leaveGroup(groupId)
+                    } else {
+                        for gid in groupIds { try await marmot.deleteGroup(gid) }
+                    }
+                } catch {
+                    // Optimistic hide already ran — reload from durable state so a
+                    // failed purge cannot leave an invisible MLS corpse (R-010).
+                    _ = await marmot.loadLocalSummaries(resolveMembers: false)
+                    showToast(
+                        shouldLeave
+                            ? "Couldn't leave group: \(error.localizedDescription)"
+                            : "Couldn't delete chat: \(error.localizedDescription)"
+                    )
                 }
+            }
+            return
+        }
+
+        // Mesh / Sonar peer: erase mesh transcript and every folded WN leg.
+        chatViewModel.deleteConversation(with: PeerID(str: id))
+        let foldedGroups: [MarmotService.MarmotGroup]
+        if let profile = resolvedSonarProfile(id) {
+            foldedGroups = marmotGroups(forNpub: profile.npub)
+            for g in foldedGroups {
+                discardRetainedConversation(g.id)
+                forgetMarmotGroupMappings(forGroupId: g.id)
+                marmot.dropGroupFromLocalState(g.id)
             }
         } else {
-            // Mesh / Sonar peer: delete the mesh transcript...
-            chatViewModel.deleteConversation(with: PeerID(str: id))
-            // ...and every folded White Noise leg, if this peer has any.
-            if let profile = resolvedSonarProfile(id) {
-                let groups = marmotGroups(forNpub: profile.npub)
-                for g in groups {
-                    discardRetainedConversation(g.id)
-                    forgetMarmotGroupMappings(forGroupId: g.id)
-                }
-                if !groups.isEmpty {
-                    Task { for g in groups { await marmot.deleteGroup(g.id) } }
-                }
-            }
+            foldedGroups = []
         }
-        // If we're currently viewing this chat, return to the Messages list.
         path.removeAll { route in
-            if case .dm(let rid) = route { return rid == id }
+            if case .dm(let rid) = route {
+                return rid == id || foldedGroups.contains(where: { $0.id == rid })
+            }
             return false
         }
         objectWillChange.send()
+        if !foldedGroups.isEmpty {
+            Task { @MainActor in
+                do {
+                    for g in foldedGroups { try await marmot.deleteGroup(g.id) }
+                } catch {
+                    _ = await marmot.loadLocalSummaries(resolveMembers: false)
+                    showToast("Couldn't delete chat: \(error.localizedDescription)")
+                }
+            }
+        }
     }
 
     // MARK: Erase all chats (keep identity)

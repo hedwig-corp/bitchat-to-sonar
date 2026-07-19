@@ -884,6 +884,9 @@ fn retryable_media_http_error(error: &Error) -> bool {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound leave/membership publish so Delete/Leave cannot park the host's serial
+/// Marmot queue behind a stuck relay `send_event` (pool waits for every relay).
+const MEMBERSHIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Extra lookback applied ONLY to the gift-wrap (welcome) `.since` filter.
 /// NIP-59 deliberately backdates a gift wrap's `created_at` (up to ~2 days, we
@@ -1520,6 +1523,10 @@ pub struct SonarClient {
     /// The group-id set currently installed in the live kind-445 subscription.
     /// This prevents stacking duplicate REQs and lets deletes narrow/unsubscribe.
     marmot_group_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Monotonic generation for background group resubscribes. A newer schedule
+    /// invalidates in-flight applies so a stale captured group set cannot widen
+    /// the live filter after a delete/leave.
+    marmot_group_resub_generation: Arc<AtomicU64>,
     /// Startup repair queue for existing groups whose local DB has MLS/group
     /// state but no chat-message page. This covers older installs where the
     /// sync watermark could be advanced by membership/commit events before the
@@ -1774,6 +1781,7 @@ impl SonarClient {
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let marmot_group_resub_generation = Arc::new(AtomicU64::new(0));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
         let initial_group_message_catchups = Arc::new(Mutex::new(VecDeque::new()));
@@ -2064,6 +2072,7 @@ impl SonarClient {
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
+            marmot_group_resub_generation,
             initial_empty_transcript_backfills,
             initial_backfill_scanned,
             initial_group_message_catchups,
@@ -2659,21 +2668,92 @@ impl SonarClient {
 
     /// Notify the group that this member is leaving, then remove the group from
     /// local storage so it disappears from the chat list.
+    ///
+    /// Leave proposal publish is scheduled after local purge so hosts that
+    /// serialize this FFI on a Marmot work queue are not blocked on relays.
+    /// Admin self-demote still needs a bounded publish+merge before MDK can
+    /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
         let leave_update = match self.engine.leave_group(group_id) {
             Ok(update) => update,
             Err(err) if err.to_string().contains("self-demote") => {
                 let demote = self.engine.self_demote(group_id)?;
-                self.publish_membership_update(demote).await?;
+                self.best_effort_membership_publish(demote, "self-demote before leave")
+                    .await;
                 self.engine.leave_group(group_id)?
             }
             Err(err) => return Err(err),
         };
-        self.publish_membership_update(leave_update).await?;
+        // Always purge locally first — Leave is a user intent to drop this chat.
+        // Leave updates are proposals (`requires_commit_merge == false`), so the
+        // evolution event can be published after MDK group state is gone.
+        let group_id_hex = hex::encode(group_id.as_slice());
         self.engine.delete_group(group_id)?;
-        let _ = self.resubscribe_marmot_groups_if_live().await;
+        self.outbox_state
+            .lock()
+            .unwrap()
+            .remove_group_entries(&group_id_hex)?;
+        self.remove_index_for_group(group_id);
+        self.notify_conversation_changed(&group_id_hex);
+        self.schedule_resubscribe_marmot_groups_if_live();
+        self.schedule_best_effort_leave_publish(leave_update);
         Ok(())
+    }
+
+    async fn best_effort_membership_publish(
+        &self,
+        update: GroupMembershipUpdate,
+        context: &'static str,
+    ) {
+        match tokio::time::timeout(MEMBERSHIP_PUBLISH_TIMEOUT, self.publish_membership_update(update))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(%err, context, "membership publish failed; continuing local delete");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    context,
+                    timeout_secs = MEMBERSHIP_PUBLISH_TIMEOUT.as_secs(),
+                    "membership publish timed out; continuing local delete"
+                );
+            }
+        }
+    }
+
+    /// Publish a leave SelfRemove proposal without occupying the leave FFI path.
+    /// Leave updates are proposals (no welcomes / no post-publish merge); only the
+    /// evolution event is sent after local purge.
+    fn schedule_best_effort_leave_publish(&self, update: GroupMembershipUpdate) {
+        if update.requires_commit_merge || !update.welcomes.is_empty() {
+            tracing::warn!(
+                requires_commit_merge = update.requires_commit_merge,
+                welcomes = update.welcomes.len(),
+                "leave update unexpectedly needs merge/welcomes; publishing evolution event only"
+            );
+        }
+        let nostr = self.nostr.clone();
+        let event = update.evolution_event;
+        tokio::spawn(async move {
+            let publish = async {
+                let output = nostr.send_event(&event).await?;
+                require_relay_success(&output, "leave")
+            };
+            match tokio::time::timeout(MEMBERSHIP_PUBLISH_TIMEOUT, publish).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "background leave publish failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = MEMBERSHIP_PUBLISH_TIMEOUT.as_secs(),
+                        "background leave publish timed out"
+                    );
+                }
+            }
+        });
     }
 
     // ── Invite links ──────────────────────────────────────────────────
@@ -5042,23 +5122,58 @@ impl SonarClient {
     /// by `backfill_group`.
     async fn subscribe_group_messages(&self) -> Result<()> {
         let group_ids = self.current_group_ids()?;
+        // Share the same generation gate as background delete/leave resubscribes
+        // so a slow startup/ensure subscribe cannot overwrite a newer narrower set.
+        let generation = self
+            .marmot_group_resub_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        Self::apply_group_message_subscription(
+            self.nostr.clone(),
+            self.marmot_group_subscriptions.clone(),
+            group_ids,
+            self.sync_watermark_secs(),
+            Some((self.marmot_group_resub_generation.clone(), generation)),
+        )
+        .await
+    }
+
+    async fn apply_group_message_subscription(
+        nostr: Client,
+        sub_state: Arc<Mutex<HashSet<String>>>,
+        group_ids: HashSet<String>,
+        watermark_secs: u64,
+        generation_gate: Option<(Arc<AtomicU64>, u64)>,
+    ) -> Result<()> {
+        let still_current = || match &generation_gate {
+            Some((cell, gen)) => cell.load(Ordering::Relaxed) == *gen,
+            None => true,
+        };
+        if !still_current() {
+            return Ok(());
+        }
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
 
         if group_ids.is_empty() {
             let had_subscription = {
-                let current = self.marmot_group_subscriptions.lock().unwrap();
+                let current = sub_state.lock().unwrap();
                 !current.is_empty()
             };
             if had_subscription {
-                self.nostr.unsubscribe(&sub_id).await;
-                self.marmot_group_subscriptions.lock().unwrap().clear();
-                tracing::info!("marmot group subscription closed (no groups)");
+                if !still_current() {
+                    return Ok(());
+                }
+                nostr.unsubscribe(&sub_id).await;
+                if still_current() {
+                    sub_state.lock().unwrap().clear();
+                    tracing::info!("marmot group subscription closed (no groups)");
+                }
             }
             return Ok(());
         }
 
         {
-            let current = self.marmot_group_subscriptions.lock().unwrap();
+            let current = sub_state.lock().unwrap();
             if *current == group_ids {
                 return Ok(());
             }
@@ -5066,7 +5181,6 @@ impl SonarClient {
 
         // Live tail is intentionally thin. Historical recovery is the catch-up
         // queue's job; using the full watermark here re-floods cold start.
-        let watermark_secs = self.sync_watermark_secs();
         let now_secs = Timestamp::now().as_secs();
         let since_secs = live_group_since_secs(watermark_secs, now_secs);
         let mut group_id_list: Vec<String> = group_ids.iter().cloned().collect();
@@ -5075,7 +5189,14 @@ impl SonarClient {
             .kind(Kind::MlsGroupMessage)
             .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list);
         filter = filter.since(Timestamp::from_secs(since_secs));
-        self.nostr.subscribe_with_id(sub_id, filter, None).await?;
+        if !still_current() {
+            return Ok(());
+        }
+        nostr.subscribe_with_id(sub_id, filter, None).await?;
+        if !still_current() {
+            // A newer schedule owns the filter; don't record a stale local set.
+            return Ok(());
+        }
         tracing::info!(
             since_secs,
             watermark_secs,
@@ -5083,7 +5204,7 @@ impl SonarClient {
             groups = group_ids.len(),
             "marmot group subscription opened"
         );
-        *self.marmot_group_subscriptions.lock().unwrap() = group_ids;
+        *sub_state.lock().unwrap() = group_ids;
         Ok(())
     }
 
@@ -5246,6 +5367,42 @@ impl SonarClient {
             return Ok(());
         }
         self.subscribe_group_messages().await
+    }
+
+    /// Narrow/refresh the live kind-445 filter without awaiting relays.
+    /// Delete/leave must stay local-first; hosts park this FFI on a serial queue.
+    fn schedule_resubscribe_marmot_groups_if_live(&self) {
+        if !*self.live_marmot_enabled.lock().unwrap() {
+            return;
+        }
+        let group_ids = match self.current_group_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::debug!(%err, "background group resubscribe skipped: list groups failed");
+                return;
+            }
+        };
+        let generation = self
+            .marmot_group_resub_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let generation_cell = self.marmot_group_resub_generation.clone();
+        let nostr = self.nostr.clone();
+        let sub_state = self.marmot_group_subscriptions.clone();
+        let watermark_secs = self.sync_watermark_secs();
+        tokio::spawn(async move {
+            if let Err(err) = Self::apply_group_message_subscription(
+                nostr,
+                sub_state,
+                group_ids,
+                watermark_secs,
+                Some((generation_cell, generation)),
+            )
+            .await
+            {
+                tracing::debug!(%err, "background marmot group resubscribe failed");
+            }
+        });
     }
 
     /// Prefer catch-up for the open chat.
@@ -6076,6 +6233,9 @@ impl SonarClient {
     /// Delete a single Marmot chat's local state (see
     /// [`MarmotEngine::delete_group`]) and narrow the live 445 subscription so we
     /// stop receiving its messages. Local-only; the peer is not notified.
+    ///
+    /// Returns after durable local purge. Live-subscription narrowing runs in
+    /// the background so delete never waits on relay round-trips.
     pub async fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         let group_id_hex = hex::encode(group_id.as_slice());
         self.engine.delete_group(group_id)?;
@@ -6085,7 +6245,7 @@ impl SonarClient {
             .remove_group_entries(&group_id_hex)?;
         self.remove_index_for_group(group_id);
         self.notify_conversation_changed(&group_id_hex);
-        let _ = self.resubscribe_marmot_groups_if_live().await;
+        self.schedule_resubscribe_marmot_groups_if_live();
         Ok(())
     }
 
