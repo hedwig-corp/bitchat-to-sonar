@@ -261,5 +261,36 @@ struct SonarNotificationPrefsTests {
         nse.userInfo = [SonarPushProcessor.nsePlaceholderUserInfoKey: true]
         #expect(SonarPushProcessor.isNSEPlaceholder(nse) == true)
     }
+
+    @Test("host replaces NSE-decorated banners by message or conversation id")
+    func nseOwnedReplaceMatchesTipIdentity() {
+        let rows: [(id: String, messageId: String?, conversationId: String?)] = [
+            ("apns-1", "msg-aaa", "marmot:g1"),
+            ("apns-2", "msg-bbb", "marmot:g2"),
+            ("local-extra", nil, "marmot:g1"),
+        ]
+        #expect(
+            SonarPushProcessor.nseOwnedIdsToRemove(
+                delivered: rows,
+                messageIdHex: "msg-aaa",
+                conversationId: nil
+            ) == ["apns-1"]
+        )
+        #expect(
+            Set(
+                SonarPushProcessor.nseOwnedIdsToRemove(
+                    delivered: rows,
+                    messageIdHex: nil,
+                    conversationId: "marmot:g1"
+                )
+            ) == Set(["apns-1", "local-extra"])
+        )
+
+        let decorated = UNMutableNotificationContent()
+        decorated.userInfo = [SonarPushProcessor.nseDecoratedUserInfoKey: true]
+        #expect(SonarPushProcessor.isNSEDecorated(decorated) == true)
+        #expect(SonarPushProcessor.isNSEOwned(decorated) == true)
+        #expect(SonarPushProcessor.isNSEPlaceholder(decorated) == false)
+    }
     #endif
 }

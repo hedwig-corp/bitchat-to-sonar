@@ -31,7 +31,8 @@ enum SonarPushProcessor {
     /// userInfo key set by the NSE on Transponder placeholders. Cleanup must
     /// match this identity — never title/body (those strings are also the
     /// router's privacy fallback when Show names + Message preview are off).
-    static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
+    static let nsePlaceholderUserInfoKey = SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey
+    static let nseDecoratedUserInfoKey = SonarNSEDecoratePolicy.nseDecoratedUserInfoKey
 
     private static let log = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "sh.hedwig.sonar",
@@ -216,6 +217,12 @@ enum SonarPushProcessor {
             log.info("Marmot sync completed from push, no new unread messages")
             return MarmotWakeOutcome(fetchResult: .newData, shouldClearNSEPlaceholders: false)
         case (false, false):
+            // If NSE already delivered a titled banner, do not stack a second
+            // generic fallback on top of it.
+            if await hasDeliveredNSEDecoratedBanner() {
+                log.warning("Marmot sync timed out; keeping NSE-decorated banner (no fallback)")
+                return MarmotWakeOutcome(fetchResult: .failed, shouldClearNSEPlaceholders: false)
+            }
             log.warning("Marmot sync timed out with nothing new unread, showing fallback")
             showFallbackNotification(prefs: prefs)
             // Avoid stacking NSE generic + local fallback generics (snapshot-scoped).
@@ -312,6 +319,12 @@ enum SonarPushProcessor {
                 userInfo: userInfo
             ) else { continue }
 
+            // Replace the NSE APNs / extra-local banner for this tip so the
+            // lock screen does not stack "New message" + named host copy.
+            await removeDeliveredNSEOwnedBanners(
+                messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
+                conversationId: conversationId
+            )
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
@@ -411,6 +424,10 @@ enum SonarPushProcessor {
                 userInfo: userInfo
             ) else { continue }
 
+            await removeDeliveredNSEOwnedBanners(
+                messageIdHex: nil,
+                conversationId: conversationId
+            )
             NotificationService.shared.sendLocalNotification(
                 title: routed.title,
                 body: routed.body,
@@ -483,10 +500,22 @@ enum SonarPushProcessor {
     /// Drop NSE Transponder placeholders once we have real local copy.
     /// Matches `sonar.nsePlaceholder` only — never user-visible title/body.
     static func isNSEPlaceholder(_ content: UNNotificationContent) -> Bool {
-        if let flag = content.userInfo[nsePlaceholderUserInfoKey] as? Bool { return flag }
-        if let flag = content.userInfo[nsePlaceholderUserInfoKey] as? NSNumber {
-            return flag.boolValue
-        }
+        boolUserInfo(content, key: nsePlaceholderUserInfoKey)
+    }
+
+    /// NSE finished a titled hydrate — host may replace this banner.
+    static func isNSEDecorated(_ content: UNNotificationContent) -> Bool {
+        boolUserInfo(content, key: nseDecoratedUserInfoKey)
+    }
+
+    /// Placeholder or decorated — anything the NSE owns on the lock screen.
+    static func isNSEOwned(_ content: UNNotificationContent) -> Bool {
+        isNSEPlaceholder(content) || isNSEDecorated(content)
+    }
+
+    private static func boolUserInfo(_ content: UNNotificationContent, key: String) -> Bool {
+        if let flag = content.userInfo[key] as? Bool { return flag }
+        if let flag = content.userInfo[key] as? NSNumber { return flag.boolValue }
         return false
     }
 
@@ -499,6 +528,21 @@ enum SonarPushProcessor {
         deliveredPlaceholderIds.intersection(allowedFromWakeStart).sorted()
     }
 
+    /// Pure filter: NSE-owned delivered ids that match tip message / conversation.
+    static func nseOwnedIdsToRemove(
+        delivered: [(id: String, messageId: String?, conversationId: String?)],
+        messageIdHex: String?,
+        conversationId: String?
+    ) -> [String] {
+        let mid = messageIdHex?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cid = conversationId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return delivered.compactMap { row in
+            if let mid, !mid.isEmpty, row.messageId == mid { return row.id }
+            if let cid, !cid.isEmpty, row.conversationId == cid { return row.id }
+            return nil
+        }
+    }
+
     private static func deliveredNSEPlaceholderIds() async -> Set<String> {
         await withCheckedContinuation { continuation in
             UNUserNotificationCenter.current().getDeliveredNotifications { notes in
@@ -507,6 +551,14 @@ enum SonarPushProcessor {
                     return note.request.identifier
                 })
                 continuation.resume(returning: ids)
+            }
+        }
+    }
+
+    private static func hasDeliveredNSEDecoratedBanner() async -> Bool {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getDeliveredNotifications { notes in
+                continuation.resume(returning: notes.contains { isNSEDecorated($0.request.content) })
             }
         }
     }
@@ -527,6 +579,36 @@ enum SonarPushProcessor {
             )
             guard !ids.isEmpty else { return }
             center.removeDeliveredNotifications(withIdentifiers: ids)
+        }
+    }
+
+    /// Remove NSE APNs / extra-local banners for the tip we are about to
+    /// re-notify from the host (named, resolved), so they do not stack.
+    private static func removeDeliveredNSEOwnedBanners(
+        messageIdHex: String?,
+        conversationId: String?
+    ) async {
+        guard (messageIdHex?.isEmpty == false) || (conversationId?.isEmpty == false) else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let center = UNUserNotificationCenter.current()
+            center.getDeliveredNotifications { notes in
+                let rows: [(id: String, messageId: String?, conversationId: String?)] = notes.compactMap { note in
+                    let content = note.request.content
+                    guard isNSEOwned(content) else { return nil }
+                    let mid = content.userInfo["sonar.messageId"] as? String
+                    let cid = content.userInfo[SonarNotificationKeys.conversationId] as? String
+                    return (note.request.identifier, mid, cid)
+                }
+                let ids = nseOwnedIdsToRemove(
+                    delivered: rows,
+                    messageIdHex: messageIdHex,
+                    conversationId: conversationId
+                )
+                if !ids.isEmpty {
+                    center.removeDeliveredNotifications(withIdentifiers: ids)
+                }
+                continuation.resume()
+            }
         }
     }
 

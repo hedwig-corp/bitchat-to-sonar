@@ -46,19 +46,25 @@ enum SonarNSEDecoratePolicy {
     }
 
     /// Local-only sender label — never hits relays from the NSE.
-    /// Hex pubkeys without a kind-0 cache read as opaque noise on the lock
-    /// screen; prefer a clear generic label.
+    /// Hex pubkeys without a kind-0 cache use a short fingerprint (not the
+    /// opaque "New message" string that looked like a second generic banner
+    /// next to the host's named local notification).
     static func senderLabel(for raw: String) -> String? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
-            return "New message"
+            return String(trimmed.prefix(8)) + "…"
         }
         if trimmed.count > 16 {
             return String(trimmed.prefix(12)) + "…"
         }
         return trimmed
     }
+
+    /// userInfo marker: NSE finished a titled hydrate (host may replace).
+    static let nseDecoratedUserInfoKey = "sonar.nseDecorated"
+    /// userInfo marker: still the privacy placeholder (host may wipe).
+    static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
 
     /// Match SonarLocalNotificationRouter privacy: when names are off, never
     /// surface sender or group strings on the lock screen.

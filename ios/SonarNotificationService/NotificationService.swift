@@ -102,7 +102,9 @@ class NotificationService: SDKNotificationService {
             // path always re-applied the generic placeholder here, so a slow
             // sync that finished apply-then-lost-the-race-to-expire delivered
             // "New Sonar message" even when diagnostics said decorated.
-            let stillPlaceholder = (content.userInfo["sonar.nsePlaceholder"] as? Bool) == true
+            let stillPlaceholder = (
+                content.userInfo[SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey] as? Bool
+            ) == true
             if SonarNSEDecoratePolicy.shouldReapplyPlaceholderOnExpire(
                 isPlaceholder: stillPlaceholder
             ) {
@@ -387,9 +389,11 @@ class NotificationService: SDKNotificationService {
             content.interruptionLevel = .active
         }
         var userInfo = content.userInfo
-        // Decorated copy is no longer a privacy placeholder — clear the marker
-        // so the app wake path does not wipe a already-titled NSE banner.
-        userInfo.removeValue(forKey: "sonar.nsePlaceholder")
+        // Decorated copy is no longer a privacy placeholder — clear that marker
+        // and stamp nseDecorated so the host can replace this banner with a
+        // named local notification instead of stacking a duplicate.
+        userInfo.removeValue(forKey: SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey)
+        userInfo[SonarNSEDecoratePolicy.nseDecoratedUserInfoKey] = true
         if !notification.groupIdHex.isEmpty {
             userInfo[conversationIdKey] = marmotConversationPrefix + notification.groupIdHex
         }
@@ -585,7 +589,8 @@ class NotificationService: SDKNotificationService {
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
         var info = content.userInfo
-        info["sonar.nsePlaceholder"] = true
+        info[SonarNSEDecoratePolicy.nsePlaceholderUserInfoKey] = true
+        info.removeValue(forKey: SonarNSEDecoratePolicy.nseDecoratedUserInfoKey)
         content.userInfo = info
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active

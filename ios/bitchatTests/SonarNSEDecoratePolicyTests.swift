@@ -38,15 +38,15 @@ struct SonarNSEDecoratePolicyTests {
         #expect(out.body == "Open Sonar to read it.")
     }
 
-    @Test("hex sender without profile becomes New message")
+    @Test("hex sender without profile uses short fingerprint (not New message)")
     func hexSenderLabel() {
         let hex = String(repeating: "ab", count: 32)
-        #expect(SonarNSEDecoratePolicy.senderLabel(for: hex) == "New message")
+        #expect(SonarNSEDecoratePolicy.senderLabel(for: hex) == "abababab…")
         let out = SonarNSEDecoratePolicy.render(
             input: .init(senderRaw: hex, groupName: "Sonar agent DM", contentPreview: "hi"),
             prefs: .init(showNames: true, showPreview: true)
         )
-        #expect(out.title == "New message")
+        #expect(out.title == "abababab…")
         #expect(out.body == "hi")
     }
 
