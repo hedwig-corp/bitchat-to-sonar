@@ -46,12 +46,11 @@ compromise and out of scope.
 
 ## Publishing (restored client)
 
-Publish the beacon immediately after the fresh KeyPackage publish, and ONLY when
-the local MLS store has **no groups**. An empty store means either a fresh
-onboarding (harmless — no peer is watching this npub yet) or a real restore
-(exactly the case peers must heal). A client that still has local groups did not
-lose state and MUST NOT beacon, so an ordinary relay reconnect can never trigger
-a spurious reset on a peer.
+Publish the beacon immediately after the fresh KeyPackage publish on the
+**explicit nsec-restore path only**. Fresh onboarding and ordinary reconnect
+MUST NOT publish: an empty MLS store alone cannot distinguish those cases, and
+the outstanding-beacon flag auto-accepts multi-member group welcomes — which
+must not be armed on a brand-new install.
 
 While a locally published beacon is outstanding, the restored client
 auto-accepts multi-member group welcomes (they are surviving admins re-inviting
