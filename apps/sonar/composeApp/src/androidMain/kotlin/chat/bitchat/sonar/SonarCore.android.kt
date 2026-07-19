@@ -595,6 +595,11 @@ actual object SonarCore {
         Unit
     }
 
+    actual suspend fun retryOutbox() = withContext(Dispatchers.IO) {
+        runCatching { node?.retryOutbox() }
+        Unit
+    }
+
     actual suspend fun waitForMarmotEvent(timeoutSecs: Long): Boolean =
         withContext(Dispatchers.IO) {
             // Honor the "park up to timeoutSecs" contract even with no node

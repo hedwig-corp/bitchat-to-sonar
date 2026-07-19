@@ -9514,6 +9514,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (!isActive) return@launch
                 if (woke) {
                     runCatching { SonarCore.drainPendingMarmot() }
+                    // Do not call retryOutbox here: it republishes in-flight
+                    // Pending and can stack fanouts / burn attempt budget.
+                    // Failed rows self-heal via core auto-retry; stranded
+                    // Pending is flushed on connect and idle ensureSubscriptions.
                 } else {
                     runCatching { SonarCore.ensureSubscriptions() }
                 }

@@ -641,6 +641,12 @@ expect object SonarCore {
      *  background/IO work and never before local chat paint. */
     suspend fun ensureSubscriptions()
 
+    /** Reload the durable outbox and republish pending/failed sends. Hosts call
+     *  this after relay connect (not on the active-chat wake path — that would
+     *  restack in-flight Pending). Core auto-retries Failed after publish
+     *  failure; idle [ensureSubscriptions] also flushes the outbox. */
+    suspend fun retryOutbox()
+
     /** Park up to [timeoutSecs] until the relay subscriptions push a live
      *  Marmot event (welcome or group message). Returns true when there is
      *  something to drain. Touches no MLS state — safe to park off the

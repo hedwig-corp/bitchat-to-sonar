@@ -1027,6 +1027,14 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().ensureSubscriptions() }
     }
 
+    /// Reload the durable outbox and republish pending/failed sends. Called
+    /// after relay connect (not on the active-chat wake path — that would
+    /// restack in-flight Pending). Core auto-retries Failed after publish
+    /// failure; idle `ensureSubscriptions` also flushes the outbox.
+    func retryOutbox() async throws {
+        try await run { try $0.requireNode().retryOutbox() }
+    }
+
     /// Delete a single Marmot chat's local state (messages + MLS keys). Local-
     /// only; the peer is not notified. Idempotent.
     func deleteGroup(groupId: String) async throws {
