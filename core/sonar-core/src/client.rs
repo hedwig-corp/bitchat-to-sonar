@@ -5086,12 +5086,18 @@ impl SonarClient {
     /// by `backfill_group`.
     async fn subscribe_group_messages(&self) -> Result<()> {
         let group_ids = self.current_group_ids()?;
+        // Share the same generation gate as background delete/leave resubscribes
+        // so a slow startup/ensure subscribe cannot overwrite a newer narrower set.
+        let generation = self
+            .marmot_group_resub_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         Self::apply_group_message_subscription(
             self.nostr.clone(),
             self.marmot_group_subscriptions.clone(),
             group_ids,
             self.sync_watermark_secs(),
-            None,
+            Some((self.marmot_group_resub_generation.clone(), generation)),
         )
         .await
     }
