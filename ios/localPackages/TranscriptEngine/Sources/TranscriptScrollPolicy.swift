@@ -91,6 +91,30 @@ public enum TranscriptScrollPolicy {
             && hasTailRow
     }
 
+    /// Clear `needsLiveEdgeOpen` only when the viewport is at today's live edge
+    /// **and** owned composer chrome has been applied. Matching "near bottom"
+    /// against an incomplete `bottomInset` / pre-chrome maxY (MsgList clears
+    /// only when `sn-bottom` appears) ends open recovery a few points short of
+    /// the last message.
+    public static func shouldClearLiveEdgeOpen(
+        isNearBottom: Bool,
+        ownedChromeApplied: Bool
+    ) -> Bool {
+        isNearBottom && ownedChromeApplied
+    }
+
+    /// Programmatic open scrolls must not set `hasLeftBottom` — that flag kills
+    /// `shouldResnapFullyReadOpen` for the rest of the open. Only user drag /
+    /// an unpinned away-from-tail scroll may abandon the live edge.
+    public static func shouldMarkLeftBottom(
+        needsLiveEdgeOpen: Bool,
+        wasPinned: Bool,
+        userDragging: Bool
+    ) -> Bool {
+        guard !needsLiveEdgeOpen else { return false }
+        return !wasPinned || userDragging
+    }
+
     public static func insetFollowDecision(
         wasAtTail: Bool,
         userScrolling: Bool,
