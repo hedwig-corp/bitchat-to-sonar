@@ -187,7 +187,13 @@ impl StickerCache {
 
     /// Persist the last-known installed pack list (kind 10031) so the sticker
     /// picker can paint across process restarts without waiting on relays.
-    pub(crate) fn remember_installed_packs(&self, packs: &[PackAddress]) -> Result<bool> {
+    /// Callers that own an authoritative update (publish / cold relay fetch)
+    /// use this; background refresh must use [`Self::apply_refreshed_installed_packs`].
+    pub(crate) fn remember_installed_packs(
+        &self,
+        packs: &[PackAddress],
+        created_at: u64,
+    ) -> Result<bool> {
         if !self.active {
             return Ok(true);
         }
@@ -198,13 +204,48 @@ impl StickerCache {
         if !self.is_current(&state, root) {
             return Ok(false);
         }
-        write_installed_packs(root, packs)?;
+        write_installed_packs(root, packs, created_at)?;
+        Ok(true)
+    }
+
+    /// Persist a background relay refresh only when it is at least as new as the
+    /// durable local snapshot. Prevents an in-flight refresh from clobbering a
+    /// newer install/uninstall publish.
+    pub(crate) fn apply_refreshed_installed_packs(
+        &self,
+        packs: &[PackAddress],
+        created_at: u64,
+    ) -> Result<bool> {
+        if !self.active {
+            return Ok(true);
+        }
+        let Some(root) = self.root.as_deref() else {
+            return Ok(true);
+        };
+        let state = lock_cache()?;
+        if !self.is_current(&state, root) {
+            return Ok(false);
+        }
+        if let Some(snapshot) = read_installed_packs_snapshot(root)? {
+            if created_at < snapshot.created_at {
+                return Ok(false);
+            }
+        }
+        write_installed_packs(root, packs, created_at)?;
         Ok(true)
     }
 
     /// Read the last-known installed pack list. `None` means never cached;
     /// `Some([])` means the user had an empty installed set when last synced.
     pub(crate) fn read_installed_packs(&self) -> Result<Option<Vec<PackAddress>>> {
+        Ok(self
+            .read_installed_packs_snapshot()?
+            .map(|snapshot| snapshot.packs))
+    }
+
+    pub(crate) fn read_installed_packs_snapshot(
+        &self,
+    ) -> Result<Option<InstalledPacksSnapshot>> {
         if !self.active {
             return Ok(None);
         }
@@ -215,7 +256,7 @@ impl StickerCache {
         if !self.is_current(&state, root) {
             return Ok(None);
         }
-        read_installed_packs(root)
+        read_installed_packs_snapshot(root)
     }
 
     /// Return verified image bytes only when the latest locally validated pack
@@ -476,9 +517,24 @@ fn installed_packs_file_path(root: &Path) -> PathBuf {
     root.join(INSTALLED_PACKS_FILE)
 }
 
-fn write_installed_packs(root: &Path, packs: &[PackAddress]) -> Result<()> {
-    let coordinates: Vec<String> = packs.iter().map(|pack| pack.coordinate()).collect();
-    let bytes = serde_json::to_vec(&coordinates)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InstalledPacksSnapshot {
+    pub created_at: u64,
+    pub packs: Vec<PackAddress>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InstalledPacksFile {
+    created_at: u64,
+    packs: Vec<String>,
+}
+
+fn write_installed_packs(root: &Path, packs: &[PackAddress], created_at: u64) -> Result<()> {
+    let file = InstalledPacksFile {
+        created_at,
+        packs: packs.iter().map(|pack| pack.coordinate()).collect(),
+    };
+    let bytes = serde_json::to_vec(&file)
         .map_err(|e| crate::Error::Storage(format!("encode installed packs cache: {e}")))?;
     if bytes.len() as u64 > MAX_INSTALLED_PACKS_BYTES {
         return Err(crate::Error::Storage(format!(
@@ -510,7 +566,31 @@ fn write_installed_packs(root: &Path, packs: &[PackAddress]) -> Result<()> {
     Ok(())
 }
 
-fn read_installed_packs(root: &Path) -> Result<Option<Vec<PackAddress>>> {
+fn parse_installed_packs_bytes(bytes: &[u8]) -> Option<InstalledPacksSnapshot> {
+    // Current format: { created_at, packs: [...] }
+    if let Ok(file) = serde_json::from_slice::<InstalledPacksFile>(bytes) {
+        let mut packs = Vec::with_capacity(file.packs.len());
+        for coordinate in file.packs {
+            packs.push(PackAddress::parse(&coordinate).ok()?);
+        }
+        return Some(InstalledPacksSnapshot {
+            created_at: file.created_at,
+            packs,
+        });
+    }
+    // Legacy format from the first local-first revision: bare coordinate array.
+    let coordinates: Vec<String> = serde_json::from_slice(bytes).ok()?;
+    let mut packs = Vec::with_capacity(coordinates.len());
+    for coordinate in coordinates {
+        packs.push(PackAddress::parse(&coordinate).ok()?);
+    }
+    Some(InstalledPacksSnapshot {
+        created_at: 0,
+        packs,
+    })
+}
+
+fn read_installed_packs_snapshot(root: &Path) -> Result<Option<InstalledPacksSnapshot>> {
     let path = installed_packs_file_path(root);
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -532,24 +612,13 @@ fn read_installed_packs(root: &Path) -> Result<Option<Vec<PackAddress>>> {
             path.display()
         ))
     })?;
-    let coordinates: Vec<String> = match serde_json::from_slice(&bytes) {
-        Ok(coordinates) => coordinates,
-        Err(_) => {
+    match parse_installed_packs_bytes(&bytes) {
+        Some(snapshot) => Ok(Some(snapshot)),
+        None => {
             let _ = fs::remove_file(&path);
-            return Ok(None);
-        }
-    };
-    let mut packs = Vec::with_capacity(coordinates.len());
-    for coordinate in coordinates {
-        match PackAddress::parse(&coordinate) {
-            Ok(address) => packs.push(address),
-            Err(_) => {
-                let _ = fs::remove_file(&path);
-                return Ok(None);
-            }
+            Ok(None)
         }
     }
-    Ok(Some(packs))
 }
 
 fn write_validated_pack(root: &Path, pack: &StickerPack) -> Result<()> {
@@ -771,6 +840,12 @@ fn collect_cache_entries(dir: &Path, entries: &mut Vec<CacheEntry>) -> Result<()
             }
             collect_cache_entries(&child.path(), entries)?;
         } else if file_type.is_file() {
+            let name = child.file_name();
+            let name = name.to_str().unwrap_or_default();
+            // Durable metadata — never count toward the image-byte budget.
+            if name == INSTALLED_PACKS_FILE || name.ends_with(".tmp") {
+                continue;
+            }
             let metadata = child.metadata().map_err(|error| {
                 crate::Error::Storage(format!(
                     "inspect sticker cache file {}: {error}",
@@ -968,7 +1043,7 @@ mod tests {
         let cache = StickerCache::for_db(&db).unwrap();
         assert!(cache.read_installed_packs().unwrap().is_none());
 
-        assert!(cache.remember_installed_packs(&[]).unwrap());
+        assert!(cache.remember_installed_packs(&[], 10).unwrap());
         assert_eq!(
             cache.read_installed_packs().unwrap().as_deref(),
             Some([].as_slice())
@@ -979,11 +1054,70 @@ mod tests {
             "sonar-cats-v1",
         )
         .unwrap();
-        assert!(cache.remember_installed_packs(&[pack.clone()]).unwrap());
+        assert!(cache.remember_installed_packs(&[pack.clone()], 20).unwrap());
         assert_eq!(
             cache.read_installed_packs().unwrap().as_deref(),
             Some([pack].as_slice())
         );
+        assert_eq!(
+            cache
+                .read_installed_packs_snapshot()
+                .unwrap()
+                .unwrap()
+                .created_at,
+            20
+        );
+    }
+
+    #[test]
+    fn refreshed_installed_packs_cannot_clobber_newer_local_snapshot() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = StickerCache::for_db(&db).unwrap();
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        assert!(cache.remember_installed_packs(&[pack.clone()], 100).unwrap());
+
+        // Older refresh must not wipe a newer publish.
+        assert!(!cache
+            .apply_refreshed_installed_packs(&[], 50)
+            .unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([pack.clone()].as_slice())
+        );
+
+        // Equal/newer refresh may replace.
+        assert!(cache
+            .apply_refreshed_installed_packs(&[], 100)
+            .unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn image_budget_eviction_preserves_installed_packs_file() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache_root = sticker_cache_dir_for_db(&db);
+        let cache = StickerCache::for_db(&db).unwrap();
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        assert!(cache.remember_installed_packs(&[pack], 1).unwrap());
+        for bytes in [b"aaaa".as_slice(), b"bbbb".as_slice(), b"cccc".as_slice()] {
+            let sha = sha256_hex(bytes);
+            assert!(cache.write_with_budget(&sha, bytes, 8).unwrap());
+        }
+        assert!(installed_packs_file_path(&cache_root).is_file());
+        assert!(cache.read_installed_packs().unwrap().is_some());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -1418,6 +1418,9 @@ pub struct SonarClient {
     /// Coalesces background kind-10031 refreshes kicked off after a local-first
     /// installed-list paint so opening the picker does not fan out N fetches.
     sticker_installed_refresh_inflight: Arc<AtomicBool>,
+    /// Bumped on every authoritative installed-list write (publish / cold fetch)
+    /// so an in-flight background refresh cannot clobber a newer local snapshot.
+    sticker_installed_epoch: Arc<AtomicU64>,
     /// Per-coordinate install prefetch cancellation. Uninstall cancels the
     /// matching task immediately; the cache generation separately cancels all
     /// old-session tasks during identity wipe.
@@ -1915,6 +1918,7 @@ impl SonarClient {
             sticker_pack_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_image_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_installed_refresh_inflight: Arc::new(AtomicBool::new(false)),
+            sticker_installed_epoch: Arc::new(AtomicU64::new(0)),
             sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
             sticker_ref_prefetch_permits: Arc::new(tokio::sync::Semaphore::new(
                 STICKER_REF_PREFETCH_CONCURRENCY,
@@ -3361,14 +3365,21 @@ impl SonarClient {
             self.spawn_installed_packs_refresh();
             return Ok(packs);
         }
-        let packs = self.fetch_installed_packs_from_relays().await?;
-        if let Err(err) = self.sticker_cache.remember_installed_packs(&packs) {
+        let (packs, created_at) = self.fetch_installed_packs_from_relays().await?;
+        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Err(err) = self
+            .sticker_cache
+            .remember_installed_packs(&packs, created_at)
+        {
             tracing::debug!(%err, "sticker installed-packs cache write failed");
         }
         Ok(packs)
     }
 
-    async fn fetch_installed_packs_from_relays(&self) -> Result<Vec<PackAddress>> {
+    /// Fetch the replaceable kind-10031 list. `created_at` is the Nostr event
+    /// timestamp when present; when relays return no event, `created_at` is
+    /// "now" so a legitimate empty account can still be cached on cold start.
+    async fn fetch_installed_packs_from_relays(&self) -> Result<(Vec<PackAddress>, u64)> {
         let filter = Filter::new()
             .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
             .author(self.identity().public_key())
@@ -3381,43 +3392,28 @@ impl SonarClient {
             .await?;
         match events.into_iter().next() {
             Some(event) => {
+                let created_at = event.created_at.as_secs();
                 let list = parse_installed_pack_list(&event)
                     .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?;
-                Ok(list.packs)
+                Ok((list.packs, created_at))
             }
-            None => Ok(Vec::new()),
+            None => Ok((Vec::new(), Timestamp::now().as_secs())),
         }
     }
 
     /// Authoritative installed-list read for install/uninstall mutations.
-    /// Prefers relays so a local-first paint cannot publish a stale set; falls
-    /// back to the durable local list only when the relay query fails.
+    /// Requires a successful relay query — publish needs the network anyway, and
+    /// falling back to a possibly-stale local list can sign a wiped set.
     async fn fetch_installed_packs_for_mutation(&self) -> Result<Vec<PackAddress>> {
-        match self.fetch_installed_packs_from_relays().await {
-            Ok(packs) => {
-                if let Err(err) = self.sticker_cache.remember_installed_packs(&packs) {
-                    tracing::debug!(%err, "sticker installed-packs cache write failed");
-                }
-                Ok(packs)
-            }
-            Err(network_err) => match self.sticker_cache.read_installed_packs() {
-                Ok(Some(packs)) => {
-                    tracing::debug!(
-                        err = %network_err,
-                        "installed pack list relay refresh failed; using local list for mutation"
-                    );
-                    Ok(packs)
-                }
-                Ok(None) => Err(network_err),
-                Err(cache_err) => {
-                    tracing::debug!(
-                        err = %cache_err,
-                        "installed pack list local fallback read failed"
-                    );
-                    Err(network_err)
-                }
-            },
+        let (packs, created_at) = self.fetch_installed_packs_from_relays().await?;
+        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
+        if let Err(err) = self
+            .sticker_cache
+            .remember_installed_packs(&packs, created_at)
+        {
+            tracing::debug!(%err, "sticker installed-packs cache write failed");
         }
+        Ok(packs)
     }
 
     fn spawn_installed_packs_refresh(&self) {
@@ -3432,9 +3428,14 @@ impl SonarClient {
         let relays = self.relays.clone();
         let sticker_cache = self.sticker_cache.clone();
         let inflight = self.sticker_installed_refresh_inflight.clone();
+        let epoch = self.sticker_installed_epoch.clone();
+        let started_epoch = epoch.load(Ordering::Acquire);
         let author = self.identity().public_key();
         tokio::spawn(async move {
             let result = async {
+                if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                    return Ok(());
+                }
                 let filter = Filter::new()
                     .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
                     .author(author)
@@ -3442,14 +3443,31 @@ impl SonarClient {
                 let relays: Vec<String> = relays.iter().map(|u| u.to_string()).collect();
                 let timeout = Duration::from_secs(10);
                 let events = nostr.fetch_events_from(relays, filter, timeout).await?;
-                let packs = match events.into_iter().next() {
-                    Some(event) => parse_installed_pack_list(&event)
-                        .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?
-                        .packs,
-                    None => Vec::new(),
+                // No event is a refresh miss — never clobber a warm local list
+                // with a durable empty snapshot from a flaky empty answer.
+                let Some(event) = events.into_iter().next() else {
+                    return Ok(());
                 };
-                if let Err(err) = sticker_cache.remember_installed_packs(&packs) {
-                    tracing::debug!(%err, "sticker installed-packs background cache write failed");
+                if epoch.load(Ordering::Acquire) != started_epoch {
+                    return Ok(());
+                }
+                if !matches!(sticker_cache.session_is_current(), Ok(true)) {
+                    return Ok(());
+                }
+                let created_at = event.created_at.as_secs();
+                let packs = parse_installed_pack_list(&event)
+                    .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?
+                    .packs;
+                match sticker_cache.apply_refreshed_installed_packs(&packs, created_at) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::debug!(
+                        created_at,
+                        "sticker installed-packs refresh skipped (stale vs local)"
+                    ),
+                    Err(err) => tracing::debug!(
+                        %err,
+                        "sticker installed-packs background cache write failed"
+                    ),
                 }
                 Ok::<(), Error>(())
             }
@@ -3466,7 +3484,13 @@ impl SonarClient {
         let tags = build_installed_packs_tags(&list);
         let builder = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "").tags(tags);
         self.nostr.send_event_builder(builder).await?;
-        if let Err(err) = self.sticker_cache.remember_installed_packs(&list.packs) {
+        // Invalidate any in-flight background refresh before durable write.
+        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
+        let created_at = Timestamp::now().as_secs();
+        if let Err(err) = self
+            .sticker_cache
+            .remember_installed_packs(&list.packs, created_at)
+        {
             tracing::debug!(%err, "sticker installed-packs cache write failed after publish");
         }
         Ok(())

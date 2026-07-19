@@ -188,8 +188,10 @@ final matched-device run), while the forced validated-local fallback completed i
 1.25 ms on Pixel. The cache itself was not the bottleneck. Foreground pack and
 installed-list reads are now local-first: validated disk metadata and the last
 kind-10031 list paint immediately, with a coalesced relay refresh behind that
-first frame. Hosts no longer gate the first pack lookup on relay connect when
-disk already has the pack. This change also keeps a 25 MiB/100-entry host LRU on
+first frame. Hosts no longer wait on relay connect before pack lookup (warm
+disk returns immediately from core; cold miss still uses the shared 10s relay
+fetch). Background kind-10031 refresh is fenced by event `created_at` and an
+epoch bump on publish so it cannot clobber a newer install/uninstall. This change also keeps a 25 MiB/100-entry host LRU on
 each app surface, a verified content-addressed disk cache with a strict 5 MiB
 per-image foreground/prefetch limit, shared per-pack/per-SHA single-flight fetch
 gates, and bounded first-20/four-task install prefetch detached from the UI/FFI
