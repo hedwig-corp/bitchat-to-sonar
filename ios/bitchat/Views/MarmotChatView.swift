@@ -303,6 +303,9 @@ final class MarmotChatModel: ObservableObject {
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
+    /// Single-flight durable media resume. Core also claims per entry id; this
+    /// stops stacking overlapping resume Tasks on flaky relay reconnects.
+    private var mediaResumeTask: Task<Void, Never>?
     /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
     private var foregroundRefreshTask: Task<Void, Never>?
     /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
@@ -743,6 +746,19 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    private func scheduleResumePendingMediaUploads() {
+        guard mediaResumeTask == nil else { return }
+        mediaResumeTask = Task { [weak self] in
+            defer {
+                Task { @MainActor in
+                    self?.mediaResumeTask = nil
+                }
+            }
+            guard let self else { return }
+            try? await self.service.resumePendingMediaUploads()
+        }
+    }
+
     private func connectRelaysIfNeeded() {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
@@ -777,7 +793,7 @@ final class MarmotChatModel: ObservableObject {
                 // Resume durable pre-Blossom media staging (mid-upload kill /
                 // disconnect). Does not block cold start; Blossom itself does
                 // not need the relay, but publish still uses the outbox.
-                Task { try? await self.service.resumePendingMediaUploads() }
+                self.scheduleResumePendingMediaUploads()
                 try? await self.service.publishKeyPackageBackground()
                 // After nsec restore the local nick/handle sidecars are empty.
                 // Fetch our own kind-0 first so the host can adopt name + nip05
@@ -3151,6 +3167,8 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        mediaResumeTask?.cancel()
+        mediaResumeTask = nil
         syncTask?.cancel()
         syncTask = nil
         foregroundRefreshTask?.cancel()

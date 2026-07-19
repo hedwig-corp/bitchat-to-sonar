@@ -16,6 +16,18 @@ use crate::{Error, Result};
 pub(crate) const MEDIA_STAGING_STATE_FILE_SUFFIX: &str = ".sonar-media-staging.json";
 pub(crate) const MEDIA_STAGING_DIR_SUFFIX: &str = ".sonar-media-staging";
 const MEDIA_STAGING_STATE_VERSION: u32 = 1;
+/// Failed staged rows older than this are deleted on resume prep so abandoned
+/// sends cannot grow staging forever.
+const FAILED_STAGING_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_STAGING_ID_LEN: usize = 128;
+
+fn is_safe_staging_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_STAGING_ID_LEN
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +147,11 @@ impl MediaStagingState {
         items: Vec<(String, String, Vec<u8>)>,
         now_secs: u64,
     ) -> Result<()> {
+        if !is_safe_staging_id(&id) || !is_safe_staging_id(&client_pending_id) {
+            return Err(Error::Media(
+                "staged media id must be a bounded alphanumeric token".into(),
+            ));
+        }
         if items.is_empty() {
             return Err(Error::Media("no media to stage".into()));
         }
@@ -275,11 +292,32 @@ impl MediaStagingState {
     }
 
     pub fn reload_from_disk(&mut self) {
-        let state_path = self.state_path.clone();
+        // In-memory sessions have no sidecar; reloading would wipe live entries
+        // mid-upload and turn progress/fail updates into silent no-ops.
+        let Some(state_path) = self.state_path.clone() else {
+            return;
+        };
         let dir_path = self.dir_path.clone();
-        let reloaded = Self::load(state_path, dir_path);
+        let reloaded = Self::load(Some(state_path), dir_path);
         self.entries = reloaded.entries;
         self.dirty = false;
+    }
+
+    /// Drop Failed entries older than [`FAILED_STAGING_TTL_SECS`].
+    pub fn purge_expired_failed(&mut self, now_secs: u64) -> Result<()> {
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry.state == MediaStagingStatus::Failed
+                    && now_secs.saturating_sub(entry.updated_at_secs) >= FAILED_STAGING_TTL_SECS
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.remove(&id)?;
+        }
+        Ok(())
     }
 
     fn save_if_dirty(&mut self) -> Result<()> {
@@ -451,6 +489,79 @@ mod tests {
             MediaStagingStatus::Uploading
         );
         assert_eq!(staging.resumable_ids(), vec!["p".to_string()]);
+    }
+
+    #[test]
+    fn rejects_unsafe_staging_ids() {
+        let mut staging = MediaStagingState::load(None, None);
+        let err = staging
+            .stage(
+                "../evil".into(),
+                "ok".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("a.jpg".into(), "image/jpeg".into(), b"x".to_vec())],
+                1,
+            )
+            .expect_err("path traversal id");
+        assert!(err.to_string().contains("alphanumeric"));
+    }
+
+    #[test]
+    fn purge_expired_failed_keeps_fresh_rows() {
+        let mut staging = MediaStagingState::load(None, None);
+        staging
+            .stage(
+                "old".into(),
+                "old".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("a.jpg".into(), "image/jpeg".into(), b"x".to_vec())],
+                1,
+            )
+            .expect("stage");
+        staging
+            .mark_failed("old", "gone".into(), 1)
+            .expect("fail");
+        staging
+            .stage(
+                "fresh".into(),
+                "fresh".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("b.jpg".into(), "image/jpeg".into(), b"y".to_vec())],
+                1,
+            )
+            .expect("stage");
+        staging
+            .mark_failed("fresh", "recent".into(), 1_000_000)
+            .expect("fail");
+        staging
+            .purge_expired_failed(1 + FAILED_STAGING_TTL_SECS)
+            .expect("purge");
+        assert!(staging.get("old").is_none());
+        assert!(staging.get("fresh").is_some());
+    }
+
+    #[test]
+    fn reload_from_disk_is_noop_without_state_path() {
+        let mut staging = MediaStagingState::load(None, None);
+        staging
+            .stage(
+                "live".into(),
+                "live".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("a.jpg".into(), "image/jpeg".into(), b"x".to_vec())],
+                1,
+            )
+            .expect("stage");
+        staging.reload_from_disk();
+        assert!(staging.get("live").is_some());
     }
 
     #[test]

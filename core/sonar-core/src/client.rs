@@ -208,6 +208,18 @@ fn media_upload_cancelled(observer: Option<&dyn MediaUploadObserver>) -> bool {
     observer.is_some_and(MediaUploadObserver::is_cancelled)
 }
 
+/// RAII guard that releases a media-upload in-flight claim on drop.
+struct MediaUploadInflightClaim {
+    inflight: Arc<Mutex<HashSet<String>>>,
+    entry_id: String,
+}
+
+impl Drop for MediaUploadInflightClaim {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.entry_id);
+    }
+}
+
 #[cfg(test)]
 async fn http_get(url: &str, observer: Option<&dyn MediaDownloadObserver>) -> Result<Vec<u8>> {
     http_get_with_limit_observer(url, MAX_MEDIA_DOWNLOAD_BYTES, observer).await
@@ -1377,6 +1389,10 @@ pub struct SonarClient {
     /// Pre-Blossom media staging: plaintext files + sidecar so mid-upload
     /// disconnect/kill does not lose attachments.
     media_staging: Arc<Mutex<MediaStagingState>>,
+    /// Entry ids currently owned by `send_media_multi_with_progress` or
+    /// `resume_pending_media_uploads`. Prevents overlapping workers from
+    /// double-publishing the same staged album.
+    media_upload_inflight: Arc<Mutex<HashSet<String>>>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1923,6 +1939,7 @@ impl SonarClient {
             media_staging_state_path,
             media_staging_dir_path,
         )));
+        let media_upload_inflight = Arc::new(Mutex::new(HashSet::new()));
         let client = Self {
             engine,
             nostr,
@@ -1936,6 +1953,7 @@ impl SonarClient {
             sync_state,
             outbox_state,
             media_staging,
+            media_upload_inflight,
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -3939,15 +3957,32 @@ impl SonarClient {
             .into_iter()
             .map(|item| (item.filename, item.mime, item.data))
             .collect();
-        self.media_staging.lock().unwrap().stage(
-            entry_id.clone(),
-            progress_id.clone(),
-            group_id_hex,
-            caption.to_string(),
-            server_url.to_string(),
-            staged_items,
-            now,
-        )?;
+        {
+            let staging = self.media_staging.clone();
+            let entry_id = entry_id.clone();
+            let progress_id = progress_id.clone();
+            let caption = caption.to_string();
+            let server_url = server_url.to_string();
+            tokio::task::spawn_blocking(move || {
+                staging.lock().unwrap().stage(
+                    entry_id,
+                    progress_id,
+                    group_id_hex,
+                    caption,
+                    server_url,
+                    staged_items,
+                    now,
+                )
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging join: {e}")))??;
+        }
+        // Claim after durable stage so a racing resume cannot also own this id.
+        let Some(_claim) = self.try_claim_media_upload(&entry_id) else {
+            // Another worker already owns this entry; leave staging alone so it
+            // can finish (or fail) the upload. Do not mark_failed here.
+            return Err(Error::Media("media upload already in flight".into()));
+        };
         if let Some(obs) = observer {
             obs.on_progress(&progress_id, 0, total_bytes);
         }
@@ -3977,12 +4012,26 @@ impl SonarClient {
         &self,
         observer: Option<&dyn MediaUploadObserver>,
     ) -> Result<u32> {
-        self.media_staging.lock().unwrap().reload_from_disk();
+        {
+            let staging = self.media_staging.clone();
+            let now = Timestamp::now().as_secs();
+            tokio::task::spawn_blocking(move || {
+                let mut staging = staging.lock().unwrap();
+                staging.reload_from_disk();
+                staging.purge_expired_failed(now)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging resume prep join: {e}")))??;
+        }
         // Only auto-resume in-flight uploads. Failed rows require an explicit
         // host retry so cold start cannot resurrect abandoned / cancelled sends.
         let ids = self.media_staging.lock().unwrap().resumable_ids();
         let mut attempted = 0u32;
         for id in ids {
+            let Some(_claim) = self.try_claim_media_upload(&id) else {
+                // Another send/resume already owns this entry.
+                continue;
+            };
             attempted += 1;
             let (group_hex, progress_id) = {
                 let staging = self.media_staging.lock().unwrap();
@@ -4049,6 +4098,19 @@ impl SonarClient {
         Ok(attempted)
     }
 
+    /// Atomically claim `entry_id` for one upload worker. Returns `None` when
+    /// another send/resume already owns the id.
+    fn try_claim_media_upload(&self, entry_id: &str) -> Option<MediaUploadInflightClaim> {
+        let mut inflight = self.media_upload_inflight.lock().unwrap();
+        if !inflight.insert(entry_id.to_string()) {
+            return None;
+        }
+        Some(MediaUploadInflightClaim {
+            inflight: self.media_upload_inflight.clone(),
+            entry_id: entry_id.to_string(),
+        })
+    }
+
     /// Encrypt + upload staged plaintext, then publish via the durable outbox.
     async fn complete_staged_media_upload(
         &self,
@@ -4060,19 +4122,25 @@ impl SonarClient {
             return Err(Error::MediaUploadCancelled);
         }
         let (caption, server_url, progress_id, items_meta, plaintext_items) = {
-            let staging = self.media_staging.lock().unwrap();
-            let entry = staging
-                .get(entry_id)
-                .ok_or_else(|| Error::Media("staged media entry missing".into()))?
-                .clone();
-            let bytes = staging.load_item_bytes(&entry)?;
-            (
-                entry.caption,
-                entry.server_url,
-                entry.client_pending_id,
-                entry.items,
-                bytes,
-            )
+            let staging = self.media_staging.clone();
+            let entry_id = entry_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let staging = staging.lock().unwrap();
+                let entry = staging
+                    .get(&entry_id)
+                    .ok_or_else(|| Error::Media("staged media entry missing".into()))?
+                    .clone();
+                let bytes = staging.load_item_bytes(&entry)?;
+                Ok::<_, Error>((
+                    entry.caption,
+                    entry.server_url,
+                    entry.client_pending_id,
+                    entry.items,
+                    bytes,
+                ))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging load join: {e}")))??
         };
         if items_meta.len() != plaintext_items.len() {
             return Err(Error::Media("staged media item count mismatch".into()));
