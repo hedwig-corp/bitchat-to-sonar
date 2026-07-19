@@ -105,11 +105,11 @@ Pure policy + tests (Swift + Kotlin mirrors):
 **Compose:** landed (`TranscriptScrollPolicy` + tests; pinner thin adapter).  
 **iOS:** landed (`SNTranscriptScrollPolicy` + tests; latch/coalescer adapters; `SNMsgList` open/resnap call sites).
 
-No production list cutover yet.
+Policy helpers are production; list hosting cut over in Phase 2/3 below.
 
-### Phase 2 — Native list hosts (flagged) ✅
-- **iOS:** flagged `SNTranscriptCollectionHost` (`UICollectionView`, `keyboardLayoutGuide`, owned insets, lockstep, ContinuityToken, `SNTranscriptOpenAction`).
-- **Compose:** flagged `TranscriptPhase2HostScaffold` (owned-pad LazyColumn, Lockstep via `decideInsetChange`, ContinuityToken, OpenAction). Top-align only.
+### Phase 2 — Native list hosts (Debug default ON → production) ✅
+- **iOS:** `SNTranscriptCollectionHost` (`UICollectionView`, `keyboardLayoutGuide`, owned insets, lockstep, ContinuityToken, `SNTranscriptOpenAction`). **Debug default ON** when UserDefaults unset; Release also default ON after Phase 3 (kill switch `SONAR_TRANSCRIPT_COLLECTION_HOST=0` / Debug Settings).
+- **Compose:** `TranscriptPhase2HostScaffold` (owned-pad LazyColumn, Lockstep via `decideInsetChange`, ContinuityToken, OpenAction). Top-align only. **Debug default ON** via `sonarTranscriptPolicyHostEnabled` (every build after Phase 3; kill switch `SONAR_TRANSCRIPT_PHASE2_HOST=0`). Spike B `reverseLayout` stays Settings-demo only.
 - Landed outside the Phase 2 shell: iOS first-open awaits local page before `push(.dm)`; Compose keyed Day/Unread/Row feed items; media Ready/thumb skip-reload; SNMsgList ContinuityToken on loadOlder fallback.
 
 ### Phase 3 — Signal engine + production cutover ✅
@@ -139,9 +139,9 @@ No production list cutover yet.
 6. Short-feed matches chosen shell (A or B) on **both** platforms  
 7. Agent-DM keyboard does not rebuild the whole window every frame  
 
-### Device smoke (Debug Phase 2 hosts)
+### Device smoke (Phase 2/3 hosts ON)
 
-Install Debug on Pixel (`./gradlew :composeApp:installDebug`) and iPhone (Debug `xcodebuild` + `devicectl install`), force-stop, then:
+Install Debug on Pixel (`./gradlew :composeApp:installDebug`; `adb install -r` only — never uninstall Sonar) and Vincenzo iPhone (Debug `xcodebuild` + `devicectl device install app`), force-stop, then:
 
 1. First open of a chat (process cold) — no snapshot→rebuild flash  
 2. Reopen same chat — instant retained paint  
@@ -150,6 +150,8 @@ Install Debug on Pixel (`./gradlew :composeApp:installDebug`) and iPhone (Debug 
 5. loadOlder — no jump  
 6. Media-heavy chat — no decode/reflow thrash  
 7. Day chips correct while scrolling up  
+
+Spike B reverseLayout short-feed remains an explicit next cutover after this smoke passes.
 
 ---
 

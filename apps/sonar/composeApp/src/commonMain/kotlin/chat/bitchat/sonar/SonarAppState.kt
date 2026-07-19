@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.crypto.Bech32
@@ -1117,6 +1118,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  grown — new arrivals were already marked read and must not drift it. */
     var openChatUnreadAnchor by mutableStateOf<Map<String, String>>(emptyMap())
 
+    /** Search / deep-link jump target for the current open (#372). Wins over
+     *  unread/live-edge in [TranscriptScrollPolicy.resolveOpenAction]. */
+    var openChatJumpMessageId by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
     /**
      * Capture the chat's unread count before opening clears it.
      *
@@ -1127,12 +1133,17 @@ class SonarAppState(private val scope: CoroutineScope) {
      * plain Marmot chats got one. That resolver is also what the read-marking
      * paths use, so capture and clear always cover the same groups.
      */
-    private fun captureOpenChatUnread(chatId: String) {
+    private fun captureOpenChatUnread(chatId: String, jumpMessageId: String? = null) {
         val unreadAtOpen = transcriptGroupIds(chatId).sumOf { unreadByChat[it] ?: 0L }
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
         // Always publish a settled value (including 0). Missing key means
         // capture has not run — hosts must not coerce that to live-edge.
         openChatUnread = openChatUnread + (chatId to unreadAtOpen)
+        openChatJumpMessageId = if (jumpMessageId != null) {
+            openChatJumpMessageId + (chatId to jumpMessageId)
+        } else {
+            openChatJumpMessageId - chatId
+        }
     }
 
     /** Give up on a pending unread divider for this open: the transcript is
@@ -1142,6 +1153,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun retireOpenChatUnread(chatId: String) {
         openChatUnread = openChatUnread + (chatId to 0L)
         openChatUnreadAnchor = openChatUnreadAnchor - chatId
+        openChatJumpMessageId = openChatJumpMessageId - chatId
     }
 
     /** Account wipe/erase: per-open transcript state must not outlive the
@@ -1149,6 +1161,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun clearOpenChatTransientState() {
         openChatUnread = emptyMap()
         openChatUnreadAnchor = emptyMap()
+        openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
     }
 
@@ -2494,6 +2507,25 @@ class SonarAppState(private val scope: CoroutineScope) {
     var presenceByGeohash by mutableStateOf<Map<String, Int>>(emptyMap())
         private set
     var toast by mutableStateOf<String?>(null)
+
+    /**
+     * In-memory composer drafts keyed by chat id (DM, channel, geo-DM).
+     * Survives leaving a chat and returning within the same process; cleared on send.
+     */
+    private val composerDrafts = mutableStateMapOf<String, String>()
+
+    fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
+
+    fun setComposerDraft(chatId: String, text: String) {
+        val current = composerDrafts.toMap()
+        val next = updatedComposerDrafts(current, chatId, text)
+        if (next == current) return
+        if (!next.containsKey(chatId)) {
+            composerDrafts.remove(chatId)
+        } else {
+            composerDrafts[chatId] = next.getValue(chatId)
+        }
+    }
 
     /** "N here now" for a geohash channel (0 ⇒ unknown / nobody). */
     fun presence(geohash: String): Int = presenceByGeohash[geohash] ?: 0
@@ -4256,7 +4288,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
-    fun openChat(chat: SonarChat) {
+    fun openChat(chat: SonarChat, jumpMessageId: String? = null) {
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
         clearNotificationsForChat(chat.id)
@@ -4278,7 +4310,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         val readChatIds = directMarmotChatIds(chat.id)
-        captureOpenChatUnread(chat.id)
+        captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
         unreadByChat = unreadByChat - readChatIds.toSet()
         val title = chatTitle(chat)
@@ -4335,12 +4367,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  BLE mesh (Noise) while in Bluetooth range, White Noise (Marmot) when out of
      *  range for a Sonar peer — both legs merged into one thread. [pay] auto-opens
      *  the payment sheet (radar "Send sats"). */
-    fun openDm(peerId: String, name: String, pay: Boolean = false) {
+    fun openDm(peerId: String, name: String, pay: Boolean = false, jumpMessageId: String? = null) {
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         val id = meshChatId(canonicalPeerId)
         if (name.isNotBlank()) rememberMeshName(canonicalPeerId, name)
         clearNotificationsForChat(id)
-        captureOpenChatUnread(id)
+        captureOpenChatUnread(id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(id)
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
@@ -4516,6 +4548,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             retainOpenTranscript(it.id, messages)
             openChatUnread = openChatUnread - it.id
             openChatUnreadAnchor = openChatUnreadAnchor - it.id
+            openChatJumpMessageId = openChatJumpMessageId - it.id
         }
         if (stack.size > 1) stack = stack.dropLast(1)
         restoreRevealedChatOrClear()
@@ -4534,6 +4567,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             messages = emptyList()
             openChatUnread = emptyMap()
             openChatUnreadAnchor = emptyMap()
+            openChatJumpMessageId = emptyMap()
         }
     }
 

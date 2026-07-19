@@ -104,6 +104,7 @@ struct SonarChannelScreen: View {
             }
 
             SNComposer(
+                text: store.composerDraftBinding(for: chId),
                 placeholder: "Message \(ch.name)",
                 transport: transport,
                 onSend: { store.sendCh(chId, $0) },

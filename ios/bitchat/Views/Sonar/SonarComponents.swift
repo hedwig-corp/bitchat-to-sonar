@@ -718,13 +718,8 @@ struct SNMediaPipeline {
     )
 }
 
-/// O(1) identity for transcript changes that can affect the live edge. A
-/// bounded window can replace its tail without changing count, so both fields
-/// are required; intermediate row identities do not change tail-following.
-struct SNTailRevision: Equatable {
-    let itemCount: Int
-    let tailID: String?
-}
+/// O(1) identity for transcript changes that can affect the live edge.
+/// Defined in TranscriptEngine; Sonar keeps the SN* name via TranscriptEngineSonarCompat.
 
 /// Reference-semantic height scratchpad. Mutating `last` does not invalidate
 /// SwiftUI the way `@State CGFloat` would, so keyboard animation can update
@@ -743,26 +738,8 @@ enum SNUserScrollActivity: Equatable {
     case towardTail
 }
 
-/// Signal `updateContentInsets` non-pinned branch: a reader away from the
-/// tail is shifted in lockstep with the inset change, clamped to the content
-/// bounds (`(oldYOffset + insetChange).clamp(minYOffset, safeContentHeight)`),
-/// with `maxContentOffsetY` using `max()` so a short chat rests top-aligned.
-/// UIKit performs the lockstep itself for safe-area-driven insets; what the
-/// SwiftUI stack lacks is the clamp — after keyboard dismiss the offset can
-/// rest past the new maximum, leaving a keyboard-sized blank band under the
-/// last message. Returns the corrected offset, or nil when already at rest
-/// within bounds.
-func snRestingOffsetOvershootCorrection(
-    offsetY: CGFloat,
-    boundsHeight: CGFloat,
-    contentHeight: CGFloat,
-    topInset: CGFloat,
-    bottomInset: CGFloat
-) -> CGFloat? {
-    let minY = -topInset
-    let maxY = max(minY, contentHeight + bottomInset - boundsHeight)
-    return offsetY > maxY + 1 ? maxY : nil
-}
+/// Signal `updateContentInsets` non-pinned branch — implemented in TranscriptEngine
+/// (`transcriptRestingOffsetOvershootCorrection` / `snRestingOffsetOvershootCorrection` shim).
 
 /// Signal owns the conversation scroll view's bottom inset itself
 /// (`newInsets.bottom = bottomBarContainer.frame.height - safeAreaInsets.bottom`)
@@ -779,16 +756,8 @@ func snOwnedTranscriptBottomContentInset(
     return 0
 }
 
-/// Signal `scrollToBottomOfLoadWindow`: `contentOffset.y = maxContentOffsetY`.
-func snScrollToBottomOfLoadWindowOffsetY(
-    boundsHeight: CGFloat,
-    contentHeight: CGFloat,
-    topInset: CGFloat,
-    bottomInset: CGFloat
-) -> CGFloat {
-    let minY = -topInset
-    return max(minY, contentHeight + bottomInset - boundsHeight)
-}
+/// Signal `scrollToBottomOfLoadWindow` — implemented in TranscriptEngine
+/// (`transcriptScrollToBottomOfLoadWindowOffsetY` / `snScrollToBottomOfLoadWindowOffsetY` shim).
 
 /// iOS 17+ / macOS 14+: start (and keep) the scroll view at the live edge —
 /// Signal `scrollToInitialPosition` → `scrollToBottomOfLoadWindow` for
@@ -3783,7 +3752,33 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 }
 
+/// Prepare a composer send: trim payload and require an empty draft before the
+/// send/command callback runs. The UIKit transcript host refreshes the hosted
+/// composer synchronously inside that callback; clearing after can re-bind the
+/// pre-send text. Compose already clears draft before send.
+func snPrepareComposerSend(text: String) -> String? {
+    let payload = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return payload.isEmpty ? nil : payload
+}
+
+/// Session-scoped per-chat draft map update. Empty text removes the entry so
+/// navigating away and back restores only real in-progress drafts.
+func snUpdatedComposerDrafts(
+    drafts: [String: String],
+    chatId: String,
+    text: String
+) -> [String: String] {
+    var next = drafts
+    if text.isEmpty {
+        next.removeValue(forKey: chatId)
+    } else {
+        next[chatId] = text
+    }
+    return next
+}
+
 struct SNComposer: View {
+    @Binding var text: String
     let placeholder: String
     let transport: SNVia
     let onSend: (String) -> Void
@@ -3798,7 +3793,6 @@ struct SNComposer: View {
     /// Hold-to-record produced a voice note at this file URL (audio/mp4 .m4a).
     var onVoice: (URL) -> Void = { _ in }
 
-    @State private var text = ""
     @State private var showEmojiTray = false
     @State private var stickerPacks: [StickerPackInfo] = []
     @FocusState private var composerFocused: Bool
@@ -3850,16 +3844,16 @@ struct SNComposer: View {
     }
 
     private func send() {
-        let tx = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tx.isEmpty else { return }
+        guard let tx = snPrepareComposerSend(text: text) else { return }
+        // Clear before the send callback (see snPrepareComposerSend).
+        text = ""
+        showEmojiTray = false
         if tx.hasPrefix("/") {
             let cmd = tx.dropFirst().split(separator: " ").first.map(String.init)?.lowercased() ?? ""
             onCommand(cmd)
         } else {
             onSend(tx)
         }
-        text = ""
-        showEmojiTray = false
     }
 
     var body: some View {
@@ -3869,8 +3863,8 @@ struct SNComposer: View {
                     HStack(spacing: 8) {
                         ForEach(snCommands, id: \.0) { cmd, desc in
                             Button {
-                                onCommand(cmd)
                                 text = ""
+                                onCommand(cmd)
                             } label: {
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(verbatim: "/" + cmd)

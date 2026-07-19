@@ -41,6 +41,7 @@ import chat.bitchat.sonar.SlashHints
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChannelMsg
 import chat.bitchat.sonar.ToastBar
+import chat.bitchat.sonar.composerDraftKeyForChannel
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
 import chat.bitchat.sonar.ui.SNDot
@@ -56,7 +57,8 @@ import chat.bitchat.sonar.ui.sonar
 @Composable
 fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
     val s = sonar
-    var draft by remember { mutableStateOf("") }
+    val draftKey = composerDraftKeyForChannel(screen.geohash)
+    val draft = state.composerDraft(draftKey)
     var authorSheet by remember { mutableStateOf<SonarChannelMsg?>(null) }
     val listState = rememberLazyListState()
     LaunchedEffect(state.channelMsgs.size) {
@@ -140,7 +142,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             }
         }
 
-        if (draft.startsWith("/")) SlashHints(draft) { draft = it }
+        if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(draftKey, it) }
 
         // composer
         Row(Modifier.fillMaxWidth().padding(10.dp), verticalAlignment = Alignment.Bottom) {
@@ -151,14 +153,14 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             ) {
                 if (draft.isEmpty()) Text("Message $name", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
-                    value = draft, onValueChange = { draft = it },
+                    value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
                     modifier = Modifier.fillMaxWidth(),
                     onSend = {
                         if (draft.isBlank()) return@MessageComposerTextField
                         val d = draft
-                        draft = ""
+                        state.setComposerDraft(draftKey, "")
                         if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
                             state.sendChannelMsg(screen.geohash, d)
                         }
@@ -170,7 +172,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                 Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
                     .clickable {
                         val d = draft
-                        draft = ""
+                        state.setComposerDraft(draftKey, "")
                         if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
                             state.sendChannelMsg(screen.geohash, d)
                         }

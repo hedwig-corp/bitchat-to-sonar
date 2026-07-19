@@ -1,5 +1,7 @@
 plugins {
     alias(libs.plugins.multiplatform)
+    alias(libs.plugins.compose)
+    alias(libs.plugins.compose.compiler)
     alias(libs.plugins.android.library)
 }
 
@@ -15,20 +17,18 @@ kotlin {
         }
     }
     sourceSets {
-        commonTest.dependencies {
-            implementation(kotlin("test"))
-        }
-        // Canonical golden lives in golden/; wire it once (do NOT also add
-        // src/commonTest/resources — KMP already includes that path and a
-        // duplicate open-action.json breaks jvmTestProcessResources).
-        val commonTest by getting {
-            resources.srcDir("golden")
+        commonMain.dependencies {
+            api(project(":transcript-engine-compose"))
+            api(project(":transcript-engine-policy"))
+            implementation(compose.runtime)
+            implementation(compose.foundation)
+            implementation(compose.material3)
         }
     }
 }
 
 android {
-    namespace = "chat.hedwig.transcript"
+    namespace = "chat.hedwig.transcript.sample"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
         minSdk = libs.versions.android.minSdk.get().toInt()
@@ -37,5 +37,4 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    sourceSets["test"].resources.srcDir("golden")
 }

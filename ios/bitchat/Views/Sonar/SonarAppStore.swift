@@ -725,6 +725,30 @@ final class SonarAppStore: ObservableObject {
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
+    /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
+    /// Survives leaving a chat and returning within the same process; cleared on send.
+    /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate
+    /// every `SonarAppStore` observer and re-enter the UIKit transcript host
+    /// (`updateUIViewController` → `applySnapshot`) while typing.
+    private var composerDrafts: [String: String] = [:]
+
+    func composerDraft(for chatId: String) -> String {
+        composerDrafts[chatId] ?? ""
+    }
+
+    func setComposerDraft(_ text: String, for chatId: String) {
+        let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
+        guard next != composerDrafts else { return }
+        composerDrafts = next
+    }
+
+    func composerDraftBinding(for chatId: String) -> Binding<String> {
+        Binding(
+            get: { [weak self] in self?.composerDraft(for: chatId) ?? "" },
+            set: { [weak self] in self?.setComposerDraft($0, for: chatId) }
+        )
+    }
+
     private var currentDMId: String? {
         if case .dm(let id)? = path.last { return id }
         return nil
@@ -1829,6 +1853,8 @@ final class SonarAppStore: ObservableObject {
     private func clearAccountBoundLocalStateForRestore() {
         path = []
         unreadCountAtOpenByDM.removeAll()
+        jumpMessageIdAtOpenByDM.removeAll()
+        pendingJumpMessageIdByDM.removeAll()
         chatViewModel.clearAllConversations()
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -3302,7 +3328,7 @@ final class SonarAppStore: ObservableObject {
     /// can resolve the recipient) and navigates to the DM screen.
     func openChannelDM(_ author: SNChannelAuthor) {
         chatViewModel.startGeohashDM(withPubkeyHex: author.pubkeyHex)
-        push(.dm(author.routeId))
+        openDM(author.routeId)
     }
 
     /// Block a geohash participant (persists across launches; their messages
@@ -6247,6 +6273,12 @@ final class SonarAppStore: ObservableObject {
     /// divider (Signal-style); cleared when the route pops.
     @Published var unreadCountAtOpenByDM: [String: UInt64] = [:]
 
+    /// Search / deep-link jump for the current DM open (#372). Not `@Published`
+    /// — set once at push; host reads it on first apply.
+    private(set) var jumpMessageIdAtOpenByDM: [String: String] = [:]
+    /// Stashed by `openDM(jumpMessageId:)` and consumed in `captureUnreadAtOpen`.
+    private var pendingJumpMessageIdByDM: [String: String] = [:]
+
     /// Capture the DM's unread count at navigation time — BEFORE `openedDM`
     /// zeroes the core counter — so the transcript can anchor at the first
     /// unread row with a divider (Signal-style) instead of force-pinning the
@@ -6260,6 +6292,11 @@ final class SonarAppStore: ObservableObject {
     /// the alpha.11 unread→tail flash race).
     func captureUnreadAtOpen(_ id: String) {
         unreadCountAtOpenByDM[id] = nil
+        if let jump = pendingJumpMessageIdByDM.removeValue(forKey: id) {
+            jumpMessageIdAtOpenByDM[id] = jump
+        } else {
+            jumpMessageIdAtOpenByDM[id] = nil
+        }
         let groupId = marmotGroupId(id)
             ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
         guard let groupId else {
@@ -6319,8 +6356,14 @@ final class SonarAppStore: ObservableObject {
     func openDM(
         _ id: String,
         marmotGroupId knownMarmotGroupId: String? = nil,
+        jumpMessageId: String? = nil,
         present: (() -> Void)? = nil
     ) {
+        if let jumpMessageId {
+            pendingJumpMessageIdByDM[id] = jumpMessageId
+        } else {
+            pendingJumpMessageIdByDM[id] = nil
+        }
         let presentDM = present ?? { self.push(.dm(id)) }
         if pendingMarmotNpub(for: id) != nil || isPendingMarmotGroup(id) {
             openedDM(id, marmotGroupId: knownMarmotGroupId)
@@ -7142,7 +7185,11 @@ final class SonarAppStore: ObservableObject {
         cleanupPreviewTempFiles()
         // The unread divider lives while its chat is on the stack; leaving the
         // chat retires it so a later reopen (already marked read) starts clean.
-        if case .dm(let id)? = path.last { unreadCountAtOpenByDM[id] = nil }
+        if case .dm(let id)? = path.last {
+            unreadCountAtOpenByDM[id] = nil
+            jumpMessageIdAtOpenByDM[id] = nil
+            pendingJumpMessageIdByDM[id] = nil
+        }
         if !path.isEmpty { path.removeLast() }
     }
 
@@ -7655,6 +7702,8 @@ final class SonarAppStore: ObservableObject {
     func eraseAllChats() {
         path = []
         unreadCountAtOpenByDM.removeAll()
+        jumpMessageIdAtOpenByDM.removeAll()
+        pendingJumpMessageIdByDM.removeAll()
         conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
@@ -7714,6 +7763,8 @@ final class SonarAppStore: ObservableObject {
     private func performWipe() async {
         path = []
         unreadCountAtOpenByDM.removeAll()
+        jumpMessageIdAtOpenByDM.removeAll()
+        pendingJumpMessageIdByDM.removeAll()
         // The Breez node must release its SQLite store before wallet files are
         // deleted. Await this before revealing onboarding so a fast re-onboard
         // cannot race a still-running destructive wallet task.
