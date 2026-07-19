@@ -301,17 +301,14 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 self.lastContentHeight = height
                 return
             }
-            guard !self.isUserScrolling, !self.isLoadingOlder else {
-                self.lastContentHeight = height
-                return
-            }
-            // Do not advance lastContentHeight while unpinned during open —
-            // otherwise the final pre-latch size is consumed and never re-pins
-            // when needsLiveEdgeOpen / wasPinned land a turn later.
+            // Always advance the watermark (MsgList shape). Freezing it while
+            // unpinned leaves a stale floor that can delayed-pin on the next
+            // callback once wasPinned / near-bottom becomes true.
+            self.lastContentHeight = height
+            guard !self.isUserScrolling, !self.isLoadingOlder else { return }
             guard self.needsLiveEdgeOpen || self.latch.wasPinned || self.isScrolledToBottom() else {
                 return
             }
-            self.lastContentHeight = height
             self.scrollToBottomOfLoadWindow(animated: false)
         }
         applySnapshot()
@@ -686,6 +683,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             CGPoint(x: collectionView.contentOffset.x, y: y),
             animated: animated
         )
+        lastContentHeight = collectionView.contentSize.height
         latch.tailVisible(itemCount: entries.count, tailID: entries.last?.id)
         clearLiveEdgeOpenIfSettled()
     }
@@ -762,7 +760,6 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             latch.userScrolled(isNearBottom: false)
         }
 
-        lastBarHeight = barHeight
         var inset = collectionView.contentInset
         inset.top = 0
         inset.bottom = owned
@@ -773,6 +770,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             collectionView.scrollIndicatorInsets = inset
             collectionView.contentOffset = oldOffset
         }
+        // Mark chrome applied only after inset is committed so
+        // clearLiveEdgeOpenIfSettled cannot race a stale bottom inset.
+        lastBarHeight = barHeight
 
         let delta = owned - oldBottom
         switch captured.decision {
