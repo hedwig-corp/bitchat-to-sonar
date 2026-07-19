@@ -310,16 +310,18 @@ final class MarmotService: @unchecked Sendable {
     /// MLS mutations internally (`MarmotEngine::write_lock`), so a send here
     /// runs concurrently with an in-flight sync/upload and waits at most for
     /// one in-flight MLS mutation, never for a relay fetch or Blossom PUT.
-    /// Mirrors Signal-iOS’s non-media send slot / Signal-Android’s plain
-    /// recipient queue (not `::MEDIA`).
+    /// Same intent as Signal keeping plain text off a stuck media send path.
     private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
 
-    /// Serial Blossom media lane (Android: media off `marmotSendMutex` on
-    /// `Dispatchers.IO`; Signal: `AttachmentUploadJob` / `Upload.uploadQueue`).
-    /// Encrypt+PUT can take minutes — must not park text sends on `sendQueue`
-    /// or sync on `workQueue`. Resume shares this lane so a reconnect resume
-    /// cannot FIFO-block composer text; new uploads serialize with resume
-    /// (core `try_claim_media_upload` still guards double-work).
+    /// Serial Blossom media lane. Encrypt+PUT can take minutes — must not park
+    /// text on `sendQueue` or sync on `workQueue` (Android keeps media off
+    /// `marmotSendMutex`; Signal isolates upload work from sync/text runners).
+    /// Host-lane isolation only: encrypt→Blossom→outbox still runs as one
+    /// UniFFI `block_on` (not a separate AttachmentUploadJob). Resume shares
+    /// this lane so reconnect resume cannot FIFO-block composer text; new
+    /// uploads serialize with resume (core `try_claim_media_upload` still
+    /// guards double-work). Serial-by-design vs Compose’s overlapping IO —
+    /// tradeoff for UniFFI `block_on` + resume ordering.
     private let mediaQueue = DispatchQueue(label: "chat.bitchat.marmot-media", qos: .userInitiated)
 
     /// Serial receive/drain lane (Android `Dispatchers.IO` parity for drain).
@@ -731,8 +733,8 @@ final class MarmotService: @unchecked Sendable {
     /// media message to the group. `serverUrl` empty → the core default.
     ///
     /// Uses `mediaLane` (not `workQueue` / `sendLane`): Blossom PUTs can take
-    /// minutes and must not FIFO-block sync or text/sticker sends — Signal
-    /// `AttachmentUploadJob` / Android media-off-`marmotSendMutex` parity.
+    /// minutes and must not FIFO-block sync or text/sticker sends — Android
+    /// media-off-`marmotSendMutex` host isolation (not full Signal job-split).
     func sendMedia(
         groupId: String,
         data: Data,

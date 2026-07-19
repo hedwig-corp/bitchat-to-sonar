@@ -2578,11 +2578,14 @@ final class MarmotChatModel: ObservableObject {
             }
             registerMediaUploadListener(echo.id, listener)
             do {
-                // Blossom upload does not need the relay — do not gate on
-                // ensureConnected. Paint the optimistic echo immediately;
-                // durable staging keeps the attachment if the process dies
-                // mid-upload. Publish waits for relay via the outbox after
-                // the URL exists.
+                // Wait for a local Marmot node (`isConnected`), not relay
+                // (`isRelayConnected`). Blossom PUTs do not need relays; kind-445
+                // publish still goes through the durable outbox after the URL
+                // exists. Without this short wait, cold-start media can fail
+                // with notConnected before staging.
+                guard await ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
@@ -2684,7 +2687,10 @@ final class MarmotChatModel: ObservableObject {
             }
             registerMediaUploadListener(echo.id, listener)
             do {
-                // Same as sendMedia: Blossom is not gated on relay connect.
+                // Same as sendMedia: local node only — not `ensureRelayConnected`.
+                guard await ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
