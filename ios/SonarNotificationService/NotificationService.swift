@@ -91,7 +91,9 @@ class NotificationService: SDKNotificationService {
 
     override func serviceExtensionTimeWillExpire() {
         hydrateTask?.cancel()
-        releaseMarmotWakeNode()
+        // Do NOT release the store lock / SonarNode here. Collect owns that
+        // lifecycle and may still hold an open SQLCipher handle on a worker;
+        // unlock-before-close races the host (goose M1).
         #if DEBUG
         Self.logResidentMemory("expire")
         #endif
@@ -101,12 +103,17 @@ class NotificationService: SDKNotificationService {
             // sync that finished apply-then-lost-the-race-to-expire delivered
             // "New Sonar message" even when diagnostics said decorated.
             let stillPlaceholder = (content.userInfo["sonar.nsePlaceholder"] as? Bool) == true
-            if stillPlaceholder {
+            if SonarNSEDecoratePolicy.shouldReapplyPlaceholderOnExpire(
+                isPlaceholder: stillPlaceholder
+            ) {
                 Self.configureTransponderNotification(content)
                 Self.recordDiagnostic("expire:stillPlaceholder")
             } else {
                 Self.recordDiagnostic(
-                    "expire:keepingDecorated title=\(content.title.prefix(32)) body=\(content.body.prefix(40))"
+                    SonarNSEDecoratePolicy.diagnosticExpireKeepingDecorated(
+                        title: content.title,
+                        body: content.body
+                    )
                 )
             }
             finish(with: content)
@@ -122,15 +129,21 @@ class NotificationService: SDKNotificationService {
             return
         }
         do {
-            let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
+            // Blocking UniFFI on a cooperative child Task (not detached) so
+            // cancel propagates; collect still owns node+lock release.
+            let hintGroupId = SonarNSEDecoratePolicy.hintGroupIdHex(
+                from: content.userInfo
+            )
+            let notifications = try await Task(priority: .userInitiated) { [weak self] in
                 guard let self else { return [DrainNotificationInfo]() }
-                return try self.collectMarmotNotificationsAfterWake()
+                return try self.collectMarmotNotificationsAfterWake(
+                    hintGroupIdHex: hintGroupId
+                )
             }.value
             #if DEBUG
             Self.logResidentMemory("after-wake")
             #endif
             guard !Task.isCancelled else {
-                releaseMarmotWakeNode()
                 finish(with: content)
                 return
             }
@@ -138,7 +151,6 @@ class NotificationService: SDKNotificationService {
                 os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
                        log: Self.log, type: .info)
                 Self.recordDiagnostic("emptyDrain:keepingGeneric")
-                releaseMarmotWakeNode()
                 finish(with: content)
                 return
             }
@@ -158,9 +170,14 @@ class NotificationService: SDKNotificationService {
             os_log("NSE: Marmot wake decorated primary + %d additional",
                    log: Self.log, type: .info, extras.count)
             Self.recordDiagnostic(
-                "decorated:showNames=\(prefs.showNames):showPreview=\(prefs.showPreview):extras=\(extras.count):title=\(content.title.prefix(40)):body=\(content.body.prefix(48))"
+                SonarNSEDecoratePolicy.diagnosticDecorated(
+                    showNames: prefs.showNames,
+                    showPreview: prefs.showPreview,
+                    extras: extras.count,
+                    title: content.title,
+                    body: content.body
+                )
             )
-            releaseMarmotWakeNode()
             finish(with: content)
         } catch {
             os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
@@ -170,11 +187,8 @@ class NotificationService: SDKNotificationService {
             if Self.lastDiagnostic().isEmpty {
                 Self.recordDiagnostic("failed:\(String(describing: error))")
             } else {
-                Self.recordDiagnostic(
-                    "\(Self.lastDiagnostic()) | catch:\(String(describing: error))"
-                )
+                Self.recordDiagnostic("catch:\(String(describing: error))")
             }
-            releaseMarmotWakeNode()
             finish(with: content)
         }
     }
@@ -182,7 +196,9 @@ class NotificationService: SDKNotificationService {
     /// Blocking UniFFI work — always call off the main actor.
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
     /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
-    private func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
+    private func collectMarmotNotificationsAfterWake(
+        hintGroupIdHex: String?
+    ) throws -> [DrainNotificationInfo] {
         let nsec = Self.readKeychainString(account: Self.nsecKeychainKey)
         let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey)
         guard let nsec, let dbKeyHex, !nsec.isEmpty, dbKeyHex.count == 64 else {
@@ -213,43 +229,46 @@ class NotificationService: SDKNotificationService {
         marmotWakeNode = node
         marmotWakeStoreLock = storeLock
         wakeNodeLock.unlock()
-        do {
-            var drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
-            // Mirror SonarPushProcessor unread-delta: drain can be empty when the
-            // row was already local, the concurrent app wake consumed the pending
-            // list first, or sync only advanced summaries. Prefer the newest
-            // unread conversation so the banner still gets names/preview.
-            // Cap at one — extras from unrelated stale unreads look like spam
-            // "Sonar Notification" banners and hide the tip that just arrived.
-            if drained.isEmpty {
-                let fromUnread = Self.drainNotificationsFromUnreadSummaries(node)
-                if !fromUnread.isEmpty {
-                    // Stamped before decorate overwrites — proves unread path.
-                    Self.recordDiagnostic(
-                        "emptyDrain:fallbackUnread tip=\(fromUnread[0].contentPreview.prefix(48))"
-                    )
-                    drained = fromUnread
-                }
+        // Always close node before unlocking — never unlock under an open handle.
+        defer { releaseMarmotWakeNode() }
+        var drained = try node.collectNotificationsAfterWake(maxWaitMs: Self.marmotWakeWaitMs)
+        // Mirror SonarPushProcessor unread-delta: drain can be empty when the
+        // row was already local, the concurrent app wake consumed the pending
+        // list first, or sync only advanced summaries. Prefer the newest
+        // unread conversation so the banner still gets names/preview.
+        // Cap at one — extras from unrelated stale unreads look like spam
+        // banners and hide the tip that just arrived.
+        if drained.isEmpty {
+            let fromUnread = Self.drainNotificationsFromUnreadSummaries(
+                node,
+                hintGroupIdHex: hintGroupIdHex
+            )
+            if !fromUnread.isEmpty {
+                Self.recordDiagnostic(
+                    SonarNSEDecoratePolicy.diagnosticFallbackUnread(count: fromUnread.count)
+                )
+                drained = fromUnread
             }
-            // Resolve kind-0 names while the node is still open (main-app path
-            // does the same via MarmotService.resolveSenderName).
-            drained = Self.withResolvedSenderLabels(drained, node: node)
-            releaseMarmotWakeNode()
-            return drained
-        } catch {
-            releaseMarmotWakeNode()
-            throw error
         }
+        return drained
     }
 
     /// Build banner rows from local unread conversation summaries (newest tip only).
     private static func drainNotificationsFromUnreadSummaries(
-        _ node: SonarNode
+        _ node: SonarNode,
+        hintGroupIdHex: String?
     ) -> [DrainNotificationInfo] {
-        Array(
-            node.conversationSummaries()
-                .filter { $0.unreadCount > 0 && !$0.latestMine }
-                .sorted { $0.latestAtSecs > $1.latestAtSecs }
+        let unread = node.conversationSummaries()
+            .filter { $0.unreadCount > 0 && !$0.latestMine }
+            .sorted { $0.latestAtSecs > $1.latestAtSecs }
+        let allowedIds = SonarNSEDecoratePolicy.filterUnreadTips(
+            groupIdHexes: unread.map(\.groupIdHex),
+            hintGroupIdHex: hintGroupIdHex
+        )
+        let allowed = Set(allowedIds.map { $0.lowercased() })
+        return Array(
+            unread
+                .filter { allowed.contains($0.groupIdHex.lowercased()) }
                 .prefix(1)
                 .map { summary in
                     DrainNotificationInfo(
@@ -263,43 +282,9 @@ class NotificationService: SDKNotificationService {
         )
     }
 
-    /// Replace raw hex/npub sender fields with kind-0 display names when known.
-    private static func withResolvedSenderLabels(
-        _ notifications: [DrainNotificationInfo],
-        node: SonarNode
-    ) -> [DrainNotificationInfo] {
-        notifications.map { note in
-            let label = resolvedSenderLabel(for: note.senderNpub, node: node)
-            guard label != note.senderNpub else { return note }
-            return DrainNotificationInfo(
-                messageIdHex: note.messageIdHex,
-                senderNpub: label,
-                groupIdHex: note.groupIdHex,
-                groupName: note.groupName,
-                contentPreview: note.contentPreview
-            )
-        }
-    }
-
-    private static func resolvedSenderLabel(for sender: String, node: SonarNode) -> String {
-        let trimmed = sender.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return trimmed }
-        if let profile = try? node.fetchProfile(npub: trimmed) {
-            let candidate = [profile.displayName, profile.name]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first { !$0.isEmpty }
-            if let candidate { return candidate }
-        }
-        // Hex pubkeys without a kind-0 profile read as opaque noise on the
-        // lock screen ("Sonar Notification"). Prefer a clear generic label.
-        if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
-            return "New message"
-        }
-        return shortLabel(for: trimmed)
-    }
-
     private func releaseMarmotWakeNode() {
         wakeNodeLock.lock()
+        // Drop the SQLCipher handle first, then the flock.
         marmotWakeNode = nil
         marmotWakeStoreLock?.release()
         marmotWakeStoreLock = nil
@@ -386,30 +371,16 @@ class NotificationService: SDKNotificationService {
         to content: UNMutableNotificationContent,
         prefs: NSENotificationPrefs
     ) {
-        let groupName = meaningfulGroupName(notification.groupName)
-        let sender = prefs.showNames
-            ? shortLabel(for: notification.senderNpub)
-            : nil
-        // Match SonarPushProcessor / router: 1:1 uses sender (or bare group);
-        // only multi-party style titles use "sender in group".
-        let title: String
-        if let groupName, let sender, groupName != sender {
-            title = "\(sender) in \(groupName)"
-        } else if let sender {
-            title = sender
-        } else if let groupName {
-            title = groupName
-        } else {
-            title = "New Sonar message"
-        }
-        let body: String
-        if prefs.showPreview, !notification.contentPreview.isEmpty {
-            body = notification.contentPreview
-        } else {
-            body = "Open Sonar to read it."
-        }
-        content.title = title
-        content.body = body
+        let rendered = SonarNSEDecoratePolicy.render(
+            input: .init(
+                senderRaw: notification.senderNpub,
+                groupName: notification.groupName,
+                contentPreview: notification.contentPreview
+            ),
+            prefs: .init(showNames: prefs.showNames, showPreview: prefs.showPreview)
+        )
+        content.title = rendered.title
+        content.body = rendered.body
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
         if #available(iOS 15.0, *) {
@@ -428,22 +399,6 @@ class NotificationService: SDKNotificationService {
         content.userInfo = userInfo
     }
 
-    /// Drop placeholder 1:1 names so the banner title is the peer, not
-    /// "hex… in Sonar agent DM".
-    private static func meaningfulGroupName(_ raw: String) -> String? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let lowered = trimmed.lowercased()
-        let placeholders: Set<String> = [
-            "sonar agent dm",
-            "dm",
-            "direct message",
-            "new chat",
-        ]
-        if placeholders.contains(lowered) { return nil }
-        return trimmed
-    }
-
     private static func postAdditionalLocalNotification(
         _ notification: DrainNotificationInfo,
         prefs: NSENotificationPrefs
@@ -457,17 +412,6 @@ class NotificationService: SDKNotificationService {
         let id = "sonar-nse-\(idSuffix)"
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
-    }
-
-    private static func shortLabel(for npub: String) -> String {
-        let trimmed = npub.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return trimmed }
-        // Hex pubkeys (64 chars) — show a short fingerprint, not a fake npub cut.
-        if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
-            return String(trimmed.prefix(8)) + "…"
-        }
-        guard trimmed.count > 16 else { return trimmed }
-        return String(trimmed.prefix(12)) + "…"
     }
 
     private func finish(with content: UNNotificationContent) {

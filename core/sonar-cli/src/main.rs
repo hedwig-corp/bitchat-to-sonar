@@ -141,7 +141,7 @@ struct SendArgs {
     /// Keep this CLI process alive until a relay acknowledges the new message
     /// and the MIP-05 push gift-wrap has been published. Default on: process
     /// exit otherwise cancels the background push task before Transponder sees
-    /// it (apps stay alive, so they do not need this). Pass --no-wait-for-ack
+    /// it (apps stay alive, so they do not need this). Pass `--wait-for-ack false`
     /// only for local-echo timing tests.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     wait_for_ack: bool,
