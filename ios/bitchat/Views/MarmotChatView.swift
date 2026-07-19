@@ -304,6 +304,11 @@ final class MarmotChatModel: ObservableObject {
     /// drain is single-consume). Cleared when the waiter collects them.
     private var pushWakeDrainActive = false
     private var pushWakeDrainBuffer: [DrainNotificationInfo] = []
+    /// Nested `refresh()` waiters share one capture window (refcount).
+    private var pushWakeDrainWaiters = 0
+    /// Gap-recovery drain handed to at most one `refresh()` awaiter so overlapping
+    /// push wakes cannot double-post the same recovered notifications.
+    private var gapRecoveryUnclaimedDrain: [DrainNotificationInfo]?
     private var relayBusy = false
     #if DEBUG
     /// SONAR_BENCH: one-shot guards for the post-connect "first wake" (T3b) and
@@ -1516,13 +1521,18 @@ final class MarmotChatModel: ObservableObject {
     /// threads and the UI repaints from `conversationChanged`.
     ///
     /// Production shape:
-    /// 1. Drain + paint on the dedicated receive lane first.
-    /// 2. If the live buffer already delivered: return those notifications for
-    ///    titled push; run single-flight `syncForce` in the background.
-    /// 3. If empty (socket was dead): await that same single-flight and merge
-    ///    its drain with any notifications the polling loop stole on
-    ///    `drainQueue` while `syncForce` was in flight (see
-    ///    `pushWakeDrainBuffer`). Mid-fetch, polling still paints the UI.
+    /// 1. Drain + paint on the dedicated receive lane first (UI can update
+    ///    via `loadLocalSummaries` / polling while sync still runs).
+    /// 2. Always await single-flight `syncForce` before returning — callers
+    ///    (`SonarPushProcessor`) end the background wake when this returns, so
+    ///    gap recovery must finish inside the granted window even when the live
+    ///    buffer already had events. Merge with anything the polling loop
+    ///    stole on `drainQueue` while `syncForce` was in flight (see
+    ///    `pushWakeDrainBuffer`) — that drain is a separate buffer fill, so
+    ///    live events already consumed above cannot reappear in it.
+    /// 3. Mid-fetch, `drainQueue` still lets the polling loop paint the chat UI
+    ///    from live events. Foreground resume uses `refreshAfterForeground`,
+    ///    which fire-and-forgets gap recovery instead of blocking first paint.
     @discardableResult
     func refresh() async -> [DrainNotificationInfo] {
         guard await ensureConnected() else { return [] }
@@ -1533,30 +1543,44 @@ final class MarmotChatModel: ObservableObject {
         let live = (try? await service.drainPending()) ?? []
         await loadLocalSummaries()
 
-        if !live.isEmpty {
-            _ = ensureGapRecovery()
-            return live
-        }
-
-        // Empty live buffer: collect anything polling drains during syncForce
-        // so titled push notifications are not lost to the UI-only path.
+        // Always await single-flight gap recovery before returning — the push
+        // processor ends the background wake window when this call returns,
+        // so recovery must finish inside the granted window even when the
+        // live buffer already delivered events. Collect anything polling
+        // drains during syncForce so titled push notifications are not lost.
         beginPushWakeDrainCapture()
         defer { endPushWakeDrainCapture() }
-        let fromGap = await ensureGapRecovery().value
+        // Await single-flight recovery for wake lifetime, but claim the drained
+        // notifications once — joiners must not re-emit the same recovered set.
+        _ = await ensureGapRecovery().value
+        let recovered = takeGapRecoveryNotifications()
         let stolen = takePushWakeDrainBuffer()
-        if stolen.isEmpty { return fromGap }
-        if fromGap.isEmpty { return stolen }
-        return fromGap + stolen
+        var notifications = live
+        if !recovered.isEmpty { notifications += recovered }
+        if !stolen.isEmpty { notifications += stolen }
+        return notifications
     }
 
     private func beginPushWakeDrainCapture() {
+        if pushWakeDrainWaiters == 0 {
+            pushWakeDrainBuffer = []
+        }
+        pushWakeDrainWaiters += 1
         pushWakeDrainActive = true
-        pushWakeDrainBuffer = []
     }
 
     private func endPushWakeDrainCapture() {
-        pushWakeDrainActive = false
-        pushWakeDrainBuffer = []
+        pushWakeDrainWaiters = max(0, pushWakeDrainWaiters - 1)
+        if pushWakeDrainWaiters == 0 {
+            pushWakeDrainActive = false
+            pushWakeDrainBuffer = []
+        }
+    }
+
+    private func takeGapRecoveryNotifications() -> [DrainNotificationInfo] {
+        let claimed = gapRecoveryUnclaimedDrain ?? []
+        gapRecoveryUnclaimedDrain = nil
+        return claimed
     }
 
     private func takePushWakeDrainBuffer() -> [DrainNotificationInfo] {
@@ -1601,6 +1625,8 @@ final class MarmotChatModel: ObservableObject {
             if Task.isCancelled { return [DrainNotificationInfo]() }
             let notifications = (try? await self.service.drainPending()) ?? [DrainNotificationInfo]()
             await self.loadLocalSummaries()
+            // One-shot claim buffer for push titled notifications.
+            self.gapRecoveryUnclaimedDrain = notifications
             return notifications
         }
         gapRecoveryTask = task
@@ -2147,15 +2173,102 @@ final class MarmotChatModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !trimmed.isEmpty else { return true }
-        errorText = nil
+        // Per-operation outcome (local `succeeded`), not shared `errorText`.
+        // Still paints a group optimistic — used when a pending-chat echo was
+        // already transferred/removed. Mesh→WN flush uses `sendQueuedText`.
+        var allOk = true
         for text in trimmed {
-            send(text, to: groupId)
+            var succeeded = false
+            let echo = MarmotService.MarmotMessage(
+                id: Self.optimisticIDPrefix + UUID().uuidString,
+                senderNpub: npub ?? "",
+                content: text,
+                createdAt: Date(),
+                isMine: true,
+                media: []
+            )
+            appendOptimistic(echo, to: groupId)
+            let previous = sendChain
+            let queuedSend = Task { [weak self] in
+                _ = await previous?.result
+                guard let self else { return }
+                do {
+                    guard await self.ensureConnected(timeoutSeconds: 2) else {
+                        throw MarmotService.ServiceError.notConnected
+                    }
+                    try await self.service.sendText(groupId: groupId, text: text)
+                    succeeded = true
+                } catch {
+                    self.discardOptimistic(id: echo.id, from: groupId)
+                    self.errorText = Self.describe(error)
+                }
+            }
+            sendChain = queuedSend
+            await queuedSend.value
+            if !succeeded { allOk = false }
         }
-        // Wait for the chain to finish so the caller knows success/failure.
-        if let chain = sendChain {
-            _ = await chain.result
+        return allOk
+    }
+
+    /// Flush text that already owns a mesh/pending echo. Unlike `send(_:to:)`,
+    /// this must not create a second optimistic row, and it reports the chain
+    /// task's own success flag (Compose / `sendQueuedSticker` parity).
+    func sendQueuedText(groupId: String, text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return true }
+        var succeeded = false
+        let previous = sendChain
+        let queuedSend = Task { [weak self] in
+            _ = await previous?.result
+            guard let self else { return }
+            do {
+                guard await self.ensureConnected(timeoutSeconds: 2) else {
+                    throw MarmotService.ServiceError.notConnected
+                }
+                try await self.service.sendText(groupId: groupId, text: trimmed)
+                succeeded = true
+            } catch {
+                self.errorText = Self.describe(error)
+            }
         }
-        return errorText == nil
+        sendChain = queuedSend
+        await queuedSend.value
+        guard succeeded else { return false }
+        await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+        Task { [weak self] in try? await self?.service.ensureSubscriptions() }
+        return true
+    }
+
+    /// Durable outgoing row present for a mesh→WN flush echo (R-011).
+    func hasCanonicalOutgoingMatch(groupId: String, text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let messages = messagesByGroup[groupId] ?? []
+        return messages.contains { message in
+            guard message.isMine,
+                  !message.id.hasPrefix(Self.optimisticIDPrefix),
+                  !message.id.hasPrefix(Self.failedOptimisticIDPrefix)
+            else { return false }
+            return message.content == trimmed
+        }
+    }
+
+    func hasCanonicalOutgoingStickerMatch(
+        groupId: String,
+        packCoordinate: String,
+        shortcode: String,
+        plaintextSha256: String
+    ) -> Bool {
+        let messages = messagesByGroup[groupId] ?? []
+        return messages.contains { message in
+            guard message.isMine,
+                  !message.id.hasPrefix(Self.optimisticIDPrefix),
+                  !message.id.hasPrefix(Self.failedOptimisticIDPrefix),
+                  let ref = message.stickerRef
+            else { return false }
+            return ref.packCoordinate == packCoordinate
+                && ref.shortcode == shortcode
+                && ref.plaintextSha256 == plaintextSha256
+        }
     }
 
     /// Retry a core-backed failed row without creating a second transcript row
@@ -2982,7 +3095,10 @@ final class MarmotChatModel: ObservableObject {
         gapRecoveryGeneration &+= 1
         gapRecoveryTask?.cancel()
         gapRecoveryTask = nil
-        endPushWakeDrainCapture()
+        gapRecoveryUnclaimedDrain = nil
+        pushWakeDrainWaiters = 0
+        pushWakeDrainActive = false
+        pushWakeDrainBuffer = []
     }
 
     private func clearIdentityScopedState() {
@@ -3002,6 +3118,16 @@ final class MarmotChatModel: ObservableObject {
         profilesByNpub = [:]
         profileFetches = []
         profileFetchedAt = [:]
+        // Invalidate any in-flight syncForce slot so a post-wipe wake cannot
+        // join the previous identity's FETCH_TIMEOUT park.
+        gapRecoveryGeneration &+= 1
+        gapRecoveryTask = nil
+        gapRecoveryUnclaimedDrain = nil
+        pushWakeDrainWaiters = 0
+        pushWakeDrainActive = false
+        pushWakeDrainBuffer = []
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
         clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)

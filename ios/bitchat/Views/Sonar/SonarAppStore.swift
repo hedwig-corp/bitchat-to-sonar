@@ -1105,7 +1105,10 @@ final class SonarAppStore: ObservableObject {
     private var pendingMarmotGroupSetupTokens: [String: UUID] = [:]
     /// Texts queued for a Sonar peer (keyed by npub) while their White
     /// Noise group is being created on first out-of-range send.
-    private var pendingMarmotSends: [String: [String]] = [:]
+    /// Out-of-range mesh→White Noise first sends (npub → queued text + echo id).
+    /// Echo lives in `pendingMarmotMessagesByChat` under the open mesh chat id so
+    /// the bubble paints before `startChat` finishes (Compose `PendingMeshMarmotSend`).
+    private var pendingMarmotSends: [String: [SNPendingMarmotSend]] = [:]
     private var pendingInviteLinks: [String] = []
     /// Per-conversation Marmot warm-up work started by openedDM. Home rows and
     /// destination onAppear can both fire; only one local hydrate/sync pass per
@@ -4760,9 +4763,8 @@ final class SonarAppStore: ObservableObject {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
-        pendingMarmotSends[npub, default: []].append(encoded)
-        marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        queuePendingMeshMarmotSend(text: encoded, npub: npub)
+        startSecureMeshMarmotChat(npub: npub)
     }
 
     private func sendOverMarmot(_ text: String, npub: String) {
@@ -4770,9 +4772,68 @@ final class SonarAppStore: ObservableObject {
             marmot.send(text, to: group.id)
             return
         }
-        pendingMarmotSends[npub, default: []].append(text)
+        queuePendingMeshMarmotSend(text: text, npub: npub)
+        showToast("Out of range — continuing over White Noise…")
+        startSecureMeshMarmotChat(npub: npub)
+    }
+
+    /// Paint a Sending echo on the open mesh conversation immediately, then
+    /// queue the plaintext for [flushPendingMarmotSends] once the WN group lands.
+    private func queuePendingMeshMarmotSend(text: String, npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let chatId = currentDMId ?? sonarPeerKey(forNpub: clean)
+        if let chatId {
+            let message = pendingMarmotEcho(text: text, createdAt: Date())
+            pendingMarmotMessagesByChat[chatId, default: []].append(message)
+            objectWillChange.send()
+            pendingMarmotSends[clean, default: []].append(
+                SNPendingMarmotSend(chatId: chatId, text: text, messageId: message.id)
+            )
+        } else {
+            pendingMarmotSends[clean, default: []].append(
+                SNPendingMarmotSend(chatId: "", text: text, messageId: "")
+            )
+        }
+    }
+
+    /// Create the White Noise group for an out-of-range mesh DM. On failure,
+    /// mark queued mesh echoes `Couldn't send` (Compose `failPendingMeshMarmotSends`).
+    private func startSecureMeshMarmotChat(npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
         marmot.connectIfNeeded()
-        marmot.startChat(with: npub)
+        // Single-flight per npub (Compose `startingMarmotChats`). Extra taps
+        // while setup runs stay queued in `pendingMarmotSends` and flush when
+        // this starter finishes.
+        guard startingMarmotChats.insert(clean).inserted else { return }
+        Task { @MainActor in
+            defer { startingMarmotChats.remove(clean) }
+            let groupId = await marmot.startChatReturningId(with: clean)
+            if groupId == nil {
+                failPendingMeshMarmotSends(npub: clean)
+                if let err = marmot.errorText, !err.isEmpty {
+                    showToast(err)
+                } else {
+                    showToast("couldn't start secure chat")
+                }
+                return
+            }
+            // Do not rely solely on `$groups` re-emitting — flush now (Compose
+            // calls `flushPendingMarmot` after `startChat`).
+            flushPendingMarmotSends()
+        }
+    }
+
+    private func failPendingMeshMarmotSends(npub: String) {
+        let clean = SNMarmotProfileCache.canonicalKey(npub)
+        let sends = pendingMarmotSends.removeValue(forKey: clean) ?? []
+        guard !sends.isEmpty else { return }
+        for send in sends where !send.chatId.isEmpty && !send.messageId.isEmpty {
+            guard let idx = pendingMarmotMessagesByChat[send.chatId]?.firstIndex(where: { $0.id == send.messageId }),
+                  let original = pendingMarmotMessagesByChat[send.chatId]?[idx]
+            else { continue }
+            pendingMarmotMessagesByChat[send.chatId]?[idx] = failedPendingMessage(original)
+        }
+        objectWillChange.send()
     }
 
     private func sendPendingMarmot(_ text: String, chatId: String, npub: String) {
@@ -5063,7 +5124,7 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
-                let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
@@ -5091,7 +5152,7 @@ final class SonarAppStore: ObservableObject {
                 if !isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
-                let ok = await sendQueuedMarmotContent(item.text, to: groupId)
+                let ok = await sendPendingTransferredMarmotContent(item.text, to: groupId)
                 if isSticker {
                     pendingMarmotMessagesByChat[realId]?.removeAll { $0.id == item.messageId }
                 }
@@ -5104,7 +5165,22 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Mesh→WN flush: no second optimistic (mesh echo already visible).
     private func sendQueuedMarmotContent(_ text: String, to groupId: String) async -> Bool {
+        if let ref = meshParseStickerContent(content: text) {
+            return await marmot.sendQueuedSticker(
+                groupId: groupId,
+                packCoordinate: ref.packCoordinate,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            )
+        }
+        return await marmot.sendQueuedText(groupId: groupId, text: text)
+    }
+
+    /// Pending-chat / pending-group flush: paint a group optimistic because the
+    /// platform echo was already moved off the pending id.
+    private func sendPendingTransferredMarmotContent(_ text: String, to groupId: String) async -> Bool {
         if let ref = meshParseStickerContent(content: text) {
             return await marmot.sendQueuedSticker(
                 groupId: groupId,
@@ -5116,21 +5192,73 @@ final class SonarAppStore: ObservableObject {
         return await marmot.send([text], to: groupId)
     }
 
+    /// R-011: clear the mesh echo only after a folded durable WN row exists.
+    private func meshMarmotCanonicalExists(groupId: String, text: String) -> Bool {
+        if let ref = meshParseStickerContent(content: text) {
+            return marmot.hasCanonicalOutgoingStickerMatch(
+                groupId: groupId,
+                packCoordinate: ref.packCoordinate,
+                shortcode: ref.shortcode,
+                plaintextSha256: ref.plaintextSha256
+            )
+        }
+        return marmot.hasCanonicalOutgoingMatch(groupId: groupId, text: text)
+    }
+
+    private func clearMeshMarmotSendEcho(_ send: SNPendingMarmotSend) {
+        guard !send.chatId.isEmpty, !send.messageId.isEmpty else { return }
+        pendingMarmotMessagesByChat[send.chatId]?.removeAll { $0.id == send.messageId }
+        if pendingMarmotMessagesByChat[send.chatId]?.isEmpty == true {
+            pendingMarmotMessagesByChat[send.chatId] = nil
+        }
+    }
+
+    private func failMeshMarmotSendEcho(_ send: SNPendingMarmotSend) {
+        guard !send.chatId.isEmpty, !send.messageId.isEmpty else { return }
+        guard let idx = pendingMarmotMessagesByChat[send.chatId]?.firstIndex(where: { $0.id == send.messageId }),
+              let original = pendingMarmotMessagesByChat[send.chatId]?[idx]
+        else { return }
+        pendingMarmotMessagesByChat[send.chatId]?[idx] = failedPendingMessage(original)
+    }
+
+    /// Keep the mesh Sending bubble until a folded canonical row is visible
+    /// (Compose `shouldClearMeshMarmotSendEcho(hasCanonicalRow)`).
+    private func clearMeshEchoWhenCanonical(send: SNPendingMarmotSend, groupId: String) async {
+        for _ in 0..<10 {
+            if meshMarmotCanonicalExists(groupId: groupId, text: send.text) {
+                clearMeshMarmotSendEcho(send)
+                objectWillChange.send()
+                return
+            }
+            await marmot.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+            if meshMarmotCanonicalExists(groupId: groupId, text: send.text) {
+                clearMeshMarmotSendEcho(send)
+                objectWillChange.send()
+                return
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        // Prefer a sticky Sending echo over a blank gap if hydrate races.
+        objectWillChange.send()
+    }
+
     private func flushPendingMarmotSends() {
         guard !pendingMarmotSends.isEmpty else { return }
-        for (npub, texts) in pendingMarmotSends {
+        for (npub, sends) in pendingMarmotSends {
             guard let group = marmotGroup(forNpub: npub) else { continue }
             pendingMarmotSends[npub] = nil
-            for text in texts {
-                if let ref = meshParseStickerContent(content: text) {
-                    marmot.sendSticker(
-                        groupId: group.id,
-                        packCoordinate: ref.packCoordinate,
-                        shortcode: ref.shortcode,
-                        plaintextSha256: ref.plaintextSha256
-                    )
-                } else {
-                    marmot.send(text, to: group.id)
+            Task { @MainActor in
+                for send in sends {
+                    // Await real send outcome without creating a second optimistic.
+                    // Clear the mesh echo only once a folded canonical row exists.
+                    let ok = await sendQueuedMarmotContent(send.text, to: group.id)
+                    guard !send.chatId.isEmpty, !send.messageId.isEmpty else { continue }
+                    if ok {
+                        await clearMeshEchoWhenCanonical(send: send, groupId: group.id)
+                    } else {
+                        failMeshMarmotSendEcho(send)
+                        objectWillChange.send()
+                    }
                 }
             }
         }

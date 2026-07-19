@@ -87,8 +87,14 @@ enum SonarPushProcessor {
                         let senderName = await marmot.resolveSenderName(npub: notif.senderNpub)
                         let groupName = notif.groupName.isEmpty ? nil : notif.groupName
                         let conversationTitle = groupName ?? senderName
+                        // Stable id so overlapping wakes replace rather than stack.
+                        let idKey = [
+                            notif.senderNpub,
+                            notif.groupName,
+                            notif.contentPreview,
+                        ].joined(separator: "|")
                         guard let routed = SonarLocalNotificationRouter.make(
-                            idKey: UUID().uuidString,
+                            idKey: idKey.isEmpty ? UUID().uuidString : idKey,
                             conversationTitle: conversationTitle,
                             senderName: senderName,
                             groupName: groupName,

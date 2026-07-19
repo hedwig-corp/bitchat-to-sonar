@@ -314,6 +314,40 @@ invalidation for verified peer/profile changes.
 
 **Not guarded:** End-to-end restore against live relays (host hydrate orchestration needs a constructible `SonarAppState` / `SonarAppStore`). iOS unit tests do not run in CI. Connect-path session short-circuit after the first own-profile fetch (iOS `didFetchOwnProfileThisSession`) is not unit-tested.
 
+---
+
+## R-011 — Mesh→White Noise first send keeps a visible echo
+
+**Invariant:** When a mesh-folded Sonar DM falls back to White Noise (no live
+Noise link), the outgoing bubble must paint immediately on the mesh chat id and
+must not be cleared until a folded White Noise canonical row exists.
+
+**Breaks as:** Banner/toast says "Out of range — continuing over White Noise…",
+then the typed message is missing for a couple of seconds (or flickers off
+"Sending · internet") while `startChat` / relay publish / `refreshOpenDm` catch up.
+
+**Call sites:** Compose `SonarAppState.sendOverMarmot` /
+`reconcileMeshMarmotSendEcho` / `flushPendingMarmot`; iOS
+`SonarAppStore.queuePendingMeshMarmotSend` / `flushPendingMarmotSends`
+
+**Guarded by:** `MeshMarmotSendEchoTest.meshWhiteNoiseEchoStaysUntilCanonicalRowExists`
+
+**Not guarded:** the real `sendOverMarmot` call site (needs a constructible
+`SonarAppState`); asymmetric BLE discovery that forces the WN fallback in the
+first place (MeshRadio dial/scanner — device-bound).
+
+**History:** Observed on Android chatting with Mac when BLE discovery was
+one-sided / no live Noise link; chat correctly continued over White Noise but
+the send echo was cleared before the canonical row merged.
+
+**Rejected:**
+- *Routing mesh DMs over BLE without `hasMeshLink` / `isPeerConnected`.* Reopens
+  R-006-style dead-radio sends.
+- *Navigating the open mesh chat onto the raw Marmot group id after `startChat`.*
+  Splits one person into two conversations (R-003).
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
