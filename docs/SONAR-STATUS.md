@@ -214,7 +214,7 @@ Goal: every row on `/status` should eventually mean "we ran a check", not
 | `relays` | WebSocket open RTT to client default + White Noise interop relays | **Done** — `probe_relay_ws` | None |
 | `dm` | KeyPackage publish + fetch own package from bootstrap relays via `sonar-core` | **Done** — `chat::probe_marmot_keypackage` (`--chat-probe`) | **Dedicated probe nsec** (`SONAR_STATUS_PROBE_NSEC`) — not the publisher key |
 | `groups` | 5-agent MLS group via Hermes task (A→B or multi-member) | **Done** (Hermes `groups-probe.sh`) | Probe nsec(s) |
-| `media` | Blossom upload bench: BUD-02 PUT+GET on `DEFAULT_BLOSSOM_SERVER` (`https://push.sonar.hedwig.sh`) vs candidate(s) (default `https://nostr.download`); HEAD-only if no probe nsec | **Done** | Probe nsec for upload mode (`SONAR_STATUS_PROBE_NSEC`) |
+| `media` | Blossom upload bench: BUD-02 PUT + GET `descriptor.url` on `DEFAULT_BLOSSOM_SERVER` (`https://push.sonar.hedwig.sh`) vs candidate(s) (default `https://nostr.download`); HEAD-only if no probe nsec. Probe nsec does **not** auto-enable `--chat-probe`. | **Done** | Probe nsec for upload mode (`SONAR_STATUS_PROBE_NSEC`); chat probe needs `--chat-probe` separately |
 | `stickers` | REQ kind 30031 on bootstrap relays, count visible packs | **Done** | None |
 | `push` | HTTP GET transponder health (and optionally sandbox) | `--http` / `SONAR_STATUS_HTTP` | None if health is public |
 | `payments` | HTTP GET Breez NDS / notify health if exposed; else mark `unknown` and omit row | `--http` | None |

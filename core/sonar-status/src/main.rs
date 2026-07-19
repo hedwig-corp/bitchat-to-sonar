@@ -298,11 +298,9 @@ async fn run() -> Result<()> {
     match cli.command {
         Command::Probe(args) => {
             let opts = ProbeOptions {
-                chat_probe: args.chat_probe
-                    || args.probe_nsec.is_some()
-                    || args.probe_nsec_file.is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                // Chat only when explicitly requested — probe nsec is also used
+                // for BUD-02 media auth and must not imply KeyPackage traffic.
+                chat_probe: args.chat_probe,
                 probe_nsec: args.probe_nsec,
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)
@@ -330,11 +328,9 @@ async fn run() -> Result<()> {
             let whitenoise_relays = parse_list(args.whitenoise_relays.as_deref(), WHITENOISE_RELAYS);
             let publish_relays = parse_list(args.publish_relays.as_deref(), DEFAULT_PUBLISH_RELAYS);
             let opts = ProbeOptions {
-                chat_probe: args.chat_probe
-                    || args.probe_nsec.is_some()
-                    || args.probe_nsec_file.is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC").is_some()
-                    || env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").is_some(),
+                // Chat only when explicitly requested — probe nsec is also used
+                // for BUD-02 media auth and must not imply KeyPackage traffic.
+                chat_probe: args.chat_probe,
                 probe_nsec: args.probe_nsec,
                 probe_nsec_file: args.probe_nsec_file.or_else(|| {
                     env::var_os("SONAR_STATUS_PROBE_NSEC_FILE").map(PathBuf::from)

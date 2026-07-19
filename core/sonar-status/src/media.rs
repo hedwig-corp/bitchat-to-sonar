@@ -31,9 +31,6 @@ const CANARY_BYTES: usize = 4_096;
 /// `/status` shows Hedwig vs the old public host.
 pub const PUBLIC_BLOSSOM_COMPARE: &str = "https://nostr.download";
 
-/// Hedwig Blossom public URL (also the app [`sonar_core::client::DEFAULT_BLOSSOM_SERVER`]).
-pub const HEDWIG_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
-
 #[derive(Debug, Clone, Serialize)]
 pub struct MediaServerSample {
     pub server: String,
@@ -50,6 +47,11 @@ pub struct MediaServerSample {
     pub upload_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub get_ms: Option<u64>,
+    /// Whether canary delete succeeded (upload mode only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -180,6 +182,8 @@ pub async fn probe_blossom_servers(
                         head_ms: None,
                         upload_ms: None,
                         get_ms: None,
+                        delete_ok: None,
+                        delete_error: None,
                         error: Some(format!("import probe identity: {e}")),
                     }],
                 };
@@ -248,6 +252,8 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
                 head_ms: Some(t0.elapsed().as_millis() as u64),
                 upload_ms: None,
                 get_ms: None,
+                delete_ok: None,
+                delete_error: None,
                 error: Some(format!("build client: {e}")),
             };
         }
@@ -277,6 +283,8 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
                 head_ms: Some(ms),
                 upload_ms: None,
                 get_ms: None,
+                delete_ok: None,
+                delete_error: None,
                 error: if ok {
                     None
                 } else {
@@ -293,6 +301,8 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
             head_ms: Some(t0.elapsed().as_millis() as u64),
             upload_ms: None,
             get_ms: None,
+            delete_ok: None,
+            delete_error: None,
             error: Some(e.to_string()),
         },
         Err(_) => MediaServerSample {
@@ -304,8 +314,32 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
             head_ms: Some(t0.elapsed().as_millis() as u64),
             upload_ms: None,
             get_ms: None,
+            delete_ok: None,
+            delete_error: None,
             error: Some(format!("timed out after {}s", MEDIA_TIMEOUT.as_secs())),
         },
+    }
+}
+
+fn upload_fail(
+    server: String,
+    primary: bool,
+    upload_ms: Option<u64>,
+    get_ms: Option<u64>,
+    error: String,
+) -> MediaServerSample {
+    MediaServerSample {
+        server,
+        primary,
+        ok: false,
+        mode: "upload".into(),
+        status: None,
+        head_ms: None,
+        upload_ms,
+        get_ms,
+        delete_ok: None,
+        delete_error: None,
+        error: Some(error),
     }
 }
 
@@ -314,17 +348,7 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
     let base = match Url::parse(&server) {
         Ok(u) => u,
         Err(e) => {
-            return MediaServerSample {
-                server,
-                primary,
-                ok: false,
-                mode: "upload".into(),
-                status: None,
-                head_ms: None,
-                upload_ms: None,
-                get_ms: None,
-                error: Some(format!("bad server url: {e}")),
-            };
+            return upload_fail(server, primary, None, None, format!("bad server url: {e}"));
         }
     };
 
@@ -345,94 +369,94 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
     let descriptor = match upload {
         Ok(Ok(desc)) => desc,
         Ok(Err(e)) => {
-            return MediaServerSample {
+            return upload_fail(
                 server,
                 primary,
-                ok: false,
-                mode: "upload".into(),
-                status: None,
-                head_ms: None,
-                upload_ms: Some(t_upload.elapsed().as_millis() as u64),
-                get_ms: None,
-                error: Some(summarize_blossom_err(&e)),
-            };
+                Some(t_upload.elapsed().as_millis() as u64),
+                None,
+                summarize_blossom_err(&e),
+            );
         }
         Err(_) => {
-            return MediaServerSample {
+            return upload_fail(
                 server,
                 primary,
-                ok: false,
-                mode: "upload".into(),
-                status: None,
-                head_ms: None,
-                upload_ms: Some(t_upload.elapsed().as_millis() as u64),
-                get_ms: None,
-                error: Some(format!("upload timed out after {}s", MEDIA_TIMEOUT.as_secs())),
-            };
+                Some(t_upload.elapsed().as_millis() as u64),
+                None,
+                format!("upload timed out after {}s", MEDIA_TIMEOUT.as_secs()),
+            );
         }
     };
     let upload_ms = t_upload.elapsed().as_millis() as u64;
 
+    // Fetch the exact URL apps store (`descriptor.url`), not reconstructed
+    // `GET /{sha256}` — matches sonar-core media send / download path.
+    let http = match reqwest::Client::builder().timeout(MEDIA_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return upload_fail(
+                server,
+                primary,
+                Some(upload_ms),
+                None,
+                format!("build GET client: {e}"),
+            );
+        }
+    };
+    let blob_url = descriptor.url.to_string();
     let t_get = Instant::now();
-    let get = tokio::time::timeout(
-        MEDIA_TIMEOUT,
-        client.get_blob(descriptor.sha256, None, None, None::<&nostr::Keys>),
-    )
-    .await;
+    let get = tokio::time::timeout(MEDIA_TIMEOUT, http.get(&blob_url).send()).await;
     let get_ms = t_get.elapsed().as_millis() as u64;
 
-    // Best-effort cleanup — failure must not fail the probe.
-    let _ = tokio::time::timeout(
+    let (get_ok, get_status, get_error) = match get {
+        Ok(Ok(resp)) => {
+            let status = resp.status().as_u16();
+            if !resp.status().is_success() {
+                (
+                    false,
+                    Some(status),
+                    Some(format!("GET {blob_url} HTTP {status}")),
+                )
+            } else {
+                match resp.bytes().await {
+                    Ok(bytes) if bytes.as_ref() == data.as_slice() => (true, Some(status), None),
+                    Ok(_) => (false, Some(status), Some("GET body mismatch".into())),
+                    Err(e) => (false, Some(status), Some(format!("GET body read: {e}"))),
+                }
+            }
+        }
+        Ok(Err(e)) => (false, None, Some(format!("GET {blob_url} failed: {e}"))),
+        Err(_) => (
+            false,
+            None,
+            Some(format!("GET timed out after {}s", MEDIA_TIMEOUT.as_secs())),
+        ),
+    };
+
+    // Cleanup is best-effort for probe ok/state, but delete outcome is recorded.
+    let (delete_ok, delete_error) = match tokio::time::timeout(
         Duration::from_secs(8),
         client.delete_blob(descriptor.sha256, None, keys),
     )
-    .await;
+    .await
+    {
+        Ok(Ok(())) => (Some(true), None),
+        Ok(Err(e)) => (Some(false), Some(summarize_blossom_err(&e))),
+        Err(_) => (Some(false), Some("delete timed out after 8s".into())),
+    };
 
-    match get {
-        Ok(Ok(bytes)) if bytes == data => MediaServerSample {
-            server,
-            primary,
-            ok: true,
-            mode: "upload".into(),
-            status: Some(201),
-            head_ms: None,
-            upload_ms: Some(upload_ms),
-            get_ms: Some(get_ms),
-            error: None,
-        },
-        Ok(Ok(_)) => MediaServerSample {
-            server,
-            primary,
-            ok: false,
-            mode: "upload".into(),
-            status: Some(200),
-            head_ms: None,
-            upload_ms: Some(upload_ms),
-            get_ms: Some(get_ms),
-            error: Some("GET body mismatch".into()),
-        },
-        Ok(Err(e)) => MediaServerSample {
-            server,
-            primary,
-            ok: false,
-            mode: "upload".into(),
-            status: None,
-            head_ms: None,
-            upload_ms: Some(upload_ms),
-            get_ms: Some(get_ms),
-            error: Some(format!("GET failed: {}", summarize_blossom_err(&e))),
-        },
-        Err(_) => MediaServerSample {
-            server,
-            primary,
-            ok: false,
-            mode: "upload".into(),
-            status: None,
-            head_ms: None,
-            upload_ms: Some(upload_ms),
-            get_ms: Some(get_ms),
-            error: Some(format!("GET timed out after {}s", MEDIA_TIMEOUT.as_secs())),
-        },
+    MediaServerSample {
+        server,
+        primary,
+        ok: get_ok,
+        mode: "upload".into(),
+        status: get_status,
+        head_ms: None,
+        upload_ms: Some(upload_ms),
+        get_ms: Some(get_ms),
+        delete_ok,
+        delete_error,
+        error: get_error,
     }
 }
 
@@ -466,19 +490,23 @@ fn summarize_blossom_err(err: &nostr_blossom::error::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sonar_core::client::DEFAULT_BLOSSOM_SERVER;
 
-    const PRIMARY: &str = HEDWIG_BLOSSOM_SERVER;
+    #[test]
+    fn primary_matches_app_default_blossom() {
+        assert_eq!(DEFAULT_BLOSSOM_SERVER, "https://push.sonar.hedwig.sh");
+    }
 
     #[test]
     fn service_mapping_ok_omits_state() {
         let r = MediaProbeReport {
             ok: true,
             state: ServiceState::Ok,
-            primary: PRIMARY.into(),
+            primary: DEFAULT_BLOSSOM_SERVER.into(),
             mode: "upload".into(),
             servers: vec![
                 MediaServerSample {
-                    server: PRIMARY.into(),
+                    server: DEFAULT_BLOSSOM_SERVER.into(),
                     primary: true,
                     ok: true,
                     mode: "upload".into(),
@@ -486,6 +514,8 @@ mod tests {
                     head_ms: None,
                     upload_ms: Some(116),
                     get_ms: Some(35),
+                    delete_ok: Some(true),
+                    delete_error: None,
                     error: None,
                 },
                 MediaServerSample {
@@ -497,6 +527,8 @@ mod tests {
                     head_ms: None,
                     upload_ms: Some(135),
                     get_ms: Some(37),
+                    delete_ok: Some(true),
+                    delete_error: None,
                     error: None,
                 },
             ],
@@ -517,10 +549,10 @@ mod tests {
         let r = MediaProbeReport {
             ok: false,
             state: ServiceState::Down,
-            primary: PRIMARY.into(),
+            primary: DEFAULT_BLOSSOM_SERVER.into(),
             mode: "head".into(),
             servers: vec![MediaServerSample {
-                server: PRIMARY.into(),
+                server: DEFAULT_BLOSSOM_SERVER.into(),
                 primary: true,
                 ok: false,
                 mode: "head".into(),
@@ -528,6 +560,8 @@ mod tests {
                 head_ms: Some(100),
                 upload_ms: None,
                 get_ms: None,
+                delete_ok: None,
+                delete_error: None,
                 error: Some("HTTP 503".into()),
             }],
         };
@@ -539,23 +573,23 @@ mod tests {
     #[test]
     fn servers_to_probe_dedupes_primary() {
         let list = blossom_servers_to_probe(
-            "https://push.sonar.hedwig.sh/",
+            &format!("{DEFAULT_BLOSSOM_SERVER}/"),
             &[
-                "https://nostr.download".into(),
-                "https://push.sonar.hedwig.sh".into(),
+                PUBLIC_BLOSSOM_COMPARE.into(),
+                DEFAULT_BLOSSOM_SERVER.into(),
             ],
         );
         assert_eq!(list.len(), 2);
         assert!(list[0].1);
-        assert_eq!(list[0].0, "https://push.sonar.hedwig.sh");
+        assert_eq!(list[0].0, DEFAULT_BLOSSOM_SERVER);
         assert!(!list[1].1);
-        assert_eq!(list[1].0, "https://nostr.download");
+        assert_eq!(list[1].0, PUBLIC_BLOSSOM_COMPARE);
     }
 
     #[test]
     fn short_host_strips_scheme() {
         assert_eq!(
-            short_host("https://push.sonar.hedwig.sh/"),
+            short_host(&format!("{DEFAULT_BLOSSOM_SERVER}/")),
             "push.sonar.hedwig.sh"
         );
     }

@@ -104,14 +104,22 @@ Compares the app default Blossom server (`DEFAULT_BLOSSOM_SERVER`, today
 `https://push.sonar.hedwig.sh`) against the previous public host (default
 `https://nostr.download`) and publishes the timings on the `media` status row.
 
-- With a probe nsec: BUD-02 upload + GET + best-effort delete of a ~4 KiB canary
-  (this is the latency that matters for media send).
+- With a probe nsec: BUD-02 upload + GET of the returned `descriptor.url` +
+  best-effort delete of a ~4 KiB canary (this is the latency that matters for
+  media send). Delete success/failure is recorded in probe JSON (`delete_ok`)
+  but does not flip the media service state.
 - Without a probe nsec: HTTP HEAD/GET reachability only.
+
+Probe nsec enables media upload auth only. It does **not** enable the Marmot
+KeyPackage chat probe — set `SONAR_STATUS_CHAT_PROBE=1` separately when you want
+that traffic.
 
 ```bash
 export SONAR_STATUS_STICKER_PROBE=1
 export SONAR_STATUS_MEDIA_PROBE=1
 export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
+# optional: also run KeyPackage dm probe
+# export SONAR_STATUS_CHAT_PROBE=1
 # optional override:
 # export SONAR_STATUS_BLOSSOM_SERVER=https://push.sonar.hedwig.sh
 # export SONAR_STATUS_BLOSSOM_COMPARE=https://nostr.download
