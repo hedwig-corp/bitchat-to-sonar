@@ -7824,6 +7824,9 @@ final class SonarAppStore: ObservableObject {
                         for gid in groupIds { try await marmot.deleteGroup(gid) }
                     }
                 } catch {
+                    // Optimistic hide already ran — reload from durable state so a
+                    // failed purge cannot leave an invisible MLS corpse (R-010).
+                    _ = await marmot.loadLocalSummaries(resolveMembers: false)
                     showToast(
                         shouldLeave
                             ? "Couldn't leave group: \(error.localizedDescription)"
@@ -7859,6 +7862,7 @@ final class SonarAppStore: ObservableObject {
                 do {
                     for g in foldedGroups { try await marmot.deleteGroup(g.id) }
                 } catch {
+                    _ = await marmot.loadLocalSummaries(resolveMembers: false)
                     showToast("Couldn't delete chat: \(error.localizedDescription)")
                 }
             }

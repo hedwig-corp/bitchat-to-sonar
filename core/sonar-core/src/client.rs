@@ -1523,6 +1523,10 @@ pub struct SonarClient {
     /// The group-id set currently installed in the live kind-445 subscription.
     /// This prevents stacking duplicate REQs and lets deletes narrow/unsubscribe.
     marmot_group_subscriptions: Arc<Mutex<HashSet<String>>>,
+    /// Monotonic generation for background group resubscribes. A newer schedule
+    /// invalidates in-flight applies so a stale captured group set cannot widen
+    /// the live filter after a delete/leave.
+    marmot_group_resub_generation: Arc<AtomicU64>,
     /// Startup repair queue for existing groups whose local DB has MLS/group
     /// state but no chat-message page. This covers older installs where the
     /// sync watermark could be advanced by membership/commit events before the
@@ -1777,6 +1781,7 @@ impl SonarClient {
         let buffer_drops_total = Arc::new(AtomicUsize::new(0));
         let live_marmot_enabled = Arc::new(Mutex::new(false));
         let marmot_group_subscriptions = Arc::new(Mutex::new(HashSet::new()));
+        let marmot_group_resub_generation = Arc::new(AtomicU64::new(0));
         let initial_empty_transcript_backfills = Arc::new(Mutex::new(HashSet::new()));
         let initial_backfill_scanned = Arc::new(AtomicBool::new(false));
         let initial_group_message_catchups = Arc::new(Mutex::new(VecDeque::new()));
@@ -2067,6 +2072,7 @@ impl SonarClient {
             buffer_drops_total,
             live_marmot_enabled,
             marmot_group_subscriptions,
+            marmot_group_resub_generation,
             initial_empty_transcript_backfills,
             initial_backfill_scanned,
             initial_group_message_catchups,
@@ -5085,6 +5091,7 @@ impl SonarClient {
             self.marmot_group_subscriptions.clone(),
             group_ids,
             self.sync_watermark_secs(),
+            None,
         )
         .await
     }
@@ -5094,7 +5101,15 @@ impl SonarClient {
         sub_state: Arc<Mutex<HashSet<String>>>,
         group_ids: HashSet<String>,
         watermark_secs: u64,
+        generation_gate: Option<(Arc<AtomicU64>, u64)>,
     ) -> Result<()> {
+        let still_current = || match &generation_gate {
+            Some((cell, gen)) => cell.load(Ordering::Relaxed) == *gen,
+            None => true,
+        };
+        if !still_current() {
+            return Ok(());
+        }
         let sub_id = SubscriptionId::new(SUB_MARMOT_GROUPS);
 
         if group_ids.is_empty() {
@@ -5103,9 +5118,14 @@ impl SonarClient {
                 !current.is_empty()
             };
             if had_subscription {
+                if !still_current() {
+                    return Ok(());
+                }
                 nostr.unsubscribe(&sub_id).await;
-                sub_state.lock().unwrap().clear();
-                tracing::info!("marmot group subscription closed (no groups)");
+                if still_current() {
+                    sub_state.lock().unwrap().clear();
+                    tracing::info!("marmot group subscription closed (no groups)");
+                }
             }
             return Ok(());
         }
@@ -5127,7 +5147,14 @@ impl SonarClient {
             .kind(Kind::MlsGroupMessage)
             .custom_tags(SingleLetterTag::lowercase(Alphabet::H), group_id_list);
         filter = filter.since(Timestamp::from_secs(since_secs));
+        if !still_current() {
+            return Ok(());
+        }
         nostr.subscribe_with_id(sub_id, filter, None).await?;
+        if !still_current() {
+            // A newer schedule owns the filter; don't record a stale local set.
+            return Ok(());
+        }
         tracing::info!(
             since_secs,
             watermark_secs,
@@ -5313,6 +5340,11 @@ impl SonarClient {
                 return;
             }
         };
+        let generation = self
+            .marmot_group_resub_generation
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let generation_cell = self.marmot_group_resub_generation.clone();
         let nostr = self.nostr.clone();
         let sub_state = self.marmot_group_subscriptions.clone();
         let watermark_secs = self.sync_watermark_secs();
@@ -5322,6 +5354,7 @@ impl SonarClient {
                 sub_state,
                 group_ids,
                 watermark_secs,
+                Some((generation_cell, generation)),
             )
             .await
             {
