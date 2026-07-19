@@ -217,6 +217,8 @@ struct SonarDMScreenContent: View {
                     loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                     onTapPack: { previewPackCoordinate = $0 },
                     onRetry: { store.retryDm(peerId, message: $0) },
+                    onCancelUpload: { store.cancelMediaUpload($0) },
+                    uploadProgressSource: store.marmot.mediaUploadProgressSource,
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
@@ -242,6 +244,8 @@ struct SonarDMScreenContent: View {
                     loadSticker: { await store.stickerImageData(for: $0, userInitiated: $1) },
                     onTapPack: { previewPackCoordinate = $0 },
                     onRetry: { store.retryDm(peerId, message: $0) },
+                    onCancelUpload: { store.cancelMediaUpload($0) },
+                    uploadProgressSource: store.marmot.mediaUploadProgressSource,
                     loadOlder: { await convo.loadOlder() },
                     loadNewest: { await convo.loadNewestIfNeeded() },
                     // Captured by push() at navigation time, before this screen

@@ -42,6 +42,8 @@ data class SonarMsg(
     val media: List<SonarMedia> = emptyList(),
     /// Local send state projected from core delivery metadata.
     val state: String? = null,
+    /// 0f..1f while a Blossom upload is in flight for this optimistic media row.
+    val uploadProgress: Float? = null,
     /// Sticker reference if this message is a sticker send.
     val stickerRef: SonarStickerRef? = null,
 )
@@ -514,6 +516,18 @@ expect object SonarCore {
         serverUrl: String = "",
     )
 
+    /** Like [sendMedia], with Blossom upload progress for the optimistic bubble. */
+    suspend fun sendMediaWithProgress(
+        chatId: String,
+        data: ByteArray,
+        filename: String,
+        mime: String,
+        caption: String,
+        clientPendingId: String,
+        listener: SonarMediaUploadListener,
+        serverUrl: String = "",
+    )
+
     /** Encrypt + upload every [items] entry, then publish them as ONE album
      *  message (a single event with N imeta tags, in order) carrying the
      *  optional [caption]. If ANY upload fails nothing is published. */
@@ -523,6 +537,22 @@ expect object SonarCore {
         caption: String,
         serverUrl: String = "",
     )
+
+    /** Like [sendMediaMulti], with aggregated album upload progress. */
+    suspend fun sendMediaMultiWithProgress(
+        chatId: String,
+        items: List<AlbumUpload>,
+        caption: String,
+        clientPendingId: String,
+        listener: SonarMediaUploadListener,
+        serverUrl: String = "",
+    )
+
+    /** Resume durable pre-Blossom media staging after disconnect/kill. */
+    suspend fun resumePendingMediaUploads(): UInt
+
+    /** Cooperative cancel for quiet resume / in-flight Blossom work. */
+    suspend fun cancelAllMediaUploads()
 
     /** Send a sticker message to a chat. */
     suspend fun sendSticker(

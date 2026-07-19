@@ -18,6 +18,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     var loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)?
     var onTapPack: ((String) -> Void)?
     var onRetry: ((SNMessage) -> Void)?
+    var onCancelUpload: ((SNMessage) -> Void)?
+    var uploadProgressSource: SNMediaUploadProgressSource?
 
     @Published var expandedMessageIDs: Set<String> = []
     private var sizingHost: UIHostingController<AnyView>?
@@ -32,7 +34,9 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         mediaPipeline: SNMediaPipeline,
         loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)?,
         onTapPack: ((String) -> Void)?,
-        onRetry: ((SNMessage) -> Void)?
+        onRetry: ((SNMessage) -> Void)?,
+        onCancelUpload: ((SNMessage) -> Void)?,
+        uploadProgressSource: SNMediaUploadProgressSource?
     ) {
         self.msgs = msgs
         var indexByID: [String: Int] = [:]
@@ -50,6 +54,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         self.loadSticker = loadSticker
         self.onTapPack = onTapPack
         self.onRetry = onRetry
+        self.onCancelUpload = onCancelUpload
+        self.uploadProgressSource = uploadProgressSource
     }
 
     func heightKey(for item: TranscriptDayRow) -> String {
@@ -153,6 +159,8 @@ final class SNTranscriptHostRenderContext: ObservableObject {
                     loadSticker: loadSticker,
                     onTapPack: onTapPack,
                     onRetry: onRetry,
+                    onCancelUpload: onCancelUpload,
+                    uploadProgressSource: uploadProgressSource,
                     columnWidth: columnWidth,
                     expandedMessageIDs: expandedMessageIDs,
                     onExpandedChange: { [weak self] newValue in
@@ -194,6 +202,8 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)?
     let onTapPack: ((String) -> Void)?
     let onRetry: ((SNMessage) -> Void)?
+    let onCancelUpload: ((SNMessage) -> Void)?
+    let uploadProgressSource: SNMediaUploadProgressSource?
     let loadOlder: (() async -> Bool)?
     let loadNewest: (() async -> Void)?
     let unreadCountAtOpen: UInt64?
@@ -228,7 +238,9 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                     mediaPipeline: mediaPipeline,
                     loadSticker: loadSticker,
                     onTapPack: onTapPack,
-                    onRetry: onRetry
+                    onRetry: onRetry,
+                    onCancelUpload: onCancelUpload,
+                    uploadProgressSource: uploadProgressSource
                 )
             },
             composer: composer

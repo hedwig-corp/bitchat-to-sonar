@@ -71,6 +71,14 @@ pub enum Error {
     #[error("media download cancelled")]
     MediaDownloadCancelled,
 
+    #[error("media upload cancelled")]
+    MediaUploadCancelled,
+
+    /// Another worker already owns this optimistic/staging id. Hosts must keep
+    /// the Uploading UI and must not treat this as success or failure.
+    #[error("media upload already in flight")]
+    MediaUploadInFlight,
+
     #[error("no relay connected within timeout")]
     NoRelayConnected,
 

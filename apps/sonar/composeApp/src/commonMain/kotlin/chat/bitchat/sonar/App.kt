@@ -2779,13 +2779,24 @@ private fun MediaBubble(
             // Photo album: render a swipeable stacked-card deck (xChat-style). A
             // mixed image+audio/file message keeps the single-first rendering
             // below (so audio still gets its player).
-            MediaDeck(
-                media = m.media,
-                state = state,
-                chatId = chatId,
-                maxBubbleWidth = maxBubbleWidth,
-                onOpen = { idx -> onOpenAlbum(m.media, idx) },
-            )
+            Box(Modifier.widthIn(max = maxBubbleWidth)) {
+                MediaDeck(
+                    media = m.media,
+                    state = state,
+                    chatId = chatId,
+                    maxBubbleWidth = maxBubbleWidth,
+                    onOpen = { idx -> onOpenAlbum(m.media, idx) },
+                )
+                if (m.state == "Uploading") {
+                    MediaUploadBar(
+                        progress = state.mediaUploadFraction(m.id) ?: m.uploadProgress ?: 0f,
+                        onCancel = { state.cancelMediaUpload(m.id) },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 4.dp, vertical = 3.dp),
+                    )
+                }
+            }
         } else if (media.isImage) {
             val transfer = state.mediaTransferState(media)
             androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
@@ -2864,6 +2875,15 @@ private fun MediaBubble(
                 }
                 if (transfer.phase == MediaTransferPhase.Downloading) {
                     MediaTransferOverlay(transfer, Modifier.align(Alignment.Center))
+                }
+                if (m.state == "Uploading") {
+                    MediaUploadBar(
+                        progress = state.mediaUploadFraction(m.id) ?: m.uploadProgress ?: 0f,
+                        onCancel = { state.cancelMediaUpload(m.id) },
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .padding(horizontal = 4.dp, vertical = 3.dp),
+                    )
                 }
                 if (media.isGif && decoded == null) GifBadge(Modifier.align(Alignment.TopEnd).padding(8.dp))
             }
@@ -3330,6 +3350,32 @@ private fun MediaTransferOverlay(transfer: MediaTransferState, modifier: Modifie
     }
 }
 
+/** XChat-style thin horizontal bar under an uploading media bubble. Tap cancels. */
+@Composable
+private fun MediaUploadBar(
+    progress: Float,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val s = sonar
+    val clamped = progress.coerceIn(0f, 1f)
+    Box(
+        modifier
+            .fillMaxWidth()
+            .height(3.dp)
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.28f))
+            .clickable(onClick = onCancel),
+    ) {
+        Box(
+            Modifier
+                .fillMaxHeight()
+                .fillMaxWidth(clamped.coerceAtLeast(0.02f))
+                .background(s.accent),
+        )
+    }
+}
+
 @Composable
 private fun MediaViewer(
     media: SonarMedia,
@@ -3709,6 +3755,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val tint = if (net) s.netFill else s.accentFill
     val onTint = if (net) s.onNet else s.onAccent
     val transfer = state.mediaTransferState(media)
+    val isSending = m.mine && (m.state == "Sending" || m.state == "Uploading")
     androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
         state.prepareMedia(chatId, media, autoDownload = true)
     }
@@ -3740,26 +3787,35 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         verticalAlignment = Alignment.CenterVertically
     ) {
         // media-playbtn: 34dp — white 24% on own bubbles, accent-soft on theirs.
+        // Outbound send: Signal-style indeterminate spinner (no horizontal upload bar).
         Box(
             Modifier.size(34.dp).clip(CircleShape)
                 .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
-                .clickable {
-                    when (transfer.phase) {
-                        MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                            state.requestMediaDownload(chatId, media)
-                        MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                        MediaTransferPhase.Available -> {
-                            val b = bytes ?: return@clickable
-                            // onComplete resets `playing` when the note ends, is stopped, or
-                            // another note steals the shared player.
-                            if (playing) AudioNotePlayer.stop()
-                            else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                .then(
+                    if (isSending) Modifier else Modifier.clickable {
+                        when (transfer.phase) {
+                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                state.requestMediaDownload(chatId, media)
+                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                            MediaTransferPhase.Available -> {
+                                val b = bytes ?: return@clickable
+                                // onComplete resets `playing` when the note ends, is stopped, or
+                                // another note steals the shared player.
+                                if (playing) AudioNotePlayer.stop()
+                                else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                            }
                         }
                     }
-                },
+                ),
             contentAlignment = Alignment.Center
         ) {
-            when (transfer.phase) {
+            if (isSending) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = if (m.mine) Color.White else s.accent,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(18.dp),
+                )
+            } else when (transfer.phase) {
                 MediaTransferPhase.NotDownloaded -> Text("↓", color = if (m.mine) Color.White else s.accentDeep, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 24.dp)
                 MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)

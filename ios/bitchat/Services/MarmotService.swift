@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Combine
 import CryptoKit
 import Foundation
@@ -294,20 +295,34 @@ final class MarmotService: @unchecked Sendable {
     /// Serial queue: serializes engine maintenance (connect, sync,
     /// group management) and `node`/`identity` writes. Keeps the blocking
     /// Rust calls off the main thread and off the Swift concurrency
-    /// cooperative pool. Text/sticker sends run on `sendQueue` and live
-    /// `drainPending` on `drainQueue` — they must not share this lane
-    /// (each sync can park it for a 10s relay timeout). Same shape as
-    /// Android: lifecycle serialization only; sync/drain hop independently.
+    /// cooperative pool. Text/stickers run on `sendQueue`, Blossom media on
+    /// `mediaQueue`, and live `drainPending` on `drainQueue` — none of those
+    /// share this lane (each sync can park it for a 10s relay timeout). Same
+    /// shape as Android: lifecycle serialization only; sync/drain hop
+    /// independently.
     private let workQueue = DispatchQueue(label: "chat.bitchat.marmot-service", qos: .userInitiated)
 
     /// Serial send lane for text/sticker sends: they must stay ordered with
     /// each other, but must never FIFO-queue behind sync relay quorum
     /// fetches on `workQueue` (each can park it for a 10s timeout — the
-    /// documented 6.6s p95 / 19.3s max send dispatch tail). The core engine
-    /// serializes MLS mutations internally (`MarmotEngine::write_lock`), so a
-    /// send here runs concurrently with an in-flight sync and waits at most
-    /// for one in-flight MLS mutation, never for a relay fetch.
+    /// documented 6.6s p95 / 19.3s max send dispatch tail) **or** behind a
+    /// multi-minute Blossom PUT on `mediaQueue`. The core engine serializes
+    /// MLS mutations internally (`MarmotEngine::write_lock`), so a send here
+    /// runs concurrently with an in-flight sync/upload and waits at most for
+    /// one in-flight MLS mutation, never for a relay fetch or Blossom PUT.
+    /// Same intent as Signal keeping plain text off a stuck media send path.
     private let sendQueue = DispatchQueue(label: "chat.bitchat.marmot-send", qos: .userInitiated)
+
+    /// Serial Blossom media lane. Encrypt+PUT can take minutes — must not park
+    /// text on `sendQueue` or sync on `workQueue` (Android keeps media off
+    /// `marmotSendMutex`; Signal isolates upload work from sync/text runners).
+    /// Host-lane isolation only: encrypt→Blossom→outbox still runs as one
+    /// UniFFI `block_on` (not a separate AttachmentUploadJob). Resume shares
+    /// this lane so reconnect resume cannot FIFO-block composer text; new
+    /// uploads serialize with resume (core `try_claim_media_upload` still
+    /// guards double-work). Serial-by-design vs Compose’s overlapping IO —
+    /// tradeoff for UniFFI `block_on` + resume ordering.
+    private let mediaQueue = DispatchQueue(label: "chat.bitchat.marmot-media", qos: .userInitiated)
 
     /// Serial receive/drain lane (Android `Dispatchers.IO` parity for drain).
     /// Must never FIFO-queue behind blocking UniFFI `syncForce` on
@@ -716,6 +731,10 @@ final class MarmotService: @unchecked Sendable {
 
     /// Encrypt `data`, upload the ciphertext to a Blossom server, and publish a
     /// media message to the group. `serverUrl` empty → the core default.
+    ///
+    /// Uses `mediaLane` (not `workQueue` / `sendLane`): Blossom PUTs can take
+    /// minutes and must not FIFO-block sync or text/sticker sends — Android
+    /// media-off-`marmotSendMutex` host isolation (not full Signal job-split).
     func sendMedia(
         groupId: String,
         data: Data,
@@ -724,14 +743,39 @@ final class MarmotService: @unchecked Sendable {
         caption: String,
         serverUrl: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMedia(
+        try await mediaLane {
+            try $0.sendMedia(
                 groupIdHex: groupId,
                 data: data,
                 filename: filename,
                 mime: mime,
                 caption: caption,
                 serverUrl: serverUrl
+            )
+        }
+    }
+
+    /// Like `sendMedia`, with Blossom upload progress for the optimistic bubble.
+    func sendMediaWithProgress(
+        groupId: String,
+        data: Data,
+        filename: String,
+        mime: String,
+        caption: String,
+        clientPendingId: String,
+        listener: MediaUploadListener,
+        serverUrl: String = ""
+    ) async throws {
+        try await mediaLane {
+            try $0.sendMediaWithProgress(
+                groupIdHex: groupId,
+                data: data,
+                filename: filename,
+                mime: mime,
+                caption: caption,
+                serverUrl: serverUrl,
+                clientPendingId: clientPendingId,
+                listener: listener
             )
         }
     }
@@ -753,8 +797,8 @@ final class MarmotService: @unchecked Sendable {
         caption: String,
         serverUrl: String = ""
     ) async throws {
-        try await run {
-            try $0.requireNode().sendMediaMulti(
+        try await mediaLane {
+            try $0.sendMediaMulti(
                 groupIdHex: groupId,
                 items: items.map {
                     MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
@@ -763,6 +807,48 @@ final class MarmotService: @unchecked Sendable {
                 serverUrl: serverUrl
             )
         }
+    }
+
+    /// Like `sendMediaMulti`, with aggregated album upload progress.
+    func sendMediaMultiWithProgress(
+        groupId: String,
+        items: [MediaAlbumItem],
+        caption: String,
+        clientPendingId: String,
+        listener: MediaUploadListener,
+        serverUrl: String = ""
+    ) async throws {
+        try await mediaLane {
+            try $0.sendMediaMultiWithProgress(
+                groupIdHex: groupId,
+                items: items.map {
+                    MediaUploadItem(data: $0.data, filename: $0.filename, mime: $0.mime)
+                },
+                caption: caption,
+                serverUrl: serverUrl,
+                clientPendingId: clientPendingId,
+                listener: listener
+            )
+        }
+    }
+
+    /// Resume durable pre-Blossom media staging after disconnect/kill.
+    /// On `mediaLane` so a multi-minute Blossom resume cannot park `workQueue`
+    /// (sync) or `sendLane` (text/stickers).
+    @discardableResult
+    func resumePendingMediaUploads() async throws -> UInt32 {
+        try await mediaLane {
+            try $0.resumePendingMediaUploadsQuiet()
+        }
+    }
+
+    /// Cooperative cancel for quiet resume / Blossom work (stopPolling, wipe).
+    /// Must not wait on `mediaLane` — that is the work being cancelled.
+    func cancelAllMediaUploads() {
+        nodeLock.lock()
+        let nodeRef = node
+        nodeLock.unlock()
+        nodeRef?.cancelAllMediaUploads()
     }
 
     /// Send a sticker message to the group.
@@ -1654,6 +1740,12 @@ final class MarmotService: @unchecked Sendable {
     /// core engine's `write_lock` responsibility.
     private func sendLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: sendQueue, body)
+    }
+
+    /// Blossom encrypt+upload (+ staging resume) on the dedicated media lane.
+    /// Must not share `sendQueue` with text/stickers or `workQueue` with sync.
+    private func mediaLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: mediaQueue, body)
     }
 
     /// Live receive drain on the dedicated serial drain lane. Must not share

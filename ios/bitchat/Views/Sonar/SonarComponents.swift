@@ -1322,6 +1322,10 @@ struct SNMsgList: View {
     var onTapPack: ((String) -> Void)? = nil
     /// Retry one failed outgoing message without rebuilding the transcript.
     var onRetry: ((SNMessage) -> Void)? = nil
+    /// Cancel an in-flight Blossom upload for an optimistic media bubble.
+    var onCancelUpload: ((SNMessage) -> Void)? = nil
+    /// Live Blossom upload fractions (collection-host / Compose parity).
+    var uploadProgressSource: SNMediaUploadProgressSource? = nil
     /// Load one older local database page. Nil for non-paged channel surfaces.
     var loadOlder: (() async -> Bool)? = nil
     /// Restore a movable historical window to its newest local page.
@@ -1560,6 +1564,8 @@ struct SNMsgList: View {
                                     maxBubbleWidth: geo.size.width * 0.72,
                                     showState: showDeliveryState,
                                     onRetry: canRetry ? { onRetry?(m) } : nil,
+                                    onCancelUpload: m.state == "Uploading" ? { onCancelUpload?(m) } : nil,
+                                    uploadProgressSource: uploadProgressSource,
                                     pipeline: mediaPipeline
                                 )
                             } else if m.stickerRef != nil {
@@ -2302,11 +2308,52 @@ private typealias PlatformImage = UIImage
 private typealias PlatformImage = NSImage
 #endif
 
+/// XChat-style thin horizontal bar along the bottom edge of an uploading media bubble.
+/// Tap cancels when [onCancel] is set.
+private struct SNMediaUploadBar: View {
+    let progress: Double
+    var onCancel: (() -> Void)? = nil
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.black.opacity(0.28))
+                Capsule()
+                    .fill(SonarTheme.accent)
+                    .frame(width: max(4, geo.size.width * min(1, max(0, progress))))
+            }
+        }
+        .frame(height: 3)
+        .clipShape(Capsule())
+        .contentShape(Capsule())
+        .onTapGesture { onCancel?() }
+        .allowsHitTesting(onCancel != nil)
+    }
+}
+
+/// Observes the live progress map so UICollectionView cells advance without a
+/// heightKey-driven reconfigure (progress is not part of that key).
+private struct SNLiveMediaUploadBar: View {
+    @ObservedObject var source: SNMediaUploadProgressSource
+    let messageId: String
+    var fallback: Double? = nil
+    var onCancel: (() -> Void)? = nil
+
+    var body: some View {
+        if let progress = source.fractions[messageId] ?? fallback {
+            SNMediaUploadBar(progress: progress, onCancel: onCancel)
+        }
+    }
+}
+
 struct SNMediaBubble: View {
     let m: SNMessage
     let maxBubbleWidth: CGFloat
     var showState: Bool = false
     var onRetry: (() -> Void)? = nil
+    var onCancelUpload: (() -> Void)? = nil
+    /// Live progress map; preferred over baked `m.uploadProgress` for cells.
+    var uploadProgressSource: SNMediaUploadProgressSource? = nil
     var pipeline: SNMediaPipeline = .unavailable
 
     @State private var bytes: Data?
@@ -2325,6 +2372,13 @@ struct SNMediaBubble: View {
     /// deck. A mixed image+audio/file message keeps the single-first rendering
     /// (so audio still gets its player), matching pre-album behavior.
     private var isDeck: Bool { m.media.count > 1 && m.media.allSatisfy { $0.isImage } }
+    /// Horizontal Blossom bar is photo/album-only (Compose + Signal voice parity).
+    private var showsHorizontalUploadBar: Bool {
+        m.state == "Uploading" && (isDeck || (item?.isImage == true))
+    }
+    private var isOutboundPending: Bool {
+        m.mine && (m.state == "Sending" || m.state == "Uploading")
+    }
     private var prepareKey: String {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? ""].joined(separator: "|")
@@ -2380,6 +2434,26 @@ struct SNMediaBubble: View {
             if m.mine { Spacer(minLength: 40) }
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
                 content
+                    .overlay(alignment: .bottom) {
+                        // XChat under-image bar is for photos/albums only.
+                        // Voice notes use Signal-style Sending + control spinner.
+                        if showsHorizontalUploadBar {
+                            Group {
+                                if let source = uploadProgressSource {
+                                    SNLiveMediaUploadBar(
+                                        source: source,
+                                        messageId: m.id,
+                                        fallback: m.uploadProgress,
+                                        onCancel: onCancelUpload
+                                    )
+                                } else if let progress = m.uploadProgress {
+                                    SNMediaUploadBar(progress: progress, onCancel: onCancelUpload)
+                                }
+                            }
+                            .padding(.horizontal, 2)
+                            .padding(.bottom, 2)
+                        }
+                    }
                 if !m.text.isEmpty {
                     Text(verbatim: m.text)
                         .font(SonarTheme.uiFont(size: 14.5))
@@ -2543,6 +2617,7 @@ struct SNMediaBubble: View {
                 mine: m.mine,
                 via: m.via ?? .mesh,
                 transfer: pipeline.state(item),
+                isSending: isOutboundPending,
                 onRequest: { pipeline.request(item) },
                 onCancel: { pipeline.cancel(item) }
             )
@@ -3625,6 +3700,8 @@ struct SNAudioBubble: View {
     let mine: Bool
     var via: SNVia = .mesh
     var transfer: SNMediaTransferState = .notDownloaded
+    /// Outbound Blossom/mesh send in flight — Signal-style spinner on the play control.
+    var isSending: Bool = false
     var onRequest: () -> Void = {}
     var onCancel: () -> Void = {}
 
@@ -3635,6 +3712,7 @@ struct SNAudioBubble: View {
     var body: some View {
         HStack(spacing: 11) {
             Button {
+                guard !isSending else { return }
                 switch transfer.phase {
                 case .notDownloaded, .failed:
                     onRequest()
@@ -3649,6 +3727,7 @@ struct SNAudioBubble: View {
                     .overlay { audioControl }
             }
             .buttonStyle(SNScaleStyle(scale: 0.92))
+            .disabled(isSending)
             SNMediaWave(seed: seed).frame(width: 124, height: 22)
             Text(verbatim: durationText)
                 .font(SonarTheme.monoFont(size: 11.5))
@@ -3666,35 +3745,39 @@ struct SNAudioBubble: View {
         let color = mine
             ? (via == .internet ? SonarTheme.onNet : SonarTheme.onAccent)
             : SonarTheme.accent
-        switch transfer.phase {
-        case .notDownloaded:
-            Image(systemName: "arrow.down")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
-        case .downloading:
-            ZStack {
-                if let progress = transfer.progress {
-                    Circle().stroke(color.opacity(0.28), lineWidth: 2)
-                    Circle()
-                        .trim(from: 0, to: progress)
-                        .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                } else {
-                    ProgressView().controlSize(.small).tint(color)
+        if isSending {
+            ProgressView().controlSize(.small).tint(color)
+        } else {
+            switch transfer.phase {
+            case .notDownloaded:
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .downloading:
+                ZStack {
+                    if let progress = transfer.progress {
+                        Circle().stroke(color.opacity(0.28), lineWidth: 2)
+                        Circle()
+                            .trim(from: 0, to: progress)
+                            .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                    } else {
+                        ProgressView().controlSize(.small).tint(color)
+                    }
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(color)
                 }
-                Image(systemName: "xmark")
-                    .font(.system(size: 7, weight: .bold))
+                .padding(5)
+            case .available:
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .failed:
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .bold))
                     .foregroundColor(color)
             }
-            .padding(5)
-        case .available:
-            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
-        case .failed:
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
         }
     }
 }

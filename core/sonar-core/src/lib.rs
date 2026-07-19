@@ -14,6 +14,7 @@ pub mod handles;
 pub mod identity;
 pub mod invite_link;
 pub mod marmot;
+pub mod media_staging;
 pub mod mesh;
 pub mod mesh_engine;
 pub mod noise;

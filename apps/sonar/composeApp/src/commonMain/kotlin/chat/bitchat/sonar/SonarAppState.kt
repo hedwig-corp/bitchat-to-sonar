@@ -3990,6 +3990,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch { publishSonarDescriptorIfNeeded(force = true) }
+        // Durable pre-Blossom media staging left by mid-upload kill/disconnect.
+        scope.launch {
+            runCatching { SonarCore.resumePendingMediaUploads() }
+        }
         updateBleDiscoveryPolicy()
         refreshKnownContactDescriptors(clearMisses = true)
         scope.launch {
@@ -5353,7 +5357,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pending = pendingMediaUploads[chatId] ?: return
         val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
         val firstIndex = matchingIndices.firstOrNull() ?: return
-        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, "Uploading") ?: return
+        val retryState =
+            if (pending[firstIndex].mime.startsWith("image/")) "Uploading" else "Sending"
+        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, retryState) ?: return
         for (index in matchingIndices) {
             pending[index] = pending[index].copy(
                 message = retryingMessage,
@@ -5371,20 +5377,45 @@ class SonarAppState(private val scope: CoroutineScope) {
                 toast = "This media is no longer available to retry."
                 return@launch
             }
+            val listener = MediaUploadControl { id, fraction ->
+                noteMediaUploadProgress(id, fraction)
+            }
+            registerMediaUploadControl(pendingId, listener)
+            mediaUploadProgress[pendingId] = 0f
             try {
                 if (uploads.size == 1) {
                     val upload = uploads.single()
-                    SonarCore.sendMedia(groupId, upload.data, upload.filename, upload.mime, upload.message.content)
+                    SonarCore.sendMediaWithProgress(
+                        groupId,
+                        upload.data,
+                        upload.filename,
+                        upload.mime,
+                        upload.message.content,
+                        pendingId,
+                        listener,
+                    )
                 } else {
-                    SonarCore.sendMediaMulti(
+                    SonarCore.sendMediaMultiWithProgress(
                         groupId,
                         uploads.map { AlbumUpload(it.data, it.filename, it.mime) },
                         uploads.first().message.content,
+                        pendingId,
+                        listener,
                     )
                 }
                 markPendingMediaCompleted(chatId, pendingId)
+                clearMediaUploadProgress(pendingId)
                 refreshRetriedMarmotMessage(chatId)
             } catch (error: Throwable) {
+                if (isMediaUploadInFlight(error)) {
+                    // Owner still uploading — keep Uploading UI / progress.
+                    return@launch
+                }
+                if (isMediaUploadCancelled(error)) {
+                    discardPendingMediaUpload(pendingId)
+                    return@launch
+                }
+                clearMediaUploadProgress(pendingId)
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(
@@ -5885,6 +5916,67 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private val pendingMediaUploads = mutableMapOf<String, MutableList<PendingMediaUpload>>()
     private var pendingMediaCompletionOrder = 0L
+    /** Blossom upload progress (0f..1f) keyed by optimistic pending message id. */
+    private val mediaUploadProgress = mutableStateMapOf<String, Float>()
+    private val mediaUploadControls = mutableMapOf<String, MediaUploadControl>()
+
+    /** Live upload fraction for [pendingId], if an upload is in flight. */
+    fun mediaUploadFraction(pendingId: String): Float? = mediaUploadProgress[pendingId]
+
+    /** Cancel an in-flight Blossom upload for the optimistic bubble [pendingId]. */
+    fun cancelMediaUpload(pendingId: String) {
+        mediaUploadControls[pendingId]?.cancel()
+        discardPendingMediaUpload(pendingId)
+    }
+
+    private fun isMediaUploadCancelled(error: Throwable): Boolean {
+        var cur: Throwable? = error
+        while (cur != null) {
+            val msg = cur.message.orEmpty()
+            if (msg.contains("upload cancelled", ignoreCase = true)) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
+    private fun isMediaUploadInFlight(error: Throwable): Boolean {
+        var cur: Throwable? = error
+        while (cur != null) {
+            val msg = cur.message.orEmpty()
+            if (msg.contains("already in flight", ignoreCase = true)) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
+    /** Drop a cancelled/abandoned optimistic media echo from host state. */
+    private fun discardPendingMediaUpload(pendingId: String) {
+        clearMediaUploadProgress(pendingId)
+        val chatId = pendingMediaUploads.entries
+            .firstOrNull { (_, pending) -> pending.any { it.message.id == pendingId } }
+            ?.key
+            ?: return
+        val pending = pendingMediaUploads[chatId] ?: return
+        pending.removeAll { it.message.id == pendingId }
+        if (pending.isEmpty()) pendingMediaUploads.remove(chatId)
+        if ((screen as? Screen.Chat)?.id == chatId) {
+            messages = visibleMessagesForChat(
+                chatId,
+                mergePendingMediaUploads(chatId, messages.filterNot { it.id == pendingId }),
+            )
+        }
+    }
+
+    private fun registerMediaUploadControl(pendingId: String, control: MediaUploadControl) {
+        // Do not cancel an existing control for the same id — a retry that races
+        // an in-flight owner must not abort the owner's progress listener.
+        if (mediaUploadControls.containsKey(pendingId)) return
+        mediaUploadControls[pendingId] = control
+    }
+
+    private fun unregisterMediaUploadControl(pendingId: String) {
+        mediaUploadControls.remove(pendingId)
+    }
 
     private fun rememberPendingMediaUpload(chatId: String, upload: PendingMediaUpload) {
         rememberPendingMediaUploads(chatId, listOf(upload))
@@ -5956,11 +6048,31 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         pendingMediaUploads[chatId] = survivors.toMutableList()
         // Distinct by id: an album echo appears once per surviving attachment.
-        val survivorMessages = survivors.map { it.message }.distinctBy { it.id }
+        val survivorMessages = survivors.map { it.message }.distinctBy { it.id }.map { msg ->
+            val progress = mediaUploadProgress[msg.id]
+            if (progress != null) msg.copy(uploadProgress = progress) else msg
+        }
         val survivorIds = survivorMessages.mapTo(mutableSetOf()) { it.id }
         return (published.filterNot { it.id in survivorIds } + survivorMessages)
             .distinctBy { it.id }
             .sortedBy { it.tsSecs }
+    }
+
+    private fun noteMediaUploadProgress(pendingId: String, fraction: Float) {
+        // Update the reactive map only — MediaUploadBar reads
+        // mediaUploadFraction(id) so we avoid rebuilding the full transcript
+        // on every ~100ms tick.
+        scope.launch(Dispatchers.Main) {
+            if (pendingId !in mediaUploadControls && pendingId !in mediaUploadProgress) {
+                return@launch
+            }
+            mediaUploadProgress[pendingId] = fraction
+        }
+    }
+
+    private fun clearMediaUploadProgress(pendingId: String) {
+        unregisterMediaUploadControl(pendingId)
+        mediaUploadProgress.remove(pendingId)
     }
 
     private suspend fun existingPublishedMediaUrls(groupId: String): Set<String> =
@@ -6133,12 +6245,26 @@ class SonarAppState(private val scope: CoroutineScope) {
                 )
             )
             mediaCache[pendingUrl] = data
+            mediaUploadProgress[pendingId] = 0f
             if ((screen as? Screen.Chat)?.id == chatId) {
                 messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
+            val listener = MediaUploadControl { id, fraction ->
+                noteMediaUploadProgress(id, fraction)
+            }
+            registerMediaUploadControl(pendingId, listener)
             try {
-                SonarCore.sendMedia(groupId, data, filename, mime, "")
+                SonarCore.sendMediaWithProgress(
+                    groupId,
+                    data,
+                    filename,
+                    mime,
+                    "",
+                    pendingId,
+                    listener,
+                )
                 markPendingMediaCompleted(chatId, pendingId)
+                clearMediaUploadProgress(pendingId)
                 // Refresh the open conversation so the sent image shows.
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
@@ -6159,6 +6285,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
+                if (isMediaUploadCancelled(e)) {
+                    discardPendingMediaUpload(pendingId)
+                    return@launch
+                }
+                clearMediaUploadProgress(pendingId)
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
@@ -6241,16 +6375,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             )
             items.forEachIndexed { idx, item -> mediaCache[pendingUrls[idx]] = item.bytes }
+            mediaUploadProgress[pendingId] = 0f
             if ((screen as? Screen.Chat)?.id == chatId) {
                 messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
+            val listener = MediaUploadControl { id, fraction ->
+                noteMediaUploadProgress(id, fraction)
+            }
+            registerMediaUploadControl(pendingId, listener)
             try {
-                SonarCore.sendMediaMulti(
+                SonarCore.sendMediaMultiWithProgress(
                     groupId,
                     items.map { AlbumUpload(it.bytes, it.filename, it.mime) },
                     "",
+                    pendingId,
+                    listener,
                 )
                 markPendingMediaCompleted(chatId, pendingId)
+                clearMediaUploadProgress(pendingId)
                 // Refresh the open conversation so the sent album shows.
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
@@ -6271,6 +6413,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
+                if (isMediaUploadCancelled(e)) {
+                    discardPendingMediaUpload(pendingId)
+                    return@launch
+                }
+                clearMediaUploadProgress(pendingId)
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
@@ -6337,7 +6487,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tsSecs = startedAtSecs,
                 viaInternet = true,
                 media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
-                state = "Uploading",
+                // Signal-style: voice uses Sending + control spinner, not Uploading bar.
+                state = "Sending",
             )
             rememberPendingMediaUpload(
                 chatId,
@@ -6352,12 +6503,26 @@ class SonarAppState(private val scope: CoroutineScope) {
                 )
             )
             mediaCache[pendingUrl] = bytes
+            mediaUploadProgress[pendingId] = 0f
             if ((screen as? Screen.Chat)?.id == chatId) {
                 messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))
             }
+            val listener = MediaUploadControl { id, fraction ->
+                noteMediaUploadProgress(id, fraction)
+            }
+            registerMediaUploadControl(pendingId, listener)
             try {
-                SonarCore.sendMedia(groupId, bytes, filename, mime, "")
+                SonarCore.sendMediaWithProgress(
+                    groupId,
+                    bytes,
+                    filename,
+                    mime,
+                    "",
+                    pendingId,
+                    listener,
+                )
                 markPendingMediaCompleted(chatId, pendingId)
+                clearMediaUploadProgress(pendingId)
                 (screen as? Screen.Chat)?.let { sc ->
                     if (sc.id == chatId) {
                         if (isMeshChat(chatId)) {
@@ -6377,6 +6542,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
+                if (isMediaUploadCancelled(e)) {
+                    discardPendingMediaUpload(pendingId)
+                    return@launch
+                }
+                clearMediaUploadProgress(pendingId)
                 markPendingMediaFailed(chatId, pendingId)
                 if ((screen as? Screen.Chat)?.id == chatId) {
                     messages = visibleMessagesForChat(chatId, mergePendingMediaUploads(chatId, messages))

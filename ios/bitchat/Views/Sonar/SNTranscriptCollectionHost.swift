@@ -83,6 +83,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)? = nil
     var onTapPack: ((String) -> Void)? = nil
     var onRetry: ((SNMessage) -> Void)? = nil
+    var onCancelUpload: ((SNMessage) -> Void)? = nil
+    var uploadProgressSource: SNMediaUploadProgressSource? = nil
     var loadOlder: (() async -> Bool)? = nil
     var loadNewest: (() async -> Void)? = nil
     var unreadCountAtOpen: UInt64? = nil
@@ -108,6 +110,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadSticker: loadSticker,
             onTapPack: onTapPack,
             onRetry: onRetry,
+            onCancelUpload: onCancelUpload,
+            uploadProgressSource: uploadProgressSource,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -128,6 +132,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             loadSticker: loadSticker,
             onTapPack: onTapPack,
             onRetry: onRetry,
+            onCancelUpload: onCancelUpload,
+            uploadProgressSource: uploadProgressSource,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -154,6 +160,8 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
     var loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)?
     var onTapPack: ((String) -> Void)?
     var onRetry: ((SNMessage) -> Void)?
+    var onCancelUpload: ((SNMessage) -> Void)?
+    var uploadProgressSource: SNMediaUploadProgressSource?
     var loadOlder: (() async -> Bool)?
     var loadNewest: (() async -> Void)?
     var unreadCountAtOpen: UInt64?
@@ -175,6 +183,8 @@ private struct SNTranscriptCollectionSwiftUIHost<Composer: View>: View {
                 loadSticker: loadSticker,
                 onTapPack: onTapPack,
                 onRetry: onRetry,
+                onCancelUpload: onCancelUpload,
+                uploadProgressSource: uploadProgressSource,
                 loadOlder: loadOlder,
                 loadNewest: loadNewest,
                 unreadCountAtOpen: unreadCountAtOpen,
@@ -239,6 +249,8 @@ struct SNCollectionHostMessageRow: View {
     let loadSticker: ((MarmotService.MarmotStickerRef, Bool) async -> Data?)?
     let onTapPack: ((String) -> Void)?
     let onRetry: ((SNMessage) -> Void)?
+    let onCancelUpload: ((SNMessage) -> Void)?
+    let uploadProgressSource: SNMediaUploadProgressSource?
     /// Collection column width (margins already subtracted). Never UIScreen —
     /// measure and cell must agree under Split View.
     let columnWidth: CGFloat
@@ -266,6 +278,8 @@ struct SNCollectionHostMessageRow: View {
                     maxBubbleWidth: mediaMax,
                     showState: showState,
                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
+                    onCancelUpload: m.state == "Uploading" ? { onCancelUpload?(m) } : nil,
+                    uploadProgressSource: uploadProgressSource,
                     pipeline: mediaPipeline
                 )
             } else if m.stickerRef != nil {

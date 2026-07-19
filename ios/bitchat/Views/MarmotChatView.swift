@@ -295,12 +295,23 @@ final class MarmotChatModel: ObservableObject {
     private(set) var pushWakeNotifiedMessageIDs = Set<String>()
     /// Group IDs already covered by a push-wake banner (drain or unread-delta).
     private(set) var pushWakeNotifiedGroupIds = Set<String>()
+    /// Blossom upload progress (0...1) keyed by optimistic message id.
+    /// Prefer reading [`mediaUploadProgressSource`] from bubbles — collection
+    /// host cells do not rebuild on progress-only changes.
+    @Published private(set) var mediaUploadProgress: [String: Double] = [:]
+    /// Observable progress map for live upload bars (Compose-style).
+    let mediaUploadProgressSource = SNMediaUploadProgressSource()
+    /// In-flight upload listeners keyed by optimistic message id (tap-to-cancel).
+    private var mediaUploadListeners: [String: SNMediaUploadListener] = [:]
 
     private let service: MarmotService
     private let keychain: KeychainManagerProtocol
     private let defaults: UserDefaults
     private var syncTask: Task<Void, Never>?
     private var relayConnectTask: Task<Void, Never>?
+    /// Single-flight durable media resume. Core also claims per entry id; this
+    /// stops stacking overlapping resume Tasks on flaky relay reconnects.
+    private var mediaResumeTask: Task<Void, Never>?
     /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
     private var foregroundRefreshTask: Task<Void, Never>?
     /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
@@ -400,11 +411,24 @@ final class MarmotChatModel: ObservableObject {
         guard message.isMine else { return nil }
         if message.id.hasPrefix(failedOptimisticIDPrefix) { return "Couldn't send" }
         if message.id.hasPrefix(optimisticIDPrefix) {
-            return message.media.isEmpty ? "Sending" : "Uploading"
+            return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
-        if message.deliveryState == "pending" { return message.media.isEmpty ? "Sending" : "Uploading" }
+        if message.deliveryState == "pending" {
+            return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
+        }
         return "Sent"
+    }
+
+    /// Image/album Blossom uploads use "Uploading" (horizontal bar). Voice notes
+    /// and other non-image attachments match Signal: "Sending" + status spinner.
+    private static func pendingOutboundStateText(
+        hasMedia: Bool,
+        media: [MarmotService.MarmotMedia]
+    ) -> String {
+        guard hasMedia else { return "Sending" }
+        let imageUpload = media.contains(where: \.isImage)
+        return imageUpload ? "Uploading" : "Sending"
     }
 
     static func shouldExposeCachedStickerPack(
@@ -741,6 +765,102 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    private func scheduleResumePendingMediaUploads() {
+        guard mediaResumeTask == nil else { return }
+        mediaResumeTask = Task { [weak self] in
+            defer {
+                Task { @MainActor in
+                    self?.mediaResumeTask = nil
+                }
+            }
+            guard let self else { return }
+            try? await self.service.resumePendingMediaUploads()
+        }
+    }
+
+    private func registerMediaUploadListener(_ id: String, _ listener: SNMediaUploadListener) {
+        mediaUploadListeners[id]?.cancel()
+        mediaUploadListeners[id] = listener
+    }
+
+    private func clearMediaUploadListener(_ id: String) {
+        mediaUploadListeners.removeValue(forKey: id)
+        noteMediaUploadProgress(id, nil)
+    }
+
+    private func noteMediaUploadProgress(_ id: String, _ fraction: Double?) {
+        if let fraction {
+            #if DEBUG
+            // Milestone logs for device upload timing (pair with media_upload_begin/end).
+            if fraction <= 0.001 {
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_progress id=\(id) fraction=0",
+                    category: .session
+                )
+            } else if fraction >= 0.999 {
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_progress id=\(id) fraction=1",
+                    category: .session
+                )
+            }
+            #endif
+            mediaUploadProgressSource.note(id: id, fraction: fraction)
+            var next = mediaUploadProgress
+            next[id] = fraction
+            mediaUploadProgress = next
+        } else {
+            mediaUploadProgressSource.clear(id: id)
+            var next = mediaUploadProgress
+            next.removeValue(forKey: id)
+            mediaUploadProgress = next
+        }
+    }
+
+    /// Cancel an in-flight Blossom upload for the optimistic bubble [pendingId].
+    /// Drops the optimistic row immediately; core abandons Blossom + staging.
+    func cancelMediaUpload(pendingId: String) {
+        mediaUploadListeners[pendingId]?.cancel()
+        noteMediaUploadProgress(pendingId, nil)
+        for (groupId, pending) in pendingOptimistic {
+            guard pending.contains(where: { $0.id == pendingId }) else { continue }
+            discardOptimistic(id: pendingId, from: groupId)
+            break
+        }
+    }
+
+    private static func isMediaUploadCancelled(_ error: Error) -> Bool {
+        let detail: String
+        if let service = error as? MarmotService.ServiceError {
+            switch service {
+            case .core(let message), .invalidInput(let message):
+                detail = message
+            case .cancelled:
+                return true
+            case .notConnected:
+                return false
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return detail.localizedCaseInsensitiveContains("upload cancelled")
+    }
+
+    /// Core returned `MediaUploadInFlight` — another worker owns this optimistic id.
+    private static func isMediaUploadInFlight(_ error: Error) -> Bool {
+        let detail: String
+        if let service = error as? MarmotService.ServiceError {
+            switch service {
+            case .core(let message), .invalidInput(let message):
+                detail = message
+            default:
+                return false
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return detail.localizedCaseInsensitiveContains("already in flight")
+    }
+
     private func connectRelaysIfNeeded() {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
@@ -772,6 +892,10 @@ final class MarmotChatModel: ObservableObject {
                 // hold the serial engine queue for their per-relay OK waits and
                 // delayed the first drain by ~50s on device (t3→t3a).
                 self.startPolling()
+                // Resume durable pre-Blossom media staging (mid-upload kill /
+                // disconnect). Does not block cold start; Blossom itself does
+                // not need the relay, but publish still uses the outbox.
+                self.scheduleResumePendingMediaUploads()
                 try? await self.service.publishKeyPackageBackground()
                 // After nsec restore the local nick/handle sidecars are empty.
                 // Fetch our own kind-0 first so the host can adopt name + nip05
@@ -2463,24 +2587,68 @@ final class MarmotChatModel: ObservableObject {
         )
         Task {
             var echoVisible = false
+            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+                Task { @MainActor in
+                    self?.noteMediaUploadProgress(pendingId, fraction)
+                }
+            }
+            registerMediaUploadListener(echo.id, listener)
             do {
-                guard await ensureConnected() else {
+                // Wait for a local Marmot node (`isConnected`), not relay
+                // (`isRelayConnected`). Blossom PUTs do not need relays; kind-445
+                // publish still goes through the durable outbox after the URL
+                // exists. Without this short wait, cold-start media can fail
+                // with notConnected before staging.
+                guard await ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
-                try await service.sendMedia(
-                    groupId: groupId, data: data, filename: filename, mime: mime, caption: caption
+                #if DEBUG
+                let uploadStarted = Date()
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_begin id=\(echo.id) bytes=\(data.count) mime=\(mime) album=1",
+                    category: .session
                 )
+                #endif
+                try await service.sendMediaWithProgress(
+                    groupId: groupId,
+                    data: data,
+                    filename: filename,
+                    mime: mime,
+                    caption: caption,
+                    clientPendingId: echo.id,
+                    listener: listener
+                )
+                #if DEBUG
+                let ms = Int(Date().timeIntervalSince(uploadStarted) * 1000)
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=1 elapsed_ms=\(ms)",
+                    category: .session
+                )
+                #endif
+                clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                #if DEBUG
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=0 err=\(Self.describe(error))",
+                    category: .session
+                )
+                #endif
+                if Self.isMediaUploadInFlight(error) {
+                    // Owner (resume or prior send) still uploading — keep echo.
+                    return
+                }
+                clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
+                if Self.isMediaUploadCancelled(error) {
+                    return
+                }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -2532,22 +2700,62 @@ final class MarmotChatModel: ObservableObject {
         )
         Task {
             var echoVisible = false
+            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+                Task { @MainActor in
+                    self?.noteMediaUploadProgress(pendingId, fraction)
+                }
+            }
+            registerMediaUploadListener(echo.id, listener)
             do {
-                guard await ensureConnected() else {
+                // Same as sendMedia: local node only — not `ensureRelayConnected`.
+                guard await ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                guard await ensureRelayConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
-                try await service.sendMediaMulti(groupId: groupId, items: items, caption: caption)
+                #if DEBUG
+                let uploadStarted = Date()
+                let albumBytes = items.reduce(0) { $0 + $1.data.count }
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_begin id=\(echo.id) bytes=\(albumBytes) mime=album album=\(items.count)",
+                    category: .session
+                )
+                #endif
+                try await service.sendMediaMultiWithProgress(
+                    groupId: groupId,
+                    items: items,
+                    caption: caption,
+                    clientPendingId: echo.id,
+                    listener: listener
+                )
+                #if DEBUG
+                let ms = Int(Date().timeIntervalSince(uploadStarted) * 1000)
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=1 elapsed_ms=\(ms)",
+                    category: .session
+                )
+                #endif
+                clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                #if DEBUG
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=0 err=\(Self.describe(error))",
+                    category: .session
+                )
+                #endif
+                if Self.isMediaUploadInFlight(error) {
+                    return
+                }
+                clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
+                if Self.isMediaUploadCancelled(error) {
+                    return
+                }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -3120,6 +3328,21 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // Latch core cancel before clearing the Task slot so an in-flight quiet
+        // resume on mediaLane observes cancel (observer=None otherwise ignores
+        // Task.cancel). Do not nil the slot until the task finishes — same
+        // stacked-resume hazard as gapRecovery.
+        let resume = mediaResumeTask
+        mediaResumeTask?.cancel()
+        service.cancelAllMediaUploads()
+        Task { [weak self] in
+            _ = await resume?.value
+            await MainActor.run {
+                if self?.mediaResumeTask === resume {
+                    self?.mediaResumeTask = nil
+                }
+            }
+        }
         syncTask?.cancel()
         syncTask = nil
         foregroundRefreshTask?.cancel()

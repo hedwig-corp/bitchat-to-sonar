@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
+use mdk_core::encrypted_media::EncryptedMediaUpload;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
@@ -36,6 +37,10 @@ use crate::invite_link::invite_link_state_path_for_db;
 use crate::marmot::{
     ChatMessage, DeliveryState, GroupCreation, GroupInvite, GroupMembershipUpdate, Incoming,
     MarmotEngine, RecentMessagePage, KEY_PACKAGE_KIND, SYNC_STATE_FILE_SUFFIX,
+};
+use crate::media_staging::{
+    media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
+    SealedMediaItem,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
@@ -104,6 +109,9 @@ const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// Bounded parallel Blossom encrypt→upload workers for album sends (per-item
+/// progress is aggregated into one bubble bar).
+const MEDIA_UPLOAD_CONCURRENCY: usize = 5;
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
 /// Upper bound on receive-time sticker prefetch work per processed event batch.
@@ -126,6 +134,17 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// Shared HTTP client for Blossom media *uploads*. Redirects disabled (streamed
+/// PUT bodies are not replayable). No aggressive default request timeout —
+/// [`blossom_upload_with_timeout`] applies the size-scaled deadline.
+static BLOSSOM_UPLOAD_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("BLOSSOM_UPLOAD_HTTP_CLIENT: reqwest builder failed")
 });
 
 /// Per-request bounds for handle registrar/NIP-05 traffic. Tighter than the
@@ -187,8 +206,87 @@ pub trait MediaDownloadObserver: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+/// Host-facing progress/cancellation hook for a Blossom upload. `client_pending_id`
+/// correlates progress with the host's optimistic media bubble.
+pub trait MediaUploadObserver: Send + Sync {
+    fn on_progress(&self, client_pending_id: &str, bytes_sent: u64, total_bytes: u64);
+    fn is_cancelled(&self) -> bool;
+}
+
 fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> bool {
     observer.is_some_and(MediaDownloadObserver::is_cancelled)
+}
+
+fn media_upload_cancelled(observer: Option<&dyn MediaUploadObserver>) -> bool {
+    observer.is_some_and(MediaUploadObserver::is_cancelled)
+}
+
+fn media_upload_cancelled_or_all(
+    observer: Option<&dyn MediaUploadObserver>,
+    cancel_all: &AtomicBool,
+) -> bool {
+    cancel_all.load(Ordering::Acquire) || media_upload_cancelled(observer)
+}
+
+fn upload_to_sealed(upload: &EncryptedMediaUpload, url: &str) -> SealedMediaItem {
+    SealedMediaItem {
+        url: url.to_string(),
+        filename: upload.filename.clone(),
+        mime: upload.mime_type.clone(),
+        original_hash_hex: hex::encode(upload.original_hash),
+        encrypted_hash_hex: hex::encode(upload.encrypted_hash),
+        nonce_hex: hex::encode(upload.nonce),
+        original_size: upload.original_size,
+        encrypted_size: upload.encrypted_size,
+        dimensions: upload.dimensions,
+        blurhash: upload.blurhash.clone(),
+        thumbhash: upload.thumbhash.clone(),
+        duration_ms: upload.duration_ms,
+        waveform: upload.waveform.clone(),
+    }
+}
+
+fn sealed_item_to_upload(sealed: SealedMediaItem) -> Result<EncryptedMediaUpload> {
+    let original_hash: [u8; 32] = hex::decode(&sealed.original_hash_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed original_hash corrupt".into()))?;
+    let encrypted_hash: [u8; 32] = hex::decode(&sealed.encrypted_hash_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed encrypted_hash corrupt".into()))?;
+    let nonce: [u8; 12] = hex::decode(&sealed.nonce_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed nonce corrupt".into()))?;
+    Ok(EncryptedMediaUpload {
+        // Ciphertext not needed for imeta rebuild after Blossom already has the blob.
+        encrypted_data: Vec::new(),
+        original_hash,
+        encrypted_hash,
+        mime_type: sealed.mime,
+        filename: sealed.filename,
+        original_size: sealed.original_size,
+        encrypted_size: sealed.encrypted_size,
+        dimensions: sealed.dimensions,
+        blurhash: sealed.blurhash,
+        thumbhash: sealed.thumbhash,
+        duration_ms: sealed.duration_ms,
+        waveform: sealed.waveform,
+        nonce,
+    })
+}
+
+/// RAII guard that releases a media-upload in-flight claim on drop.
+struct MediaUploadInflightClaim {
+    inflight: Arc<Mutex<HashSet<String>>>,
+    entry_id: String,
+}
+
+impl Drop for MediaUploadInflightClaim {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.entry_id);
+    }
 }
 
 #[cfg(test)]
@@ -1357,6 +1455,16 @@ pub struct SonarClient {
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
     outbox_state: Arc<Mutex<OutboxState>>,
+    /// Pre-Blossom media staging: plaintext files + sidecar so mid-upload
+    /// disconnect/kill does not lose attachments.
+    media_staging: Arc<Mutex<MediaStagingState>>,
+    /// Entry ids currently owned by `send_media_multi_with_progress` or
+    /// `resume_pending_media_uploads`. Prevents overlapping workers from
+    /// double-publishing the same staged album.
+    media_upload_inflight: Arc<Mutex<HashSet<String>>>,
+    /// Host-set latch so quiet resume (no observer) can still be cancelled on
+    /// wipe / stopPolling. Cleared at the start of each resume pass.
+    media_upload_cancel_all: Arc<AtomicBool>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1485,6 +1593,7 @@ impl SonarClient {
                 None
             }
         };
+        let (media_staging_state, media_staging_dir) = media_staging_paths_for_db(db_path);
         let mut client = Self::with_engine(
             identity,
             relays,
@@ -1492,6 +1601,7 @@ impl SonarClient {
             true,
             Some(sync_state_path_for_db(db_path)),
             Some(outbox_state_path_for_db(db_path)),
+            Some((media_staging_state, media_staging_dir)),
             Some(invite_link_state_path_for_db(db_path)),
             Some(push_token_cache_path_for_db(db_path)),
             StickerCache::for_db(db_path)?,
@@ -1520,6 +1630,7 @@ impl SonarClient {
             None,
             None,
             None,
+            None,
             StickerCache::disabled(),
             None,
         )
@@ -1533,6 +1644,7 @@ impl SonarClient {
         allow_geo_relays: bool,
         sync_state_path: Option<PathBuf>,
         outbox_state_path: Option<PathBuf>,
+        media_staging_paths: Option<(PathBuf, PathBuf)>,
         invite_link_state_path: Option<PathBuf>,
         push_token_cache_path: Option<PathBuf>,
         sticker_cache: StickerCache,
@@ -1891,6 +2003,16 @@ impl SonarClient {
             storage_empty,
         )));
         let outbox_state = Arc::new(Mutex::new(OutboxState::load(outbox_state_path)));
+        let (media_staging_state_path, media_staging_dir_path) = match media_staging_paths {
+            Some((state, dir)) => (Some(state), Some(dir)),
+            None => (None, None),
+        };
+        let media_staging = Arc::new(Mutex::new(MediaStagingState::load(
+            media_staging_state_path,
+            media_staging_dir_path,
+        )));
+        let media_upload_inflight = Arc::new(Mutex::new(HashSet::new()));
+        let media_upload_cancel_all = Arc::new(AtomicBool::new(false));
         let client = Self {
             engine,
             nostr,
@@ -1903,6 +2025,9 @@ impl SonarClient {
             identity_secret,
             sync_state,
             outbox_state,
+            media_staging,
+            media_upload_inflight,
+            media_upload_cancel_all,
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -3837,13 +3962,13 @@ impl SonarClient {
         .await
     }
 
-    /// Send N media attachments as ONE message (album): encrypt each with the
-    /// group key (MIP-04), upload every ciphertext to Blossom, then publish a
-    /// single kind-445 event carrying all `imeta` tags in order plus the optional
-    /// `caption`. Every upload must succeed BEFORE the message is published, so a
-    /// failed upload never leaves a dangling reference and nothing partial hits
-    /// the wire. `items` must be non-empty. `server_url` empty →
-    /// [`DEFAULT_BLOSSOM_SERVER`].
+    /// Send N media attachments as ONE message (album): stage locally, encrypt
+    /// each with the group key (MIP-04), upload every ciphertext to Blossom
+    /// (bounded parallel), then publish a single kind-445 event carrying all
+    /// `imeta` tags in order plus the optional `caption`. Every upload must
+    /// succeed BEFORE the message is published. Mid-upload failure leaves
+    /// durable staging for [`Self::resume_pending_media_uploads`].
+    /// `items` must be non-empty. `server_url` empty → [`DEFAULT_BLOSSOM_SERVER`].
     pub async fn send_media_multi(
         &self,
         group_id: &GroupId,
@@ -3851,9 +3976,33 @@ impl SonarClient {
         caption: &str,
         server_url: &str,
     ) -> Result<()> {
+        self.send_media_multi_with_progress(group_id, items, caption, server_url, "", None)
+            .await
+    }
+
+    /// Like [`Self::send_media_multi`], with upload progress for the host's
+    /// optimistic bubble identified by `client_pending_id`.
+    pub async fn send_media_multi_with_progress(
+        &self,
+        group_id: &GroupId,
+        items: Vec<MediaUpload>,
+        caption: &str,
+        server_url: &str,
+        client_pending_id: &str,
+        observer: Option<&dyn MediaUploadObserver>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        // Direct send is intentional — clear any prior stopPolling / wipe latch
+        // so a new upload is not immediately cancelled (Android can race a
+        // concurrent send between stopPolling and the next resume pass).
+        self.clear_media_upload_cancel();
+        tracing::info!(
+            items = items.len(),
+            client_pending_id,
+            "media send_media_multi_with_progress enter"
+        );
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
         // Reject before any encrypt/upload work. The aggregate cap bounds the
@@ -3874,29 +4023,582 @@ impl SonarClient {
                 max: MAX_MEDIA_TOTAL_PLAINTEXT_BYTES as u64,
             });
         }
-        // Encrypt + upload every attachment first; only then build + publish the
-        // single message. Any failure aborts the whole album with nothing sent.
-        let mut uploads = Vec::with_capacity(items.len());
-        for item in &items {
-            let upload =
-                self.engine
-                    .encrypt_media(group_id, &item.data, &item.mime, &item.filename)?;
-            let url = self
-                .blossom_upload(server_url, upload.encrypted_data.clone())
-                .await?;
-            uploads.push((upload, url));
+
+        let entry_id = if client_pending_id.is_empty() {
+            new_media_staging_id()
+        } else {
+            client_pending_id.to_string()
+        };
+        let progress_id = if client_pending_id.is_empty() {
+            entry_id.clone()
+        } else {
+            client_pending_id.to_string()
+        };
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let now = Timestamp::now().as_secs();
+        let staged_items: Vec<(String, String, Vec<u8>)> = items
+            .into_iter()
+            .map(|item| (item.filename, item.mime, item.data))
+            .collect();
+        // Claim *before* stage so a racing resume cannot observe an Uploading
+        // row on disk and steal the entry mid-fsync.
+        let Some(_claim) = self.try_claim_media_upload(&entry_id) else {
+            // Another send/resume already owns this optimistic id. Hosts must
+            // keep Uploading UI — not success (clears progress) or hard fail.
+            return Err(Error::MediaUploadInFlight);
+        };
+        {
+            let staging = self.media_staging.clone();
+            let entry_id = entry_id.clone();
+            let progress_id = progress_id.clone();
+            let caption = caption.to_string();
+            let server_url = server_url.to_string();
+            tokio::task::spawn_blocking(move || {
+                staging.lock().unwrap().stage(
+                    entry_id,
+                    progress_id,
+                    group_id_hex,
+                    caption,
+                    server_url,
+                    staged_items,
+                    now,
+                )
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging join: {e}")))??;
         }
-        let refs: Vec<_> = uploads.iter().map(|(u, url)| (u, url.as_str())).collect();
+        if let Some(obs) = observer {
+            obs.on_progress(&progress_id, 0, total_bytes);
+        }
+
+        match self
+            .complete_staged_media_upload(&entry_id, group_id, observer)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Cancel is intentional abandon — drop the sidecar so cold start
+                // does not keep a Failed row until TTL.
+                if matches!(err, Error::MediaUploadCancelled) {
+                    self.staging_remove(&entry_id).await;
+                } else {
+                    self.staging_mark_failed(&entry_id, err.to_string()).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Latch used by wipe / stopPolling so quiet resume (no observer) can stop.
+    pub fn cancel_all_media_uploads(&self) {
+        self.media_upload_cancel_all.store(true, Ordering::Release);
+    }
+
+    /// Clear the process-wide cancel latch (called at the start of each resume).
+    pub fn clear_media_upload_cancel(&self) {
+        self.media_upload_cancel_all.store(false, Ordering::Release);
+    }
+
+    /// Resume durable staged media uploads left behind by a failed or
+    /// interrupted send. Returns how many entries were attempted.
+    pub async fn resume_pending_media_uploads(
+        &self,
+        observer: Option<&dyn MediaUploadObserver>,
+    ) -> Result<u32> {
+        // New resume pass is intentional — clear any prior stopPolling latch.
+        self.clear_media_upload_cancel();
+        {
+            let staging = self.media_staging.clone();
+            let now = Timestamp::now().as_secs();
+            tokio::task::spawn_blocking(move || {
+                let mut staging = staging.lock().unwrap();
+                staging.reload_from_disk();
+                staging.purge_expired_failed(now)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging resume prep join: {e}")))??;
+        }
+        let mut attempted = 0u32;
+        // Finish Committed rows that crashed after the local event existed but
+        // before outbox durability — never re-encrypt/re-upload.
+        attempted += self.resume_committed_media_outbox().await?;
+        // Only auto-resume in-flight uploads. Failed rows require an explicit
+        // host retry so cold start cannot resurrect abandoned / cancelled sends.
+        let ids = self.media_staging.lock().unwrap().resumable_ids();
+        for id in ids {
+            let Some(_claim) = self.try_claim_media_upload(&id) else {
+                // Another send/resume already owns this entry.
+                continue;
+            };
+            attempted += 1;
+            let (group_hex, progress_id) = {
+                let staging = self.media_staging.lock().unwrap();
+                let Some(entry) = staging.get(&id) else {
+                    continue;
+                };
+                (entry.group_id_hex.clone(), entry.client_pending_id.clone())
+            };
+            let group_bytes = match hex::decode(&group_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let _ = self.media_staging.lock().unwrap().mark_failed(
+                        &id,
+                        "invalid staged group id".into(),
+                        Timestamp::now().as_secs(),
+                    );
+                    continue;
+                }
+            };
+            // GroupId::from_slice panics on wrong length — refuse corrupt rows.
+            if group_bytes.len() != 32 {
+                let _ = self.media_staging.lock().unwrap().mark_failed(
+                    &id,
+                    format!(
+                        "invalid staged group id length: {} (want 32)",
+                        group_bytes.len()
+                    ),
+                    Timestamp::now().as_secs(),
+                );
+                continue;
+            }
+            let group_id = GroupId::from_slice(&group_bytes);
+            let _ = self
+                .media_staging
+                .lock()
+                .unwrap()
+                .mark_uploading(&id, Timestamp::now().as_secs());
+            if let Some(obs) = observer {
+                let total = self
+                    .media_staging
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .map(|e| e.total_bytes)
+                    .unwrap_or(0);
+                obs.on_progress(&progress_id, 0, total);
+            }
+            match self
+                .complete_staged_media_upload(&id, &group_id, observer)
+                .await
+            {
+                Ok(()) => {}
+                Err(Error::MediaUploadCancelled) => {
+                    self.staging_remove(&id).await;
+                }
+                Err(err) => {
+                    self.staging_mark_failed(&id, err.to_string()).await;
+                }
+            }
+        }
+        Ok(attempted)
+    }
+
+    /// Atomically claim `entry_id` for one upload worker. Returns `None` when
+    /// another send/resume already owns the id.
+    fn try_claim_media_upload(&self, entry_id: &str) -> Option<MediaUploadInflightClaim> {
+        let mut inflight = self.media_upload_inflight.lock().unwrap();
+        if !inflight.insert(entry_id.to_string()) {
+            return None;
+        }
+        Some(MediaUploadInflightClaim {
+            inflight: self.media_upload_inflight.clone(),
+            entry_id: entry_id.to_string(),
+        })
+    }
+
+    /// Recover Committed staging rows that still hold an outbox payload
+    /// (crash between `mark_committed_for_publish` and remove).
+    async fn resume_committed_media_outbox(&self) -> Result<u32> {
+        let ids = self.media_staging.lock().unwrap().committed_recovery_ids();
+        let mut attempted = 0u32;
+        for id in ids {
+            let Some(_claim) = self.try_claim_media_upload(&id) else {
+                continue;
+            };
+            attempted += 1;
+            let recovery = {
+                let staging = self.media_staging.lock().unwrap();
+                let Some(entry) = staging.get(&id) else {
+                    continue;
+                };
+                (
+                    entry.group_id_hex.clone(),
+                    entry.committed_message_id_hex.clone(),
+                    entry.committed_event_id_hex.clone(),
+                    entry.committed_event_json.clone(),
+                )
+            };
+            let (group_id_hex, Some(message_id_hex), Some(event_id_hex), Some(event_json)) =
+                recovery
+            else {
+                let staging = self.media_staging.clone();
+                let id = id.clone();
+                let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&id))
+                    .await;
+                continue;
+            };
+            let event = match Event::from_json(&event_json) {
+                Ok(event) => event,
+                Err(err) => {
+                    let staging = self.media_staging.clone();
+                    let id = id.clone();
+                    let msg = format!("committed media outbox decode: {err}");
+                    let now = Timestamp::now().as_secs();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        staging.lock().unwrap().mark_failed(&id, msg, now)
+                    })
+                    .await;
+                    continue;
+                }
+            };
+            if let Err(err) = self.outbox_state.lock().unwrap().mark_pending(
+                group_id_hex.clone(),
+                message_id_hex.clone(),
+                event_id_hex,
+                event_json,
+                Timestamp::now().as_secs(),
+            ) {
+                let staging = self.media_staging.clone();
+                let id = id.clone();
+                let msg = err.to_string();
+                let now = Timestamp::now().as_secs();
+                let _ = tokio::task::spawn_blocking(move || {
+                    staging.lock().unwrap().mark_failed(&id, msg, now)
+                })
+                .await;
+                continue;
+            }
+            let staging = self.media_staging.clone();
+            let remove_id = id.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                staging.lock().unwrap().remove(&remove_id)
+            })
+            .await;
+            let _ = self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
+            self.notify_conversation_changed(&group_id_hex);
+        }
+        Ok(attempted)
+    }
+
+    async fn staging_remove(&self, entry_id: &str) {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || staging.lock().unwrap().remove(&entry_id)).await;
+    }
+
+    async fn staging_mark_failed(&self, entry_id: &str, error: String) {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let now = Timestamp::now().as_secs();
+        let _ = tokio::task::spawn_blocking(move || {
+            staging.lock().unwrap().mark_failed(&entry_id, error, now)
+        })
+        .await;
+    }
+
+    async fn staging_mark_committed_for_publish(
+        &self,
+        entry_id: &str,
+        message_id_hex: String,
+        event_id_hex: String,
+        event_json: String,
+    ) -> Result<()> {
+        let staging = self.media_staging.clone();
+        let entry_id = entry_id.to_string();
+        let now = Timestamp::now().as_secs();
+        tokio::task::spawn_blocking(move || {
+            staging.lock().unwrap().mark_committed_for_publish(
+                &entry_id,
+                message_id_hex,
+                event_id_hex,
+                event_json,
+                now,
+            )
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("media staging commit join: {e}")))?
+    }
+
+    /// Encrypt + upload staged plaintext, then publish via the durable outbox.
+    /// True when a local transcript message already carries every Blossom URL
+    /// (crash between MLS create and Committed left the row without staging mark).
+    ///
+    /// Scans a bounded newest-first page only — the crash window always leaves
+    /// the local kind-445 near the tip; a full `messages()` deserialize would
+    /// pay O(history) on every successful media send.
+    fn local_media_urls_present(&self, group_id: &GroupId, urls: &[String]) -> Result<bool> {
+        if urls.is_empty() {
+            return Ok(false);
+        }
+        const CRASH_RECOVERY_URL_SCAN: usize = 64;
+        let messages = self.engine.messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
+        Ok(messages.iter().any(|message| {
+            urls.iter()
+                .all(|url| message.media.iter().any(|m| m.url == *url))
+        }))
+    }
+
+    async fn complete_staged_media_upload(
+        &self,
+        entry_id: &str,
+        group_id: &GroupId,
+        observer: Option<&dyn MediaUploadObserver>,
+    ) -> Result<()> {
+        if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
+            return Err(Error::MediaUploadCancelled);
+        }
+        let (caption, server_url, progress_id, items_meta, plaintext_items, sealed_items) = {
+            let staging = self.media_staging.clone();
+            let entry_id = entry_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                let staging = staging.lock().unwrap();
+                let entry = staging
+                    .get(&entry_id)
+                    .ok_or_else(|| Error::Media("staged media entry missing".into()))?
+                    .clone();
+                let bytes = staging.load_item_bytes(&entry)?;
+                Ok::<_, Error>((
+                    entry.caption,
+                    entry.server_url,
+                    entry.client_pending_id,
+                    entry.items,
+                    bytes,
+                    entry.sealed_items,
+                ))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("media staging load join: {e}")))??
+        };
+        if items_meta.len() != plaintext_items.len() {
+            return Err(Error::Media("staged media item count mismatch".into()));
+        }
+
+        let item_count = plaintext_items.len();
+        let plaintext_total: u64 = plaintext_items.iter().map(|d| d.len() as u64).sum();
+        let upload_t0 = std::time::Instant::now();
+        tracing::info!(
+            entry_id,
+            items = item_count,
+            plaintext_bytes = plaintext_total,
+            "media upload encrypt+blossom begin"
+        );
+
+        let (encrypted, urls) = if let Some(sealed) = sealed_items.filter(|s| !s.is_empty()) {
+            // Blossom already succeeded on a prior attempt — skip re-upload.
+            let urls: Vec<String> = sealed.iter().map(|s| s.url.clone()).collect();
+            let encrypted = sealed
+                .into_iter()
+                .map(sealed_item_to_upload)
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(obs) = observer {
+                let total: u64 = encrypted.iter().map(|u| u.encrypted_size.max(1)).sum();
+                obs.on_progress(&progress_id, total, total);
+            }
+            (encrypted, urls)
+        } else {
+            let plaintext_lens: Arc<Vec<u64>> = Arc::new(
+                plaintext_items
+                    .iter()
+                    .map(|d| d.len() as u64)
+                    .collect(),
+            );
+            let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+                (0..item_count)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            );
+            let item_totals: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+                (0..item_count)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            );
+            let provisional_total: u64 = plaintext_lens.iter().sum();
+            if let Some(obs) = observer {
+                obs.on_progress(&progress_id, 0, provisional_total);
+            }
+
+            let pairs: Vec<_> = items_meta.into_iter().zip(plaintext_items).collect();
+            let group_id_owned = group_id.clone();
+            let cancel_all = self.media_upload_cancel_all.clone();
+            let upload_futs = pairs.into_iter().enumerate().map(|(index, (meta, data))| {
+                let server_url = server_url.clone();
+                let item_sent = item_sent.clone();
+                let item_totals = item_totals.clone();
+                let group_id = group_id_owned.clone();
+                let cancel_all = cancel_all.clone();
+                async move {
+                    if media_upload_cancelled_or_all(observer, &cancel_all) {
+                        return Err(Error::MediaUploadCancelled);
+                    }
+                    // On the multi-thread UniFFI runtime, park this worker so
+                    // encrypt CPU does not starve Blossom/cancel polls. Current-
+                    // thread test runtimes cannot use block_in_place.
+                    let upload = if matches!(
+                        tokio::runtime::Handle::current().runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    ) {
+                        tokio::task::block_in_place(|| {
+                            self.engine.encrypt_media(
+                                &group_id,
+                                &data,
+                                &meta.mime,
+                                &meta.filename,
+                            )
+                        })?
+                    } else {
+                        self.engine.encrypt_media(
+                            &group_id,
+                            &data,
+                            &meta.mime,
+                            &meta.filename,
+                        )?
+                    };
+                    let cipher_len = upload.encrypted_data.len() as u64;
+                    item_totals[index].store(cipher_len, Ordering::Relaxed);
+                    if media_upload_cancelled_or_all(observer, &cancel_all) {
+                        return Err(Error::MediaUploadCancelled);
+                    }
+                    let cipher = upload.encrypted_data.clone();
+                    let url = self
+                        .blossom_upload_with_progress(
+                            &server_url,
+                            cipher,
+                            Some(Box::new({
+                                let item_sent = item_sent.clone();
+                                move |sent: u64, _total: u64| {
+                                    item_sent[index].store(sent, Ordering::Relaxed);
+                                }
+                            }) as Box<dyn FnMut(u64, u64) + Send>),
+                        )
+                        .await?;
+                    Ok::<_, Error>((index, upload, url))
+                }
+            });
+
+            use futures_util::stream::{self, StreamExt};
+            let uploads = async {
+                stream::iter(upload_futs)
+                    .buffer_unordered(MEDIA_UPLOAD_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await
+            };
+            let entry_id_owned = entry_id.to_string();
+            let media_staging = self.media_staging.clone();
+            let cancel_all = self.media_upload_cancel_all.clone();
+            let progress_tick = {
+                let item_sent = item_sent.clone();
+                let item_totals = item_totals.clone();
+                let plaintext_lens = plaintext_lens.clone();
+                let media_staging = media_staging.clone();
+                let entry_id_owned = entry_id_owned.clone();
+                let progress_id = progress_id.clone();
+                let cancel_all = cancel_all.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if media_upload_cancelled_or_all(observer, &cancel_all) {
+                            return Error::MediaUploadCancelled;
+                        }
+                        let aggregate: u64 =
+                            item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+                        let mut album_total = 0u64;
+                        for (i, total) in item_totals.iter().enumerate() {
+                            let known = total.load(Ordering::Relaxed);
+                            album_total += if known > 0 {
+                                known
+                            } else {
+                                plaintext_lens[i]
+                            };
+                        }
+                        let aggregate = aggregate.min(album_total.max(1));
+                        let _ = media_staging.lock().unwrap().update_progress(
+                            &entry_id_owned,
+                            aggregate,
+                            Timestamp::now().as_secs(),
+                            false,
+                        );
+                        if let Some(obs) = observer {
+                            obs.on_progress(&progress_id, aggregate, album_total.max(1));
+                        }
+                    }
+                }
+            };
+
+            let results = tokio::select! {
+                biased;
+                results = uploads => results,
+                err = progress_tick => return Err(err),
+            };
+            let mut encrypted_slots = Vec::with_capacity(item_count);
+            encrypted_slots.resize_with(item_count, || None);
+            let mut urls = vec![String::new(); item_count];
+            for result in results {
+                let (index, upload, url) = result?;
+                encrypted_slots[index] = Some(upload);
+                urls[index] = url;
+            }
+            let encrypted: Vec<_> = encrypted_slots
+                .into_iter()
+                .map(|slot| {
+                    slot.ok_or_else(|| Error::Media("album upload missing encrypted item".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
+                return Err(Error::MediaUploadCancelled);
+            }
+            let sealed: Vec<SealedMediaItem> = encrypted
+                .iter()
+                .zip(urls.iter())
+                .map(|(u, url)| upload_to_sealed(u, url))
+                .collect();
+            {
+                let staging = self.media_staging.clone();
+                let entry_id = entry_id.to_string();
+                let now = Timestamp::now().as_secs();
+                tokio::task::spawn_blocking(move || {
+                    staging.lock().unwrap().mark_sealed(&entry_id, sealed, now)
+                })
+                .await
+                .map_err(|e| Error::Storage(format!("media seal join: {e}")))??;
+            }
+            (encrypted, urls)
+        };
+
+        if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
+            return Err(Error::MediaUploadCancelled);
+        }
+        let album_total: u64 = encrypted
+            .iter()
+            .map(|u| u.encrypted_size.max(u.encrypted_data.len() as u64).max(1))
+            .sum();
+
+        // Crash between MLS create and Committed left a local row with these
+        // Blossom URLs — do not create a second kind-445.
+        if self.local_media_urls_present(group_id, &urls)? {
+            self.staging_remove(entry_id).await;
+            if let Some(obs) = observer {
+                obs.on_progress(&progress_id, album_total, album_total);
+            }
+            tracing::info!(
+                entry_id,
+                items = item_count,
+                "media upload skipped create; local urls already present"
+            );
+            return Ok(());
+        }
+
+        let refs: Vec<_> = encrypted
+            .iter()
+            .zip(urls.iter())
+            .map(|(u, url)| (u, url.as_str()))
+            .collect();
         // Local-first, same sequencing as `send_text`: encrypt + write the
         // local row under one MLS guard, mark the durable outbox pending, and
-        // publish in the background with first-ACK delivery state. Media rows
-        // previously published inline and skipped the outbox entirely, so a
-        // relay failure either surfaced as a send error (pre-refactor) or
-        // could have stranded a false-Sent row.
+        // publish in the background with first-ACK delivery state.
         let (event, incoming) = {
             let _epoch = self.membership_gate.read().await;
             self.engine
-                .create_and_process_media_event_multi(group_id, &refs, caption)?
+                .create_and_process_media_event_multi(group_id, &refs, &caption)?
         };
         let Incoming::Message(message) = incoming else {
             return Err(Error::Storage(
@@ -3905,13 +4607,38 @@ impl SonarClient {
         };
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
-        self.mark_outbox_pending(group_id, &message, &event)?;
+        let message_id_hex = message.id.to_hex();
         let event_id = event.id;
+        let event_id_hex = event_id.to_hex();
+        let event_json = event.as_json();
+        // Durable Committed+payload *before* outbox so a crash cannot leave an
+        // Uploading row (which would re-upload into a second kind-445). Resume
+        // recovers Committed payloads via outbox-only publish.
+        self.staging_mark_committed_for_publish(
+            entry_id,
+            message_id_hex.clone(),
+            event_id_hex,
+            event_json.clone(),
+        )
+        .await?;
+        self.mark_outbox_pending(group_id, &message, &event)?;
+        self.staging_remove(entry_id).await;
         let publish_ack =
-            self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
+            self.spawn_outbox_publish(message_id_hex, group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
         self.spawn_send_bookkeeping(group_name, message, event_id);
         self.spawn_push_notification(group_id.clone(), publish_ack);
+        if let Some(obs) = observer {
+            obs.on_progress(&progress_id, album_total, album_total);
+        }
+        tracing::info!(
+            entry_id,
+            items = item_count,
+            plaintext_bytes = plaintext_total,
+            ciphertext_bytes = album_total,
+            elapsed_ms = upload_t0.elapsed().as_millis() as u64,
+            "media upload encrypt+blossom end"
+        );
         Ok(())
     }
 
@@ -3969,9 +4696,20 @@ impl SonarClient {
 
     /// Upload an encrypted blob to a Blossom server (BUD-02), authed with our
     /// Nostr key, returning the URL where it can be fetched.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn blossom_upload(&self, server_url: &str, data: Vec<u8>) -> Result<String> {
+        self.blossom_upload_with_progress(server_url, data, None)
+            .await
+    }
+
+    async fn blossom_upload_with_progress(
+        &self,
+        server_url: &str,
+        data: Vec<u8>,
+        on_progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
+    ) -> Result<String> {
         let timeout = blossom_upload_timeout(data.len());
-        self.blossom_upload_with_timeout(server_url, data, timeout)
+        self.blossom_upload_with_timeout(server_url, data, timeout, on_progress)
             .await
     }
 
@@ -3980,6 +4718,7 @@ impl SonarClient {
         server_url: &str,
         data: Vec<u8>,
         timeout: Duration,
+        on_progress: Option<Box<dyn FnMut(u64, u64) + Send>>,
     ) -> Result<String> {
         let server = if server_url.is_empty() {
             DEFAULT_BLOSSOM_SERVER
@@ -3988,24 +4727,41 @@ impl SonarClient {
         };
         let base = Url::parse(server)
             .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
-        let client = BlossomClient::new(base);
-        let descriptor = tokio::time::timeout(
-            timeout,
-            client.upload_blob(
-                data,
-                Some(ENCRYPTED_BLOB_MIME_TYPE.to_string()),
-                None,
-                Some(self.identity().keys()),
-            ),
-        )
-        .await
-        .map_err(|_| {
-            Error::Blossom(format!(
-                "upload to {server} timed out after {} seconds",
-                timeout.as_secs()
-            ))
-        })?
-        .map_err(|e| Error::Blossom(e.to_string()))?;
+        let loopback = matches!(
+            base.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("::1")
+        );
+        if base.scheme() != "https" && !(base.scheme() == "http" && loopback) {
+            return Err(Error::Blossom(format!(
+                "blossom upload requires https (got {})",
+                base.scheme()
+            )));
+        }
+        // Reuse the process-wide upload client so sequential/concurrent PUTs
+        // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
+        let client =
+            BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
+        let keys = self.identity().keys();
+        let mime = Some(ENCRYPTED_BLOB_MIME_TYPE.to_string());
+        let upload = async {
+            match on_progress {
+                Some(cb) => {
+                    client
+                        .upload_blob_with_progress(data, mime, None, Some(keys), Some(cb))
+                        .await
+                }
+                None => client.upload_blob(data, mime, None, Some(keys)).await,
+            }
+        };
+        let descriptor = tokio::time::timeout(timeout, upload)
+            .await
+            .map_err(|_| {
+                Error::Blossom(format!(
+                    "upload to {server} timed out after {} seconds",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| Error::Blossom(e.to_string()))?;
         Ok(descriptor.url.to_string())
     }
 
@@ -5691,11 +6447,13 @@ impl SonarClient {
         let push_result = wipe_push_token_cache_for_db(db_path);
         let sticker_result = wipe_sticker_cache_for_db(db_path);
         let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
+        let media_staging_result = wipe_media_staging_for_db(db_path);
         db_result?;
         index_result?;
         push_result?;
         sticker_result?;
-        handle_result
+        handle_result?;
+        media_staging_result
     }
 
     /// MIP-05: encrypt a device push token to the transponder's public key.
@@ -6047,6 +6805,80 @@ mod tests {
     use std::net::TcpListener;
 
     #[tokio::test]
+    async fn blossom_upload_reports_monotonic_progress() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("listener address")
+        );
+        let payload = vec![0xABu8; 180_000];
+        let expected_len = payload.len();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept upload");
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 8192];
+            let header_end = loop {
+                let read = stream.read(&mut chunk).expect("read upload request");
+                assert!(read > 0, "upload request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .expect("upload content length");
+            let body_start = header_end + 4;
+            while request.len() < body_start + content_length {
+                let read = stream.read(&mut chunk).expect("read upload body");
+                assert!(read > 0, "upload request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = &request[body_start..body_start + content_length];
+            let sha = hex::encode(sha2::Sha256::digest(body));
+            let json = format!(
+                "{{\"url\":\"http://blossom.test/{sha}\",\"sha256\":\"{sha}\",\"size\":{},\"type\":\"application/octet-stream\",\"uploaded\":0}}",
+                body.len()
+            );
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                json.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client without relays");
+        let last = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_cb = last.clone();
+        let url = client
+            .blossom_upload_with_progress(
+                &base,
+                payload,
+                Some(Box::new(move |sent, total| {
+                    assert_eq!(total, expected_len as u64);
+                    let prev = last_cb.load(Ordering::Relaxed);
+                    assert!(sent >= prev, "progress must be monotonic: {sent} < {prev}");
+                    last_cb.store(sent, Ordering::Relaxed);
+                })),
+            )
+            .await
+            .expect("progress upload");
+        assert!(url.contains("blossom.test/"));
+        server.join().expect("mock Blossom exits");
+        assert_eq!(last.load(Ordering::Relaxed), expected_len as u64);
+    }
+
+    #[tokio::test]
     async fn blossom_upload_sends_binary_content_type_and_accepts_created() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Blossom");
         let base = format!(
@@ -6139,6 +6971,7 @@ mod tests {
                 &base,
                 b"encrypted image ciphertext".to_vec(),
                 Duration::from_millis(50),
+                None,
             )
             .await
             .expect_err("a stalled Blossom server must time out");

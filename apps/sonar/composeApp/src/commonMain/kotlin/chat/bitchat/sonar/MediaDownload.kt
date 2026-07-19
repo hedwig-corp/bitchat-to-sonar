@@ -54,6 +54,38 @@ internal class MediaDownloadControl(
     }
 }
 
+/** Platform-neutral Blossom upload progress listener. */
+interface SonarMediaUploadListener {
+    fun onProgress(clientPendingId: String, bytesSent: ULong, totalBytes: ULong)
+    fun isCancelled(): Boolean
+}
+
+internal class MediaUploadControl(
+    private val progress: (String, Float) -> Unit,
+) : SonarMediaUploadListener {
+    @Volatile private var cancelled = false
+    @Volatile private var lastEmitMs = 0L
+
+    override fun onProgress(clientPendingId: String, bytesSent: ULong, totalBytes: ULong) {
+        val fraction = if (totalBytes == 0uL) {
+            0f
+        } else {
+            (bytesSent.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f)
+        }
+        val now = System.currentTimeMillis()
+        val due = now - lastEmitMs >= 100L || fraction >= 1f || fraction <= 0f
+        if (!due) return
+        lastEmitMs = now
+        progress(clientPendingId, fraction)
+    }
+
+    override fun isCancelled(): Boolean = cancelled
+
+    fun cancel() {
+        cancelled = true
+    }
+}
+
 internal fun mediaCacheKey(url: String): String =
     Sha256.hash(url.encodeToByteArray())
         .joinToString("") { ((it.toInt() and 0xFF) + 0x100).toString(16).substring(1) }

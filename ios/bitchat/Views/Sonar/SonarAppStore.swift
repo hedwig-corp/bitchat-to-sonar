@@ -351,6 +351,8 @@ struct SNMessage: Identifiable, Equatable {
     var transcriptSourceID: String? = nil
     var via: SNVia?
     var state: String?
+    /// 0...1 while a Blossom upload is in flight for this optimistic media row.
+    var uploadProgress: Double? = nil
     /// Non-nil = render as a PayBubble instead of a text bubble.
     var pay: SNPayInfo?
     /// Non-nil = render a compact CallLog row instead of a bubble (call.jsx).
@@ -405,6 +407,7 @@ struct SNMediaItem: Equatable {
     var width: UInt32? = nil
     var height: UInt32? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
+    var isAudio: Bool { mime.hasPrefix("audio/") }
     var isGif: Bool {
         mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
         filename.lowercased().hasSuffix(".gif")
@@ -453,6 +456,73 @@ private final class SNMediaDownloadListener: MediaDownloadListener, @unchecked S
 
     func onProgress(bytesReceived: UInt64, totalBytes: UInt64?) {
         progressHandler(bytesReceived, totalBytes)
+    }
+
+    func isCancelled() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
+/// Live Blossom upload fractions keyed by optimistic message id.
+///
+/// Collection-host cells only reconfigure when the transcript `heightKey`
+/// changes — progress is intentionally excluded from that key (bar height is
+/// constant). Bubbles therefore observe this object directly (Compose
+/// `mediaUploadFraction` parity) instead of waiting for a cell rebuild.
+@MainActor
+final class SNMediaUploadProgressSource: ObservableObject {
+    @Published private(set) var fractions: [String: Double] = [:]
+
+    func note(id: String, fraction: Double) {
+        // Assign a new dictionary — in-place subscript mutation does not
+        // reliably fire `@Published` / `objectWillChange`.
+        var next = fractions
+        next[id] = fraction
+        fractions = next
+    }
+
+    func clear(id: String) {
+        guard fractions[id] != nil else { return }
+        var next = fractions
+        next.removeValue(forKey: id)
+        fractions = next
+    }
+}
+
+/// Bridges UniFFI upload progress into the optimistic media bubble bar.
+final class SNMediaUploadListener: MediaUploadListener, @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var lastEmit = Date.distantPast
+    private let progressHandler: @Sendable (String, Double) -> Void
+
+    init(progress: @escaping @Sendable (String, Double) -> Void) {
+        self.progressHandler = progress
+    }
+
+    func onProgress(clientPendingId: String, bytesSent: UInt64, totalBytes: UInt64) {
+        let fraction: Double
+        if totalBytes == 0 {
+            fraction = 0
+        } else {
+            fraction = min(1, Double(bytesSent) / Double(totalBytes))
+        }
+        // ~100ms throttle mirrors download progress paint cadence.
+        let now = Date()
+        lock.lock()
+        let due = now.timeIntervalSince(lastEmit) >= 0.1 || fraction >= 1 || fraction <= 0
+        if due { lastEmit = now }
+        lock.unlock()
+        guard due else { return }
+        progressHandler(clientPendingId, fraction)
     }
 
     func isCancelled() -> Bool {
@@ -4358,6 +4428,7 @@ final class SonarAppStore: ObservableObject {
                             transcriptSourceID: group.id,
                             via: .internet,
                             state: MarmotChatModel.stateText(for: m),
+                            uploadProgress: marmot.mediaUploadProgress[m.id],
                             media: Self.mediaItems(m, groupId: group.id),
                             stickerRef: m.stickerRef
                         ))
@@ -4527,6 +4598,7 @@ final class SonarAppStore: ObservableObject {
                         transcriptSourceID: group.id,
                         via: .internet,
                         state: MarmotChatModel.stateText(for: m),
+                        uploadProgress: marmot.mediaUploadProgress[m.id],
                         media: Self.mediaItems(m, groupId: group.id),
                         stickerRef: m.stickerRef
                     ))
@@ -4607,6 +4679,11 @@ final class SonarAppStore: ObservableObject {
             return
         }
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+    }
+
+    /// Cancel an in-flight Blossom upload for an optimistic media bubble.
+    func cancelMediaUpload(_ message: SNMessage) {
+        marmot.cancelMediaUpload(pendingId: message.id)
     }
 
     /// Signal-style retry for one failed outgoing row. Durable Marmot rows

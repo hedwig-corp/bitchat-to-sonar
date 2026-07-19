@@ -37,6 +37,17 @@ struct MarmotDeliveryStateTests {
         )
     }
 
+    private var voice: MarmotService.MarmotMedia {
+        MarmotService.MarmotMedia(
+            url: "https://blossom.test/voice",
+            mimeType: "audio/mp4",
+            filename: "vn.m4a",
+            width: nil,
+            height: nil,
+            durationMs: nil
+        )
+    }
+
     @Test
     func coreDeliveryTransitionsRenderWithoutRelayEcho() {
         #expect(MarmotChatModel.stateText(for: message(deliveryState: "pending")) == "Sending")
@@ -45,11 +56,25 @@ struct MarmotDeliveryStateTests {
     }
 
     @Test
-    func pendingMediaUsesUploadingLabel() {
+    func pendingImageUsesUploadingLabel() {
         #expect(
             MarmotChatModel.stateText(
                 for: message(deliveryState: "pending", media: [image])
             ) == "Uploading"
+        )
+    }
+
+    @Test
+    func pendingVoiceUsesSendingLabelLikeSignal() {
+        #expect(
+            MarmotChatModel.stateText(
+                for: message(deliveryState: "pending", media: [voice])
+            ) == "Sending"
+        )
+        #expect(
+            MarmotChatModel.stateText(
+                for: message(id: "optimistic-voice", deliveryState: nil, media: [voice])
+            ) == "Sending"
         )
     }
 
