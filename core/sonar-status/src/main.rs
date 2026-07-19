@@ -539,15 +539,18 @@ async fn build_payload(
             Some(raw) if !raw.trim().is_empty() => parse_list(Some(raw), &[]),
             _ => default_blossom_compare(),
         };
-        // Prefer the dedicated probe identity for BUD-02 auth. If the operator
-        // enabled media without a probe nsec, fall back to HEAD-only.
-        let probe_secret = load_probe_secret(
+        // BUD-02 auth is required for a meaningful Media storage row. HEAD-only
+        // must not publish Ok — it cannot prove MIP-04 upload works.
+        match load_probe_secret(
             opts.probe_nsec.as_deref(),
             opts.probe_nsec_file.as_ref(),
             "SONAR_STATUS_PROBE_NSEC",
-        )
-        .ok();
-        Some(probe_blossom_servers(server, &compare, probe_secret.as_deref()).await)
+        ) {
+            Ok(secret) => {
+                Some(probe_blossom_servers(server, &compare, Some(secret.as_str())).await)
+            }
+            Err(e) => Some(media::media_probe_requires_nsec(server, &e)),
+        }
     } else {
         None
     };

@@ -5,8 +5,9 @@
 //! the path that matters for media send — not only a HEAD reachability ping.
 //!
 //! When a probe nsec is available, each server gets a BUD-02 upload + GET +
-//! best-effort delete of a tiny canary blob. Without a probe nsec, the probe
-//! falls back to HEAD/GET reachability (same as v1).
+//! best-effort delete of a tiny canary blob. Without a probe nsec, callers
+//! should fail closed (do not publish Ok from HEAD-only) — HEAD cannot prove
+//! authenticated MIP-04 upload works.
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,6 +27,9 @@ const MEDIA_HEAD_DEGRADED_MS: u64 = 5_000;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(20);
 /// Cap on compare hosts so a bad env list cannot stretch the cron forever.
 const MAX_COMPARE_HOSTS: usize = 2;
+/// Wall-clock budget for non-primary (compare) hosts — primary keeps the full
+/// [`MEDIA_TIMEOUT`] per op; a hung compare must not stretch publish to ~48s.
+const COMPARE_HOST_BUDGET: Duration = Duration::from_secs(12);
 /// Canary payload size (~4 KiB) — enough to exercise the PUT body path without
 /// dominating cron runtime.
 const CANARY_BYTES: usize = 4_096;
@@ -156,6 +160,33 @@ pub fn default_blossom_compare() -> Vec<String> {
     vec![PUBLIC_BLOSSOM_COMPARE.to_owned()]
 }
 
+/// Fail-closed report when `--media-probe` is set without a probe nsec.
+/// HEAD reachability alone must not mark Media storage Ok.
+pub fn media_probe_requires_nsec(primary: &str, reason: &str) -> MediaProbeReport {
+    let primary = primary.trim_end_matches('/').to_owned();
+    MediaProbeReport {
+        ok: false,
+        state: ServiceState::Degraded,
+        primary: primary.clone(),
+        mode: "upload".into(),
+        servers: vec![MediaServerSample {
+            server: primary,
+            primary: true,
+            ok: false,
+            mode: "upload".into(),
+            status: None,
+            head_ms: None,
+            upload_ms: None,
+            get_ms: None,
+            delete_ok: None,
+            delete_error: None,
+            error: Some(format!(
+                "probe nsec required for BUD-02 media check ({reason})"
+            )),
+        }],
+    }
+}
+
 /// Probe Blossom servers. With `probe_secret`, run BUD-02 upload+GET+delete;
 /// otherwise HEAD/GET reachability only.
 pub async fn probe_blossom_servers(
@@ -202,7 +233,8 @@ pub async fn probe_blossom_servers(
         None => None,
     };
 
-    // Probe hosts concurrently so a slow compare host does not delay primary.
+    // Probe hosts concurrently. Compare hosts get a tighter wall-clock budget
+    // so a hung candidate cannot stretch publish to the full per-op stack.
     let samples = {
         let futs: Vec<_> = servers
             .iter()
@@ -211,10 +243,35 @@ pub async fn probe_blossom_servers(
                 let server = server.clone();
                 let is_primary = *is_primary;
                 async move {
-                    if let Some(ref keys) = keys {
-                        probe_upload(&server, is_primary, keys).await
+                    let fut = async {
+                        if let Some(ref keys) = keys {
+                            probe_upload(&server, is_primary, keys).await
+                        } else {
+                            probe_head(&server, is_primary).await
+                        }
+                    };
+                    if is_primary {
+                        fut.await
                     } else {
-                        probe_head(&server, is_primary).await
+                        match tokio::time::timeout(COMPARE_HOST_BUDGET, fut).await {
+                            Ok(sample) => sample,
+                            Err(_) => MediaServerSample {
+                                server,
+                                primary: false,
+                                ok: false,
+                                mode: mode.into(),
+                                status: None,
+                                head_ms: None,
+                                upload_ms: None,
+                                get_ms: None,
+                                delete_ok: None,
+                                delete_error: None,
+                                error: Some(format!(
+                                    "compare timed out after {}s",
+                                    COMPARE_HOST_BUDGET.as_secs()
+                                )),
+                            },
+                        }
                     }
                 }
             })
@@ -256,9 +313,27 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
     let t0 = Instant::now();
     let server = server.trim_end_matches('/').to_owned();
 
+    if let Ok(u) = Url::parse(&server) {
+        if u.scheme() != "https" {
+            return MediaServerSample {
+                server,
+                primary,
+                ok: false,
+                mode: "head".into(),
+                status: None,
+                head_ms: Some(t0.elapsed().as_millis() as u64),
+                upload_ms: None,
+                get_ms: None,
+                delete_ok: None,
+                delete_error: None,
+                error: Some(format!("refusing non-https blossom server {}", u.scheme())),
+            };
+        }
+    }
+
     let client = match reqwest::Client::builder()
         .timeout(MEDIA_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(3))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -279,15 +354,16 @@ async fn probe_head(server: &str, primary: bool) -> MediaServerSample {
         }
     };
 
-    // One deadline for HEAD and the 405/404 GET fallback.
+    // One deadline for HEAD and the 405/404 GET fallback. 3xx is failure
+    // (redirects disabled — do not treat redirection as reachability).
     let reachability = async {
         let resp = client.head(&server).send().await?;
         let mut status = resp.status().as_u16();
-        let mut ok = resp.status().is_success() || resp.status().is_redirection();
+        let mut ok = resp.status().is_success();
         if status == 405 || status == 404 {
             let r = client.get(&server).send().await?;
             status = r.status().as_u16();
-            ok = r.status().is_success() || r.status().is_redirection();
+            ok = r.status().is_success();
         }
         Ok::<_, reqwest::Error>((status, ok))
     };
@@ -364,7 +440,7 @@ fn upload_fail(
     }
 }
 
-/// Require https + same host as the upload base (no open redirects / SSRF).
+/// Require https + same host:port as the upload base (no open redirects / SSRF).
 fn validate_canary_get_url(upload_base: &Url, blob_url: &Url) -> Result<(), String> {
     if blob_url.scheme() != "https" {
         return Err(format!(
@@ -377,6 +453,13 @@ fn validate_canary_get_url(upload_base: &Url, blob_url: &Url) -> Result<(), Stri
     if upload_host.is_empty() || blob_host != upload_host {
         return Err(format!(
             "descriptor.url host {blob_host:?} != upload host {upload_host:?}"
+        ));
+    }
+    let upload_port = upload_base.port_or_known_default();
+    let blob_port = blob_url.port_or_known_default();
+    if upload_port != blob_port {
+        return Err(format!(
+            "descriptor.url port {blob_port:?} != upload port {upload_port:?}"
         ));
     }
     Ok(())
@@ -462,7 +545,31 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
     let upload_ms = t_upload.elapsed().as_millis() as u64;
 
     if let Err(e) = validate_canary_get_url(&upload_base, &descriptor.url) {
-        return upload_fail(server, primary, Some(upload_ms), None, e);
+        // Upload already landed — still best-effort delete so a bad descriptor
+        // URL cannot leave canaries on every cron tick.
+        let (delete_ok, delete_error) = match tokio::time::timeout(
+            Duration::from_secs(2),
+            client.delete_blob(descriptor.sha256, None, keys),
+        )
+        .await
+        {
+            Ok(Ok(())) => (Some(true), None),
+            Ok(Err(err)) => (Some(false), Some(summarize_blossom_err(&err))),
+            Err(_) => (Some(false), Some("delete timed out after 2s".into())),
+        };
+        return MediaServerSample {
+            server,
+            primary,
+            ok: false,
+            mode: "upload".into(),
+            status: None,
+            head_ms: None,
+            upload_ms: Some(upload_ms),
+            get_ms: None,
+            delete_ok,
+            delete_error,
+            error: Some(e),
+        };
     }
 
     // Fetch the exact URL apps store (`descriptor.url`). Hardened like
@@ -702,5 +809,20 @@ mod tests {
 
         let other = Url::parse("https://evil.example/aa").unwrap();
         assert!(validate_canary_get_url(&base, &other).is_err());
+
+        let other_port = Url::parse("https://push.sonar.hedwig.sh:9100/aa").unwrap();
+        assert!(validate_canary_get_url(&base, &other_port).is_err());
+    }
+
+    #[test]
+    fn media_probe_without_nsec_is_degraded_not_ok() {
+        let r = media_probe_requires_nsec(DEFAULT_BLOSSOM_SERVER, "missing nsec");
+        assert!(!r.ok);
+        assert_eq!(r.state, ServiceState::Degraded);
+        assert!(r.servers[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("probe nsec required"));
     }
 }

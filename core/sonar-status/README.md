@@ -108,11 +108,16 @@ Compares the app default Blossom server (`DEFAULT_BLOSSOM_SERVER`, today
   best-effort delete of a ~4 KiB canary (this is the latency that matters for
   media send). Delete success/failure is recorded in probe JSON (`delete_ok`)
   but does not flip the media service state.
-- Without a probe nsec: HTTP HEAD/GET reachability only.
+- Without a probe nsec: Media storage is published as **Degraded** (fail closed).
+  HEAD alone cannot prove authenticated MIP-04 upload works.
 
 Probe nsec enables media upload auth only. It does **not** enable the Marmot
 KeyPackage chat probe — set `SONAR_STATUS_CHAT_PROBE=1` separately when you want
 that traffic.
+
+Flipping the app default Blossom host does **not** migrate or delete blobs on
+the previous host (`nostr.download`). Existing messages keep absolute blob URLs;
+clients fetch those URLs as-is.
 
 ```bash
 export SONAR_STATUS_STICKER_PROBE=1

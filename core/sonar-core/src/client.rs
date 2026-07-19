@@ -58,6 +58,12 @@ const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
 /// `application/octet-stream` (201) and wins upload latency vs the previous
 /// public default (`nostr.download`) in the status media bench. Prefer
 /// `https://blossom.sonar.hedwig.sh` once that DNS name is live.
+///
+/// Changing this constant only redirects **new** uploads. It does not migrate
+/// or delete historical blobs: messages store absolute `descriptor.url` values,
+/// and [`SonarClient::fetch_media`] downloads those URLs directly — so existing
+/// `https://nostr.download/...` (or any prior host) attachments keep working
+/// for as long as that host retains the objects.
 pub const DEFAULT_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
 
 /// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
