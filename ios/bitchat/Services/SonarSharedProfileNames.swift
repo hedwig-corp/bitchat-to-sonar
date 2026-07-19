@@ -43,8 +43,7 @@ enum SonarSharedProfileNames {
     }
 
     /// Resolve a human alias for a sender npub/hex using the App Group map.
-    /// Tries exact, lowercased, and (for hex) uppercase variants — writers store
-    /// both npub and hex keys when available.
+    /// Tries exact then lowercased keys — writers store npub + lowercase hex.
     static func bestName(for sender: String, in names: [String: String]) -> String? {
         let trimmed = sender.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
