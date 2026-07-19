@@ -4446,8 +4446,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(visible)
             push(Screen.Chat(id, name, pay))
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
-            // Keep mark-read in lockstep with the folded WN legs that just painted.
-            markGroupsRead(transcriptGroupIds(id))
+            // markGroupsRead already ran before the local page; refreshOpenDm
+            // (reopen path / housekeeping) re-marks if folded groups appear later.
             refreshChats()
         }
     }
@@ -9120,7 +9120,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun refreshUnreadCounts() {
-        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        // null = FFI failure — keep the current map (same guard as markGroupsRead).
+        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrNull()
+            ?: return
         applyUnreadCounts(summaries)
     }
 
@@ -9238,9 +9240,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         refreshChats()
         drainDirectDms()
         // One cheap FFI probe of every chat's newest message + unread count.
-        val summaries = runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        val summariesResult = runCatching { SonarCore.conversationSummaries() }
+        val summaries = summariesResult.getOrDefault(emptyList())
         val summaryByChat = summaries.associateBy { it.groupIdHex }
-        applyUnreadCounts(summaries)
+        // Only publish unread on a successful probe — getOrDefault(emptyList())
+        // on failure would wipe every badge until the next cycle.
+        if (summariesResult.isSuccess) applyUnreadCounts(summaries)
         // Incremental scan: only chats whose newest ts moved past the watermark
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
