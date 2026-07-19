@@ -92,7 +92,9 @@ async fn recovery_beacon_heals_dm_after_local_wipe() {
     assert_eq!(resets[0].old_group_id_hex, hex::encode(alice_old_group.as_slice()));
     assert_eq!(resets[0].new_group_id_hex, hex::encode(alice_new_group.as_slice()));
 
-    // Restored bob accepts the re-invite and clears his outstanding beacon.
+    // Restored bob accepts the re-invite. The outstanding-beacon flag stays set
+    // so additional chats can still auto-accept in later sync batches (cleared
+    // only by the accept cap or the 48h TTL — not by the first new group).
     bob2.sync().await.expect("bob2 accepts the re-invite");
     let bob2_group = bob2.groups().expect("bob2 groups");
     assert_eq!(bob2_group.len(), 1, "bob2 joined the healed group");
@@ -102,8 +104,8 @@ async fn recovery_beacon_heals_dm_after_local_wipe() {
         "both sides converge on the same healed MLS group"
     );
     assert!(
-        !bob2.has_outstanding_recovery_beacon(),
-        "beacon cleared once the conversation healed"
+        bob2.has_outstanding_recovery_beacon(),
+        "outstanding beacon stays open for multi-chat heals after the first accept"
     );
 
     // Text flows both ways on the NEW group.

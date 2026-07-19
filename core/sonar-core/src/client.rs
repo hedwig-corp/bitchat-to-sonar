@@ -3082,30 +3082,47 @@ impl SonarClient {
             return Ok(());
         }
 
+        let actionable_dms = dm_group_ids.len();
+        let mut executor_groups = 0usize;
+        let mut healed_any = false;
         for old_group_id in dm_group_ids {
-            if let Err(err) = self
+            match self
                 .heal_dm_via_recovery(&author, &old_group_id, hinted_key_package)
                 .await
             {
-                tracing::warn!(%err, peer = %author_hex, "recovery DM heal failed");
+                Ok(()) => healed_any = true,
+                Err(err) => {
+                    tracing::warn!(%err, peer = %author_hex, "recovery DM heal failed")
+                }
             }
         }
         for (group_id, members) in multi_groups {
             if !Self::is_recovery_executor(&members, &me, &author) {
                 continue;
             }
-            if let Err(err) = self.readd_member_via_recovery(&group_id, &author).await {
-                tracing::warn!(%err, peer = %author_hex, "recovery group re-add failed");
+            executor_groups += 1;
+            match self
+                .readd_member_via_recovery(&group_id, &author, hinted_key_package)
+                .await
+            {
+                Ok(()) => healed_any = true,
+                Err(err) => {
+                    tracing::warn!(%err, peer = %author_hex, "recovery group re-add failed")
+                }
             }
         }
 
-        // Mark processed regardless of per-conversation outcome: one action per
-        // (peer, beacon.created_at) is the rate limit. A newer beacon can heal
-        // again; a duplicate/out-of-order copy is a no-op.
-        self.recovery_state
-            .lock()
-            .unwrap()
-            .mark_beacon_processed(&author_hex, created_at)?;
+        // Advance the durable processed watermark when at least one heal
+        // succeeded, OR when there was nothing actionable (all shared groups
+        // already retired / we are not the executor). Transient heal failures
+        // leave the beacon retriable on the next sync.
+        let nothing_actionable = actionable_dms == 0 && executor_groups == 0;
+        if healed_any || nothing_actionable {
+            self.recovery_state
+                .lock()
+                .unwrap()
+                .mark_beacon_processed(&author_hex, created_at)?;
+        }
         Ok(())
     }
 
@@ -3148,27 +3165,38 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Deterministic multi-member re-add: remove the stale member, then re-add
-    /// with a fresh KeyPackage. Both are ordinary membership commits (gated by
-    /// `membership_gate` inside the client methods). If the add fails after a
-    /// successful remove, retry the add once — otherwise the restored member
-    /// would be expelled with no automatic recovery (a later beacon is ignored
-    /// because they are no longer in the roster).
+    /// Deterministic multi-member re-add: fetch a usable KeyPackage first, then
+    /// remove the stale MLS leaf and re-add with that package. Fetching before
+    /// remove avoids expelling the member when the relay/KP path is down.
     async fn readd_member_via_recovery(
         &self,
         group_id: &GroupId,
         member: &PublicKey,
+        hinted_key_package: Option<EventId>,
     ) -> Result<()> {
+        let key_package = match hinted_key_package {
+            Some(id) => match self.fetch_key_package_by_id(*member, id).await {
+                Ok(event) => event,
+                Err(_) => self.fetch_key_package(*member).await?,
+            },
+            None => self.fetch_key_package(*member).await?,
+        };
         self.remove_group_members(group_id, vec![*member]).await?;
-        match self.add_group_members(group_id, vec![*member]).await {
+        let _epoch = self.membership_gate.write().await;
+        let update = self.engine.add_members(group_id, vec![key_package])?;
+        match self.publish_membership_update(update).await {
             Ok(()) => {}
             Err(err) => {
                 tracing::warn!(
                     %err,
                     peer = %member.to_hex(),
-                    "recovery re-add failed after remove; retrying once"
+                    "recovery re-add publish failed after remove; retrying once with newest KP"
                 );
-                self.add_group_members(group_id, vec![*member]).await?;
+                drop(_epoch);
+                let retry_kp = self.fetch_key_package(*member).await?;
+                let _epoch = self.membership_gate.write().await;
+                let update = self.engine.add_members(group_id, vec![retry_kp])?;
+                self.publish_membership_update(update).await?;
             }
         }
         self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
@@ -3190,31 +3218,58 @@ impl SonarClient {
     /// Auto-accept a group welcome that arrived while our own recovery beacon is
     /// outstanding: it is a surviving admin re-inviting us after our nsec
     /// restore, so it should heal silently rather than sit in the invite UI.
-    async fn auto_accept_recovery_invite(&self, group_id: &GroupId) -> Result<()> {
+    ///
+    /// After an nsec wipe there is no local peer roster to allowlist against, so
+    /// accepts are bounded by [`crate::recovery::MAX_RECOVERY_AUTO_ACCEPTS`] and
+    /// require a real welcomer distinct from us. The outstanding flag stays set
+    /// across multiple chats until the cap is hit or the beacon TTL expires —
+    /// clearing it on the first new group would strand later re-invites.
+    async fn auto_accept_recovery_invite(&self, group_id: &GroupId) -> Result<bool> {
         let Some(invite) = self
             .engine
             .pending_group_invites()?
             .into_iter()
             .find(|invite| &invite.group_id == group_id)
         else {
-            return Ok(());
+            return Ok(false);
         };
+        if invite.welcomer == self.identity().public_key() {
+            return Ok(false);
+        }
+        if !self
+            .recovery_state
+            .lock()
+            .unwrap()
+            .can_auto_accept_recovery_invite()
+        {
+            return Ok(false);
+        }
         self.accept_group_invite(&invite.id).await?;
-        Ok(())
+        let mut state = self.recovery_state.lock().unwrap();
+        let _ = state.note_recovery_auto_accept()?;
+        // Close the window once the spam/heal cap is exhausted.
+        if !state.can_auto_accept_recovery_invite() {
+            if let Err(err) = state.clear_outstanding_beacon() {
+                tracing::debug!(%err, "failed to clear outstanding recovery beacon at cap");
+            }
+        }
+        Ok(true)
     }
 
-    /// Clear the outstanding beacon once at least one conversation has healed
-    /// (a new group appeared). The beacon event stays published (addressable)
-    /// for late-connecting peers; only the local auto-accept flag flips.
-    fn clear_outstanding_beacon_if_healed(&self, new_group_ids: &[String]) {
-        if new_group_ids.is_empty() {
+    /// Drop a stale outstanding-beacon flag so ordinary invites stop auto-accepting
+    /// long after an nsec restore (multi-chat heals keep the flag until then).
+    fn maybe_expire_outstanding_recovery_beacon(&self) {
+        const OUTSTANDING_TTL_SECS: u64 = 48 * 60 * 60;
+        let now = Timestamp::now().as_secs();
+        let mut state = self.recovery_state.lock().unwrap();
+        let Some(created) = state.outstanding_beacon_created_at() else {
+            return;
+        };
+        if now.saturating_sub(created) < OUTSTANDING_TTL_SECS {
             return;
         }
-        let mut state = self.recovery_state.lock().unwrap();
-        if state.has_outstanding_beacon() {
-            if let Err(err) = state.clear_outstanding_beacon() {
-                tracing::debug!(%err, "failed to clear outstanding recovery beacon");
-            }
+        if let Err(err) = state.clear_outstanding_beacon() {
+            tracing::debug!(%err, "failed to expire outstanding recovery beacon");
         }
     }
 
@@ -5797,10 +5852,10 @@ impl SonarClient {
                 }
             }
         }
-        // A welcome just accepted above may have healed a conversation we asked
-        // for via our own beacon; clear the outstanding flag so we stop
-        // auto-accepting further invites.
-        self.clear_outstanding_beacon_if_healed(&new_group_ids);
+        // Outstanding-beacon auto-accept stays open across multiple chats until
+        // the accept cap or 48h TTL — do not clear merely because a new group
+        // appeared (that stranded later re-invites).
+        self.maybe_expire_outstanding_recovery_beacon();
         // Detect surviving-peer recovery beacons and re-invite them into fresh
         // groups. This runs on the explicit sync path (the only path in-memory
         // e2e sessions use); the live path buffers 30447 and drains it in
@@ -6904,19 +6959,24 @@ impl SonarClient {
                     {
                         changed_groups.insert(hex::encode(group_id.as_slice()));
                     }
-                    // Auto-accept a multi-member re-invite while our own recovery
-                    // beacon is outstanding: it is a surviving admin healing the
-                    // group after our nsec restore, so it should not wait in the
-                    // invite UI.
+                    // Auto-accept a re-invite while our own recovery beacon is
+                    // outstanding: a surviving peer healing us after nsec restore.
                     if let Incoming::GroupInvitePending(group_id) = &incoming {
-                        if self.recovery_state.lock().unwrap().has_outstanding_beacon() {
+                        self.maybe_expire_outstanding_recovery_beacon();
+                        if self
+                            .recovery_state
+                            .lock()
+                            .unwrap()
+                            .can_auto_accept_recovery_invite()
+                        {
                             // Box::pin breaks the async recursion cycle
                             // (process_marmot_events → accept → backfill →
                             // process_marmot_events).
                             match Box::pin(self.auto_accept_recovery_invite(group_id)).await {
-                                Ok(()) => {
+                                Ok(true) => {
                                     changed_groups.insert(hex::encode(group_id.as_slice()));
                                 }
+                                Ok(false) => {}
                                 Err(err) => tracing::debug!(
                                     %err,
                                     "recovery auto-accept of group invite failed"
@@ -7095,10 +7155,7 @@ impl SonarClient {
             }
             let _ = self.resubscribe_marmot_groups_if_live().await;
         }
-        // A welcome accepted above (including an auto-accepted recovery re-invite)
-        // may have healed a conversation we beaconed for; drop the outstanding
-        // flag so we stop auto-accepting.
-        self.clear_outstanding_beacon_if_healed(&new_ids);
+        self.maybe_expire_outstanding_recovery_beacon();
         // Heal any surviving-peer recovery beacons buffered by the live handler.
         for beacon in &recovery_beacons {
             if let Err(err) = self.handle_recovery_beacon(beacon).await {

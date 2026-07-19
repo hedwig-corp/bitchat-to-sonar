@@ -857,6 +857,7 @@ actual object SonarCore {
             if (saved != null) return@withLock SonarIdentity.import(saved).npub()
             val identity = SonarIdentity.generate()
             AndroidSecrets.put("nsec", identity.nsec(), durable = true)
+            prefs().edit().putBoolean("recovery.announcePending", false).apply()
             identity.npub()
         }
     }
@@ -1144,6 +1145,8 @@ actual object SonarCore {
         }
         val id = SonarIdentity.generate()
         AndroidSecrets.put("nsec", id.nsec(), durable = true)
+        // Fresh onboarding must never inherit a stale restore-path arm flag.
+        prefs().edit().putBoolean("recovery.announcePending", false).apply()
         return id
     }
 

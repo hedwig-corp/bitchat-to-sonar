@@ -45,6 +45,12 @@ pub struct ConversationReset {
     pub at_secs: u64,
 }
 
+/// Cap silent auto-accepts while a local recovery beacon is outstanding.
+/// After nsec wipe the restored client has no local peer roster, so auto-accept
+/// cannot be allowlisted by prior membership; the cap bounds spam during the
+/// recovery window. Legitimate multi-chat restores stay well under this.
+pub const MAX_RECOVERY_AUTO_ACCEPTS: u32 = 32;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct RecoveryStateDisk {
     version: u32,
@@ -58,6 +64,10 @@ struct RecoveryStateDisk {
     pending_resets: Vec<ConversationReset>,
     #[serde(default)]
     last_inbound_from: HashMap<String, u64>,
+    /// How many group invites we silently accepted during the current
+    /// outstanding-beacon window (spam bound).
+    #[serde(default)]
+    recovery_auto_accepts: u32,
 }
 
 /// In-memory recovery bookkeeping, persisted to a JSON sidecar.
@@ -73,6 +83,7 @@ pub(crate) struct RecoveryState {
     pending_resets: Vec<ConversationReset>,
     /// peer pubkey hex → newest inbound (peer-authored) message `created_at`.
     last_inbound_from: HashMap<String, u64>,
+    recovery_auto_accepts: u32,
     dirty: bool,
 }
 
@@ -92,6 +103,7 @@ impl RecoveryState {
             retired_dm_group_ids: disk.retired_dm_group_ids,
             pending_resets: disk.pending_resets,
             last_inbound_from: disk.last_inbound_from,
+            recovery_auto_accepts: disk.recovery_auto_accepts,
             dirty: false,
         }
     }
@@ -101,14 +113,16 @@ impl RecoveryState {
     pub fn set_outstanding_beacon(&mut self, created_at: u64) -> Result<()> {
         if self.outstanding_beacon_created_at != Some(created_at) {
             self.outstanding_beacon_created_at = Some(created_at);
+            self.recovery_auto_accepts = 0;
             self.dirty = true;
         }
         self.save_if_dirty()
     }
 
-    /// Clear the outstanding-beacon flag once at least one conversation healed.
+    /// Clear the outstanding-beacon flag once recovery auto-accept is done.
     pub fn clear_outstanding_beacon(&mut self) -> Result<()> {
         if self.outstanding_beacon_created_at.take().is_some() {
+            self.recovery_auto_accepts = 0;
             self.dirty = true;
         }
         self.save_if_dirty()
@@ -116,6 +130,26 @@ impl RecoveryState {
 
     pub fn has_outstanding_beacon(&self) -> bool {
         self.outstanding_beacon_created_at.is_some()
+    }
+
+    pub fn outstanding_beacon_created_at(&self) -> Option<u64> {
+        self.outstanding_beacon_created_at
+    }
+
+    /// True while we may still silently accept a recovery re-invite.
+    pub fn can_auto_accept_recovery_invite(&self) -> bool {
+        self.has_outstanding_beacon() && self.recovery_auto_accepts < MAX_RECOVERY_AUTO_ACCEPTS
+    }
+
+    /// Count one silent accept; returns false if the cap is already exhausted.
+    pub fn note_recovery_auto_accept(&mut self) -> Result<bool> {
+        if !self.can_auto_accept_recovery_invite() {
+            return Ok(false);
+        }
+        self.recovery_auto_accepts = self.recovery_auto_accepts.saturating_add(1);
+        self.dirty = true;
+        self.save_if_dirty()?;
+        Ok(true)
     }
 
     /// True when a beacon from `peer_hex` at `created_at` must be ignored:
@@ -222,6 +256,7 @@ impl RecoveryState {
             retired_dm_group_ids: self.retired_dm_group_ids.clone(),
             pending_resets: self.pending_resets.clone(),
             last_inbound_from: self.last_inbound_from.clone(),
+            recovery_auto_accepts: self.recovery_auto_accepts,
         };
         let bytes = serde_json::to_vec(&disk)?;
         let tmp = recovery_state_tmp_path(path);

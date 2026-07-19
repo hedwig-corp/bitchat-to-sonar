@@ -850,6 +850,7 @@ actual object SonarCore {
             if (saved != null) return@withLock SonarIdentity.import(saved).npub()
             val identity = SonarIdentity.generate()
             DesktopSecrets.put("nsec", identity.nsec())
+            DesktopEnv.putBoolean("recovery.announcePending", false)
             identity.npub()
         }
     }
@@ -1065,6 +1066,8 @@ actual object SonarCore {
         }
         val id = SonarIdentity.generate()
         DesktopSecrets.put("nsec", id.nsec())
+        // Fresh onboarding must never inherit a stale restore-path arm flag.
+        DesktopEnv.putBoolean("recovery.announcePending", false)
         return id
     }
 
