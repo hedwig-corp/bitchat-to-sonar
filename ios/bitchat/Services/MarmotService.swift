@@ -1027,10 +1027,10 @@ final class MarmotService: @unchecked Sendable {
         try await run { try $0.requireNode().ensureSubscriptions() }
     }
 
-    /// Reload the durable outbox and republish pending/failed sends. Core also
-    /// auto-retries after a publish failure; hosts call this on the wake path
-    /// so rows created while relays were briefly unavailable are not stranded
-    /// until idle `ensureSubscriptions` or app restart.
+    /// Reload the durable outbox and republish pending/failed sends. Called
+    /// after relay connect (not on the active-chat wake path — that would
+    /// restack in-flight Pending). Core auto-retries Failed after publish
+    /// failure; idle `ensureSubscriptions` also flushes the outbox.
     func retryOutbox() async throws {
         try await run { try $0.requireNode().retryOutbox() }
     }
