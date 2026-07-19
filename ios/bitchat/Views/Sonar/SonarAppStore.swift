@@ -6618,6 +6618,9 @@ final class SonarAppStore: ObservableObject {
             rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
             markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
         }
+        // Bind badge suppression as soon as the DM is considered open — even
+        // when navigation used a custom `present` path that skipped `push`.
+        syncViewingUnreadGroups()
         if let pendingNpub = pendingMarmotNpub(for: id) {
             marmot.connectIfNeeded()
             marmot.ensureProfile(pendingNpub)
@@ -7491,6 +7494,7 @@ final class SonarAppStore: ObservableObject {
         if case .call = route { return }
         #endif
         path.append(route)
+        syncViewingUnreadGroups()
     }
 
     /// Whether the given conversation is the top DM route (used to suppress
@@ -7603,6 +7607,25 @@ final class SonarAppStore: ObservableObject {
             pendingJumpMessageIdByDM[id] = nil
         }
         if !path.isEmpty { path.removeLast() }
+        syncViewingUnreadGroups()
+    }
+
+    /// Keep Marmot unread-badge suppression tied to the top DM route so a
+    /// summary refresh cannot restore the dot while the chat is open (or while
+    /// mark-read is still in flight after leaving).
+    private func syncViewingUnreadGroups() {
+        guard let id = currentDMId else {
+            marmot.setViewingUnreadGroups([])
+            return
+        }
+        let groupId = marmotGroupId(id)
+            ?? resolvedSonarProfile(id).flatMap { marmotGroup(forNpub: $0.npub)?.id }
+        guard let groupId else {
+            marmot.setViewingUnreadGroups([])
+            return
+        }
+        let groups = directMarmotGroups(matchingGroupId: groupId)
+        marmot.setViewingUnreadGroups(groups.isEmpty ? [groupId] : groups.map(\.id))
     }
 
     private func popCallRouteIfNeeded() {

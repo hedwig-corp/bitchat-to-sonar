@@ -285,6 +285,13 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var initialLocalHomeReady = false
     /// Unread message counts per Marmot group, keyed by group ID hex.
     @Published var unreadByGroup: [String: UInt64] = [:]
+    /// Groups marked read whose core `unread_count` may still be nonzero while
+    /// `markConversationRead` is in flight. Summary refresh must not restore
+    /// their badges (Compose `unreadSuppressGroupIds` parity).
+    private var unreadSuppressGroupIds = Set<String>()
+    /// Groups belonging to the DM currently on screen. Suppressed for the
+    /// whole viewing session so arrivals while reading never flash a badge.
+    private var viewingUnreadGroupIds = Set<String>()
     /// While true, SonarAppStore must not emit process-alive Marmot banners —
     /// `SonarPushProcessor` owns lock-screen copy for the current push wake.
     /// Backed by a refcount so overlapping wakes cannot clear ownership early.
@@ -1426,6 +1433,11 @@ final class MarmotChatModel: ObservableObject {
                         // yet, so only that case needs the wider summary hydrate.
                         await self.loadLocalSummaries(resolveMembers: false)
                     }
+                    // Viewing this chat: zero unread so the badge cannot stick
+                    // after the user already read the new arrival.
+                    if self.viewingUnreadGroupIds.contains(changedGroupId) {
+                        self.markConversationRead(groupId: changedGroupId)
+                    }
                 }
                 if deferredBusyGroup {
                     try? await Task.sleep(nanoseconds: 50_000_000)
@@ -1511,11 +1523,7 @@ final class MarmotChatModel: ObservableObject {
                     .filter { activeGroupIds.contains($0.groupIdHex) }
                     .map { ($0.groupIdHex, $0) }
             )
-            var unread: [String: UInt64] = [:]
-            for summary in summaries where summary.unreadCount > 0 {
-                unread[summary.groupIdHex] = summary.unreadCount
-            }
-            self.unreadByGroup = unread
+            self.publishUnread(from: summaries)
             self.groups = groups
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
@@ -1688,10 +1696,6 @@ final class MarmotChatModel: ObservableObject {
                     .filter { activeGroupIds.contains($0.groupIdHex) }
                     .map { ($0.groupIdHex, $0) }
             )
-            var unread: [String: UInt64] = [:]
-            for s in summaries where s.unreadCount > 0 {
-                unread[s.groupIdHex] = s.unreadCount
-            }
             // All service reads above suspend. Snapshot the live dictionary only
             // after they finish, then merge each result into that latest state in
             // one main-actor segment. A summary refresh can therefore never
@@ -1731,7 +1735,7 @@ final class MarmotChatModel: ObservableObject {
                 }
                 byGroup[page.groupId] = Self.mergeMessages(existing: canonical, incoming: echoes)
             }
-            self.unreadByGroup = unread
+            self.publishUnread(from: summaries)
             self.groups = groups
             dropResolvedPendingDirectChats()
             self.pendingGroupInvites = invites
@@ -1970,8 +1974,41 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func markConversationRead(groupId: String) {
+        unreadSuppressGroupIds.insert(groupId)
         unreadByGroup[groupId] = nil
-        Task { await service.markConversationRead(groupId: groupId) }
+        Task { @MainActor in
+            await service.markConversationRead(groupId: groupId)
+            // End in-flight suppress for this id, then reconcile from core.
+            // Viewing suppress still covers an open DM; without this release a
+            // failed/raced mark could hide real unread for the rest of the process.
+            unreadSuppressGroupIds.remove(groupId)
+            // Always reconcile. `readOnlyNonThrowing` maps FFI failure to [],
+            // which clears badges until the next successful summary load — the
+            // same self-correcting window as Compose's null-vs-empty split, and
+            // required so an empty inbox still drops stale dots.
+            publishUnread(from: await service.conversationSummaries())
+        }
+    }
+
+    /// Bind chat-list unread suppression to the DM currently on screen.
+    /// Call with the folded Marmot group ids at open; call with `[]` on pop.
+    func setViewingUnreadGroups(_ groupIds: [String]) {
+        viewingUnreadGroupIds = Set(groupIds)
+        for groupId in groupIds {
+            unreadByGroup[groupId] = nil
+        }
+    }
+
+    private func publishUnread(from summaries: [MarmotService.ConversationSummary]) {
+        let tuples = summaries.map { ($0.groupIdHex, $0.unreadCount) }
+        unreadSuppressGroupIds = SNUnreadCounts.pruneConfirmedSuppressions(
+            unreadSuppressGroupIds,
+            summaries: tuples
+        )
+        unreadByGroup = SNUnreadCounts.unreadByGroup(
+            from: tuples,
+            suppressing: unreadSuppressGroupIds.union(viewingUnreadGroupIds)
+        )
     }
 
     /// Publish our own kind-0 profile so peers see our nickname, not our npub.
@@ -3559,6 +3596,9 @@ final class MarmotChatModel: ObservableObject {
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
+        unreadByGroup = [:]
+        unreadSuppressGroupIds = []
+        viewingUnreadGroupIds = []
         pendingOptimistic = [:]
         preexistingCanonicalMessageIDsByOptimisticID = [:]
         localTranscriptCursorByGroup = [:]
