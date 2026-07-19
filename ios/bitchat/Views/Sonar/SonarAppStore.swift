@@ -7133,6 +7133,13 @@ final class SonarAppStore: ObservableObject {
         }()
         if isConversationOpen(id) {
             clearNotificationsForConversation(id)
+            // Already on this DM — still apply Jump so a tap while backgrounded
+            // on the open chat scrolls to the notified message (#376 GLM Medium).
+            if let jump {
+                pendingJumpMessageIdByDM[id] = jump
+                jumpMessageIdAtOpenByDM[id] = jump
+                objectWillChange.send()
+            }
             return
         }
         guard let target = resolveNotificationConversation(id) else {
