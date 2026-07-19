@@ -13,6 +13,18 @@
 import Foundation
 
 enum SonarNSEDecoratePolicy {
+    /// Per acquire-loop sleeps (100ms). Host `closeNode` often needs >4s when
+    /// UniFFI teardown is queued behind other work; too-short waits leave
+    /// banners on the generic placeholder (`storeBusy`).
+    static let storeLockRetryAttempts = 80 // ~8s
+    /// Outer hydrate retries when the flock stays busy (stuck host or prior NSE).
+    static let storeBusyHydrateRetries = 4
+    static let storeBusyHydrateRetrySleepNs: UInt64 = 500_000_000
+
+    static func shouldRetryHydrateAfterStoreBusy(attempt: Int, maxAttempts: Int = storeBusyHydrateRetries) -> Bool {
+        attempt < maxAttempts
+    }
+
     struct Prefs: Equatable {
         var showNames: Bool
         var showPreview: Bool

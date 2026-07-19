@@ -134,4 +134,16 @@ struct SonarNSEDecoratePolicyTests {
             SonarNSEDecoratePolicy.hintGroupIdHex(from: ["conversation_id": "marmot:abc"]) == "abc"
         )
     }
+
+    @Test("storeBusy hydrate retries until the attempt budget is spent")
+    func storeBusyRetryBudget() {
+        #expect(SonarNSEDecoratePolicy.storeLockRetryAttempts >= 80)
+        #expect(SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(attempt: 1))
+        #expect(SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(attempt: 3))
+        #expect(
+            SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(
+                attempt: SonarNSEDecoratePolicy.storeBusyHydrateRetries
+            ) == false
+        )
+    }
 }

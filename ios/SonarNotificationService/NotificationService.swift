@@ -130,70 +130,98 @@ class NotificationService: SDKNotificationService {
             finish(with: UNMutableNotificationContent())
             return
         }
-        do {
-            // Blocking UniFFI + flock retries on a detached worker so
-            // Thread.sleep does not pin a cooperative pool thread. Collect
-            // still owns node+lock release (expire must not unlock).
-            let hintGroupId = SonarNSEDecoratePolicy.hintGroupIdHex(
-                from: content.userInfo
-            )
-            let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
-                guard let self else { return [DrainNotificationInfo]() }
-                return try self.collectMarmotNotificationsAfterWake(
-                    hintGroupIdHex: hintGroupId
-                )
-            }.value
-            #if DEBUG
-            Self.logResidentMemory("after-wake")
-            #endif
+        // Blocking UniFFI + flock retries on a detached worker so
+        // Thread.sleep does not pin a cooperative pool thread. Collect
+        // still owns node+lock release (expire must not unlock under an
+        // open handle). Retry storeBusy — host closeNode / a prior NSE
+        // often holds the flock longer than one acquire window.
+        let hintGroupId = SonarNSEDecoratePolicy.hintGroupIdHex(
+            from: content.userInfo
+        )
+        let maxAttempts = SonarNSEDecoratePolicy.storeBusyHydrateRetries
+        for attempt in 1...maxAttempts {
             guard !Task.isCancelled else {
                 finish(with: content)
                 return
             }
-            if notifications.isEmpty {
-                os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
-                       log: Self.log, type: .info)
-                Self.recordDiagnostic("emptyDrain:keepingGeneric")
+            do {
+                let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
+                    guard let self else { return [DrainNotificationInfo]() }
+                    return try self.collectMarmotNotificationsAfterWake(
+                        hintGroupIdHex: hintGroupId
+                    )
+                }.value
+                #if DEBUG
+                Self.logResidentMemory("after-wake")
+                #endif
+                guard !Task.isCancelled else {
+                    finish(with: content)
+                    return
+                }
+                if notifications.isEmpty {
+                    os_log("NSE: Marmot wake drained 0 notifications — keeping generic banner",
+                           log: Self.log, type: .info)
+                    Self.recordDiagnostic("emptyDrain:keepingGeneric")
+                    finish(with: content)
+                    return
+                }
+                let prefs = Self.notificationPrefs()
+                // Drain is oldest-first (sync queue + live append). Banner the tip.
+                let ordered = Array(notifications.reversed())
+                let primary = ordered[0]
+                Self.apply(
+                    notification: primary,
+                    to: content,
+                    prefs: prefs
+                )
+                let extras = Array(ordered.dropFirst().prefix(Self.maxAdditionalPresentations))
+                for extra in extras {
+                    Self.postAdditionalLocalNotification(extra, prefs: prefs)
+                }
+                os_log("NSE: Marmot wake decorated primary + %d additional",
+                       log: Self.log, type: .info, extras.count)
+                Self.recordDiagnostic(
+                    SonarNSEDecoratePolicy.diagnosticDecorated(
+                        showNames: prefs.showNames,
+                        showPreview: prefs.showPreview,
+                        extras: extras.count,
+                        title: content.title,
+                        body: content.body
+                    )
+                )
+                finish(with: content)
+                return
+            } catch {
+                let storeBusy: Bool = {
+                    if let nse = error as? NSEMarmotError, case .storeBusy = nse { return true }
+                    return false
+                }()
+                if storeBusy,
+                   SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(
+                    attempt: attempt,
+                    maxAttempts: maxAttempts
+                   ) {
+                    Self.recordDiagnostic("storeBusy:hydrateRetry attempt=\(attempt)")
+                    try? await Task.sleep(
+                        nanoseconds: SonarNSEDecoratePolicy.storeBusyHydrateRetrySleepNs
+                    )
+                    continue
+                }
+                os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
+                       log: Self.log, type: .error, String(describing: error))
+                // Opaque tag only — never persist error strings (may embed SQL /
+                // content). Prefer a prior precise stamp from credential/lock paths.
+                if Self.lastDiagnostic().isEmpty {
+                    Self.recordDiagnostic("failed:\(Self.opaqueErrorTag(error))")
+                } else {
+                    Self.recordDiagnostic("catch:\(Self.opaqueErrorTag(error))")
+                }
                 finish(with: content)
                 return
             }
-            let prefs = Self.notificationPrefs()
-            // Drain is oldest-first (sync queue + live append). Banner the tip.
-            let ordered = Array(notifications.reversed())
-            let primary = ordered[0]
-            Self.apply(
-                notification: primary,
-                to: content,
-                prefs: prefs
-            )
-            let extras = Array(ordered.dropFirst().prefix(Self.maxAdditionalPresentations))
-            for extra in extras {
-                Self.postAdditionalLocalNotification(extra, prefs: prefs)
-            }
-            os_log("NSE: Marmot wake decorated primary + %d additional",
-                   log: Self.log, type: .info, extras.count)
-            Self.recordDiagnostic(
-                SonarNSEDecoratePolicy.diagnosticDecorated(
-                    showNames: prefs.showNames,
-                    showPreview: prefs.showPreview,
-                    extras: extras.count,
-                    title: content.title,
-                    body: content.body
-                )
-            )
-            finish(with: content)
-        } catch {
-            os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
-                   log: Self.log, type: .error, String(describing: error))
-            // Opaque tag only — never persist error strings (may embed SQL /
-            // content). Prefer a prior precise stamp from credential/lock paths.
-            if Self.lastDiagnostic().isEmpty {
-                Self.recordDiagnostic("failed:\(Self.opaqueErrorTag(error))")
-            } else {
-                Self.recordDiagnostic("catch:\(Self.opaqueErrorTag(error))")
-            }
-            finish(with: content)
         }
+        Self.recordDiagnostic("storeBusy:hydrateRetriesExhausted")
+        finish(with: content)
     }
 
     /// Blocking UniFFI work — always call off the main actor.
@@ -294,11 +322,11 @@ class NotificationService: SDKNotificationService {
         wakeNodeLock.unlock()
     }
 
-    /// ~4s of flock retries (40 × 100ms). Matches the common race where the
-    /// host has started `closeNode` but has not released `marmot.store.lock` yet.
+    /// ~8s of flock retries. Matches the common race where the host has
+    /// started `closeNode` but has not released `marmot.store.lock` yet.
     /// Blocking sleep is OK — callers run this on a `Task.detached` worker.
     private static func acquireStoreLockForWake() throws -> MarmotStoreLock {
-        let attempts = 40 // ~4s — covers SIGKILL teardown + closeNode background task
+        let attempts = SonarNSEDecoratePolicy.storeLockRetryAttempts
         let delaySecs = 0.1
         var last: MarmotStoreLock.TryAcquireResult = .unavailable
         for attempt in 1...attempts {

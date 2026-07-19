@@ -606,7 +606,9 @@ final class MarmotChatModel: ObservableObject {
                 box.endOnce()
             }
         )
-        Task { [weak self] in
+        // userInitiated: flock release must beat Transponder NSE acquire
+        // (default Task priority often loses the race → storeBusy generic banner).
+        Task(priority: .userInitiated) { [weak self] in
             await self?.service.closeNode()
             box.endOnce()
         }
