@@ -3957,6 +3957,14 @@ impl SonarClient {
             .into_iter()
             .map(|item| (item.filename, item.mime, item.data))
             .collect();
+        // Claim *before* stage so a racing resume cannot observe an Uploading
+        // row on disk and steal the entry mid-fsync.
+        let Some(_claim) = self.try_claim_media_upload(&entry_id) else {
+            // Another send/resume already owns this optimistic id. Treat as
+            // success so hosts do not paint a false "Couldn't send" while the
+            // owner finishes (or fails) the upload.
+            return Ok(());
+        };
         {
             let staging = self.media_staging.clone();
             let entry_id = entry_id.clone();
@@ -3977,12 +3985,6 @@ impl SonarClient {
             .await
             .map_err(|e| Error::Storage(format!("media staging join: {e}")))??;
         }
-        // Claim after durable stage so a racing resume cannot also own this id.
-        let Some(_claim) = self.try_claim_media_upload(&entry_id) else {
-            // Another worker already owns this entry; leave staging alone so it
-            // can finish (or fail) the upload. Do not mark_failed here.
-            return Err(Error::Media("media upload already in flight".into()));
-        };
         if let Some(obs) = observer {
             obs.on_progress(&progress_id, 0, total_bytes);
         }

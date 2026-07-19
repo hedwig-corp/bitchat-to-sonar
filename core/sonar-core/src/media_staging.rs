@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,15 @@ fn is_safe_staging_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+fn is_safe_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && Path::new(path)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -97,6 +106,14 @@ impl MediaStagingState {
                 state
                     .entries
                     .into_iter()
+                    .filter(|entry| {
+                        is_safe_staging_id(&entry.id)
+                            && is_safe_staging_id(&entry.client_pending_id)
+                            && entry
+                                .items
+                                .iter()
+                                .all(|item| is_safe_relative_path(&item.relative_path))
+                    })
                     .map(|entry| (entry.id.clone(), entry))
                     .collect()
             })
@@ -254,6 +271,11 @@ impl MediaStagingState {
     }
 
     pub fn remove(&mut self, id: &str) -> Result<()> {
+        if !is_safe_staging_id(id) {
+            return Err(Error::Media(
+                "staged media id must be a bounded alphanumeric token".into(),
+            ));
+        }
         self.inline.data.remove(id);
         if self.entries.remove(id).is_some() {
             self.dirty = true;
@@ -266,6 +288,11 @@ impl MediaStagingState {
     }
 
     pub fn load_item_bytes(&self, entry: &StagedMediaEntry) -> Result<Vec<Vec<u8>>> {
+        if !is_safe_staging_id(&entry.id) {
+            return Err(Error::Media(
+                "staged media id must be a bounded alphanumeric token".into(),
+            ));
+        }
         if let Some(inline) = self.inline.data.get(&entry.id) {
             return Ok(inline.clone());
         }
@@ -274,6 +301,12 @@ impl MediaStagingState {
         })?;
         let mut out = Vec::with_capacity(entry.items.len());
         for item in &entry.items {
+            if !is_safe_relative_path(&item.relative_path) {
+                return Err(Error::Storage(format!(
+                    "unsafe staged media path: {}",
+                    item.relative_path
+                )));
+            }
             let path = dir.join(&item.relative_path);
             let bytes = fs::read(&path).map_err(|e| {
                 Error::Storage(format!("read staged media {}: {e}", path.display()))
@@ -544,6 +577,42 @@ mod tests {
             .expect("purge");
         assert!(staging.get("old").is_none());
         assert!(staging.get("fresh").is_some());
+    }
+
+    #[test]
+    fn load_skips_unsafe_disk_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("chat.db");
+        let (state_path, staging_dir) = media_staging_paths_for_db(&db);
+        let disk = MediaStagingStateDisk {
+            version: MEDIA_STAGING_STATE_VERSION,
+            entries: vec![StagedMediaEntry {
+                id: "../evil".into(),
+                client_pending_id: "ok".into(),
+                group_id_hex: "g".into(),
+                caption: String::new(),
+                server_url: String::new(),
+                items: vec![StagedMediaItem {
+                    filename: "a.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    relative_path: "../../etc/passwd".into(),
+                    byte_len: 1,
+                }],
+                created_at_secs: 1,
+                updated_at_secs: 1,
+                state: MediaStagingStatus::Uploading,
+                last_error: None,
+                bytes_sent: 0,
+                total_bytes: 1,
+            }],
+        };
+        fs::write(
+            &state_path,
+            serde_json::to_vec(&disk).expect("serialize"),
+        )
+        .expect("write");
+        let staging = MediaStagingState::load(Some(state_path), Some(staging_dir));
+        assert!(staging.entries.is_empty());
     }
 
     #[test]
