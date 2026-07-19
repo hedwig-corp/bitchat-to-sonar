@@ -6949,6 +6949,9 @@ impl SonarClient {
                 }
             }
         }
+        if let Err(err) = self.recovery_state.lock().unwrap().flush() {
+            tracing::debug!(%err, "failed to flush recovery state after marmot batch");
+        }
         self.notify_conversations_changed(&changed_groups);
         // Signal-style receive-time warming: sticker attachments referenced by
         // freshly processed messages download in the background now, so opening

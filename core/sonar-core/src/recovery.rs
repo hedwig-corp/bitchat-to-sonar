@@ -163,7 +163,12 @@ impl RecoveryState {
     }
 
     /// Record the newest inbound (peer-authored) message timestamp for a peer.
-    pub fn record_inbound_from(&mut self, peer_hex: &str, created_at: u64) -> Result<()> {
+    ///
+    /// Marks the state dirty only — does **not** flush to disk. Callers that
+    /// update this on every decrypted message (sync / live drain) must
+    /// [`flush`](Self::flush) once per batch so catch-up does not rewrite the
+    /// sidecar JSON per event.
+    pub fn record_inbound_from(&mut self, peer_hex: &str, created_at: u64) {
         let slot = self
             .last_inbound_from
             .entry(peer_hex.to_string())
@@ -172,6 +177,10 @@ impl RecoveryState {
             *slot = created_at;
             self.dirty = true;
         }
+    }
+
+    /// Persist dirty recovery state (batched inbound watermarks, etc.).
+    pub fn flush(&mut self) -> Result<()> {
         self.save_if_dirty()
     }
 
@@ -319,7 +328,7 @@ mod tests {
         assert!(!state.is_beacon_replayed_or_stale(&peer, 101));
 
         // A beacon strictly older than the newest inbound is stale.
-        state.record_inbound_from(&peer, 200).unwrap();
+        state.record_inbound_from(&peer, 200);
         assert!(state.is_beacon_replayed_or_stale(&peer, 150));
         // Same-second-as-inbound beacon is NOT stale (heals immediately).
         assert!(!state.is_beacon_replayed_or_stale(&peer, 200));
