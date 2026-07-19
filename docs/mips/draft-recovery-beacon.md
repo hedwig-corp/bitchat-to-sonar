@@ -47,7 +47,10 @@ compromise and out of scope.
 ## Publishing (restored client)
 
 Publish the beacon immediately after the fresh KeyPackage publish on the
-**explicit nsec-restore path only**. Fresh onboarding and ordinary reconnect
+**explicit nsec-restore path only**, and only when Blossom account-backup
+restore did **not** succeed (Missing/Failed). A successful Blossom restore
+already returns MLS state, so publishing a beacon would incorrectly force peers
+to reset healthy chats. Fresh onboarding and ordinary reconnect
 MUST NOT publish: an empty MLS store alone cannot distinguish those cases, and
 the outstanding-beacon flag auto-accepts multi-member group welcomes — which
 must not be armed on a brand-new install.
