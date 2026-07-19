@@ -103,12 +103,28 @@ enum SonarPushProcessor {
                 marmotWakeInFlight = nil
                 marmotWakeNeedsRerun = false
             }
+            // Snapshot placeholders present at wake start. Only those may be
+            // removed when this wake posts titled copy — NSEs delivered for
+            // other chats during the wake must stay until their own wake runs.
+            let nsePlaceholderSnapshot = await deliveredNSEPlaceholderIds()
+            // One ownership span for the whole single-flight + trailing refresh
+            // loop. Per-iteration begin/end cleared pushWakeNotifiedMessageIDs
+            // between repeats and double-bannered with the live path.
+            marmot.beginPushWakeNotificationOwnership()
+            defer { marmot.endPushWakeNotificationOwnership() }
+
             var overall: UIBackgroundFetchResult = .noData
+            var clearNSEPlaceholders = false
             repeat {
                 marmotWakeNeedsRerun = false
-                let result = await runMarmotWakeup(marmot: marmot, prefs: prefs)
-                overall = mergeFetchResult(overall, result)
+                let outcome = await runMarmotWakeup(marmot: marmot, prefs: prefs)
+                overall = mergeFetchResult(overall, outcome.fetchResult)
+                clearNSEPlaceholders = clearNSEPlaceholders || outcome.shouldClearNSEPlaceholders
             } while marmotWakeNeedsRerun
+
+            if clearNSEPlaceholders {
+                removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: nsePlaceholderSnapshot)
+            }
             return overall
         }
         marmotWakeInFlight = task
@@ -118,16 +134,18 @@ enum SonarPushProcessor {
         }
     }
 
+    private struct MarmotWakeOutcome {
+        let fetchResult: UIBackgroundFetchResult
+        let shouldClearNSEPlaceholders: Bool
+    }
+
     @MainActor
     private static func runMarmotWakeup(
         marmot: MarmotChatModel,
         prefs: SonarLocalNotificationPrefs
-    ) async -> UIBackgroundFetchResult {
-        // Own push-wake banners so SonarAppStore's live message sink does
-        // not also fire for the same drained rows (duplicate lock-screen
-        // banners with different identifiers).
-        marmot.beginPushWakeNotificationOwnership()
-        defer { marmot.endPushWakeNotificationOwnership() }
+    ) async -> MarmotWakeOutcome {
+        // Ownership is held by the outer single-flight loop so trailing
+        // refreshes share one notified-ID set.
 
         // Hydrate the unread baseline from local storage BEFORE refresh.
         // Cold/background launches often have an empty in-memory summary
@@ -155,12 +173,15 @@ enum SonarPushProcessor {
 
         guard prefs.enabled else {
             log.info("Marmot wakeup done (synced=\(synced)), notifications disabled")
-            return synced ? .newData : .failed
+            return MarmotWakeOutcome(
+                fetchResult: synced ? .newData : .failed,
+                shouldClearNSEPlaceholders: false
+            )
         }
 
         // Prefer drain metadata, then also run unread-delta so rows that land
         // via gap recovery after the returned drain list are not dropped.
-        // Delta skips groups already bannered from the drain list.
+        // Delta skips message tips already bannered from the drain list.
         var notified = 0
         if !drained.isEmpty {
             notified = await notifyDrained(drained, marmot: marmot, prefs: prefs)
@@ -171,27 +192,23 @@ enum SonarPushProcessor {
             before: beforeUnread,
             baselineHydrated: baselineHydrated,
             marmot: marmot,
-            prefs: prefs,
-            excludingGroupIds: marmot.pushWakeNotifiedGroupIds
+            prefs: prefs
         )
 
         switch (notified > 0, synced) {
         case (true, _):
             log.info("Marmot wakeup: notified for \(notified) conversation(s) (synced=\(synced))")
-            // NSE placeholders are conversation-agnostic (plaintext-free APNS).
-            // After a successful prefs-aware render, drop all of them so the
-            // lock screen is not left with both generic + titled banners.
-            removeDeliveredNSEPlaceholderBanners()
-            return .newData
+            // Wipe of NSE placeholders is deferred to the outer loop with a
+            // start-of-wake snapshot so overlapping chats are not erased.
+            return MarmotWakeOutcome(fetchResult: .newData, shouldClearNSEPlaceholders: true)
         case (false, true):
             log.info("Marmot sync completed from push, no new unread messages")
-            return .newData
+            return MarmotWakeOutcome(fetchResult: .newData, shouldClearNSEPlaceholders: false)
         case (false, false):
             log.warning("Marmot sync timed out with nothing new unread, showing fallback")
             showFallbackNotification(prefs: prefs)
-            // Avoid stacking NSE generic + local fallback generics.
-            removeDeliveredNSEPlaceholderBanners()
-            return .failed
+            // Avoid stacking NSE generic + local fallback generics (snapshot-scoped).
+            return MarmotWakeOutcome(fetchResult: .failed, shouldClearNSEPlaceholders: true)
         }
     }
 
@@ -272,12 +289,10 @@ enum SonarPushProcessor {
         before: [String: SonarPushUnreadDelta.Fingerprint],
         baselineHydrated: Bool,
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs,
-        excludingGroupIds: Set<String> = []
+        prefs: SonarLocalNotificationPrefs
     ) async -> Int {
         let after = marmot.conversationSummariesByGroup.values.filter { summary in
-            guard !excludingGroupIds.contains(summary.groupIdHex) else { return false }
-            return SonarPushUnreadDelta.isNewlyAdvanced(
+            SonarPushUnreadDelta.isNewlyAdvanced(
                 groupId: summary.groupIdHex,
                 after: SonarPushUnreadDelta.Fingerprint(
                     unread: summary.unreadCount,
@@ -292,6 +307,16 @@ enum SonarPushProcessor {
 
         var notified = 0
         for summary in after {
+            // Skip only when drain already bannered *this* tip message.
+            // Group-level exclude dropped a second in-group advance that landed
+            // via gap recovery after the drain list was returned.
+            if marmot.pushWakeAlreadyNotifiedLatest(
+                groupIdHex: summary.groupIdHex,
+                content: summary.latestContent
+            ) {
+                continue
+            }
+
             let kind: SonarLocalNotificationKind = {
                 switch sonarNotificationClassifyContent(content: summary.latestContent) {
                 case .call: return .call
@@ -403,13 +428,41 @@ enum SonarPushProcessor {
         return false
     }
 
-    private static func removeDeliveredNSEPlaceholderBanners() {
+    /// Pure filter used by wipe + tests: keep only placeholder ids that were
+    /// already delivered when this wake started (`allowed`).
+    static func nsePlaceholderIdsToRemove(
+        deliveredPlaceholderIds: Set<String>,
+        allowedFromWakeStart: Set<String>
+    ) -> [String] {
+        deliveredPlaceholderIds.intersection(allowedFromWakeStart).sorted()
+    }
+
+    private static func deliveredNSEPlaceholderIds() async -> Set<String> {
+        await withCheckedContinuation { continuation in
+            UNUserNotificationCenter.current().getDeliveredNotifications { notes in
+                let ids = Set(notes.compactMap { note -> String? in
+                    guard isNSEPlaceholder(note.request.content) else { return nil }
+                    return note.request.identifier
+                })
+                continuation.resume(returning: ids)
+            }
+        }
+    }
+
+    private static func removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: Set<String>) {
+        // Empty snapshot ⇒ nothing was present at wake start; do not wipe
+        // placeholders that arrived for other chats during this wake.
+        guard !onlyIdentifiers.isEmpty else { return }
         let center = UNUserNotificationCenter.current()
         center.getDeliveredNotifications { notes in
-            let ids = notes.compactMap { note -> String? in
+            let delivered = Set(notes.compactMap { note -> String? in
                 guard isNSEPlaceholder(note.request.content) else { return nil }
                 return note.request.identifier
-            }
+            })
+            let ids = nsePlaceholderIdsToRemove(
+                deliveredPlaceholderIds: delivered,
+                allowedFromWakeStart: onlyIdentifiers
+            )
             guard !ids.isEmpty else { return }
             center.removeDeliveredNotifications(withIdentifiers: ids)
         }

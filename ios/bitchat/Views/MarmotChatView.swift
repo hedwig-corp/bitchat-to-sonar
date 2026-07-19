@@ -287,6 +287,9 @@ final class MarmotChatModel: ObservableObject {
     /// Backed by a refcount so overlapping wakes cannot clear ownership early.
     private(set) var pushWakeOwnsNotifications = false
     private var pushWakeOwnershipCount = 0
+    /// Bumps when ownership drops to zero so SonarAppStore can catch up live
+    /// banners that were suppressed while push owned the lock screen.
+    @Published private(set) var pushWakeLiveCatchUpGeneration: UInt64 = 0
     /// Message IDs the push wake already bannered. Live path marks these seen
     /// after ownership ends — stable IDs, not display labels / truncated previews.
     private(set) var pushWakeNotifiedMessageIDs = Set<String>()
@@ -1027,15 +1030,27 @@ final class MarmotChatModel: ObservableObject {
 
     func endPushWakeNotificationOwnership() {
         pushWakeOwnershipCount = max(0, pushWakeOwnershipCount - 1)
-        pushWakeOwnsNotifications = pushWakeOwnershipCount > 0
+        let stillOwned = pushWakeOwnershipCount > 0
+        pushWakeOwnsNotifications = stillOwned
+        if !stillOwned {
+            // Live `$messagesByGroup` sink early-returns while owned; bump so
+            // SonarAppStore re-runs the processor for any unsuppressed rows.
+            pushWakeLiveCatchUpGeneration &+= 1
+        }
     }
 
     /// Record that push wake already bannered the local rows matching a drain
     /// notification (preview may be core-truncated with `…`).
     func notePushWakeNotified(drain notif: DrainNotificationInfo) {
         let preview = notif.contentPreview
+        let hasGroupName = !notif.groupName.isEmpty
+        let hasSender = !notif.senderNpub.isEmpty
+        // DMs often ship empty groupName from core (`unwrap_or("")`). Without a
+        // sender or name anchor, refuse to scan every chat for preview match.
+        guard hasGroupName || hasSender else { return }
+
         for (groupId, messages) in messagesByGroup {
-            if !notif.groupName.isEmpty {
+            if hasGroupName {
                 let title = groups.first(where: { $0.id == groupId }).map { self.title(for: $0) } ?? ""
                 let summaryName = conversationSummariesByGroup[groupId]?.name ?? ""
                 if title != notif.groupName && summaryName != notif.groupName {
@@ -1044,6 +1059,9 @@ final class MarmotChatModel: ObservableObject {
             }
             var matched = false
             for message in messages where !message.isMine {
+                if hasSender && message.senderNpub != notif.senderNpub {
+                    continue
+                }
                 if SonarPushWakeDedup.matchesPreview(fullContent: message.content, preview: preview) {
                     pushWakeNotifiedMessageIDs.insert(message.id)
                     matched = true
@@ -1068,6 +1086,20 @@ final class MarmotChatModel: ObservableObject {
         if let latest = messages.last(where: { !$0.isMine }) {
             pushWakeNotifiedMessageIDs.insert(latest.id)
         }
+    }
+
+    /// True when push wake already bannered the current unread tip for this group.
+    func pushWakeAlreadyNotifiedLatest(groupIdHex: String, content: String) -> Bool {
+        guard let messages = messagesByGroup[groupIdHex] else { return false }
+        if let match = messages.last(where: {
+            !$0.isMine && SonarPushWakeDedup.matchesPreview(fullContent: $0.content, preview: content)
+        }) {
+            return pushWakeNotifiedMessageIDs.contains(match.id)
+        }
+        if let latest = messages.last(where: { !$0.isMine }) {
+            return pushWakeNotifiedMessageIDs.contains(latest.id)
+        }
+        return false
     }
 
     /// Best-effort local hydration for screen open paths. This never waits for

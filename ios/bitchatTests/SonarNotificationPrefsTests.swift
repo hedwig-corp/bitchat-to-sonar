@@ -74,16 +74,37 @@ struct SonarNotificationPrefsTests {
             showPreview: true,
             showPaymentAmount: true
         )
-        let routed = SonarLocalNotificationRouter.make(
-            idKey: "peer-1",
-            kind: .message,
-            conversationTitle: "Alice",
-            senderName: "Alice",
-            preview: "secret hello",
+        // Pin the mesh call-site seam (`NotificationService.routedPrivateMessageNotification`),
+        // not only the bare router — R-001 style: helpers can stay green while the
+        // instance method hard-codes private copy again.
+        let routed = NotificationService.routedPrivateMessageNotification(
+            sender: "Alice",
+            message: "secret hello",
+            peerID: "peer-1",
             prefs: prefs
         )
         #expect(routed?.title == "Alice")
         #expect(routed?.body == "secret hello")
+        #expect(routed?.identifier == "private-sonar-message-peer-1")
+    }
+
+    @Test("mesh mention seam honors preview opt-in")
+    func mentionSeamRespectsPreviewOptIn() {
+        let prefs = SonarLocalNotificationPrefs(
+            enabled: true,
+            showNames: true,
+            showPreview: true,
+            showPaymentAmount: true
+        )
+        let routed = NotificationService.routedMentionNotification(
+            sender: "Bob",
+            message: "hey @you",
+            prefs: prefs,
+            idKey: "mention-1"
+        )
+        #expect(routed?.title == "Bob")
+        #expect(routed?.body == "hey @you")
+        #expect(routed?.identifier.hasPrefix("mention-") == true)
     }
 
     @Test("private-message router hides names when setting is off")
@@ -191,6 +212,21 @@ struct SonarNotificationPrefsTests {
     }
 
     #if os(iOS)
+    @Test("NSE placeholder wipe keeps ids that arrived after wake start")
+    func nsePlaceholderWipeRespectsWakeSnapshot() {
+        let toRemove = SonarPushProcessor.nsePlaceholderIdsToRemove(
+            deliveredPlaceholderIds: ["nse-a", "nse-b-new"],
+            allowedFromWakeStart: ["nse-a"]
+        )
+        #expect(toRemove == ["nse-a"])
+        #expect(
+            SonarPushProcessor.nsePlaceholderIdsToRemove(
+                deliveredPlaceholderIds: ["nse-b-new"],
+                allowedFromWakeStart: []
+            ).isEmpty
+        )
+    }
+
     @Test("NSE placeholder detection ignores router privacy-fallback copy")
     func nsePlaceholderMatchesIdentityNotCopy() {
         // Router privacy fallback (names off, preview off) uses the same

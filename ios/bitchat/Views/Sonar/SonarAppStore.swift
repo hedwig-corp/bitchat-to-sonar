@@ -1390,6 +1390,15 @@ final class SonarAppStore: ObservableObject {
                 self.objectWillChange.send()
             }
             .store(in: &cancellables)
+        // Push-wake ownership suppresses live banners; when ownership ends the
+        // messages sink does not re-fire, so catch up suppressed rows once.
+        marmot.$pushWakeLiveCatchUpGeneration
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.processIncomingMarmotNotifications()
+            }
+            .store(in: &cancellables)
 
         // Restore persisted Sonar profiles so a peer's mesh + White Noise legs
         // stay folded into one conversation across restarts (before dmRows runs).
