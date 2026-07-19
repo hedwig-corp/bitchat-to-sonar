@@ -143,8 +143,8 @@
     <string name="end_to_end_encrypted_only_group_members">End-to-end encrypted — only group members can read this</string>
     <string name="esc">esc</string>
     <string name="far_internet">far · internet</string>
-    <string name="find_by_username">New discussion</string>
-    <string name="find_someone">New discussion</string>
+    <string name="find_by_username">Find by username</string>
+    <string name="find_someone">Find someone</string>
     <string name="fingerprint_action_mark_verified">mark as verified</string>
     <string name="fingerprint_action_remove_verification">remove verification</string>
     <string name="fingerprint_badge_not_verified">⚠️ NOT VERIFIED</string>
@@ -219,6 +219,7 @@
     <string name="nearby">Nearby</string>
     <string name="nearby_bluetooth">nearby · Bluetooth</string>
     <string name="nearby_on_mesh"> · %1$s nearby on mesh</string>
+    <string name="new_discussion">New discussion</string>
     <string name="nickname">nickname</string>
     <string name="no_account_was_created_anywhere_your">No account was created anywhere — your identity lives on this phone.</string>
     <string name="no_payments_yet">No payments yet</string>
@@ -226,7 +227,6 @@
     <string name="no_secure_chats_yet">No secure chats yet</string>
     <string name="no_shared_groups">No shared groups</string>
     <string name="no_signup_your_identity_is_a_private">No signup. Your identity is a private key created on this phone — nobody else ever sees it.</string>
-    <string name="new_discussion">New discussion</string>
     <string name="nobody_in_bluetooth_range_right_now">Nobody in Bluetooth range right now.</string>
     <string name="nsec">nsec</string>
     <string name="nsec1">nsec1...</string>
