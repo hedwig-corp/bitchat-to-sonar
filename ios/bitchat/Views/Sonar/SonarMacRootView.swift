@@ -1889,6 +1889,8 @@ private struct MacCommandPalette: View {
         }
         .onChange(of: isPresented) { open in
             if !open {
+                findLookupTask?.cancel()
+                findLookupTask = nil
                 groupEntry = false
                 findUsernameEntry = false
                 findDraft = ""

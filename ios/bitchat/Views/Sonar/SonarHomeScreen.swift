@@ -113,6 +113,8 @@ struct SonarHomeScreen: View {
         }
         .onChange(of: composeSheet) { open in
             if !open {
+                findLookupTask?.cancel()
+                findLookupTask = nil
                 groupEntry = false
                 findUsername = false
                 findDraft = ""
