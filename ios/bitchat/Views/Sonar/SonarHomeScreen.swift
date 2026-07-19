@@ -494,7 +494,9 @@ struct SonarHomeScreen: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(verbatim: showSuffix || (!trimmed.contains("@") && !trimmed.hasPrefix("npub1"))
                                     ? trimmed
-                                    : (trimmed.contains("@") ? String(trimmed.split(separator: "@").first ?? trimmed) : trimmed))
+                                    : (trimmed.contains("@")
+                                        ? (trimmed.split(separator: "@").first.map(String.init) ?? trimmed)
+                                        : trimmed))
                                     .font(SonarTheme.uiFont(size: 16, weight: .semibold))
                                     .foregroundColor(SonarTheme.text)
                                 Text(verbatim: previewAddress)

@@ -905,7 +905,7 @@ final class MarmotChatModel: ObservableObject {
                 detail = message
             case .cancelled:
                 return true
-            case .notConnected:
+            case .notConnected, .backupAlreadyInProgress:
                 return false
             }
         } else {
