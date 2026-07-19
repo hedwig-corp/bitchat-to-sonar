@@ -209,6 +209,9 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
 
     func updateComposer(_ composer: Composer) {
         composerStore.composer = composer
+        // Text / tray changes often arrive via a new Composer value; relayout so
+        // intrinsic composer height and owned insets catch up in the same pass.
+        view.setNeedsLayout()
     }
 
     private func applyTranscriptBackground() {
@@ -248,10 +251,16 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         addChild(composerHost)
         composerContainer.addSubview(composerHost.view)
         composerHost.didMove(toParent: self)
+        composerHost.view.setContentHuggingPriority(.required, for: .vertical)
+        composerHost.view.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let bottomToKeyboard = composerContainer.bottomAnchor.constraint(
             equalTo: view.keyboardLayoutGuide.topAnchor
         )
+        // Height comes from UIHostingController.sizingOptions = .intrinsicContentSize
+        // so multi-line TextField growth can resize the bar. Owned bottom inset still
+        // uses sizeThatFits (not frame.minY) so an oversized host cannot inflate the
+        // empty band under the last message.
 
         NSLayoutConstraint.activate([
             collectionView.topAnchor.constraint(equalTo: view.topAnchor),
@@ -667,12 +676,24 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     // MARK: Owned insets
 
     private func updateOwnedInsetsFromChrome() {
-        let barHeight = composerContainer.bounds.height
-        guard barHeight > 0, collectionView.bounds.height > 0 else { return }
-        let composerInViewport = composerContainer.convert(composerContainer.bounds, to: view)
+        guard collectionView.bounds.height > 0 else { return }
+        let width = max(collectionView.bounds.width, 1)
+        let fittingHeight = composerHost.sizeThatFits(
+            in: CGSize(width: width, height: UIView.layoutFittingExpandedSize.height)
+        ).height
+        // Prefer fitting size: an oversized UIHostingController frame would make
+        // `bounds.minY` near the top of the viewport and inflate bottom inset
+        // into a keyboard-sized empty band under the last message.
+        let barHeight = fittingHeight > 1 ? fittingHeight : composerContainer.bounds.height
+        guard barHeight > 0 else { return }
+        let composerBottomY = composerContainer.convert(
+            CGPoint(x: 0, y: composerContainer.bounds.maxY),
+            to: view
+        ).y
         let owned = transcriptOwnedBottomContentInset(
             collectionBoundsHeight: collectionView.bounds.height,
-            composerMinYInViewport: composerInViewport.minY
+            composerBottomYInViewport: composerBottomY,
+            composerHeight: barHeight
         )
         let insetChanged = abs(collectionView.contentInset.bottom - owned) > 0.5
             || abs(lastBarHeight - barHeight) > 0.5
@@ -813,6 +834,31 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         needsLiveEdgeOpen = false
         recordUserScroll(isNearBottom: isScrolledToBottom())
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        if !decelerate { clampRestingOffsetIfNeeded() }
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+        clampRestingOffsetIfNeeded()
+    }
+
+    /// Keyboard dismiss / rubber-band can leave offset past maxY — the blank
+    /// band under the last message. Clamp when the user finishes scrolling.
+    private func clampRestingOffsetIfNeeded() {
+        guard !collectionView.isDragging, !collectionView.isDecelerating else { return }
+        guard let y = transcriptRestingOffsetOvershootCorrection(
+            offsetY: collectionView.contentOffset.y,
+            boundsHeight: collectionView.bounds.height,
+            contentHeight: collectionView.contentSize.height,
+            topInset: collectionView.adjustedContentInset.top,
+            bottomInset: collectionView.adjustedContentInset.bottom
+        ) else { return }
+        collectionView.setContentOffset(
+            CGPoint(x: collectionView.contentOffset.x, y: y),
+            animated: false
+        )
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {

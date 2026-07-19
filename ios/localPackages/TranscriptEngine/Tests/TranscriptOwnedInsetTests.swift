@@ -116,5 +116,51 @@ struct TranscriptOwnedInsetTests {
             ) == 0
         )
     }
+
+    @Test
+    func ownedInsetIgnoresOversizedComposerContainerBounds() {
+        // Hosting view stretched full-bleed; visible chrome is only 76pt at bottom.
+        let viewportHeight: CGFloat = 844
+        let chromeHeight: CGFloat = 76
+        let host = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: viewportHeight))
+        let collection = UICollectionView(
+            frame: host.bounds,
+            collectionViewLayout: UICollectionViewFlowLayout()
+        )
+        host.addSubview(collection)
+        let oversized = UIView(frame: host.bounds) // minY == 0 — the bug shape
+        host.addSubview(oversized)
+
+        let broken = transcriptOwnedBottomContentInset(
+            collectionBoundsHeight: collection.bounds.height,
+            composerMinYInViewport: oversized.convert(oversized.bounds, to: host).minY
+        )
+        #expect(abs(broken - viewportHeight) < 0.5)
+
+        let bottomY = oversized.convert(
+            CGPoint(x: 0, y: oversized.bounds.maxY),
+            to: host
+        ).y
+        let owned = transcriptOwnedBottomContentInset(
+            collectionBoundsHeight: collection.bounds.height,
+            composerBottomYInViewport: bottomY,
+            composerHeight: chromeHeight
+        )
+        #expect(abs(owned - chromeHeight) < 0.5)
+    }
+
+    @Test
+    func ownedInsetFromBottomStillGrowsWithKeyboard() {
+        let viewportHeight: CGFloat = 844
+        let chromeHeight: CGFloat = 76
+        let keyboard: CGFloat = 336
+        let composerBottomY = viewportHeight - keyboard
+        let owned = transcriptOwnedBottomContentInset(
+            collectionBoundsHeight: viewportHeight,
+            composerBottomYInViewport: composerBottomY,
+            composerHeight: chromeHeight
+        )
+        #expect(abs(owned - (keyboard + chromeHeight)) < 0.5)
+    }
 }
 #endif

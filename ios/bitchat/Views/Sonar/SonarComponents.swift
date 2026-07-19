@@ -3752,6 +3752,15 @@ final class SNAudioPlayer: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 }
 
+/// Prepare a composer send: trim payload and require an empty draft before the
+/// send/command callback runs. The UIKit transcript host refreshes the hosted
+/// composer synchronously inside that callback; clearing after can re-bind the
+/// pre-send text. Compose already clears draft before send.
+func snPrepareComposerSend(text: String) -> String? {
+    let payload = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return payload.isEmpty ? nil : payload
+}
+
 struct SNComposer: View {
     let placeholder: String
     let transport: SNVia
@@ -3819,16 +3828,16 @@ struct SNComposer: View {
     }
 
     private func send() {
-        let tx = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !tx.isEmpty else { return }
+        guard let tx = snPrepareComposerSend(text: text) else { return }
+        // Clear before the send callback (see snPrepareComposerSend).
+        text = ""
+        showEmojiTray = false
         if tx.hasPrefix("/") {
             let cmd = tx.dropFirst().split(separator: " ").first.map(String.init)?.lowercased() ?? ""
             onCommand(cmd)
         } else {
             onSend(tx)
         }
-        text = ""
-        showEmojiTray = false
     }
 
     var body: some View {
@@ -3838,8 +3847,8 @@ struct SNComposer: View {
                     HStack(spacing: 8) {
                         ForEach(snCommands, id: \.0) { cmd, desc in
                             Button {
-                                onCommand(cmd)
                                 text = ""
+                                onCommand(cmd)
                             } label: {
                                 VStack(alignment: .leading, spacing: 1) {
                                     Text(verbatim: "/" + cmd)
