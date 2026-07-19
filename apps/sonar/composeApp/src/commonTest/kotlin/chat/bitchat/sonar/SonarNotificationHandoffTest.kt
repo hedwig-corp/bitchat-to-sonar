@@ -87,4 +87,19 @@ class SonarNotificationHandoffTest {
             ),
         )
     }
+
+    @Test
+    fun normalizeJumpMessageIdTrimsAndDropsBlanks() {
+        assertEquals("msg-1", SonarNotificationHandoff.normalizeJumpMessageId(" msg-1 "))
+        assertNull(SonarNotificationHandoff.normalizeJumpMessageId("   "))
+        assertNull(SonarNotificationHandoff.normalizeJumpMessageId(null))
+    }
+
+    @Test
+    fun pendingOpenConversationCarriesOptionalJump() {
+        val req = PendingOpenConversation("chat-a", jumpMessageId = "msg-9")
+        assertEquals("chat-a", req.conversationId)
+        assertEquals("msg-9", req.jumpMessageId)
+        assertNull(PendingOpenConversation("chat-b").jumpMessageId)
+    }
 }

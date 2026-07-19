@@ -200,6 +200,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
     let expectedNewestDate: Date?
     /// Search / deep-link jump target; wins over unread/live-edge open (#372).
     var jumpMessageId: String? = nil
+    var onJumpSettled: (() -> Void)? = nil
     @ViewBuilder var composer: () -> Composer
 
     @StateObject private var renderContext = SNTranscriptHostRenderContext()
@@ -231,6 +232,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                     onRetry: onRetry
                 )
             },
+            onJumpSettled: onJumpSettled,
             composer: composer
         )
     }

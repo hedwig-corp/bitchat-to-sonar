@@ -3663,6 +3663,7 @@ private struct MacCollectionHostDM<Composer: View>: View {
                 unreadCountAtOpen: store.unreadCountAtOpenByDM[peerId],
                 expectedNewestDate: store.expectedNewestMessageDate(peerId),
                 jumpMessageId: store.jumpMessageIdAtOpenByDM[peerId],
+                onJumpSettled: { store.clearJumpMessageIdAtOpen(peerId) },
                 composer: composer
             )
         }

@@ -173,23 +173,27 @@ object SonarLifecycle {
         queued.forEach(handler)
     }
 
-    @Volatile private var onOpenConversation: ((String) -> Unit)? = null
-    private val pendingOpenConversations = mutableListOf<String>()
+    @Volatile private var onOpenConversation: ((PendingOpenConversation) -> Unit)? = null
+    private val pendingOpenConversations = mutableListOf<PendingOpenConversation>()
 
-    fun submitOpenConversation(conversationId: String) {
+    fun submitOpenConversation(conversationId: String, jumpMessageId: String? = null) {
         val id = conversationId.trim()
         if (id.isEmpty()) return
+        val req = PendingOpenConversation(
+            conversationId = id,
+            jumpMessageId = SonarNotificationHandoff.normalizeJumpMessageId(jumpMessageId),
+        )
         val handler = onOpenConversation
         if (handler != null) {
-            handler(id)
+            handler(req)
         } else {
             // Dedupe: cold-start / locked taps may retry the same id.
-            pendingOpenConversations.removeAll { it == id }
-            pendingOpenConversations.add(id)
+            pendingOpenConversations.removeAll { it.conversationId == id }
+            pendingOpenConversations.add(req)
         }
     }
 
-    fun installOpenConversationHandler(handler: (String) -> Unit) {
+    fun installOpenConversationHandler(handler: (PendingOpenConversation) -> Unit) {
         onOpenConversation = handler
         val queued = pendingOpenConversations.toList()
         pendingOpenConversations.clear()
@@ -198,7 +202,7 @@ object SonarLifecycle {
 
     /** Drop the live handler so later taps re-enter [pendingOpenConversations]
      *  until a live composition owns them again (Activity recreate / lock). */
-    fun clearOpenConversationHandler(handler: ((String) -> Unit)? = null) {
+    fun clearOpenConversationHandler(handler: ((PendingOpenConversation) -> Unit)? = null) {
         if (handler == null || onOpenConversation === handler) {
             onOpenConversation = null
         }
@@ -233,7 +237,12 @@ fun App(
             SonarLifecycle.clearOpenConversationHandler()
             return@LaunchedEffect
         }
-        val handler: (String) -> Unit = { state.openConversationFromNotification(it) }
+        val handler: (PendingOpenConversation) -> Unit = {
+            state.openConversationFromNotification(
+                conversationId = it.conversationId,
+                jumpMessageId = it.jumpMessageId,
+            )
+        }
         try {
             SonarLifecycle.installOpenConversationHandler(handler)
             awaitCancellation()
@@ -1303,11 +1312,13 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                         val idx = if (jumpIdx >= 0) {
                             chatFeedListIndexForFeedRow(listItems, jumpIdx).coerceAtLeast(0)
                         } else {
+                            // Soft-fail: id not in newest local page → unread/live-edge.
                             chatFeedListOpenIndex(listItems, unreadAnchorId, feedIdx)
                         }
                         listState.scrollToItem(idx)
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
+                        state.clearOpenChatJump(screen.id)
                     }
                 }
             } else {
@@ -1327,6 +1338,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     is TranscriptOpenAction.Jump -> {
                         needsLiveEdgeOpen = false
                         didInitialScroll = true
+                        state.clearOpenChatJump(screen.id)
                     }
                 }
             }

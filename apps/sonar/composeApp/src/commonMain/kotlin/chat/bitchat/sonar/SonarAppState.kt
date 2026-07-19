@@ -1156,6 +1156,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId = openChatJumpMessageId - chatId
     }
 
+    /** Drop a one-shot Jump target after the host applied (or soft-failed) it. */
+    fun clearOpenChatJump(chatId: String) {
+        openChatJumpMessageId = openChatJumpMessageId - chatId
+    }
+
     /** Account wipe/erase: per-open transcript state must not outlive the
      *  chats it is keyed by. */
     private fun clearOpenChatTransientState() {
@@ -3733,6 +3738,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         groupName: String? = null,
         unreadCount: Long = 1,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
+        messageId: String? = null,
     ) {
         if (foreground) return
         val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
@@ -3752,6 +3758,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             body = notification.body,
             sound = sound,
             conversationId = idKey,
+            messageId = messageId,
         )
     }
 
@@ -3778,19 +3785,26 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Unknown ids never invent a blank chat screen: refresh once and retry,
      * otherwise stay on Home and clear the shade entry.
      */
-    fun openConversationFromNotification(conversationId: String) {
+    fun openConversationFromNotification(
+        conversationId: String,
+        jumpMessageId: String? = null,
+    ) {
         val id = conversationId.trim()
         if (id.isEmpty()) return
-        if (openResolvedNotificationTarget(id)) return
+        val jump = SonarNotificationHandoff.normalizeJumpMessageId(jumpMessageId)
+        if (openResolvedNotificationTarget(id, jump)) return
         scope.launch {
             runCatching { refreshChats() }
-            if (openResolvedNotificationTarget(id)) return@launch
+            if (openResolvedNotificationTarget(id, jump)) return@launch
             clearNotificationsForChat(id)
             toast = "That chat isn’t ready yet — try again from Messages."
         }
     }
 
-    private fun openResolvedNotificationTarget(conversationId: String): Boolean {
+    private fun openResolvedNotificationTarget(
+        conversationId: String,
+        jumpMessageId: String? = null,
+    ): Boolean {
         val target = SonarNotificationHandoff.resolveOpenTarget(
             conversationId = conversationId,
             knownChatIds = chats.mapTo(hashSetOf()) { it.id },
@@ -3799,10 +3813,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         ) ?: return false
         when (target) {
             is SonarNotificationOpenTarget.MeshPeer ->
-                openDm(target.peerId, meshPeerName(target.peerId))
+                openDm(target.peerId, meshPeerName(target.peerId), jumpMessageId = jumpMessageId)
             is SonarNotificationOpenTarget.Chat -> {
                 val chat = chats.firstOrNull { it.id == target.chatId } ?: return false
-                openChat(chat)
+                openChat(chat, jumpMessageId = jumpMessageId)
             }
         }
         return true
@@ -3908,6 +3922,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 senderName = notificationSenderName(c, newestIncoming),
                 groupName = groupName,
                 unreadCount = unreadForChat(idKey).coerceAtLeast(1L),
+                messageId = newestIncoming.id,
             )
         }
     }
@@ -8450,6 +8465,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 content = preview,
                 senderName = sender,
                 sound = SonarNotificationSound.Ble,
+                messageId = msg.id,
             )
         }
         touched.forEach { persistMesh(it) } // write-through so received DMs survive restart
@@ -8515,7 +8531,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             touched += peerId
             ackEventIds += m.eventId
             val preview = if (msg.stickerRef != null) "Sticker" else m.content
-            notifyIncoming(chatId, meshPeerName(peerId), preview)
+            notifyIncoming(chatId, meshPeerName(peerId), preview, messageId = id)
         }
         for (peerId in touched) {
             MessageStore.saveMeshDm(peerId, meshChats[peerId].orEmpty())
@@ -8558,6 +8574,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 meshPeerName(m.peerId),
                 mediaPreviewLabel(m.mimeType, m.filename),
                 sound = SonarNotificationSound.Ble,
+                messageId = id,
             )
         }
         if (touched.isEmpty()) return false

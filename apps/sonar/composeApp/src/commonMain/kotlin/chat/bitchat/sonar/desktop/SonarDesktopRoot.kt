@@ -92,7 +92,12 @@ fun DesktopApp() {
             SonarLifecycle.clearOpenConversationHandler()
             return@LaunchedEffect
         }
-        val handler: (String) -> Unit = { state.openConversationFromNotification(it) }
+        val handler: (PendingOpenConversation) -> Unit = {
+            state.openConversationFromNotification(
+                conversationId = it.conversationId,
+                jumpMessageId = it.jumpMessageId,
+            )
+        }
         try {
             SonarLifecycle.installOpenConversationHandler(handler)
             awaitCancellation()

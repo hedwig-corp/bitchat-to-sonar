@@ -366,25 +366,32 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
     weak var sonarStore: SonarAppStore?
     /// Cold-launch taps can arrive before `bind` wires the store.
     private var pendingConversationId: String?
+    private var pendingJumpMessageId: String?
 
     func bind(chatViewModel: ChatViewModel, sonarStore: SonarAppStore) {
         self.chatViewModel = chatViewModel
         self.sonarStore = sonarStore
         if let pending = pendingConversationId {
+            let jump = pendingJumpMessageId
             pendingConversationId = nil
-            openConversation(pending)
+            pendingJumpMessageId = nil
+            openConversation(pending, jumpMessageId: jump)
         }
     }
 
-    private func openConversation(_ conversationId: String) {
+    private func openConversation(_ conversationId: String, jumpMessageId: String? = nil) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
+        let jump = jumpMessageId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let jumpOrNil = (jump?.isEmpty == false) ? jump : nil
         guard let store = sonarStore else {
             pendingConversationId = id
+            pendingJumpMessageId = jumpOrNil
             return
         }
         DispatchQueue.main.async {
-            store.openConversationFromNotification(id)
+            store.openConversationFromNotification(id, jumpMessageId: jumpOrNil)
         }
     }
 
@@ -397,7 +404,10 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
         // Sonar root owns DM navigation — prefer that over the legacy
         // ChatViewModel private-chat path so the tap lands on the real chat.
         if let conversationId = SonarNotificationHandoff.conversationId(from: userInfo) {
-            openConversation(conversationId)
+            openConversation(
+                conversationId,
+                jumpMessageId: SonarNotificationHandoff.messageId(from: userInfo)
+            )
         } else if identifier.hasPrefix("private-"),
                   let peerID = userInfo[SonarNotificationKeys.peerID] as? String {
             DispatchQueue.main.async {

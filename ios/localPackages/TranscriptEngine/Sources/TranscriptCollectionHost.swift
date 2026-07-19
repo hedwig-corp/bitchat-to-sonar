@@ -67,6 +67,9 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// Runs on the UIKit update path before `apply` — use for app render-context
     /// sync so SwiftUI `body` stays side-effect free.
     var prepareForUpdate: (() -> Void)?
+    /// Invoked once after a Jump open-action is applied (hit or soft-fail) so
+    /// the app can clear its one-shot jump target (#372).
+    var onJumpSettled: (() -> Void)?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -80,6 +83,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         loadNewest: (() async -> Void)? = nil,
         transcriptBackgroundColor: UIColor = .systemBackground,
         prepareForUpdate: (() -> Void)? = nil,
+        onJumpSettled: (() -> Void)? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -92,6 +96,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.loadNewest = loadNewest
         self.transcriptBackgroundColor = transcriptBackgroundColor
         self.prepareForUpdate = prepareForUpdate
+        self.onJumpSettled = onJumpSettled
         self.composer = composer
     }
 
@@ -105,6 +110,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             heightKey: heightKey,
             transcriptBackgroundColor: transcriptBackgroundColor
         )
+        vc.onJumpSettled = onJumpSettled
         vc.apply(
             entries: entries,
             unreadCountAtOpen: unreadCountAtOpen,
@@ -124,6 +130,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             return
         }
         prepareForUpdate?()
+        vc.onJumpSettled = onJumpSettled
         vc.updateComposer(composer())
         vc.apply(
             entries: entries,
@@ -177,6 +184,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var unreadCountAtOpen: UInt64?
     private var expectedNewestDate: Date?
     private var jumpMessageId: String?
+    var onJumpSettled: (() -> Void)?
 
     private var unreadAnchorId: String?
     private var unreadAnchorAbandoned = false
@@ -616,7 +624,17 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
                 guard let self else { return }
                 if let indexPath = self.dataSource?.indexPath(for: .message(id)) {
                     self.collectionView.scrollToItem(at: indexPath, at: .top, animated: false)
+                } else {
+                    // Soft-fail: id not in the newest local page — unread/live-edge.
+                    let fallback = TranscriptScrollPolicy.openAction(
+                        unreadAnchorId: self.unreadAnchorId,
+                        unreadCountAtOpen: self.unreadCountAtOpen,
+                        unreadAnchorAbandoned: self.unreadAnchorAbandoned,
+                        jumpId: nil
+                    )
+                    self.applyOpenAction(fallback)
                 }
+                self.onJumpSettled?()
             }
         }
     }
