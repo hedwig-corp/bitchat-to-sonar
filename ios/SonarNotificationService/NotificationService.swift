@@ -144,7 +144,7 @@ class NotificationService: SDKNotificationService {
             os_log("NSE: Marmot wake decorated primary + %d additional",
                    log: Self.log, type: .info, extras.count)
             Self.recordDiagnostic(
-                "decorated:showNames=\(prefs.showNames):showPreview=\(prefs.showPreview):extras=\(extras.count):title=\(content.title.prefix(48))"
+                "decorated:showNames=\(prefs.showNames):showPreview=\(prefs.showPreview):extras=\(extras.count):title=\(content.title.prefix(40)):body=\(content.body.prefix(48))"
             )
             releaseMarmotWakeNode()
             finish(with: content)
@@ -327,17 +327,19 @@ class NotificationService: SDKNotificationService {
         to content: UNMutableNotificationContent,
         prefs: NSENotificationPrefs
     ) {
-        let groupName = notification.groupName.isEmpty ? nil : notification.groupName
+        let groupName = meaningfulGroupName(notification.groupName)
         let sender = prefs.showNames
             ? shortLabel(for: notification.senderNpub)
             : nil
+        // Match SonarPushProcessor / router: 1:1 uses sender (or bare group);
+        // only multi-party style titles use "sender in group".
         let title: String
-        if let groupName, let sender {
+        if let groupName, let sender, groupName != sender {
             title = "\(sender) in \(groupName)"
-        } else if let groupName {
-            title = groupName
         } else if let sender {
             title = sender
+        } else if let groupName {
+            title = groupName
         } else {
             title = "New Sonar message"
         }
@@ -367,6 +369,22 @@ class NotificationService: SDKNotificationService {
         content.userInfo = userInfo
     }
 
+    /// Drop placeholder 1:1 names so the banner title is the peer, not
+    /// "hex… in Sonar agent DM".
+    private static func meaningfulGroupName(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lowered = trimmed.lowercased()
+        let placeholders: Set<String> = [
+            "sonar agent dm",
+            "dm",
+            "direct message",
+            "new chat",
+        ]
+        if placeholders.contains(lowered) { return nil }
+        return trimmed
+    }
+
     private static func postAdditionalLocalNotification(
         _ notification: DrainNotificationInfo,
         prefs: NSENotificationPrefs
@@ -384,6 +402,11 @@ class NotificationService: SDKNotificationService {
 
     private static func shortLabel(for npub: String) -> String {
         let trimmed = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return trimmed }
+        // Hex pubkeys (64 chars) — show a short fingerprint, not a fake npub cut.
+        if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
+            return String(trimmed.prefix(8)) + "…"
+        }
         guard trimmed.count > 16 else { return trimmed }
         return String(trimmed.prefix(12)) + "…"
     }
