@@ -597,7 +597,10 @@ final class MarmotChatModel: ObservableObject {
     /// Restore an existing identity from a pasted `nsec1…` backup (onboarding
     /// "I already have a key"): validate it, persist it as THE identity, then
     /// connect as it. Throws on an invalid key so the caller can surface it.
-    func restoreIdentity(nsec raw: String) async throws {
+    /// When a Blossom account backup exists for this nsec, Marmot chats are
+    /// restored before reconnect; otherwise chats start empty.
+    @discardableResult
+    func restoreIdentity(nsec raw: String) async throws -> AccountBackupRestoreOutcome {
         let nsec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Validate without mutating the live service. A failed import must leave
         // the currently connected identity and its local database untouched.
@@ -632,10 +635,17 @@ final class MarmotChatModel: ObservableObject {
             _ = await performConnect()
             throw MarmotService.ServiceError.core("failed to persist restored identity")
         }
+        let backupOutcome = await service.tryRestoreAccountFromBlossom(nsec: nsec)
         // Drive the full local-first connect sequence directly; performConnect
-        // reads the nsec persisted above and opens a fresh encrypted database.
+        // reads the nsec persisted above and opens the restored or fresh DB.
         guard await performConnect() else {
             let replacementError = errorText ?? "failed to connect restored identity"
+            // A committed Blossom restore already wrote live ciphertext under the
+            // new nsec. Wiping / deleting that nsec would permanently lose chats
+            // (and violate Account Key Durability on first-time import).
+            if backupOutcome == .restored {
+                throw MarmotService.ServiceError.core(replacementError)
+            }
             // A failed local open may have installed the replacement identity in
             // memory or left a partial SQLite store. Tear it down before restoring
             // the prior key so callers never observe an account/key mismatch.
@@ -655,16 +665,34 @@ final class MarmotChatModel: ObservableObject {
                     forKey: Self.nsecKeychainKey
                 )
             } else {
-                keyRestored = keychain.deleteIdentityKey(forKey: Self.nsecKeychainKey)
+                // Never delete a freshly persisted nsec on first-time restore —
+                // surface the connect error and keep the account key durable.
+                keyRestored = true
             }
             guard keyRestored else {
                 throw MarmotService.ServiceError.core(
                     "\(replacementError); failed to restore the previous account key"
                 )
             }
-            _ = await performConnect()
+            if previousNsec != nil {
+                _ = await performConnect()
+            }
             throw MarmotService.ServiceError.core(replacementError)
         }
+        return backupOutcome
+    }
+
+    /// Upload an encrypted Marmot account backup to Blossom, then reconnect.
+    func backupAccount() async throws {
+        let wasPolling = syncTask != nil
+        busy = true
+        defer { busy = false }
+        stopPolling()
+        _ = try await service.uploadAccountBackup()
+        guard await performConnect() else {
+            throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+        }
+        if wasPolling { startPolling() }
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
@@ -696,13 +724,16 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func connectRelaysIfNeeded() {
-        guard !relayBusy else { return }
+        // Identity backup/restore holds `busy` with the node closed — do not
+        // reopen the DB underneath a staged restore or in-flight upload.
+        guard !busy, !relayBusy else { return }
         relayConnectTask?.cancel()
         relayConnectTask = nil
         relayBusy = true
         Task { [weak self] in
             guard let self else { return }
             defer { self.relayBusy = false }
+            guard !self.busy else { return }
             do {
                 self.relayConnected = false
                 #if DEBUG

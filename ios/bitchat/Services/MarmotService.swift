@@ -23,6 +23,14 @@ import SonarCore
 ///   SonarCore types directly from the main thread.
 /// - This service owns no UI state. ViewModels observe/own their own state
 ///   and call into this service.
+
+/// Soft-try result for Blossom Marmot backup restore during nsec import.
+enum AccountBackupRestoreOutcome: Equatable, Sendable {
+    case restored
+    case missing
+    case failed
+}
+
 final class MarmotService: @unchecked Sendable {
 
     private final class NodeLifecycleLease: @unchecked Sendable {
@@ -1122,6 +1130,7 @@ final class MarmotService: @unchecked Sendable {
         // which would otherwise block the whole Marmot relay-sync path.
         if let benchNsec = ProcessInfo.processInfo.environment["SONAR_BENCH_NSEC"], !benchNsec.isEmpty {
             let keyHex = SHA256.hash(data: Data(benchNsec.utf8)).map { String(format: "%02x", $0) }.joined()
+            try? reconcileAccountRestore(dbPath: url.path, dbKeyHex: keyHex)
             return (url.path, keyHex)
         }
         #endif
@@ -1170,6 +1179,22 @@ final class MarmotService: @unchecked Sendable {
             // The key likely EXISTS but isn't readable now. Do NOT regenerate.
             throw ServiceError.core("database key not readable yet (device locked?) — deferring")
         }
+        // Resume an interrupted stage→persist→commit (crash after key write).
+        // Wrong/orphan staging is aborted so connect never pairs ciphertext with
+        // a minted key. If staging remains after a reconcile error, refuse open.
+        do {
+            _ = try reconcileAccountRestore(dbPath: url.path, dbKeyHex: keyHex)
+        } catch {
+            if accountRestoreStagingPresent(dbPath: url.path) {
+                throw ServiceError.core(
+                    "account restore staging present after reconcile failure — refusing connect"
+                )
+            }
+            SecureLogger.warning(
+                "⚠️ Account restore reconcile failed: \(error.localizedDescription)",
+                category: .session
+            )
+        }
         return (url.path, keyHex)
     }
 
@@ -1209,6 +1234,172 @@ final class MarmotService: @unchecked Sendable {
                 throw ServiceError.core("failed to delete Marmot database key")
             }
             return ()
+        }
+    }
+
+    /// Drop the live `SonarNode` so DB files can be read/replaced. Does not
+    /// delete files or the Keychain DB key. When `keepClosed` is true, leaves
+    /// `nodeClosing` set so reconnect cannot race the following FFI work;
+    /// caller must clear it (via another `closeNode(keepClosed: false)` path
+    /// or by completing connect after clearing).
+    func closeNode(keepClosed: Bool = false) async {
+        await runNonThrowing { service in
+            service.sessionGeneration = service.sessionGeneration &+ 1
+            #if os(iOS)
+            SonarPushRegistration.shared.clearSonarNode()
+            #endif
+            service.nodeLock.lock()
+            service.nodeClosing = true
+            service.node = nil
+            service.relayConnected = false
+            service.nodeLock.unlock()
+            return ()
+        }
+        await withCheckedContinuation { continuation in
+            nodeLifecycleGroup.notify(queue: workQueue) {
+                continuation.resume()
+            }
+        }
+        if !keepClosed {
+            await runNonThrowing { service in
+                service.nodeLock.lock()
+                service.nodeClosing = false
+                service.nodeLock.unlock()
+                return ()
+            }
+        }
+    }
+
+    /// Clear the close fence after backup/restore FFI finishes.
+    func clearNodeClosingFence() async {
+        await runNonThrowing { service in
+            service.nodeLock.lock()
+            service.nodeClosing = false
+            service.nodeLock.unlock()
+            return ()
+        }
+    }
+
+    /// Persist the SQLCipher key used by Marmot (host-owned). Used after a
+    /// Blossom account restore so `connect` opens with the restored key.
+    func persistDatabaseKey(_ dbKeyHex: String) throws {
+        guard dbKeyHex.range(of: "^[0-9a-fA-F]{64}$", options: .regularExpression) != nil else {
+            throw ServiceError.core("database key malformed — refusing to persist")
+        }
+        guard KeychainManager().saveIdentityKey(Data(dbKeyHex.utf8), forKey: Self.dbKeychainKey) else {
+            throw ServiceError.core("failed to persist database encryption key")
+        }
+    }
+
+    /// Signal-style encrypted chat backup: close the node, seal DB+key with the
+    /// account nsec, upload to Blossom. Caller reconnects afterward.
+    @discardableResult
+    func uploadAccountBackup(blossomServer: String? = nil) async throws -> AccountBackupUploadInfo {
+        let nsec = try await run { service -> String in
+            guard let nsec = service.identity?.nsec() else {
+                throw ServiceError.core("no identity to back up")
+            }
+            return nsec
+        }
+        // Close before databaseConfig: that path runs restore reconcile/rename
+        // and must not race a live SQLCipher handle.
+        await closeNode(keepClosed: true)
+        let (dbPath, dbKeyHex): (String, String)
+        do {
+            (dbPath, dbKeyHex) = try Self.databaseConfig()
+        } catch {
+            await clearNodeClosingFence()
+            throw error
+        }
+        do {
+            let info = try backupAccountToBlossom(
+                nsec: nsec,
+                dbPath: dbPath,
+                dbKeyHex: dbKeyHex,
+                blossomServer: blossomServer
+            )
+            await clearNodeClosingFence()
+            return info
+        } catch let error as SonarFfiError {
+            await clearNodeClosingFence()
+            throw Self.mapFfi(error)
+        } catch {
+            await clearNodeClosingFence()
+            throw error
+        }
+    }
+
+    /// After wipe + before reconnect during nsec restore: download latest
+    /// Blossom account backup if any, stage files, persist `db_key`, then
+    /// commit. Missing backup is soft (`.missing`); staging/persist/network
+    /// failures roll back and return `.failed` so connect never pairs restored
+    /// ciphertext with a newly minted key. Identity import still proceeds.
+    @discardableResult
+    func tryRestoreAccountFromBlossom(
+        nsec: String,
+        blossomServer: String? = nil
+    ) async -> AccountBackupRestoreOutcome {
+        let url: URL
+        do {
+            url = try Self.databaseURL()
+            try FileManager.default.createDirectory(
+                at: url.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
+            SecureLogger.warning(
+                "⚠️ Account backup restore skipped (db path): \(error.localizedDescription)",
+                category: .session
+            )
+            return .failed
+        }
+        await closeNode(keepClosed: true)
+        do {
+            let dbKeyHex = try restoreAccountFromBlossom(
+                nsec: nsec,
+                dbPath: url.path,
+                blossomServer: blossomServer
+            )
+            do {
+                try persistDatabaseKey(dbKeyHex)
+                try commitAccountRestore(dbPath: url.path)
+            } catch {
+                // Clear the restored key only while staging is still present
+                // (DB not promoted). After a successful main-DB rename, clearing
+                // the key orphans live ciphertext forever.
+                if accountRestoreStagingPresent(dbPath: url.path) {
+                    try? abortAccountRestore(dbPath: url.path)
+                    _ = KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey)
+                }
+                SecureLogger.warning(
+                    "⚠️ Account backup staged but key persist/commit failed — aborted: \(error.localizedDescription)",
+                    category: .session
+                )
+                await clearNodeClosingFence()
+                return .failed
+            }
+            await clearNodeClosingFence()
+            SecureLogger.info("✅ Restored Marmot account backup from Blossom", category: .session)
+            return .restored
+        } catch {
+            try? abortAccountRestore(dbPath: url.path)
+            let msg = error.localizedDescription
+            let missing = isMissingAccountBackupError(message: msg)
+            SecureLogger.warning(
+                missing
+                    ? "⚠️ No Blossom account backup for this key"
+                    : "⚠️ Blossom account backup restore failed: \(msg)",
+                category: .session
+            )
+            await clearNodeClosingFence()
+            return missing ? .missing : .failed
+        }
+    }
+
+    private static func mapFfi(_ error: SonarFfiError) -> ServiceError {
+        switch error {
+        case .InvalidInput(let message): return .invalidInput(message)
+        case .Core(let message): return .core(message)
         }
     }
 

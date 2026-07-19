@@ -54,6 +54,11 @@ pub enum Error {
     #[error("blossom storage error: {0}")]
     Blossom(String),
 
+    /// Soft-fail path for nsec restore: no Blossom account-backup blob for this key.
+    /// Stable Display text — hosts and FFI match on `"no account backup found"`.
+    #[error("no account backup found on Blossom for this key")]
+    AccountBackupMissing,
+
     #[error("http error: {0}")]
     Http(String),
 

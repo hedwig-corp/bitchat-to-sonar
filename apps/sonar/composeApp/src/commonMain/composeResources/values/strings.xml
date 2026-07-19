@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- AUTO-GENERATED from ios/bitchat/Localizable.xcstrings by scripts/i18n/xcstrings_to_compose.py. DO NOT EDIT. -->
 <resources>
+    <string name="account_restored_chat_backup_restore">Account restored — chat backup restore failed; try again when online</string>
+    <string name="account_restored_chats_recovered_from">Account restored — chats recovered from backup</string>
+    <string name="account_restored_chats_start_empty">Account restored — chats start empty until you back up</string>
     <string name="active">%1$s active</string>
     <string name="adds_debug_detail_to_captured_logs">Adds debug detail to captured logs. Never includes your private key.</string>
     <string name="anyone_with_this_key_controls_your">Anyone with this key controls your account and wallet. Only restore from your own backup.</string>
@@ -39,7 +42,11 @@
     <string name="app_info_warning_title">WARNING</string>
     <string name="are_you_sure_you_want_to_leave_this">Are you sure you want to leave this group? You won’t be able to read or send messages anymore.</string>
     <string name="audio_is_connected">Audio is connected</string>
+    <string name="backup_chats">Backup chats</string>
+    <string name="backup_failed_try_again_when_online">Backup failed — try again when online</string>
     <string name="bluetooth_finds_people_around_you_even">Bluetooth finds people around you, even offline.</string>
+    <string name="cancel">Cancel</string>
+    <string name="chat_backup_uploaded">Chat backup uploaded</string>
     <string name="choose_an_image">Choose an image</string>
     <string name="close">Close</string>
     <string name="close_2">close</string>
@@ -121,6 +128,7 @@
     <string name="decline">Decline</string>
     <string name="direct_messages_are_end_to_end">Direct messages are end-to-end encrypted. Always.</string>
     <string name="direct_sonar_and_unify_payments_will">Direct Sonar and Unify payments will appear here after you send or receive money.</string>
+    <string name="encrypted_cloud_backup_recover_chats">Encrypted cloud backup — recover chats after reinstall</string>
     <string name="encryption_accessibility_establishing">establishing encryption</string>
     <string name="encryption_accessibility_failed">encryption failed</string>
     <string name="encryption_accessibility_not_encrypted">not encrypted</string>
@@ -156,6 +164,7 @@
     <string name="group_name">Group name</string>
     <string name="here_now">%1$s · %2$s here now</string>
     <string name="i_already_have_a_key">I already have a key</string>
+    <string name="i_understand_chats_on_this_phone_will">I understand chats on this phone will be erased</string>
     <string name="identity_key_sharing_payments_and_safety">Identity, key sharing, payments, and safety</string>
     <string name="images_are_only_available_in_mesh_chats">Images are only available in mesh chats.</string>
     <string name="in_range_scanning">%1$s in range · scanning</string>
@@ -225,7 +234,7 @@
     <string name="paste_from_clipboard">Paste from clipboard</string>
     <string name="paste_key">Paste key</string>
     <string name="paste_the">Paste the </string>
-    <string name="paste_your_nsec_private_key_to_bring">Paste your nsec private key to bring this Sonar identity and wallet onto this device.</string>
+    <string name="paste_your_nsec_private_key_to_bring">Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history is recovered from your encrypted Blossom backup when one exists for this key.</string>
     <string name="payment_address_bip_353">Payment address (BIP-353)</string>
     <string name="people_in_range">%1$s people in range</string>
     <string name="people_nearby_can_send_you_money_at">People nearby can send you money at this address. It's shared with your Sonar announce — leave it empty to share nothing.</string>
@@ -239,6 +248,7 @@
     <string name="recording">recording %1$s</string>
     <string name="relay_sync">Relay sync</string>
     <string name="remote_video_unavailable">Remote video unavailable</string>
+    <string name="replace_this_account_with_an_nsec_from">Replace this account with an nsec from a backup</string>
     <string name="restore_account">Restore account</string>
     <string name="restore_your_account">Restore your account</string>
     <string name="restoring">Restoring...</string>
@@ -285,6 +295,7 @@
     <string name="this_deletes_every_conversation_from">This deletes every conversation from this phone — Bluetooth chats and White Noise secure chats. Your identity, nickname and wallet stay, so you can start fresh without setting up again.</string>
     <string name="this_deletes_your_key_your_nickname_and">This deletes your key, your nickname and every conversation from this phone. There is no account to recover — gone is gone.</string>
     <string name="this_removes_the_conversation_from_this">This removes the conversation from this device only. The other person isn't notified.</string>
+    <string name="this_replaces_the_account_on_this_phone">This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync).</string>
     <string name="this_sends_a_leave_update_to_the_group">This sends a leave update to the group and removes the conversation from this device.</string>
     <string name="tip_store_it_in_a_password_manager">Tip: store it in a password manager. Sonar can’t recover it for you.</string>
     <string name="today">Today</string>

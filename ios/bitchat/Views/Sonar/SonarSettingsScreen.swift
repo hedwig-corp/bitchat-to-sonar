@@ -155,8 +155,16 @@ struct SonarSettingsScreen: View {
                             exportKeySheet = true
                         }
                         SNSettingsRow(
-                            icon: .importKey, tone: .cyan, label: "Restore account",
-                            sub: "Replace this account with an nsec from a backup"
+                            icon: .shieldCheck, tone: .cyan,
+                            label: String(localized: "Backup chats"),
+                            sub: String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                        ) {
+                            Task { await store.backupAccountNow() }
+                        }
+                        SNSettingsRow(
+                            icon: .importKey, tone: .cyan,
+                            label: String(localized: "Restore account"),
+                            sub: String(localized: "Replace this account with an nsec from a backup")
                         ) {
                             restoreKeySheet = true
                         }
@@ -463,7 +471,7 @@ struct SNRestoreAccountSheetContent: View {
             HStack(alignment: .top, spacing: 11) {
                 SNIcon(name: .shield, size: 18, weight: 2)
                     .foregroundColor(SonarTheme.danger)
-                Text("This replaces the account on this phone. Chats stored here are erased. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync).")
+                Text(String(localized: "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync)."))
                     .font(SonarTheme.uiFont(size: 13))
                     .lineSpacing(13 * 0.5)
                     .foregroundColor(SonarTheme.text)
@@ -498,7 +506,7 @@ struct SNRestoreAccountSheetContent: View {
             .padding(.horizontal, 8)
 
             Toggle(isOn: $confirmed) {
-                Text("I understand chats on this phone will be erased")
+                Text(String(localized: "I understand chats on this phone will be erased"))
                     .font(SonarTheme.uiFont(size: 13, weight: .semibold))
                     .foregroundColor(SonarTheme.text)
             }
@@ -515,14 +523,16 @@ struct SNRestoreAccountSheetContent: View {
             }
 
             SNPrimaryButton(
-                label: inFlight ? "Restoring\u{2026}" : "Restore account",
+                label: inFlight
+                    ? String(localized: "Restoring...")
+                    : String(localized: "Restore account"),
                 danger: true,
                 disabled: !nsecOk || !confirmed || inFlight
             ) {
                 restore()
             }
             .padding(.horizontal, 8)
-            SNGhostButton(label: "Cancel", action: onClose)
+            SNGhostButton(label: String(localized: "Cancel"), action: onClose)
                 .padding(.top, 4)
         }
     }

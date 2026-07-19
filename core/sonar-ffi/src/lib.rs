@@ -129,6 +129,122 @@ pub fn wipe_marmot_database(db_path: String) -> FfiResult<()> {
     Ok(())
 }
 
+/// Result of uploading an encrypted account backup to Blossom.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AccountBackupUploadInfo {
+    pub url: String,
+    pub sha256_hex: String,
+    pub size: u64,
+}
+
+fn backup_runtime() -> FfiResult<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| SonarFfiError::Core(format!("tokio runtime: {e}")))
+}
+
+/// Encrypt the Marmot DB at `db_path` (plus conversation index) with a key
+/// derived from `nsec`, then upload to Blossom (BUD-02).
+///
+/// Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
+/// Empty `blossom_server` uses the default Blossom host.
+#[uniffi::export]
+pub fn backup_account_to_blossom(
+    nsec: String,
+    db_path: String,
+    db_key_hex: String,
+    blossom_server: Option<String>,
+) -> FfiResult<AccountBackupUploadInfo> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    let server = blossom_server.unwrap_or_default();
+    let runtime = backup_runtime()?;
+    let uploaded = runtime.block_on(sonar_core::account_backup::backup_account_files(
+        identity.keys(),
+        Path::new(&db_path),
+        &db_key_hex,
+        &server,
+    ))?;
+    Ok(AccountBackupUploadInfo {
+        url: uploaded.url,
+        sha256_hex: uploaded.sha256_hex,
+        size: uploaded.size,
+    })
+}
+
+/// Download this identity's latest account backup from Blossom, decrypt with
+/// `nsec`, and **stage** files beside `db_path`. Returns the SQLCipher
+/// `db_key_hex` the host must persist, then call [`commit_account_restore`].
+/// On persist failure call [`abort_account_restore`] instead.
+///
+/// Call with **no** live node on `db_path`. Typically after wipe / before
+/// reconnect during nsec restore.
+#[uniffi::export]
+pub fn restore_account_from_blossom(
+    nsec: String,
+    db_path: String,
+    blossom_server: Option<String>,
+) -> FfiResult<String> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    let server = blossom_server.unwrap_or_default();
+    let runtime = backup_runtime()?;
+    match runtime.block_on(sonar_core::account_backup::restore_account_files(
+        identity.keys(),
+        Path::new(&db_path),
+        &server,
+    )) {
+        Ok(db_key_hex) => Ok(db_key_hex),
+        Err(e) if sonar_core::account_backup::is_missing_backup_error(&e) => {
+            Err(SonarFfiError::InvalidInput(
+                sonar_core::account_backup::ACCOUNT_BACKUP_MISSING_MARKER.into(),
+            ))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// After persisting the restored `db_key_hex`, promote staged restore files to
+/// the live `db_path`.
+#[uniffi::export]
+pub fn commit_account_restore(db_path: String) -> FfiResult<()> {
+    sonar_core::account_backup::commit_staged_account_restore(Path::new(&db_path))?;
+    Ok(())
+}
+
+/// Discard staged restore files when key persistence failed.
+///
+/// Only safe when [`account_restore_staging_present`] is still true. If the
+/// main DB was already promoted, aborting is a no-op for the live file — hosts
+/// must keep the restored `db_key`.
+#[uniffi::export]
+pub fn abort_account_restore(db_path: String) -> FfiResult<()> {
+    sonar_core::account_backup::abort_staged_account_restore(Path::new(&db_path));
+    Ok(())
+}
+
+/// Boot-time recovery for interrupted stage→persist→commit. Returns `true` if
+/// leftover staging was committed under `db_key_hex`.
+#[uniffi::export]
+pub fn reconcile_account_restore(db_path: String, db_key_hex: String) -> FfiResult<bool> {
+    Ok(sonar_core::account_backup::reconcile_staged_account_restore(
+        Path::new(&db_path),
+        &db_key_hex,
+    )?)
+}
+
+/// True when `*.sonar-restore-staging` still exists (DB not yet promoted).
+#[uniffi::export]
+pub fn account_restore_staging_present(db_path: String) -> bool {
+    sonar_core::account_backup::account_restore_staging_present(Path::new(&db_path))
+}
+
+/// Host helper: classify FFI error text as soft-missing backup.
+#[uniffi::export]
+pub fn is_missing_account_backup_error(message: String) -> bool {
+    sonar_core::account_backup::message_indicates_missing_backup(&message)
+}
+
 /// Install (or re-configure) the on-device diagnostics log sink: a bounded,
 /// rotating file family under `dir` fed by the core's `tracing` events
 /// (relay connects, EOSE, watermark moves, decrypt failures, ...).

@@ -4,6 +4,7 @@
 //! (MLS over Nostr via MDK). Native shells (SwiftUI / Compose) bind to this
 //! crate and stay UI-only.
 
+pub mod account_backup;
 pub mod call;
 pub mod client;
 pub mod conversation_index;

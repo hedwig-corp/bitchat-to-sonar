@@ -1753,8 +1753,9 @@ final class SonarAppStore: ObservableObject {
 
     /// Restore an existing account from a pasted `nsec1…` backup (onboarding
     /// "Restore account" or Settings → Restore account): import the identity,
-    /// wipe any prior wallet on this device, rebuild the Lightning wallet from
-    /// the restored nsec, then finish onboarding. Throws on an invalid key.
+    /// try Blossom chat restore, wipe any prior wallet on this device, rebuild
+    /// the Lightning wallet from the restored nsec, then finish onboarding.
+    /// Throws on an invalid key.
     func restoreAccount(nsec: String) async throws {
         let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
         // Validate before any destructive work. An invalid paste must leave the
@@ -1782,8 +1783,9 @@ final class SonarAppStore: ObservableObject {
         // crash after identity import must never paint the previous account's
         // mesh chats, contacts, payment rows, media, or wallet offer.
         clearAccountBoundLocalStateForRestore()
+        let backupOutcome: AccountBackupRestoreOutcome
         do {
-            try await marmot.restoreIdentity(nsec: key)
+            backupOutcome = try await marmot.restoreIdentity(nsec: key)
         } catch {
             #if os(iOS) || os(macOS)
             bridged?.retrySetup()
@@ -1796,7 +1798,29 @@ final class SonarAppStore: ObservableObject {
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
-        toast = "Account restored"
+        switch backupOutcome {
+        case .restored:
+            toast = String(localized: "Account restored — chats recovered from backup")
+        case .missing:
+            toast = String(localized: "Account restored — chats start empty until you back up")
+        case .failed:
+            toast = String(localized: "Account restored — chat backup restore failed; try again when online")
+        }
+    }
+
+    /// Settings → Backup chats: encrypt Marmot DB+key with nsec and upload to
+    /// Blossom so delete→reinstall→paste nsec can recover history.
+    func backupAccountNow() async {
+        do {
+            try await marmot.backupAccount()
+            toast = String(localized: "Chat backup uploaded")
+        } catch {
+            toast = String(localized: "Backup failed — try again when online")
+            SecureLogger.warning(
+                "⚠️ Account backup failed: \(error.localizedDescription)",
+                category: .session
+            )
+        }
     }
 
     private func clearAccountBoundLocalStateForRestore() {

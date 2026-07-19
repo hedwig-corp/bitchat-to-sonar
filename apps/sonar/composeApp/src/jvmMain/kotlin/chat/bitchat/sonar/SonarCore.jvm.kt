@@ -52,8 +52,12 @@ actual object SonarCore {
     @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
+    @Volatile private var lastImportBackupOutcomeValue: AccountBackupRestoreOutcome =
+        AccountBackupRestoreOutcome.Missing
 
     private fun marmotDir(): File = DesktopEnv.file("sonar-marmot").apply { mkdirs() }
+
+    actual fun lastImportBackupOutcome(): AccountBackupRestoreOutcome = lastImportBackupOutcomeValue
 
     actual suspend fun start(): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
@@ -65,6 +69,12 @@ actual object SonarCore {
 
                 val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
                 val dbKeyHex = loadOrCreateDbKey()
+                runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
+                    .onFailure {
+                        if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                            throw it
+                        }
+                    }
 
                 // Diagnostics file sink must exist before the node spins up so
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
@@ -86,6 +96,12 @@ actual object SonarCore {
 
             val dbPath = File(marmotDir(), "marmot.sqlite").absolutePath
             val dbKeyHex = loadOrCreateDbKey()
+            runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
+                .onFailure {
+                    if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                        throw it
+                    }
+                }
             installCoreLogging(diagnosticsVerbose())
 
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
@@ -752,6 +768,9 @@ actual object SonarCore {
                     DesktopSecrets.put("nsec", identity.nsec())
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
+                    tryRestoreAccountBackupLocked(identity, marmotDir).also {
+                        lastImportBackupOutcomeValue = it
+                    }
                     npub
                 } catch (importError: Throwable) {
                     if (previousIdentity != null) {
@@ -767,6 +786,65 @@ actual object SonarCore {
                     }
                     throw importError
                 }
+            }
+        }
+    }
+
+
+    actual suspend fun backupAccountToBlossom(): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            stickerOperationLock.write {
+                val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
+                val dir = marmotDir()
+                val dbPath = File(dir, "marmot.sqlite").absolutePath
+                val dbKeyHex = loadOrCreateDbKey()
+                closeNode()
+                val info = uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
+                "uploaded ${info.size} bytes"
+            }
+        }
+    }
+
+    actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        lock.withLock {
+            stickerOperationLock.write {
+                val nsec = DesktopSecrets.get("nsec")
+                    ?: return@write AccountBackupRestoreOutcome.Missing
+                tryRestoreAccountBackupLocked(SonarIdentity.import(nsec), marmotDir())
+            }
+        }
+    }
+
+    private fun tryRestoreAccountBackupLocked(
+        identity: SonarIdentity,
+        marmotDir: File,
+    ): AccountBackupRestoreOutcome {
+        marmotDir.mkdirs()
+        val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
+        closeNode()
+        return try {
+            val dbKeyHex = uniffi.sonar_ffi.restoreAccountFromBlossom(identity.nsec(), dbPath, null)
+            require(dbKeyHex.matches(Regex("^[0-9a-fA-F]{64}$"))) { "restored db key malformed" }
+            try {
+                DesktopSecrets.put("dbKeyHex", dbKeyHex)
+                uniffi.sonar_ffi.commitAccountRestore(dbPath)
+                AccountBackupRestoreOutcome.Restored
+            } catch (persistError: Throwable) {
+                if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                    runCatching { uniffi.sonar_ffi.abortAccountRestore(dbPath) }
+                    DesktopSecrets.clear("dbKeyHex")
+                }
+                throw persistError
+            }
+        } catch (e: Throwable) {
+            runCatching { uniffi.sonar_ffi.abortAccountRestore(dbPath) }
+            val msg = e.message.orEmpty()
+            if (uniffi.sonar_ffi.isMissingAccountBackupError(msg)) {
+                AccountBackupRestoreOutcome.Missing
+            } else {
+                AccountBackupRestoreOutcome.Failed
             }
         }
     }
@@ -858,6 +936,9 @@ actual object SonarCore {
     private fun wipeMarmotStorage(marmotDir: File) {
         wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath)
         check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
+        // Match iOS wipeDatabase: drop the host SQLCipher key so a soft-failed
+        // Blossom restore cannot reopen a fresh empty DB with a prior key.
+        DesktopSecrets.clear("dbKeyHex")
     }
 
     private fun loadOrCreateIdentity(): SonarIdentity {
@@ -877,7 +958,13 @@ actual object SonarCore {
     }
 
     private fun loadOrCreateDbKey(): String {
-        DesktopSecrets.get("dbKeyHex")?.let { return it }
+        val existing = DesktopSecrets.get("dbKeyHex")
+        if (existing != null) {
+            require(existing.matches(Regex("^[0-9a-fA-F]{64}$"))) {
+                "database key malformed — refusing to overwrite (would lose history)"
+            }
+            return existing
+        }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
         DesktopSecrets.put("dbKeyHex", hex)
