@@ -4222,10 +4222,13 @@ impl SonarClient {
                     let aggregate: u64 =
                         item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
                     let aggregate = aggregate.min(album_total);
+                    // Memory-only: avoid sync JSON write every 100ms on the
+                    // tokio worker. Terminal paths persist via mark_*/remove.
                     let _ = media_staging.lock().unwrap().update_progress(
                         &entry_id_owned,
                         aggregate,
                         Timestamp::now().as_secs(),
+                        false,
                     );
                     if let Some(obs) = observer {
                         obs.on_progress(&progress_id, aggregate, album_total);
@@ -4249,6 +4252,7 @@ impl SonarClient {
             entry_id,
             aggregate.min(album_total),
             Timestamp::now().as_secs(),
+            true,
         );
         if media_upload_cancelled(observer) {
             return Err(Error::MediaUploadCancelled);
@@ -4275,8 +4279,13 @@ impl SonarClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         let group_name = self.resolve_group_name(group_id);
         self.mark_outbox_pending(group_id, &message, &event)?;
-        // Drop staging as soon as the outbox row is durable so a crash before
-        // the caller returns cannot resume into a duplicate media publish.
+        // Flip to Committed *before* remove so a crash after outbox durability
+        // cannot leave an Uploading row that resume would re-publish as a new
+        // event. retry_outbox owns the single publish path from here.
+        let _ = self.media_staging.lock().unwrap().mark_committed(
+            entry_id,
+            Timestamp::now().as_secs(),
+        );
         let _ = self.media_staging.lock().unwrap().remove(entry_id);
         let event_id = event.id;
         let publish_ack =

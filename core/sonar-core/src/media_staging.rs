@@ -43,6 +43,9 @@ fn is_safe_relative_path(path: &str) -> bool {
 pub(crate) enum MediaStagingStatus {
     Uploading,
     Failed,
+    /// Outbox already owns publish. Never auto-resume — a crash after
+    /// `mark_outbox_pending` must not create a second kind-445.
+    Committed,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -235,17 +238,29 @@ impl MediaStagingState {
         self.save_if_dirty()
     }
 
-    pub fn update_progress(&mut self, id: &str, bytes_sent: u64, now_secs: u64) -> Result<()> {
+    pub fn update_progress(
+        &mut self,
+        id: &str,
+        bytes_sent: u64,
+        now_secs: u64,
+        persist: bool,
+    ) -> Result<()> {
         let Some(entry) = self.entries.get_mut(id) else {
             return Ok(());
         };
         if bytes_sent > entry.bytes_sent {
             entry.bytes_sent = bytes_sent.min(entry.total_bytes);
             entry.updated_at_secs = now_secs;
-            entry.state = MediaStagingStatus::Uploading;
+            if entry.state != MediaStagingStatus::Committed {
+                entry.state = MediaStagingStatus::Uploading;
+            }
             self.dirty = true;
         }
-        self.save_if_dirty()
+        if persist {
+            self.save_if_dirty()
+        } else {
+            Ok(())
+        }
     }
 
     pub fn mark_failed(&mut self, id: &str, error: String, now_secs: u64) -> Result<()> {
@@ -263,7 +278,22 @@ impl MediaStagingState {
         let Some(entry) = self.entries.get_mut(id) else {
             return Ok(());
         };
+        if entry.state == MediaStagingStatus::Committed {
+            return Ok(());
+        }
         entry.state = MediaStagingStatus::Uploading;
+        entry.last_error = None;
+        entry.updated_at_secs = now_secs;
+        self.dirty = true;
+        self.save_if_dirty()
+    }
+
+    /// Outbox row is durable — never auto-resume this entry again.
+    pub fn mark_committed(&mut self, id: &str, now_secs: u64) -> Result<()> {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return Ok(());
+        };
+        entry.state = MediaStagingStatus::Committed;
         entry.last_error = None;
         entry.updated_at_secs = now_secs;
         self.dirty = true;
@@ -336,14 +366,17 @@ impl MediaStagingState {
         self.dirty = false;
     }
 
-    /// Drop Failed entries older than [`FAILED_STAGING_TTL_SECS`].
+    /// Drop Committed rows immediately and Failed rows older than
+    /// [`FAILED_STAGING_TTL_SECS`].
     pub fn purge_expired_failed(&mut self, now_secs: u64) -> Result<()> {
         let expired: Vec<String> = self
             .entries
             .iter()
             .filter(|(_, entry)| {
-                entry.state == MediaStagingStatus::Failed
-                    && now_secs.saturating_sub(entry.updated_at_secs) >= FAILED_STAGING_TTL_SECS
+                entry.state == MediaStagingStatus::Committed
+                    || (entry.state == MediaStagingStatus::Failed
+                        && now_secs.saturating_sub(entry.updated_at_secs)
+                            >= FAILED_STAGING_TTL_SECS)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -525,6 +558,26 @@ mod tests {
     }
 
     #[test]
+    fn committed_is_not_resumable_and_is_purged() {
+        let mut staging = MediaStagingState::load(None, None);
+        staging
+            .stage(
+                "c".into(),
+                "c".into(),
+                "g".into(),
+                "".into(),
+                "".into(),
+                vec![("a.jpg".into(), "image/jpeg".into(), b"x".to_vec())],
+                1,
+            )
+            .expect("stage");
+        staging.mark_committed("c", 2).expect("commit");
+        assert!(staging.resumable_ids().is_empty());
+        staging.purge_expired_failed(2).expect("purge");
+        assert!(staging.get("c").is_none());
+    }
+
+    #[test]
     fn rejects_unsafe_staging_ids() {
         let mut staging = MediaStagingState::load(None, None);
         let err = staging
@@ -647,9 +700,9 @@ mod tests {
                 1,
             )
             .expect("stage");
-        staging.update_progress("p", 40, 2).expect("p1");
-        staging.update_progress("p", 20, 3).expect("p2 ignored");
-        staging.update_progress("p", 80, 4).expect("p3");
+        staging.update_progress("p", 40, 2, true).expect("p1");
+        staging.update_progress("p", 20, 3, true).expect("p2 ignored");
+        staging.update_progress("p", 80, 4, true).expect("p3");
         assert_eq!(staging.get("p").expect("entry").bytes_sent, 80);
     }
 }
