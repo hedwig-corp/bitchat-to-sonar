@@ -69,9 +69,15 @@ final class SNTranscriptHostRenderContext: ObservableObject {
 
     func makeCallbacks() -> TranscriptCollectionHostCallbacks {
         TranscriptCollectionHostCallbacks(
-            configureCell: { [weak self] _, cell, _, item in
+            configureCell: { [weak self] collectionView, cell, _, item in
                 guard let self else { return }
-                let width = max(1, (cell.bounds.width > 0 ? cell.bounds.width : UIScreen.main.bounds.width) - 28)
+                // Same column source as itemHeight / main bubbleColumnWidth —
+                // never size against UIScreen while the collection already has
+                // a width (Split View / first configure with empty cell bounds).
+                let column = collectionView.bounds.width > 0
+                    ? collectionView.bounds.width
+                    : UIScreen.main.bounds.width
+                let width = max(1, column - 28)
                 cell.contentConfiguration = UIHostingConfiguration {
                     self.row(for: item, columnWidth: width)
                 }

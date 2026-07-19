@@ -50,6 +50,36 @@
         "jumpMessageId": null
       },
       "expected": "LiveEdge"
+    },
+    {
+      "name": "frozen_anchor_zero_count_unread_divider",
+      "input": {
+        "unreadAnchorId": "m:unread",
+        "unreadCountAtOpen": 0,
+        "unreadAnchorAbandoned": false,
+        "jumpMessageId": null
+      },
+      "expected": "UnreadDivider"
+    },
+    {
+      "name": "frozen_anchor_unset_count_unread_divider",
+      "input": {
+        "unreadAnchorId": "m:unread",
+        "unreadCountAtOpen": null,
+        "unreadAnchorAbandoned": false,
+        "jumpMessageId": null
+      },
+      "expected": "UnreadDivider"
+    },
+    {
+      "name": "frozen_anchor_abandoned_keeps_divider",
+      "input": {
+        "unreadAnchorId": "m:unread",
+        "unreadCountAtOpen": 2,
+        "unreadAnchorAbandoned": true,
+        "jumpMessageId": null
+      },
+      "expected": "UnreadDivider"
     }
   ]
 }

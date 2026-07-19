@@ -50,6 +50,24 @@ struct TranscriptScrollPolicyTests {
     }
 
     @Test
+    func openActionFrozenUnreadAnchorIsUnreadDivider() {
+        #expect(
+            TranscriptScrollPolicy.openAction(
+                unreadAnchorId: "m:abc",
+                unreadCountAtOpen: 0,
+                unreadAnchorAbandoned: false
+            ) == .unreadDivider
+        )
+        #expect(
+            TranscriptScrollPolicy.openAction(
+                unreadAnchorId: "m:abc",
+                unreadCountAtOpen: nil,
+                unreadAnchorAbandoned: false
+            ) == .unreadDivider
+        )
+    }
+
+    @Test
     func insetFollowPinsWhenWasAtTail() {
         #expect(
             TranscriptScrollPolicy.insetFollowDecision(

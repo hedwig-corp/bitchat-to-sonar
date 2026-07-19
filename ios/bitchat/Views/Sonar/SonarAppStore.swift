@@ -1272,20 +1272,6 @@ final class SonarAppStore: ObservableObject {
         // the KeyPackage) using the current nickname, so a peer never sees our raw
         // npub because the opportunistic publish below lost the relay/onboarding race.
         marmot.profileNameProvider = { [weak self] in self?.chatViewModel.nickname ?? "" }
-        marmot.localBip353Provider = { [weak self] in self?.bip353 ?? "" }
-        marmot.handleDomainProvider = { Self.handleDomain }
-        marmot.handleOfferProvider = { [weak self] in
-            guard let self, case .ready = self.walletState else { return nil }
-            return try? await self.wallet.createOffer()
-        }
-        // Adopt own kind-0 into local Profile state before the connect-path
-        // republish (nsec restore clears the device-bound nick/handle).
-        marmot.onOwnProfileFetched = { [weak self] profile in
-            self?.adoptOwnKind0Profile(profile)
-        }
-        marmot.onOwnHandleSidecarSeeded = { [weak self] address in
-            self?.noteOwnHandleSidecarSeeded(address)
-        }
         marmot.$groups
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.resolvePendingSecureChats() }
@@ -1308,10 +1294,7 @@ final class SonarAppStore: ObservableObject {
                 guard let self, connected else { return }
                 // Relay-dependent work starts only after the delayed background
                 // attach, never as a side effect of publishing the local Home.
-                // Kind-0 republish lives only in MarmotChatModel's connect path
-                // (hydrate own profile first). Publishing here after nsec restore
-                // can emit metadata without `nip05` and replace the durable
-                // kind-0 on relays.
+                self.marmot.publishProfile(name: self.chatViewModel.nickname)
                 self.adoptClaimedHandleIfNeeded()
                 self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
@@ -1695,20 +1678,8 @@ final class SonarAppStore: ObservableObject {
     func rename(_ nick: String) {
         chatViewModel.nickname = nick
         chatViewModel.validateAndSaveNickname()
-        // Re-publish our kind-0 profile so peers see the new name — but never
-        // when a local handle pref exists without the core sidecar. That emit
-        // would omit `nip05` and replace the durable kind-0 after restore.
-        guard marmot.npub != nil else { return }
-        let name = chatViewModel.nickname
-        let handlePref = bip353
-        Task { @MainActor in
-            let claimed = await marmot.claimedHandle()
-            guard OwnProfileHydration.canPublishOwnProfile(
-                localBip353: handlePref,
-                coreClaimedHandle: claimed
-            ) else { return }
-            marmot.publishProfile(name: name)
-        }
+        // Re-publish our kind-0 profile so peers see the new name.
+        if marmot.npub != nil { marmot.publishProfile(name: chatViewModel.nickname) }
     }
 
     func completeOnboarding(nick: String) {
@@ -1861,48 +1832,7 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
-        coreClaimedHandle = nil
-        handleClaimState = .idle
-        // Previous account's nickname must not survive into the restored
-        // identity — kind-0 on relays is authoritative after hydrate.
-        chatViewModel.clearNicknameForAccountRestore()
         objectWillChange.send()
-    }
-
-    /// Apply a fetched own kind-0 into local nickname / handle prefs.
-    /// Mirrors Compose `hydrateOwnProfileFromRelays` adoption.
-    /// Does not mark `coreClaimedHandle` — that waits on registrar claim success
-    /// via `noteOwnHandleSidecarSeeded`.
-    private func adoptOwnKind0Profile(_ profile: MarmotService.Profile) {
-        let plan = OwnProfileHydration.plan(
-            localNickname: chatViewModel.nickname,
-            localBip353: bip353,
-            localClaimedHandle: coreClaimedHandle,
-            remoteName: profile.bestName,
-            remoteNip05: profile.nip05,
-            handleDomain: Self.handleDomain
-        )
-        if let name = plan.nicknameToAdopt, !name.isEmpty {
-            chatViewModel.nickname = name
-            chatViewModel.saveNickname()
-        }
-        if let address = plan.nip05ToAdopt, !address.isEmpty {
-            setBip353(address)
-        }
-    }
-
-    /// Core sidecar was re-seeded after restore reclaim — safe to show the
-    /// registrar seal and treat the address as claim-backed.
-    private func noteOwnHandleSidecarSeeded(_ address: String) {
-        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        coreClaimedHandle = trimmed
-        if bip353.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            setBip353(trimmed)
-        }
-        if handleClaimState == .idle {
-            handleClaimState = .claimed(trimmed)
-        }
     }
 
     /// Start Unify scanning while the Nearby/radar screen is visible; stop it
@@ -3278,7 +3208,7 @@ final class SonarAppStore: ObservableObject {
     /// can resolve the recipient) and navigates to the DM screen.
     func openChannelDM(_ author: SNChannelAuthor) {
         chatViewModel.startGeohashDM(withPubkeyHex: author.pubkeyHex)
-        push(.dm(author.routeId))
+        openDM(author.routeId)
     }
 
     /// Block a geohash participant (persists across launches; their messages
