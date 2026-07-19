@@ -26,6 +26,10 @@ internal fun unreadCountsFromSummaries(
  * After a summaries refresh, drop suppress entries the core has confirmed as
  * read (`unread_count == 0` or missing). Keep suppressing while the DB still
  * reports unread so an in-flight mark-read cannot flash the badge back.
+ *
+ * Callers must clear a mark batch from the suppress set once the FFI settles
+ * (see [SonarAppState.markGroupsRead]); this prune alone must not be the only
+ * release path, or a failed mark would hide unread for the whole process.
  */
 internal fun pruneConfirmedUnreadSuppressions(
     suppressGroupIds: Set<String>,

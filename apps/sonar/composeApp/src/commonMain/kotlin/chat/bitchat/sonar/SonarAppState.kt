@@ -1176,12 +1176,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
     private fun markGroupsRead(groupIds: Collection<String>) {
         if (groupIds.isEmpty()) return
-        unreadSuppressGroupIds.addAll(groupIds)
-        unreadByChat = unreadByChat - groupIds.toSet()
+        val marked = groupIds.toSet()
+        unreadSuppressGroupIds.addAll(marked)
+        unreadByChat = unreadByChat - marked
         scope.launch {
-            for (groupId in groupIds) {
+            for (groupId in marked) {
                 runCatching { SonarCore.markConversationRead(groupId) }
             }
+            // End in-flight suppress for this batch, then reconcile from core.
+            // Open-session suppress is re-applied inside applyUnreadCounts so a
+            // failed mark (or a message that landed after mark) cannot hide a
+            // real badge for the rest of the process.
+            val summaries = runCatching { SonarCore.conversationSummaries() }
+                .getOrDefault(emptyList())
+            unreadSuppressGroupIds.removeAll(marked)
+            applyUnreadCounts(summaries)
         }
     }
 

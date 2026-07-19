@@ -1976,7 +1976,15 @@ final class MarmotChatModel: ObservableObject {
     func markConversationRead(groupId: String) {
         unreadSuppressGroupIds.insert(groupId)
         unreadByGroup[groupId] = nil
-        Task { await service.markConversationRead(groupId: groupId) }
+        Task { @MainActor in
+            await service.markConversationRead(groupId: groupId)
+            // End in-flight suppress for this id, then reconcile from core.
+            // Viewing suppress still covers an open DM; without this release a
+            // failed/raced mark could hide real unread for the rest of the process.
+            unreadSuppressGroupIds.remove(groupId)
+            let summaries = await service.conversationSummaries()
+            publishUnread(from: summaries)
+        }
     }
 
     /// Bind chat-list unread suppression to the DM currently on screen.

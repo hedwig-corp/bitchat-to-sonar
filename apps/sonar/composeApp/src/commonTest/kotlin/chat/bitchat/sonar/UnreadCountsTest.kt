@@ -52,4 +52,18 @@ class UnreadCountsTest {
             pruneConfirmedUnreadSuppressions(suppress, summaries),
         )
     }
+
+    @Test
+    fun afterMarkReleaseFailedGroupsSurfaceAgain() {
+        // Simulates markGroupsRead's post-FFI release: in-flight suppress is
+        // cleared for the batch, so a still-unread group is visible again
+        // unless the open-session suppress set still covers it.
+        val summaries = listOf(summary("g-failed", 2), summary("g-open", 1))
+        val afterRelease = emptySet<String>()
+        val openSession = setOf("g-open")
+        assertEquals(
+            mapOf("g-failed" to 2L),
+            unreadCountsFromSummaries(summaries, afterRelease + openSession),
+        )
+    }
 }
