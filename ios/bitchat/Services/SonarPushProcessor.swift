@@ -103,15 +103,17 @@ enum SonarPushProcessor {
                 marmotWakeInFlight = nil
                 marmotWakeNeedsRerun = false
             }
+            // Own banners before any suspension so the live sink cannot emit
+            // during the NSE snapshot await (or later wake work).
+            // One ownership span for the whole single-flight + trailing refresh
+            // loop — per-iteration begin/end cleared notified IDs and double-bannered.
+            marmot.beginPushWakeNotificationOwnership()
+            defer { marmot.endPushWakeNotificationOwnership() }
+
             // Snapshot placeholders present at wake start. Only those may be
             // removed when this wake posts titled copy — NSEs delivered for
             // other chats during the wake must stay until their own wake runs.
             let nsePlaceholderSnapshot = await deliveredNSEPlaceholderIds()
-            // One ownership span for the whole single-flight + trailing refresh
-            // loop. Per-iteration begin/end cleared pushWakeNotifiedMessageIDs
-            // between repeats and double-bannered with the live path.
-            marmot.beginPushWakeNotificationOwnership()
-            defer { marmot.endPushWakeNotificationOwnership() }
 
             var overall: UIBackgroundFetchResult = .noData
             var clearNSEPlaceholders = false
