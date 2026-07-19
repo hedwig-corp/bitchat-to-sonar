@@ -2503,10 +2503,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun composerDraft(chatId: String): String = composerDrafts[chatId].orEmpty()
 
     fun setComposerDraft(chatId: String, text: String) {
-        if (text.isEmpty()) {
+        val current = composerDrafts.toMap()
+        val next = updatedComposerDrafts(current, chatId, text)
+        if (next == current) return
+        if (!next.containsKey(chatId)) {
             composerDrafts.remove(chatId)
-        } else if (composerDrafts[chatId] != text) {
-            composerDrafts[chatId] = text
+        } else {
+            composerDrafts[chatId] = next.getValue(chatId)
         }
     }
 

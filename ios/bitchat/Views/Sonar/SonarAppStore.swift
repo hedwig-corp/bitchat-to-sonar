@@ -727,7 +727,10 @@ final class SonarAppStore: ObservableObject {
 
     /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
     /// Survives leaving a chat and returning within the same process; cleared on send.
-    @Published private(set) var composerDrafts: [String: String] = [:]
+    /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate
+    /// every `SonarAppStore` observer and re-enter the UIKit transcript host
+    /// (`updateUIViewController` → `applySnapshot`) while typing.
+    private var composerDrafts: [String: String] = [:]
 
     func composerDraft(for chatId: String) -> String {
         composerDrafts[chatId] ?? ""
