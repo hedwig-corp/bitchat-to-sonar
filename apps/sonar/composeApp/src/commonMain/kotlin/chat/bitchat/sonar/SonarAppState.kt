@@ -1188,9 +1188,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             // failed mark (or a message that landed after mark) cannot hide a
             // real badge for the rest of the process.
             val summaries = runCatching { SonarCore.conversationSummaries() }
-                .getOrDefault(emptyList())
+                .getOrNull()
             unreadSuppressGroupIds.removeAll(marked)
-            applyUnreadCounts(summaries)
+            // null = FFI failure — keep the current map (do not wipe every badge).
+            // emptyList() is a real empty inbox and must clear badges.
+            if (summaries != null) applyUnreadCounts(summaries)
         }
     }
 

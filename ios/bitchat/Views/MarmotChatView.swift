@@ -1983,7 +1983,11 @@ final class MarmotChatModel: ObservableObject {
             // failed/raced mark could hide real unread for the rest of the process.
             unreadSuppressGroupIds.remove(groupId)
             let summaries = await service.conversationSummaries()
-            publishUnread(from: summaries)
+            // readOnlyNonThrowing defaults to [] on failure — skip so we do not
+            // wipe every unread badge until the next successful summary load.
+            if !summaries.isEmpty {
+                publishUnread(from: summaries)
+            }
         }
     }
 
@@ -3578,6 +3582,9 @@ final class MarmotChatModel: ObservableObject {
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
+        unreadByGroup = [:]
+        unreadSuppressGroupIds = []
+        viewingUnreadGroupIds = []
         pendingOptimistic = [:]
         preexistingCanonicalMessageIDsByOptimisticID = [:]
         localTranscriptCursorByGroup = [:]
