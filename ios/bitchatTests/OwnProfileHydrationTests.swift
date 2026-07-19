@@ -1,5 +1,5 @@
 import Testing
-@testable import bitchat
+@testable import Sonar
 
 struct OwnProfileHydrationTests {
     private let domain = "sonarprivacy.xyz"

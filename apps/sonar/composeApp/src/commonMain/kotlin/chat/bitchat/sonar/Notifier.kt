@@ -3,6 +3,8 @@ package chat.bitchat.sonar
 enum class SonarNotificationSound {
     Default,
     Ble,
+    /** MSN-style trill (nudge) — the distinct double-bell alert. */
+    Trill,
 }
 
 /**

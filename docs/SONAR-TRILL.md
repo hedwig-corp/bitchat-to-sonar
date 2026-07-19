@@ -114,3 +114,7 @@ Public geohash channels have no nudge action.
 - Mute does not sync across linked devices (see above).
 - Old clients render the raw `⚡TRILL|1|<id>` line as text — same accepted
   wart as `⚡PAY` before it shipped.
+- **Compose Desktop in-app buzz**: `TrillEffects` is a no-op on JVM (no haptic
+  hardware). Mute, nudge send, transcript row, and tray notification with the
+  trill sound still ship via `commonMain`. Native macOS must mirror the iOS
+  nudge/mute affordances in `SonarMacRootView`.

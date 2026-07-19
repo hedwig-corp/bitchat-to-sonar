@@ -142,8 +142,16 @@ class SonarPushProcessingService : Service() {
             if (prefs.showNames) prefetchSenderProfiles(unread, cachedProfiles)
             else emptyMap()
 
+        // Per-chat mute is honored on the killed-app drain too: rows and unread
+        // counts still accrued in local storage — only the banner is skipped.
+        // muteChat persists the whole folded-id set, so a direct group-id
+        // lookup is sufficient here.
+        val mutes = decodeMuteMap(SonarCore.loadBlob(MUTE_BLOB_KEY))
+        val nowSecs = System.currentTimeMillis() / 1000
+
         var notified = 0
         for (summary in unread) {
+            if (isMutedAt(mutes[summary.groupIdHex], nowSecs)) continue
             val kind = SonarNotificationRouter.classifyContent(
                 summary.latestContent,
                 isCallControl = { SonarCore.callParseControl(it) != null },
@@ -172,6 +180,12 @@ class SonarPushProcessingService : Service() {
                     id = notif.id,
                     title = notif.title,
                     body = notif.body,
+                    // A trill rings its distinct bell on background drains too.
+                    sound = if (kind == SonarNotificationKind.Trill) {
+                        SonarNotificationSound.Trill
+                    } else {
+                        SonarNotificationSound.Default
+                    },
                     conversationId = summary.groupIdHex,
                 )
                 notified++

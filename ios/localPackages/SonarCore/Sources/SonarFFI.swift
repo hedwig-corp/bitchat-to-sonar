@@ -6058,6 +6058,7 @@ public enum SonarNotificationKindInfo: Equatable, Hashable {
     case message
     case payment
     case call
+    case trill
     case invite
     case mention
     case geohash
@@ -6089,13 +6090,15 @@ public struct FfiConverterTypeSonarNotificationKindInfo: FfiConverterRustBuffer 
 
         case 3: return .call
 
-        case 4: return .invite
+        case 4: return .trill
 
-        case 5: return .mention
+        case 5: return .invite
 
-        case 6: return .geohash
+        case 6: return .mention
 
-        case 7: return .network
+        case 7: return .geohash
+
+        case 8: return .network
 
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -6117,20 +6120,24 @@ public struct FfiConverterTypeSonarNotificationKindInfo: FfiConverterRustBuffer 
             writeInt(&buf, Int32(3))
 
 
-        case .invite:
+        case .trill:
             writeInt(&buf, Int32(4))
 
 
-        case .mention:
+        case .invite:
             writeInt(&buf, Int32(5))
 
 
-        case .geohash:
+        case .mention:
             writeInt(&buf, Int32(6))
 
 
-        case .network:
+        case .geohash:
             writeInt(&buf, Int32(7))
+
+
+        case .network:
+            writeInt(&buf, Int32(8))
 
         }
     }

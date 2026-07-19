@@ -4,6 +4,7 @@ enum class SonarNotificationKind {
     Message,
     Payment,
     Call,
+    Trill,
     Invite,
     Mention,
     Geohash,
@@ -115,6 +116,7 @@ object SonarNotificationRouter {
             isCallControl(content) ||
                 content.trimStart().startsWith("\u260eCALL|") -> SonarNotificationKind.Call
             PayLine.decode(content) != null -> SonarNotificationKind.Payment
+            TrillLine.isTrillLine(content) -> SonarNotificationKind.Trill
             else -> SonarNotificationKind.Message
         }
 
@@ -148,6 +150,14 @@ object SonarNotificationRouter {
                 if (!label.isNullOrBlank()) "Payment from $label" else "Payment received"
             SonarNotificationKind.Call ->
                 if (!label.isNullOrBlank()) "Incoming call from $label" else "Incoming Sonar call"
+            // Mirrors core render_notification: never expose the raw ⚡TRILL line.
+            SonarNotificationKind.Trill ->
+                when {
+                    !label.isNullOrBlank() && !group.isNullOrBlank() -> "$label nudged $group"
+                    !label.isNullOrBlank() -> "$label nudged you"
+                    !group.isNullOrBlank() -> "Nudge in $group"
+                    else -> "Someone nudged you"
+                }
             SonarNotificationKind.Invite ->
                 if (!label.isNullOrBlank()) "Invite from $label" else "New Sonar invite"
             SonarNotificationKind.Mention ->
@@ -173,6 +183,7 @@ object SonarNotificationRouter {
                 else "Open Sonar to read it."
             SonarNotificationKind.Payment -> paymentBody(preview, input, label, group)
             SonarNotificationKind.Call -> "Tap to answer."
+            SonarNotificationKind.Trill -> "👋 They want your attention."
             SonarNotificationKind.Invite ->
                 if (!group.isNullOrBlank()) "Open Sonar to review the invite to $group."
                 else "Open Sonar to review the invite."

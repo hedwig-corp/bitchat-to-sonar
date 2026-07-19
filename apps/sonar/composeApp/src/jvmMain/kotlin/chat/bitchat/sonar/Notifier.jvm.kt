@@ -102,6 +102,7 @@ actual object Notifier {
             val resource = when (sound) {
                 SonarNotificationSound.Default -> "/sonar_notification.wav"
                 SonarNotificationSound.Ble -> "/sonar_ble_notification.wav"
+                SonarNotificationSound.Trill -> "/sonar_trill.wav"
             }
             val bytes = Notifier::class.java
                 .getResourceAsStream(resource)

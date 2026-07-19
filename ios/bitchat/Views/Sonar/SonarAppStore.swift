@@ -64,6 +64,7 @@ enum SonarLocalNotificationKind {
     case message
     case payment
     case call
+    case trill
     case invite
     case mention
     case geohash
@@ -122,6 +123,7 @@ enum SonarLocalNotificationRouter {
         case .message: return "message"
         case .payment: return "payment"
         case .call: return "call"
+        case .trill: return "trill"
         case .invite: return "invite"
         case .mention: return "mention"
         case .geohash: return "geohash"
@@ -136,6 +138,7 @@ private extension SonarLocalNotificationKind {
         case .message: return .message
         case .payment: return .payment
         case .call: return .call
+        case .trill: return .trill
         case .invite: return .invite
         case .mention: return .mention
         case .geohash: return .geohash
@@ -357,6 +360,9 @@ struct SNMessage: Identifiable, Equatable {
     var pay: SNPayInfo?
     /// Non-nil = render a compact CallLog row instead of a bubble (call.jsx).
     var call: SNCallInfo?
+    /// True = ⚡TRILL nudge: render the centered NudgeMsg pill instead of a
+    /// bubble. The raw control line must never be shown (`text` stays empty).
+    var trill: Bool = false
     /// Encrypted media attachments (White Noise / Marmot MIP-04). Non-empty ⇒
     /// render a media bubble (image inline, else a file chip).
     var media: [SNMediaItem] = []
@@ -594,6 +600,8 @@ struct SNDMRow: Identifiable {
     let lastDate: Date?
     /// Marmot MLS group backing this row, even when the row id is a folded peer id.
     var marmotGroupId: String? = nil
+    /// Muted chat: the row shows a bell-slash instead of the unread dot.
+    var muted: Bool = false
 }
 
 /// Stable home ordering shared by the live list and the regression smoke
@@ -1217,6 +1225,14 @@ final class SonarAppStore: ObservableObject {
     private var refreshingDMTasks: [String: Task<Void, Never>] = [:]
     /// Chat-message ids whose ⚡PAY control lines were already processed.
     private var scannedPayMessageIDs = Set<String>()
+    /// ⚡TRILL lines already processed for receive effects (buzz/notification),
+    /// separate from the pay scan so replaying transcripts stays idempotent.
+    private var scannedTrillMessageIDs = Set<String>()
+    /// Sender cooldown (8s per chat, MSN's own guard) — session-local.
+    private var trillCooldownUntilByChat: [String: Date] = [:]
+    /// Bumped once per foreground buzz; SonarRootView shakes the viewport on
+    /// change (skipped under Reduce Motion).
+    @Published private(set) var trillShakeTick = 0
     private let localNotificationStartedAt = Date()
     private var seenMarmotNotificationMessageIDs = Set<String>()
     private var seenPrivateChatPaymentNotificationMessageIDs = Set<String>()
@@ -1477,6 +1493,7 @@ final class SonarAppStore: ObservableObject {
                     self?.applyBLEDiscoveryPolicy()
                 }
                 self.processIncomingPayLines()
+                self.processIncomingTrillLines()
                 self.processIncomingCallLines()
             }
             .store(in: &cancellables)
@@ -1487,6 +1504,7 @@ final class SonarAppStore: ObservableObject {
                 self.cachePublishedUploadMedia()
                 self.processIncomingMarmotNotifications()
                 self.processIncomingPayLines()
+                self.processIncomingTrillLines()
                 self.processIncomingCallLines()
                 self.objectWillChange.send()
             }
@@ -1498,6 +1516,7 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
                 self?.processIncomingMarmotNotifications()
+                self?.processIncomingTrillLines()
             }
             .store(in: &cancellables)
 
@@ -2017,6 +2036,10 @@ final class SonarAppStore: ObservableObject {
         // restore, so the incoming account's messages must not be treated as
         // already-notified. Compose fixed the same gap in #288.
         seenMarmotNotificationMessageIDs = []
+        scannedTrillMessageIDs = []
+        trillCooldownUntilByChat = [:]
+        SonarTrillThrottle.shared.reset()
+        SonarChatMuteStore.shared.wipe()
         pendingPayPeer = nil
         payLedger.wipe()
         paymentActivityLedger.wipe()
@@ -2435,6 +2458,7 @@ final class SonarAppStore: ObservableObject {
         switch sonarNotificationClassifyContent(content: content) {
         case .call: return .call
         case .payment: return .payment
+        case .trill: return .trill
         default: return .message
         }
     }
@@ -2500,7 +2524,9 @@ final class SonarAppStore: ObservableObject {
                 }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
-                guard kind != .call else { continue }
+                // ⚡TRILL alerts (throttle + buzz + trill sound) are owned by
+                // processIncomingTrillLines, same split as ⚡PAY on mesh.
+                guard kind != .call, kind != .trill else { continue }
                 let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
                 sendSonarNotification(
                     kind: kind,
@@ -4116,7 +4142,11 @@ final class SonarAppStore: ObservableObject {
             )
         }
         let rows = Array(byKey.values) + pendingRows + pendingGroupRows + marmotRows
-        return snSortDMRowsByRecency(rows)
+        return snSortDMRowsByRecency(rows).map { row in
+            var row = row
+            row.muted = isChatMuted(row.id)
+            return row
+        }
     }
 
     private func meshRow(peerID: PeerID, last: BitchatMessage?) -> SNDMRow {
@@ -4316,12 +4346,14 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// How one chat line renders: regular text, a ⚡PAY receipt bubble,
-    /// or hidden (⚡PAYDONE is a protocol control line). Unknown
-    /// ⚡PAY versions decode to nothing and fall through as plain text.
+    /// a ⚡TRILL nudge pill, or hidden (⚡PAYDONE is a protocol control
+    /// line). Unknown versions decode to nothing and fall through as text.
     private enum PayMapping {
         case notPay
         case hidden
         case bubble(SNPayInfo, SNVia)
+        /// ⚡TRILL|1|<id>: render the centered nudge pill (docs/SONAR-TRILL.md).
+        case trill
     }
 
     private func payMapping(_ content: String, fallbackVia: SNVia) -> PayMapping {
@@ -4330,6 +4362,7 @@ final class SonarAppStore: ObservableObject {
         if Self.looksLikeCallControl(content), callParseControl(content: content) != nil {
             return .hidden
         }
+        if SonarTrillMessage.isTrillLine(content) { return .trill }
         guard let line = SonarPayMessage.decode(content) else { return .notPay }
         guard case .pay(let pid, let sats) = line else { return .hidden }
         return payBubble(paymentId: pid, wireSats: sats, fallbackVia: fallbackVia)
@@ -4355,7 +4388,12 @@ final class SonarAppStore: ObservableObject {
             guard let wireSats = Int64(exactly: sats) else { return .notPay }
             return payBubble(paymentId: pid, wireSats: wireSats, fallbackVia: fallbackVia)
         case .text:
-            if m.content.hasPrefix("\u{26A1}PAY") || Self.looksLikeCallControl(m.content) {
+            // Core MessageClassInfo has no trill variant (yet); ⚡TRILL lines
+            // classify as .text and are picked up by the string decode here,
+            // exactly like a just-sent optimistic ⚡PAY echo.
+            if m.content.hasPrefix("\u{26A1}PAY")
+                || m.content.hasPrefix("\u{26A1}TRILL")
+                || Self.looksLikeCallControl(m.content) {
                 return payMapping(m.content, fallbackVia: fallbackVia)
             }
             return .notPay
@@ -4457,6 +4495,16 @@ final class SonarAppStore: ObservableObject {
                     switch payMapping(m, fallbackVia: .internet) {
                     case .hidden:
                         return nil
+                    case .trill:
+                        return (m.createdAt, SNMessage(
+                            id: m.id, mine: m.isMine,
+                            author: marmot.marmotAuthorName(m),
+                            text: "",
+                            time: Self.clock(m.createdAt),
+                            transcriptSourceID: group.id,
+                            via: .internet,
+                            trill: true
+                        ))
                     case .bubble(let pay, let payVia):
                         return (m.createdAt, SNMessage(
                             id: m.id, mine: m.isMine, text: m.content,
@@ -4495,6 +4543,16 @@ final class SonarAppStore: ObservableObject {
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
                         return nil
+                    case .trill:
+                        return (m.timestamp, SNMessage(
+                            id: m.id, mine: mine,
+                            author: m.sender,
+                            text: "",
+                            time: Self.clock(m.timestamp),
+                            transcriptSourceID: SNConversationTranscriptSource.meshID,
+                            via: via,
+                            trill: true
+                        ))
                     case .bubble(let pay, let payVia):
                         return (m.timestamp, SNMessage(
                             id: m.id, mine: mine, text: m.content,
@@ -4583,6 +4641,16 @@ final class SonarAppStore: ObservableObject {
             switch payMapping(m.content, fallbackVia: via) {
             case .hidden:
                 return nil
+            case .trill:
+                return (m.timestamp, SNMessage(
+                    id: m.id, mine: mine,
+                    author: m.sender,
+                    text: "",
+                    time: Self.clock(m.timestamp),
+                    transcriptSourceID: SNConversationTranscriptSource.meshID,
+                    via: via,
+                    trill: true
+                ))
             case .bubble(let pay, let payVia):
                 return (m.timestamp, SNMessage(
                     id: m.id, mine: mine, text: m.content,
@@ -4627,6 +4695,16 @@ final class SonarAppStore: ObservableObject {
                 switch payMapping(m, fallbackVia: .internet) {
                 case .hidden:
                     return nil
+                case .trill:
+                    return (m.createdAt, SNMessage(
+                        id: m.id, mine: m.isMine,
+                        author: m.isMine ? nil : peerDisplayName(id),
+                        text: "",
+                        time: Self.clock(m.createdAt),
+                        transcriptSourceID: group.id,
+                        via: .internet,
+                        trill: true
+                    ))
                 case .bubble(let pay, let payVia):
                     return (m.createdAt, SNMessage(
                         id: m.id, mine: m.isMine, text: m.content,
@@ -5075,14 +5153,18 @@ final class SonarAppStore: ObservableObject {
                 plaintextSha256: $0.plaintextSha256
             )
         }
+        // A queued ⚡TRILL echo must render as the nudge pill, never as the
+        // raw control line (these rows bypass payMapping).
+        let isTrill = SonarTrillMessage.isTrillLine(text)
         return SNMessage(
             id: id,
             mine: true,
-            text: stickerRef == nil ? text : "",
+            text: (stickerRef == nil && !isTrill) ? text : "",
             time: Self.clock(createdAt),
             sortDate: createdAt,
             via: .internet,
             state: state,
+            trill: isTrill,
             stickerRef: stickerRef
         )
     }
@@ -6952,6 +7034,197 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: ⚡TRILL nudges (docs/SONAR-TRILL.md)
+
+    /// True when the nudge action for this chat is currently allowed (outside
+    /// the 8-second sender cooldown).
+    func canSendTrill(_ id: String) -> Bool {
+        SonarTrillPolicy.cooldownRemaining(until: trillCooldownUntilByChat[chatAlertKey(id)]) == nil
+    }
+
+    /// Sends an MSN-style nudge through the exact same path a text message
+    /// takes (mesh or Marmot, both chat kinds), buzzes locally, and starts
+    /// the per-chat sender cooldown.
+    func sendTrill(_ id: String) {
+        guard canSendTrill(id) else { return }
+        trillCooldownUntilByChat[chatAlertKey(id)] =
+            Date().addingTimeInterval(SonarTrillPolicy.cooldownSeconds)
+        sendDm(id, SonarTrillMessage(id: SonarTrillMessage.makeID()).encoded())
+        // The sender's own send triggers the local buzz (MSN behaviour).
+        triggerTrillBuzz()
+        objectWillChange.send()
+    }
+
+    /// Foreground receive effect: viewport shake (via `trillShakeTick`, the
+    /// root view skips it under Reduce Motion), the trill bell (ambient —
+    /// never overrides the silent switch), and two medium haptic pulses
+    /// 100 ms apart (same style as the 🫂 hugs haptic in ChatViewModel).
+    private func triggerTrillBuzz() {
+        // Never disturb an active call's audio session or UI.
+        guard activeCall == nil else { return }
+        trillShakeTick &+= 1
+        SonarTrillSoundPlayer.shared.play()
+        #if os(iOS)
+        let impactFeedback = UIImpactFeedbackGenerator(style: .medium)
+        impactFeedback.prepare()
+        impactFeedback.impactOccurred()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            impactFeedback.impactOccurred()
+        }
+        #endif
+    }
+
+    /// Scans both transcript stores for incoming ⚡TRILL lines and fires the
+    /// receive effect (foreground buzz, or a trill-sound notification), with
+    /// the per-chat receiver throttle and mute applied. Mirrors
+    /// `processIncomingPayLines`; scanning is idempotent across replays.
+    private func processIncomingTrillLines() {
+        let my = chatViewModel.meshService.myPeerID
+        for (peerID, msgs) in chatViewModel.privateChats {
+            for m in msgs where m.senderPeerID != my {
+                guard !scannedTrillMessageIDs.contains(m.id),
+                      SonarTrillMessage.isTrillLine(m.content)
+                else { continue }
+                scannedTrillMessageIDs.insert(m.id)
+                let name = peerDisplayName(peerID.id)
+                handleIncomingTrill(
+                    messageId: m.id,
+                    convId: peerID.id,
+                    arrivedBeforeLaunch: m.timestamp <= localNotificationStartedAt,
+                    isBlocked: false, // mesh ingest already drops blocked peers
+                    conversationTitle: name,
+                    senderName: name,
+                    groupName: nil,
+                    content: m.content
+                )
+            }
+        }
+        // Push-wake owns Marmot banners for the current Transponder sync
+        // (`SonarPushProcessor` classifies + throttles trills itself); catch
+        // up after ownership ends, same as processIncomingMarmotNotifications.
+        if marmot.pushWakeOwnsNotifications { return }
+        for group in marmot.groups {
+            let convId = marmotConvId(forGroup: group.id)
+            let title = marmot.title(for: group)
+            for m in marmot.messagesByGroup[group.id] ?? [] where !m.isMine {
+                guard !scannedTrillMessageIDs.contains(m.id),
+                      SonarTrillMessage.isTrillLine(m.content)
+                else { continue }
+                if marmot.pushWakeNotifiedMessageIDs.contains(m.id) {
+                    scannedTrillMessageIDs.insert(m.id)
+                    continue
+                }
+                scannedTrillMessageIDs.insert(m.id)
+                let senderName = marmot.displayName(forNpub: m.senderNpub)
+                    ?? snShortNpubLabel(m.senderNpub)
+                handleIncomingTrill(
+                    messageId: m.id,
+                    convId: convId,
+                    arrivedBeforeLaunch: m.createdAt <= localNotificationStartedAt,
+                    isBlocked: isMarmotSenderBlocked(m.senderNpub),
+                    conversationTitle: title,
+                    senderName: senderName,
+                    groupName: group.memberNpubs.count > 2 ? title : nil,
+                    content: m.content
+                )
+            }
+        }
+    }
+
+    private func handleIncomingTrill(
+        messageId: String,
+        convId: String,
+        arrivedBeforeLaunch: Bool,
+        isBlocked: Bool,
+        conversationTitle: String?,
+        senderName: String?,
+        groupName: String?,
+        content: String
+    ) {
+        let alertKey = chatAlertKey(convId)
+        let decision = SonarTrillPolicy.alertDecision(
+            arrivedBeforeLaunch: arrivedBeforeLaunch,
+            isBlocked: isBlocked,
+            isMuted: isChatMuted(convId),
+            isForeground: isForeground,
+            admitThrottle: { SonarTrillThrottle.shared.admit(chatKey: alertKey) }
+        )
+        switch decision {
+        case .suppress:
+            break
+        case .buzz:
+            triggerTrillBuzz()
+        case .notify, .notifySilently:
+            sendSonarNotification(
+                kind: .trill,
+                idKey: messageId,
+                conversationId: convId,
+                conversationTitle: conversationTitle,
+                senderName: senderName,
+                groupName: groupName,
+                preview: content,
+                sound: decision == .notify ? .trill : .silent
+            )
+        }
+    }
+
+    // MARK: Per-chat mute (general — suppresses all alert kinds for a chat)
+
+    /// One canonical alert key per conversation, shared by the sender
+    /// cooldown, the receiver throttle, and the mute lookup.
+    private func chatAlertKey(_ id: String) -> String {
+        if id.hasPrefix(Self.marmotIDPrefix) { return id }
+        return canonicalPeerKey(PeerID(str: id))
+    }
+
+    /// Every key an alerting path may carry for this chat (see
+    /// docs/CHAT-TYPES.md — one conversation, five id shapes): the raw chat
+    /// id, its canonical peer key, each folded Marmot group id (bare and
+    /// `marmot:`-prefixed), and — for direct chats only — the peer's npub
+    /// (the push drain path has no group id). Group-chat mutes never store an
+    /// npub so muting a group cannot silence the member's direct chat.
+    private func muteKeys(forChatId id: String) -> [String] {
+        var keys: Set<String> = [id, chatAlertKey(id)]
+        for group in localTranscriptGroups(for: id) where !group.id.isEmpty {
+            keys.insert(group.id)
+            keys.insert(Self.marmotIDPrefix + group.id)
+            keys.insert(chatAlertKey(marmotConvId(forGroup: group.id)))
+            if let full = marmot.groups.first(where: { $0.id == group.id }),
+               marmot.isDirectGroup(full),
+               let other = full.memberNpubs.first(where: { $0 != marmot.npub }) {
+                keys.insert(other)
+            }
+        }
+        if let npub = resolvedSonarProfile(id)?.npub ?? pendingMarmotNpub(for: id) {
+            keys.insert(npub)
+        }
+        return keys.filter { !$0.isEmpty }
+    }
+
+    func isChatMuted(_ id: String) -> Bool {
+        // Match the full folded-id set muteChat stores — not just the raw id /
+        // canonical peer key — so a mute keyed by group id / npub still wins
+        // when the alert path carries a different shape for the same chat.
+        SonarChatMuteStore.shared.isMuted(anyOf: muteKeys(forChatId: id))
+    }
+
+    /// Mute end for the chat (`.distantFuture` = until turned back on).
+    func chatMuteEnd(_ id: String) -> Date? {
+        SonarChatMuteStore.shared.muteEnd(anyOf: muteKeys(forChatId: id))
+    }
+
+    /// Mute for `duration` seconds, or indefinitely when nil.
+    func muteChat(_ id: String, for duration: TimeInterval?) {
+        let until = duration.map { Date().addingTimeInterval($0) } ?? .distantFuture
+        SonarChatMuteStore.shared.mute(keys: muteKeys(forChatId: id), until: until)
+        objectWillChange.send()
+    }
+
+    func unmuteChat(_ id: String) {
+        SonarChatMuteStore.shared.unmute(keys: muteKeys(forChatId: id))
+        objectWillChange.send()
+    }
+
     /// A Marmot group folded into a Sonar peer's conversation replies on
     /// that conversation id, so sendDm routes by current reachability.
     private func marmotConvId(forGroup groupId: String) -> String {
@@ -6990,6 +7263,7 @@ final class SonarAppStore: ObservableObject {
         if looksLikeCallControl(content), callParseControl(content: content) != nil {
             return "Voice call"
         }
+        if SonarTrillMessage.isTrillLine(content) { return "Nudge" }
         if SonarPayMessage.decode(content) != nil { return "\u{20BF} Payment" }
         if content.isEmpty, !media.isEmpty { return Self.mediaPreviewLabel(media) }
         return content
@@ -7904,6 +8178,10 @@ final class SonarAppStore: ObservableObject {
         cancelPendingSecureChatSetups()
         cancelPendingMarmotGroupSetups()
         scannedPayMessageIDs = []
+        scannedTrillMessageIDs = []
+        trillCooldownUntilByChat = [:]
+        SonarTrillThrottle.shared.reset()
+        SonarChatMuteStore.shared.wipe()
         pendingPayPeer = nil
         localHydratingDMs = []
         clearMarmotConversationGroups()
@@ -8032,6 +8310,10 @@ final class SonarAppStore: ObservableObject {
         // Message-id dedup state is account-bound: this store outlives a wipe,
         // so a restored account whose ids collide would be silently swallowed.
         seenMarmotNotificationMessageIDs = []
+        scannedTrillMessageIDs = []
+        trillCooldownUntilByChat = [:]
+        SonarTrillThrottle.shared.reset()
+        SonarChatMuteStore.shared.wipe()
         pendingPayPeer = nil
         clearCallLogs()
         resetCallState()

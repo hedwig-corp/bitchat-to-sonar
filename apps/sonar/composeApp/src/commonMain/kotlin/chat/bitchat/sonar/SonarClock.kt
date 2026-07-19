@@ -12,6 +12,10 @@ expect object SonarClock {
     /** Current epoch seconds. */
     fun nowSecs(): Long
 
+    /** Monotonic milliseconds (immune to wall-clock changes) — used for the
+     *  trill send-cooldown and receiver alert throttle windows. */
+    fun monotonicMillis(): Long
+
     /** Local "HH:MM" (24h, zero-padded) label for [epochSecs] — design `bcNow`. */
     fun hourMinute(epochSecs: Long): String
 }

@@ -10,6 +10,8 @@ actual object SonarClock {
 
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 
+    actual fun monotonicMillis(): Long = android.os.SystemClock.elapsedRealtime()
+
     actual fun hourMinute(epochSecs: Long): String =
         SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(epochSecs * 1000))
 }

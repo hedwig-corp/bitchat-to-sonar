@@ -17,6 +17,10 @@ import AppKit
 enum SonarNotificationSound {
     case standard
     case ble
+    /// MSN-style nudge (⚡TRILL) — the distinct trill bell.
+    case trill
+    /// Deliver visually with no sound (throttled trills alert silently).
+    case silent
 }
 
 /// UserInfo / identifier keys shared by Sonar local notifications and the
@@ -54,6 +58,9 @@ final class NotificationService {
     private static let bleNotificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_ble_notification.wav")
     )
+    private static let trillNotificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_trill.wav")
+    )
 
     /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
     private var isRunningTests: Bool {
@@ -87,12 +94,23 @@ final class NotificationService {
         sound: SonarNotificationSound = .standard
     ) {
         guard !isRunningTests else { return }
+        // Central per-chat mute gate: every conversation-scoped local
+        // notification funnels through here, so a muted chat suppresses ALL
+        // kinds (message/payment/trill/BLE) without sprinkling checks at
+        // call sites. Rows and unread badges still accrue upstream.
+        if let userInfo,
+           let conversationId = SonarNotificationHandoff.conversationId(from: userInfo),
+           SonarChatMuteStore.shared.isMuted(conversationId) {
+            return
+        }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = switch sound {
         case .standard: Self.standardNotificationSound
         case .ble: Self.bleNotificationSound
+        case .trill: Self.trillNotificationSound
+        case .silent: nil
         }
         content.interruptionLevel = interruptionLevel
 

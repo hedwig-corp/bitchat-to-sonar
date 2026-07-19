@@ -102,7 +102,9 @@ struct SonarNotificationPrefsTests {
             prefs: prefs,
             idKey: "mention-1"
         )
-        #expect(routed?.title == "Bob")
+        // Core renders the mention title as "<sender> mentioned you"
+        // (notification.rs since #144); the seam adds the mention- prefix.
+        #expect(routed?.title == "Bob mentioned you")
         #expect(routed?.body == "hey @you")
         #expect(routed?.identifier.hasPrefix("mention-") == true)
     }

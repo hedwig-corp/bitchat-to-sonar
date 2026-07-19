@@ -17,6 +17,7 @@ import android.os.Build
 actual object Notifier {
     private const val MESSAGE_CHANNEL = "messages_v8"
     private const val BLE_CHANNEL = "ble_notifications_v6"
+    private const val TRILL_CHANNEL = "trill_v1"
     private val LEGACY_CHANNELS = listOf(
         "messages",
         "messages_v2",
@@ -62,6 +63,15 @@ actual object Notifier {
                 description = "Notifications received over Bluetooth",
                 soundResourceId = R.raw.sonar_ble_notification,
             )
+            ensureChannel(
+                nm = nm,
+                id = TRILL_CHANNEL,
+                name = "Nudges",
+                description = "MSN-style nudges that buzz your screen",
+                soundResourceId = R.raw.sonar_trill,
+                // Match the in-app buzz: [40ms buzz, 60ms pause, 40ms buzz].
+                vibrationPattern = longArrayOf(0, 40, 60, 40),
+            )
         }
     }
 
@@ -71,6 +81,7 @@ actual object Notifier {
         name: String,
         description: String,
         soundResourceId: Int,
+        vibrationPattern: LongArray = longArrayOf(0, 250, 200, 250),
     ) {
         if (nm.getNotificationChannel(id) != null) return
         val uri = soundUri(soundResourceId)
@@ -85,7 +96,7 @@ actual object Notifier {
             NotificationChannel(id, name, NotificationManager.IMPORTANCE_HIGH).apply {
                 this.description = description
                 enableVibration(true)
-                vibrationPattern = longArrayOf(0, 250, 200, 250)
+                this.vibrationPattern = vibrationPattern
                 setSound(uri, audioAttributes)
                 setShowBadge(true)
             }
@@ -142,6 +153,7 @@ actual object Notifier {
         val channel = when (sound) {
             SonarNotificationSound.Default -> MESSAGE_CHANNEL
             SonarNotificationSound.Ble -> BLE_CHANNEL
+            SonarNotificationSound.Trill -> TRILL_CHANNEL
         }
         val n = Notification.Builder(ctx, channel)
             .setSmallIcon(android.R.drawable.stat_notify_chat)
