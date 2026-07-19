@@ -13,6 +13,7 @@
 
 #if os(macOS)
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 
 extension Notification.Name {
@@ -1655,7 +1656,7 @@ private struct MacRadarPeerRow: View {
 
 private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     case profile
-    case secureChat
+    case findUsername
     case newGroup
     case settings
     case nearby
@@ -1665,7 +1666,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var icon: SNIconName {
         switch self {
         case .profile: return .key
-        case .secureChat: return .key
+        case .findUsername: return .key
         case .newGroup: return .people
         case .settings: return .list
         case .nearby: return .rings
@@ -1675,7 +1676,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .profile: return "Profile"
-        case .secureChat: return "Secure chat via npub"
+        case .findUsername: return "New discussion"
         case .newGroup: return "New group"
         case .settings: return "Settings"
         case .nearby: return "People Nearby"
@@ -1684,9 +1685,9 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
 
     var sub: String {
         switch self {
-        case .profile: return "Identity, key sharing, safety, and payment address"
-        case .secureChat: return "Encrypted chat over the internet - reaches anywhere"
-        case .newGroup: return "Invite people by npub"
+        case .profile: return "Name, username, key sharing, and payment address"
+        case .findUsername: return "Username, name@domain, or paste a key — reaches anywhere"
+        case .newGroup: return "Invite contacts or paste keys"
         case .settings: return "Appearance, network, wallet, and privacy"
         case .nearby: return "Open Sonar discovery"
         }
@@ -1699,8 +1700,14 @@ private struct MacCommandPalette: View {
     let openSettings: () -> Void
     @Binding var isPresented: Bool
     @State private var query = ""
-    @State private var npubDraft = ""
-    @State private var npubEntry = false
+    @State private var findUsernameEntry = false
+    @State private var findDraft = ""
+    @State private var findResolving = false
+    @State private var findNpub: String?
+    @State private var findMiss = false
+    @State private var findLookupGeneration = 0
+    @State private var findLookupTask: Task<Void, Never>?
+    @State private var findStartError: String?
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
     @State private var selectedGroupNpubs: Set<String> = []
@@ -1771,11 +1778,57 @@ private struct MacCommandPalette: View {
                                 resolveHandleAndStartChat()
                             }
                         }
-                        if npubEntry || canStartSecureChatFromQuery {
+                        if findUsernameEntry {
+                            MacFindUsernameCard(
+                                draft: Binding(
+                                    get: { findDraft },
+                                    set: {
+                                        findLookupTask?.cancel()
+                                        findLookupTask = nil
+                                        findDraft = $0
+                                        findNpub = nil
+                                        findMiss = false
+                                        findResolving = false
+                                        findStartError = nil
+                                        findLookupGeneration &+= 1
+                                    }
+                                ),
+                                resolving: findResolving,
+                                foundNpub: findNpub,
+                                missed: findMiss,
+                                startError: findStartError,
+                                domain: SonarAppStore.handleDomain,
+                                onLookup: { lookupUsernameFromPalette() },
+                                onStart: { npub in
+                                    findStartError = nil
+                                    if store.startSecureChat(npub: npub) != nil {
+                                        isPresented = false
+                                    } else {
+                                        findStartError = "That key isn't a valid npub — check it and try again."
+                                        findNpub = nil
+                                    }
+                                },
+                                onBack: {
+                                    findLookupTask?.cancel()
+                                    findLookupTask = nil
+                                    findLookupGeneration &+= 1
+                                    findUsernameEntry = false
+                                    findDraft = ""
+                                    findNpub = nil
+                                    findMiss = false
+                                    findResolving = false
+                                    findStartError = nil
+                                }
+                            )
+                        }
+                        if canStartSecureChatFromQuery {
                             MacNpubComposeCard(
-                                npub: secureChatBinding,
+                                npub: Binding(
+                                    get: { query },
+                                    set: { query = $0 }
+                                ),
                                 errorText: store.marmot.errorText,
-                                onStart: { startSecureChatFromDraft() }
+                                onStart: { startSecureChat(with: trimmedQuery) }
                             )
                         }
                         if groupEntry {
@@ -1836,12 +1889,21 @@ private struct MacCommandPalette: View {
         }
         .onChange(of: isPresented) { open in
             if !open {
-                npubEntry = false
+                findLookupTask?.cancel()
+                findLookupTask = nil
                 groupEntry = false
-                npubDraft = ""
+                findUsernameEntry = false
+                findDraft = ""
+                findResolving = false
+                findNpub = nil
+                findMiss = false
+                findStartError = nil
+                findLookupGeneration &+= 1
                 groupNameDraft = ""
                 groupMembersDraft = ""
                 selectedGroupNpubs = []
+                resolvingHandle = false
+                handleMissQuery = nil
             }
         }
         .snSheet(isPresented: $walletSheet, title: "Your wallet") {
@@ -1869,16 +1931,6 @@ private struct MacCommandPalette: View {
         !canStartSecureChatFromQuery
             && !trimmedQuery.isEmpty
             && MarmotService.handleLooksValid(trimmedQuery)
-    }
-
-    private var secureChatBinding: Binding<String> {
-        if canStartSecureChatFromQuery {
-            return Binding(
-                get: { query },
-                set: { query = $0 }
-            )
-        }
-        return $npubDraft
     }
 
     private var filteredChannels: [SNChannelItem] {
@@ -1928,14 +1980,16 @@ private struct MacCommandPalette: View {
         switch command {
         case .profile:
             choose(SonarMacSelection.profile)
-        case .secureChat:
+        case .findUsername:
             if canStartSecureChatFromQuery {
                 startSecureChat(with: trimmedQuery)
+            } else if canStartHandleChatFromQuery {
+                resolveHandleAndStartChat()
             } else {
-                if npubDraft.isEmpty, trimmedQuery.hasPrefix("npub") {
-                    npubDraft = trimmedQuery
+                if findDraft.isEmpty, !trimmedQuery.isEmpty {
+                    findDraft = trimmedQuery
                 }
-                npubEntry = true
+                findUsernameEntry = true
                 groupEntry = false
             }
         case .newGroup:
@@ -1944,13 +1998,48 @@ private struct MacCommandPalette: View {
             } else if groupMembersDraft.isEmpty, trimmedQuery.hasPrefix("npub") {
                 groupMembersDraft = trimmedQuery
             }
-            npubEntry = false
+            findUsernameEntry = false
             groupEntry = true
         case .settings:
             openSettings()
             isPresented = false
         case .nearby:
             choose(SonarMacSelection.radar)
+        }
+    }
+
+    private func lookupUsernameFromPalette() {
+        let trimmed = findDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !findResolving else { return }
+        findStartError = nil
+        if trimmed.lowercased().hasPrefix("npub1") {
+            if let decoded = try? Bech32.decode(trimmed), decoded.hrp == "npub", decoded.data.count == 32 {
+                findNpub = SNMarmotProfileCache.canonicalKey(trimmed)
+                findMiss = false
+            } else {
+                findNpub = nil
+                findMiss = false
+                findStartError = "That key isn't a valid npub — check it and try again."
+            }
+            return
+        }
+        guard MarmotService.handleLooksValid(trimmed) else { return }
+        findLookupTask?.cancel()
+        findLookupGeneration &+= 1
+        let generation = findLookupGeneration
+        findResolving = true
+        findMiss = false
+        findNpub = nil
+        findLookupTask = Task { @MainActor in
+            let npub = await store.resolveHandleForChat(trimmed)
+            guard !Task.isCancelled, generation == findLookupGeneration else { return }
+            findResolving = false
+            findLookupTask = nil
+            if let npub {
+                findNpub = npub
+            } else {
+                findMiss = true
+            }
         }
     }
 
@@ -1996,14 +2085,13 @@ private struct MacCommandPalette: View {
         }
     }
 
-    private func startSecureChatFromDraft() {
-        let npub = secureChatBinding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        startSecureChat(with: npub)
-    }
-
     private func startSecureChat(with npub: String) {
-        guard npub.hasPrefix("npub1") else { return }
-        store.startSecureChat(npub: npub)
+        let trimmed = npub.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let decoded = try? Bech32.decode(trimmed),
+              decoded.hrp == "npub",
+              decoded.data.count == 32
+        else { return }
+        guard store.startSecureChat(npub: trimmed) != nil else { return }
         isPresented = false
     }
 
@@ -2022,8 +2110,12 @@ private struct MacCommandPalette: View {
                 return
             }
             resolvingHandle = false
-            if let npub {
-                store.startSecureChat(npub: npub)
+            guard let npub else {
+                handleMissQuery = handle
+                return
+            }
+            // Match the New-discussion card: only dismiss when local chat open succeeds.
+            if store.startSecureChat(npub: npub) != nil {
                 isPresented = false
             } else {
                 handleMissQuery = handle
@@ -2085,6 +2177,91 @@ private struct MacPaletteRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(SNRowPressStyle(cornerRadius: 0))
+    }
+}
+
+private struct MacFindUsernameCard: View {
+    @Binding var draft: String
+    let resolving: Bool
+    let foundNpub: String?
+    let missed: Bool
+    var startError: String? = nil
+    let domain: String
+    let onLookup: () -> Void
+    let onStart: (String) -> Void
+    let onBack: () -> Void
+
+    private var trimmed: String {
+        draft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private var looksValid: Bool {
+        MarmotService.handleLooksValid(trimmed) || trimmed.hasPrefix("npub1")
+    }
+
+    private var showSuffix: Bool {
+        !trimmed.isEmpty && !trimmed.contains("@") && !trimmed.hasPrefix("npub1")
+    }
+
+    private var previewAddress: String {
+        if trimmed.hasPrefix("npub1") { return trimmed }
+        if trimmed.contains("@") { return trimmed }
+        return "\(trimmed)@\(domain)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Type a username, name@domain, or paste a key.")
+                .font(SonarTheme.uiFont(size: 13))
+                .foregroundColor(SonarTheme.text2)
+            HStack(spacing: 8) {
+                TextField(
+                    "",
+                    text: $draft,
+                    prompt: Text(verbatim: "vincenzo").foregroundColor(SonarTheme.text3)
+                )
+                .textFieldStyle(.plain)
+                .font(SonarTheme.monoFont(size: 13))
+                .foregroundColor(SonarTheme.text)
+                .onSubmit { onLookup() }
+                if showSuffix {
+                    Text(verbatim: "@\(domain)")
+                        .font(SonarTheme.monoFont(size: 12))
+                        .foregroundColor(SonarTheme.text3)
+                }
+            }
+            .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
+
+            if resolving {
+                Text(verbatim: "Looking up \(previewAddress)\u{2026}")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.text2)
+            } else if let startError {
+                Text(verbatim: startError)
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.danger)
+            } else if missed {
+                Text("No Sonar user found at that address.")
+                    .font(SonarTheme.uiFont(size: 12))
+                    .foregroundColor(SonarTheme.danger)
+            }
+
+            if let npub = foundNpub {
+                SNPrimaryButton(label: "Start encrypted chat", disabled: false) {
+                    onStart(npub)
+                }
+            } else {
+                SNPrimaryButton(
+                    label: resolving ? "Looking up\u{2026}" : "Look up",
+                    disabled: !looksValid || resolving
+                ) {
+                    onLookup()
+                }
+            }
+            SNGhostButton(label: "Back", action: onBack)
+        }
+        .padding(EdgeInsets(top: 4, leading: 14, bottom: 7, trailing: 14))
     }
 }
 
@@ -2394,10 +2571,27 @@ private struct MacProfilePane: View {
 
     private var paymentCard: some View {
         VStack(spacing: 0) {
-            SNSectionLabel("Payments")
+            SNSectionLabel("Username")
             SNSettingsCard {
-                SonarHandleClaimCard(store: store)
+                SonarHandleClaimCard(store: store, showTitle: false)
                     .padding(16)
+            }
+            if let address = store.paymentAddressDisplay {
+                SNSectionLabel("Payment address")
+                SNSettingsCard {
+                    SNSettingsRow(
+                        icon: .coin,
+                        tone: .gold,
+                        label: "Payment address",
+                        sub: address,
+                        value: "Copy",
+                        trail: .none,
+                        divider: false
+                    ) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(address, forType: .string)
+                    }
+                }
             }
         }
     }
@@ -2812,8 +3006,9 @@ private struct MacSettingsModal: View {
                     wipeAsk = true
                 }
             }
+            SNSectionLabel("Username")
             SNSettingsCard {
-                SonarHandleClaimCard(store: store)
+                SonarHandleClaimCard(store: store, showTitle: false)
                     .padding(14)
             }
         }

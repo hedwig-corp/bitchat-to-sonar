@@ -129,7 +129,12 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Text(state.nick.ifBlank { "you" }, color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                    Text(shortKey(state.npub), color = s.text3, style = SonarType.mono(12.0), modifier = Modifier.padding(top = 2.dp))
+                    Text(
+                        profileCardSubtitle(state),
+                        color = s.text3,
+                        style = SonarType.mono(12.0),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
                 }
                 SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
             }

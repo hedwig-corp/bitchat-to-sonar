@@ -22,28 +22,35 @@ function bcNow() {
 }
 
 function bcFreshState() {
+  const groupMsgs = BC_DATA.groupMsgs || {};
   return {
-    v: 2,
+    v: 3,
     onboarded: false,
     nick: '',
     network: 'online',
     balance: 182400,
+    txns: (BC_DATA.txns || []).slice(),
     verified: {},
+    muted: {},
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
     prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR' },
-    chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
-    dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
+    chMsgs: { centro: (BC_DATA.chMsgs || []).slice(), city: [] },
+    dmMsgs: { maya: (BC_DATA.dmMsgs || []).slice(), sofia: (BC_DATA.dmMsgsSofia || []).slice() },
+    groupMsgs: {
+      lake: (groupMsgs.lake || []).slice(),
+      trip: (groupMsgs.trip || []).slice(),
+    },
   };
 }
 
 function bcLoadState() {
   try {
     const s = JSON.parse(localStorage.getItem('sn_proto_v1'));
-    if (s && s.v === 2) {
+    if (s && s.v === 3) {
       const d = bcFreshState();
-      return { ...d, ...s, nav: '', prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) } };
+      return { ...d, ...s, nav: '', prefs: { ...d.prefs, ...(s.prefs || {}) }, chMsgs: { ...d.chMsgs, ...(s.chMsgs || {}) }, dmMsgs: { ...d.dmMsgs, ...(s.dmMsgs || {}) }, groupMsgs: { ...d.groupMsgs, ...(s.groupMsgs || {}) }, txns: s.txns || d.txns };
     }
   } catch (e) { /* fall through */ }
   return bcFreshState();
@@ -79,6 +86,8 @@ function SonarApp() {
   const toggleNetwork = () => setApp((a) => ({ ...a, network: a.network === 'online' ? 'offline' : 'online' }));
   const wipe = () => setApp(bcFreshState());
   const setPref = (k, v) => setApp((a) => ({ ...a, prefs: { ...(a.prefs || {}), [k]: v } }));
+  const muteConv = (id, dur) => setApp((a) => ({ ...a, muted: { ...a.muted, [id]: dur || 'forever' } }));
+  const unmuteConv = (id) => setApp((a) => { const m = { ...a.muted }; delete m[id]; return { ...a, muted: m }; });
 
   const appendCh = (chId, m) => setApp((a) => ({
     ...a, chMsgs: { ...a.chMsgs, [chId]: [...(a.chMsgs[chId] || []), m] },
@@ -86,6 +95,46 @@ function SonarApp() {
   const appendDm = (peerId, m) => setApp((a) => ({
     ...a, dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), m] },
   }));
+
+  // ── Nudge (MSN-style "trillo"): shake the frame + play a bell ──
+  const [shake, setShake] = React.useState(0);
+  const buzz = () => {
+    setShake((n) => n + 1);
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) {
+        const ctx = window.__bcAudio || (window.__bcAudio = new AC());
+        if (ctx.state === 'suspended') ctx.resume();
+        [0, 0.16].forEach((t0) => {
+          const o = ctx.createOscillator(), g = ctx.createGain();
+          o.type = 'sine'; o.frequency.setValueAtTime(880, ctx.currentTime + t0);
+          o.frequency.exponentialRampToValueAtTime(660, ctx.currentTime + t0 + 0.12);
+          g.gain.setValueAtTime(0.0001, ctx.currentTime + t0);
+          g.gain.exponentialRampToValueAtTime(0.32, ctx.currentTime + t0 + 0.02);
+          g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t0 + 0.22);
+          o.connect(g); g.connect(ctx.destination);
+          o.start(ctx.currentTime + t0); o.stop(ctx.currentTime + t0 + 0.24);
+        });
+      }
+    } catch (e) { /* audio optional */ }
+    if (navigator.vibrate) { try { navigator.vibrate([40, 60, 40]); } catch (e) {} }
+  };
+  React.useEffect(() => {
+    if (!shake) return;
+    const el = document.querySelector('.bc-app');
+    if (!el) return;
+    el.setAttribute('data-shake', '1');
+    const id = setTimeout(() => el.removeAttribute('data-shake'), 620);
+    return () => clearTimeout(id);
+  }, [shake]);
+  const sendNudge = (peerId) => {
+    setApp((a) => ({ ...a, dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), { nudge: true, mine: true, time: bcNow() }] } }));
+    buzz();
+  };
+  const sendNudgeGroup = (groupId) => {
+    setApp((a) => ({ ...a, groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), { nudge: true, mine: true, author: a.nick || 'you', time: bcNow() }] } }));
+    buzz();
+  };
 
   // Channel routing: Nostr when online, Bluetooth mesh when offline
   const sendCh = (chId, text) => setApp((a) => ({
@@ -114,32 +163,27 @@ function SonarApp() {
     };
   });
 
-  // Payments ride the same rails: ecash over Bluetooth in range, Lightning otherwise
-  const sendPay = (peerId, sats) => {
-    setApp((a) => {
-      const peer = BC_DATA.peers.find((p) => p.id === peerId);
-      const via = peer && peer.inRange ? 'mesh' : 'internet';
-      return {
-        ...a,
-        balance: Math.max(0, (a.balance || 0) - sats),
-        dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), { pay: true, mine: true, amount: sats, via, state: 'sealed', time: bcNow() }] },
-      };
-    });
-    setTimeout(() => setApp((a) => {
-      const list = (a.dmMsgs[peerId] || []).slice();
-      for (let i = list.length - 1; i >= 0; i--) {
-        if (list[i].pay && list[i].mine && list[i].state === 'sealed') { list[i] = { ...list[i], state: 'claimed' }; break; }
-      }
-      return { ...a, dmMsgs: { ...a.dmMsgs, [peerId]: list } };
-    }), 2600);
-  };
-  const claimPay = (peerId, idx) => setApp((a) => {
-    const list = (a.dmMsgs[peerId] || []).slice();
-    const m = list[idx];
-    if (!m || !m.pay || m.mine || m.state !== 'sealed') return a;
-    list[idx] = { ...m, state: 'claimed' };
-    return { ...a, balance: (a.balance || 0) + m.amount, dmMsgs: { ...a.dmMsgs, [peerId]: list } };
+  // Direct payment to the peer's BOLT12 offer: pending → paid → confirmed (signed receipt)
+  const pushTxn = (a, tx) => ({ ...a, txns: [tx, ...((a.txns) || [])] });
+  const setPayState = (peerId, key, state) => setApp((a) => {
+    const list = (a.dmMsgs[peerId] || []).map((m) => (m.payKey === key ? { ...m, state } : m));
+    const txns = (a.txns || []).map((t) => (t.key === key ? { ...t, state } : t));
+    return { ...a, dmMsgs: { ...a.dmMsgs, [peerId]: list }, txns };
   });
+  const sendPay = (peerId, sats) => {
+    const key = 'tx' + Date.now();
+    const peer = BC_DATA.peers.find((p) => p.id === peerId);
+    const via = peer && peer.inRange ? 'mesh' : 'internet';
+    const time = bcNow();
+    setApp((a) => {
+      const withMsg = { ...a, balance: Math.max(0, (a.balance || 0) - sats),
+        dmMsgs: { ...a.dmMsgs, [peerId]: [...(a.dmMsgs[peerId] || []), { pay: true, mine: true, amount: sats, via, state: 'pending', time, payKey: key }] } };
+      return pushTxn(withMsg, { key, dir: 'out', who: peer ? peer.name : 'unknown', amount: sats, via, state: 'pending', time });
+    });
+    setTimeout(() => setPayState(peerId, key, 'paid'), 1400);
+    setTimeout(() => setPayState(peerId, key, 'confirmed'), 3200);
+  };
+  const claimPay = () => {};
 
   // Media rides the same rails as messages (Bluetooth in range, internet otherwise)
   const sendMediaCh = (chId, type) => setApp((a) => ({
@@ -187,11 +231,48 @@ function SonarApp() {
     }] },
   }));
 
+  // Group chats: route to members in range over Bluetooth, the rest over internet
+  const groupVia = (groupId) => 'internet';
+  const sendGroup = (groupId, text) => setApp((a) => ({
+    ...a,
+    groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, text, time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const sendMediaGroup = (groupId, type) => setApp((a) => ({
+    ...a,
+    groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, media: bcSampleMedia(type), time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const sendVoiceGroup = (groupId, sec) => setApp((a) => ({
+    ...a,
+    groupMsgs: { ...a.groupMsgs, [groupId]: [...(a.groupMsgs[groupId] || []), {
+      mine: true, media: bcVoiceMedia(sec), time: bcNow(), via: groupVia(groupId), state: 'Delivered',
+    }] },
+  }));
+  const createGroup = (name, memberIds) => {
+    const id = 'g' + Date.now().toString(36);
+    BC_DATA.groups = [{ id, name, members: memberIds, preview: 'New group', time: 'now', unread: 0 }, ...(BC_DATA.groups || [])];
+    setApp((a) => ({
+      ...a,
+      groupMsgs: { ...a.groupMsgs, [id]: [] },
+      stack: [...a.stack.slice(0, -1), { s: 'group', id }],
+      nav: 'push',
+    }));
+  };
+  const leaveGroup = (groupId) => {
+    BC_DATA.groups = (BC_DATA.groups || []).filter((g) => g.id !== groupId);
+    setApp((a) => ({ ...a, stack: [{ s: 'home' }], nav: 'pop' }));
+  };
+
   const onCommand = (ctx, cmd) => {
     if (cmd === 'who' || cmd === 'msg') { push('nearby'); return; }
     if (cmd === 'slap') {
       const m = { action: true, text: '* ' + (app.nick || 'you') + ' slaps ' + ctx.target + ' around a bit with a large trout', time: bcNow() };
-      if (ctx.type === 'ch') appendCh(ctx.id, m); else appendDm(ctx.id, m);
+      if (ctx.type === 'ch') appendCh(ctx.id, m);
+      else if (ctx.type === 'group') setApp((a) => ({ ...a, groupMsgs: { ...a.groupMsgs, [ctx.id]: [...(a.groupMsgs[ctx.id] || []), m] } }));
+      else appendDm(ctx.id, m);
     }
   };
 
@@ -199,20 +280,32 @@ function SonarApp() {
   const screenKey = app.stack.length + '-' + top.s + '-' + (top.id || '');
   let screen = null;
   if (top.s === 'home') {
-    screen = <HomeScreen key={screenKey} app={app} t={t} nav={app.nav} push={push} toggleNetwork={toggleNetwork} onWipe={wipe} />;
+    screen = <HomeScreen key={screenKey} app={app} t={t} nav={app.nav} push={push} toggleNetwork={toggleNetwork} onWipe={wipe} onMute={muteConv} onUnmute={unmuteConv} />;
   } else if (top.s === 'channel') {
     screen = <ChannelScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} chId={top.id} onSend={sendCh} onCommand={onCommand} onMedia={sendMediaCh} onVoice={sendVoiceCh} />;
   } else if (top.s === 'dm') {
-    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} />;
+    screen = <DMScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onSend={sendDm} onNudge={sendNudge} onCommand={onCommand} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} onPay={(sats) => sendPay(top.id, sats)} onClaimPay={claimPay} openPay={!!top.pay} onMedia={sendMediaDm} onVoice={sendVoiceDm} onMute={muteConv} onUnmute={unmuteConv} />;
   } else if (top.s === 'nearby') {
     screen = <SonarScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} />;
+  } else if (top.s === 'group') {
+    screen = <GroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onSend={sendGroup} onNudge={sendNudgeGroup} onCommand={onCommand} onMedia={sendMediaGroup} onVoice={sendVoiceGroup} />;
+  } else if (top.s === 'groupinfo') {
+    screen = <GroupInfoScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} groupId={top.id} onLeave={leaveGroup} />;
+  } else if (top.s === 'newgroup') {
+    screen = <NewGroupScreen key={screenKey} app={app} nav={app.nav} pop={pop} onCreate={createGroup} />;
   } else if (top.s === 'call') {
     const cpeer = BC_DATA.peers.find((p) => p.id === top.id) || BC_DATA.peers[0];
     screen = <CallView key={screenKey} peer={cpeer} kind={top.kind} nick={app.nick} transport={cpeer.inRange ? 'mesh' : 'internet'} onEnd={(sec) => endCall(top.id, top.kind, sec)} />;
   } else if (top.s === 'settings') {
-    screen = <SettingsScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} mode={t.mode} onToggleMode={() => setTweak('mode', t.mode === 'dark' ? 'light' : 'dark')} toggleNetwork={toggleNetwork} onWipe={wipe} onPref={setPref} />;
+    screen = <SettingsScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} mode={t.mode} onToggleMode={() => setTweak('mode', t.mode === 'dark' ? 'light' : 'dark')} toggleNetwork={toggleNetwork} onWipe={wipe} onPref={setPref} onUnmute={unmuteConv} />;
   } else if (top.s === 'profile') {
     screen = <ProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} onRename={(n) => setApp((a) => ({ ...a, nick: n }))} />;
+  } else if (top.s === 'wallet') {
+    screen = <WalletScreen key={screenKey} app={app} nav={app.nav} pop={pop} />;
+  } else if (top.s === 'donate') {
+    screen = <DonateScreen key={screenKey} app={app} nav={app.nav} pop={pop} onBecomeSupporter={() => setPref('supporter', true)} />;
+  } else if (top.s === 'peer') {
+    screen = <PeerProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} />;
   }
 
   const fontStack = BC_FONTS[t.typeface] || BC_FONTS.Figtree;

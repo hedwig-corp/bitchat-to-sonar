@@ -33,14 +33,18 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.Screen
+import chat.bitchat.sonar.SonarAnnounce
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.canonicalProfileKey
+import chat.bitchat.sonar.crypto.Bech32
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -62,6 +66,8 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     var showVerify by remember { mutableStateOf(false) }
     var paySheet by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var paymentCopied by remember { mutableStateOf(false) }
+    LaunchedEffect(paymentCopied) { if (paymentCopied) { delay(1700); paymentCopied = false } }
 
     // Derive the peer npub from the chat members list, or accept a direct
     // npub when opened from a group member tap.
@@ -108,6 +114,15 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
     val canPay = state.hasDirectPaymentRoute(effectiveChatId) && !blocked
     val canFavorite = state.canFavoriteContact(effectiveChatId)
     val favorite = state.isContactFavorite(effectiveChatId)
+    val nip05 = peerNpub?.let { state.profilesByNpub[it]?.nip05 }?.takeIf { it.isNotBlank() }
+    var nip05Verified by remember(peerNpub, nip05) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(peerNpub, nip05) {
+        if (peerNpub != null && nip05 != null && '@' in nip05) {
+            nip05Verified = SonarCore.verifyNip05(nip05, peerNpub)
+        } else {
+            nip05Verified = null
+        }
+    }
     LaunchedEffect(effectiveChatId) {
         state.refreshDescriptorForChat(effectiveChatId)
     }
@@ -162,16 +177,7 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                         style = SonarType.mono(12.0)
                     )
                 }
-                // NIP-05 handle from the peer's kind-0 profile, with a live
-                // verification check (never blocks paint; runs once per screen).
-                val nip05 = peerNpub?.let { state.profilesByNpub[it]?.nip05 }?.takeIf { it.isNotBlank() }
                 if (nip05 != null) {
-                    var nip05Verified by remember(peerNpub, nip05) { mutableStateOf<Boolean?>(null) }
-                    LaunchedEffect(peerNpub, nip05) {
-                        if (peerNpub != null && '@' in nip05) {
-                            nip05Verified = SonarCore.verifyNip05(nip05, peerNpub)
-                        }
-                    }
                     Spacer(Modifier.height(5.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
@@ -249,6 +255,69 @@ fun SonarContactProfileScreen(state: SonarAppState, screen: Screen.ContactProfil
                     onDismiss = { showVerify = false }
                 )
                 Spacer(Modifier.height(12.dp))
+            }
+
+            // Mesh BIP-353 first (only when announce npub matches this contact),
+            // then verified kind-0 NIP-05 only — never an unverified claim.
+            val paymentAddress = remember(
+                screen.chatId, effectiveChatId, peerNpub, state.sonarPeerProfiles, nip05, nip05Verified
+            ) {
+                val contact = peerNpub
+                fun announceNpubKey(profile: SonarAnnounce): String? =
+                    Bech32.encode("npub", profile.npub)?.let { canonicalProfileKey(it) }
+                fun bipBoundToContact(id: String): String? {
+                    if (contact == null) return null
+                    val profile = state.sonarProfile(id) ?: return null
+                    if (announceNpubKey(profile) != contact) return null
+                    return profile.bip353?.takeIf { it.isNotBlank() }
+                }
+                val peerIds = buildList {
+                    if (screen.chatId.startsWith("mesh:")) add(screen.chatId.removePrefix("mesh:"))
+                    if (effectiveChatId.startsWith("mesh:")) add(effectiveChatId.removePrefix("mesh:"))
+                    // One pass over live announces — avoid scanning meshDmRows + Bech32 per row.
+                    if (contact != null) {
+                        state.sonarPeerProfiles.entries.firstOrNull { (_, ann) ->
+                            announceNpubKey(ann) == contact
+                        }?.key?.let { add(it) }
+                    }
+                }.distinct()
+                peerIds.firstNotNullOfOrNull(::bipBoundToContact)
+                    ?: nip05?.takeIf { '@' in it && nip05Verified == true }
+            }
+            if (paymentAddress != null) {
+                SNSectionLabel("Payment address")
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp)
+                        .clip(RoundedCornerShape(18.dp)).background(s.surface)
+                        .clickable {
+                            clipboard.setText(AnnotatedString(paymentAddress))
+                            paymentCopied = true
+                            state.toast = "Payment address copied"
+                        }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        Modifier.size(38.dp).clip(RoundedCornerShape(12.dp)).background(s.goldSoft),
+                        contentAlignment = Alignment.Center
+                    ) { SNIcon(SNIconName.Coin, 17.dp, s.goldDeep) }
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        paymentAddress,
+                        color = s.text,
+                        style = SonarType.mono(13.0),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Text(
+                        if (paymentCopied) "Copied" else "Copy",
+                        color = if (paymentCopied) s.green else s.accent,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
             }
 
             // ── Identity card ──

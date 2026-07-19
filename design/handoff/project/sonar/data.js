@@ -56,4 +56,21 @@ window.BC_DATA = {
   nsec: 'nsec18gk4m2c7q0e2v9zk5xr3thl6f8s2a7d4ynq9c3uxe650pgh8vrtsq9w7xda',
   myFingerprint: 'a3f9 2c41 770e 5b2d',
   nicknames: ['quietfox', 'tram12', 'lakeswim', 'verdigris', 'morningstatic', 'papercrane', 'northpine', 'softsignal'],
+  // Wallet activity + group transcripts used by bcFreshState / Home Messages.
+  txns: [
+    { key: 't1', peer: 'maya', amount: 5000, dir: 'out', state: 'sealed', time: '18:06' },
+  ],
+  groups: [
+    { id: 'lake', name: 'Lake crew', members: ['maya', 'luca', 'sofia'], preview: 'Maya: bring towels', time: 'Sun', unread: 1 },
+    { id: 'trip', name: 'Weekend trip', members: ['sofia', 'tomas'], preview: 'Sofia: train at 9', time: 'Sat', unread: 0 },
+  ],
+  groupMsgs: {
+    lake: [
+      { author: 'Maya', text: 'bring towels', time: 'Sun', via: 'mesh' },
+      { mine: true, text: 'on it', time: 'Sun', via: 'mesh', state: 'Delivered' },
+    ],
+    trip: [
+      { author: 'Sofia', text: 'train at 9', time: 'Sat', via: 'internet' },
+    ],
+  },
 };

@@ -118,6 +118,8 @@ import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
+import chat.bitchat.sonar.crypto.Bech32
+import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
@@ -125,6 +127,7 @@ import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SonarType
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -4092,20 +4095,84 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
     }
 
 /**
- * "Start a chat" sheet — 1:1 with the iOS SonarHomeScreen compose sheet:
- * nearby Bluetooth peers, a "People nearby" radar entry, and an expandable
- * "Secure chat via npub" field. This is the home compose (cyan) button's action.
+ * "Start a chat" sheet — nearby peers, new discussion (username/NIP-05/key), and new group.
  */
 @Composable
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
-    var npubEntry by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     var groupEntry by remember { mutableStateOf(false) }
-    var npubDraft by remember { mutableStateOf("") }
+    var findUsername by remember { mutableStateOf(false) }
+    var findDraft by remember { mutableStateOf("") }
+    var findResolving by remember { mutableStateOf(false) }
+    var findNpub by remember { mutableStateOf<String?>(null) }
+    var findMiss by remember { mutableStateOf(false) }
+    var findStartError by remember { mutableStateOf<String?>(null) }
+    var findLookupGeneration by remember { mutableStateOf(0) }
+    var findLookupJob by remember { mutableStateOf<Job?>(null) }
     var groupName by remember { mutableStateOf("") }
     var groupMembers by remember { mutableStateOf("") }
     var selectedGroupNpubs by remember { mutableStateOf(setOf<String>()) }
     val inRange = state.meshPeers
+
+    fun resetFind() {
+        findLookupJob?.cancel()
+        findLookupJob = null
+        findLookupGeneration += 1
+        findUsername = false
+        findDraft = ""
+        findResolving = false
+        findNpub = null
+        findMiss = false
+        findStartError = null
+    }
+
+    fun isValidNpub(value: String): Boolean {
+        val decoded = Bech32.decode(value.trim()) ?: return false
+        return decoded.hrp == "npub" && decoded.data.size == 32
+    }
+
+    fun startChatFromFind(npub: String) {
+        findStartError = null
+        if (!isValidNpub(npub)) {
+            findStartError = "That key isn't a valid npub — check it and try again."
+            findNpub = null
+            return
+        }
+        state.startChat(npub)
+        onClose()
+    }
+
+    fun lookupUsername() {
+        val trimmed = findDraft.trim()
+        if (trimmed.isEmpty() || findResolving) return
+        findStartError = null
+        if (trimmed.lowercase().startsWith("npub1")) {
+            if (isValidNpub(trimmed)) {
+                findNpub = trimmed
+                findMiss = false
+            } else {
+                findNpub = null
+                findMiss = false
+                findStartError = "That key isn't a valid npub — check it and try again."
+            }
+            return
+        }
+        if (!SonarCore.handleLooksValid(trimmed)) return
+        findLookupJob?.cancel()
+        findLookupGeneration += 1
+        val generation = findLookupGeneration
+        findResolving = true
+        findMiss = false
+        findNpub = null
+        findLookupJob = scope.launch {
+            val npub = state.resolveHandleForChat(trimmed)
+            if (generation != findLookupGeneration) return@launch
+            findResolving = false
+            if (npub != null) findNpub = npub else findMiss = true
+        }
+    }
+
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -4116,6 +4183,97 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     .verticalScroll(rememberScrollState())
                     .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
             ) {
+                if (findUsername) {
+                    Text("New discussion", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Type a username — just vincenzo for @${state.handleDomain}, a full name@domain, or paste a key.",
+                        color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    val trimmed = findDraft.trim().lowercase()
+                    val showSuffix = trimmed.isNotEmpty() && '@' !in trimmed && !trimmed.startsWith("npub1")
+                    val preview = when {
+                        trimmed.startsWith("npub1") -> trimmed
+                        '@' in trimmed -> trimmed
+                        else -> "$trimmed@${state.handleDomain}"
+                    }
+                    val looksValid = SonarCore.handleLooksValid(findDraft.trim()) ||
+                        findDraft.trim().lowercase().startsWith("npub1")
+                    Row(
+                        Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        SNIcon(SNIconName.Key, 16.dp, s.text3, weight = 2f)
+                        Spacer(Modifier.width(8.dp))
+                        Box(Modifier.weight(1f)) {
+                            if (findDraft.isEmpty()) Text("vincenzo", color = s.text3, fontSize = 14.sp)
+                            BasicTextField(
+                                value = findDraft,
+                                onValueChange = {
+                                    findDraft = it
+                                    findNpub = null
+                                    findMiss = false
+                                    findResolving = false
+                                    findStartError = null
+                                    findLookupJob?.cancel()
+                                    findLookupJob = null
+                                    findLookupGeneration += 1
+                                },
+                                singleLine = true,
+                                textStyle = TextStyle(color = s.text, fontSize = 14.sp),
+                                cursorBrush = SolidColor(s.accent),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (showSuffix) {
+                            Text("@${state.handleDomain}", color = s.text3, style = SonarType.mono(12.0), maxLines = 1)
+                        }
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    when {
+                        findResolving -> Text("Looking up $preview…", color = s.text2, fontSize = 13.sp)
+                        findStartError != null -> Text(findStartError!!, color = s.danger, fontSize = 13.sp)
+                        findMiss -> Text("No Sonar user found at that address.", color = s.danger, fontSize = 13.sp)
+                        findNpub != null -> {
+                            val npub = findNpub!!
+                            Row(
+                                Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(s.surface2)
+                                    .clickable { startChatFromFind(npub) }
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                SonarAvatar(trimmed.substringBefore('@').ifBlank { "user" }, 46.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        trimmed.substringBefore('@').ifBlank { trimmed },
+                                        color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold
+                                    )
+                                    Text(preview, color = s.text2, style = SonarType.mono(12.0), maxLines = 1)
+                                    Text(
+                                        if (npub.length > 22) npub.take(22) + "…" else npub,
+                                        color = s.text3, style = SonarType.mono(11.5), maxLines = 1
+                                    )
+                                }
+                                SNIcon(SNIconName.Chevron, 16.dp, s.text3, weight = 2.4f)
+                            }
+                            Spacer(Modifier.height(10.dp))
+                        }
+                    }
+                    if (findNpub != null) {
+                        SNPrimaryButton("Start encrypted chat") { startChatFromFind(findNpub!!) }
+                    } else {
+                        SNPrimaryButton(
+                            if (findResolving) "Looking up…" else "Look up",
+                            disabled = !looksValid || findResolving,
+                            net = true
+                        ) { lookupUsername() }
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    SNGhostButton("Back") { resetFind() }
+                } else {
                 Text("Start a chat", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(10.dp))
                 if (inRange.isEmpty()) {
@@ -4146,20 +4304,12 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                 ActionRow(SNIconName.Rings, "People nearby", "Open the radar to see everyone in range") {
                     onClose(); state.push(Screen.Nearby)
                 }
-                ActionRow(SNIconName.Key, "Secure chat via npub", "Encrypted chat over the internet — reaches anywhere") {
-                    npubEntry = true; groupEntry = false
+                ActionRow(SNIconName.Key, "New discussion", "Username, name@domain, or paste a key — reaches anywhere") {
+                    findUsername = true; groupEntry = false
+                    findDraft = ""; findNpub = null; findMiss = false
                 }
-                ActionRow(SNIconName.People, "New group", "Invite nearby people or paste npubs") {
-                    groupEntry = true; npubEntry = false
-                }
-                if (npubEntry) {
-                    Spacer(Modifier.height(8.dp))
-                    SheetField(npubDraft, "npub1…") { npubDraft = it }
-                    Spacer(Modifier.height(10.dp))
-                    SNPrimaryButton(
-                        "Start secure chat",
-                        disabled = !npubDraft.trim().startsWith("npub1")
-                    ) { state.startChat(npubDraft.trim()); onClose() }
+                ActionRow(SNIconName.People, "New group", "Invite contacts or paste keys") {
+                    groupEntry = true; findUsername = false
                 }
                 if (groupEntry) {
                     Spacer(Modifier.height(8.dp))
@@ -4185,6 +4335,7 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                         "Create group",
                         disabled = groupName.trim().isEmpty() || members.size < 2
                     ) { state.createGroup(groupName, members); onClose() }
+                }
                 }
             }
         }
