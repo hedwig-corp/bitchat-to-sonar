@@ -3755,6 +3755,7 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val tint = if (net) s.netFill else s.accentFill
     val onTint = if (net) s.onNet else s.onAccent
     val transfer = state.mediaTransferState(media)
+    val isSending = m.mine && (m.state == "Sending" || m.state == "Uploading")
     androidx.compose.runtime.LaunchedEffect(media.url, chatId) {
         state.prepareMedia(chatId, media, autoDownload = true)
     }
@@ -3786,26 +3787,35 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         verticalAlignment = Alignment.CenterVertically
     ) {
         // media-playbtn: 34dp — white 24% on own bubbles, accent-soft on theirs.
+        // Outbound send: Signal-style indeterminate spinner (no horizontal upload bar).
         Box(
             Modifier.size(34.dp).clip(CircleShape)
                 .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
-                .clickable {
-                    when (transfer.phase) {
-                        MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                            state.requestMediaDownload(chatId, media)
-                        MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                        MediaTransferPhase.Available -> {
-                            val b = bytes ?: return@clickable
-                            // onComplete resets `playing` when the note ends, is stopped, or
-                            // another note steals the shared player.
-                            if (playing) AudioNotePlayer.stop()
-                            else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                .then(
+                    if (isSending) Modifier else Modifier.clickable {
+                        when (transfer.phase) {
+                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
+                                state.requestMediaDownload(chatId, media)
+                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
+                            MediaTransferPhase.Available -> {
+                                val b = bytes ?: return@clickable
+                                // onComplete resets `playing` when the note ends, is stopped, or
+                                // another note steals the shared player.
+                                if (playing) AudioNotePlayer.stop()
+                                else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                            }
                         }
                     }
-                },
+                ),
             contentAlignment = Alignment.Center
         ) {
-            when (transfer.phase) {
+            if (isSending) {
+                androidx.compose.material3.CircularProgressIndicator(
+                    color = if (m.mine) Color.White else s.accent,
+                    strokeWidth = 2.dp,
+                    modifier = Modifier.size(18.dp),
+                )
+            } else when (transfer.phase) {
                 MediaTransferPhase.NotDownloaded -> Text("↓", color = if (m.mine) Color.White else s.accentDeep, fontSize = 17.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Downloading -> MediaTransferProgress(transfer, 24.dp)
                 MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)

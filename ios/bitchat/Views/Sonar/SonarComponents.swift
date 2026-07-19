@@ -2372,6 +2372,13 @@ struct SNMediaBubble: View {
     /// deck. A mixed image+audio/file message keeps the single-first rendering
     /// (so audio still gets its player), matching pre-album behavior.
     private var isDeck: Bool { m.media.count > 1 && m.media.allSatisfy { $0.isImage } }
+    /// Horizontal Blossom bar is photo/album-only (Compose + Signal voice parity).
+    private var showsHorizontalUploadBar: Bool {
+        m.state == "Uploading" && (isDeck || (item?.isImage == true))
+    }
+    private var isOutboundPending: Bool {
+        m.mine && (m.state == "Sending" || m.state == "Uploading")
+    }
     private var prepareKey: String {
         guard let item else { return "" }
         return [item.url, item.groupId, item.localPath ?? ""].joined(separator: "|")
@@ -2428,7 +2435,9 @@ struct SNMediaBubble: View {
             VStack(alignment: m.mine ? .trailing : .leading, spacing: 4) {
                 content
                     .overlay(alignment: .bottom) {
-                        if m.state == "Uploading" {
+                        // XChat under-image bar is for photos/albums only.
+                        // Voice notes use Signal-style Sending + control spinner.
+                        if showsHorizontalUploadBar {
                             Group {
                                 if let source = uploadProgressSource {
                                     SNLiveMediaUploadBar(
@@ -2608,6 +2617,7 @@ struct SNMediaBubble: View {
                 mine: m.mine,
                 via: m.via ?? .mesh,
                 transfer: pipeline.state(item),
+                isSending: isOutboundPending,
                 onRequest: { pipeline.request(item) },
                 onCancel: { pipeline.cancel(item) }
             )
@@ -3690,6 +3700,8 @@ struct SNAudioBubble: View {
     let mine: Bool
     var via: SNVia = .mesh
     var transfer: SNMediaTransferState = .notDownloaded
+    /// Outbound Blossom/mesh send in flight — Signal-style spinner on the play control.
+    var isSending: Bool = false
     var onRequest: () -> Void = {}
     var onCancel: () -> Void = {}
 
@@ -3700,6 +3712,7 @@ struct SNAudioBubble: View {
     var body: some View {
         HStack(spacing: 11) {
             Button {
+                guard !isSending else { return }
                 switch transfer.phase {
                 case .notDownloaded, .failed:
                     onRequest()
@@ -3714,6 +3727,7 @@ struct SNAudioBubble: View {
                     .overlay { audioControl }
             }
             .buttonStyle(SNScaleStyle(scale: 0.92))
+            .disabled(isSending)
             SNMediaWave(seed: seed).frame(width: 124, height: 22)
             Text(verbatim: durationText)
                 .font(SonarTheme.monoFont(size: 11.5))
@@ -3731,35 +3745,39 @@ struct SNAudioBubble: View {
         let color = mine
             ? (via == .internet ? SonarTheme.onNet : SonarTheme.onAccent)
             : SonarTheme.accent
-        switch transfer.phase {
-        case .notDownloaded:
-            Image(systemName: "arrow.down")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
-        case .downloading:
-            ZStack {
-                if let progress = transfer.progress {
-                    Circle().stroke(color.opacity(0.28), lineWidth: 2)
-                    Circle()
-                        .trim(from: 0, to: progress)
-                        .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                        .rotationEffect(.degrees(-90))
-                } else {
-                    ProgressView().controlSize(.small).tint(color)
+        if isSending {
+            ProgressView().controlSize(.small).tint(color)
+        } else {
+            switch transfer.phase {
+            case .notDownloaded:
+                Image(systemName: "arrow.down")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .downloading:
+                ZStack {
+                    if let progress = transfer.progress {
+                        Circle().stroke(color.opacity(0.28), lineWidth: 2)
+                        Circle()
+                            .trim(from: 0, to: progress)
+                            .stroke(color, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                    } else {
+                        ProgressView().controlSize(.small).tint(color)
+                    }
+                    Image(systemName: "xmark")
+                        .font(.system(size: 7, weight: .bold))
+                        .foregroundColor(color)
                 }
-                Image(systemName: "xmark")
-                    .font(.system(size: 7, weight: .bold))
+                .padding(5)
+            case .available:
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundColor(color)
+            case .failed:
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 13, weight: .bold))
                     .foregroundColor(color)
             }
-            .padding(5)
-        case .available:
-            Image(systemName: isPlaying ? "pause.fill" : "play.fill")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
-        case .failed:
-            Image(systemName: "arrow.clockwise")
-                .font(.system(size: 13, weight: .bold))
-                .foregroundColor(color)
         }
     }
 }

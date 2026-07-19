@@ -411,11 +411,24 @@ final class MarmotChatModel: ObservableObject {
         guard message.isMine else { return nil }
         if message.id.hasPrefix(failedOptimisticIDPrefix) { return "Couldn't send" }
         if message.id.hasPrefix(optimisticIDPrefix) {
-            return message.media.isEmpty ? "Sending" : "Uploading"
+            return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
         }
         if message.deliveryState == "failed" { return "Couldn't send" }
-        if message.deliveryState == "pending" { return message.media.isEmpty ? "Sending" : "Uploading" }
+        if message.deliveryState == "pending" {
+            return pendingOutboundStateText(hasMedia: !message.media.isEmpty, media: message.media)
+        }
         return "Sent"
+    }
+
+    /// Image/album Blossom uploads use "Uploading" (horizontal bar). Voice notes
+    /// and other non-image attachments match Signal: "Sending" + status spinner.
+    private static func pendingOutboundStateText(
+        hasMedia: Bool,
+        media: [MarmotService.MarmotMedia]
+    ) -> String {
+        guard hasMedia else { return "Sending" }
+        let imageUpload = media.contains(where: \.isImage)
+        return imageUpload ? "Uploading" : "Sending"
     }
 
     static func shouldExposeCachedStickerPack(

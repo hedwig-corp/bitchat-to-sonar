@@ -407,6 +407,7 @@ struct SNMediaItem: Equatable {
     var width: UInt32? = nil
     var height: UInt32? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
+    var isAudio: Bool { mime.hasPrefix("audio/") }
     var isGif: Bool {
         mime.caseInsensitiveCompare("image/gif") == .orderedSame ||
         filename.lowercased().hasSuffix(".gif")

@@ -5357,7 +5357,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val pending = pendingMediaUploads[chatId] ?: return
         val matchingIndices = pending.indices.filter { pending[it].message.id == pendingId }
         val firstIndex = matchingIndices.firstOrNull() ?: return
-        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, "Uploading") ?: return
+        val retryState =
+            if (pending[firstIndex].mime.startsWith("image/")) "Uploading" else "Sending"
+        val retryingMessage = sonarMessageForRetry(pending[firstIndex].message, retryState) ?: return
         for (index in matchingIndices) {
             pending[index] = pending[index].copy(
                 message = retryingMessage,
@@ -6463,7 +6465,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 tsSecs = startedAtSecs,
                 viaInternet = true,
                 media = listOf(SonarMedia(pendingUrl, mime, filename, null, null, null)),
-                state = "Uploading",
+                // Signal-style: voice uses Sending + control spinner, not Uploading bar.
+                state = "Sending",
             )
             rememberPendingMediaUpload(
                 chatId,
