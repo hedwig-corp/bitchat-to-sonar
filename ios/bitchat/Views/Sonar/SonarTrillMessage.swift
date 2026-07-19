@@ -82,9 +82,6 @@ enum SonarTrillAlert: Equatable {
     case buzz
     /// Background: local notification with the trill sound.
     case notify
-    /// Background but inside the throttle window: notification without sound
-    /// ("excess trills persist and count unread but alert silently").
-    case notifySilently
 }
 
 enum SonarTrillPolicy {
@@ -96,7 +93,8 @@ enum SonarTrillPolicy {
     /// Decision table for one incoming trill. `admitThrottle` is a closure so
     /// a muted/blocked/replayed trill never consumes the throttle window —
     /// the receiver enforces its own window because client cooldowns cannot
-    /// be trusted.
+    /// be trusted. Throttled trills are row-only on both platforms (no silent
+    /// banner) — "at most one alert per window".
     static func alertDecision(
         arrivedBeforeLaunch: Bool,
         isBlocked: Bool,
@@ -105,9 +103,7 @@ enum SonarTrillPolicy {
         admitThrottle: () -> Bool
     ) -> SonarTrillAlert {
         if isBlocked || arrivedBeforeLaunch || isMuted { return .suppress }
-        guard admitThrottle() else {
-            return isForeground ? .suppress : .notifySilently
-        }
+        guard admitThrottle() else { return .suppress }
         return isForeground ? .buzz : .notify
     }
 
@@ -119,7 +115,7 @@ enum SonarTrillPolicy {
 }
 
 /// Per-chat alert throttle: at most one buzz/notification per chat per
-/// window. Excess trills still persist as rows but alert silently.
+/// window. Excess trills still persist as rows but produce no alert.
 final class SonarTrillThrottle {
     static let shared = SonarTrillThrottle()
 

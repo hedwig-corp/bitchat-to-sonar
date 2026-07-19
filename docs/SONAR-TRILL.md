@@ -80,8 +80,9 @@ than the chat's notification level already allows.**
 - **Sender cooldown**: the nudge action is disabled for 8 s per chat after
   sending (MSN's own guard).
 - **Receiver alert throttle**: at most one `buzz()`/notification per chat per
-  8 s window; excess trills still persist as rows but alert silently. Client
-  cooldowns cannot be trusted — the receiver enforces its own window.
+  8 s window; excess trills still persist as rows but produce no alert (no
+  silent banner either). Client cooldowns cannot be trusted — the receiver
+  enforces its own window.
 
 ## Per-chat mute (shipped with trill; general, not trill-specific)
 

@@ -19,7 +19,7 @@ enum SonarNotificationSound {
     case ble
     /// MSN-style nudge (⚡TRILL) — the distinct trill bell.
     case trill
-    /// Deliver visually with no sound (throttled trills alert silently).
+    /// Deliver visually with no sound.
     case silent
 }
 

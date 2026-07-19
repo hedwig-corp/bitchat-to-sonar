@@ -47,7 +47,7 @@ internal const val TRILL_SEND_COOLDOWN_MS = 8_000L
 /** Receiver-side guard: at most one buzz/notification per chat per window.
  *  Client cooldowns cannot be trusted — the receiver enforces its own window
  *  on a monotonic clock. Excess trills still persist as rows and count unread;
- *  they just alert silently. */
+ *  they just produce no alert. */
 internal const val TRILL_ALERT_WINDOW_MS = 8_000L
 
 internal class TrillAlertThrottle(private val windowMs: Long = TRILL_ALERT_WINDOW_MS) {

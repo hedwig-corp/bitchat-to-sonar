@@ -255,12 +255,13 @@ enum SonarPushProcessor {
                SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
                 continue
             }
-            // Receiver trill throttle: one audible alert per chat per window;
-            // excess trills still banner, silently.
+            // Receiver trill throttle: one alert per chat per window; excess
+            // trills stay row-only (no silent banner — matches Android).
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
                 let throttleKey = notif.groupName.isEmpty ? notif.senderNpub : notif.groupName
-                sound = SonarTrillThrottle.shared.admit(chatKey: throttleKey) ? .trill : .silent
+                guard SonarTrillThrottle.shared.admit(chatKey: throttleKey) else { continue }
+                sound = .trill
             }
 
             let senderName: String?
@@ -361,10 +362,11 @@ enum SonarPushProcessor {
             if kind == .call { continue }
             // Per-chat mute: unread still accrues, no banner.
             if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) { continue }
-            // Receiver trill throttle (silent banner inside the window).
+            // Receiver trill throttle: excess trills stay row-only.
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
-                sound = SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) ? .trill : .silent
+                guard SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) else { continue }
+                sound = .trill
             }
 
             let senderName: String?

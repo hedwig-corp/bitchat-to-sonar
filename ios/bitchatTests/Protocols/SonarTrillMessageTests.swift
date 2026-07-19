@@ -159,7 +159,7 @@ final class SonarTrillMessageTests: XCTestCase {
         XCTAssertEqual(decision, .notify)
     }
 
-    func testThrottledBackgroundTrillAlertsSilently() {
+    func testThrottledBackgroundTrillIsRowOnly() {
         let decision = SonarTrillPolicy.alertDecision(
             arrivedBeforeLaunch: false,
             isBlocked: false,
@@ -167,7 +167,8 @@ final class SonarTrillMessageTests: XCTestCase {
             isForeground: false,
             admitThrottle: { false }
         )
-        XCTAssertEqual(decision, .notifySilently)
+        // At most one alert per window — no silent banner either (Android parity).
+        XCTAssertEqual(decision, .suppress)
     }
 
     func testThrottledForegroundTrillIsRowOnly() {

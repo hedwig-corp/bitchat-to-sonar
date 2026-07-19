@@ -3796,6 +3796,13 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  the local buzz effect (design parity). */
     fun sendTrill(chatId: String) {
         if (!canSendTrill(chatId)) return
+        // Mirror send()'s blocked-contact guard before burning the cooldown or
+        // buzzing locally — otherwise a blocked nudge locks the button for 8s
+        // and shakes the sender while never leaving the device.
+        if (isContactBlocked(chatId)) {
+            toast = "Unblock to send a nudge"
+            return
+        }
         trillCooldownUntilMs = trillCooldownUntilMs +
             (chatId to SonarClock.monotonicMillis() + TRILL_SEND_COOLDOWN_MS)
         send(chatId, TrillLine(randomTrillId()).encoded())
@@ -3806,6 +3813,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  actions and receive callbacks. The shake itself honors reduce-motion in
      *  TrillShakeHost; TrillEffects dispatches sound/haptic off-thread. */
     private fun triggerTrillBuzz() {
+        // Never disturb an active call's audio session or UI (iOS parity).
+        if (activeCall != null) return
         trillShakeTick++
         TrillEffects.buzz()
     }

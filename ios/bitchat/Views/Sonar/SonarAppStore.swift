@@ -7154,7 +7154,7 @@ final class SonarAppStore: ObservableObject {
             break
         case .buzz:
             triggerTrillBuzz()
-        case .notify, .notifySilently:
+        case .notify:
             sendSonarNotification(
                 kind: .trill,
                 idKey: messageId,
@@ -7163,7 +7163,7 @@ final class SonarAppStore: ObservableObject {
                 senderName: senderName,
                 groupName: groupName,
                 preview: content,
-                sound: decision == .notify ? .trill : .silent
+                sound: .trill
             )
         }
     }
