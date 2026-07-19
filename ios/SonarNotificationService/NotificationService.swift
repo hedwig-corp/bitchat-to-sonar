@@ -374,9 +374,13 @@ class NotificationService: SDKNotificationService {
         to content: UNMutableNotificationContent,
         prefs: NSENotificationPrefs
     ) {
+        // App Group kind-0 mirror — never fetchProfile (relay) from the NSE.
+        // Without this, kill-state banners only show pubkey fingerprints.
+        let senderRaw = SonarSharedProfileNames.bestName(for: notification.senderNpub)
+            ?? notification.senderNpub
         let rendered = SonarNSEDecoratePolicy.render(
             input: .init(
-                senderRaw: notification.senderNpub,
+                senderRaw: senderRaw,
                 groupName: notification.groupName,
                 contentPreview: notification.contentPreview
             ),

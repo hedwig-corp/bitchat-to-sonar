@@ -71,16 +71,23 @@ enum SNMarmotProfileCache {
         guard let data = defaults.data(forKey: defaultsKey),
               let profiles = try? JSONDecoder().decode([String: MarmotService.Profile].self, from: data)
         else { return [:] }
-        return normalized(profiles)
+        let loaded = normalized(profiles)
+        // Keep the NSE App Group name mirror warm even when nothing new was
+        // fetched this session (kill-state Transponder banners need aliases).
+        syncSharedProfileNames(loaded)
+        return loaded
     }
 
     static func save(_ profiles: [String: MarmotService.Profile], to defaults: UserDefaults) {
-        guard let data = try? JSONEncoder().encode(normalized(profiles)) else { return }
+        let normalizedProfiles = normalized(profiles)
+        guard let data = try? JSONEncoder().encode(normalizedProfiles) else { return }
         defaults.set(data, forKey: defaultsKey)
+        syncSharedProfileNames(normalizedProfiles)
     }
 
     static func clear(from defaults: UserDefaults) {
         defaults.removeObject(forKey: defaultsKey)
+        SonarSharedProfileNames.clear()
     }
 
     private static func normalized(_ profiles: [String: MarmotService.Profile]) -> [String: MarmotService.Profile] {
@@ -90,6 +97,47 @@ enum SNMarmotProfileCache {
                 result[key] = entry.value
             }
         }
+    }
+
+    /// Mirror bestName under both npub and hex so NSE drain senders (often hex)
+    /// resolve without Bech32 / relay fetch inside the appex.
+    private static func syncSharedProfileNames(_ profiles: [String: MarmotService.Profile]) {
+        var names: [String: String] = [:]
+        for (key, profile) in profiles {
+            guard let best = profile.bestName?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !best.isEmpty else { continue }
+            names[key] = best
+            names[key.lowercased()] = best
+            if let hex = pubkeyHex(for: key) {
+                names[hex] = best
+                names[hex.lowercased()] = best
+            }
+            if let npub = npub(for: key) {
+                names[npub] = best
+            }
+        }
+        SonarSharedProfileNames.save(names)
+    }
+
+    private static func pubkeyHex(for key: String) -> String? {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {
+            return trimmed.lowercased()
+        }
+        guard trimmed.hasPrefix("npub1"),
+              let decoded = try? Bech32.decode(trimmed),
+              decoded.hrp == "npub",
+              decoded.data.count == 32 else { return nil }
+        return decoded.data.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func npub(for key: String) -> String? {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("npub1") { return canonicalKey(trimmed) }
+        guard let data = Data(hexString: trimmed), data.count == 32,
+              let encoded = try? Bech32.encode(hrp: "npub", data: data) else { return nil }
+        return encoded
     }
 }
 
@@ -2311,9 +2359,11 @@ final class MarmotChatModel: ObservableObject {
             ?? profilesByNpub[member]?.bestName
     }
 
-    /// Resolve sender name for push notifications: cached profile → fetch → short npub.
+    /// Resolve sender name for push notifications: in-memory kind-0 → App Group
+    /// mirror (NSE-shared) → relay fetch → short npub.
     func resolveSenderName(npub: String) async -> String {
         if let cached = displayName(forNpub: npub) { return cached }
+        if let shared = SonarSharedProfileNames.bestName(for: npub) { return shared }
         if let profile = try? await service.fetchProfile(npub: npub),
            let name = profile.bestName { return name }
         return String(npub.prefix(12)) + "…"

@@ -20,6 +20,7 @@
 		A15C0DE300000000000000E1 /* MarmotStoreLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15C0DE300000000000000E0 /* MarmotStoreLock.swift */; };
 		A15C0DE300000000000000E3 /* MarmotAppGroupStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15C0DE300000000000000E2 /* MarmotAppGroupStore.swift */; };
 		A15C0DE300000000000000E5 /* SonarNSEDecoratePolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15C0DE300000000000000E4 /* SonarNSEDecoratePolicy.swift */; };
+		A15C0DE300000000000000E7 /* SonarSharedProfileNames.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15C0DE300000000000000E6 /* SonarSharedProfileNames.swift */; };
 		885BBED78092484A5B069461 /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 4EB6BA1B8464F1EA38F4E286 /* P256K */; };
 		A15C0DE000000000000000A4 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A2 /* SonarCore */; };
 		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
@@ -110,6 +111,7 @@
 		A15C0DE300000000000000E0 /* MarmotStoreLock.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MarmotStoreLock.swift; path = bitchat/Services/MarmotStoreLock.swift; sourceTree = SOURCE_ROOT; };
 		A15C0DE300000000000000E2 /* MarmotAppGroupStore.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MarmotAppGroupStore.swift; path = bitchat/Services/MarmotAppGroupStore.swift; sourceTree = SOURCE_ROOT; };
 		A15C0DE300000000000000E4 /* SonarNSEDecoratePolicy.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SonarNSEDecoratePolicy.swift; path = bitchat/Services/SonarNSEDecoratePolicy.swift; sourceTree = SOURCE_ROOT; };
+		A15C0DE300000000000000E6 /* SonarSharedProfileNames.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = SonarSharedProfileNames.swift; path = bitchat/Services/SonarSharedProfileNames.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -268,6 +270,7 @@
 				A15C0DE300000000000000E0 /* MarmotStoreLock.swift */,
 				A15C0DE300000000000000E2 /* MarmotAppGroupStore.swift */,
 				A15C0DE300000000000000E4 /* SonarNSEDecoratePolicy.swift */,
+				A15C0DE300000000000000E6 /* SonarSharedProfileNames.swift */,
 				A11D50000000000000000004 /* sonar_notification.wav */,
 				A11D51000000000000000004 /* sonar_ble_notification.wav */,
 				A6E32C972E762EA70032EA8A /* bitchat */,
@@ -617,6 +620,7 @@
 				A15C0DE300000000000000E1 /* MarmotStoreLock.swift in Sources */,
 				A15C0DE300000000000000E3 /* MarmotAppGroupStore.swift in Sources */,
 				A15C0DE300000000000000E5 /* SonarNSEDecoratePolicy.swift in Sources */,
+				A15C0DE300000000000000E7 /* SonarSharedProfileNames.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */

@@ -50,6 +50,28 @@ struct SonarNSEDecoratePolicyTests {
         #expect(out.body == "hi")
     }
 
+    @Test("cached kind-0 bestName wins over hex fingerprint")
+    func cachedAliasWins() {
+        let hex = String(repeating: "cd", count: 32)
+        #expect(
+            SonarNSEDecoratePolicy.senderLabel(for: hex, cachedBestName: "Alice") == "Alice"
+        )
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "Sonar agent DM", contentPreview: "hi"),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(out.title == "Alice")
+    }
+
+    @Test("App Group profile name map resolves hex sender")
+    func sharedProfileNamesResolveHex() {
+        let hex = String(repeating: "ef", count: 32)
+        let names = [hex: "Bob", hex.uppercased(): "Bob"]
+        #expect(SonarSharedProfileNames.bestName(for: hex, in: names) == "Bob")
+        #expect(SonarSharedProfileNames.bestName(for: hex.uppercased(), in: names) == "Bob")
+        #expect(SonarSharedProfileNames.bestName(for: "unknown", in: names) == nil)
+    }
+
     @Test("placeholder group names are dropped for 1:1 titles")
     func placeholderGroupDropped() {
         #expect(SonarNSEDecoratePolicy.meaningfulGroupName("Sonar agent DM") == nil)

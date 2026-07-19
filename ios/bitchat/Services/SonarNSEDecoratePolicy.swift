@@ -46,10 +46,16 @@ enum SonarNSEDecoratePolicy {
     }
 
     /// Local-only sender label — never hits relays from the NSE.
-    /// Hex pubkeys without a kind-0 cache use a short fingerprint (not the
-    /// opaque "New message" string that looked like a second generic banner
-    /// next to the host's named local notification).
-    static func senderLabel(for raw: String) -> String? {
+    /// Prefer a cached kind-0 `bestName` from the App Group mirror; otherwise
+    /// hex pubkeys use a short fingerprint (not the opaque "New message"
+    /// string that looked like a second generic banner next to the host's
+    /// named local notification).
+    static func senderLabel(for raw: String, cachedBestName: String? = nil) -> String? {
+        if let cached = cachedBestName?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !cached.isEmpty {
+            return cached
+        }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         if trimmed.count == 64, trimmed.allSatisfy(\.isHexDigit) {

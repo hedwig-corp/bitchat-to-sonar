@@ -95,8 +95,8 @@ Ship as stacked PRs if needed: **P0 → P1 → P2+P3 → P4**. Do not land App G
 
 | Platform | Status | Follow-up |
 | --- | --- | --- |
-| iOS NSE (`SonarNotificationService`) | Hydrate + decorate + host replace of `nseDecorated` (#362 / #381) | — |
-| Android host/FCM (`SonarPushProcessingService`) | Already syncs-on-push into local DB before/with notification | Confirm banner-replace / dual-banner stacking does not regress vs iOS `nseDecorated` remove-before-post; no Android code change in #381 |
+| iOS NSE (`SonarNotificationService`) | Hydrate + decorate + host replace of `nseDecorated` (#362 / #381); App Group `SonarSharedProfileNames` mirrors kind-0 aliases for kill-state titles | — |
+| Android host/FCM (`SonarPushProcessingService`) | Already syncs-on-push; `resolvePushSenderName` uses persisted kind-0 cache then fetch | Confirm banner-replace / dual-banner stacking does not regress vs iOS `nseDecorated` remove-before-post; no Android code change in #381 |
 
 **Gap reason:** APNs NSE + App Group SQLCipher is iOS-only; Android already used a host FCM path. Follow-up is parity verification + any dual-banner fixes on Compose, not blocking this iOS ship.
 
