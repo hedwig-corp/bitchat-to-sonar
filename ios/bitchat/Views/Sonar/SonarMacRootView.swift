@@ -1657,7 +1657,6 @@ private struct MacRadarPeerRow: View {
 private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     case profile
     case findUsername
-    case secureChat
     case newGroup
     case settings
     case nearby
@@ -1668,7 +1667,6 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return .key
         case .findUsername: return .key
-        case .secureChat: return .key
         case .newGroup: return .people
         case .settings: return .list
         case .nearby: return .rings
@@ -1678,8 +1676,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .profile: return "Profile"
-        case .findUsername: return "Find by username"
-        case .secureChat: return "Secure chat via npub"
+        case .findUsername: return "New discussion"
         case .newGroup: return "New group"
         case .settings: return "Settings"
         case .nearby: return "People Nearby"
@@ -1689,9 +1686,8 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var sub: String {
         switch self {
         case .profile: return "Name, username, key sharing, and payment address"
-        case .findUsername: return "e.g. vincenzo · or name@domain · reaches anywhere"
-        case .secureChat: return "Encrypted chat over the internet - reaches anywhere"
-        case .newGroup: return "Invite people by npub"
+        case .findUsername: return "Username, name@domain, or paste a key — reaches anywhere"
+        case .newGroup: return "Invite contacts or paste keys"
         case .settings: return "Appearance, network, wallet, and privacy"
         case .nearby: return "Open Sonar discovery"
         }
@@ -1704,8 +1700,6 @@ private struct MacCommandPalette: View {
     let openSettings: () -> Void
     @Binding var isPresented: Bool
     @State private var query = ""
-    @State private var npubDraft = ""
-    @State private var npubEntry = false
     @State private var findUsernameEntry = false
     @State private var findDraft = ""
     @State private var findResolving = false
@@ -1822,11 +1816,14 @@ private struct MacCommandPalette: View {
                                 }
                             )
                         }
-                        if npubEntry || canStartSecureChatFromQuery {
+                        if canStartSecureChatFromQuery {
                             MacNpubComposeCard(
-                                npub: secureChatBinding,
+                                npub: Binding(
+                                    get: { query },
+                                    set: { query = $0 }
+                                ),
                                 errorText: store.marmot.errorText,
-                                onStart: { startSecureChatFromDraft() }
+                                onStart: { startSecureChat(with: trimmedQuery) }
                             )
                         }
                         if groupEntry {
@@ -1887,7 +1884,6 @@ private struct MacCommandPalette: View {
         }
         .onChange(of: isPresented) { open in
             if !open {
-                npubEntry = false
                 groupEntry = false
                 findUsernameEntry = false
                 findDraft = ""
@@ -1896,7 +1892,6 @@ private struct MacCommandPalette: View {
                 findMiss = false
                 findStartError = nil
                 findLookupGeneration &+= 1
-                npubDraft = ""
                 groupNameDraft = ""
                 groupMembersDraft = ""
                 selectedGroupNpubs = []
@@ -1929,16 +1924,6 @@ private struct MacCommandPalette: View {
         !canStartSecureChatFromQuery
             && !trimmedQuery.isEmpty
             && MarmotService.handleLooksValid(trimmedQuery)
-    }
-
-    private var secureChatBinding: Binding<String> {
-        if canStartSecureChatFromQuery {
-            return Binding(
-                get: { query },
-                set: { query = $0 }
-            )
-        }
-        return $npubDraft
     }
 
     private var filteredChannels: [SNChannelItem] {
@@ -1989,26 +1974,16 @@ private struct MacCommandPalette: View {
         case .profile:
             choose(SonarMacSelection.profile)
         case .findUsername:
-            if canStartHandleChatFromQuery {
+            if canStartSecureChatFromQuery {
+                startSecureChat(with: trimmedQuery)
+            } else if canStartHandleChatFromQuery {
                 resolveHandleAndStartChat()
             } else {
-                if findDraft.isEmpty, !trimmedQuery.hasPrefix("npub"), !trimmedQuery.isEmpty {
+                if findDraft.isEmpty, !trimmedQuery.isEmpty {
                     findDraft = trimmedQuery
                 }
                 findUsernameEntry = true
-                npubEntry = false
                 groupEntry = false
-            }
-        case .secureChat:
-            if canStartSecureChatFromQuery {
-                startSecureChat(with: trimmedQuery)
-            } else {
-                if npubDraft.isEmpty, trimmedQuery.hasPrefix("npub") {
-                    npubDraft = trimmedQuery
-                }
-                npubEntry = true
-                groupEntry = false
-                findUsernameEntry = false
             }
         case .newGroup:
             if groupNameDraft.isEmpty, !trimmedQuery.hasPrefix("npub") {
@@ -2016,7 +1991,6 @@ private struct MacCommandPalette: View {
             } else if groupMembersDraft.isEmpty, trimmedQuery.hasPrefix("npub") {
                 groupMembersDraft = trimmedQuery
             }
-            npubEntry = false
             findUsernameEntry = false
             groupEntry = true
         case .settings:
@@ -2100,11 +2074,6 @@ private struct MacCommandPalette: View {
                 choose(.dm(peer.id))
             }
         }
-    }
-
-    private func startSecureChatFromDraft() {
-        let npub = secureChatBinding.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        startSecureChat(with: npub)
     }
 
     private func startSecureChat(with npub: String) {
@@ -2225,7 +2194,7 @@ private struct MacFindUsernameCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("Type a Sonar username or paste an npub.")
+            Text("Type a username, name@domain, or paste a key.")
                 .font(SonarTheme.uiFont(size: 13))
                 .foregroundColor(SonarTheme.text2)
             HStack(spacing: 8) {

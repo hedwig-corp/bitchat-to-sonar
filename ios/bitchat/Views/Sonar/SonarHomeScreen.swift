@@ -26,7 +26,6 @@ struct SonarHomeScreen: View {
     @State private var searchSheet = false
     @State private var composeSheet = false
     @State private var pendingInvite: MarmotService.GroupInvite?
-    @State private var npubEntry = false
     @State private var groupEntry = false
     @State private var findUsername = false
     @State private var findDraft = ""
@@ -36,7 +35,6 @@ struct SonarHomeScreen: View {
     /// Bumped on draft edit / Back so in-flight lookups cannot apply stale results.
     @State private var findLookupGeneration = 0
     @State private var findStartError: String?
-    @State private var npubDraft = ""
     @State private var groupNameDraft = ""
     @State private var groupMembersDraft = ""
     @State private var selectedGroupNpubs: Set<String> = []
@@ -94,7 +92,7 @@ struct SonarHomeScreen: View {
         .snSheet(isPresented: $searchSheet, title: "Search") {
             SNSearchSheetContent(onClose: { searchSheet = false })
         }
-        .snSheet(isPresented: $composeSheet, title: findUsername ? "Find someone" : "Start a chat") {
+        .snSheet(isPresented: $composeSheet, title: findUsername ? "New discussion" : "Start a chat") {
             if findUsername {
                 findUsernameContent
             } else {
@@ -114,7 +112,6 @@ struct SonarHomeScreen: View {
         }
         .onChange(of: composeSheet) { open in
             if !open {
-                npubEntry = false
                 groupEntry = false
                 findUsername = false
                 findDraft = ""
@@ -123,7 +120,6 @@ struct SonarHomeScreen: View {
                 findMiss = false
                 findLookupGeneration &+= 1
                 findStartError = nil
-                npubDraft = ""
                 groupNameDraft = ""
                 groupMembersDraft = ""
                 selectedGroupNpubs = []
@@ -305,7 +301,7 @@ struct SonarHomeScreen: View {
         .padding(.bottom, 12)
     }
 
-    // ── Compose sheet: nearby peers + radar + secure chat via npub ──
+    // ── Compose sheet: nearby peers + radar + new discussion + group ──
     private var composeContent: some View {
         let inRange = store.nearbyPeers.filter(\.inRange)
         return ScrollView {
@@ -342,26 +338,16 @@ struct SonarHomeScreen: View {
                     composeSheet = false
                     store.push(.nearby)
                 }
-                SNActionRow(icon: .key, label: "Find by username", desc: "e.g. vincenzo · or name@domain · reaches anywhere") {
+                SNActionRow(icon: .key, label: "New discussion", desc: "Username, name@domain, or paste a key — reaches anywhere") {
                     findUsername = true
-                    npubEntry = false
                     groupEntry = false
                     findDraft = ""
                     findNpub = nil
                     findMiss = false
                 }
-                SNActionRow(icon: .key, label: "Secure chat via npub", desc: "Encrypted chat over the internet — reaches anywhere") {
-                    npubEntry = true
-                    groupEntry = false
-                    findUsername = false
-                }
-                SNActionRow(icon: .people, label: "New group", desc: "Invite people by npub") {
+                SNActionRow(icon: .people, label: "New group", desc: "Invite contacts or paste keys") {
                     groupEntry = true
-                    npubEntry = false
                     findUsername = false
-                }
-                if npubEntry {
-                    npubField
                 }
                 if groupEntry {
                     groupField
@@ -383,7 +369,7 @@ struct SonarHomeScreen: View {
         }()
         return ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("Type a Sonar username — just vincenzo for a @\(SonarAppStore.handleDomain) account, or a full address like name@domain. You can also paste a raw npub.")
+                Text("Type a username — just vincenzo for @\(SonarAppStore.handleDomain), a full name@domain, or paste a key.")
                     .font(SonarTheme.uiFont(size: 13.5))
                     .foregroundColor(SonarTheme.text2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -543,39 +529,6 @@ struct SonarHomeScreen: View {
                 findMiss = true
             }
         }
-    }
-
-    private var npubField: some View {
-        VStack(spacing: 8) {
-            TextField(
-                "",
-                text: $npubDraft,
-                prompt: Text(verbatim: "npub1\u{2026}").foregroundColor(SonarTheme.text3)
-            )
-            .textFieldStyle(.plain)
-            .font(SonarTheme.monoFont(size: 13))
-            .foregroundColor(SonarTheme.text)
-            #if os(iOS)
-            .textInputAutocapitalization(.never)
-            .autocorrectionDisabled()
-            #endif
-            .padding(EdgeInsets(top: 11, leading: 14, bottom: 11, trailing: 14))
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(SonarTheme.surface2))
-            if let err = store.marmot.errorText {
-                Text(verbatim: err)
-                    .font(SonarTheme.uiFont(size: 12))
-                    .foregroundColor(SonarTheme.danger)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            SNPrimaryButton(
-                label: "Start secure chat",
-                disabled: !npubDraft.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("npub1")
-            ) {
-                store.startSecureChat(npub: npubDraft)
-                composeSheet = false
-            }
-        }
-        .padding(EdgeInsets(top: 6, leading: 10, bottom: 2, trailing: 10))
     }
 
     private var groupField: some View {

@@ -279,8 +279,8 @@ function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure }) {
       ))}
       <div style={{ height: 1, background: 'var(--hairline)', margin: '6px 12px' }}></div>
       <ActionRow icon="people" label="People nearby" desc="Open the radar to see everyone in range" onClick={onRadar} />
-      <ActionRow icon="key" label="Find by username" desc={'e.g. vincenzo · or name@domain · reaches anywhere'} onClick={() => setFind(true)} />
-      <ActionRow icon="plus" label="New group" desc="Private, encrypted, with people you choose" onClick={onNewGroup} />
+      <ActionRow icon="key" label="New discussion" desc={'Username, name@domain, or paste a key — reaches anywhere'} onClick={() => setFind(true)} />
+      <ActionRow icon="plus" label="New group" desc="Invite contacts or paste keys" onClick={onNewGroup} />
     </Sheet>
   );
 }

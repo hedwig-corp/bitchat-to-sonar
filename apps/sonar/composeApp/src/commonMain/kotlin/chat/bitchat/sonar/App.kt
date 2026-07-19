@@ -4039,13 +4039,12 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
     }
 
 /**
- * "Start a chat" sheet — nearby peers, Find by username, npub, and new group.
+ * "Start a chat" sheet — nearby peers, new discussion (username/NIP-05/key), and new group.
  */
 @Composable
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
     val scope = rememberCoroutineScope()
-    var npubEntry by remember { mutableStateOf(false) }
     var groupEntry by remember { mutableStateOf(false) }
     var findUsername by remember { mutableStateOf(false) }
     var findDraft by remember { mutableStateOf("") }
@@ -4055,7 +4054,6 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     var findStartError by remember { mutableStateOf<String?>(null) }
     var findLookupGeneration by remember { mutableStateOf(0) }
     var findLookupJob by remember { mutableStateOf<Job?>(null) }
-    var npubDraft by remember { mutableStateOf("") }
     var groupName by remember { mutableStateOf("") }
     var groupMembers by remember { mutableStateOf("") }
     var selectedGroupNpubs by remember { mutableStateOf(setOf<String>()) }
@@ -4130,10 +4128,10 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
             ) {
                 if (findUsername) {
-                    Text("Find someone", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text("New discussion", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "Type a Sonar username — just vincenzo for a @${state.handleDomain} account, or a full address like name@domain. You can also paste a raw npub.",
+                        "Type a username — just vincenzo for @${state.handleDomain}, a full name@domain, or paste a key.",
                         color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp
                     )
                     Spacer(Modifier.height(12.dp))
@@ -4250,24 +4248,12 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                 ActionRow(SNIconName.Rings, "People nearby", "Open the radar to see everyone in range") {
                     onClose(); state.push(Screen.Nearby)
                 }
-                ActionRow(SNIconName.Key, "Find by username", "e.g. vincenzo · or name@domain · reaches anywhere") {
-                    findUsername = true; npubEntry = false; groupEntry = false
+                ActionRow(SNIconName.Key, "New discussion", "Username, name@domain, or paste a key — reaches anywhere") {
+                    findUsername = true; groupEntry = false
                     findDraft = ""; findNpub = null; findMiss = false
                 }
-                ActionRow(SNIconName.Key, "Secure chat via npub", "Encrypted chat over the internet — reaches anywhere") {
-                    npubEntry = true; groupEntry = false; findUsername = false
-                }
-                ActionRow(SNIconName.People, "New group", "Invite nearby people or paste npubs") {
-                    groupEntry = true; npubEntry = false; findUsername = false
-                }
-                if (npubEntry) {
-                    Spacer(Modifier.height(8.dp))
-                    SheetField(npubDraft, "npub1…") { npubDraft = it }
-                    Spacer(Modifier.height(10.dp))
-                    SNPrimaryButton(
-                        "Start secure chat",
-                        disabled = !npubDraft.trim().startsWith("npub1")
-                    ) { state.startChat(npubDraft.trim()); onClose() }
+                ActionRow(SNIconName.People, "New group", "Invite contacts or paste keys") {
+                    groupEntry = true; findUsername = false
                 }
                 if (groupEntry) {
                     Spacer(Modifier.height(8.dp))
