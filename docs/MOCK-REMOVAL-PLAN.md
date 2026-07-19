@@ -40,7 +40,7 @@ value rendered now comes from the real services:
 | 12 | Settings: Read receipts toggle | **HIDDEN** | Read receipts are always sent by `PrivateChatManager`; needs a real pref the manager consults before unhiding. |
 | 13 | Settings: Message requests (fake "driftwood" request) | **HIDDEN** | Needs a real message-request queue (unknown-sender gating) in the chat pipeline. |
 | 14 | Settings: App icon picker (Cyan/Midnight/Paper) | **HIDDEN** | No `CFBundleAlternateIcons` registered. Register alternate icons + `setAlternateIconName` to unhide. |
-| 15 | Settings: Notifications sheet (allow / show names / preview toggles) | **HIDDEN** | No real prefs exist; `NotificationService` ignores them. Add prefs it consults (and reflect UNAuthorizationStatus) to unhide. |
+| 15 | Settings: Notifications sheet (allow / show names / preview toggles) | **SHIPPED** | Prefs live in `SonarNotificationPreferenceStore`; mesh/mention paths and `SonarPushProcessor` route through `SonarLocalNotificationRouter`. Killed-app NSE still lacks Marmot DB (#146) so names/previews stay generic until App Group catch-up. |
 | 16 | Settings: Data & storage ("124 MB", "Wi-Fi only") | **HIDDEN** | Fabricated numbers. Needs real storage measurement / data-usage policy. |
 | 17 | Settings: Help row | **HIDDEN** | No destination. Needs a real help URL/screen. |
 | 18 | Composer "+" sheet: "Share location" row | **HIDDEN** | Needs a real location-share message type over mesh/Nostr. ("People nearby" kept — it opens the real radar.) |

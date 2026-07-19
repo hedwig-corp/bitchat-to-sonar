@@ -28,6 +28,7 @@ class NotificationService: SDKNotificationService {
 
     private static let appGroupId = "group.sh.hedwig.sonar"
     private static let notificationsEnabledKey = "sonar.notifications.enabled"
+    private static let showNamesKey = "sonar.notifications.showNames"
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
     private static let notificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
@@ -191,14 +192,31 @@ class NotificationService: SDKNotificationService {
 
     private static func configureTransponderNotification(_ content: UNMutableNotificationContent) {
         // Never trust provider payload copy for user-visible text. Transponder
-        // pushes are plaintext-free wakeups; the app renders precise copy after open.
-        content.title = "New Sonar message"
+        // pushes are plaintext-free wakeups. The NSE has no Marmot DB in the
+        // App Group yet (#146), so names/previews cannot be rendered here —
+        // honor Show names only for the generic title, and let the background
+        // SonarPushProcessor replace this banner with prefs-aware copy once
+        // unread state is available.
+        //
+        // Mark with sonar.nsePlaceholder so the app can remove THIS banner by
+        // identity — never by matching title/body (those strings are also the
+        // router's privacy fallback when Show names + Message preview are off).
+        let showNames = notificationShowNames()
+        content.title = showNames ? "New Sonar message" : "Sonar"
         content.body = "Open Sonar to read it."
         content.sound = notificationSound
         content.categoryIdentifier = "sonar.message"
+        var info = content.userInfo
+        info["sonar.nsePlaceholder"] = true
+        content.userInfo = info
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active
         }
+    }
+
+    private static func notificationShowNames() -> Bool {
+        guard let defaults = UserDefaults(suiteName: appGroupId) else { return true }
+        return defaults.object(forKey: showNamesKey) as? Bool ?? true
     }
 
     private static func mutableContent(for request: UNNotificationRequest) -> UNMutableNotificationContent {

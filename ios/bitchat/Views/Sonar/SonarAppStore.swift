@@ -590,9 +590,9 @@ final class SonarAppStore: ObservableObject {
         static let marmotConversationGroups = "sonar.marmotConversationGroups.v1"
         /// Persisted local call-log rows ([conversation id: call records] JSON).
         static let callLogs = "sonar.callLogs.v1"
-        static let notificationsEnabled = "sonar.notifications.enabled"
-        static let notificationShowNames = "sonar.notifications.showNames"
-        static let notificationShowPreview = "sonar.notifications.showPreview"
+        static let notificationsEnabled = SonarNotificationPreferenceStore.enabledKey
+        static let notificationShowNames = SonarNotificationPreferenceStore.showNamesKey
+        static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
         static let marmotNsecKeychainKey = "marmot-nsec"
@@ -1391,6 +1391,15 @@ final class SonarAppStore: ObservableObject {
                 self.processIncomingPayLines()
                 self.processIncomingCallLines()
                 self.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+        // Push-wake ownership suppresses live banners; when ownership ends the
+        // messages sink does not re-fire, so catch up suppressed rows once.
+        marmot.$pushWakeLiveCatchUpGeneration
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.processIncomingMarmotNotifications()
             }
             .store(in: &cancellables)
 
@@ -2254,12 +2263,7 @@ final class SonarAppStore: ObservableObject {
     // MARK: Local notification routing
 
     private var notificationPrefs: SonarLocalNotificationPrefs {
-        SonarLocalNotificationPrefs(
-            enabled: notificationsEnabled,
-            showNames: notificationShowNames,
-            showPreview: notificationShowPreview,
-            showPaymentAmount: true
-        )
+        SonarNotificationPreferenceStore.loadMerged()
     }
 
     private func localNotificationKind(for content: String) -> SonarLocalNotificationKind {
@@ -2304,6 +2308,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func processIncomingMarmotNotifications() {
+        // Push-wake owns banners for the current Transponder sync; emitting
+        // here as well double-fires (different identifiers) for the same row.
+        // Do NOT blanket-mark every in-memory message seen — that drops rows
+        // that land via gap recovery after the drain list was returned.
+        if marmot.pushWakeOwnsNotifications { return }
         for group in marmot.groups {
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
@@ -2318,11 +2327,16 @@ final class SonarAppStore: ObservableObject {
                     seenMarmotNotificationMessageIDs.insert(message.id)
                     continue
                 }
+                let groupName = group.memberNpubs.count > 2 ? title : nil
+                // Push wake already bannered this message id — mark seen, no second banner.
+                if marmot.pushWakeNotifiedMessageIDs.contains(message.id) {
+                    seenMarmotNotificationMessageIDs.insert(message.id)
+                    continue
+                }
                 guard seenMarmotNotificationMessageIDs.insert(message.id).inserted else { continue }
                 let kind = localNotificationKind(for: message.content)
                 guard kind != .call else { continue }
                 let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
-                let groupName = group.memberNpubs.count > 2 ? title : nil
                 sendSonarNotification(
                     kind: kind,
                     idKey: message.id,
