@@ -106,3 +106,5 @@ Sonar core: `core/sonar-core/src/recovery.rs` (state + event builder),
 `core/sonar-core/src/client.rs` (publish / subscribe / fetch / handle). e2e:
 `core/sonar-core/tests/recovery_beacon.rs`. Regression invariant: `R-011` in
 `docs/REGRESSIONS.md`.
+
+# force CI
