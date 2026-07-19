@@ -52,6 +52,7 @@ import chat.bitchat.sonar.MeshRadio
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.PendingOpenConversation
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
 import chat.bitchat.sonar.mergeHomeMessageRows
