@@ -107,9 +107,9 @@ const MEDIA_DOWNLOAD_ATTEMPTS: usize = 3;
 const MEDIA_DOWNLOAD_RETRY_DELAY: Duration = Duration::from_millis(350);
 const MEDIA_DOWNLOAD_CANCEL_POLL: Duration = Duration::from_millis(100);
 const MEDIA_DOWNLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-/// Bounded parallel Blossom uploads for album sends (per-item progress is
-/// aggregated into one bubble bar).
-const MEDIA_UPLOAD_CONCURRENCY: usize = 3;
+/// Bounded parallel Blossom encrypt→upload workers for album sends (per-item
+/// progress is aggregated into one bubble bar).
+const MEDIA_UPLOAD_CONCURRENCY: usize = 5;
 const STICKER_PREFETCH_CONCURRENCY: usize = 4;
 const STICKER_PREFETCH_DOWNLOAD_BYTES: usize = MAX_STICKER_CACHE_BYTES;
 /// Upper bound on receive-time sticker prefetch work per processed event batch.
@@ -132,6 +132,17 @@ static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .timeout(Duration::from_secs(60))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+});
+
+/// Shared HTTP client for Blossom media *uploads*. Redirects disabled (streamed
+/// PUT bodies are not replayable). No aggressive default request timeout —
+/// [`blossom_upload_with_timeout`] applies the size-scaled deadline.
+static BLOSSOM_UPLOAD_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("BLOSSOM_UPLOAD_HTTP_CLIENT: reqwest builder failed")
 });
 
 /// Per-request bounds for handle registrar/NIP-05 traffic. Tighter than the
@@ -3920,6 +3931,11 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        tracing::info!(
+            items = items.len(),
+            client_pending_id,
+            "media send_media_multi_with_progress enter"
+        );
         // Receivers hard-cap downloads at MAX_MEDIA_PLAINTEXT_BYTES, so an
         // over-limit upload would publish a message NO client can ever fetch.
         // Reject before any encrypt/upload work. The aggregate cap bounds the
@@ -4260,45 +4276,68 @@ impl SonarClient {
             return Err(Error::Media("staged media item count mismatch".into()));
         }
 
-        // Encrypt all items first (CPU), then upload in bounded parallel.
-        let mut encrypted = Vec::with_capacity(plaintext_items.len());
-        for (meta, data) in items_meta.iter().zip(plaintext_items.into_iter()) {
-            if media_upload_cancelled(observer) {
-                return Err(Error::MediaUploadCancelled);
-            }
-            let upload =
-                self.engine
-                    .encrypt_media(group_id, &data, &meta.mime, &meta.filename)?;
-            encrypted.push(upload);
-        }
-
-        let album_total: u64 = encrypted
-            .iter()
-            .map(|u| u.encrypted_data.len() as u64)
-            .sum();
+        let item_count = plaintext_items.len();
+        let plaintext_total: u64 = plaintext_items.iter().map(|d| d.len() as u64).sum();
+        let upload_t0 = std::time::Instant::now();
+        tracing::info!(
+            entry_id,
+            items = item_count,
+            plaintext_bytes = plaintext_total,
+            "media upload encrypt+blossom begin"
+        );
+        let plaintext_lens: Arc<Vec<u64>> = Arc::new(
+            plaintext_items
+                .iter()
+                .map(|d| d.len() as u64)
+                .collect(),
+        );
         // Progress callbacks inside Blossom must be 'static, so they only bump
         // atomics. A ticker below mirrors those atomics to the host observer.
+        // Ciphertext totals fill in as each item finishes encrypt (pipelined).
         let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
-            (0..encrypted.len())
+            (0..item_count)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
                 .collect(),
         );
+        let item_totals: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+            (0..item_count)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        );
+        let provisional_total: u64 = plaintext_lens.iter().sum();
         if let Some(obs) = observer {
-            obs.on_progress(&progress_id, 0, album_total);
+            obs.on_progress(&progress_id, 0, provisional_total);
         }
 
-        let upload_futs = encrypted.iter().enumerate().map(|(index, upload)| {
-            let data = upload.encrypted_data.clone();
+        // Pipeline encrypt∥upload per item so album CPU and uplink overlap.
+        // Peak ciphertext RAM is ~concurrency items, not the whole album.
+        let pairs: Vec<_> = items_meta.into_iter().zip(plaintext_items).collect();
+        let group_id_owned = group_id.clone();
+        let upload_futs = pairs.into_iter().enumerate().map(|(index, (meta, data))| {
             let server_url = server_url.clone();
             let item_sent = item_sent.clone();
+            let item_totals = item_totals.clone();
+            let group_id = group_id_owned.clone();
             async move {
                 if media_upload_cancelled(observer) {
                     return Err(Error::MediaUploadCancelled);
                 }
+                let upload = self.engine.encrypt_media(
+                    &group_id,
+                    &data,
+                    &meta.mime,
+                    &meta.filename,
+                )?;
+                let cipher_len = upload.encrypted_data.len() as u64;
+                item_totals[index].store(cipher_len, Ordering::Relaxed);
+                if media_upload_cancelled(observer) {
+                    return Err(Error::MediaUploadCancelled);
+                }
+                let cipher = upload.encrypted_data.clone();
                 let url = self
                     .blossom_upload_with_progress(
                         &server_url,
-                        data,
+                        cipher,
                         Some(Box::new({
                             let item_sent = item_sent.clone();
                             move |sent: u64, _total: u64| {
@@ -4307,7 +4346,7 @@ impl SonarClient {
                         }) as Box<dyn FnMut(u64, u64) + Send>),
                     )
                     .await?;
-                Ok::<(usize, String), Error>((index, url))
+                Ok::<_, Error>((index, upload, url))
             }
         });
 
@@ -4322,6 +4361,8 @@ impl SonarClient {
         let media_staging = self.media_staging.clone();
         let progress_tick = {
             let item_sent = item_sent.clone();
+            let item_totals = item_totals.clone();
+            let plaintext_lens = plaintext_lens.clone();
             let media_staging = media_staging.clone();
             let entry_id_owned = entry_id_owned.clone();
             let progress_id = progress_id.clone();
@@ -4333,7 +4374,16 @@ impl SonarClient {
                     }
                     let aggregate: u64 =
                         item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-                    let aggregate = aggregate.min(album_total);
+                    let mut album_total = 0u64;
+                    for (i, total) in item_totals.iter().enumerate() {
+                        let known = total.load(Ordering::Relaxed);
+                        album_total += if known > 0 {
+                            known
+                        } else {
+                            plaintext_lens[i]
+                        };
+                    }
+                    let aggregate = aggregate.min(album_total.max(1));
                     // Memory-only: avoid sync JSON write every 100ms on the
                     // tokio worker. Terminal paths persist via mark_*/remove.
                     let _ = media_staging.lock().unwrap().update_progress(
@@ -4343,7 +4393,7 @@ impl SonarClient {
                         false,
                     );
                     if let Some(obs) = observer {
-                        obs.on_progress(&progress_id, aggregate, album_total);
+                        obs.on_progress(&progress_id, aggregate, album_total.max(1));
                     }
                 }
             }
@@ -4354,14 +4404,27 @@ impl SonarClient {
             results = uploads => results,
             err = progress_tick => return Err(err),
         };
-        let mut urls = vec![String::new(); encrypted.len()];
+        let mut encrypted = Vec::with_capacity(item_count);
+        encrypted.resize_with(item_count, || None);
+        let mut urls = vec![String::new(); item_count];
         for result in results {
-            let (index, url) = result?;
+            let (index, upload, url) = result?;
+            encrypted[index] = Some(upload);
             urls[index] = url;
         }
+        let encrypted: Vec<_> = encrypted
+            .into_iter()
+            .map(|slot| {
+                slot.ok_or_else(|| Error::Media("album upload missing encrypted item".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
         if media_upload_cancelled(observer) {
             return Err(Error::MediaUploadCancelled);
         }
+        let album_total: u64 = encrypted
+            .iter()
+            .map(|u| u.encrypted_data.len() as u64)
+            .sum();
 
         let refs: Vec<_> = encrypted
             .iter()
@@ -4407,6 +4470,14 @@ impl SonarClient {
         if let Some(obs) = observer {
             obs.on_progress(&progress_id, album_total, album_total);
         }
+        tracing::info!(
+            entry_id,
+            items = item_count,
+            plaintext_bytes = plaintext_total,
+            ciphertext_bytes = album_total,
+            elapsed_ms = upload_t0.elapsed().as_millis() as u64,
+            "media upload encrypt+blossom end"
+        );
         Ok(())
     }
 
@@ -4495,7 +4566,10 @@ impl SonarClient {
         };
         let base = Url::parse(server)
             .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
-        let client = BlossomClient::new(base);
+        // Reuse the process-wide upload client so sequential/concurrent PUTs
+        // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
+        let client =
+            BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
         let keys = self.identity().keys();
         let mime = Some(ENCRYPTED_BLOB_MIME_TYPE.to_string());
         let upload = async {

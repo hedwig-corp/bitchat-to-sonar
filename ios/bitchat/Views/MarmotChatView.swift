@@ -790,6 +790,20 @@ final class MarmotChatModel: ObservableObject {
 
     private func noteMediaUploadProgress(_ id: String, _ fraction: Double?) {
         if let fraction {
+            #if DEBUG
+            // Milestone logs for device upload timing (pair with media_upload_begin/end).
+            if fraction <= 0.001 {
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_progress id=\(id) fraction=0",
+                    category: .session
+                )
+            } else if fraction >= 0.999 {
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_progress id=\(id) fraction=1",
+                    category: .session
+                )
+            }
+            #endif
             mediaUploadProgressSource.note(id: id, fraction: fraction)
             var next = mediaUploadProgress
             next[id] = fraction
@@ -2564,17 +2578,23 @@ final class MarmotChatModel: ObservableObject {
             }
             registerMediaUploadListener(echo.id, listener)
             do {
-                guard await ensureConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
+                // Blossom upload does not need the relay — do not gate on
+                // ensureConnected. Paint the optimistic echo immediately;
+                // durable staging keeps the attachment if the process dies
+                // mid-upload. Publish waits for relay via the outbox after
+                // the URL exists.
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
-                // Blossom upload does not need the relay; durable staging keeps
-                // the attachment if the process dies mid-upload. Publish waits
-                // for relay via the outbox after the URL exists.
+                #if DEBUG
+                let uploadStarted = Date()
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_begin id=\(echo.id) bytes=\(data.count) mime=\(mime) album=1",
+                    category: .session
+                )
+                #endif
                 try await service.sendMediaWithProgress(
                     groupId: groupId,
                     data: data,
@@ -2584,10 +2604,23 @@ final class MarmotChatModel: ObservableObject {
                     clientPendingId: echo.id,
                     listener: listener
                 )
+                #if DEBUG
+                let ms = Int(Date().timeIntervalSince(uploadStarted) * 1000)
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=1 elapsed_ms=\(ms)",
+                    category: .session
+                )
+                #endif
                 clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                #if DEBUG
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=0 err=\(Self.describe(error))",
+                    category: .session
+                )
+                #endif
                 clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
@@ -2651,14 +2684,20 @@ final class MarmotChatModel: ObservableObject {
             }
             registerMediaUploadListener(echo.id, listener)
             do {
-                guard await ensureConnected() else {
-                    throw MarmotService.ServiceError.notConnected
-                }
+                // Same as sendMedia: Blossom is not gated on relay connect.
                 await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
                 noteMediaUploadProgress(echo.id, 0)
                 appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
+                #if DEBUG
+                let uploadStarted = Date()
+                let albumBytes = items.reduce(0) { $0 + $1.data.count }
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_begin id=\(echo.id) bytes=\(albumBytes) mime=album album=\(items.count)",
+                    category: .session
+                )
+                #endif
                 try await service.sendMediaMultiWithProgress(
                     groupId: groupId,
                     items: items,
@@ -2666,10 +2705,23 @@ final class MarmotChatModel: ObservableObject {
                     clientPendingId: echo.id,
                     listener: listener
                 )
+                #if DEBUG
+                let ms = Int(Date().timeIntervalSince(uploadStarted) * 1000)
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=1 elapsed_ms=\(ms)",
+                    category: .session
+                )
+                #endif
                 clearMediaUploadListener(echo.id)
                 onComplete?()
                 await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
+                #if DEBUG
+                SecureLogger.info(
+                    "SONAR_BENCH media_upload_end id=\(echo.id) ok=0 err=\(Self.describe(error))",
+                    category: .session
+                )
+                #endif
                 clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {

@@ -41,11 +41,22 @@ impl BlossomClient {
         }
     }
 
-    /// Builds the reqwest client
+    /// Creates a `BlossomClient` that reuses an existing [`reqwest::Client`].
+    ///
+    /// Callers that upload streamed bodies (progress path) should pass a client
+    /// with redirects disabled — a streamed body is not replayable across 3xx.
+    pub fn with_client(base_url: Url, client: reqwest::Client) -> Self {
+        Self { base_url, client }
+    }
+
+    /// Builds the default reqwest client.
+    ///
+    /// Redirects are disabled so `upload_blob_with_progress` can reuse
+    /// `self.client` safely (streamed bodies are not replayable).
     fn build_client() -> reqwest::Result<reqwest::Client> {
         let builder = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder.redirect(Policy::limited(10));
+        let builder = builder.redirect(Policy::none());
         builder.build()
     }
 
@@ -151,9 +162,9 @@ impl BlossomClient {
         // request body is polled. Progress fires from the stream path itself —
         // no extra runtime timer dependency in this crate.
         //
-        // Redirects are disabled: a streamed body is not replayable, so
-        // following a 3xx would fail mid-upload. BUD-02 upload endpoints
-        // answer in place; treat redirects as errors instead.
+        // Uses `self.client` (redirects disabled by default / via `with_client`)
+        // so keep-alive + TLS session cache survive across PUTs. Do not follow
+        // 3xx: a streamed body is not replayable.
         const CHUNK: usize = 64 * 1024;
         let data = Arc::new(data);
         let progress = Arc::new(Mutex::new(on_progress));
@@ -178,17 +189,8 @@ impl BlossomClient {
         });
         let body = Body::wrap_stream(body_stream);
 
-        #[cfg(not(target_arch = "wasm32"))]
-        let upload_client = {
-            reqwest::Client::builder()
-                .redirect(Policy::none())
-                .build()
-                .unwrap_or_else(|_| self.client.clone())
-        };
-        #[cfg(target_arch = "wasm32")]
-        let upload_client = self.client.clone();
-
-        let response: Response = upload_client
+        let response: Response = self
+            .client
             .put(url)
             .headers(headers)
             .body(body)

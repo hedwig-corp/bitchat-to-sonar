@@ -21,6 +21,19 @@ This document covers **two benchmark tracks**:
   you **bump the MDK rev** or change the welcome/commit path, to get before/after
   numbers on the protocol itself.
 
+### Media upload orchestration A/B (device-independent)
+
+Relative encrypt+Blossom-PUT orchestration (baseline vs shared-client + pipeline
++ concurrency 5) against an in-process mock with synthetic RTT:
+
+```bash
+cd core && cargo run -p sonar-core --example media_upload_ab_bench --release
+# optional: SONAR_UPLOAD_BENCH_LATENCY_MS=40 SONAR_UPLOAD_BENCH_CONNECT_MS=15
+```
+
+Report-only; do not gate CI on wall times. Use it when changing
+`complete_staged_media_upload` / Blossom upload client reuse.
+
 ## What it measures
 
 The app emits `SONAR_BENCH` markers to the unified log (`SecureLogger.info`,
