@@ -140,7 +140,7 @@ class NotificationService: SDKNotificationService {
             releaseMarmotWakeNode()
             finish(with: content)
         } catch {
-            os_log("NSE: Marmot wake failed — %{public}@ — keeping generic banner",
+            os_log("NSE: Marmot wake failed — %{private}@ — keeping generic banner",
                    log: Self.log, type: .error, String(describing: error))
             releaseMarmotWakeNode()
             finish(with: content)

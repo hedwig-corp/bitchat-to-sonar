@@ -1283,8 +1283,21 @@ final class MarmotService: @unchecked Sendable {
 
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
+    /// Resolves wipe targets from fixed App Group + legacy roots — never via
+    /// `databaseURL()` / `databaseDirectory()` (those migrate before open).
     func wipeDatabase() async throws {
-        let url = try Self.databaseURL()
+        var wipePaths: [String] = []
+        if let shared = MarmotAppGroupStore.existingSharedDatabaseURL() {
+            wipePaths.append(shared.path)
+        }
+        #if os(iOS)
+        if let legacyDir = MarmotAppGroupStore.legacyApplicationSupportDirectory() {
+            let legacyDb = legacyDir.appendingPathComponent(MarmotAppGroupStore.dbFileName)
+            if FileManager.default.fileExists(atPath: legacyDb.path) {
+                wipePaths.append(legacyDb.path)
+            }
+        }
+        #endif
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)
@@ -1312,9 +1325,10 @@ final class MarmotService: @unchecked Sendable {
                 service.nodeClosing = false
                 service.nodeLock.unlock()
             }
-            try wipeMarmotDatabase(dbPath: url.path)
-            // Also drop any leftover pre-App-Group Application Support fork so
-            // a later launch cannot reopen orphaned history after wipe.
+            for path in wipePaths {
+                try wipeMarmotDatabase(dbPath: path)
+            }
+            // Drop directory roots (sidecars, empty dirs) without remigrating.
             MarmotAppGroupStore.removeAllStoreFiles()
             guard KeychainManager().deleteIdentityKey(forKey: Self.dbKeychainKey) else {
                 throw ServiceError.core("failed to delete Marmot database key")

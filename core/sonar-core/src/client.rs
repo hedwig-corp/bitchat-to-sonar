@@ -1440,6 +1440,22 @@ impl Profile {
     }
 }
 
+/// Restores the pre-wake sync-state snapshot and clears the freeze flag on
+/// drop — including panic / early-return paths inside a push wake.
+struct FrozenWakeGuard<'a> {
+    client: &'a SonarClient,
+    snapshot: Option<SyncState>,
+}
+
+impl Drop for FrozenWakeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.snapshot.take() {
+            self.client.restore_sync_state_after_frozen_wake(snapshot);
+        }
+        self.client.set_sync_watermark_frozen(false);
+    }
+}
+
 pub struct SonarClient {
     engine: MarmotEngine,
     nostr: Client,
@@ -1458,7 +1474,8 @@ pub struct SonarClient {
     /// watermark advances. Messages still decrypt into the store; the next
     /// durable session re-fetches any gap a short wake may have missed.
     /// Matches White Noise iOS `cursorPersistence: .frozen`.
-    sync_watermark_frozen: AtomicBool,
+    /// Shared `Arc` so deferred bookkeeping threads observe the same flag.
+    sync_watermark_frozen: Arc<AtomicBool>,
     /// Durable local delivery metadata for Signal-style outgoing text sends.
     /// The actual decrypted message body stays in MDK storage; this sidecar
     /// records pending/sent/failed state and the encrypted relay event to retry.
@@ -2032,7 +2049,7 @@ impl SonarClient {
             geo_subscribed,
             identity_secret,
             sync_state,
-            sync_watermark_frozen: AtomicBool::new(false),
+            sync_watermark_frozen: Arc::new(AtomicBool::new(false)),
             outbox_state,
             media_staging,
             media_upload_inflight,
@@ -2840,6 +2857,7 @@ impl SonarClient {
     ) {
         let conversation_index = self.conversation_index.clone();
         let sync_state = self.sync_state.clone();
+        let sync_watermark_frozen = self.sync_watermark_frozen.clone();
         let event_id_hex = event_id.to_hex();
         std::thread::spawn(move || {
             if let Some(ref idx) = conversation_index {
@@ -2859,6 +2877,12 @@ impl SonarClient {
             {
                 let mut state = sync_state.lock().unwrap();
                 state.mark_processed_id(event_id_hex);
+                if sync_watermark_frozen.load(Ordering::Relaxed) {
+                    tracing::debug!(
+                        "deferred sync-state persist skipped (frozen cursor / push wake)"
+                    );
+                    return;
+                }
                 if let Err(e) = state.save_if_dirty() {
                     tracing::debug!(%e, "deferred sync-state persist failed");
                 }
@@ -5390,7 +5414,7 @@ impl SonarClient {
             watermark_secs: state.watermark_secs,
             processed_event_ids: state.processed_event_ids.clone(),
             processed_event_order: state.processed_event_order.clone(),
-            dirty: false,
+            dirty: state.dirty,
         }
     }
 
@@ -5399,7 +5423,7 @@ impl SonarClient {
         state.watermark_secs = snapshot.watermark_secs;
         state.processed_event_ids = snapshot.processed_event_ids;
         state.processed_event_order = snapshot.processed_event_order;
-        state.dirty = false;
+        state.dirty = snapshot.dirty;
     }
 
     /// White Noise–shaped push wake: force gap recovery under a frozen
@@ -5413,7 +5437,11 @@ impl SonarClient {
     ) -> Result<Vec<DrainNotification>> {
         let snapshot = self.snapshot_sync_state_for_frozen_wake();
         self.set_sync_watermark_frozen(true);
-        let drain_result = async {
+        let drain_result = {
+            let _unfreeze = FrozenWakeGuard {
+                client: self,
+                snapshot: Some(snapshot),
+            };
             match tokio::time::timeout(max_wait, self.sync_force()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
@@ -5427,10 +5455,7 @@ impl SonarClient {
                 }
             }
             self.drain_pending_marmot().await
-        }
-        .await;
-        self.restore_sync_state_after_frozen_wake(snapshot);
-        self.set_sync_watermark_frozen(false);
+        };
         drain_result
     }
 

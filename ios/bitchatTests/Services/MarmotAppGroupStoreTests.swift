@@ -38,8 +38,10 @@ struct MarmotAppGroupStoreTests {
         )
 
         let sharedDb = shared.appendingPathComponent(MarmotAppGroupStore.dbFileName)
+        let sharedSidecar = shared.appendingPathComponent("marmot.sqlite.sonar-sync.json")
         #expect(fm.fileExists(atPath: sharedDb.path))
         #expect(try String(contentsOf: sharedDb, encoding: .utf8) == "legacy-db")
+        #expect(fm.fileExists(atPath: sharedSidecar.path))
         #expect(!fm.fileExists(atPath: legacy.path))
         #endif
     }
