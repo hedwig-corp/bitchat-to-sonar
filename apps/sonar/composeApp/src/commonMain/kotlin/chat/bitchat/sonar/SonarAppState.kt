@@ -612,11 +612,6 @@ internal enum class StickerCacheLookupState { HIT, MISS, INVALIDATED }
 private const val STICKER_IMAGE_MEMORY_BUDGET_BYTES = 25 * 1024 * 1024
 private const val STICKER_IMAGE_MEMORY_ENTRY_LIMIT = 100
 
-/** Bounded wait for the relay before a sticker pack lookup. Mirrors the iOS
- *  `ensureRelayConnected(timeoutSeconds: 10)` guard: chats open local-first, so
- *  the first sticker render often races the relay connection on cold start. */
-private const val STICKER_PACK_RELAY_WAIT_MS = 10_000L
-
 /** Cap on remembered unresolvable refs. A peer can mint refs freely, so the
  *  negative cache that protects the relay must itself be bounded. */
 private const val STICKER_UNRESOLVABLE_REF_LIMIT = 256
@@ -6373,12 +6368,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         val cacheKey = "30031:${authorPubkeyHex.lowercase()}:$identifier"
         stickerPackCache.remove(cacheKey)?.let { stickerPackCache[cacheKey] = it; return it }
         return try {
-            // Cold-start race: chats paint before the relay connects, so give
-            // the connection a bounded head start instead of failing the
-            // kind-30031 lookup instantly (mirrors iOS ensureRelayConnected).
-            if (!SonarCore.isRelayConnected()) {
-                withTimeoutOrNull(STICKER_PACK_RELAY_WAIT_MS) { awaitRelayConnection() }
-            }
+            // Do not wait on relay connect first: core is local-first for
+            // validated disk metadata, and a warm cache must not stall on relays.
             if (stickerCacheGeneration != generation) return null
             val pack = SonarCore.fetchStickerPack(authorPubkeyHex, identifier, relayUrls)
             if (stickerCacheGeneration != generation) return null
