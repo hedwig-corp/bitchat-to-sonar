@@ -3994,6 +3994,10 @@ impl SonarClient {
         if items.is_empty() {
             return Err(Error::Media("no media to send".into()));
         }
+        // Direct send is intentional — clear any prior stopPolling / wipe latch
+        // so a new upload is not immediately cancelled (Android can race a
+        // concurrent send between stopPolling and the next resume pass).
+        self.clear_media_upload_cancel();
         tracing::info!(
             items = items.len(),
             client_pending_id,
@@ -4318,11 +4322,16 @@ impl SonarClient {
     /// Encrypt + upload staged plaintext, then publish via the durable outbox.
     /// True when a local transcript message already carries every Blossom URL
     /// (crash between MLS create and Committed left the row without staging mark).
+    ///
+    /// Scans a bounded newest-first page only — the crash window always leaves
+    /// the local kind-445 near the tip; a full `messages()` deserialize would
+    /// pay O(history) on every successful media send.
     fn local_media_urls_present(&self, group_id: &GroupId, urls: &[String]) -> Result<bool> {
         if urls.is_empty() {
             return Ok(false);
         }
-        let messages = self.engine.messages(group_id)?;
+        const CRASH_RECOVERY_URL_SCAN: usize = 64;
+        let messages = self.engine.messages_page(group_id, CRASH_RECOVERY_URL_SCAN, 0)?;
         Ok(messages.iter().any(|message| {
             urls.iter()
                 .all(|url| message.media.iter().any(|m| m.url == *url))
