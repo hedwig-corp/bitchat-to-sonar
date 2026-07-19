@@ -63,7 +63,7 @@ pub const DEFAULT_BLOSSOM_SERVER: &str = "https://push.sonar.hedwig.sh";
 /// MIP-04 uploads ciphertext, not the original media bytes. Blossom servers
 /// validate the request body's media type, so encrypted blobs must use the
 /// generic binary MIME even though the encrypted imeta keeps the source MIME.
-const ENCRYPTED_BLOB_MIME_TYPE: &str = "application/octet-stream";
+pub const ENCRYPTED_BLOB_MIME_TYPE: &str = "application/octet-stream";
 
 /// One attachment for an album send (see [`SonarClient::send_media_multi`]).
 /// Raw plaintext bytes plus the source filename and MIME; each item is

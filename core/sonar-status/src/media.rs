@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nostr::Url;
 use nostr_blossom::prelude::*;
 use serde::Serialize;
+use sonar_core::client::ENCRYPTED_BLOB_MIME_TYPE;
 use sonar_core::identity::Identity;
 
 use crate::schema::{ServiceState, StatusService};
@@ -79,7 +80,8 @@ impl MediaProbeReport {
         };
         StatusService {
             id: "media".into(),
-            name: "Media messages".into(),
+            // Blossom storage latency (canary PUT/GET), not full MIP-04 send.
+            name: "Media storage".into(),
             desc,
             uptime,
             state: match self.state {
@@ -116,9 +118,9 @@ fn format_media_desc(report: &MediaProbeReport) -> String {
         })
         .collect();
     if parts.is_empty() {
-        "Blossom probe produced no samples".into()
+        "Blossom storage probe produced no samples".into()
     } else {
-        parts.join(" · ")
+        format!("Blossom storage · {}", parts.join(" · "))
     }
 }
 
@@ -429,7 +431,7 @@ async fn probe_upload(server: &str, primary: bool, keys: &nostr::Keys) -> MediaS
         MEDIA_TIMEOUT,
         client.upload_blob(
             data.clone(),
-            Some("application/octet-stream".into()),
+            Some(ENCRYPTED_BLOB_MIME_TYPE.into()),
             None,
             Some(keys),
         ),
@@ -625,7 +627,9 @@ mod tests {
         };
         let s = r.to_service();
         assert_eq!(s.id, "media");
+        assert_eq!(s.name, "Media storage");
         assert!(s.state.is_none());
+        assert!(s.desc.starts_with("Blossom storage ·"));
         assert!(s.desc.contains("primary"));
         assert!(s.desc.contains("push.sonar.hedwig.sh"));
         assert!(s.desc.contains("candidate"));

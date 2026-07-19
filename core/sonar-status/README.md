@@ -129,8 +129,11 @@ export SONAR_STATUS_PROBE_NSEC_FILE=~/.config/sonar/status-probe.hex
 The service description looks like:
 
 ```text
-primary push.sonar.hedwig.sh upload 116 ms · get 35 ms · candidate nostr.download upload 135 ms · get 37 ms
+Blossom storage · primary push.sonar.hedwig.sh upload 116 ms · get 35 ms · candidate nostr.download upload 135 ms · get 37 ms
 ```
 
 Service state follows the **primary** (app default) only — a slower or failing
-compare host is shown in the description without marking Media Messages down.
+compare host is shown in the description without marking Media storage down.
+
+Ops can dump full probe meta (including per-server `delete_ok`) with
+`sonar-status probe --media-probe --include-probe`.

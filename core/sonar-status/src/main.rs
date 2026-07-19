@@ -179,6 +179,10 @@ struct ProbeArgs {
     /// Include payments row as coming soon.
     #[arg(long, env = "SONAR_STATUS_PAYMENTS_COMING_SOON")]
     payments_coming_soon: bool,
+    /// Include internal `probe` meta (media delete_ok, per-relay RTT, …).
+    /// Default output is the website view, which strips this.
+    #[arg(long)]
+    include_probe: bool,
     /// Pretty-print JSON.
     #[arg(long)]
     pretty: bool,
@@ -322,7 +326,7 @@ async fn run() -> Result<()> {
                 &opts,
             )
             .await?;
-            print_json(&payload, args.pretty)?;
+            print_json(&payload, args.pretty, args.include_probe)?;
         }
         Command::Publish(args) => {
             let keys = load_keys(args.nsec.as_deref(), args.nsec_file.as_ref())?;
@@ -444,12 +448,16 @@ async fn run() -> Result<()> {
     Ok(())
 }
 
-fn print_json(payload: &StatusPayload, pretty: bool) -> Result<()> {
-    let view = website_view(payload);
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+fn print_json(payload: &StatusPayload, pretty: bool, include_probe: bool) -> Result<()> {
+    let value = if include_probe {
+        serde_json::to_value(payload)?
     } else {
-        println!("{}", serde_json::to_string(&view)?);
+        serde_json::to_value(&website_view(payload))?
+    };
+    if pretty {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{}", serde_json::to_string(&value)?);
     }
     Ok(())
 }
