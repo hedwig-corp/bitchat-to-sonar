@@ -189,6 +189,9 @@ impl StickerCache {
     /// picker can paint across process restarts without waiting on relays.
     /// Callers that own an authoritative update (publish / cold relay fetch)
     /// use this; background refresh must use [`Self::apply_refreshed_installed_packs`].
+    ///
+    /// Refuses to lower `created_at` below the durable snapshot so a stale
+    /// relay replica cannot weaken the refresh fence or drop packs.
     pub(crate) fn remember_installed_packs(
         &self,
         packs: &[PackAddress],
@@ -203,6 +206,11 @@ impl StickerCache {
         let state = lock_cache()?;
         if !self.is_current(&state, root) {
             return Ok(false);
+        }
+        if let Some(snapshot) = read_installed_packs_snapshot(root)? {
+            if created_at < snapshot.created_at {
+                return Ok(false);
+            }
         }
         write_installed_packs(root, packs, created_at)?;
         Ok(true)
@@ -573,7 +581,11 @@ fn parse_installed_packs_bytes(bytes: &[u8]) -> Option<InstalledPacksSnapshot> {
     if let Ok(file) = serde_json::from_slice::<InstalledPacksFile>(bytes) {
         let mut packs = Vec::with_capacity(file.packs.len());
         for coordinate in file.packs {
-            packs.push(PackAddress::parse(&coordinate).ok()?);
+            match PackAddress::parse(&coordinate) {
+                Ok(pack) => packs.push(pack),
+                // One bad coordinate must not delete the whole warm snapshot.
+                Err(_) => continue,
+            }
         }
         return Some(InstalledPacksSnapshot {
             created_at: file.created_at,
@@ -584,7 +596,10 @@ fn parse_installed_packs_bytes(bytes: &[u8]) -> Option<InstalledPacksSnapshot> {
     let coordinates: Vec<String> = serde_json::from_slice(bytes).ok()?;
     let mut packs = Vec::with_capacity(coordinates.len());
     for coordinate in coordinates {
-        packs.push(PackAddress::parse(&coordinate).ok()?);
+        match PackAddress::parse(&coordinate) {
+            Ok(pack) => packs.push(pack),
+            Err(_) => continue,
+        }
     }
     Some(InstalledPacksSnapshot {
         created_at: 0,
@@ -1102,6 +1117,65 @@ mod tests {
         assert_eq!(
             cache.read_installed_packs().unwrap().as_deref(),
             Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn authoritative_remember_refuses_older_created_at() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = StickerCache::for_db(&db).unwrap();
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        assert!(cache.remember_installed_packs(&[pack.clone()], 100).unwrap());
+        assert!(!cache.remember_installed_packs(&[], 50).unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([pack].as_slice())
+        );
+    }
+
+    #[test]
+    fn installed_packs_parse_skips_invalid_coordinates() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        write_installed_packs(root, &[pack.clone()], 42).unwrap();
+        // Corrupt one entry in place while keeping the object envelope.
+        let path = installed_packs_file_path(root);
+        let mut file: InstalledPacksFile =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file.packs.push("not-a-coordinate".into());
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let snapshot = read_installed_packs_snapshot(root).unwrap().unwrap();
+        assert_eq!(snapshot.created_at, 42);
+        assert_eq!(snapshot.packs, vec![pack]);
+    }
+
+    #[test]
+    fn cold_empty_created_at_zero_does_not_fence_out_real_events() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let cache = StickerCache::for_db(&db).unwrap();
+        assert!(cache.remember_installed_packs(&[], 0).unwrap());
+        let pack = PackAddress::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sonar-cats-v1",
+        )
+        .unwrap();
+        assert!(cache
+            .apply_refreshed_installed_packs(&[pack.clone()], 1)
+            .unwrap());
+        assert_eq!(
+            cache.read_installed_packs().unwrap().as_deref(),
+            Some([pack].as_slice())
         );
     }
 

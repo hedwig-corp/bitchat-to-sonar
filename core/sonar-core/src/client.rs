@@ -1421,6 +1421,9 @@ pub struct SonarClient {
     /// Bumped on every authoritative installed-list write (publish / cold fetch)
     /// so an in-flight background refresh cannot clobber a newer local snapshot.
     sticker_installed_epoch: Arc<AtomicU64>,
+    /// Serializes install/uninstall read-modify-publish so concurrent mutations
+    /// cannot silently drop each other's pack-set edits.
+    sticker_installed_mutate: Arc<tokio::sync::Mutex<()>>,
     /// Per-coordinate install prefetch cancellation. Uninstall cancels the
     /// matching task immediately; the cache generation separately cancels all
     /// old-session tasks during identity wipe.
@@ -1919,6 +1922,7 @@ impl SonarClient {
             sticker_image_fetch_gates: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             sticker_installed_refresh_inflight: Arc::new(AtomicBool::new(false)),
             sticker_installed_epoch: Arc::new(AtomicU64::new(0)),
+            sticker_installed_mutate: Arc::new(tokio::sync::Mutex::new(())),
             sticker_prefetch_registry: Arc::new(Mutex::new(HashMap::new())),
             sticker_ref_prefetch_permits: Arc::new(tokio::sync::Semaphore::new(
                 STICKER_REF_PREFETCH_CONCURRENCY,
@@ -3377,8 +3381,9 @@ impl SonarClient {
     }
 
     /// Fetch the replaceable kind-10031 list. `created_at` is the Nostr event
-    /// timestamp when present; when relays return no event, `created_at` is
-    /// "now" so a legitimate empty account can still be cached on cold start.
+    /// timestamp when present. When relays return no event, use `created_at = 0`
+    /// so a cold empty cache never fences out a later real event with an older
+    /// wall-clock stamp than a synthetic `now`.
     async fn fetch_installed_packs_from_relays(&self) -> Result<(Vec<PackAddress>, u64)> {
         let filter = Filter::new()
             .kind(Kind::Custom(USER_STICKER_PACKS_KIND))
@@ -3397,15 +3402,16 @@ impl SonarClient {
                     .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?;
                 Ok((list.packs, created_at))
             }
-            None => Ok((Vec::new(), Timestamp::now().as_secs())),
+            None => Ok((Vec::new(), 0)),
         }
     }
 
     /// Authoritative installed-list read for install/uninstall mutations.
     ///
-    /// A successful kind-10031 event updates the durable cache. An empty relay
-    /// answer is treated as a miss when a local snapshot already exists (same
-    /// class as background refresh) so we never `remember([], now)` and poison
+    /// A successful kind-10031 event updates the durable cache when it is at
+    /// least as new as the local snapshot. Stale/older relay replicas keep the
+    /// local list as the mutation base. An empty relay answer is a miss when a
+    /// local snapshot already exists so we never `remember([], now)` and poison
     /// the created_at fence. Never-published accounts still start from `[]`.
     async fn fetch_installed_packs_for_mutation(&self) -> Result<Vec<PackAddress>> {
         let filter = Filter::new()
@@ -3424,6 +3430,16 @@ impl SonarClient {
                 let packs = parse_installed_pack_list(&event)
                     .map_err(|e| Error::Http(format!("invalid installed pack list: {e}")))?
                     .packs;
+                if let Ok(Some(snapshot)) = self.sticker_cache.read_installed_packs_snapshot() {
+                    if created_at < snapshot.created_at {
+                        tracing::debug!(
+                            relay_created_at = created_at,
+                            local_created_at = snapshot.created_at,
+                            "installed pack list relay event is older than local; using local for mutation"
+                        );
+                        return Ok(snapshot.packs);
+                    }
+                }
                 self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
                 if let Err(err) = self
                     .sticker_cache
@@ -3441,13 +3457,9 @@ impl SonarClient {
                     Ok(packs)
                 }
                 Ok(None) => Ok(Vec::new()),
-                Err(cache_err) => {
-                    tracing::debug!(
-                        err = %cache_err,
-                        "installed pack list local read failed during mutation"
-                    );
-                    Ok(Vec::new())
-                }
+                Err(cache_err) => Err(Error::Storage(format!(
+                    "installed pack list local read failed during mutation: {cache_err}"
+                ))),
             },
         }
     }
@@ -3468,6 +3480,13 @@ impl SonarClient {
         let started_epoch = epoch.load(Ordering::Acquire);
         let author = self.identity().public_key();
         tokio::spawn(async move {
+            struct ClearInflight(Arc<AtomicBool>);
+            impl Drop for ClearInflight {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::Release);
+                }
+            }
+            let _clear = ClearInflight(inflight);
             let result = async {
                 if !matches!(sticker_cache.session_is_current(), Ok(true)) {
                     return Ok(());
@@ -3511,17 +3530,12 @@ impl SonarClient {
             if let Err(err) = result {
                 tracing::debug!(%err, "sticker installed-packs background refresh failed");
             }
-            inflight.store(false, Ordering::Release);
         });
     }
 
     async fn publish_installed_packs(&self, packs: Vec<PackAddress>) -> Result<()> {
         let list = InstalledPackList::new(packs);
         let tags = build_installed_packs_tags(&list);
-        let builder = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "").tags(tags);
-        self.nostr.send_event_builder(builder).await?;
-        // Invalidate any in-flight background refresh before durable write.
-        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
         let local_created_at = self
             .sticker_cache
             .read_installed_packs_snapshot()
@@ -3532,6 +3546,13 @@ impl SonarClient {
         let created_at = Timestamp::now()
             .as_secs()
             .max(local_created_at.saturating_add(1));
+        // Invalidate in-flight refresh before the network round-trip so a
+        // refresh that sampled the old epoch cannot apply during send.
+        self.sticker_installed_epoch.fetch_add(1, Ordering::AcqRel);
+        let builder = EventBuilder::new(Kind::Custom(USER_STICKER_PACKS_KIND), "")
+            .tags(tags)
+            .custom_created_at(Timestamp::from_secs(created_at));
+        self.nostr.send_event_builder(builder).await?;
         if let Err(err) = self
             .sticker_cache
             .remember_installed_packs(&list.packs, created_at)
@@ -3545,11 +3566,13 @@ impl SonarClient {
         let address = PackAddress::parse(coordinate)
             .map_err(|e| Error::Http(format!("invalid pack coordinate: {e}")))?;
         let coordinate = address.coordinate();
+        let _guard = self.sticker_installed_mutate.lock().await;
         let mut packs = self.fetch_installed_packs_for_mutation().await?;
         if !packs.iter().any(|p| p.coordinate() == coordinate) {
             packs.push(address);
         }
         self.publish_installed_packs(packs).await?;
+        drop(_guard);
         self.spawn_sticker_pack_prefetch(coordinate);
         Ok(())
     }
@@ -3563,6 +3586,7 @@ impl SonarClient {
                 cancellation.cancel();
             }
         }
+        let _guard = self.sticker_installed_mutate.lock().await;
         let mut packs = self.fetch_installed_packs_for_mutation().await?;
         packs.retain(|p| p.coordinate() != coordinate);
         self.publish_installed_packs(packs).await
