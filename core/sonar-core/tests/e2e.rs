@@ -259,7 +259,7 @@ async fn delete_group_removes_a_single_chat_locally() {
         .expect("idempotent re-delete");
 }
 
-/// Leave must always clear local state even when membership publish is slow —
+/// Leave must always clear local state without awaiting leave-proposal publish —
 /// hosts serialize leave on a work queue, so hanging on relays made Delete/Leave
 /// appear stuck in the chat list.
 #[tokio::test]

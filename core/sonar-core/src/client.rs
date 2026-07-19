@@ -2669,9 +2669,10 @@ impl SonarClient {
     /// Notify the group that this member is leaving, then remove the group from
     /// local storage so it disappears from the chat list.
     ///
-    /// Leave publishes are best-effort and time-bounded: a stuck/slow relay must
-    /// not prevent the local chat from being deleted (hosts serialize this FFI
-    /// call on their Marmot work queue).
+    /// Leave proposal publish is scheduled after local purge so hosts that
+    /// serialize this FFI on a Marmot work queue are not blocked on relays.
+    /// Admin self-demote still needs a bounded publish+merge before MDK can
+    /// create the leave proposal (MIP-03).
     pub async fn leave_group(&self, group_id: &GroupId) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
         let leave_update = match self.engine.leave_group(group_id) {
@@ -2684,8 +2685,9 @@ impl SonarClient {
             }
             Err(err) => return Err(err),
         };
-        self.best_effort_membership_publish(leave_update, "leave").await;
-        // Always purge locally — Leave is a user intent to drop this chat here.
+        // Always purge locally first — Leave is a user intent to drop this chat.
+        // Leave updates are proposals (`requires_commit_merge == false`), so the
+        // evolution event can be published after MDK group state is gone.
         let group_id_hex = hex::encode(group_id.as_slice());
         self.engine.delete_group(group_id)?;
         self.outbox_state
@@ -2695,6 +2697,7 @@ impl SonarClient {
         self.remove_index_for_group(group_id);
         self.notify_conversation_changed(&group_id_hex);
         self.schedule_resubscribe_marmot_groups_if_live();
+        self.schedule_best_effort_leave_publish(leave_update);
         Ok(())
     }
 
@@ -2718,6 +2721,39 @@ impl SonarClient {
                 );
             }
         }
+    }
+
+    /// Publish a leave SelfRemove proposal without occupying the leave FFI path.
+    /// Leave updates are proposals (no welcomes / no post-publish merge); only the
+    /// evolution event is sent after local purge.
+    fn schedule_best_effort_leave_publish(&self, update: GroupMembershipUpdate) {
+        if update.requires_commit_merge || !update.welcomes.is_empty() {
+            tracing::warn!(
+                requires_commit_merge = update.requires_commit_merge,
+                welcomes = update.welcomes.len(),
+                "leave update unexpectedly needs merge/welcomes; publishing evolution event only"
+            );
+        }
+        let nostr = self.nostr.clone();
+        let event = update.evolution_event;
+        tokio::spawn(async move {
+            let publish = async {
+                let output = nostr.send_event(&event).await?;
+                require_relay_success(&output, "leave")
+            };
+            match tokio::time::timeout(MEMBERSHIP_PUBLISH_TIMEOUT, publish).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(%err, "background leave publish failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_secs = MEMBERSHIP_PUBLISH_TIMEOUT.as_secs(),
+                        "background leave publish timed out"
+                    );
+                }
+            }
+        });
     }
 
     // ── Invite links ──────────────────────────────────────────────────
