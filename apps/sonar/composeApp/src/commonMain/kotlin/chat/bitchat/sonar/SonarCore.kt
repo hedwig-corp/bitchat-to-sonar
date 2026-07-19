@@ -388,6 +388,9 @@ data class SonarChannelMsg(
 /** State of a 1:1 P2P call, as the core engine reports it. */
 enum class SonarCallState { Ringing, Connecting, Connected, Ended, Failed, Declined, Busy, Missed }
 
+/** Result of soft-trying a Blossom Marmot backup during nsec import. */
+enum class AccountBackupRestoreOutcome { Restored, Missing, Failed }
+
 /** A call state change emitted by the engine (drained via [SonarCore.callWaitEvent]). */
 data class SonarCallEvent(
     val callId: String,
@@ -731,8 +734,28 @@ expect object SonarCore {
     /** Validate an identity without mutating the active account or local storage. */
     suspend fun validateIdentity(nsec: String): String
 
-    /** Validate and persist an existing identity. Returns the restored npub. */
+    /** Validate and persist an existing identity. Returns the restored npub.
+     *  When a Blossom account backup exists for this nsec, Marmot chats are
+     *  restored before the next `start()`/`connect`. */
     suspend fun importIdentity(nsec: String): String
+
+    /** Outcome of the Blossom backup attempt during the most recent [importIdentity]. */
+    fun lastImportBackupOutcome(): AccountBackupRestoreOutcome
+
+    /**
+     * Encrypt the local Marmot DB + SQLCipher key with the account nsec and
+     * upload to Blossom. Drops the live node first; caller should `start()` /
+     * reconnect afterward. Returns a short status line for toasts.
+     */
+    suspend fun backupAccountToBlossom(): String
+
+    /**
+     * After [importIdentity] wipe (or before first connect on restore): try to
+     * download and apply the latest Blossom account backup. Soft-fails with
+     * [AccountBackupRestoreOutcome.Missing] / [AccountBackupRestoreOutcome.Failed]
+     * so identity import still proceeds with a fresh empty DB.
+     */
+    suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome
 
     /** Onboarding gate. */
     fun onboardingComplete(): Boolean

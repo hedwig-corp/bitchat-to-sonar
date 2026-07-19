@@ -100,9 +100,12 @@ activity must never hold back another’s resync.
 
 - Fresh install: onboarding shows a clear **Restore account with private key**
   button (not easy to miss). Paste a valid `nsec1…` → same identity + wallet
-  balance after Breez sync. Local chats start empty (backup not shipped yet).
-- Settings → **Restore account**: replace the current account with a pasted
-  nsec; confirm wipe; wallet rebuilds from that key.
+  balance after Breez sync. If you previously used **Backup chats**, Marmot
+  history comes back from Blossom; otherwise local chats start empty.
+- Settings → **Backup chats**: uploads an encrypted Marmot backup (needs
+  network). Settings → **Restore account**: replace the current account with a
+  pasted nsec; confirm wipe; wallet rebuilds from that key; chats restore from
+  Blossom when a backup exists.
 - Invalid nsec shows an error and does not corrupt the current account.
 
 ## Regression pass (still expected)

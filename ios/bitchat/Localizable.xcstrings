@@ -7,6 +7,39 @@
     "Restore account" : {
 
     },
+    "Account restored — chats recovered from backup" : {
+
+    },
+    "Account restored — chats start empty until you back up" : {
+
+    },
+    "Account restored — chat backup restore failed; try again when online" : {
+
+    },
+    "Chat backup uploaded" : {
+
+    },
+    "Backup failed — try again when online" : {
+
+    },
+    "Backup chats" : {
+
+    },
+    "I understand chats on this phone will be erased" : {
+
+    },
+    "Cancel" : {
+
+    },
+    "This replaces the account on this phone. Chats stored here are erased, then recovered from your encrypted Blossom backup when one exists for this nsec. Your Lightning wallet is rebuilt from the nsec you paste (same key = same balance after sync)." : {
+
+    },
+    "Encrypted cloud backup — recover chats after reinstall" : {
+
+    },
+    "Replace this account with an nsec from a backup" : {
+
+    },
     "Create a new identity" : {
 
     },
@@ -43,7 +76,7 @@
     "Direct messages are end-to-end encrypted. Always." : {
 
     },
-    "Paste your nsec private key to bring this Sonar identity and wallet onto this device." : {
+    "Paste your nsec private key. This restores your Sonar identity and Lightning wallet. Chat history is recovered from your encrypted Blossom backup when one exists for this key." : {
 
     },
     "nsec1..." : {

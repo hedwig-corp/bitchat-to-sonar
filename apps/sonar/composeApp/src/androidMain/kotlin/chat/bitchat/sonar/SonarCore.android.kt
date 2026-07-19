@@ -46,9 +46,13 @@ actual object SonarCore {
     @Volatile private var relayConnected = false
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
+    @Volatile private var lastImportBackupOutcomeValue: AccountBackupRestoreOutcome =
+        AccountBackupRestoreOutcome.Missing
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
+
+    actual fun lastImportBackupOutcome(): AccountBackupRestoreOutcome = lastImportBackupOutcomeValue
 
     actual suspend fun start(): String = withContext(Dispatchers.IO) {
         lock.withLock {
@@ -60,6 +64,13 @@ actual object SonarCore {
                 val dir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
                 val dbPath = File(dir, "marmot.sqlite").absolutePath
                 val dbKeyHex = loadOrCreateDbKey()
+                // Finish or discard an interrupted Blossom restore before open.
+                runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
+                    .onFailure {
+                        if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                            throw it
+                        }
+                    }
 
                 // Diagnostics file sink must exist before the node spins up so
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
@@ -81,6 +92,12 @@ actual object SonarCore {
             val dir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
             val dbPath = File(dir, "marmot.sqlite").absolutePath
             val dbKeyHex = loadOrCreateDbKey()
+            runCatching { uniffi.sonar_ffi.reconcileAccountRestore(dbPath, dbKeyHex) }
+                .onFailure {
+                    if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                        throw it
+                    }
+                }
             installCoreLogging(diagnosticsVerbose())
 
             // Match iOS MarmotService.connect(): keep the local-only node usable
@@ -755,6 +772,9 @@ actual object SonarCore {
                     AndroidSecrets.put("nsec", identity.nsec(), durable = true)
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
+                    tryRestoreAccountBackupLocked(identity, marmotDir).also {
+                        lastImportBackupOutcomeValue = it
+                    }
                     npub
                 } catch (importError: Throwable) {
                     if (previousIdentity != null) {
@@ -770,6 +790,69 @@ actual object SonarCore {
                     }
                     throw importError
                 }
+            }
+        }
+    }
+
+
+    actual suspend fun backupAccountToBlossom(): String = withContext(Dispatchers.IO) {
+        lock.withLock {
+            stickerOperationLock.write {
+                val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+                    ?: error("no identity to back up")
+                val marmotDir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
+                val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
+                val dbKeyHex = loadOrCreateDbKey()
+                // UniFFI close — nulling `node` alone leaves SQLCipher open.
+                closeNode()
+                val info = uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
+                "uploaded ${info.size} bytes"
+            }
+        }
+    }
+
+    actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
+        lock.withLock {
+            stickerOperationLock.write {
+                val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+                    ?: return@write AccountBackupRestoreOutcome.Missing
+                val marmotDir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
+                tryRestoreAccountBackupLocked(SonarIdentity.import(nsec), marmotDir)
+            }
+        }
+    }
+
+    /** Caller must hold [lock] + sticker write lock; node must be closed. */
+    private fun tryRestoreAccountBackupLocked(
+        identity: SonarIdentity,
+        marmotDir: File,
+    ): AccountBackupRestoreOutcome {
+        marmotDir.mkdirs()
+        val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
+        closeNode()
+        return try {
+            val dbKeyHex = uniffi.sonar_ffi.restoreAccountFromBlossom(identity.nsec(), dbPath, null)
+            require(dbKeyHex.matches(Regex("^[0-9a-fA-F]{64}$"))) { "restored db key malformed" }
+            try {
+                AndroidSecrets.put("dbKeyHex", dbKeyHex, durable = true)
+                uniffi.sonar_ffi.commitAccountRestore(dbPath)
+                AccountBackupRestoreOutcome.Restored
+            } catch (persistError: Throwable) {
+                // Clear the key only while staging remains (DB not promoted).
+                if (uniffi.sonar_ffi.accountRestoreStagingPresent(dbPath)) {
+                    runCatching { uniffi.sonar_ffi.abortAccountRestore(dbPath) }
+                    AndroidSecrets.remove("dbKeyHex", durable = true)
+                }
+                throw persistError
+            }
+        } catch (e: Throwable) {
+            runCatching { uniffi.sonar_ffi.abortAccountRestore(dbPath) }
+            // Identity restore still proceeds with a fresh empty DB.
+            val msg = e.message.orEmpty()
+            if (uniffi.sonar_ffi.isMissingAccountBackupError(msg)) {
+                AccountBackupRestoreOutcome.Missing
+            } else {
+                AccountBackupRestoreOutcome.Failed
             }
         }
     }
@@ -934,6 +1017,9 @@ actual object SonarCore {
     private fun wipeMarmotStorage(marmotDir: File) {
         wipeMarmotDatabase(File(marmotDir, "marmot.sqlite").absolutePath)
         check(marmotDir.deleteRecursively()) { "failed to remove Marmot storage" }
+        // Match iOS wipeDatabase: drop the host SQLCipher key so a soft-failed
+        // Blossom restore cannot reopen a fresh empty DB with a prior key.
+        AndroidSecrets.remove("dbKeyHex", durable = true)
     }
 
     private fun loadOrCreateIdentity(): SonarIdentity {
@@ -950,7 +1036,13 @@ actual object SonarCore {
     }
 
     private fun loadOrCreateDbKey(): String {
-        AndroidSecrets.getMigrating("dbKeyHex", durable = true)?.let { return it }
+        val existing = AndroidSecrets.getMigrating("dbKeyHex", durable = true)
+        if (existing != null) {
+            require(existing.matches(Regex("^[0-9a-fA-F]{64}$"))) {
+                "database key malformed — refusing to overwrite (would lose history)"
+            }
+            return existing
+        }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }
         AndroidSecrets.put("dbKeyHex", hex, durable = true)

@@ -37,6 +37,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.TimeSource
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.account_restored_chat_backup_restore
+import chat.bitchat.sonar.resources.account_restored_chats_recovered_from
+import chat.bitchat.sonar.resources.account_restored_chats_start_empty
+import chat.bitchat.sonar.resources.backup_failed_try_again_when_online
+import chat.bitchat.sonar.resources.chat_backup_uploaded
+import org.jetbrains.compose.resources.getString
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
 private const val SONAR_DESCRIPTOR_MISS_TTL_SECS = 60L
@@ -3258,10 +3265,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 UnifyRadio.stopScanning()
                 UnifyRadio.stopAdvertising()
                 unifyOffer = null; unifyPeers = emptyList()
-                pollJob?.cancel(); pollJob = null
-                relayConnectJob?.cancel(); relayConnectJob = null
+                // Match backupAccountNow: cancel AND join so wake/poll cannot race
+                // wipe + Blossom stage/commit under a live node.
+                val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
+                pollJob = null
+                relayConnectJob = null
+                housekeepingJob = null
+                marmotWakeJob = null
                 relayStartupCompleted = false
-                stopMarmotWakeLoop()
+                toJoin.forEach { it.cancel() }
+                toJoin.forEach { job ->
+                    runCatching { withTimeoutOrNull(3_000) { job.join() } }
+                }
                 resetCallState()
                 cancelPendingMarmotSetups()
                 cancelPendingMarmotGroupSetups()
@@ -3350,9 +3365,46 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // will not re-fire — boot explicitly. From onboarding, false→true
                 // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
                 if (needsExplicitBoot) boot()
-                toast = "Account restored"
+                toast = when (SonarCore.lastImportBackupOutcome()) {
+                    AccountBackupRestoreOutcome.Restored ->
+                        getString(Res.string.account_restored_chats_recovered_from)
+                    AccountBackupRestoreOutcome.Missing ->
+                        getString(Res.string.account_restored_chats_start_empty)
+                    AccountBackupRestoreOutcome.Failed ->
+                        getString(Res.string.account_restored_chat_backup_restore)
+                }
             }
             onResult(result.map { Unit })
+        }
+    }
+
+    fun backupAccountNow() {
+        scope.launch {
+            val result = runCatching {
+                // Match wipe: cancel AND join so in-flight node FFI cannot race
+                // closeNode + wal_checkpoint(TRUNCATE) during backup.
+                val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
+                pollJob = null
+                relayConnectJob = null
+                housekeepingJob = null
+                marmotWakeJob = null
+                relayStartupCompleted = false
+                toJoin.forEach { it.cancel() }
+                toJoin.forEach { job ->
+                    runCatching { withTimeoutOrNull(3_000) { job.join() } }
+                }
+                started = false
+                connecting = false
+                localCoreReady = false
+                SonarCore.backupAccountToBlossom()
+            }
+            // Always reboot — a failed backup must not leave Marmot unreconnected.
+            runCatching { boot() }
+            toast = if (result.isSuccess) {
+                getString(Res.string.chat_backup_uploaded)
+            } else {
+                getString(Res.string.backup_failed_try_again_when_online)
+            }
         }
     }
 

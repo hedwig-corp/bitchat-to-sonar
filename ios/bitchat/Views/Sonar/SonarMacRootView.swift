@@ -2486,6 +2486,7 @@ private struct MacSettingsModal: View {
     @State private var walletSheet = false
     @State private var currencySheet = false
     @State private var exportKeySheet = false
+    @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
     @FocusState private var nameFocused: Bool
 
@@ -2562,6 +2563,9 @@ private struct MacSettingsModal: View {
         }
         .snSheet(isPresented: $exportKeySheet, title: "Export private key") {
             SNExportKeySheetContent()
+        }
+        .snSheet(isPresented: $restoreKeySheet, title: String(localized: "Restore account")) {
+            SNRestoreAccountSheetContent(onClose: { restoreKeySheet = false })
         }
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
@@ -2771,6 +2775,22 @@ private struct MacSettingsModal: View {
                     sub: "Move your account to another wallet"
                 ) {
                     exportKeySheet = true
+                }
+                SNSettingsRow(
+                    icon: .shieldCheck,
+                    tone: .cyan,
+                    label: String(localized: "Backup chats"),
+                    sub: String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                ) {
+                    Task { await store.backupAccountNow() }
+                }
+                SNSettingsRow(
+                    icon: .importKey,
+                    tone: .cyan,
+                    label: String(localized: "Restore account"),
+                    sub: String(localized: "Replace this account with an nsec from a backup")
+                ) {
+                    restoreKeySheet = true
                 }
                 SNSettingsRow(
                     icon: .trash,

@@ -292,7 +292,7 @@ struct SonarOnboardingScreen: View {
                 .foregroundColor(SonarTheme.text)
                 .padding(.bottom, 10)
             (Text("Paste your ") + Text("nsec").fontWeight(.bold)
-                + Text(" private key. This restores your Sonar identity and Lightning wallet on this phone. Chat history on this device starts fresh until backup ships."))
+                + Text(" private key. This restores your Sonar identity and Lightning wallet on this phone. Chat history is recovered from your encrypted Blossom backup when one exists for this key."))
                 .font(SonarTheme.uiFont(size: 16))
                 .lineSpacing(16 * 0.3)
                 .foregroundColor(SonarTheme.text2)

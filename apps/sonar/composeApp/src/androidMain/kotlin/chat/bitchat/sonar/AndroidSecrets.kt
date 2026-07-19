@@ -49,6 +49,16 @@ internal object AndroidSecrets {
         legacyPrefs().edit().remove(key).apply()
     }
 
+    fun remove(key: String, durable: Boolean = false) {
+        val edit = secretsPrefs().edit().remove(key)
+        if (durable) {
+            check(edit.commit()) { "Failed to remove Android secret: $key" }
+        } else {
+            edit.apply()
+        }
+        legacyPrefs().edit().remove(key).apply()
+    }
+
     fun clear() {
         secretsPrefs().edit().clear().apply()
     }

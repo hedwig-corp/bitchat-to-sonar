@@ -72,7 +72,18 @@ import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
 import chat.bitchat.sonar.Notifier
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.backup_chats
+import chat.bitchat.sonar.resources.cancel
+import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
+import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
+import chat.bitchat.sonar.resources.paste_from_clipboard
+import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
+import chat.bitchat.sonar.resources.restore_account
+import chat.bitchat.sonar.resources.restoring
+import chat.bitchat.sonar.resources.this_replaces_the_account_on_this_phone
 import kotlinx.coroutines.delay
+import org.jetbrains.compose.resources.stringResource
 
 /**
  * Full Settings screen — 1:1 reproduction of design/handoff/project/sonar/
@@ -212,8 +223,14 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
                 ) { exportKey = true }
                 SNXSettingsRow(
-                    label = "Restore account",
-                    sub = "Replace this account with an nsec from a backup",
+                    label = stringResource(Res.string.backup_chats),
+                    sub = stringResource(Res.string.encrypted_cloud_backup_recover_chats),
+                    chevron = true,
+                    icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
+                ) { state.backupAccountNow() }
+                SNXSettingsRow(
+                    label = stringResource(Res.string.restore_account),
+                    sub = stringResource(Res.string.replace_this_account_with_an_nsec_from),
                     chevron = true,
                     icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
                 ) { restoreKey = true }
@@ -531,7 +548,7 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
             SNIcon(SNIconName.Shield, 18.dp, s.danger, weight = 2f)
             Spacer(Modifier.width(11.dp))
             Text(
-                "This replaces the account on this phone. Chats stored here are erased. Your Lightning wallet is rebuilt from the nsec you paste.",
+                stringResource(Res.string.this_replaces_the_account_on_this_phone),
                 color = s.text, fontSize = 13.sp, lineHeight = 19.5.sp,
             )
         }
@@ -560,12 +577,12 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
         ) {
             SNXIcon(SNXIconName.Copy, 16.dp, s.accentDeep, weight = 2f)
             Spacer(Modifier.width(7.dp))
-            Text("Paste from clipboard", color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(stringResource(Res.string.paste_from_clipboard), color = s.accentDeep, fontSize = 14.sp, fontWeight = FontWeight.Bold)
         }
         Spacer(Modifier.height(8.dp))
         SNSettingsRow(
             icon = SNIconName.ShieldCheck,
-            label = "I understand chats on this phone will be erased",
+            label = stringResource(Res.string.i_understand_chats_on_this_phone_will),
             toggle = confirmed,
             divider = false,
         ) { confirmed = !confirmed }
@@ -583,7 +600,7 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             SNPrimaryButton(
-                if (inFlight) "Restoring..." else "Restore account",
+                if (inFlight) stringResource(Res.string.restoring) else stringResource(Res.string.restore_account),
                 disabled = !nsecOk || !confirmed || inFlight,
             ) {
                 inFlight = true
@@ -596,7 +613,7 @@ private fun RestoreAccountSheet(state: SonarAppState, onClose: () -> Unit) {
                     } ?: onClose()
                 }
             }
-            SNGhostButton("Cancel") { onClose() }
+            SNGhostButton(stringResource(Res.string.cancel)) { onClose() }
         }
     }
 }

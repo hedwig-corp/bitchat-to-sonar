@@ -1423,66 +1423,6 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func cachedStickerImageForRef(packCoordinate: String, shortcode: String, plaintextSha256: String) throws  -> Data?
 
     /**
-     * The user accepted an incoming call: we are the dialer. Dials the offerer
-     * and starts media. Blocks on the QUIC connect.
-     */
-    func callAccept(callId: String) throws
-
-    /**
-     * Hang up / cancel a call: tears down media + connection, emits `Ended`.
-     */
-    func callHangup(callId: String) throws
-
-    /**
-     * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
-     */
-    func callLocalAddress() throws  -> String
-
-    /**
-     * The offerer received the peer's ANSWER (host-parsed). On accept this pins
-     * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
-     */
-    func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String) throws
-
-    /**
-     * Register an inbound OFFER the host parsed (`call_parse_control`).
-     */
-    func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool) throws
-
-    /**
-     * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
-     * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
-     */
-    func callPlace(callId: String, video: Bool) throws
-
-    /**
-     * Toggle local microphone capture for an active or still-connecting call.
-     * The RTP session keeps sending timed silence frames while muted.
-     */
-    func callSetMuted(callId: String, muted: Bool) throws
-
-    /**
-     * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
-     * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
-     * the host passes nothing and never reimplements the derivation; the NodeId
-     * is stable across launches. Idempotent-ish: a second call rebinds.
-     */
-    func callStart() throws
-
-    /**
-     * Park up to `timeout_secs` for the next call state change. The host loops
-     * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout.
-     *
-     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
-     * we STILL park for the timeout instead of returning instantly — otherwise
-     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
-     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
-     * which also blocks the timeout when there is nothing yet to wait on.
-     */
-    func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
-
-    /**
      * Claim (or refresh) a handle at the Sonar registrar. One claim registers
      * both resolutions: NIP-05 (chat) always, BIP-353 (payments) when `offer`
      * is present. Signed with the identity key, so restoring the nsec
@@ -1969,126 +1909,6 @@ open func cachedStickerImageForRef(packCoordinate: String, shortcode: String, pl
         FfiConverterString.lower(packCoordinate),
         FfiConverterString.lower(shortcode),
         FfiConverterString.lower(plaintextSha256),$0
-    )
-})
-}
-
-    /**
-     * The user accepted an incoming call: we are the dialer. Dials the offerer
-     * and starts media. Blocks on the QUIC connect.
-     */
-open func callAccept(callId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_accept(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),$0
-    )
-}
-}
-
-    /**
-     * Hang up / cancel a call: tears down media + connection, emits `Ended`.
-     */
-open func callHangup(callId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_hangup(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),$0
-    )
-}
-}
-
-    /**
-     * Our dialable address as the `nodeAddrB64` token to embed in an OFFER/ANSWER.
-     */
-open func callLocalAddress()throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_local_address(
-            self.uniffiCloneHandle(),$0
-    )
-})
-}
-
-    /**
-     * The offerer received the peer's ANSWER (host-parsed). On accept this pins
-     * the answerer + goes Connecting (awaiting their dial); decline/busy ends it.
-     */
-open func callOnAnswer(callId: String, answer: CallAnswerKind, remoteAddrB64: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_on_answer(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterTypeCallAnswerKind_lower(answer),
-        FfiConverterString.lower(remoteAddrB64),$0
-    )
-}
-}
-
-    /**
-     * Register an inbound OFFER the host parsed (`call_parse_control`).
-     */
-open func callOnIncomingOffer(callId: String, remoteAddrB64: String, video: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_on_incoming_offer(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterString.lower(remoteAddrB64),
-        FfiConverterBool.lower(video),$0
-    )
-}
-}
-
-    /**
-     * Begin an OUTGOING call (offerer). Returns immediately (Ringing); the host
-     * then sends `call_encode_offer(call_id, video, call_local_address(), now)`.
-     */
-open func callPlace(callId: String, video: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_place(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(video),$0
-    )
-}
-}
-
-    /**
-     * Toggle local microphone capture for an active or still-connecting call.
-     * The RTP session keeps sending timed silence frames while muted.
-     */
-open func callSetMuted(callId: String, muted: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_set_muted(
-            self.uniffiCloneHandle(),
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(muted),$0
-    )
-}
-}
-
-    /**
-     * Bind the iroh call endpoint once for this session. The iroh Ed25519 key is
-     * derived IN-CORE from this node's Nostr secret (HKDF, `call::identity`), so
-     * the host passes nothing and never reimplements the derivation; the NodeId
-     * is stable across launches. Idempotent-ish: a second call rebinds.
-     */
-open func callStart()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_start(
-            self.uniffiCloneHandle(),$0
-    )
-}
-}
-
-    /**
-     * Park up to `timeout_secs` for the next call state change. The host loops
-     * this on a dedicated thread (like `wait_for_marmot_event`); it touches no
-     * MLS state. `None` on timeout.
-     *
-     * If the engine is not bound yet (`call_start` hasn't run, or it failed),
-     * we STILL park for the timeout instead of returning instantly — otherwise
-     * the host's `while { waitEvent(20) }` loop busy-spins (on iOS that loop is
-     * MainActor-isolated → the UI freezes). Mirrors `wait_for_marmot_event`,
-     * which also blocks the timeout when there is nothing yet to wait on.
-     */
-open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
-    return try!  FfiConverterOptionTypeCallEventInfo.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_method_sonarnode_call_wait_event(
-            self.uniffiCloneHandle(),
-        FfiConverterUInt64.lower(timeoutSecs),$0
     )
 })
 }
@@ -3143,33 +2963,19 @@ public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
 
 
 /**
- * A call state change drained by `call_wait_event`.
+ * Result of uploading an encrypted account backup to Blossom.
  */
-public struct CallEventInfo: Equatable, Hashable {
-    public var callId: String
-    public var state: CallStateInfo
-    /**
-     * Connected duration in seconds — only meaningful for `Ended`.
-     */
-    public var durationSecs: UInt64
-    /**
-     * Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
-     */
-    public var reason: String
+public struct AccountBackupUploadInfo: Equatable, Hashable {
+    public var url: String
+    public var sha256Hex: String
+    public var size: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(callId: String, state: CallStateInfo,
-        /**
-         * Connected duration in seconds — only meaningful for `Ended`.
-         */durationSecs: UInt64,
-        /**
-         * Human reason for `Ended`/`Failed`/`Declined`/`Busy` (else empty).
-         */reason: String) {
-        self.callId = callId
-        self.state = state
-        self.durationSecs = durationSecs
-        self.reason = reason
+    public init(url: String, sha256Hex: String, size: UInt64) {
+        self.url = url
+        self.sha256Hex = sha256Hex
+        self.size = size
     }
 
 
@@ -3178,28 +2984,26 @@ public struct CallEventInfo: Equatable, Hashable {
 }
 
 #if compiler(>=6)
-extension CallEventInfo: Sendable {}
+extension AccountBackupUploadInfo: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeCallEventInfo: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallEventInfo {
+public struct FfiConverterTypeAccountBackupUploadInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountBackupUploadInfo {
         return
-            try CallEventInfo(
-                callId: FfiConverterString.read(from: &buf),
-                state: FfiConverterTypeCallStateInfo.read(from: &buf),
-                durationSecs: FfiConverterUInt64.read(from: &buf),
-                reason: FfiConverterString.read(from: &buf)
+            try AccountBackupUploadInfo(
+                url: FfiConverterString.read(from: &buf),
+                sha256Hex: FfiConverterString.read(from: &buf),
+                size: FfiConverterUInt64.read(from: &buf)
         )
     }
 
-    public static func write(_ value: CallEventInfo, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.callId, into: &buf)
-        FfiConverterTypeCallStateInfo.write(value.state, into: &buf)
-        FfiConverterUInt64.write(value.durationSecs, into: &buf)
-        FfiConverterString.write(value.reason, into: &buf)
+    public static func write(_ value: AccountBackupUploadInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.sha256Hex, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
     }
 }
 
@@ -3207,15 +3011,15 @@ public struct FfiConverterTypeCallEventInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeCallEventInfo_lift(_ buf: RustBuffer) throws -> CallEventInfo {
-    return try FfiConverterTypeCallEventInfo.lift(buf)
+public func FfiConverterTypeAccountBackupUploadInfo_lift(_ buf: RustBuffer) throws -> AccountBackupUploadInfo {
+    return try FfiConverterTypeAccountBackupUploadInfo.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeCallEventInfo_lower(_ value: CallEventInfo) -> RustBuffer {
-    return FfiConverterTypeCallEventInfo.lower(value)
+public func FfiConverterTypeAccountBackupUploadInfo_lower(_ value: AccountBackupUploadInfo) -> RustBuffer {
+    return FfiConverterTypeAccountBackupUploadInfo.lower(value)
 }
 
 
@@ -5074,298 +4878,6 @@ public func FfiConverterTypeStickerRefInfo_lower(_ value: StickerRefInfo) -> Rus
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * The answerer's verdict on an incoming offer (mirrors `signaling::AnswerKind`).
- */
-
-public enum CallAnswerKind: Equatable, Hashable {
-
-    case accept
-    case decline
-    case busy
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallAnswerKind: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallAnswerKind: FfiConverterRustBuffer {
-    typealias SwiftType = CallAnswerKind
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallAnswerKind {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        case 1: return .accept
-
-        case 2: return .decline
-
-        case 3: return .busy
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: CallAnswerKind, into buf: inout [UInt8]) {
-        switch value {
-
-
-        case .accept:
-            writeInt(&buf, Int32(1))
-
-
-        case .decline:
-            writeInt(&buf, Int32(2))
-
-
-        case .busy:
-            writeInt(&buf, Int32(3))
-
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallAnswerKind_lift(_ buf: RustBuffer) throws -> CallAnswerKind {
-    return try FfiConverterTypeCallAnswerKind.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallAnswerKind_lower(_ value: CallAnswerKind) -> RustBuffer {
-    return FfiConverterTypeCallAnswerKind.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * A parsed inbound `☎CALL` control line (the host scan loop feeds raw message
- * content to `call_parse_control` and routes the result to the call engine).
- */
-
-public enum CallControlInfo: Equatable, Hashable {
-
-    case offer(callId: String, video: Bool, nodeAddrB64: String, unixSecs: UInt64
-    )
-    case answer(callId: String, answer: CallAnswerKind, nodeAddrB64: String
-    )
-    case cancel(callId: String
-    )
-    case end(callId: String, reason: String
-    )
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallControlInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallControlInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallControlInfo
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallControlInfo {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        case 1: return .offer(callId: try FfiConverterString.read(from: &buf), video: try FfiConverterBool.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf), unixSecs: try FfiConverterUInt64.read(from: &buf)
-        )
-
-        case 2: return .answer(callId: try FfiConverterString.read(from: &buf), answer: try FfiConverterTypeCallAnswerKind.read(from: &buf), nodeAddrB64: try FfiConverterString.read(from: &buf)
-        )
-
-        case 3: return .cancel(callId: try FfiConverterString.read(from: &buf)
-        )
-
-        case 4: return .end(callId: try FfiConverterString.read(from: &buf), reason: try FfiConverterString.read(from: &buf)
-        )
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: CallControlInfo, into buf: inout [UInt8]) {
-        switch value {
-
-
-        case let .offer(callId,video,nodeAddrB64,unixSecs):
-            writeInt(&buf, Int32(1))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterBool.write(video, into: &buf)
-            FfiConverterString.write(nodeAddrB64, into: &buf)
-            FfiConverterUInt64.write(unixSecs, into: &buf)
-
-
-        case let .answer(callId,answer,nodeAddrB64):
-            writeInt(&buf, Int32(2))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterTypeCallAnswerKind.write(answer, into: &buf)
-            FfiConverterString.write(nodeAddrB64, into: &buf)
-
-
-        case let .cancel(callId):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(callId, into: &buf)
-
-
-        case let .end(callId,reason):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(callId, into: &buf)
-            FfiConverterString.write(reason, into: &buf)
-
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallControlInfo_lift(_ buf: RustBuffer) throws -> CallControlInfo {
-    return try FfiConverterTypeCallControlInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallControlInfo_lower(_ value: CallControlInfo) -> RustBuffer {
-    return FfiConverterTypeCallControlInfo.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * Public call state for the host UI (mirrors `sonar_core::call::engine::CallStateKind`).
- */
-
-public enum CallStateInfo: Equatable, Hashable {
-
-    case ringing
-    case connecting
-    case connected
-    case ended
-    case failed
-    case declined
-    case busy
-    case missed
-
-
-
-
-
-}
-
-#if compiler(>=6)
-extension CallStateInfo: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeCallStateInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallStateInfo
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallStateInfo {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-
-        case 1: return .ringing
-
-        case 2: return .connecting
-
-        case 3: return .connected
-
-        case 4: return .ended
-
-        case 5: return .failed
-
-        case 6: return .declined
-
-        case 7: return .busy
-
-        case 8: return .missed
-
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: CallStateInfo, into buf: inout [UInt8]) {
-        switch value {
-
-
-        case .ringing:
-            writeInt(&buf, Int32(1))
-
-
-        case .connecting:
-            writeInt(&buf, Int32(2))
-
-
-        case .connected:
-            writeInt(&buf, Int32(3))
-
-
-        case .ended:
-            writeInt(&buf, Int32(4))
-
-
-        case .failed:
-            writeInt(&buf, Int32(5))
-
-
-        case .declined:
-            writeInt(&buf, Int32(6))
-
-
-        case .busy:
-            writeInt(&buf, Int32(7))
-
-
-        case .missed:
-            writeInt(&buf, Int32(8))
-
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallStateInfo_lift(_ buf: RustBuffer) throws -> CallStateInfo {
-    return try FfiConverterTypeCallStateInfo.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeCallStateInfo_lower(_ value: CallStateInfo) -> RustBuffer {
-    return FfiConverterTypeCallStateInfo.lower(value)
-}
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 
 public enum MeshEngineCommand: Equatable, Hashable {
 
@@ -6342,30 +5854,6 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeCallEventInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallEventInfo?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeCallEventInfo.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeCallEventInfo.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeMeshAnnounceInfo: FfiConverterRustBuffer {
     typealias SwiftType = MeshAnnounceInfo?
 
@@ -6598,30 +6086,6 @@ fileprivate struct FfiConverterOptionTypeStickerRefInfo: FfiConverterRustBuffer 
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeStickerRefInfo.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-fileprivate struct FfiConverterOptionTypeCallControlInfo: FfiConverterRustBuffer {
-    typealias SwiftType = CallControlInfo?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeCallControlInfo.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeCallControlInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -7100,61 +6564,54 @@ fileprivate struct FfiConverterSequenceTypeMeshEngineEvent: FfiConverterRustBuff
     }
 }
 /**
- * Encode an ANSWER control line (`node_addr_b64` empty for decline/busy).
+ * Discard staged restore files when key persistence failed.
+ *
+ * Only safe when [`account_restore_staging_present`] is still true. If the
+ * main DB was already promoted, aborting is a no-op for the live file — hosts
+ * must keep the restored `db_key`.
  */
-public func callEncodeAnswer(callId: String, answer: CallAnswerKind, nodeAddrB64: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_answer(
-        FfiConverterString.lower(callId),
-        FfiConverterTypeCallAnswerKind_lower(answer),
-        FfiConverterString.lower(nodeAddrB64),$0
+public func abortAccountRestore(dbPath: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_abort_account_restore(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
+}
+/**
+ * True when `*.sonar-restore-staging` still exists (DB not yet promoted).
+ */
+public func accountRestoreStagingPresent(dbPath: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_account_restore_staging_present(
+        FfiConverterString.lower(dbPath),$0
     )
 })
 }
 /**
- * Encode a CANCEL control line (offerer retracted before answer).
+ * Encrypt the Marmot DB at `db_path` (plus conversation index) with a key
+ * derived from `nsec`, then upload to Blossom (BUD-02).
+ *
+ * Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
+ * Empty `blossom_server` uses the default Blossom host.
  */
-public func callEncodeCancel(callId: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_cancel(
-        FfiConverterString.lower(callId),$0
+public func backupAccountToBlossom(nsec: String, dbPath: String, dbKeyHex: String, blossomServer: String?)throws  -> AccountBackupUploadInfo  {
+    return try  FfiConverterTypeAccountBackupUploadInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_backup_account_to_blossom(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(dbKeyHex),
+        FfiConverterOptionString.lower(blossomServer),$0
     )
 })
 }
 /**
- * Encode an END control line (either side hung up a connected call).
+ * After persisting the restored `db_key_hex`, promote staged restore files to
+ * the live `db_path`.
  */
-public func callEncodeEnd(callId: String, reason: String) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_end(
-        FfiConverterString.lower(callId),
-        FfiConverterString.lower(reason),$0
+public func commitAccountRestore(dbPath: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_commit_account_restore(
+        FfiConverterString.lower(dbPath),$0
     )
-})
 }
-/**
- * Encode an OFFER control line to send as encrypted message content.
- */
-public func callEncodeOffer(callId: String, video: Bool, nodeAddrB64: String, unixSecs: UInt64) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_encode_offer(
-        FfiConverterString.lower(callId),
-        FfiConverterBool.lower(video),
-        FfiConverterString.lower(nodeAddrB64),
-        FfiConverterUInt64.lower(unixSecs),$0
-    )
-})
-}
-/**
- * Parse message content as a `☎CALL` control line. `None` for plain chat,
- * `⚡PAY` lines, unknown versions, and malformed lines (so they are ignored).
- */
-public func callParseControl(content: String) -> CallControlInfo?  {
-    return try!  FfiConverterOptionTypeCallControlInfo.lift(try! rustCall() {
-    uniffi_sonar_ffi_fn_func_call_parse_control(
-        FfiConverterString.lower(content),$0
-    )
-})
 }
 /**
  * The default handle domain (bare nicknames resolve here, and only handles
@@ -7178,6 +6635,16 @@ public func handleLooksValid(input: String) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_func_handle_looks_valid(
         FfiConverterString.lower(input),$0
+    )
+})
+}
+/**
+ * Host helper: classify FFI error text as soft-missing backup.
+ */
+public func isMissingAccountBackupError(message: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_is_missing_account_backup_error(
+        FfiConverterString.lower(message),$0
     )
 })
 }
@@ -7441,6 +6908,36 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
 })
 }
 /**
+ * Boot-time recovery for interrupted stage→persist→commit. Returns `true` if
+ * leftover staging was committed under `db_key_hex`.
+ */
+public func reconcileAccountRestore(dbPath: String, dbKeyHex: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_reconcile_account_restore(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(dbKeyHex),$0
+    )
+})
+}
+/**
+ * Download this identity's latest account backup from Blossom, decrypt with
+ * `nsec`, and **stage** files beside `db_path`. Returns the SQLCipher
+ * `db_key_hex` the host must persist, then call [`commit_account_restore`].
+ * On persist failure call [`abort_account_restore`] instead.
+ *
+ * Call with **no** live node on `db_path`. Typically after wipe / before
+ * reconnect during nsec restore.
+ */
+public func restoreAccountFromBlossom(nsec: String, dbPath: String, blossomServer: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_restore_account_from_blossom(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
+        FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+/**
  * Install (or re-configure) the on-device diagnostics log sink: a bounded,
  * rotating file family under `dir` fed by the core's `tracing` events
  * (relay connects, EOSE, watermark moves, decrypt failures, ...).
@@ -7509,25 +7006,25 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_answer() != 19224) {
+    if (uniffi_sonar_ffi_checksum_func_abort_account_restore() != 48901) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_cancel() != 22458) {
+    if (uniffi_sonar_ffi_checksum_func_account_restore_staging_present() != 58444) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_end() != 36912) {
+    if (uniffi_sonar_ffi_checksum_func_backup_account_to_blossom() != 15464) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_call_encode_offer() != 65011) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_func_call_parse_control() != 41480) {
+    if (uniffi_sonar_ffi_checksum_func_commit_account_restore() != 32963) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_default_handle_domain() != 45849) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_handle_looks_valid() != 39625) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_is_missing_account_backup_error() != 20301) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_max_media_plaintext_bytes() != 26928) {
@@ -7588,6 +7085,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_reconcile_account_restore() != 25360) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_restore_account_from_blossom() != 16615) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_setup_logging() != 6013) {
@@ -7714,33 +7217,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_cached_sticker_image_for_ref() != 15827) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_accept() != 7250) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_hangup() != 32240) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_local_address() != 54349) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_on_answer() != 26235) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_on_incoming_offer() != 54164) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_place() != 62446) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_set_muted() != 49605) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_start() != 21488) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_claim_handle() != 7894) {
