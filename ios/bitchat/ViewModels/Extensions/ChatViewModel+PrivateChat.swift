@@ -267,7 +267,8 @@ extension ChatViewModel {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderName,
                 message: pm.content,
-                peerID: convKey
+                peerID: convKey,
+                messageId: messageId
             )
         }
         
@@ -807,7 +808,8 @@ extension ChatViewModel {
                 key: actualSenderNoiseKey,
                 isRecentMessage: isRecentMessage,
                 senderNickname: senderNickname,
-                messageContent: messageContent
+                messageContent: messageContent,
+                messageId: messageId
             )
         }
 
@@ -904,6 +906,7 @@ extension ChatViewModel {
                     from: message.sender,
                     message: notifBody,
                     peerID: peerID,
+                    messageId: message.id,
                     sound: .ble
                 )
             }
@@ -985,7 +988,8 @@ extension ChatViewModel {
         key: Data?,
         isRecentMessage: Bool,
         senderNickname: String,
-        messageContent: String
+        messageContent: String,
+        messageId: String? = nil
     ) {
         guard shouldMarkAsUnread else { return }
         
@@ -1000,7 +1004,8 @@ extension ChatViewModel {
             NotificationService.shared.sendPrivateMessageNotification(
                 from: senderNickname,
                 message: messageContent,
-                peerID: targetPeerID
+                peerID: targetPeerID,
+                messageId: messageId
             )
         }
     }

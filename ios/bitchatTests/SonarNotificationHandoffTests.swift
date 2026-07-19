@@ -49,4 +49,19 @@ struct SonarNotificationHandoffTests {
             SonarNotificationKeys.conversationId: "\n\t",
         ]) == nil)
     }
+
+    @Test func messageIdReadsSonarMessageKey() {
+        let userInfo: [AnyHashable: Any] = [
+            SonarNotificationKeys.conversationId: "chat-a",
+            SonarNotificationKeys.messageId: "msg-1",
+        ]
+        #expect(SonarNotificationHandoff.messageId(from: userInfo) == "msg-1")
+    }
+
+    @Test func messageIdIgnoresBlankValues() {
+        #expect(SonarNotificationHandoff.messageId(from: [
+            SonarNotificationKeys.messageId: "  ",
+        ]) == nil)
+        #expect(SonarNotificationHandoff.messageId(from: [:]) == nil)
+    }
 }

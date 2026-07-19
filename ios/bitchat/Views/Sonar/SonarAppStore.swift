@@ -2472,10 +2472,20 @@ final class SonarAppStore: ObservableObject {
         groupName: String? = nil,
         preview: String? = nil,
         unreadCount: UInt64 = 1,
+        messageId: String? = nil,
         sound: SonarNotificationSound = .standard
     ) {
         guard !isForeground else { return }
-        let userInfo: [String: Any] = conversationId.map { [SonarNotificationKeys.conversationId: $0] } ?? [:]
+        var userInfo: [String: Any] = [:]
+        if let conversationId {
+            userInfo[SonarNotificationKeys.conversationId] = conversationId
+        }
+        if let messageId {
+            let trimmed = messageId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                userInfo[SonarNotificationKeys.messageId] = trimmed
+            }
+        }
         guard let notification = SonarLocalNotificationRouter.make(
             idKey: idKey,
             kind: kind,
@@ -2535,7 +2545,8 @@ final class SonarAppStore: ObservableObject {
                     conversationTitle: title,
                     senderName: senderName,
                     groupName: groupName,
-                    preview: message.content
+                    preview: message.content,
+                    messageId: message.id
                 )
             }
         }
@@ -7019,6 +7030,7 @@ final class SonarAppStore: ObservableObject {
                             conversationTitle: peerDisplayName(peerID.id),
                             senderName: peerDisplayName(peerID.id),
                             preview: m.content,
+                            messageId: m.id,
                             sound: via == .mesh ? .ble : .standard
                         )
                     }
@@ -7508,11 +7520,28 @@ final class SonarAppStore: ObservableObject {
     /// Open a conversation from a notification tap (local or private-message).
     /// Uses the local-first `openDM` path (await newest page before present) and
     /// refuses stale ids that no longer resolve to a live local conversation.
-    func openConversationFromNotification(_ conversationId: String) {
+    /// When `jumpMessageId` is set, transcript open-action Jump wins (#372);
+    /// missing ids soft-fail to unread/live-edge inside the host.
+    func openConversationFromNotification(
+        _ conversationId: String,
+        jumpMessageId: String? = nil
+    ) {
         let id = conversationId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty else { return }
+        let jump: String? = {
+            guard let raw = jumpMessageId?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { return nil }
+            return raw
+        }()
         if isConversationOpen(id) {
             clearNotificationsForConversation(id)
+            // Already on this DM — still apply Jump so a tap while backgrounded
+            // on the open chat scrolls to the notified message (#376 GLM Medium).
+            if let jump {
+                pendingJumpMessageIdByDM[id] = jump
+                jumpMessageIdAtOpenByDM[id] = jump
+                objectWillChange.send()
+            }
             return
         }
         guard let target = resolveNotificationConversation(id) else {
@@ -7520,7 +7549,17 @@ final class SonarAppStore: ObservableObject {
             clearNotificationsForConversation(id)
             return
         }
-        openDM(target.id, marmotGroupId: target.marmotGroupId)
+        openDM(target.id, marmotGroupId: target.marmotGroupId, jumpMessageId: jump)
+    }
+
+    /// Drop a one-shot Jump target after the host has applied (or soft-failed)
+    /// the open action so later transcript updates do not re-jump.
+    func clearJumpMessageIdAtOpen(_ id: String) {
+        guard jumpMessageIdAtOpenByDM[id] != nil || pendingJumpMessageIdByDM[id] != nil else { return }
+        jumpMessageIdAtOpenByDM[id] = nil
+        pendingJumpMessageIdByDM[id] = nil
+        // Not `@Published` — nudge SwiftUI so the host stops receiving the jump.
+        objectWillChange.send()
     }
 
     /// Map a notification conversation id onto a current local DM row / pending

@@ -52,6 +52,7 @@ import chat.bitchat.sonar.MeshRadio
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.PendingOpenConversation
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
 import chat.bitchat.sonar.mergeHomeMessageRows
@@ -92,7 +93,12 @@ fun DesktopApp() {
             SonarLifecycle.clearOpenConversationHandler()
             return@LaunchedEffect
         }
-        val handler: (String) -> Unit = { state.openConversationFromNotification(it) }
+        val handler: (PendingOpenConversation) -> Unit = {
+            state.openConversationFromNotification(
+                conversationId = it.conversationId,
+                jumpMessageId = it.jumpMessageId,
+            )
+        }
         try {
             SonarLifecycle.installOpenConversationHandler(handler)
             awaitCancellation()

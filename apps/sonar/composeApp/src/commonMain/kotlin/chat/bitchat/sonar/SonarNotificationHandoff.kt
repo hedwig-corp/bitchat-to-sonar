@@ -11,8 +11,16 @@ sealed class SonarNotificationOpenTarget {
  * notifications when that chat is opened. Kept pure so Compose unit tests can
  * pin the handoff without constructing [SonarAppState].
  */
+/** Tap payload queued until the chat list is ready to open. */
+data class PendingOpenConversation(
+    val conversationId: String,
+    val jumpMessageId: String? = null,
+)
+
 object SonarNotificationHandoff {
     const val EXTRA_CONVERSATION_ID = "sonar_conversation_id"
+    /** Stable local message id for Jump open-action (#372). Optional. */
+    const val EXTRA_MESSAGE_ID = "sonar_message_id"
     private const val MESH_CHAT_PREFIX = "mesh:"
 
     /** Stable local-notification id used by [Notifier] (matches router idKey.hashCode()). */
@@ -63,4 +71,7 @@ object SonarNotificationHandoff {
         }
         return null
     }
+
+    fun normalizeJumpMessageId(messageId: String?): String? =
+        messageId?.trim()?.takeIf { it.isNotEmpty() }
 }

@@ -91,6 +91,8 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
     var expectedNewestDate: Date? = nil
     /// Search / deep-link jump; see #372 for Sonar search wiring.
     var jumpMessageId: String? = nil
+    /// Cleared by the host after Jump applies (or soft-fails).
+    var onJumpSettled: (() -> Void)? = nil
     @ViewBuilder var composer: () -> Composer
 
     var body: some View {
@@ -117,6 +119,7 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            onJumpSettled: onJumpSettled,
             composer: composer
         )
         .ignoresSafeArea(.keyboard, edges: .bottom)
@@ -140,6 +143,9 @@ struct SNTranscriptCollectionHost<Composer: View>: View {
             expectedNewestDate: expectedNewestDate,
             composer: composer
         )
+        // AppKit list has no Jump scroll yet — settle so the one-shot target
+        // does not stick across later opens (#372 Mac gap).
+        .onAppear { if jumpMessageId != nil { onJumpSettled?() } }
         #endif
     }
 }

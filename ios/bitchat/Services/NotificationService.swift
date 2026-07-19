@@ -28,6 +28,8 @@ enum SonarNotificationSound {
 enum SonarNotificationKeys {
     static let conversationId = "sonarConversationId"
     static let peerID = "peerID"
+    /// Stable local message id for Jump open-action (#372). Optional.
+    static let messageId = "sonarMessageId"
 }
 
 /// Pure helpers for which delivered notifications belong to a conversation.
@@ -42,6 +44,12 @@ enum SonarNotificationHandoff {
             return peerID
         }
         return nil
+    }
+
+    static func messageId(from userInfo: [AnyHashable: Any]) -> String? {
+        guard let id = userInfo[SonarNotificationKeys.messageId] as? String else { return nil }
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     static func matches(userInfo: [AnyHashable: Any], conversationIds: Set<String>) -> Bool {
@@ -150,6 +158,7 @@ final class NotificationService {
         from sender: String,
         message: String,
         peerID: PeerID,
+        messageId: String? = nil,
         sound: SonarNotificationSound = .standard
     ) {
         // Callers pass the real sender + body; never discard them for a
@@ -159,7 +168,8 @@ final class NotificationService {
             sender: sender,
             message: message,
             peerID: peerID.id,
-            prefs: SonarNotificationPreferenceStore.loadMerged()
+            prefs: SonarNotificationPreferenceStore.loadMerged(),
+            messageId: messageId
         ) else { return }
 
         // Identifier is `private-sonar-message-<peerID>` (replace-per-peer),
@@ -180,7 +190,8 @@ final class NotificationService {
         sender: String,
         message: String,
         peerID: String,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        messageId: String? = nil
     ) -> SonarLocalNotification? {
         var userInfo: [String: Any] = [
             SonarNotificationKeys.peerID: peerID,
@@ -188,6 +199,9 @@ final class NotificationService {
         ]
         if prefs.showNames {
             userInfo["senderName"] = sender
+        }
+        if let messageId, !messageId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            userInfo[SonarNotificationKeys.messageId] = messageId
         }
         guard let routed = SonarLocalNotificationRouter.make(
             idKey: peerID,

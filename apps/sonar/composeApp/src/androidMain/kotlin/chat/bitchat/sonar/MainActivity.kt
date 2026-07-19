@@ -210,8 +210,10 @@ class MainActivity : ComponentActivity() {
             ?.trim()
             ?.takeIf { it.isNotEmpty() }
             ?: return
+        val jumpMessageId = intent.getStringExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID)
         intent.removeExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID)
-        SonarLifecycle.submitOpenConversation(chatId)
+        intent.removeExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID)
+        SonarLifecycle.submitOpenConversation(chatId, jumpMessageId = jumpMessageId)
     }
 
     /**

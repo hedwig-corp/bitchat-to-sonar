@@ -21,6 +21,7 @@ expect object Notifier {
         body: String,
         sound: SonarNotificationSound = SonarNotificationSound.Default,
         conversationId: String? = null,
+        messageId: String? = null,
     )
     /** Dismiss delivered notifications that belong to any of [conversationIds]. */
     fun clearConversations(conversationIds: Collection<String>)

@@ -25,6 +25,7 @@ import javax.sound.sampled.AudioSystem
 actual object Notifier {
     @Volatile private var trayIcon: TrayIcon? = null
     private val lastConversationId = AtomicReference<String?>(null)
+    private val lastMessageId = AtomicReference<String?>(null)
     private val soundGeneration = AtomicLong()
     private val soundExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "sonar-notification-sound").apply { isDaemon = true }
@@ -50,7 +51,12 @@ actual object Notifier {
                 isImageAutoSize = true
                 addActionListener(
                     ActionListener {
-                        lastConversationId.get()?.let(SonarLifecycle::submitOpenConversation)
+                        lastConversationId.get()?.let { chatId ->
+                            SonarLifecycle.submitOpenConversation(
+                                conversationId = chatId,
+                                jumpMessageId = lastMessageId.get(),
+                            )
+                        }
                     },
                 )
             }
@@ -75,9 +81,11 @@ actual object Notifier {
         body: String,
         sound: SonarNotificationSound,
         conversationId: String?,
+        messageId: String?,
     ) {
         if (!conversationId.isNullOrBlank()) {
             lastConversationId.set(conversationId)
+            lastMessageId.set(SonarNotificationHandoff.normalizeJumpMessageId(messageId))
         }
         val icon = trayIcon ?: run { ensureChannel(); trayIcon } ?: return
         runCatching { icon.displayMessage(title, body, TrayIcon.MessageType.INFO) }
@@ -92,7 +100,11 @@ actual object Notifier {
         val cleared = conversationIds.filter { it.isNotBlank() }.toSet()
         if (cleared.isEmpty()) return
         val last = lastConversationId.get()
-        if (last != null && last in cleared) lastConversationId.compareAndSet(last, null)
+        if (last != null && last in cleared) {
+            if (lastConversationId.compareAndSet(last, null)) {
+                lastMessageId.set(null)
+            }
+        }
     }
 
     private fun playNotificationSound(sound: SonarNotificationSound) {

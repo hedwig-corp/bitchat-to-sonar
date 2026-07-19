@@ -137,6 +137,7 @@ actual object Notifier {
         body: String,
         sound: SonarNotificationSound,
         conversationId: String?,
+        messageId: String?,
     ) {
         if (!canNotify()) return
         val open = Intent(ctx, MainActivity::class.java).apply {
@@ -144,6 +145,9 @@ actual object Notifier {
                 Intent.FLAG_ACTIVITY_SINGLE_TOP
             if (!conversationId.isNullOrBlank()) {
                 putExtra(SonarNotificationHandoff.EXTRA_CONVERSATION_ID, conversationId)
+            }
+            SonarNotificationHandoff.normalizeJumpMessageId(messageId)?.let {
+                putExtra(SonarNotificationHandoff.EXTRA_MESSAGE_ID, it)
             }
         }
         val pi = PendingIntent.getActivity(
