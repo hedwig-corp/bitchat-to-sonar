@@ -106,8 +106,15 @@ struct SonarContactProfileScreen: View {
 
     /// Mesh BIP-353 first, then verified kind-0 NIP-05 (never an unverified claim).
     private var paymentAddress: String? {
-        let candidates = [peerId, effectiveChatId]
-        for id in candidates {
+        // When opened from an npub (e.g. group member) with an existing Marmot
+        // DM, `effectiveChatId` is the group id — still probe the mesh peer key
+        // so an announced BIP-353 is not dropped.
+        var candidates = [peerId, effectiveChatId]
+        if let meshKey = store.sonarPeerKey(forNpub: resolvedNpub) {
+            candidates.append(meshKey)
+        }
+        var seen = Set<String>()
+        for id in candidates where seen.insert(id).inserted {
             if let bip = store.sonarProfile(id)?.bip353?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !bip.isEmpty {

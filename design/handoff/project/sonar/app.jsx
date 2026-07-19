@@ -22,22 +22,26 @@ function bcNow() {
 }
 
 function bcFreshState() {
+  const groupMsgs = BC_DATA.groupMsgs || {};
   return {
     v: 3,
     onboarded: false,
     nick: '',
     network: 'online',
     balance: 182400,
-    txns: BC_DATA.txns.slice(),
+    txns: (BC_DATA.txns || []).slice(),
     verified: {},
     muted: {},
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
     prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR' },
-    chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
-    dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
-    groupMsgs: { lake: BC_DATA.groupMsgs.lake.slice(), trip: BC_DATA.groupMsgs.trip.slice() },
+    chMsgs: { centro: (BC_DATA.chMsgs || []).slice(), city: [] },
+    dmMsgs: { maya: (BC_DATA.dmMsgs || []).slice(), sofia: (BC_DATA.dmMsgsSofia || []).slice() },
+    groupMsgs: {
+      lake: (groupMsgs.lake || []).slice(),
+      trip: (groupMsgs.trip || []).slice(),
+    },
   };
 }
 

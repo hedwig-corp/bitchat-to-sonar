@@ -185,9 +185,20 @@ extension SonarAppStore {
         return address
     }
 
-    /// Persisted payment / username address for copy rows (empty → nil).
+    /// Persisted payment address for copy rows (empty → nil).
+    ///
+    /// Chat-only registrar claims write the handle into `bip353` before any
+    /// BIP-353 DNS/offer exists — hide that until the wallet is ready (the
+    /// re-claim path then attaches the offer). External `name@other` addresses
+    /// always show.
     var paymentAddressDisplay: String? {
         let stored = bip353.trimmingCharacters(in: .whitespacesAndNewlines)
-        return stored.isEmpty ? nil : stored
+        guard !stored.isEmpty else { return nil }
+        if let claimed = coreClaimedHandle?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !claimed.isEmpty,
+           stored == claimed {
+            guard case .ready = walletState else { return nil }
+        }
+        return stored
     }
 }
