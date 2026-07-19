@@ -57,10 +57,39 @@ struct SonarNSEDecoratePolicyTests {
             SonarNSEDecoratePolicy.senderLabel(for: hex, cachedBestName: "Alice") == "Alice"
         )
         let out = SonarNSEDecoratePolicy.render(
-            input: .init(senderRaw: "Alice", groupName: "Sonar agent DM", contentPreview: "hi"),
+            input: .init(
+                senderRaw: hex,
+                groupName: "Sonar agent DM",
+                contentPreview: "hi",
+                cachedBestName: "Alice"
+            ),
             prefs: .init(showNames: true, showPreview: true)
         )
         #expect(out.title == "Alice")
+    }
+
+    @Test("long kind-0 aliases are not truncated when passed via cachedBestName")
+    func longAliasNotTruncated() {
+        let hex = String(repeating: "ab", count: 32)
+        let alias = "Vincenzo Palazzo Extended Name"
+        #expect(alias.count > 16)
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(
+                senderRaw: hex,
+                groupName: "Sonar agent DM",
+                contentPreview: "hi",
+                cachedBestName: alias
+            ),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(out.title == alias)
+        // Regression: stuffing alias into senderRaw used to truncate at 16.
+        let truncated = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: alias, groupName: "", contentPreview: "hi"),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(truncated.title != alias)
+        #expect(truncated.title.hasSuffix("…"))
     }
 
     @Test("App Group profile name map resolves hex sender")
@@ -138,8 +167,17 @@ struct SonarNSEDecoratePolicyTests {
     @Test("storeBusy hydrate retries until the attempt budget is spent")
     func storeBusyRetryBudget() {
         #expect(SonarNSEDecoratePolicy.storeLockRetryAttempts >= 80)
+        #expect(SonarNSEDecoratePolicy.storeBusyHydrateRetries <= 3)
+        #expect(
+            SonarNSEDecoratePolicy.storeLockRetryAttempts(forHydrateAttempt: 1)
+                == SonarNSEDecoratePolicy.storeLockRetryAttempts
+        )
+        #expect(
+            SonarNSEDecoratePolicy.storeLockRetryAttempts(forHydrateAttempt: 2)
+                == SonarNSEDecoratePolicy.storeLockRetryAttemptsOnHydrateRetry
+        )
         #expect(SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(attempt: 1))
-        #expect(SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(attempt: 3))
+        #expect(SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(attempt: 2))
         #expect(
             SonarNSEDecoratePolicy.shouldRetryHydrateAfterStoreBusy(
                 attempt: SonarNSEDecoratePolicy.storeBusyHydrateRetries

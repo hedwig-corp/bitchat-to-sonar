@@ -148,7 +148,8 @@ class NotificationService: SDKNotificationService {
                 let notifications = try await Task.detached(priority: .userInitiated) { [weak self] in
                     guard let self else { return [DrainNotificationInfo]() }
                     return try self.collectMarmotNotificationsAfterWake(
-                        hintGroupIdHex: hintGroupId
+                        hintGroupIdHex: hintGroupId,
+                        hydrateAttempt: attempt
                     )
                 }.value
                 #if DEBUG
@@ -228,7 +229,8 @@ class NotificationService: SDKNotificationService {
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
     /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
     private func collectMarmotNotificationsAfterWake(
-        hintGroupIdHex: String?
+        hintGroupIdHex: String?,
+        hydrateAttempt: Int = 1
     ) throws -> [DrainNotificationInfo] {
         let nsec = Self.readKeychainString(account: Self.nsecKeychainKey)
         let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey)
@@ -242,7 +244,7 @@ class NotificationService: SDKNotificationService {
         // Background suspend releases the flock asynchronously (beginBackgroundTask
         // + closeNode). Retry briefly so a Transponder wake that races the
         // suspend path still hydrates instead of sticking on the generic banner.
-        let storeLock = try Self.acquireStoreLockForWake()
+        let storeLock = try Self.acquireStoreLockForWake(hydrateAttempt: hydrateAttempt)
         let identity = try SonarIdentity.import(nsec: nsec)
         let node: SonarNode
         do {
@@ -361,8 +363,10 @@ class NotificationService: SDKNotificationService {
     /// ~8s of flock retries. Matches the common race where the host has
     /// started `closeNode` but has not released `marmot.store.lock` yet.
     /// Blocking sleep is OK — callers run this on a `Task.detached` worker.
-    private static func acquireStoreLockForWake() throws -> MarmotStoreLock {
-        let attempts = SonarNSEDecoratePolicy.storeLockRetryAttempts
+    private static func acquireStoreLockForWake(hydrateAttempt: Int = 1) throws -> MarmotStoreLock {
+        let attempts = SonarNSEDecoratePolicy.storeLockRetryAttempts(
+            forHydrateAttempt: hydrateAttempt
+        )
         let delaySecs = 0.1
         var last: MarmotStoreLock.TryAcquireResult = .unavailable
         for attempt in 1...attempts {
@@ -439,14 +443,15 @@ class NotificationService: SDKNotificationService {
         prefs: NSENotificationPrefs
     ) {
         // App Group kind-0 mirror — never fetchProfile (relay) from the NSE.
-        // Without this, kill-state banners only show pubkey fingerprints.
-        let senderRaw = SonarSharedProfileNames.bestName(for: notification.senderNpub)
-            ?? notification.senderNpub
+        // Pass alias via cachedBestName so senderLabel does not truncate it.
         let rendered = SonarNSEDecoratePolicy.render(
             input: .init(
-                senderRaw: senderRaw,
+                senderRaw: notification.senderNpub,
                 groupName: notification.groupName,
-                contentPreview: notification.contentPreview
+                contentPreview: notification.contentPreview,
+                cachedBestName: SonarSharedProfileNames.bestName(
+                    for: notification.senderNpub
+                )
             ),
             prefs: .init(showNames: prefs.showNames, showPreview: prefs.showPreview)
         )

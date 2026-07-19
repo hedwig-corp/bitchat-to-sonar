@@ -16,13 +16,20 @@ enum SonarNSEDecoratePolicy {
     /// Per acquire-loop sleeps (100ms). Host `closeNode` often needs >4s when
     /// UniFFI teardown is queued behind other work; too-short waits leave
     /// banners on the generic placeholder (`storeBusy`).
-    static let storeLockRetryAttempts = 80 // ~8s
+    static let storeLockRetryAttempts = 80 // ~8s first attempt
+    /// Shorter flock wait on hydrate retries so 3× acquire + wake stays inside
+    /// the ~30s NSE budget (80×100ms × 4 would alone exceed it).
+    static let storeLockRetryAttemptsOnHydrateRetry = 30 // ~3s
     /// Outer hydrate retries when the flock stays busy (stuck host or prior NSE).
-    static let storeBusyHydrateRetries = 4
-    static let storeBusyHydrateRetrySleepNs: UInt64 = 500_000_000
+    static let storeBusyHydrateRetries = 3
+    static let storeBusyHydrateRetrySleepNs: UInt64 = 400_000_000
 
     static func shouldRetryHydrateAfterStoreBusy(attempt: Int, maxAttempts: Int = storeBusyHydrateRetries) -> Bool {
         attempt < maxAttempts
+    }
+
+    static func storeLockRetryAttempts(forHydrateAttempt attempt: Int) -> Int {
+        attempt <= 1 ? storeLockRetryAttempts : storeLockRetryAttemptsOnHydrateRetry
     }
 
     struct Prefs: Equatable {
@@ -34,6 +41,10 @@ enum SonarNSEDecoratePolicy {
         var senderRaw: String
         var groupName: String
         var contentPreview: String
+        /// Kind-0 alias from the App Group mirror. Must be passed separately —
+        /// stuffing it into `senderRaw` makes `senderLabel` truncate names
+        /// longer than 16 chars as if they were npubs.
+        var cachedBestName: String? = nil
     }
 
     struct Output: Equatable {
@@ -100,7 +111,10 @@ enum SonarNSEDecoratePolicy {
         }
 
         let groupName = meaningfulGroupName(input.groupName)
-        let sender = senderLabel(for: input.senderRaw)
+        let sender = senderLabel(
+            for: input.senderRaw,
+            cachedBestName: input.cachedBestName
+        )
         let title: String
         if let groupName, let sender, groupName != sender {
             title = "\(sender) in \(groupName)"
