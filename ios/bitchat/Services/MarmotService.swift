@@ -361,6 +361,11 @@ final class MarmotService: @unchecked Sendable {
     private var node: SonarNode?
     private var relayConnected = false
     private var sessionGeneration: UInt64 = 0
+    #if os(iOS)
+    /// Cross-process exclusive lock — held while `node` is open so the NSE
+    /// cannot open the shared SQLCipher store concurrently.
+    private var storeLock: MarmotStoreLock?
+    #endif
 
     init(relayUrls: [String] = MarmotService.defaultRelayUrls) {
         self.relayUrls = relayUrls
@@ -389,12 +394,23 @@ final class MarmotService: @unchecked Sendable {
             return (identity, service.sessionGeneration)
         }
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
-        let (node, nodeLease) = try await connectNode(
-            identity: identity,
-            relayUrls: relayUrls,
-            dbPath: dbPath,
-            dbKeyHex: dbKeyHex
-        )
+        #if os(iOS)
+        let acquiredLock = try MarmotStoreLock.acquireExclusive()
+        #endif
+        let (node, nodeLease): (SonarNode, NodeLifecycleLease)
+        do {
+            (node, nodeLease) = try await connectNode(
+                identity: identity,
+                relayUrls: relayUrls,
+                dbPath: dbPath,
+                dbKeyHex: dbKeyHex
+            )
+        } catch {
+            #if os(iOS)
+            acquiredLock.release()
+            #endif
+            throw error
+        }
         defer { nodeLease.release() }
         let installed = await runNonThrowing { service in
             guard service.sessionGeneration == generation,
@@ -406,6 +422,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = true
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = acquiredLock
+            #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
             #if os(iOS)
@@ -414,6 +434,9 @@ final class MarmotService: @unchecked Sendable {
             return true
         }
         guard installed else {
+            #if os(iOS)
+            acquiredLock.release()
+            #endif
             throw ServiceError.cancelled
         }
         try await run { try $0.requireNode().retryOutbox() }
@@ -437,16 +460,31 @@ final class MarmotService: @unchecked Sendable {
             }
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             SonarDiagnostics.installCoreLoggingIfNeeded()
-            let node = try SonarNode.connect(
-                identity: identity,
-                relayUrls: [],
-                dbPath: dbPath,
-                dbKeyHex: dbKeyHex
-            )
+            #if os(iOS)
+            let acquiredLock = try MarmotStoreLock.acquireExclusive()
+            #endif
+            let node: SonarNode
+            do {
+                node = try SonarNode.connect(
+                    identity: identity,
+                    relayUrls: [],
+                    dbPath: dbPath,
+                    dbKeyHex: dbKeyHex
+                )
+            } catch {
+                #if os(iOS)
+                acquiredLock.release()
+                #endif
+                throw error
+            }
             service.identity = identity
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = false
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = acquiredLock
+            #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
             #if os(iOS)
@@ -1307,6 +1345,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeClosing = true
             service.node = nil
             service.relayConnected = false
+            #if os(iOS)
+            service.storeLock?.release()
+            service.storeLock = nil
+            #endif
             service.nodeLock.unlock()
             service.identity = nil
             return ()

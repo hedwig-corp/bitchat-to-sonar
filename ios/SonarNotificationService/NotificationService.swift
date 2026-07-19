@@ -149,6 +149,7 @@ class NotificationService: SDKNotificationService {
 
     /// Blocking UniFFI work — always call off the main actor.
     /// Main app owns App Group migration; NSE never creates an empty SQLCipher DB.
+    /// Skips when the main app holds `MarmotStoreLock` (no concurrent writers).
     private func collectMarmotNotificationsAfterWake() throws -> [DrainNotificationInfo] {
         guard let nsec = Self.readKeychainString(account: Self.nsecKeychainKey),
               let dbKeyHex = Self.readKeychainString(account: Self.dbKeychainKey),
@@ -158,6 +159,10 @@ class NotificationService: SDKNotificationService {
             throw NSEMarmotError.missingCredentials
         }
         let dbURL = try Self.existingMarmotDatabaseURL()
+        guard let storeLock = MarmotStoreLock.tryAcquireExclusive() else {
+            throw NSEMarmotError.storeBusy
+        }
+        defer { storeLock.release() }
         let identity = try SonarIdentity.import(nsec: nsec)
         let node = try SonarNode.connect(
             identity: identity,
@@ -463,6 +468,8 @@ private enum NSEMarmotError: Error {
     case appGroupUnavailable
     case sharedDatabaseMissing
     case databaseLocked
+    /// Main app holds `MarmotStoreLock` — skip hydrate (fail closed).
+    case storeBusy
 }
 
 #if DEBUG

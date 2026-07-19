@@ -17,6 +17,7 @@
 		44AA8F6F653CD2B2A28DA1BB /* BreezSDKLiquid in Frameworks */ = {isa = PBXBuildFile; productRef = F758224FFCADDAB1B95B5A73 /* BreezSDKLiquid */; };
 		62C08C1AD2F542AA138828E4 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3CCA5BD63046ACF8E7086F97 /* Foundation.framework */; };
 		7DD12DECDE2888D3342FC4E2 /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = F62BDC1A7D4AF65B56B65F99 /* NotificationService.swift */; };
+		A15C0DE300000000000000E1 /* MarmotStoreLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = A15C0DE300000000000000E0 /* MarmotStoreLock.swift */; };
 		885BBED78092484A5B069461 /* P256K in Frameworks */ = {isa = PBXBuildFile; productRef = 4EB6BA1B8464F1EA38F4E286 /* P256K */; };
 		A15C0DE000000000000000A4 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A2 /* SonarCore */; };
 		A15C0DE000000000000000A5 /* SonarCore in Frameworks */ = {isa = PBXBuildFile; productRef = A15C0DE000000000000000A3 /* SonarCore */; };
@@ -104,6 +105,7 @@
 		C771D3214DFE24F42D724BF4 /* SonarNotificationService.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SonarNotificationService.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */ = {isa = PBXFileReference; lastKnownFileType = text; path = ../relays/online_relays_gps.csv; sourceTree = "<group>"; };
 		F62BDC1A7D4AF65B56B65F99 /* NotificationService.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		A15C0DE300000000000000E0 /* MarmotStoreLock.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; name = MarmotStoreLock.swift; path = bitchat/Services/MarmotStoreLock.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -259,6 +261,7 @@
 		18198ED912AAF495D8AF7763 = {
 			isa = PBXGroup;
 			children = (
+				A15C0DE300000000000000E0 /* MarmotStoreLock.swift */,
 				A11D50000000000000000004 /* sonar_notification.wav */,
 				A11D51000000000000000004 /* sonar_ble_notification.wav */,
 				A6E32C972E762EA70032EA8A /* bitchat */,
@@ -605,6 +608,7 @@
 			isa = PBXSourcesBuildPhase;
 			files = (
 				7DD12DECDE2888D3342FC4E2 /* NotificationService.swift in Sources */,
+				A15C0DE300000000000000E1 /* MarmotStoreLock.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */
