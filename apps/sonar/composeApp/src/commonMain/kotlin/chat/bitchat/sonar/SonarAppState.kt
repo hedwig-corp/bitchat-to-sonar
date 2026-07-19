@@ -1105,6 +1105,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     var unreadByChat by mutableStateOf<Map<String, Long>>(emptyMap())
         private set
 
+    /**
+     * Group ids the host has marked read (or is viewing). Summary refresh must
+     * not restore their badges while `markConversationRead` is still in flight.
+     * Entries drop once core summaries confirm `unread_count == 0`.
+     */
+    private val unreadSuppressGroupIds = linkedSetOf<String>()
+
     /** Unread count per chat captured at open time — BEFORE opening zeroes the
      *  core unread counter — so the transcript can anchor at the first unread
      *  row with a divider (Signal-style) instead of force-pinning the tail.
@@ -1163,6 +1170,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatUnreadAnchor = emptyMap()
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
+        unreadSuppressGroupIds.clear()
+    }
+
+    /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
+    private fun markGroupsRead(groupIds: Collection<String>) {
+        if (groupIds.isEmpty()) return
+        unreadSuppressGroupIds.addAll(groupIds)
+        unreadByChat = unreadByChat - groupIds.toSet()
+        scope.launch {
+            for (groupId in groupIds) {
+                runCatching { SonarCore.markConversationRead(groupId) }
+            }
+        }
     }
 
     /**
@@ -4316,7 +4336,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val readChatIds = directMarmotChatIds(chat.id)
         captureOpenChatUnread(chat.id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(chat.id)
-        unreadByChat = unreadByChat - readChatIds.toSet()
+        // Mark read immediately — do not wait for the local page. Housekeeping
+        // can otherwise restore unreadByChat from still-nonzero summaries.
+        markGroupsRead(readChatIds)
         val title = chatTitle(chat)
 
         // Reopen: retained paint is already the last leave frame — push now.
@@ -4325,9 +4347,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(messages)
             push(Screen.Chat(chat.id, title))
             scope.launch {
-                for (readId in readChatIds) {
-                    runCatching { SonarCore.markConversationRead(readId) }
-                }
                 val local = withSendEchoes(
                     chat.id,
                     mergePendingMediaUploads(chat.id, marmotMessagesPageForChat(chat.id, generation)),
@@ -4359,9 +4378,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isCurrentTranscriptSession(chat.id, generation)) {
                 markTranscriptHydrated(chat.id)
             }
-            for (readId in readChatIds) {
-                runCatching { SonarCore.markConversationRead(readId) }
-            }
             for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
         }
@@ -4378,6 +4394,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         clearNotificationsForChat(id)
         captureOpenChatUnread(id, jumpMessageId = jumpMessageId)
         clearTranscriptHydrated(id)
+        // Mesh route ids are not group keys — resolve before clearing badges.
+        markGroupsRead(transcriptGroupIds(id))
         val generation = beginTranscriptSession(id)
         resolveMarmotGroupId(id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
@@ -4416,6 +4434,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(visible)
             push(Screen.Chat(id, name, pay))
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+            // Keep mark-read in lockstep with the folded WN legs that just painted.
+            markGroupsRead(transcriptGroupIds(id))
             refreshChats()
         }
     }
@@ -8481,10 +8501,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         val aliases = meshPeerAliases(canonicalPeerId)
         val groups = npubRawFor(canonicalPeerId)?.let { marmotGroupsForNpub(it) }
             ?: chats.filter { group -> peerIdForMarmotGroup(group)?.let { it in aliases } == true }
-        for (group in groups) {
-            unreadByChat = unreadByChat - group.id
-            runCatching { SonarCore.markConversationRead(group.id) }
-        }
+        markGroupsRead(groups.map { it.id })
     }
 
     private fun observedMeshPeer(peerId: String): Boolean =
@@ -9075,6 +9092,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                             withSendEchoes(sc.id, mergePendingMediaUploads(sc.id, mergedMessages)),
                             processCalls = true,
                         )
+                        // Viewing the chat: new arrivals must not leave a badge.
+                        markGroupsRead(directMarmotChatIds(sc.id))
                     } else if (isMeshChat(sc.id)) {
                         val peerId = peerIdForMarmotGroup(groupIdHex)
                         if (peerId != null && sc.id == meshChatId(peerId)) {
@@ -9094,11 +9113,22 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun applyUnreadCounts(summaries: List<SonarConversationSummary>) {
-        val counts = mutableMapOf<String, Long>()
-        for (s in summaries) {
-            if (s.unreadCount > 0) counts[s.groupIdHex] = s.unreadCount
-        }
-        unreadByChat = counts
+        // Keep suppressing the open transcript's groups for the whole view
+        // session, even before the first markGroupsRead lands.
+        val openIds = (screen as? Screen.Chat)?.id
+            ?.let { transcriptGroupIds(it) }
+            .orEmpty()
+        unreadSuppressGroupIds.addAll(openIds)
+        val nextSuppress = pruneConfirmedUnreadSuppressions(
+            unreadSuppressGroupIds.toSet(),
+            summaries,
+        ).toMutableSet()
+        // Re-add open groups after prune so a viewing session never loses
+        // suppression mid-refresh (new arrivals bump unread_count again).
+        nextSuppress.addAll(openIds)
+        unreadSuppressGroupIds.clear()
+        unreadSuppressGroupIds.addAll(nextSuppress)
+        unreadByChat = unreadCountsFromSummaries(summaries, unreadSuppressGroupIds)
     }
 
     /** Request a housekeeping pass. Conflated: many requests within one in-flight
