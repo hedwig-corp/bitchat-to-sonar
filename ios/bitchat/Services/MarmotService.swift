@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Combine
 import CryptoKit
 import Foundation
