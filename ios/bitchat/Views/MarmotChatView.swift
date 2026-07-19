@@ -265,6 +265,9 @@ final class MarmotChatModel: ObservableObject {
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
     @Published var busy = false
+    /// Serializes Settings → Backup chats so a second tap cannot seal while the
+    /// first has already reopened SQLCipher (Compose joins jobs before FFI).
+    private var accountBackupInFlight = false
     @Published var errorText: String?
     /// Resolved kind-0 profiles, keyed by npub — fills in human names/avatars
     /// for Marmot members instead of raw npubs.
@@ -725,16 +728,71 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Upload an encrypted Marmot account backup to Blossom, then reconnect.
+    ///
+    /// Always reconnects after the upload attempt — Compose `backupAccountNow`
+    /// always `boot()`s so a failed Blossom call cannot leave the node closed
+    /// (Settings tap would look dead and chats stay offline until restart).
     func backupAccount() async throws {
+        // `@MainActor` serializes check-then-set; Settings taps share this actor.
+        guard !accountBackupInFlight else {
+            throw MarmotService.ServiceError.backupAlreadyInProgress
+        }
+        accountBackupInFlight = true
+        defer { accountBackupInFlight = false }
+
         let wasPolling = syncTask != nil
+        // Raise `busy` before stopping poll/relay so an in-flight
+        // `connectRelaysIfNeeded` body sees the fence and bails before reopen.
         busy = true
         defer { busy = false }
         stopPolling()
-        _ = try await service.uploadAccountBackup()
-        guard await performConnect() else {
-            throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+        if !(await awaitRelayIdleForBackup()) {
+            SecureLogger.warning(
+                "⚠️ Account backup proceeding while relay still busy after drain timeout",
+                category: .session
+            )
+        }
+
+        var uploadError: Error?
+        do {
+            _ = try await service.uploadAccountBackup()
+        } catch {
+            uploadError = error
+        }
+        let reconnected = await performConnect()
+        // Clear busy before relay attach: `performConnect` schedules
+        // `connectRelaysIfNeeded` with a short delay that no-ops while `busy`,
+        // which would leave a local-only node after Settings backup.
+        // (`defer` also clears if we're cancelled mid-`performConnect`.)
+        busy = false
+        if reconnected {
+            connectRelaysIfNeeded()
         }
         if wasPolling { startPolling() }
+        let outcome = MarmotAccountBackupFlow.outcome(
+            uploadSucceeded: uploadError == nil,
+            reconnected: reconnected
+        )
+        if outcome.shouldSurfaceUploadFailure, let uploadError {
+            throw uploadError
+        }
+        if outcome.shouldSurfaceReconnectFailure {
+            throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+        }
+    }
+
+    /// Best-effort drain of an in-flight relay attach before `closeNode` +
+    /// WAL checkpoint (Compose cancels and joins relay jobs before FFI).
+    /// Returns `false` when the timeout elapsed while `relayBusy` stayed true
+    /// (caller still proceeds — closeNode fences new attach — but logs).
+    @discardableResult
+    private func awaitRelayIdleForBackup(timeoutSeconds: Double = 3) async -> Bool {
+        let start = Date()
+        while relayBusy && Date().timeIntervalSince(start) < timeoutSeconds {
+            if Task.isCancelled { return !relayBusy }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return !relayBusy
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
@@ -3612,6 +3670,8 @@ final class MarmotChatModel: ObservableObject {
             return "Not connected yet — try again in a moment."
         case MarmotService.ServiceError.cancelled:
             return "Operation cancelled."
+        case MarmotService.ServiceError.backupAlreadyInProgress:
+            return "Backup already in progress."
         case MarmotService.ServiceError.invalidInput(let detail):
             return "Invalid input: \(detail)"
         case MarmotService.ServiceError.core(let detail):

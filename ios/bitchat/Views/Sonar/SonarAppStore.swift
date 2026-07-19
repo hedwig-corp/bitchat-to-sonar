@@ -721,6 +721,10 @@ final class SonarAppStore: ObservableObject {
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
     @Published var toast: String? = nil
+    /// Invalidates in-flight toast dismissals when a newer toast is shown.
+    private var toastSession = SNToastSession()
+    /// Replaced on each `showToast` so rapid toasts don't pile sleeping tasks.
+    private var toastDismissTask: Task<Void, Never>?
     @Published private(set) var onboarded: Bool
     @Published private(set) var mode: String
     @Published private(set) var discoverNewPeople: Bool
@@ -1738,11 +1742,36 @@ final class SonarAppStore: ObservableObject {
 
     @MainActor
     func showToast(_ text: String) {
-        toast = text
-        Task { @MainActor in
+        let epoch = toastSession.show(text)
+        toast = toastSession.text
+        // Detached so a cancelled Settings `Task { await backupAccountNow() }`
+        // (navigation pop / view refresh) cannot cancel the dismiss and leave
+        // "Chat backup uploaded" stuck on screen forever. Cancel the previous
+        // dismiss task so we don't accumulate sleepers on rapid toasts.
+        toastDismissTask?.cancel()
+        toastDismissTask = Task.detached { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 1_600_000_000)
-            if toast == text { toast = nil }
+            guard let self, !Task.isCancelled else { return }
+            // Epoch owns the session; also require the published toast still
+            // matches what we showed so a later showToast/showStickyToast
+            // is not wiped ~1.6s later by a stale dismiss.
+            guard self.toastSession.epoch == epoch else { return }
+            if self.toast == text {
+                self.toastSession.clear(ifEpoch: epoch)
+                self.toast = nil
+            } else {
+                self.toastSession.clear(ifEpoch: epoch)
+            }
         }
+    }
+
+    /// Progress toast that stays until replaced by `showToast` / another sticky.
+    @MainActor
+    private func showStickyToast(_ text: String) {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        toastSession.showSticky(text)
+        toast = toastSession.text
     }
 
     func toggleMode() {
@@ -1818,7 +1847,7 @@ final class SonarAppStore: ObservableObject {
         Task { @MainActor in
             rename(nick)
             guard await marmot.prepareIdentityForOnboarding() else {
-                toast = "Couldn't save your account key. Try again."
+                showToast("Couldn't save your account key. Try again.")
                 return
             }
             onboarded = true
@@ -1906,22 +1935,31 @@ final class SonarAppStore: ObservableObject {
         path = []
         switch backupOutcome {
         case .restored:
-            toast = String(localized: "Account restored — chats recovered from backup")
+            showToast(String(localized: "Account restored — chats recovered from backup"))
         case .missing:
-            toast = String(localized: "Account restored — chats start empty until you back up")
+            showToast(String(localized: "Account restored — chats start empty until you back up"))
         case .failed:
-            toast = String(localized: "Account restored — chat backup restore failed; try again when online")
+            showToast(String(localized: "Account restored — chat backup restore failed; try again when online"))
         }
     }
 
     /// Settings → Backup chats: encrypt Marmot DB+key with nsec and upload to
     /// Blossom so delete→reinstall→paste nsec can recover history.
     func backupAccountNow() async {
+        // Sticky progress (no auto-dismiss) — a timed dismiss racing the long
+        // upload was leaving the completion toast uncleared when the parent
+        // Task was cancelled, or colliding with the result toast epoch.
+        // Platform gap (Compose): no progress string yet — iOS-only UX; track
+        // parity when Compose Settings backup grows a progress toast.
+        showStickyToast(String(localized: "Backing up chats…"))
         do {
             try await marmot.backupAccount()
-            toast = String(localized: "Chat backup uploaded")
+            showToast(String(localized: "Chat backup uploaded"))
+        } catch MarmotService.ServiceError.backupAlreadyInProgress {
+            // In-flight backup owns sticky/result toasts; do not clobber with failure.
+            return
         } catch {
-            toast = String(localized: "Backup failed — try again when online")
+            showToast(String(localized: "Backup failed — try again when online"))
             SecureLogger.warning(
                 "⚠️ Account backup failed: \(error.localizedDescription)",
                 category: .session
@@ -2258,9 +2296,9 @@ final class SonarAppStore: ObservableObject {
         Task {
             do {
                 try await marmot.requestJoinViaLink(token: token)
-                await MainActor.run { toast = "Join request sent" }
+                await MainActor.run { showToast("Join request sent") }
             } catch {
-                await MainActor.run { toast = "Couldn't join: \(error.localizedDescription)" }
+                await MainActor.run { showToast("Couldn't join: \(error.localizedDescription)") }
             }
         }
     }
@@ -2680,6 +2718,8 @@ final class SonarAppStore: ObservableObject {
             return "Not connected yet — try again in a moment."
         case MarmotService.ServiceError.cancelled:
             return "Claim cancelled — try again."
+        case MarmotService.ServiceError.backupAlreadyInProgress:
+            return "Backup already in progress."
         case MarmotService.ServiceError.invalidInput(let message),
              MarmotService.ServiceError.core(let message):
             detail = message
@@ -7953,7 +7993,7 @@ final class SonarAppStore: ObservableObject {
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
         if !walletWipeComplete {
-            toast = "Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account."
+            showToast("Wallet cleanup is incomplete. Restart Sonar before creating or restoring an account.")
         }
     }
 
