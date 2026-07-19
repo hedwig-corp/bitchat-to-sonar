@@ -6,6 +6,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import BitLogger
 import Combine
 import CryptoKit
 import Foundation
@@ -1293,6 +1294,12 @@ final class MarmotService: @unchecked Sendable {
 
     /// Signal-style encrypted chat backup: close the node, seal DB+key with the
     /// account nsec, upload to Blossom. Caller reconnects afterward.
+    ///
+    /// The UniFFI entrypoint is synchronous (`runtime.block_on` for seal + HTTP).
+    /// It must never run on the MainActor — Settings → Backup chats is invoked
+    /// from `@MainActor MarmotChatModel`, and parking UI for a multi‑MB upload
+    /// freezes the tap with no toast until the call returns (or the OS kills us).
+    /// Compose already hops to `Dispatchers.IO`; mirror that here.
     @discardableResult
     func uploadAccountBackup(blossomServer: String? = nil) async throws -> AccountBackupUploadInfo {
         let nsec = try await run { service -> String in
@@ -1312,17 +1319,16 @@ final class MarmotService: @unchecked Sendable {
             throw error
         }
         do {
-            let info = try backupAccountToBlossom(
-                nsec: nsec,
-                dbPath: dbPath,
-                dbKeyHex: dbKeyHex,
-                blossomServer: blossomServer
-            )
+            let info = try await runAccountBackupFFI {
+                try backupAccountToBlossom(
+                    nsec: nsec,
+                    dbPath: dbPath,
+                    dbKeyHex: dbKeyHex,
+                    blossomServer: blossomServer
+                )
+            }
             await clearNodeClosingFence()
             return info
-        } catch let error as SonarFfiError {
-            await clearNodeClosingFence()
-            throw Self.mapFfi(error)
         } catch {
             await clearNodeClosingFence()
             throw error
@@ -1355,11 +1361,15 @@ final class MarmotService: @unchecked Sendable {
         }
         await closeNode(keepClosed: true)
         do {
-            let dbKeyHex = try restoreAccountFromBlossom(
-                nsec: nsec,
-                dbPath: url.path,
-                blossomServer: blossomServer
-            )
+            // Same MainActor hazard as upload: restore downloads + decrypts under
+            // `runtime.block_on` and must stay off the UI thread.
+            let dbKeyHex = try await runAccountBackupFFI {
+                try restoreAccountFromBlossom(
+                    nsec: nsec,
+                    dbPath: url.path,
+                    blossomServer: blossomServer
+                )
+            }
             do {
                 try persistDatabaseKey(dbKeyHex)
                 try commitAccountRestore(dbPath: url.path)
@@ -1400,6 +1410,30 @@ final class MarmotService: @unchecked Sendable {
         switch error {
         case .InvalidInput(let message): return .invalidInput(message)
         case .Core(let message): return .core(message)
+        }
+    }
+
+    /// Dedicated lane for blocking account-backup UniFFI (`block_on` network).
+    /// Kept off `workQueue` so a long upload cannot stall unrelated Marmot ops
+    /// once the close fence is cleared / reconnect begins.
+    private let accountBackupQueue = DispatchQueue(
+        label: "chat.bitchat.marmot-account-backup",
+        qos: .userInitiated
+    )
+
+    private func runAccountBackupFFI<T: Sendable>(
+        _ body: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            accountBackupQueue.async {
+                do {
+                    continuation.resume(returning: try body())
+                } catch let error as SonarFfiError {
+                    continuation.resume(throwing: Self.mapFfi(error))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
         }
     }
 

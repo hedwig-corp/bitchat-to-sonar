@@ -1847,11 +1847,14 @@ final class SonarAppStore: ObservableObject {
     /// Settings → Backup chats: encrypt Marmot DB+key with nsec and upload to
     /// Blossom so delete→reinstall→paste nsec can recover history.
     func backupAccountNow() async {
+        // Immediate feedback — the seal+upload path can take seconds and used
+        // to run on the MainActor with no toast until completion.
+        showToast(String(localized: "Backing up chats…"))
         do {
             try await marmot.backupAccount()
-            toast = String(localized: "Chat backup uploaded")
+            showToast(String(localized: "Chat backup uploaded"))
         } catch {
-            toast = String(localized: "Backup failed — try again when online")
+            showToast(String(localized: "Backup failed — try again when online"))
             SecureLogger.warning(
                 "⚠️ Account backup failed: \(error.localizedDescription)",
                 category: .session

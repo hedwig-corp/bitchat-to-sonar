@@ -701,16 +701,39 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Upload an encrypted Marmot account backup to Blossom, then reconnect.
+    ///
+    /// Always reconnects after the upload attempt — Compose `backupAccountNow`
+    /// always `boot()`s so a failed Blossom call cannot leave the node closed
+    /// (Settings tap would look dead and chats stay offline until restart).
     func backupAccount() async throws {
         let wasPolling = syncTask != nil
         busy = true
-        defer { busy = false }
         stopPolling()
-        _ = try await service.uploadAccountBackup()
-        guard await performConnect() else {
-            throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+        var uploadError: Error?
+        do {
+            _ = try await service.uploadAccountBackup()
+        } catch {
+            uploadError = error
+        }
+        let reconnected = await performConnect()
+        // Clear busy before relay attach: `performConnect` schedules
+        // `connectRelaysIfNeeded` with a short delay that no-ops while `busy`,
+        // which would leave a local-only node after Settings backup.
+        busy = false
+        if reconnected {
+            connectRelaysIfNeeded()
         }
         if wasPolling { startPolling() }
+        let outcome = MarmotAccountBackupFlow.outcome(
+            uploadSucceeded: uploadError == nil,
+            reconnected: reconnected
+        )
+        if outcome.shouldSurfaceUploadFailure, let uploadError {
+            throw uploadError
+        }
+        if outcome.shouldSurfaceReconnectFailure {
+            throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+        }
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking
