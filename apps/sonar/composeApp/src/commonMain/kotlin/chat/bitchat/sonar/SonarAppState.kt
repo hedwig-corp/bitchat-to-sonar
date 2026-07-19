@@ -5407,6 +5407,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 clearMediaUploadProgress(pendingId)
                 refreshRetriedMarmotMessage(chatId)
             } catch (error: Throwable) {
+                if (isMediaUploadInFlight(error)) {
+                    // Owner still uploading — keep Uploading UI / progress.
+                    return@launch
+                }
                 if (isMediaUploadCancelled(error)) {
                     discardPendingMediaUpload(pendingId)
                     return@launch
@@ -5935,6 +5939,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         return false
     }
 
+    private fun isMediaUploadInFlight(error: Throwable): Boolean {
+        var cur: Throwable? = error
+        while (cur != null) {
+            val msg = cur.message.orEmpty()
+            if (msg.contains("already in flight", ignoreCase = true)) return true
+            cur = cur.cause
+        }
+        return false
+    }
+
     /** Drop a cancelled/abandoned optimistic media echo from host state. */
     private fun discardPendingMediaUpload(pendingId: String) {
         clearMediaUploadProgress(pendingId)
@@ -5954,7 +5968,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun registerMediaUploadControl(pendingId: String, control: MediaUploadControl) {
-        mediaUploadControls[pendingId]?.cancel()
+        // Do not cancel an existing control for the same id — a retry that races
+        // an in-flight owner must not abort the owner's progress listener.
+        if (mediaUploadControls.containsKey(pendingId)) return
         mediaUploadControls[pendingId] = control
     }
 
@@ -6269,6 +6285,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
                 if (isMediaUploadCancelled(e)) {
                     discardPendingMediaUpload(pendingId)
                     return@launch
@@ -6394,6 +6413,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
                 if (isMediaUploadCancelled(e)) {
                     discardPendingMediaUpload(pendingId)
                     return@launch
@@ -6520,6 +6542,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                 }
             } catch (e: Throwable) {
+                if (isMediaUploadInFlight(e)) {
+                    return@launch
+                }
                 if (isMediaUploadCancelled(e)) {
                     discardPendingMediaUpload(pendingId)
                     return@launch

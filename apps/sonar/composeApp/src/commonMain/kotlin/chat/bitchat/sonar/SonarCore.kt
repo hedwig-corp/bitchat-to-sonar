@@ -551,6 +551,9 @@ expect object SonarCore {
     /** Resume durable pre-Blossom media staging after disconnect/kill. */
     suspend fun resumePendingMediaUploads(): UInt
 
+    /** Cooperative cancel for quiet resume / in-flight Blossom work. */
+    suspend fun cancelAllMediaUploads()
+
     /** Send a sticker message to a chat. */
     suspend fun sendSticker(
         chatId: String,

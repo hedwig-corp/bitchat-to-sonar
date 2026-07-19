@@ -280,6 +280,11 @@ actual object SonarCore {
         requireNode().resumePendingMediaUploadsQuiet()
     }
 
+    actual suspend fun cancelAllMediaUploads() = withContext(Dispatchers.IO) {
+        runCatching { requireNode().cancelAllMediaUploads() }
+        Unit
+    }
+
     actual suspend fun sendSticker(
         chatId: String,
         packCoordinate: String,

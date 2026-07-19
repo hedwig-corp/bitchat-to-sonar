@@ -842,6 +842,15 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// Cooperative cancel for quiet resume / Blossom work (stopPolling, wipe).
+    /// Must not wait on `mediaLane` — that is the work being cancelled.
+    func cancelAllMediaUploads() {
+        nodeLock.lock()
+        let nodeRef = node
+        nodeLock.unlock()
+        nodeRef?.cancelAllMediaUploads()
+    }
+
     /// Send a sticker message to the group.
     func sendSticker(
         groupId: String,

@@ -57,6 +57,32 @@ pub(crate) struct StagedMediaItem {
     pub byte_len: u64,
 }
 
+/// Blossom URL + imeta fields persisted after upload succeeds and before MLS
+/// create. Lets resume skip re-upload and detect an already-created local
+/// message (same URLs) so a crash between create and Committed cannot
+/// double-publish a second kind-445.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct SealedMediaItem {
+    pub url: String,
+    pub filename: String,
+    pub mime: String,
+    pub original_hash_hex: String,
+    pub encrypted_hash_hex: String,
+    pub nonce_hex: String,
+    pub original_size: u64,
+    pub encrypted_size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbhash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<Vec<u8>>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct StagedMediaEntry {
     pub id: String,
@@ -71,6 +97,9 @@ pub(crate) struct StagedMediaEntry {
     pub last_error: Option<String>,
     pub bytes_sent: u64,
     pub total_bytes: u64,
+    /// Set after Blossom succeeds, before MLS create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sealed_items: Option<Vec<SealedMediaItem>>,
     /// Set when flipping to [`MediaStagingStatus::Committed`] so a crash before
     /// `mark_outbox_pending` can finish publish without creating a new event.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,11 +269,31 @@ impl MediaStagingState {
             last_error: None,
             bytes_sent: 0,
             total_bytes,
+            sealed_items: None,
             committed_message_id_hex: None,
             committed_event_id_hex: None,
             committed_event_json: None,
         };
         self.entries.insert(id, entry);
+        self.dirty = true;
+        self.save_if_dirty()
+    }
+
+    /// Persist Blossom URLs + imeta fields after upload, before MLS create.
+    pub fn mark_sealed(
+        &mut self,
+        id: &str,
+        sealed_items: Vec<SealedMediaItem>,
+        now_secs: u64,
+    ) -> Result<()> {
+        let Some(entry) = self.entries.get_mut(id) else {
+            return Ok(());
+        };
+        if entry.state == MediaStagingStatus::Committed {
+            return Ok(());
+        }
+        entry.sealed_items = Some(sealed_items);
+        entry.updated_at_secs = now_secs;
         self.dirty = true;
         self.save_if_dirty()
     }
@@ -733,6 +782,7 @@ mod tests {
                 last_error: None,
                 bytes_sent: 0,
                 total_bytes: 1,
+                sealed_items: None,
                 committed_message_id_hex: None,
                 committed_event_id_hex: None,
                 committed_event_json: None,

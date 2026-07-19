@@ -845,6 +845,22 @@ final class MarmotChatModel: ObservableObject {
         return detail.localizedCaseInsensitiveContains("upload cancelled")
     }
 
+    /// Core returned `MediaUploadInFlight` — another worker owns this optimistic id.
+    private static func isMediaUploadInFlight(_ error: Error) -> Bool {
+        let detail: String
+        if let service = error as? MarmotService.ServiceError {
+            switch service {
+            case .core(let message), .invalidInput(let message):
+                detail = message
+            default:
+                return false
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return detail.localizedCaseInsensitiveContains("already in flight")
+    }
+
     private func connectRelaysIfNeeded() {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
@@ -2624,6 +2640,10 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
+                if Self.isMediaUploadInFlight(error) {
+                    // Owner (resume or prior send) still uploading — keep echo.
+                    return
+                }
                 clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
@@ -2728,6 +2748,9 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
+                if Self.isMediaUploadInFlight(error) {
+                    return
+                }
                 clearMediaUploadListener(echo.id)
                 discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
@@ -3305,8 +3328,21 @@ final class MarmotChatModel: ObservableObject {
     func stopPolling() {
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // Latch core cancel before clearing the Task slot so an in-flight quiet
+        // resume on mediaLane observes cancel (observer=None otherwise ignores
+        // Task.cancel). Do not nil the slot until the task finishes — same
+        // stacked-resume hazard as gapRecovery.
+        let resume = mediaResumeTask
         mediaResumeTask?.cancel()
-        mediaResumeTask = nil
+        service.cancelAllMediaUploads()
+        Task { [weak self] in
+            _ = await resume?.value
+            await MainActor.run {
+                if self?.mediaResumeTask === resume {
+                    self?.mediaResumeTask = nil
+                }
+            }
+        }
         syncTask?.cancel()
         syncTask = nil
         foregroundRefreshTask?.cancel()

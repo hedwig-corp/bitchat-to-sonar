@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::{BoxFuture, Shared};
 use futures_util::FutureExt;
+use mdk_core::encrypted_media::EncryptedMediaUpload;
 use mdk_core::prelude::*;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
@@ -39,6 +40,7 @@ use crate::marmot::{
 };
 use crate::media_staging::{
     media_staging_paths_for_db, new_media_staging_id, wipe_media_staging_for_db, MediaStagingState,
+    SealedMediaItem,
 };
 use crate::outbox::{outbox_state_path_for_db, OutboxState};
 use crate::push::{push_token_cache_path_for_db, wipe_push_token_cache_for_db, PushTokenCache};
@@ -217,6 +219,62 @@ fn media_download_cancelled(observer: Option<&dyn MediaDownloadObserver>) -> boo
 
 fn media_upload_cancelled(observer: Option<&dyn MediaUploadObserver>) -> bool {
     observer.is_some_and(MediaUploadObserver::is_cancelled)
+}
+
+fn media_upload_cancelled_or_all(
+    observer: Option<&dyn MediaUploadObserver>,
+    cancel_all: &AtomicBool,
+) -> bool {
+    cancel_all.load(Ordering::Acquire) || media_upload_cancelled(observer)
+}
+
+fn upload_to_sealed(upload: &EncryptedMediaUpload, url: &str) -> SealedMediaItem {
+    SealedMediaItem {
+        url: url.to_string(),
+        filename: upload.filename.clone(),
+        mime: upload.mime_type.clone(),
+        original_hash_hex: hex::encode(upload.original_hash),
+        encrypted_hash_hex: hex::encode(upload.encrypted_hash),
+        nonce_hex: hex::encode(upload.nonce),
+        original_size: upload.original_size,
+        encrypted_size: upload.encrypted_size,
+        dimensions: upload.dimensions,
+        blurhash: upload.blurhash.clone(),
+        thumbhash: upload.thumbhash.clone(),
+        duration_ms: upload.duration_ms,
+        waveform: upload.waveform.clone(),
+    }
+}
+
+fn sealed_item_to_upload(sealed: SealedMediaItem) -> Result<EncryptedMediaUpload> {
+    let original_hash: [u8; 32] = hex::decode(&sealed.original_hash_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed original_hash corrupt".into()))?;
+    let encrypted_hash: [u8; 32] = hex::decode(&sealed.encrypted_hash_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed encrypted_hash corrupt".into()))?;
+    let nonce: [u8; 12] = hex::decode(&sealed.nonce_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::Media("sealed nonce corrupt".into()))?;
+    Ok(EncryptedMediaUpload {
+        // Ciphertext not needed for imeta rebuild after Blossom already has the blob.
+        encrypted_data: Vec::new(),
+        original_hash,
+        encrypted_hash,
+        mime_type: sealed.mime,
+        filename: sealed.filename,
+        original_size: sealed.original_size,
+        encrypted_size: sealed.encrypted_size,
+        dimensions: sealed.dimensions,
+        blurhash: sealed.blurhash,
+        thumbhash: sealed.thumbhash,
+        duration_ms: sealed.duration_ms,
+        waveform: sealed.waveform,
+        nonce,
+    })
 }
 
 /// RAII guard that releases a media-upload in-flight claim on drop.
@@ -1404,6 +1462,9 @@ pub struct SonarClient {
     /// `resume_pending_media_uploads`. Prevents overlapping workers from
     /// double-publishing the same staged album.
     media_upload_inflight: Arc<Mutex<HashSet<String>>>,
+    /// Host-set latch so quiet resume (no observer) can still be cancelled on
+    /// wipe / stopPolling. Cleared at the start of each resume pass.
+    media_upload_cancel_all: Arc<AtomicBool>,
     /// Live giftwraps (1059→us) buffered by the notification handler.
     pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>>,
     /// Live MLS group messages (kind 445) buffered by the notification handler.
@@ -1951,6 +2012,7 @@ impl SonarClient {
             media_staging_dir_path,
         )));
         let media_upload_inflight = Arc::new(Mutex::new(HashSet::new()));
+        let media_upload_cancel_all = Arc::new(AtomicBool::new(false));
         let client = Self {
             engine,
             nostr,
@@ -1965,6 +2027,7 @@ impl SonarClient {
             outbox_state,
             media_staging,
             media_upload_inflight,
+            media_upload_cancel_all,
             pending_marmot_giftwraps,
             pending_marmot_groups,
             marmot_notify,
@@ -3976,10 +4039,9 @@ impl SonarClient {
         // Claim *before* stage so a racing resume cannot observe an Uploading
         // row on disk and steal the entry mid-fsync.
         let Some(_claim) = self.try_claim_media_upload(&entry_id) else {
-            // Another send/resume already owns this optimistic id. Treat as
-            // success so hosts do not paint a false "Couldn't send" while the
-            // owner finishes (or fails) the upload.
-            return Ok(());
+            // Another send/resume already owns this optimistic id. Hosts must
+            // keep Uploading UI — not success (clears progress) or hard fail.
+            return Err(Error::MediaUploadInFlight);
         };
         {
             let staging = self.media_staging.clone();
@@ -4023,12 +4085,24 @@ impl SonarClient {
         }
     }
 
+    /// Latch used by wipe / stopPolling so quiet resume (no observer) can stop.
+    pub fn cancel_all_media_uploads(&self) {
+        self.media_upload_cancel_all.store(true, Ordering::Release);
+    }
+
+    /// Clear the process-wide cancel latch (called at the start of each resume).
+    pub fn clear_media_upload_cancel(&self) {
+        self.media_upload_cancel_all.store(false, Ordering::Release);
+    }
+
     /// Resume durable staged media uploads left behind by a failed or
     /// interrupted send. Returns how many entries were attempted.
     pub async fn resume_pending_media_uploads(
         &self,
         observer: Option<&dyn MediaUploadObserver>,
     ) -> Result<u32> {
+        // New resume pass is intentional — clear any prior stopPolling latch.
+        self.clear_media_upload_cancel();
         {
             let staging = self.media_staging.clone();
             let now = Timestamp::now().as_secs();
@@ -4242,16 +4316,29 @@ impl SonarClient {
     }
 
     /// Encrypt + upload staged plaintext, then publish via the durable outbox.
+    /// True when a local transcript message already carries every Blossom URL
+    /// (crash between MLS create and Committed left the row without staging mark).
+    fn local_media_urls_present(&self, group_id: &GroupId, urls: &[String]) -> Result<bool> {
+        if urls.is_empty() {
+            return Ok(false);
+        }
+        let messages = self.engine.messages(group_id)?;
+        Ok(messages.iter().any(|message| {
+            urls.iter()
+                .all(|url| message.media.iter().any(|m| m.url == *url))
+        }))
+    }
+
     async fn complete_staged_media_upload(
         &self,
         entry_id: &str,
         group_id: &GroupId,
         observer: Option<&dyn MediaUploadObserver>,
     ) -> Result<()> {
-        if media_upload_cancelled(observer) {
+        if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
             return Err(Error::MediaUploadCancelled);
         }
-        let (caption, server_url, progress_id, items_meta, plaintext_items) = {
+        let (caption, server_url, progress_id, items_meta, plaintext_items, sealed_items) = {
             let staging = self.media_staging.clone();
             let entry_id = entry_id.to_string();
             tokio::task::spawn_blocking(move || {
@@ -4267,6 +4354,7 @@ impl SonarClient {
                     entry.client_pending_id,
                     entry.items,
                     bytes,
+                    entry.sealed_items,
                 ))
             })
             .await
@@ -4285,146 +4373,210 @@ impl SonarClient {
             plaintext_bytes = plaintext_total,
             "media upload encrypt+blossom begin"
         );
-        let plaintext_lens: Arc<Vec<u64>> = Arc::new(
-            plaintext_items
+
+        let (encrypted, urls) = if let Some(sealed) = sealed_items.filter(|s| !s.is_empty()) {
+            // Blossom already succeeded on a prior attempt — skip re-upload.
+            let urls: Vec<String> = sealed.iter().map(|s| s.url.clone()).collect();
+            let encrypted = sealed
+                .into_iter()
+                .map(sealed_item_to_upload)
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(obs) = observer {
+                let total: u64 = encrypted.iter().map(|u| u.encrypted_size.max(1)).sum();
+                obs.on_progress(&progress_id, total, total);
+            }
+            (encrypted, urls)
+        } else {
+            let plaintext_lens: Arc<Vec<u64>> = Arc::new(
+                plaintext_items
+                    .iter()
+                    .map(|d| d.len() as u64)
+                    .collect(),
+            );
+            let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+                (0..item_count)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            );
+            let item_totals: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
+                (0..item_count)
+                    .map(|_| std::sync::atomic::AtomicU64::new(0))
+                    .collect(),
+            );
+            let provisional_total: u64 = plaintext_lens.iter().sum();
+            if let Some(obs) = observer {
+                obs.on_progress(&progress_id, 0, provisional_total);
+            }
+
+            let pairs: Vec<_> = items_meta.into_iter().zip(plaintext_items).collect();
+            let group_id_owned = group_id.clone();
+            let cancel_all = self.media_upload_cancel_all.clone();
+            let upload_futs = pairs.into_iter().enumerate().map(|(index, (meta, data))| {
+                let server_url = server_url.clone();
+                let item_sent = item_sent.clone();
+                let item_totals = item_totals.clone();
+                let group_id = group_id_owned.clone();
+                let cancel_all = cancel_all.clone();
+                async move {
+                    if media_upload_cancelled_or_all(observer, &cancel_all) {
+                        return Err(Error::MediaUploadCancelled);
+                    }
+                    // On the multi-thread UniFFI runtime, park this worker so
+                    // encrypt CPU does not starve Blossom/cancel polls. Current-
+                    // thread test runtimes cannot use block_in_place.
+                    let upload = if matches!(
+                        tokio::runtime::Handle::current().runtime_flavor(),
+                        tokio::runtime::RuntimeFlavor::MultiThread
+                    ) {
+                        tokio::task::block_in_place(|| {
+                            self.engine.encrypt_media(
+                                &group_id,
+                                &data,
+                                &meta.mime,
+                                &meta.filename,
+                            )
+                        })?
+                    } else {
+                        self.engine.encrypt_media(
+                            &group_id,
+                            &data,
+                            &meta.mime,
+                            &meta.filename,
+                        )?
+                    };
+                    let cipher_len = upload.encrypted_data.len() as u64;
+                    item_totals[index].store(cipher_len, Ordering::Relaxed);
+                    if media_upload_cancelled_or_all(observer, &cancel_all) {
+                        return Err(Error::MediaUploadCancelled);
+                    }
+                    let cipher = upload.encrypted_data.clone();
+                    let url = self
+                        .blossom_upload_with_progress(
+                            &server_url,
+                            cipher,
+                            Some(Box::new({
+                                let item_sent = item_sent.clone();
+                                move |sent: u64, _total: u64| {
+                                    item_sent[index].store(sent, Ordering::Relaxed);
+                                }
+                            }) as Box<dyn FnMut(u64, u64) + Send>),
+                        )
+                        .await?;
+                    Ok::<_, Error>((index, upload, url))
+                }
+            });
+
+            use futures_util::stream::{self, StreamExt};
+            let uploads = async {
+                stream::iter(upload_futs)
+                    .buffer_unordered(MEDIA_UPLOAD_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await
+            };
+            let entry_id_owned = entry_id.to_string();
+            let media_staging = self.media_staging.clone();
+            let cancel_all = self.media_upload_cancel_all.clone();
+            let progress_tick = {
+                let item_sent = item_sent.clone();
+                let item_totals = item_totals.clone();
+                let plaintext_lens = plaintext_lens.clone();
+                let media_staging = media_staging.clone();
+                let entry_id_owned = entry_id_owned.clone();
+                let progress_id = progress_id.clone();
+                let cancel_all = cancel_all.clone();
+                async move {
+                    loop {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if media_upload_cancelled_or_all(observer, &cancel_all) {
+                            return Error::MediaUploadCancelled;
+                        }
+                        let aggregate: u64 =
+                            item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
+                        let mut album_total = 0u64;
+                        for (i, total) in item_totals.iter().enumerate() {
+                            let known = total.load(Ordering::Relaxed);
+                            album_total += if known > 0 {
+                                known
+                            } else {
+                                plaintext_lens[i]
+                            };
+                        }
+                        let aggregate = aggregate.min(album_total.max(1));
+                        let _ = media_staging.lock().unwrap().update_progress(
+                            &entry_id_owned,
+                            aggregate,
+                            Timestamp::now().as_secs(),
+                            false,
+                        );
+                        if let Some(obs) = observer {
+                            obs.on_progress(&progress_id, aggregate, album_total.max(1));
+                        }
+                    }
+                }
+            };
+
+            let results = tokio::select! {
+                biased;
+                results = uploads => results,
+                err = progress_tick => return Err(err),
+            };
+            let mut encrypted_slots = Vec::with_capacity(item_count);
+            encrypted_slots.resize_with(item_count, || None);
+            let mut urls = vec![String::new(); item_count];
+            for result in results {
+                let (index, upload, url) = result?;
+                encrypted_slots[index] = Some(upload);
+                urls[index] = url;
+            }
+            let encrypted: Vec<_> = encrypted_slots
+                .into_iter()
+                .map(|slot| {
+                    slot.ok_or_else(|| Error::Media("album upload missing encrypted item".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
+                return Err(Error::MediaUploadCancelled);
+            }
+            let sealed: Vec<SealedMediaItem> = encrypted
                 .iter()
-                .map(|d| d.len() as u64)
-                .collect(),
-        );
-        // Progress callbacks inside Blossom must be 'static, so they only bump
-        // atomics. A ticker below mirrors those atomics to the host observer.
-        // Ciphertext totals fill in as each item finishes encrypt (pipelined).
-        let item_sent: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
-            (0..item_count)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-        );
-        let item_totals: Arc<Vec<std::sync::atomic::AtomicU64>> = Arc::new(
-            (0..item_count)
-                .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-        );
-        let provisional_total: u64 = plaintext_lens.iter().sum();
-        if let Some(obs) = observer {
-            obs.on_progress(&progress_id, 0, provisional_total);
-        }
-
-        // Pipeline encrypt∥upload per item so album CPU and uplink overlap.
-        // Peak ciphertext RAM is ~concurrency items, not the whole album.
-        let pairs: Vec<_> = items_meta.into_iter().zip(plaintext_items).collect();
-        let group_id_owned = group_id.clone();
-        let upload_futs = pairs.into_iter().enumerate().map(|(index, (meta, data))| {
-            let server_url = server_url.clone();
-            let item_sent = item_sent.clone();
-            let item_totals = item_totals.clone();
-            let group_id = group_id_owned.clone();
-            async move {
-                if media_upload_cancelled(observer) {
-                    return Err(Error::MediaUploadCancelled);
-                }
-                let upload = self.engine.encrypt_media(
-                    &group_id,
-                    &data,
-                    &meta.mime,
-                    &meta.filename,
-                )?;
-                let cipher_len = upload.encrypted_data.len() as u64;
-                item_totals[index].store(cipher_len, Ordering::Relaxed);
-                if media_upload_cancelled(observer) {
-                    return Err(Error::MediaUploadCancelled);
-                }
-                let cipher = upload.encrypted_data.clone();
-                let url = self
-                    .blossom_upload_with_progress(
-                        &server_url,
-                        cipher,
-                        Some(Box::new({
-                            let item_sent = item_sent.clone();
-                            move |sent: u64, _total: u64| {
-                                item_sent[index].store(sent, Ordering::Relaxed);
-                            }
-                        }) as Box<dyn FnMut(u64, u64) + Send>),
-                    )
-                    .await?;
-                Ok::<_, Error>((index, upload, url))
-            }
-        });
-
-        use futures_util::stream::{self, StreamExt};
-        let uploads = async {
-            stream::iter(upload_futs)
-                .buffer_unordered(MEDIA_UPLOAD_CONCURRENCY)
-                .collect::<Vec<_>>()
+                .zip(urls.iter())
+                .map(|(u, url)| upload_to_sealed(u, url))
+                .collect();
+            {
+                let staging = self.media_staging.clone();
+                let entry_id = entry_id.to_string();
+                let now = Timestamp::now().as_secs();
+                tokio::task::spawn_blocking(move || {
+                    staging.lock().unwrap().mark_sealed(&entry_id, sealed, now)
+                })
                 .await
-        };
-        let entry_id_owned = entry_id.to_string();
-        let media_staging = self.media_staging.clone();
-        let progress_tick = {
-            let item_sent = item_sent.clone();
-            let item_totals = item_totals.clone();
-            let plaintext_lens = plaintext_lens.clone();
-            let media_staging = media_staging.clone();
-            let entry_id_owned = entry_id_owned.clone();
-            let progress_id = progress_id.clone();
-            async move {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    if media_upload_cancelled(observer) {
-                        return Error::MediaUploadCancelled;
-                    }
-                    let aggregate: u64 =
-                        item_sent.iter().map(|a| a.load(Ordering::Relaxed)).sum();
-                    let mut album_total = 0u64;
-                    for (i, total) in item_totals.iter().enumerate() {
-                        let known = total.load(Ordering::Relaxed);
-                        album_total += if known > 0 {
-                            known
-                        } else {
-                            plaintext_lens[i]
-                        };
-                    }
-                    let aggregate = aggregate.min(album_total.max(1));
-                    // Memory-only: avoid sync JSON write every 100ms on the
-                    // tokio worker. Terminal paths persist via mark_*/remove.
-                    let _ = media_staging.lock().unwrap().update_progress(
-                        &entry_id_owned,
-                        aggregate,
-                        Timestamp::now().as_secs(),
-                        false,
-                    );
-                    if let Some(obs) = observer {
-                        obs.on_progress(&progress_id, aggregate, album_total.max(1));
-                    }
-                }
+                .map_err(|e| Error::Storage(format!("media seal join: {e}")))??;
             }
+            (encrypted, urls)
         };
 
-        let results = tokio::select! {
-            biased;
-            results = uploads => results,
-            err = progress_tick => return Err(err),
-        };
-        let mut encrypted = Vec::with_capacity(item_count);
-        encrypted.resize_with(item_count, || None);
-        let mut urls = vec![String::new(); item_count];
-        for result in results {
-            let (index, upload, url) = result?;
-            encrypted[index] = Some(upload);
-            urls[index] = url;
-        }
-        let encrypted: Vec<_> = encrypted
-            .into_iter()
-            .map(|slot| {
-                slot.ok_or_else(|| Error::Media("album upload missing encrypted item".into()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if media_upload_cancelled(observer) {
+        if media_upload_cancelled_or_all(observer, &self.media_upload_cancel_all) {
             return Err(Error::MediaUploadCancelled);
         }
         let album_total: u64 = encrypted
             .iter()
-            .map(|u| u.encrypted_data.len() as u64)
+            .map(|u| u.encrypted_size.max(u.encrypted_data.len() as u64).max(1))
             .sum();
+
+        // Crash between MLS create and Committed left a local row with these
+        // Blossom URLs — do not create a second kind-445.
+        if self.local_media_urls_present(group_id, &urls)? {
+            self.staging_remove(entry_id).await;
+            if let Some(obs) = observer {
+                obs.on_progress(&progress_id, album_total, album_total);
+            }
+            tracing::info!(
+                entry_id,
+                items = item_count,
+                "media upload skipped create; local urls already present"
+            );
+            return Ok(());
+        }
 
         let refs: Vec<_> = encrypted
             .iter()
@@ -4566,6 +4718,16 @@ impl SonarClient {
         };
         let base = Url::parse(server)
             .map_err(|e| Error::Blossom(format!("bad server url {server}: {e}")))?;
+        let loopback = matches!(
+            base.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("::1")
+        );
+        if base.scheme() != "https" && !(base.scheme() == "http" && loopback) {
+            return Err(Error::Blossom(format!(
+                "blossom upload requires https (got {})",
+                base.scheme()
+            )));
+        }
         // Reuse the process-wide upload client so sequential/concurrent PUTs
         // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
         let client =

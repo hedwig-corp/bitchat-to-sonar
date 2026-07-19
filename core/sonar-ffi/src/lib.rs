@@ -1460,6 +1460,11 @@ impl SonarNode {
             .block_on(self.client.resume_pending_media_uploads(None))?)
     }
 
+    /// Latch cancel for quiet resume / in-flight Blossom work (wipe, stopPolling).
+    pub fn cancel_all_media_uploads(&self) {
+        self.client.cancel_all_media_uploads();
+    }
+
     /// Download + decrypt the media blob at `url` for `group_id`. Returns plaintext.
     pub fn fetch_media(&self, group_id_hex: String, url: String) -> FfiResult<Vec<u8>> {
         let group_id = parse_group_id(&group_id_hex)?;

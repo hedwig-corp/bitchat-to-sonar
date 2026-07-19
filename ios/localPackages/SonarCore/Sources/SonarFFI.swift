@@ -1483,6 +1483,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func callWaitEvent(timeoutSecs: UInt64)  -> CallEventInfo?
 
     /**
+     * Latch cancel for quiet resume / in-flight Blossom work (wipe, stopPolling).
+     */
+    func cancelAllMediaUploads()
+
+    /**
      * Claim (or refresh) a handle at the Sonar registrar. One claim registers
      * both resolutions: NIP-05 (chat) always, BIP-353 (payments) when `offer`
      * is present. Signed with the identity key, so restoring the nsec
@@ -2113,6 +2118,16 @@ open func callWaitEvent(timeoutSecs: UInt64) -> CallEventInfo?  {
         FfiConverterUInt64.lower(timeoutSecs),$0
     )
 })
+}
+
+    /**
+     * Latch cancel for quiet resume / in-flight Blossom work (wipe, stopPolling).
+     */
+open func cancelAllMediaUploads()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_cancel_all_media_uploads(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
 
     /**
@@ -8157,6 +8172,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_call_wait_event() != 8621) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_cancel_all_media_uploads() != 39733) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_claim_handle() != 7894) {
