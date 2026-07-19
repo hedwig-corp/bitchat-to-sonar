@@ -77,6 +77,18 @@ public func snCollectionHostOwnedBottomContentInset(
     )
 }
 
+public func snCollectionHostOwnedBottomContentInset(
+    collectionBoundsHeight: CGFloat,
+    composerBottomYInViewport: CGFloat,
+    composerHeight: CGFloat
+) -> CGFloat {
+    transcriptOwnedBottomContentInset(
+        collectionBoundsHeight: collectionBoundsHeight,
+        composerBottomYInViewport: composerBottomYInViewport,
+        composerHeight: composerHeight
+    )
+}
+
 public func snCollectionHostFloatingComposerGap(
     keyboardOcclusionHeight: CGFloat,
     swiftUIKeyboardAvoidanceActive: Bool
