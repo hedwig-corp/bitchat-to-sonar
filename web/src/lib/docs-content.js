@@ -7,7 +7,7 @@
  */
 export const SONAR_DOCS = {
   groups: [
-    { name: 'Overview', items: ['index'] },
+    { name: 'Overview', items: ['index', 'PERFORMANCE'] },
     { name: 'Protocol', items: ['SONAR-DISCOVERY'] },
     { name: 'Money', items: ['SONAR-PAYMENTS', 'bip353-registration'] },
     { name: 'Content', items: ['SONAR-STICKERS'] },
@@ -29,6 +29,7 @@ These docs describe the protocols and conventions behind the app.
 - **[Discovery](SONAR-DISCOVERY.md)** — how peers find each other over BLE and Nostr, and how capabilities are advertised.
 - **[Payments](SONAR-PAYMENTS.md)** — direct Bolt12 wallet payments and the in-chat receipt format.
 - **[Stickers](SONAR-STICKERS.md)** — the open sticker-pack directory published on Nostr.
+- **[Performance](PERFORMANCE.md)** — cold-start, relay-sync, and send latency benchmarks on real devices.
 - **[Hermes Agent](HERMES-AGENT.md)** — autonomous AI over Sonar DMs via sonar-cli and the Hermes gateway.
 
 ## Principles
@@ -39,6 +40,89 @@ These docs describe the protocols and conventions behind the app.
 4. **No new identifiers.** Sonar rides existing bitchat mesh framing and standard Nostr event kinds.
 
 > These pages are generated from the \`docs/\` folder of the repository. Use **View on GitHub** on any page to read the source.`,
+    },
+
+    PERFORMANCE: {
+      title: 'Performance',
+      status: 'device bench',
+      kind: 'benchmarks',
+      gh: 'https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/PERFORMANCE.md',
+      blurb: 'cold-start relay-sync and send latency on real iphone and android',
+      md: `# Performance
+
+Sonar aims for **Signal-comparable local-first performance**: open an existing chat from local storage first, and keep relay sync / publish work off the first-paint path.
+
+This page summarizes the device latency track. The full harness, markers, gotchas, sticker/send/keyboard benches, and protocol-scale work live in [\`docs/PERFORMANCE.md\`](https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/PERFORMANCE.md).
+
+## What we measure
+
+Cold starts of the signed Debug iOS app against a **real account** (real chats, live relays). The process is terminated and relaunched; the container is never erased. The app emits \`SONAR_BENCH\` phase markers:
+
+| marker | meaning |
+| --- | --- |
+| \`t0_launch\` | process entered app \`init\` |
+| \`t1_local_paint\` | local groups hydrated (first paint, no relays) |
+| \`t2_relay_connect_begin\` | relay attach begins |
+| \`t3_relay_connected\` | relay quorum connected |
+| \`t3b_first_wake\` | first Marmot event wake |
+| \`t4_first_drain\` | first relay burst applied to local storage |
+
+Headline totals: **\`t0 → t4\`** (in-app cold → synced) and **\`t2 → t4\`** (relay path). \`t4\` with \`woke=1\` means the real re-sync path ran.
+
+## Latest physical-device result (2026-07-20)
+
+**Device:** iPhone 14 Pro Max · iOS 26.5 · real account with **82 Marmot groups** · 5 cold starts · every run \`woke=1 notif=0\`.
+
+| phase | median |
+| --- | ---: |
+| t0 → t1 (open DB + local paint) | 0.301 s |
+| t2 → t3 (relay quorum connect) | 0.242 s |
+| t3 → t4 (post-connect sync) | 0.084 s |
+| **relay path t2 → t4** | **0.311 s** |
+| **TOTAL t0 → t4 (cold → synced)** | **0.921 s** |
+
+Full min / median / max:
+
+| phase | min | median | max |
+| --- | ---: | ---: | ---: |
+| t0 → t1 | 0.271 s | 0.301 s | 0.446 s |
+| t2 → t3 | 0.211 s | 0.242 s | 0.467 s |
+| t3 → t4 | 0.049 s | 0.084 s | 0.117 s |
+| t2 → t4 | 0.291 s | 0.311 s | 0.584 s |
+| **t0 → t4** | **0.872 s** | **0.921 s** | **1.254 s** |
+
+Compared with the 2026-06-29 physical-device sample (28 groups, after early relay fixes): total cold → synced dropped from **~24 s** to **~0.9 s**, and the relay path from **~21 s** to **~0.3 s**.
+
+## Why it got faster
+
+The old pain point was blocking KeyPackage + profile publish on the cold-start critical path — often ~18–57 s waiting for relay OK acks before the drain loop started. Sonar now:
+
+1. Starts \`startPolling()\` immediately after relay quorum (\`t3\`).
+2. Publishes KeyPackage / profile in the background (\`publish_*_background\`).
+3. Keeps local paint on the encrypted DB path before any relay work.
+
+Publish and kind-0 profile hydrate can still take tens of seconds in the background; they no longer gate first sync drain.
+
+## How to reproduce
+
+\`\`\`bash
+# signed Debug build on a paired iPhone (install over the existing app — never wipe)
+xcodebuild -project ios/bitchat.xcodeproj -scheme 'bitchat (iOS)' \\
+  -configuration Debug -destination 'platform=iOS,id=<UDID>' \\
+  -derivedDataPath /tmp/sonar-device-bench-dd -allowProvisioningUpdates build
+xcrun devicectl device install app --device <UDID> \\
+  /tmp/sonar-device-bench-dd/Build/Products/Debug-iphoneos/Sonar.app
+
+UDID=<UDID> RUNS=5 scripts/bench/device-bench.sh
+\`\`\`
+
+The harness uses USB \`idevicesyslog\` when the device is attached that way, otherwise it pulls the on-device diagnostics log over CoreDevice (Wi-Fi-safe).
+
+Simulator / provisioned-account benches, text-send latency, sticker cache ladders, Android chat-open first-frame, and MLS group-scale (\`sonar-sim\`) are documented in the [full PERFORMANCE.md](https://github.com/hedwig-corp/bitchat-to-sonar/blob/main/docs/PERFORMANCE.md).
+
+## Design rule
+
+If a change can make chat opening, sending, or scrolling meaningfully slower than Signal-style local database windowing, design a bounded local page first, move sync to the background, and document any platform gap with a follow-up path.`,
     },
 
     'SONAR-DISCOVERY': {

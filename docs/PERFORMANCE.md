@@ -2,7 +2,7 @@
 
 Status: harnesses implemented under `scripts/bench/`; native Apple and Compose
 Multiplatform app surfaces supported.
-Last updated: 2026-07-14.
+Last updated: 2026-07-20.
 
 Reproducible measurement of how long a **cold start** of the iOS Sonar app takes
 to become usable and to finish its first **Nostr/Marmot relay sync**, broken down
@@ -73,10 +73,13 @@ cost.
 - `_aggregate.py` — shared parser/aggregator.
 - `device-bench.sh` — the same benchmark on a PHYSICAL iPhone against the REAL
   account (real chats). Properly signed → Keychain works, no env hooks. Installs
-  over the existing app (data preserved), cold-starts via `devicectl`, captures
-  markers via `idevicesyslog -m SONAR_BENCH`, and parses the device-local
-  `[HH:MM:SS.mmm]` BitLogger timestamps. Splits the post-connect window into
-  publish / wait / drain via the `t3a`/`t3b` markers.
+  over the existing app (data preserved), cold-starts via `devicectl`, and
+  captures markers via USB `idevicesyslog -m SONAR_BENCH` when available, or
+  via CoreDevice pull of the app `LogFileSink`
+  (`Library/Application Support/sonar-marmot/logs/ios/sonar-ios.log`) over
+  Wi-Fi. Parses the device-local `[HH:MM:SS.mmm]` BitLogger timestamps. After
+  background KeyPackage/profile publish, the sync critical path is
+  `t2→t3→t3b→t4`; `t3→t3a` is off-path (publish enqueue + kind-0 hydrate).
 - `README.md` — usage + design notes.
 - `_sticker_aggregate.py` — cross-platform sticker pack/image benchmark parser.
   It reports relay metadata fetch, HTTPS miss phases, verified disk/reference
@@ -312,6 +315,59 @@ post-connect relay path after the PR.
 > directly comparable with newer runs; `startPolling()` also no longer waits
 > for t3a, so first-drain timings improved independently of publish latency.
 
+## Current device result (2026-07-20 — post background publish)
+
+Run on 2026-07-20 with `scripts/bench/device-bench.sh`, `RUNS=5`,
+`TIMEOUT=90`, `CAPTURE=applog` (CoreDevice Wi-Fi pull of the app log — USB
+`idevicesyslog` was unavailable), after installing a signed Debug build over
+the existing app so real account data was preserved. The Debug build includes
+the `LogFileSink`-before-`t0_launch` ordering so the file tee includes T0.
+All 5 runs reached `t4_first_drain` within 2 s of launch; every run had
+`woke=1 notif=0`.
+
+This is a larger account than the 2026-06-29 after-PR sample (82 Marmot groups
+vs 28). Local paint stayed well under the old multi-second baseline despite the
+extra groups.
+
+Median of 5 cold starts · iPhone 14 Pro Max (`Vincenzo`) · iOS 26.5 · **real
+account with 82 Marmot groups** · live relays:
+
+| phase | median | vs 2026-06-29 after PR #154 |
+|---|---:|---:|
+| t0 → t1 (open DB + local paint) | 0.301 s | 2.440 s → **~8× faster** |
+| t2 → t3 (relay quorum connect) | 0.242 s | 1.711 s |
+| t3 → t3b (first event wait) | 0.050 s | (was gated on publish) |
+| t3b → t4 (`drainPending` MLS) | 0.034 s | 0.229 s |
+| **t3 → t4 (post-connect sync)** | **0.084 s** | was bundled into ~20 s relay path |
+| **relay path t2 → t4** | **0.311 s** | **20.880 s → ~67× faster** |
+| **TOTAL t0 → t4 (in-app → synced)** | **0.921 s** | **23.958 s → ~26× faster** |
+
+Full min/median/max table:
+
+| phase | min | median | max |
+|---|---:|---:|---:|
+| t0 → t1 (open DB + local paint) | 0.271 s | 0.301 s | 0.446 s |
+| t1 → t2 (pre-relay window) | 0.264 s | 0.298 s | 0.506 s |
+| t2 → t3 (relay quorum connect) | 0.211 s | 0.242 s | 0.467 s |
+| t3 → t3b (first event wait) | 0.011 s | 0.050 s | 0.107 s |
+| t3b → t4 (`drainPending` MLS) | 0.010 s | 0.034 s | 0.039 s |
+| t3 → t4 (post-connect sync) | 0.049 s | 0.084 s | 0.117 s |
+| t2 → t4 (relay path) | 0.291 s | 0.311 s | 0.584 s |
+| TOTAL t1 → t4 (paint → synced) | 0.558 s | 0.620 s | 0.848 s |
+| **TOTAL t0 → t4 (in-app → synced)** | **0.872 s** | **0.921 s** | **1.254 s** |
+
+**Interpretation.** Background KeyPackage/profile publish + starting
+`startPolling()` immediately after `t3` removed the old ~18–57 s publish stall
+from the sync critical path. Cold start to first drain is now ~0.9 s median on
+an 82-group real account. KeyPackage publish and kind-0 profile hydrate still
+run after polling starts (often ~20–30 s wall time) but no longer gate
+`t4_first_drain`; the harness reports them as off-path `t3 → t3a` when the
+capture window waits long enough.
+
+Public summary lives on the website docs page **Performance**
+(`web/src/lib/docs-content.js` → `/docs#PERFORMANCE`). This file remains the
+harness source of truth.
+
 ## PR #220 replacement: text-send latency evaluation
 
 Run on 2026-07-13/14 for the replacement of accidentally merged PR #220. Each
@@ -505,10 +561,11 @@ backed by Signal's
    message events fan out per relay, the delivery row flips on the first relay
    OK, and best-effort push work waits behind the content attempt. Slow relays
    continue in the background and no longer hold the user-visible send state.
-3. **Secondary:** opening the encrypted DB + local paint scales with group
-   count: ~0.19 s for 1 group on the sim, ~1.3 s for the old 24-group device
-   baseline, and 2.44 s median for the 28-group after-PR run. Window it if it
-   grows.
+3. **Secondary:** opening the encrypted DB + local paint historically scaled
+   with group count (~0.19 s for 1 group on the sim, ~1.3–2.4 s on the old
+   24–28-group device baselines). The 2026-07-20 run paints 82 groups in
+   **0.301 s median** — keep watching this as accounts grow; window it if it
+   regresses.
 
 ## Findings / how to interpret
 

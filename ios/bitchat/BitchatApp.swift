@@ -39,6 +39,11 @@ struct BitchatApp: App {
     #endif
 
     init() {
+        // Diagnostics: tee SecureLogger into the bounded on-device log file so
+        // "Share debug bundle" works on shipped builds (Settings → Diagnostics).
+        // Configure before t0 so Wi-Fi / CoreDevice benches can pull markers from
+        // the app log when idevicesyslog (USB) is unavailable.
+        SonarDiagnostics.configureAppSink()
         #if DEBUG
         // SONAR_BENCH: earliest in-process cold-start marker (T0) + benchmark
         // provisioning. DEBUG-only — the markers are only %{public}@ (visible in
@@ -52,9 +57,6 @@ struct BitchatApp: App {
         }
         #endif
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
-        // Diagnostics: tee SecureLogger into the bounded on-device log file so
-        // "Share debug bundle" works on shipped builds (Settings → Diagnostics).
-        SonarDiagnostics.configureAppSink()
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
     }
