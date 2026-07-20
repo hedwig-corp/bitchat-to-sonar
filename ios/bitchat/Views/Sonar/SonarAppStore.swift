@@ -5304,8 +5304,9 @@ final class SonarAppStore: ObservableObject {
 
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
         guard !lines.isEmpty else { return true }
-        if meshReachable(id) {
-            for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
+        if let route = liveMeshRoutePeerId(for: id) {
+            let peer = PeerID(str: route)
+            for line in lines { chatViewModel.sendPrivateMessage(line, to: peer) }
             return true
         }
         if let groupId = marmotGroupId(id) {
@@ -5329,8 +5330,8 @@ final class SonarAppStore: ObservableObject {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
-        if meshReachable(id) {
-            chatViewModel.sendPrivateMessage(content, to: PeerID(str: id))
+        if let route = liveMeshRoutePeerId(for: id) {
+            chatViewModel.sendPrivateMessage(content, to: PeerID(str: route))
             return
         }
         if let groupId = marmotGroupId(id) {
@@ -6288,18 +6289,19 @@ final class SonarAppStore: ObservableObject {
             }
             return
         }
-        if meshReachable(id) {
+        if let route = liveMeshRoutePeerId(for: id) {
             // Per-item over mesh (no album packet), preserving each MIME:
             // sendImageOverMesh forces JPEG, so route GIFs through the file
             // path to keep the animation instead of flattening it.
             var failed = 0
+            let routePeer = PeerID(str: route)
             for item in items {
                 if item.mime == "image/gif" || item.mime.hasPrefix("video/") {
                     if !sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime) {
                         failed += 1
                     }
                 } else {
-                    sendImageOverMesh(PeerID(str: id), data: item.data)
+                    sendImageOverMesh(routePeer, data: item.data)
                 }
             }
             if failed > 0 {
@@ -6376,9 +6378,9 @@ final class SonarAppStore: ObservableObject {
     func sendAttachment(_ id: String, data: Data, filename: String, mime: String) -> Bool {
         let safeName = snEncryptedAttachmentFilename(filename)
         let safeMime = snEncryptedAttachmentMime(mime)
-        if meshReachable(id) {
+        if let route = liveMeshRoutePeerId(for: id) {
             if FileTransferLimits.isValidPayload(data.count) {
-                chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+                chatViewModel.selectedPrivateChatPeer = PeerID(str: route)
                 let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
                 chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
                 return true
@@ -6441,8 +6443,8 @@ final class SonarAppStore: ObservableObject {
     /// media. Same routing as `sendImage`, audio mime. Cleans up the temp file.
     func sendVoiceNote(_ id: String, url: URL) {
         defer { try? FileManager.default.removeItem(at: url) }
-        if meshReachable(id) {
-            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+        if let route = liveMeshRoutePeerId(for: id) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: route)
             chatViewModel.sendVoiceNote(at: url)
             return
         }
@@ -8327,13 +8329,13 @@ final class SonarAppStore: ObservableObject {
     private func sendCallControl(_ convId: String, _ line: String, via: SNVia) -> Bool {
         switch via {
         case .mesh:
-            guard meshReachable(convId) else {
+            guard let route = liveMeshRoutePeerId(for: convId) else {
                 SecureLogger.debug("SonarCall: dropping control without mesh route convId=\(convId.prefix(16))", category: .session)
                 return false
             }
-            let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: convId), messageID: UUID().uuidString)
+            let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: route), messageID: UUID().uuidString)
             if !sent {
-                SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16))", category: .session)
+                SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16)) route=\(route.prefix(16))", category: .session)
             }
             return sent
         case .internet:
