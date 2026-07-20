@@ -3229,12 +3229,21 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Mesh/bitchat private messages across every alias of this conversation.
+    /// Single-alias keeps the pre-fold O(1) `privateChats[peer]` return (already
+    /// chronological); multi-fingerprint merges + sorts only when needed.
     private func meshPrivateMessages(forConversationId id: String) -> [BitchatMessage] {
-        let aliases = Set(meshPeerAliases(for: id))
+        let aliases = meshPeerAliases(for: id)
+        let aliasSet = Set(aliases)
+        if aliasSet.count <= 1 {
+            let key = aliases.first ?? id
+            return chatViewModel.privateChats[PeerID(str: key)]
+                ?? chatViewModel.privateChats[PeerID(str: id)]
+                ?? []
+        }
         var byId: [String: BitchatMessage] = [:]
         for (peerID, msgs) in chatViewModel.privateChats {
             let key = canonicalPeerKey(peerID)
-            guard aliases.contains(key) || aliases.contains(peerID.id) else { continue }
+            guard aliasSet.contains(key) || aliasSet.contains(peerID.id) else { continue }
             for message in msgs { byId[message.id] = message }
         }
         return byId.values.sorted { $0.timestamp < $1.timestamp }
