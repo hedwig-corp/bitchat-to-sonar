@@ -641,6 +641,7 @@ func snGroupMeshPeerIdsByIdentity(
     }
     .values
     .map { $0.sorted() }
+    .sorted { ($0.first ?? "") < ($1.first ?? "") }
 }
 
 /// Prefer an already-persisted fold target so a row key stays stable; otherwise
@@ -3117,20 +3118,25 @@ final class SonarAppStore: ObservableObject {
         return keys.filter { !$0.isEmpty }.sorted()
     }
 
-    private func linkedNpubHex(forPeerKey key: String) -> String? {
-        if let profile = resolvedSonarProfile(key),
-           let data = Self.nostrPubkeyData(profile.npub) {
-            return data.hexEncodedString().lowercased()
+    /// Linked Sonar account for a mesh peer — bech32 `npub1…` or hex, as stored
+    /// on the profile / favorite. Prefer this over hex-only when calling
+    /// `peerKeys(linkedToNpub:)` so the call site matches every other fold path.
+    private func linkedNpub(forPeerKey key: String) -> String? {
+        if let profile = resolvedSonarProfile(key) {
+            return profile.npub
         }
         let short = Self.canonicalStoredKey(key)
         for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
             guard PeerID(publicKey: noiseKey).bare == short else { continue }
-            if let nostr = rel.peerNostrPublicKey,
-               let data = Self.nostrPubkeyData(nostr) {
-                return data.hexEncodedString().lowercased()
-            }
+            return rel.peerNostrPublicKey
         }
         return nil
+    }
+
+    private func linkedNpubHex(forPeerKey key: String) -> String? {
+        linkedNpub(forPeerKey: key).flatMap {
+            Self.nostrPubkeyData($0)?.hexEncodedString().lowercased()
+        }
     }
 
     /// All mesh peer keys that represent the same person as `id` (same linked
@@ -3142,8 +3148,8 @@ final class SonarAppStore: ObservableObject {
     /// pagination count.
     private func meshPeerAliases(for id: String) -> [String] {
         let key = canonicalPeerKey(PeerID(str: id))
-        if let hex = linkedNpubHex(forPeerKey: key) {
-            var aliases = Set(peerKeys(linkedToNpub: hex))
+        if let npub = linkedNpub(forPeerKey: key) {
+            var aliases = Set(peerKeys(linkedToNpub: npub))
             aliases.insert(key)
             aliases.insert(Self.canonicalStoredKey(id))
             return aliases.filter { !$0.isEmpty }.sorted()
@@ -3152,12 +3158,21 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Unique mesh message count across aliases — no sort / no full array alloc.
+    /// Single-alias conversations keep the pre-fold O(1) dictionary lookup;
+    /// multi-fingerprint (same npub) pays a bounded merge only when needed.
     private func meshPrivateMessageCount(forConversationId id: String) -> Int {
-        let aliases = Set(meshPeerAliases(for: id))
+        let aliases = meshPeerAliases(for: id)
+        let aliasSet = Set(aliases)
+        if aliasSet.count <= 1 {
+            let key = aliases.first ?? id
+            return chatViewModel.privateChats[PeerID(str: key)]?.count
+                ?? chatViewModel.privateChats[PeerID(str: id)]?.count
+                ?? 0
+        }
         var seen = Set<String>()
         for (peerID, msgs) in chatViewModel.privateChats {
             let key = canonicalPeerKey(peerID)
-            guard aliases.contains(key) || aliases.contains(peerID.id) else { continue }
+            guard aliasSet.contains(key) || aliasSet.contains(peerID.id) else { continue }
             for message in msgs { seen.insert(message.id) }
         }
         return seen.count
