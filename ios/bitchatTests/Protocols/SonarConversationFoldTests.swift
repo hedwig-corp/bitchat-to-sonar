@@ -142,4 +142,35 @@ struct SonarConversationFoldTests {
             ) == "abef0238b73563e6"
         )
     }
+
+    @Test
+    func rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical() {
+        // Live row is only under fingerprint B; full peerKeys universe prefers
+        // inactive A (lexicographically smaller). Without rekey, Marmot fold
+        // targets A while the mesh row stays at B → duplicate home rows.
+        let live = "dfb13e10b8069122"
+        let staleCanonical = "abef0238b73563e6"
+        let rows: [String: SNDMRow] = [
+            live: SNDMRow(
+                id: live,
+                title: "Vincenzo Palazzo",
+                preview: "Ok it is receiving notifica",
+                time: "00:58",
+                unread: true,
+                presence: false,
+                verified: false,
+                isMarmot: false,
+                lastDate: Date(timeIntervalSince1970: 200)
+            ),
+        ]
+        let aligned = snRekeyMeshRowsToCanonicalIds(rowsByPeer: rows) { key in
+            key == live ? staleCanonical : nil
+        }
+        #expect(aligned.count == 1)
+        #expect(aligned[staleCanonical] != nil)
+        #expect(aligned[live] == nil)
+        #expect(aligned[staleCanonical]?.id == staleCanonical)
+        #expect(aligned[staleCanonical]?.preview == "Ok it is receiving notifica")
+        #expect(aligned[staleCanonical]?.unread == true)
+    }
 }

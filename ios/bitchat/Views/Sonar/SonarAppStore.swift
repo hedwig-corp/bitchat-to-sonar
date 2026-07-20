@@ -704,6 +704,56 @@ func snCollapseMeshDMRowsByIdentity(
     return result
 }
 
+/// Re-key mesh rows onto the same canonical id `sonarPeerKey(forNpub:)` would
+/// pick. Collapse only sees fingerprints that currently have a DM row; the
+/// Marmot fold path uses the full peerKeys universe (including inactive
+/// persisted fingerprints). Without this alignment, a stale fingerprint that
+/// sorts first becomes the fold target while the live row stays under another
+/// key — `byKey[foldKey]` misses and the person shows twice again.
+func snRekeyMeshRowsToCanonicalIds(
+    rowsByPeer: [String: SNDMRow],
+    canonicalIdForPeer: (String) -> String?
+) -> [String: SNDMRow] {
+    var result: [String: SNDMRow] = [:]
+    for (key, row) in rowsByPeer {
+        let canonical = canonicalIdForPeer(key) ?? key
+        if let existing = result[canonical] {
+            let preferRow = (row.lastDate ?? .distantPast) >= (existing.lastDate ?? .distantPast)
+            let chosen = preferRow ? row : existing
+            result[canonical] = SNDMRow(
+                id: canonical,
+                title: chosen.title,
+                preview: chosen.preview,
+                time: chosen.time,
+                unread: existing.unread || row.unread,
+                presence: existing.presence || row.presence,
+                verified: existing.verified || row.verified,
+                isMarmot: chosen.isMarmot,
+                lastDate: chosen.lastDate,
+                marmotGroupId: chosen.marmotGroupId,
+                muted: existing.muted || row.muted
+            )
+        } else if canonical == row.id {
+            result[canonical] = row
+        } else {
+            result[canonical] = SNDMRow(
+                id: canonical,
+                title: row.title,
+                preview: row.preview,
+                time: row.time,
+                unread: row.unread,
+                presence: row.presence,
+                verified: row.verified,
+                isMarmot: row.isMarmot,
+                lastDate: row.lastDate,
+                marmotGroupId: row.marmotGroupId,
+                muted: row.muted
+            )
+        }
+    }
+    return result
+}
+
 /// A local contact that can be invited into a Marmot group.
 struct SNGroupContact: Identifiable, Hashable {
     let id: String          // npub, so duplicates across radar/messages collapse.
@@ -4170,6 +4220,11 @@ final class SonarAppStore: ObservableObject {
             linkedNpubByPeer: linkedNpubByPeer,
             persistedFoldPeerIds: Set(marmotGroupIdsByConversationId.keys.map(Self.canonicalStoredKey))
         )
+        // Same canonical universe as `sonarPeerKey` / Marmot fold (full peerKeys
+        // set), not only fingerprints that currently have a mesh row.
+        byKey = snRekeyMeshRowsToCanonicalIds(rowsByPeer: byKey) { key in
+            linkedNpub(forPeerKey: key).flatMap { sonarPeerKey(forNpub: $0) }
+        }
         // Marmot (White Noise) groups are internet-transport chats. A group
         // whose counterpart is a Sonar-discovered peer is the SAME
         // conversation as that peer's mesh chat: fold it into the peer row
