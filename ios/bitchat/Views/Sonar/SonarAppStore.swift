@@ -1526,6 +1526,15 @@ final class SonarAppStore: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] note in self?.handleSonarProfileNotification(note) }
             .store(in: &cancellables)
+        // Favorites Noise↔Nostr links feed the peerKeys reverse index used by
+        // same-npub fold / Marmot foldKey — invalidate when favorites change.
+        NotificationCenter.default.publisher(for: .favoriteStatusChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.invalidatePeerKeysIndex()
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
         #if os(iOS)
         NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)
             .receive(on: DispatchQueue.main)
