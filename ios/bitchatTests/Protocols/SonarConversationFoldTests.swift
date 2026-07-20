@@ -144,6 +144,36 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func liveMeshRoutePrefersConnectedAliasOverCanonical() {
+        let connected = "dfb13e10b8069122"
+        let canonical = "abef0238b73563e6"
+        #expect(
+            snSelectLiveMeshRoutePeerId(
+                aliases: [canonical, connected],
+                isConnected: { $0 == connected },
+                isReachable: { _ in false },
+                requireDirectConnection: true
+            ) == connected
+        )
+        #expect(
+            snSelectLiveMeshRoutePeerId(
+                aliases: [canonical, connected],
+                isConnected: { _ in false },
+                isReachable: { $0 == connected },
+                requireDirectConnection: true
+            ) == nil
+        )
+        #expect(
+            snSelectLiveMeshRoutePeerId(
+                aliases: [canonical, connected],
+                isConnected: { _ in false },
+                isReachable: { $0 == connected },
+                requireDirectConnection: false
+            ) == connected
+        )
+    }
+
+    @Test
     func rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical() {
         // Live row is only under fingerprint B; full peerKeys universe prefers
         // inactive A (lexicographically smaller). Without rekey, Marmot fold
