@@ -355,8 +355,10 @@ final class MarmotService: @unchecked Sendable {
     /// would stall syncs/sends). The wait touches no MLS state, so this is safe.
     private let waitQueue = DispatchQueue(label: "chat.bitchat.marmot-wait", qos: .utility)
 
-    // Identity is guarded by `workQueue`; node/relay connection state is
-    // guarded by `nodeLock` so read-only transfers can safely snapshot it.
+    // Identity is guarded by `identityLock` so export/npub reads never
+    // FIFO-wait behind sync/connect on `workQueue`. Node/relay connection
+    // state is guarded by `nodeLock` so read-only transfers can snapshot it.
+    private let identityLock = NSLock()
     private var identity: SonarIdentity?
     private var node: SonarNode?
     private var relayConnected = false
@@ -384,12 +386,12 @@ final class MarmotService: @unchecked Sendable {
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
-            } else if let existing = service.identity {
+            } else if let existing = service.snapshotIdentity() {
                 identity = existing
             } else {
                 identity = SonarIdentity.generate()
             }
-            service.identity = identity
+            service.setIdentity(identity)
             service.sessionGeneration = service.sessionGeneration &+ 1
             return (identity, service.sessionGeneration)
         }
@@ -416,11 +418,11 @@ final class MarmotService: @unchecked Sendable {
         defer { nodeLease.release() }
         let installed = await runNonThrowing { service in
             guard service.sessionGeneration == generation,
-                  service.identity?.npub() == identity.npub()
+                  service.snapshotIdentity()?.npub() == identity.npub()
             else {
                 return false
             }
-            service.identity = identity
+            service.setIdentity(identity)
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = true
@@ -454,7 +456,7 @@ final class MarmotService: @unchecked Sendable {
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
-            } else if let existing = service.identity {
+            } else if let existing = service.snapshotIdentity() {
                 identity = existing
             } else {
                 identity = SonarIdentity.generate()
@@ -478,7 +480,7 @@ final class MarmotService: @unchecked Sendable {
                 #endif
                 throw error
             }
-            service.identity = identity
+            service.setIdentity(identity)
             service.nodeLock.lock()
             service.node = node
             service.relayConnected = false
@@ -505,20 +507,21 @@ final class MarmotService: @unchecked Sendable {
             let identity: SonarIdentity
             if let nsec {
                 identity = try SonarIdentity.import(nsec: nsec)
-            } else if let existing = service.identity {
+            } else if let existing = service.snapshotIdentity() {
                 identity = existing
             } else {
                 identity = SonarIdentity.generate()
             }
-            service.identity = identity
+            service.setIdentity(identity)
             service.sessionGeneration = service.sessionGeneration &+ 1
             return identity.npub()
         }
     }
 
     /// `npub1...` of the connected identity (nil before `connect`).
+    /// Offline-derivable — must not wait on `workQueue` sync/connect.
     func currentNpub() async -> String? {
-        await runNonThrowing { $0.identity?.npub() }
+        snapshotIdentity()?.npub()
     }
 
     /// True once `connect` has opened the node (relays + encrypted DB). False
@@ -540,8 +543,22 @@ final class MarmotService: @unchecked Sendable {
 
     /// `nsec1...` backup export of the connected identity (nil before `connect`).
     /// Handle with care; intended for user-driven backup only.
+    /// Offline-derivable — must not wait on `workQueue` sync/connect (Settings
+    /// → Export private key; Compose reads secrets synchronously).
     func exportNsec() async -> String? {
-        await runNonThrowing { $0.identity?.nsec() }
+        snapshotIdentity()?.nsec()
+    }
+
+    private func snapshotIdentity() -> SonarIdentity? {
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        return identity
+    }
+
+    private func setIdentity(_ newValue: SonarIdentity?) {
+        identityLock.lock()
+        defer { identityLock.unlock() }
+        identity = newValue
     }
 
     /// JSON snapshot of relay/sync state (relay statuses, sync watermark,
@@ -1358,7 +1375,7 @@ final class MarmotService: @unchecked Sendable {
             service.storeLock = nil
             #endif
             service.nodeLock.unlock()
-            service.identity = nil
+            service.setIdentity(nil)
             return ()
         }
         // Do not block workQueue while draining: an off-queue relay connect may
@@ -1474,11 +1491,8 @@ final class MarmotService: @unchecked Sendable {
             accountBackupLock.unlock()
         }
 
-        let nsec = try await run { service -> String in
-            guard let nsec = service.identity?.nsec() else {
-                throw ServiceError.core("no identity to back up")
-            }
-            return nsec
+        guard let nsec = snapshotIdentity()?.nsec() else {
+            throw ServiceError.core("no identity to back up")
         }
         // Close before databaseConfig: that path runs restore reconcile/rename
         // and must not race a live SQLCipher handle.

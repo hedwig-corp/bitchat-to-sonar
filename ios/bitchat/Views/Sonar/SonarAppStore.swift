@@ -673,7 +673,7 @@ final class SonarAppStore: ObservableObject {
         static let notificationShowPreview = SonarNotificationPreferenceStore.showPreviewKey
         static let discoverNewPeople = "sonar.ble.discoverNewPeople"
         static let bleKnownChatKeys = "sonar.ble.knownChatKeys.v1"
-        static let marmotNsecKeychainKey = "marmot-nsec"
+        static let marmotNsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     }
 
     #if os(iOS)
@@ -1876,9 +1876,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// `nsec1…` backup of the current identity for the "Export private key"
-    /// sheet (self-custody). Nil until the secure-chat identity has loaded.
+    /// sheet (self-custody). Prefers the durable keychain copy (Compose
+    /// `identityNsec` parity) so the sheet never waits on Marmot sync.
     func exportNsec() async -> String? {
-        await marmot.exportNsec()
+        await SonarAccountKeyExport.exportNsec(keychain: keychain) {
+            await marmot.exportNsec()
+        }
     }
 
     // MARK: - Diagnostics (Settings → Diagnostics)

@@ -256,7 +256,7 @@ final class MarmotChatModel: ObservableObject {
         case invalidated
     }
 
-    private static let nsecKeychainKey = "marmot-nsec"
+    private static let nsecKeychainKey = SonarAccountKeyExport.marmotNsecKey
     /// Raw encoded sticker bytes stay bounded independently from the 100 MiB
     /// disk cache. Decoded SwiftUI images have their own framework caches, so
     /// retaining hundreds of multi-megabyte Data values here only adds memory
@@ -730,9 +730,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// `nsec1…` backup of the connected identity, for the "Export private key"
-    /// self-custody escape hatch. Nil until the identity has loaded.
+    /// self-custody escape hatch. Prefers keychain (Compose secrets parity)
+    /// so callers never wait on Marmot `workQueue` sync/connect.
     func exportNsec() async -> String? {
-        await service.exportNsec()
+        await SonarAccountKeyExport.exportNsec(keychain: keychain) {
+            await service.exportNsec()
+        }
     }
 
     /// Relay/sync diagnostics snapshot JSON for the Diagnostics screen and
