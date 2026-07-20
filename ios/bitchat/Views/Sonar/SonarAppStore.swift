@@ -3135,31 +3135,32 @@ final class SonarAppStore: ObservableObject {
 
     /// All mesh peer keys that represent the same person as `id` (same linked
     /// npub, or the bare peer key when unlinked).
+    ///
+    /// Linked peers reuse `peerKeys(linkedToNpub:)` (profiles + fingerprints +
+    /// favorites) instead of scanning every private chat and calling
+    /// `linkedNpubHex` per candidate — that O(N×F) path sat on chat-open and
+    /// pagination count.
     private func meshPeerAliases(for id: String) -> [String] {
         let key = canonicalPeerKey(PeerID(str: id))
-        var candidates = Set<String>([key, Self.canonicalStoredKey(id)])
-        for (peerID, msgs) in chatViewModel.privateChats where !msgs.isEmpty {
-            candidates.insert(canonicalPeerKey(peerID))
+        if let hex = linkedNpubHex(forPeerKey: key) {
+            var aliases = Set(peerKeys(linkedToNpub: hex))
+            aliases.insert(key)
+            aliases.insert(Self.canonicalStoredKey(id))
+            return aliases.filter { !$0.isEmpty }.sorted()
         }
-        for fingerprint in sonarProfilesByFingerprint.keys {
-            candidates.insert(Self.canonicalStoredKey(fingerprint))
+        return Array(Set([key, Self.canonicalStoredKey(id)].filter { !$0.isEmpty })).sorted()
+    }
+
+    /// Unique mesh message count across aliases — no sort / no full array alloc.
+    private func meshPrivateMessageCount(forConversationId id: String) -> Int {
+        let aliases = Set(meshPeerAliases(for: id))
+        var seen = Set<String>()
+        for (peerID, msgs) in chatViewModel.privateChats {
+            let key = canonicalPeerKey(peerID)
+            guard aliases.contains(key) || aliases.contains(peerID.id) else { continue }
+            for message in msgs { seen.insert(message.id) }
         }
-        for live in sonarProfiles.keys {
-            candidates.insert(canonicalPeerKey(PeerID(str: live)))
-        }
-        for mapped in marmotGroupIdsByConversationId.keys {
-            candidates.insert(Self.canonicalStoredKey(mapped))
-        }
-        var linked: [String: String] = [:]
-        for candidate in candidates {
-            if let hex = linkedNpubHex(forPeerKey: candidate) {
-                linked[candidate] = hex
-            }
-        }
-        let identity = snMeshConversationIdentityKey(peerId: key, linkedNpubHex: linked[key])
-        return candidates
-            .filter { snMeshConversationIdentityKey(peerId: $0, linkedNpubHex: linked[$0]) == identity }
-            .sorted()
+        return seen.count
     }
 
     /// Mesh/bitchat private messages across every alias of this conversation.
@@ -4451,7 +4452,7 @@ final class SonarAppStore: ObservableObject {
         guard !id.hasPrefix(Self.marmotIDPrefix),
               pendingMarmotNpub(for: id) == nil,
               !isPendingMarmotGroup(id) else { return false }
-        return meshPrivateMessages(forConversationId: id).count
+        return meshPrivateMessageCount(forConversationId: id)
             > visibleLimit + newestOffset
     }
 
@@ -4459,7 +4460,7 @@ final class SonarAppStore: ObservableObject {
         guard !id.hasPrefix(Self.marmotIDPrefix),
               pendingMarmotNpub(for: id) == nil,
               !isPendingMarmotGroup(id) else { return 0 }
-        return meshPrivateMessages(forConversationId: id).count
+        return meshPrivateMessageCount(forConversationId: id)
     }
 
     func cachedPaymentActivityCount(_ id: String) -> Int {
