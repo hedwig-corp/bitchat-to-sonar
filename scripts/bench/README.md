@@ -92,6 +92,26 @@ commit them. The `SONAR_BENCH_NSEC` hook and markers are `#if DEBUG` only.
 Raw per-run logs land in `/tmp/sonar-bench/runs/run_*.ndjson`. The aggregator
 (`_aggregate.py`) prints a min/median/max table per phase.
 
+## Physical iPhone (real account)
+
+Install a signed Debug build over the existing app (never erase the container),
+then:
+
+```bash
+UDID=<hardware-udid> RUNS=5 scripts/bench/device-bench.sh
+```
+
+Capture modes (`CAPTURE=auto|syslog|applog`):
+
+- **syslog** — USB `idevicesyslog -m SONAR_BENCH` when `idevice_id` sees the UDID.
+- **applog** — CoreDevice pull of
+  `Library/Application Support/sonar-marmot/logs/ios/sonar-ios.log`
+  (Wi-Fi-safe). Requires the app to configure `LogFileSink` before `t0_launch`
+  so T0 is present in the file tee.
+
+After background KeyPackage/profile publish, compare `t0→t4` and `t2→t4`;
+`t3→t3a` is off the sync critical path.
+
 ## Text-send flow (iPhone, macOS, Android)
 
 The shared Rust core emits these content-free markers for every Marmot text
