@@ -21,7 +21,13 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     var onCancelUpload: ((SNMessage) -> Void)?
     var uploadProgressSource: SNMediaUploadProgressSource?
 
-    @Published var expandedMessageIDs: Set<String> = []
+    @Published var expandedMessageIDs: Set<String> = [] {
+        didSet { contentRevision &+= 1 }
+    }
+    /// O(1) transcript content revision: bumped only when rows or row-affecting
+    /// inputs change. The collection host skips its O(n) snapshot rebuild while
+    /// this is unchanged (composer keystrokes, unrelated store publishes).
+    private(set) var contentRevision: UInt64 = 0
     private var sizingHost: UIHostingController<AnyView>?
 
     func sync(
@@ -38,6 +44,11 @@ final class SNTranscriptHostRenderContext: ObservableObject {
         onCancelUpload: ((SNMessage) -> Void)?,
         uploadProgressSource: SNMediaUploadProgressSource?
     ) {
+        // Bump only on real row-content change: composer keystrokes republish
+        // the store with an identical transcript and must stay O(1) here.
+        if msgs != self.msgs || showAuthors != self.showAuthors {
+            contentRevision &+= 1
+        }
         self.msgs = msgs
         var indexByID: [String: Int] = [:]
         indexByID.reserveCapacity(msgs.count)
@@ -245,6 +256,7 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                 )
             },
             onJumpSettled: onJumpSettled,
+            contentVersion: renderContext.contentRevision,
             composer: composer
         )
     }

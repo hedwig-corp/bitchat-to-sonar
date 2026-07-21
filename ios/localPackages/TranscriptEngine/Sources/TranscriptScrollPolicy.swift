@@ -115,6 +115,27 @@ public enum TranscriptScrollPolicy {
         return !wasPinned || userDragging
     }
 
+    /// No-op render pass detector (Signal CVRenderState shape): skip the
+    /// snapshot rebuild only when the app-owned content revision AND every
+    /// open-action input are unchanged. A nil revision (generic hosts) always
+    /// applies; a late unread-count settle or new jump target must apply even
+    /// when the transcript itself is unchanged.
+    public static func shouldSkipUnchangedApply(
+        contentVersion: UInt64?,
+        lastContentVersion: UInt64?,
+        unreadCountAtOpen: UInt64?,
+        lastUnreadCountAtOpen: UInt64?,
+        jumpMessageId: String?,
+        lastJumpMessageId: String?,
+        expectedNewestDate: Date?,
+        lastExpectedNewestDate: Date?
+    ) -> Bool {
+        guard let contentVersion, contentVersion == lastContentVersion else { return false }
+        return unreadCountAtOpen == lastUnreadCountAtOpen
+            && jumpMessageId == lastJumpMessageId
+            && expectedNewestDate == lastExpectedNewestDate
+    }
+
     public static func insetFollowDecision(
         wasAtTail: Bool,
         userScrolling: Bool,
