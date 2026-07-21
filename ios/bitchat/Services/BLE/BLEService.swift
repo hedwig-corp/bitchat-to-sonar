@@ -1020,6 +1020,7 @@ final class BLEService: NSObject {
             SecureLogger.debug("📁 Sending private file transfer to \(targetID.id.prefix(8))… requested=\(peerID.id.prefix(8))… bytes=\(payload.count)", category: .session)
             self.broadcastPacket(packet, transferId: transferId)
         }
+        return true
     }
 
     
