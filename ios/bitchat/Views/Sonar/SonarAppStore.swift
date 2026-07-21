@@ -654,6 +654,29 @@ func snSelectCanonicalMeshPeerId(
         ?? aliases.min()
 }
 
+/// Compose-parity filter for reverse-index hits (`peerKeys` / `meshPeerAliases`).
+/// Keep only candidates whose *current* linked npub hex matches `targetNpubHex`,
+/// so a stale or conflicting favorites claim cannot pull a different person into
+/// the alias set (home row, transcript, mute, live send route).
+func snFilterPeerKeysMatchingNpubHex(
+    candidates: [String],
+    linkedNpubHexByPeer: [String: String],
+    targetNpubHex: String
+) -> [String] {
+    let target = targetNpubHex
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    guard target.count == 64,
+          target.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) }) else {
+        return []
+    }
+    return candidates.filter {
+        linkedNpubHexByPeer[$0]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == target
+    }.sorted()
+}
+
 /// Pick the live BLE route among aliases (Compose `liveMeshRoutePeerId`).
 /// Prefer a directly connected peer; optionally fall back to retained reachability
 /// for plain bitchat (not Sonar discovery peers).
@@ -3188,7 +3211,21 @@ final class SonarAppStore: ObservableObject {
     private func peerKeys(linkedToNpub npub: String) -> [String] {
         guard let target = Self.nostrPubkeyData(npub) else { return [] }
         let hex = target.hexEncodedString().lowercased()
-        return (peerKeysIndex()[hex] ?? []).sorted()
+        let candidates = Array(peerKeysIndex()[hex] ?? [])
+        // Re-check each candidate's *current* link (profile preferred over
+        // favorites). Compose filters `meshConversationIdentityKey(it, link)`
+        // the same way — reverse-index membership alone is not enough.
+        var linked: [String: String] = [:]
+        for key in candidates {
+            if let candidateHex = linkedNpubHex(forPeerKey: key) {
+                linked[key] = candidateHex
+            }
+        }
+        return snFilterPeerKeysMatchingNpubHex(
+            candidates: candidates,
+            linkedNpubHexByPeer: linked,
+            targetNpubHex: hex
+        )
     }
 
     private func invalidatePeerKeysIndex() {
@@ -3210,9 +3247,19 @@ final class SonarAppStore: ObservableObject {
             insert(Self.canonicalStoredKey(key), npub: profile.npub)
         }
         for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
-            if let nostr = rel.peerNostrPublicKey {
-                insert(PeerID(publicKey: noiseKey).bare, npub: nostr)
+            guard let nostr = rel.peerNostrPublicKey else { continue }
+            let bare = PeerID(publicKey: noiseKey).bare
+            // Prefer Sonar 0x53 / fingerprint profile over a conflicting favorite
+            // claim so the reverse index never indexes the same Noise key under
+            // two npubs.
+            if let profileNpub = sonarProfilesByFingerprint[bare]?.npub
+                ?? sonarProfiles[bare]?.npub,
+               let profileData = Self.nostrPubkeyData(profileNpub),
+               let favData = Self.nostrPubkeyData(nostr),
+               profileData != favData {
+                continue
             }
+            insert(bare, npub: nostr)
         }
         peerKeysByNpubHex = index
         return index
@@ -3264,11 +3311,24 @@ final class SonarAppStore: ObservableObject {
     /// pagination count.
     private func meshPeerAliases(for id: String) -> [String] {
         let key = canonicalPeerKey(PeerID(str: id))
-        if let npub = linkedNpub(forPeerKey: key) {
-            var aliases = Set(peerKeys(linkedToNpub: npub))
-            aliases.insert(key)
-            aliases.insert(Self.canonicalStoredKey(id))
-            return aliases.filter { !$0.isEmpty }.sorted()
+        if let npub = linkedNpub(forPeerKey: key),
+           let hex = Self.nostrPubkeyData(npub)?.hexEncodedString().lowercased() {
+            // peerKeys already Compose-filters; still re-check inserted short/id
+            // forms so an empty/unlinked alias cannot sneak into the set.
+            var candidates = Set(peerKeys(linkedToNpub: npub))
+            candidates.insert(key)
+            candidates.insert(Self.canonicalStoredKey(id))
+            var linked: [String: String] = [:]
+            for alias in candidates {
+                if let aliasHex = linkedNpubHex(forPeerKey: alias) {
+                    linked[alias] = aliasHex
+                }
+            }
+            return snFilterPeerKeysMatchingNpubHex(
+                candidates: Array(candidates),
+                linkedNpubHexByPeer: linked,
+                targetNpubHex: hex
+            )
         }
         return Array(Set([key, Self.canonicalStoredKey(id)].filter { !$0.isEmpty })).sorted()
     }

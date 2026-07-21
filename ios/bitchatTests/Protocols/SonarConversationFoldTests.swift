@@ -144,6 +144,25 @@ struct SonarConversationFoldTests {
     }
 
     @Test
+    func filterPeerKeysDropsConflictingFavoriteClaim() {
+        // Reverse index may still list sara under vincenzo's npub if a stale
+        // favorite claimed it; current linked map must drop her (Compose parity).
+        let vincenzo = String(repeating: "ab", count: 32)
+        let sara = String(repeating: "cd", count: 32)
+        let filtered = snFilterPeerKeysMatchingNpubHex(
+            candidates: ["fp-vincenzo", "fp-vincenzo-mac", "fp-sara"],
+            linkedNpubHexByPeer: [
+                "fp-vincenzo": vincenzo,
+                "fp-vincenzo-mac": vincenzo,
+                "fp-sara": sara,
+            ],
+            targetNpubHex: vincenzo
+        )
+        #expect(filtered == ["fp-vincenzo", "fp-vincenzo-mac"])
+        #expect(!filtered.contains("fp-sara"))
+    }
+
+    @Test
     func liveMeshRoutePrefersConnectedAliasOverCanonical() {
         let connected = "dfb13e10b8069122"
         let canonical = "abef0238b73563e6"
