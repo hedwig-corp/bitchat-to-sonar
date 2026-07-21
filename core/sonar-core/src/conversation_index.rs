@@ -371,7 +371,7 @@ fn sanitize_preview_label(content: String) -> String {
     if (t.starts_with('{') || t.starts_with('['))
         && serde_json::from_str::<serde_json::Value>(t).is_ok()
     {
-        return "JSON payload".to_owned();
+        return crate::client::JSON_PAYLOAD_PREVIEW_LABEL.to_owned();
     }
     content
 }

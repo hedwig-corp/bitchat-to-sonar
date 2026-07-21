@@ -7061,12 +7061,16 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// The caption/text wins when present; a caption-less media message previews
 /// as its attachment kind ("Photo", "3 photos", "Voice note", filename) so an
 /// arriving album never shows an empty home row.
+/// Preview label for machine-sent JSON payloads (agents/bots, interop control).
+/// Shared with conversation_index::sanitize_preview_label — keep in sync.
+pub(crate) const JSON_PAYLOAD_PREVIEW_LABEL: &str = "JSON payload";
+
 fn index_preview(message: &ChatMessage) -> String {
     if !message.content.is_empty() {
         // Machine-sent JSON payloads (agents/bots, interop control messages)
         // must not leak raw into chat-list rows or NSE banner bodies.
         if looks_like_json_payload(&message.content) {
-            return "JSON payload".to_owned();
+            return JSON_PAYLOAD_PREVIEW_LABEL.to_owned();
         }
         return message.content.clone();
     }
@@ -7458,7 +7462,6 @@ mod tests {
         assert_eq!(relay_fetch_quorum(5), 2);
     }
 
-    #[test]
     #[test]
     fn index_preview_labels_json_payloads_without_leaking_raw_json() {
         let msg = |content: &str| ChatMessage {
