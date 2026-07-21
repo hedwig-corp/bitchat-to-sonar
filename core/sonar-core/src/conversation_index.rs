@@ -86,6 +86,7 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index db wal: {e}")))?;
         let idx = Self { db };
         idx.migrate()?;
+        idx.repair_json_previews()?;
         Ok(idx)
     }
 
@@ -94,7 +95,43 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index db memory: {e}")))?;
         let idx = Self { db };
         idx.migrate()?;
+        idx.repair_json_previews()?;
         Ok(idx)
+    }
+
+    /// One-time repair for rows persisted before the JSON-preview guard:
+    /// rewrite raw JSON payloads to the shared label at open so list reads
+    /// never reparse payload trees (Codex P2). Bounded by group count; a
+    /// no-op once rows are clean.
+    fn repair_json_previews(&self) -> Result<()> {
+        let mut stmt = self
+            .db
+            .prepare(
+                // No SQL pre-filter: SQLite ltrim strips only ASCII spaces,
+                // while the Rust check below uses trim_start (tabs/newlines too).
+                // One row per group keeps the full scan bounded and tiny.
+                "SELECT group_id_hex, latest_content FROM conversation_summary",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index repair prepare: {e}")))?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| crate::Error::Storage(format!("index repair query: {e}")))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| crate::Error::Storage(format!("index repair row: {e}")))?;
+        for (group_id_hex, content) in rows {
+            let t = content.trim_start();
+            if (t.starts_with('{') || t.starts_with('['))
+                && serde_json::from_str::<serde_json::Value>(t).is_ok()
+            {
+                self.db
+                    .execute(
+                        "UPDATE conversation_summary SET latest_content = ?1 WHERE group_id_hex = ?2",
+                        params![crate::client::JSON_PAYLOAD_PREVIEW_LABEL, group_id_hex],
+                    )
+                    .map_err(|e| crate::Error::Storage(format!("index repair update: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     fn migrate(&self) -> Result<()> {
@@ -343,7 +380,7 @@ impl ConversationIndex {
                 self.upsert_summary(
                     &group_id_hex,
                     &group.name,
-                    &msg.content,
+                    &crate::client::index_preview(msg),
                     &sender,
                     msg.created_at.as_secs(),
                     msg.mine,
@@ -367,6 +404,24 @@ impl ConversationIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[test]
+    fn repair_json_previews_rewrites_legacy_rows_once() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        // Simulate a row written before the guard landed.
+        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false).unwrap();
+        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false).unwrap();
+        idx.repair_json_previews().unwrap();
+        let summaries = idx.summaries_ordered().unwrap();
+        let g1 = summaries.iter().find(|s| s.group_id_hex == "g1").unwrap();
+        let g2 = summaries.iter().find(|s| s.group_id_hex == "g2").unwrap();
+        assert_eq!(g1.latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+        assert_eq!(g2.latest_content, "{ not json, just a brace");
+        // Second repair is a no-op (row no longer brace-prefixed JSON).
+        idx.repair_json_previews().unwrap();
+        assert_eq!(idx.summaries_ordered().unwrap().iter().find(|s| s.group_id_hex == "g1").unwrap().latest_content, crate::client::JSON_PAYLOAD_PREVIEW_LABEL);
+    }
 
     #[test]
     fn open_in_memory_and_migrate() {
