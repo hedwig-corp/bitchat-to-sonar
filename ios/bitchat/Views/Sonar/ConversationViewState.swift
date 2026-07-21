@@ -182,11 +182,12 @@ enum SNConversationTranscriptWindow {
     static func sourceIDsNeedingExpansion(
         _ sources: [SNConversationTranscriptSource],
         before oldestVisible: SNMessage,
-        pageSize: Int
+        pageSize: Int,
+        ignoring stalledSourceIDs: Set<String> = []
     ) -> Set<String> {
         guard pageSize > 0 else { return [] }
         return Set(sources.compactMap { source in
-            guard source.hasMore else { return nil }
+            guard source.hasMore, !stalledSourceIDs.contains(source.id) else { return nil }
             let olderCount = source.rows.lazy
                 .filter { isOrderedBefore($0, oldestVisible) }
                 .prefix(pageSize)
@@ -360,7 +361,7 @@ final class ConversationViewState: ObservableObject {
         let pageSize = TransportConfig.sonarTranscriptPageCount
         let retained = TransportConfig.sonarTranscriptRetainedCount
 
-        func prependClosestCandidatePage() -> Bool {
+        func prependClosestCandidatePage(ignoringStalled stalledSourceIDs: Set<String> = []) -> Bool {
             guard let oldest = messages.first else { return false }
             let candidates = store.dmMsgs(
                 conversationId,
@@ -386,7 +387,8 @@ final class ConversationViewState: ObservableObject {
             guard SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
                 sources,
                 before: oldest,
-                pageSize: pageSize
+                pageSize: pageSize,
+                ignoring: stalledSourceIDs
             ).isEmpty else { return false }
 
             let previous = messages
@@ -431,6 +433,7 @@ final class ConversationViewState: ObservableObject {
         // issuing another local database read.
         if prependClosestCandidatePage() { return true }
 
+        var progressedSourceIDs = Set<String>()
         for attempt in 0..<Self.olderSourceLoadAttemptLimit {
             guard let oldest = messages.first else { return false }
             let candidates = store.dmMsgs(
@@ -498,6 +501,10 @@ final class ConversationViewState: ObservableObject {
                 paymentRowsLoaded,
                 callRowsLoaded
             ].max() ?? 0
+            if meshRowsLoaded > 0 { progressedSourceIDs.insert(SNConversationTranscriptSource.meshID) }
+            if paymentRowsLoaded > 0 { progressedSourceIDs.insert(SNConversationTranscriptSource.paymentActivityID) }
+            if callRowsLoaded > 0 { progressedSourceIDs.insert(SNConversationTranscriptSource.callLogID) }
+            if databaseLoad.added { progressedSourceIDs.formUnion(groupIDs) }
             let meshOverflow = max(0, sourceMessageLimit + meshRowsLoaded - retained)
             let paymentOverflow = max(0, sourceMessageLimit + paymentRowsLoaded - retained)
             let callOverflow = max(0, sourceMessageLimit + callRowsLoaded - retained)
@@ -521,6 +528,35 @@ final class ConversationViewState: ObservableObject {
                callRowsLoaded == 0,
                attempt + 1 < Self.olderSourceLoadAttemptLimit {
                 try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }
+
+        // A source whose page never grew across all attempts has a stale
+        // hasMore (loader busy or local page exhausted). Don't let it fence
+        // off every other source's cached older page permanently — consume
+        // the adjacent page with only the stalled sources off the frontier.
+        if let oldest = messages.first {
+            let stalledSourceIDs = SNConversationTranscriptWindow.sourceIDsNeedingExpansion(
+                store.dmTranscriptSources(
+                    conversationId,
+                    candidates: store.dmMsgs(
+                        conversationId,
+                        limit: min(retained, sourceMessageLimit + 1),
+                        meshNewestOffset: meshNewestOffset,
+                        paymentNewestOffset: paymentNewestOffset,
+                        callNewestOffset: callNewestOffset
+                    ),
+                    sourceLimit: sourceMessageLimit,
+                    meshNewestOffset: meshNewestOffset,
+                    paymentNewestOffset: paymentNewestOffset,
+                    callNewestOffset: callNewestOffset
+                ),
+                before: oldest,
+                pageSize: pageSize
+            ).subtracting(progressedSourceIDs)
+            if !stalledSourceIDs.isEmpty,
+               prependClosestCandidatePage(ignoringStalled: stalledSourceIDs) {
+                return true
             }
         }
 
