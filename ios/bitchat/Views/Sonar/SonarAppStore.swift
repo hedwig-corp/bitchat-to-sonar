@@ -617,6 +617,182 @@ func snSortDMRowsByRecency(_ rows: [SNDMRow]) -> [SNDMRow] {
     }
 }
 
+/// Stable conversation identity for BLE fingerprints that advertise the same
+/// Sonar account (parity with Compose `meshConversationIdentityKey`). Unlinked
+/// peers stay isolated by their Noise fingerprint / short peer id.
+func snMeshConversationIdentityKey(peerId: String, linkedNpubHex: String?) -> String {
+    let linked = linkedNpubHex?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    if let linked,
+       linked.count == 64,
+       linked.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) }) {
+        return "npub:\(linked)"
+    }
+    return "peer:\(peerId)"
+}
+
+func snGroupMeshPeerIdsByIdentity(
+    peerIds: [String],
+    linkedNpubByPeer: [String: String]
+) -> [[String]] {
+    Dictionary(grouping: Set(peerIds)) {
+        snMeshConversationIdentityKey(peerId: $0, linkedNpubHex: linkedNpubByPeer[$0])
+    }
+    .values
+    .map { $0.sorted() }
+    .sorted { ($0.first ?? "") < ($1.first ?? "") }
+}
+
+/// Prefer an already-persisted fold target so a row key stays stable; otherwise
+/// choose a deterministic fingerprint from the alias set.
+func snSelectCanonicalMeshPeerId(
+    aliases: [String],
+    persistedFoldPeerIds: Set<String>
+) -> String? {
+    aliases.filter { persistedFoldPeerIds.contains($0) }.min()
+        ?? aliases.min()
+}
+
+/// Compose-parity filter for reverse-index hits (`peerKeys` / `meshPeerAliases`).
+/// Keep only candidates whose *current* linked npub hex matches `targetNpubHex`,
+/// so a stale or conflicting favorites claim cannot pull a different person into
+/// the alias set (home row, transcript, mute, live send route).
+func snFilterPeerKeysMatchingNpubHex(
+    candidates: [String],
+    linkedNpubHexByPeer: [String: String],
+    targetNpubHex: String
+) -> [String] {
+    let target = targetNpubHex
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    guard target.count == 64,
+          target.unicodeScalars.allSatisfy({ CharacterSet(charactersIn: "0123456789abcdef").contains($0) }) else {
+        return []
+    }
+    return candidates.filter {
+        linkedNpubHexByPeer[$0]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == target
+    }.sorted()
+}
+
+/// Pick the live BLE route among aliases (Compose `liveMeshRoutePeerId`).
+/// Prefer a directly connected peer; optionally fall back to retained reachability
+/// for plain bitchat (not Sonar discovery peers).
+func snSelectLiveMeshRoutePeerId(
+    aliases: [String],
+    isConnected: (String) -> Bool,
+    isReachable: (String) -> Bool,
+    requireDirectConnection: Bool
+) -> String? {
+    for alias in aliases where isConnected(alias) { return alias }
+    if !requireDirectConnection {
+        for alias in aliases where isReachable(alias) { return alias }
+    }
+    return nil
+}
+
+/// Collapse mesh home rows that share a linked Sonar npub into one person-row
+/// (R-003 / Fix What We Break). Different Noise fingerprints for the same
+/// account must not render as two Messages entries.
+func snCollapseMeshDMRowsByIdentity(
+    rowsByPeer: [String: SNDMRow],
+    linkedNpubByPeer: [String: String],
+    persistedFoldPeerIds: Set<String>
+) -> [String: SNDMRow] {
+    var result: [String: SNDMRow] = [:]
+    for aliases in snGroupMeshPeerIdsByIdentity(
+        peerIds: Array(rowsByPeer.keys),
+        linkedNpubByPeer: linkedNpubByPeer
+    ) {
+        guard let canonical = snSelectCanonicalMeshPeerId(
+            aliases: aliases,
+            persistedFoldPeerIds: persistedFoldPeerIds
+        ) else { continue }
+        var best: SNDMRow?
+        var unread = false
+        var presence = false
+        var verified = false
+        var muted = false
+        for alias in aliases {
+            guard let row = rowsByPeer[alias] else { continue }
+            unread = unread || row.unread
+            presence = presence || row.presence
+            verified = verified || row.verified
+            muted = muted || row.muted
+            if best == nil || (row.lastDate ?? .distantPast) > (best!.lastDate ?? .distantPast) {
+                best = row
+            }
+        }
+        guard let chosen = best else { continue }
+        result[canonical] = SNDMRow(
+            id: canonical,
+            title: chosen.title,
+            preview: chosen.preview,
+            time: chosen.time,
+            unread: unread,
+            presence: presence,
+            verified: verified,
+            isMarmot: chosen.isMarmot,
+            lastDate: chosen.lastDate,
+            marmotGroupId: chosen.marmotGroupId,
+            muted: muted
+        )
+    }
+    return result
+}
+
+/// Re-key mesh rows onto the same canonical id `sonarPeerKey(forNpub:)` would
+/// pick. Collapse only sees fingerprints that currently have a DM row; the
+/// Marmot fold path uses the full peerKeys universe (including inactive
+/// persisted fingerprints). Without this alignment, a stale fingerprint that
+/// sorts first becomes the fold target while the live row stays under another
+/// key — `byKey[foldKey]` misses and the person shows twice again.
+func snRekeyMeshRowsToCanonicalIds(
+    rowsByPeer: [String: SNDMRow],
+    canonicalIdForPeer: (String) -> String?
+) -> [String: SNDMRow] {
+    var result: [String: SNDMRow] = [:]
+    for (key, row) in rowsByPeer {
+        let canonical = canonicalIdForPeer(key) ?? key
+        if let existing = result[canonical] {
+            let preferRow = (row.lastDate ?? .distantPast) >= (existing.lastDate ?? .distantPast)
+            let chosen = preferRow ? row : existing
+            result[canonical] = SNDMRow(
+                id: canonical,
+                title: chosen.title,
+                preview: chosen.preview,
+                time: chosen.time,
+                unread: existing.unread || row.unread,
+                presence: existing.presence || row.presence,
+                verified: existing.verified || row.verified,
+                isMarmot: chosen.isMarmot,
+                lastDate: chosen.lastDate,
+                marmotGroupId: chosen.marmotGroupId,
+                muted: existing.muted || row.muted
+            )
+        } else if canonical == row.id {
+            result[canonical] = row
+        } else {
+            result[canonical] = SNDMRow(
+                id: canonical,
+                title: row.title,
+                preview: row.preview,
+                time: row.time,
+                unread: row.unread,
+                presence: row.presence,
+                verified: row.verified,
+                isMarmot: row.isMarmot,
+                lastDate: row.lastDate,
+                marmotGroupId: row.marmotGroupId,
+                muted: row.muted
+            )
+        }
+    }
+    return result
+}
+
 /// A local contact that can be invited into a Marmot group.
 struct SNGroupContact: Identifiable, Hashable {
     let id: String          // npub, so duplicates across radar/messages collapse.
@@ -747,6 +923,14 @@ final class SonarAppStore: ObservableObject {
     /// peer's mesh (Noise) and White Noise (Marmot) legs folded into ONE
     /// conversation even when the live 0x53 announce isn't currently arriving.
     private var sonarProfilesByFingerprint: [String: SonarPeerProfile] = [:]
+    /// Lazy reverse index: npub hex → mesh peer keys. Invalidated when live /
+    /// persisted profiles change so `peerKeys(linkedToNpub:)` stays O(1) on the
+    /// chat-open hot path instead of rescanning every contact.
+    private var peerKeysByNpubHex: [String: Set<String>]?
+    /// Reverse of `peerKeysByNpubHex`: canonical peer key → stored npub string.
+    /// Built with `peerKeysIndex()` so `linkedNpub(forPeerKey:)` stays O(1) on
+    /// `dmRows` instead of scanning favorites per row.
+    private var npubByPeerKey: [String: String]?
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
@@ -1368,6 +1552,15 @@ final class SonarAppStore: ObservableObject {
         NotificationCenter.default.publisher(for: .sonarPeerProfileUpdated)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] note in self?.handleSonarProfileNotification(note) }
+            .store(in: &cancellables)
+        // Favorites Noise↔Nostr links feed the peerKeys reverse index used by
+        // same-npub fold / Marmot foldKey — invalidate when favorites change.
+        NotificationCenter.default.publisher(for: .favoriteStatusChanged)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.invalidatePeerKeysIndex()
+                self?.objectWillChange.send()
+            }
             .store(in: &cancellables)
         #if os(iOS)
         NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)
@@ -2019,6 +2212,7 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.bleKnownChatKeys)
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
+        invalidatePeerKeysIndex()
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
         defaults.removeObject(forKey: Keys.sonarProfiles)
@@ -2688,6 +2882,7 @@ final class SonarAppStore: ObservableObject {
         }
         if blocked, let noiseKey = contactNoiseKey(id) {
             FavoritesPersistenceService.shared.removeFavorite(peerNoisePublicKey: noiseKey)
+            invalidatePeerKeysIndex()
         }
         objectWillChange.send()
         let display = name.isEmpty ? "contact" : name
@@ -2835,6 +3030,7 @@ final class SonarAppStore: ObservableObject {
         )
         if sonarProfiles[peerID] != profile {
             sonarProfiles[peerID] = profile
+            invalidatePeerKeysIndex()
         }
         // Persist the npub↔peer link keyed by the canonical 16-hex short id, so
         // the mesh + White Noise legs stay ONE conversation across restarts /
@@ -2843,6 +3039,7 @@ final class SonarAppStore: ObservableObject {
         let key = canonicalPeerKey(PeerID(str: peerID))
         if sonarProfilesByFingerprint[key] != profile {
             sonarProfilesByFingerprint[key] = profile
+            invalidatePeerKeysIndex()
             persistSonarProfiles()
         }
         if let group = marmotGroup(forNpub: profile.npub) {
@@ -2892,6 +3089,7 @@ final class SonarAppStore: ObservableObject {
             if migrated[short] == nil { migrated[short] = v }
         }
         sonarProfilesByFingerprint = migrated
+        invalidatePeerKeysIndex()
         if changed { persistSonarProfiles() }
     }
 
@@ -3001,25 +3199,200 @@ final class SonarAppStore: ObservableObject {
     /// matches `npub`, if any — used to fold a Marmot group into that peer's mesh
     /// conversation even with no live announce. Matches the key `dmRows` builds
     /// its mesh rows under, so the fold lands both in and out of BLE range.
+    ///
+    /// When several Noise fingerprints advertise the same npub, returns one
+    /// stable alias (persisted fold target preferred) so mesh+Marmot collapse
+    /// onto a single home row.
     func sonarPeerKey(forNpub npub: String) -> String? {
-        guard let target = Self.nostrPubkeyData(npub) else { return nil }
-        if let live = sonarProfiles.first(where: { Self.nostrPubkeyData($0.value.npub) == target })?.key {
-            return canonicalPeerKey(PeerID(str: live))
-        }
-        if let persisted = sonarProfilesByFingerprint.first(where: { Self.nostrPubkeyData($0.value.npub) == target })?.key {
-            return persisted
-        }
-        // Fallback: a favorite we've met over BLE carries the noise↔nostr link, so a
-        // White Noise chat with that npub is the SAME person as the mesh chat — fold
-        // it even when we never captured a 0x53 announce from them (the gap that made
-        // one person show as two chats). Compare canonically so a hex-vs-npub format
-        // mismatch never blocks the fold.
-        for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
-            if let nostr = rel.peerNostrPublicKey, Self.nostrPubkeyData(nostr) == target {
-                return PeerID(publicKey: noiseKey).bare
+        let aliases = peerKeys(linkedToNpub: npub)
+        guard !aliases.isEmpty else { return nil }
+        return snSelectCanonicalMeshPeerId(
+            aliases: aliases,
+            persistedFoldPeerIds: Set(marmotGroupIdsByConversationId.keys.map(Self.canonicalStoredKey))
+        )
+    }
+
+    /// Every known 16-hex mesh key linked to `npub` (live 0x53, persisted
+    /// fingerprint map, favorites Noise↔Nostr). Used to collapse rotating /
+    /// multi-device BLE identities that share one Sonar account.
+    private func peerKeys(linkedToNpub npub: String) -> [String] {
+        guard let target = Self.nostrPubkeyData(npub) else { return [] }
+        let hex = target.hexEncodedString().lowercased()
+        let candidates = Array(peerKeysIndex()[hex] ?? [])
+        // Re-check each candidate's *current* link (profile preferred over
+        // favorites). Compose filters `meshConversationIdentityKey(it, link)`
+        // the same way — reverse-index membership alone is not enough.
+        var linked: [String: String] = [:]
+        for key in candidates {
+            if let candidateHex = linkedNpubHex(forPeerKey: key) {
+                linked[key] = candidateHex
             }
         }
+        return snFilterPeerKeysMatchingNpubHex(
+            candidates: candidates,
+            linkedNpubHexByPeer: linked,
+            targetNpubHex: hex
+        )
+    }
+
+    private func invalidatePeerKeysIndex() {
+        peerKeysByNpubHex = nil
+        npubByPeerKey = nil
+    }
+
+    private func peerKeysIndex() -> [String: Set<String>] {
+        if let cached = peerKeysByNpubHex { return cached }
+        var index: [String: Set<String>] = [:]
+        var reverse: [String: String] = [:]
+        func insert(_ peerKey: String, npub: String) {
+            guard !peerKey.isEmpty,
+                  let data = Self.nostrPubkeyData(npub) else { return }
+            index[data.hexEncodedString().lowercased(), default: []].insert(peerKey)
+            reverse[peerKey] = npub
+        }
+        for (key, profile) in sonarProfiles {
+            insert(canonicalPeerKey(PeerID(str: key)), npub: profile.npub)
+        }
+        for (key, profile) in sonarProfilesByFingerprint {
+            insert(Self.canonicalStoredKey(key), npub: profile.npub)
+        }
+        for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
+            guard let nostr = rel.peerNostrPublicKey else { continue }
+            let bare = PeerID(publicKey: noiseKey).bare
+            // Prefer Sonar 0x53 / fingerprint profile over a conflicting favorite
+            // claim so the reverse index never indexes the same Noise key under
+            // two npubs.
+            if let profileNpub = sonarProfilesByFingerprint[bare]?.npub
+                ?? sonarProfiles[bare]?.npub,
+               let profileData = Self.nostrPubkeyData(profileNpub),
+               let favData = Self.nostrPubkeyData(nostr),
+               profileData != favData {
+                continue
+            }
+            insert(bare, npub: nostr)
+        }
+        peerKeysByNpubHex = index
+        npubByPeerKey = reverse
+        return index
+    }
+
+    /// peerKey → stored npub, co-built with `peerKeysIndex()`.
+    private func linkedNpubIndex() -> [String: String] {
+        _ = peerKeysIndex()
+        return npubByPeerKey ?? [:]
+    }
+
+    /// Live BLE route for a conversation — may differ from the canonical fold
+    /// row id when the same npub has multiple Noise fingerprints (Compose
+    /// `liveMeshRoutePeerId`).
+    private func liveMeshRoutePeerId(for id: String) -> String? {
+        let mesh = chatViewModel.meshService
+        let aliases = meshPeerAliases(for: id)
+        let isSonar = resolvedSonarProfile(id) != nil
+            || aliases.contains { resolvedSonarProfile($0) != nil }
+        return snSelectLiveMeshRoutePeerId(
+            aliases: aliases,
+            isConnected: { mesh.isPeerConnected(PeerID(str: $0)) },
+            isReachable: { mesh.isPeerReachable(PeerID(str: $0)) },
+            requireDirectConnection: isSonar
+        )
+    }
+
+    /// Linked Sonar account for a mesh peer — bech32 `npub1…` or hex, as stored
+    /// on the profile / favorite. Prefer this over hex-only when calling
+    /// `peerKeys(linkedToNpub:)` so the call site matches every other fold path.
+    private func linkedNpub(forPeerKey key: String) -> String? {
+        if let profile = resolvedSonarProfile(key) {
+            return profile.npub
+        }
+        let short = Self.canonicalStoredKey(key)
+        let byPeer = linkedNpubIndex()
+        if let npub = byPeer[short] ?? byPeer[key] {
+            return npub
+        }
+        // Index includes favorites; scan only on miss (stale / race).
+        for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
+            guard PeerID(publicKey: noiseKey).bare == short else { continue }
+            return rel.peerNostrPublicKey
+        }
         return nil
+    }
+
+    private func linkedNpubHex(forPeerKey key: String) -> String? {
+        linkedNpub(forPeerKey: key).flatMap {
+            Self.nostrPubkeyData($0)?.hexEncodedString().lowercased()
+        }
+    }
+
+    /// All mesh peer keys that represent the same person as `id` (same linked
+    /// npub, or the bare peer key when unlinked).
+    ///
+    /// Linked peers reuse `peerKeys(linkedToNpub:)` (profiles + fingerprints +
+    /// favorites) instead of scanning every private chat and calling
+    /// `linkedNpubHex` per candidate — that O(N×F) path sat on chat-open and
+    /// pagination count.
+    private func meshPeerAliases(for id: String) -> [String] {
+        let key = canonicalPeerKey(PeerID(str: id))
+        if let npub = linkedNpub(forPeerKey: key),
+           let hex = Self.nostrPubkeyData(npub)?.hexEncodedString().lowercased() {
+            // peerKeys already Compose-filters; still re-check inserted short/id
+            // forms so an empty/unlinked alias cannot sneak into the set.
+            var candidates = Set(peerKeys(linkedToNpub: npub))
+            candidates.insert(key)
+            candidates.insert(Self.canonicalStoredKey(id))
+            var linked: [String: String] = [:]
+            for alias in candidates {
+                if let aliasHex = linkedNpubHex(forPeerKey: alias) {
+                    linked[alias] = aliasHex
+                }
+            }
+            return snFilterPeerKeysMatchingNpubHex(
+                candidates: Array(candidates),
+                linkedNpubHexByPeer: linked,
+                targetNpubHex: hex
+            )
+        }
+        return Array(Set([key, Self.canonicalStoredKey(id)].filter { !$0.isEmpty })).sorted()
+    }
+
+    /// Unique mesh message count across aliases — no sort / no full array alloc.
+    /// Single-alias conversations keep the pre-fold O(1) dictionary lookup;
+    /// multi-fingerprint (same npub) merges only the alias keys (Compose-shaped).
+    private func meshPrivateMessageCount(forConversationId id: String) -> Int {
+        let aliases = meshPeerAliases(for: id)
+        let aliasSet = Set(aliases)
+        if aliasSet.count <= 1 {
+            let key = aliases.first ?? id
+            return chatViewModel.privateChats[PeerID(str: key)]?.count
+                ?? chatViewModel.privateChats[PeerID(str: id)]?.count
+                ?? 0
+        }
+        var seen = Set<String>()
+        for alias in aliases {
+            guard let msgs = chatViewModel.privateChats[PeerID(str: alias)] else { continue }
+            for message in msgs { seen.insert(message.id) }
+        }
+        return seen.count
+    }
+
+    /// Mesh/bitchat private messages across every alias of this conversation.
+    /// Single-alias keeps the pre-fold O(1) `privateChats[peer]` return (already
+    /// chronological); multi-fingerprint merges only alias keys (Compose-shaped).
+    private func meshPrivateMessages(forConversationId id: String) -> [BitchatMessage] {
+        let aliases = meshPeerAliases(for: id)
+        let aliasSet = Set(aliases)
+        if aliasSet.count <= 1 {
+            let key = aliases.first ?? id
+            return chatViewModel.privateChats[PeerID(str: key)]
+                ?? chatViewModel.privateChats[PeerID(str: id)]
+                ?? []
+        }
+        var byId: [String: BitchatMessage] = [:]
+        for alias in aliases {
+            guard let msgs = chatViewModel.privateChats[PeerID(str: alias)] else { continue }
+            for message in msgs { byId[message.id] = message }
+        }
+        return byId.values.sorted { $0.timestamp < $1.timestamp }
     }
 
     @discardableResult
@@ -3988,6 +4361,39 @@ final class SonarAppStore: ObservableObject {
                 byKey[key] = meshRow(peerID: fav.peerID, last: nil)
             }
         }
+        // Same Sonar npub on multiple Noise fingerprints (rotated BLE id /
+        // second device advertising the same account) → one person-row.
+        // Without this, Vincenzo Palazzo showed twice with different previews.
+        var linkedNpubByPeer: [String: String] = [:]
+        for key in byKey.keys {
+            if let hex = linkedNpubHex(forPeerKey: key) {
+                linkedNpubByPeer[key] = hex
+            }
+        }
+        let persistedFoldPeerIds = Set(
+            marmotGroupIdsByConversationId.keys.map(Self.canonicalStoredKey)
+        )
+        byKey = snCollapseMeshDMRowsByIdentity(
+            rowsByPeer: byKey,
+            linkedNpubByPeer: linkedNpubByPeer,
+            persistedFoldPeerIds: persistedFoldPeerIds
+        )
+        // Same canonical universe as `sonarPeerKey` / Marmot fold (full peerKeys
+        // set), not only fingerprints that currently have a mesh row. Memoize
+        // per npub so we don't rebuild peerKeys for every row.
+        var canonicalByNpubHex: [String: String] = [:]
+        byKey = snRekeyMeshRowsToCanonicalIds(rowsByPeer: byKey) { key in
+            guard let npub = linkedNpub(forPeerKey: key),
+                  let data = Self.nostrPubkeyData(npub) else { return nil }
+            let hex = data.hexEncodedString().lowercased()
+            if let cached = canonicalByNpubHex[hex] { return cached }
+            let canonical = snSelectCanonicalMeshPeerId(
+                aliases: peerKeys(linkedToNpub: npub),
+                persistedFoldPeerIds: persistedFoldPeerIds
+            )
+            if let canonical { canonicalByNpubHex[hex] = canonical }
+            return canonical
+        }
         // Marmot (White Noise) groups are internet-transport chats. A group
         // whose counterpart is a Sonar-discovered peer is the SAME
         // conversation as that peer's mesh chat: fold it into the peer row
@@ -4045,6 +4451,13 @@ final class SonarAppStore: ObservableObject {
             }
             if let foldKey {
                 rememberMarmotGroup(rowGroupId, forConversationId: foldKey)
+            }
+            // Persist the fold under every known Noise alias for this npub so
+            // an older fingerprint still opens the same conversation.
+            if let otherNpub {
+                for alias in peerKeys(linkedToNpub: otherNpub) {
+                    rememberMarmotGroup(rowGroupId, forConversationId: alias)
+                }
             }
             if let foldKey, let existing = byKey[foldKey] {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
@@ -4278,7 +4691,7 @@ final class SonarAppStore: ObservableObject {
         guard !id.hasPrefix(Self.marmotIDPrefix),
               pendingMarmotNpub(for: id) == nil,
               !isPendingMarmotGroup(id) else { return false }
-        return (chatViewModel.privateChats[PeerID(str: id)]?.count ?? 0)
+        return meshPrivateMessageCount(forConversationId: id)
             > visibleLimit + newestOffset
     }
 
@@ -4286,7 +4699,7 @@ final class SonarAppStore: ObservableObject {
         guard !id.hasPrefix(Self.marmotIDPrefix),
               pendingMarmotNpub(for: id) == nil,
               !isPendingMarmotGroup(id) else { return 0 }
-        return chatViewModel.privateChats[PeerID(str: id)]?.count ?? 0
+        return meshPrivateMessageCount(forConversationId: id)
     }
 
     func cachedPaymentActivityCount(_ id: String) -> Int {
@@ -4545,11 +4958,10 @@ final class SonarAppStore: ObservableObject {
                 }
             }
             if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
-                let peerID = PeerID(str: id)
                 let via: SNVia = .mesh
                 let my = chatViewModel.meshService.myPeerID
                 dated += Self.transcriptSource(
-                    chatViewModel.privateChats[peerID] ?? [],
+                    meshPrivateMessages(forConversationId: id),
                     limit: limit,
                     newestOffset: meshNewestOffset
                 ).compactMap { m in
@@ -4643,11 +5055,10 @@ final class SonarAppStore: ObservableObject {
                 newestOffset: callNewestOffset
             )
         }
-        let peerID = PeerID(str: id)
         let via = dmTransport(id)
         let my = chatViewModel.meshService.myPeerID
         var dated: [(Date, SNMessage)] = Self.transcriptSource(
-            chatViewModel.privateChats[peerID] ?? [],
+            meshPrivateMessages(forConversationId: id),
             limit: limit,
             newestOffset: meshNewestOffset
         ).compactMap { m in
@@ -4797,8 +5208,10 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendDm(_ id: String, _ text: String) {
-        if meshReachable(id) {
-            chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+        // Route on the live BLE alias — canonical fold id may be a stale
+        // fingerprint while the peer is connected under another Noise key.
+        if let route = liveMeshRoutePeerId(for: id) {
+            chatViewModel.sendPrivateMessage(text, to: PeerID(str: route))
             return
         }
         if let groupId = marmotGroupId(id) {
@@ -4973,8 +5386,9 @@ final class SonarAppStore: ObservableObject {
 
     private func sendPaymentReceiptLines(_ lines: [String], to id: String) async -> Bool {
         guard !lines.isEmpty else { return true }
-        if meshReachable(id) {
-            for line in lines { chatViewModel.sendPrivateMessage(line, to: PeerID(str: id)) }
+        if let route = liveMeshRoutePeerId(for: id) {
+            let peer = PeerID(str: route)
+            for line in lines { chatViewModel.sendPrivateMessage(line, to: peer) }
             return true
         }
         if let groupId = marmotGroupId(id) {
@@ -4998,8 +5412,8 @@ final class SonarAppStore: ObservableObject {
             shortcode: sticker.shortcode,
             plaintextSha256: sticker.sha256
         )
-        if meshReachable(id) {
-            chatViewModel.sendPrivateMessage(content, to: PeerID(str: id))
+        if let route = liveMeshRoutePeerId(for: id) {
+            chatViewModel.sendPrivateMessage(content, to: PeerID(str: route))
             return
         }
         if let groupId = marmotGroupId(id) {
@@ -5890,21 +6304,16 @@ final class SonarAppStore: ObservableObject {
     /// still useful for plain bitchat relay but should not hold Sonar on BLE.
     private func meshReachable(_ id: String) -> Bool {
         guard !id.hasPrefix(Self.marmotIDPrefix) else { return false }
-        let peerID = PeerID(str: id)
-        guard !peerID.isGeoDM else { return false }
-        let mesh = chatViewModel.meshService
-        if resolvedSonarProfile(id) != nil {
-            return mesh.isPeerConnected(peerID)
-        }
-        return mesh.isPeerConnected(peerID) || mesh.isPeerReachable(peerID)
+        guard !PeerID(str: id).isGeoDM else { return false }
+        return liveMeshRoutePeerId(for: id) != nil
     }
 
     /// Send an image. Over the BLE mesh (bitchat file transfer, type 0x22) when
     /// the peer is reachable over Bluetooth — interops with stock bitchat;
     /// otherwise encrypt + Blossom-upload + publish over White Noise (Marmot).
     func sendImage(_ id: String, data: Data, filename: String, mime: String) {
-        if meshReachable(id) {
-            sendImageOverMesh(PeerID(str: id), data: data)
+        if let route = liveMeshRoutePeerId(for: id) {
+            sendImageOverMesh(PeerID(str: route), data: data)
             return
         }
         let groupId: String?
@@ -5962,18 +6371,19 @@ final class SonarAppStore: ObservableObject {
             }
             return
         }
-        if meshReachable(id) {
+        if let route = liveMeshRoutePeerId(for: id) {
             // Per-item over mesh (no album packet), preserving each MIME:
             // sendImageOverMesh forces JPEG, so route GIFs through the file
             // path to keep the animation instead of flattening it.
             var failed = 0
+            let routePeer = PeerID(str: route)
             for item in items {
                 if item.mime == "image/gif" || item.mime.hasPrefix("video/") {
                     if !sendAttachment(id, data: item.data, filename: item.filename, mime: item.mime) {
                         failed += 1
                     }
                 } else {
-                    sendImageOverMesh(PeerID(str: id), data: item.data)
+                    sendImageOverMesh(routePeer, data: item.data)
                 }
             }
             if failed > 0 {
@@ -6050,9 +6460,9 @@ final class SonarAppStore: ObservableObject {
     func sendAttachment(_ id: String, data: Data, filename: String, mime: String) -> Bool {
         let safeName = snEncryptedAttachmentFilename(filename)
         let safeMime = snEncryptedAttachmentMime(mime)
-        if meshReachable(id) {
+        if let route = liveMeshRoutePeerId(for: id) {
             if FileTransferLimits.isValidPayload(data.count) {
-                chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+                chatViewModel.selectedPrivateChatPeer = PeerID(str: route)
                 let meshMime = MimeType(safeMime)?.mimeString ?? "application/octet-stream"
                 chatViewModel.sendFile(data: data, filename: safeName, mime: meshMime)
                 return true
@@ -6115,8 +6525,8 @@ final class SonarAppStore: ObservableObject {
     /// media. Same routing as `sendImage`, audio mime. Cleans up the temp file.
     func sendVoiceNote(_ id: String, url: URL) {
         defer { try? FileManager.default.removeItem(at: url) }
-        if meshReachable(id) {
-            chatViewModel.selectedPrivateChatPeer = PeerID(str: id)
+        if let route = liveMeshRoutePeerId(for: id) {
+            chatViewModel.selectedPrivateChatPeer = PeerID(str: route)
             chatViewModel.sendVoiceNote(at: url)
             return
         }
@@ -7203,6 +7613,9 @@ final class SonarAppStore: ObservableObject {
     /// npub so muting a group cannot silence the member's direct chat.
     private func muteKeys(forChatId id: String) -> [String] {
         var keys: Set<String> = [id, chatAlertKey(id)]
+        for alias in meshPeerAliases(for: id) {
+            keys.insert(alias)
+        }
         for group in localTranscriptGroups(for: id) where !group.id.isEmpty {
             keys.insert(group.id)
             keys.insert(Self.marmotIDPrefix + group.id)
@@ -7609,6 +8022,15 @@ final class SonarAppStore: ObservableObject {
         }
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: left)), fp == right { return true }
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: right)), fp == left { return true }
+        let leftKey = canonicalPeerKey(PeerID(str: left))
+        let rightKey = canonicalPeerKey(PeerID(str: right))
+        if leftKey == rightKey { return true }
+        // Same Sonar npub on different Noise fingerprints = one person.
+        if let leftHex = linkedNpubHex(forPeerKey: leftKey),
+           let rightHex = linkedNpubHex(forPeerKey: rightKey),
+           leftHex == rightHex {
+            return true
+        }
         return false
     }
 
@@ -7628,10 +8050,17 @@ final class SonarAppStore: ObservableObject {
             ids.insert(mapped)
             ids.insert(Self.marmotIDPrefix + mapped)
         }
-        // Mesh fingerprint alias of the same peer.
+        // Mesh fingerprint alias of the same peer (incl. same-npub BLE aliases).
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: conversationId)) {
             ids.insert(fp)
             if let mapped = marmotGroupIdsByConversationId[fp] {
+                ids.insert(mapped)
+                ids.insert(Self.marmotIDPrefix + mapped)
+            }
+        }
+        for alias in meshPeerAliases(for: conversationId) {
+            ids.insert(alias)
+            if let mapped = marmotGroupIdsByConversationId[alias] {
                 ids.insert(mapped)
                 ids.insert(Self.marmotIDPrefix + mapped)
             }
@@ -7982,13 +8411,13 @@ final class SonarAppStore: ObservableObject {
     private func sendCallControl(_ convId: String, _ line: String, via: SNVia) -> Bool {
         switch via {
         case .mesh:
-            guard meshReachable(convId) else {
+            guard let route = liveMeshRoutePeerId(for: convId) else {
                 SecureLogger.debug("SonarCall: dropping control without mesh route convId=\(convId.prefix(16))", category: .session)
                 return false
             }
-            let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: convId), messageID: UUID().uuidString)
+            let sent = chatViewModel.meshService.sendPrivateMessageNow(line, to: PeerID(str: route), messageID: UUID().uuidString)
             if !sent {
-                SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16))", category: .session)
+                SecureLogger.debug("SonarCall: dropping control without established Noise route convId=\(convId.prefix(16)) route=\(route.prefix(16))", category: .session)
             }
             return sent
         case .internet:
@@ -8331,6 +8760,7 @@ final class SonarAppStore: ObservableObject {
         }
         sonarProfiles = [:]
         sonarProfilesByFingerprint = [:]
+        invalidatePeerKeysIndex()
         meshPeerFirstSeenAt = [:]
         pendingCapabilityRefreshKeys = []
         defaults.removeObject(forKey: Keys.sonarProfiles)
