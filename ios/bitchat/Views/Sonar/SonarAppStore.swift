@@ -6590,8 +6590,6 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
-    /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
-    /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
     /// Internet fallback for a mesh media send that found no live BLE route
     /// (e.g. the peer went out of range between route selection and send).
     /// Encrypts + Blossom-uploads + publishes over White Noise (Marmot), the
@@ -6635,6 +6633,8 @@ final class SonarAppStore: ObservableObject {
         return true
     }
 
+    /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file
+    /// path (saves outgoing, echoes "[image] <name>", sends `sendFilePrivate`).
     private func sendImageOverMesh(_ peerID: PeerID, data: Data) {
         chatViewModel.selectedPrivateChatPeer = peerID // target + enable media context
         let tmp = FileManager.default.temporaryDirectory
