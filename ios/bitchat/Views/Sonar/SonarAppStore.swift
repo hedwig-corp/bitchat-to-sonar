@@ -6324,7 +6324,10 @@ final class SonarAppStore: ObservableObject {
         } else {
             groupId = nil
         }
-        guard let gid = groupId else { return }
+        guard let gid = groupId else {
+            showToast("Couldn't send the image — the secure chat isn't ready yet.")
+            return
+        }
         let pendingURL = Self.pendingMediaURL()
         rememberPendingUploadMedia(
             groupId: gid,
@@ -6539,7 +6542,10 @@ final class SonarAppStore: ObservableObject {
         } else {
             groupId = nil
         }
-        guard let gid = groupId else { return }
+        guard let gid = groupId else {
+            showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
+            return
+        }
         let pendingURL = Self.pendingMediaURL()
         rememberPendingUploadMedia(
             groupId: gid,
