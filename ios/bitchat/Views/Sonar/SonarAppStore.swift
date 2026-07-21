@@ -1543,6 +1543,14 @@ final class SonarAppStore: ObservableObject {
         callLogs = Self.loadCallLogs(from: defaults)
         syncNotificationPrefsToAppGroup()
 
+        // Internet fallback for private mesh media sends: when the BLE route
+        // drops between route selection and send, ChatViewModel hands the
+        // packet here so it still goes out over White Noise (Marmot). Must be
+        // installed after all stored properties are initialized (captures self).
+        chatViewModel.meshMediaSendFallback = { [weak self] packet, peerID, _ in
+            self?.sendMeshMediaOverInternet(packet, to: peerID) ?? false
+        }
+
         // The screens read computed properties off this store; republish
         // whenever any underlying service changes.
         republish(chatViewModel.objectWillChange)
@@ -6334,7 +6342,10 @@ final class SonarAppStore: ObservableObject {
         } else {
             groupId = nil
         }
-        guard let gid = groupId else { return }
+        guard let gid = groupId else {
+            showToast("Couldn't send the image — the secure chat isn't ready yet.")
+            return
+        }
         let pendingURL = Self.pendingMediaURL()
         rememberPendingUploadMedia(
             groupId: gid,
@@ -6549,7 +6560,10 @@ final class SonarAppStore: ObservableObject {
         } else {
             groupId = nil
         }
-        guard let gid = groupId else { return }
+        guard let gid = groupId else {
+            showToast("Couldn't send the voice note — the secure chat isn't ready yet.")
+            return
+        }
         let pendingURL = Self.pendingMediaURL()
         rememberPendingUploadMedia(
             groupId: gid,
@@ -6584,6 +6598,49 @@ final class SonarAppStore: ObservableObject {
                 )
             }
         )
+    }
+
+    /// Internet fallback for a mesh media send that found no live BLE route
+    /// (e.g. the peer went out of range between route selection and send).
+    /// Encrypts + Blossom-uploads + publishes over White Noise (Marmot), the
+    /// same path as non-mesh `sendImage`/`sendVoiceNote`/`sendAttachment`.
+    /// Returns false when no Marmot group exists for the peer — the caller
+    /// then marks the message failed instead.
+    private func sendMeshMediaOverInternet(_ packet: BitchatFilePacket, to peerID: PeerID) -> Bool {
+        let filename = packet.fileName ?? "file"
+        let mime = packet.mimeType ?? "application/octet-stream"
+        let key = canonicalPeerKey(peerID)
+        var groupId = marmotGroupId(key)
+        if groupId == nil, let profile = resolvedSonarProfile(key) {
+            groupId = marmotGroup(forNpub: profile.npub)?.id
+        }
+        if groupId == nil {
+            for alias in meshPeerAliases(for: key) {
+                if let gid = marmotGroupId(alias) { groupId = gid; break }
+                if let profile = resolvedSonarProfile(alias),
+                   let group = marmotGroup(forNpub: profile.npub) {
+                    groupId = group.id
+                    break
+                }
+            }
+        }
+        guard let gid = groupId else { return false }
+        let pendingURL = Self.pendingMediaURL()
+        rememberPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL, data: packet.content)
+        marmot.sendMedia(
+            groupId: gid,
+            data: packet.content,
+            filename: filename,
+            mime: mime,
+            localPreviewURL: pendingURL,
+            onComplete: { [weak self] in
+                self?.markPendingUploadMediaCompleted(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
+            },
+            onFailure: { [weak self] in
+                self?.forgetPendingUploadMedia(groupId: gid, filename: filename, mime: mime, caption: "", localURL: pendingURL)
+            }
+        )
+        return true
     }
 
     /// Send an image over the BLE mesh by reusing ChatViewModel's bitchat file

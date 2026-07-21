@@ -382,7 +382,17 @@ extension ChatViewModel {
 
         registerTransfer(transferId: transferId, messageID: messageID)
         if let peerID = targetPeer {
-            meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
+            if !meshService.sendFilePrivate(packet, to: peerID, transferId: transferId) {
+                // No live BLE route (it may have dropped between route
+                // selection and send): hand the media to the internet
+                // fallback; only mark failed when no fallback takes it.
+                if meshMediaSendFallback?(packet, peerID, messageID) == true {
+                    clearTransferMapping(for: messageID)
+                    removeMessage(withID: messageID, cleanupFile: true)
+                } else {
+                    handleMediaSendFailure(messageID: messageID, reason: "Peer is not reachable over Bluetooth")
+                }
+            }
         } else {
             meshService.sendFileBroadcast(packet, transferId: transferId)
         }
@@ -427,7 +437,18 @@ extension ChatViewModel {
                     let transferId = self.makeTransferID(messageID: messageID)
                     self.registerTransfer(transferId: transferId, messageID: messageID)
                     if let peerID = targetPeer {
-                        self.meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
+                        if !self.meshService.sendFilePrivate(packet, to: peerID, transferId: transferId) {
+                            // No live BLE route (it may have dropped between
+                            // route selection and send): hand the media to the
+                            // internet fallback; only mark failed when no
+                            // fallback takes it.
+                            if self.meshMediaSendFallback?(packet, peerID, messageID) == true {
+                                self.clearTransferMapping(for: messageID)
+                                self.removeMessage(withID: messageID, cleanupFile: true)
+                            } else {
+                                self.handleMediaSendFailure(messageID: messageID, reason: "Peer is not reachable over Bluetooth")
+                            }
+                        }
                     } else {
                         self.meshService.sendFileBroadcast(packet, transferId: transferId)
                     }
@@ -484,7 +505,17 @@ extension ChatViewModel {
 
         registerTransfer(transferId: transferId, messageID: messageID)
         if let peerID = targetPeer {
-            meshService.sendFilePrivate(packet, to: peerID, transferId: transferId)
+            if !meshService.sendFilePrivate(packet, to: peerID, transferId: transferId) {
+                // No live BLE route (it may have dropped between route
+                // selection and send): hand the media to the internet
+                // fallback; only mark failed when no fallback takes it.
+                if meshMediaSendFallback?(packet, peerID, messageID) == true {
+                    clearTransferMapping(for: messageID)
+                    removeMessage(withID: messageID, cleanupFile: true)
+                } else {
+                    handleMediaSendFailure(messageID: messageID, reason: "Peer is not reachable over Bluetooth")
+                }
+            }
         } else {
             meshService.sendFileBroadcast(packet, transferId: transferId)
         }

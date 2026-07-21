@@ -977,7 +977,16 @@ final class BLEService: NSObject {
         }
     }
 
-    func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: PeerID, transferId: String) {
+    @discardableResult
+    func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: PeerID, transferId: String) -> Bool {
+        // Fail fast when the file would go nowhere: `routingPeerID(for:)`
+        // fabricates a short ID for 64-hex noise keys even when the peer was
+        // never discovered, which would flood the mesh with a packet addressed
+        // to a non-existent recipient while the UI shows the media as sent.
+        guard let targetRoute = routingPeerID(for: peerID), isPeerReachable(targetRoute) else {
+            SecureLogger.error("❌ No live route for private file transfer: \(peerID)", category: .session)
+            return false
+        }
         messageQueue.async { [weak self] in
             guard let self = self else { return }
             guard let payload = filePacket.encode() else {
@@ -1011,6 +1020,7 @@ final class BLEService: NSObject {
             SecureLogger.debug("📁 Sending private file transfer to \(targetID.id.prefix(8))… requested=\(peerID.id.prefix(8))… bytes=\(payload.count)", category: .session)
             self.broadcastPacket(packet, transferId: transferId)
         }
+        return true
     }
 
     

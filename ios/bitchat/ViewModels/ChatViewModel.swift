@@ -1342,6 +1342,12 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
 
 
 
+    /// Installed by SonarAppStore. Called when a private mesh media send fails
+    /// because the peer has no live BLE route; return true when an internet
+    /// fallback (White Noise / Marmot) took over the send — the caller then
+    /// removes the optimistic mesh message instead of marking it failed.
+    @MainActor var meshMediaSendFallback: ((BitchatFilePacket, PeerID, String) -> Bool)?
+
     @MainActor
     func removeMessage(withID messageID: String, cleanupFile: Bool = false) {
         var removedMessage: BitchatMessage?
