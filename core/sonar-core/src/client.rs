@@ -7065,7 +7065,7 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// Shared with conversation_index::sanitize_preview_label — keep in sync.
 pub(crate) const JSON_PAYLOAD_PREVIEW_LABEL: &str = "JSON payload";
 
-fn index_preview(message: &ChatMessage) -> String {
+pub(crate) fn index_preview(message: &ChatMessage) -> String {
     if !message.content.is_empty() {
         // Machine-sent JSON payloads (agents/bots, interop control messages)
         // must not leak raw into chat-list rows or NSE banner bodies.
