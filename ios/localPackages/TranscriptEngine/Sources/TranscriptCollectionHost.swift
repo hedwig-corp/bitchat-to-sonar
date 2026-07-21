@@ -70,6 +70,11 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
     /// Invoked once after a Jump open-action is applied (hit or soft-fail) so
     /// the app can clear its one-shot jump target (#372).
     var onJumpSettled: (() -> Void)?
+    /// O(1) app-owned content revision. While it (and the open-action inputs)
+    /// are unchanged, apply skips the O(n) snapshot rebuild — composer
+    /// keystrokes and unrelated store publishes must not re-measure rows.
+    /// Nil = always apply (generic default). Must cover entries + height keys.
+    var contentVersion: UInt64?
     @ViewBuilder var composer: () -> Composer
 
     public init(
@@ -84,6 +89,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         transcriptBackgroundColor: UIColor = .systemBackground,
         prepareForUpdate: (() -> Void)? = nil,
         onJumpSettled: (() -> Void)? = nil,
+        contentVersion: UInt64? = nil,
         @ViewBuilder composer: @escaping () -> Composer
     ) {
         self.entries = entries
@@ -97,6 +103,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
         self.transcriptBackgroundColor = transcriptBackgroundColor
         self.prepareForUpdate = prepareForUpdate
         self.onJumpSettled = onJumpSettled
+        self.contentVersion = contentVersion
         self.composer = composer
     }
 
@@ -116,6 +123,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            contentVersion: contentVersion,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -137,6 +145,7 @@ public struct TranscriptCollectionHostView<Composer: View>: UIViewControllerRepr
             unreadCountAtOpen: unreadCountAtOpen,
             expectedNewestDate: expectedNewestDate,
             jumpMessageId: jumpMessageId,
+            contentVersion: contentVersion,
             loadOlder: loadOlder,
             loadNewest: loadNewest,
             callbacks: callbacks,
@@ -201,6 +210,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var pendingContinuity: TranscriptContinuityToken?
     private var contentSizeObservation: NSKeyValueObservation?
     private var lastContentHeight: CGFloat = 0
+    private var lastAppliedContentVersion: UInt64?
 
     private let heightCache = TranscriptRowHeightCache()
     private var appliedHeightKeys: [TranscriptDayRow: String] = [:]
@@ -340,6 +350,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         unreadCountAtOpen: UInt64?,
         expectedNewestDate: Date?,
         jumpMessageId: String? = nil,
+        contentVersion: UInt64? = nil,
         loadOlder: (() async -> Bool)?,
         loadNewest: (() async -> Void)?,
         callbacks: TranscriptCollectionHostCallbacks? = nil,
@@ -361,6 +372,26 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             self.transcriptBackgroundColor = transcriptBackgroundColor
             if isViewLoaded { applyTranscriptBackground() }
         }
+        if TranscriptScrollPolicy.shouldSkipUnchangedApply(
+            contentVersion: contentVersion,
+            lastContentVersion: lastAppliedContentVersion,
+            unreadCountAtOpen: unreadCountAtOpen,
+            lastUnreadCountAtOpen: self.unreadCountAtOpen,
+            jumpMessageId: jumpMessageId,
+            lastJumpMessageId: self.jumpMessageId,
+            expectedNewestDate: expectedNewestDate,
+            lastExpectedNewestDate: self.expectedNewestDate
+        ) {
+            // SwiftUI rebuilds closures every turn; keep them fresh and keep
+            // the live-edge open pump alive, but skip the O(n) snapshot
+            // rebuild (height keys embed full message text) when nothing
+            // visible changed (CVRenderState no-op render pass shape).
+            self.loadOlder = loadOlder
+            self.loadNewest = loadNewest
+            if needsLiveEdgeOpen { resnapFullyReadOpenIfNeeded() }
+            return
+        }
+        lastAppliedContentVersion = contentVersion
         let previousRevision = TranscriptTailRevision(
             itemCount: self.entries.count,
             tailID: self.entries.last?.id

@@ -185,4 +185,54 @@ struct TranscriptScrollPolicyTests {
             )
         )
     }
+
+    @Test
+    func unchangedApplySkipsOnlyWhenVersionAndOpenInputsMatch() {
+        // Nil version (generic hosts) must always apply.
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: nil, lastContentVersion: nil,
+                unreadCountAtOpen: nil, lastUnreadCountAtOpen: nil,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+        // Same version + same open inputs: composer keystroke / unrelated
+        // store publish — skip the snapshot rebuild.
+        #expect(
+            TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 0, lastUnreadCountAtOpen: 0,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+        // Content bump must apply.
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 8, lastContentVersion: 7,
+                unreadCountAtOpen: 0, lastUnreadCountAtOpen: 0,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+        // Late unread-count settle or a new jump target must apply even when
+        // the transcript itself is unchanged.
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 3, lastUnreadCountAtOpen: 0,
+                jumpMessageId: nil, lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+        #expect(
+            !TranscriptScrollPolicy.shouldSkipUnchangedApply(
+                contentVersion: 7, lastContentVersion: 7,
+                unreadCountAtOpen: 0, lastUnreadCountAtOpen: 0,
+                jumpMessageId: "m1", lastJumpMessageId: nil,
+                expectedNewestDate: nil, lastExpectedNewestDate: nil
+            )
+        )
+    }
 }
