@@ -2252,25 +2252,56 @@ impl SonarClient {
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
     /// display name + avatar. `name` is used for both `name` and `display_name`;
     /// `about`/`picture` are optional (a bad picture URL is dropped, not fatal).
+    /// Merge caller-provided fields over the current relay kind-0 so a Sonar
+    /// publish never wipes metadata it does not manage (about, picture,
+    /// banner, website, lud16, external nip05, custom keys). Only
+    /// `name`/`display_name` always change; `about`/`picture` only when a
+    /// non-empty value is passed; `nip05` only when a Sonar handle was
+    /// explicitly claimed (external nip05 is otherwise preserved).
+    fn merge_profile_metadata(
+        current: Option<&Metadata>,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+        claimed_handle: Option<String>,
+    ) -> Metadata {
+        let mut metadata = current.cloned().unwrap_or_default();
+        metadata.name = Some(name.to_string());
+        metadata.display_name = Some(name.to_string());
+        if let Some(about) = about.filter(|s| !s.is_empty()) {
+            metadata.about = Some(about.to_string());
+        }
+        if let Some(url) = picture
+            .filter(|s| !s.is_empty())
+            .and_then(|p| Url::parse(p).ok())
+        {
+            metadata.picture = Some(url.to_string());
+        }
+        if let Some(address) = claimed_handle {
+            metadata.nip05 = Some(address);
+        }
+        metadata
+    }
+
     pub async fn publish_profile(
         &self,
         name: &str,
         about: Option<&str>,
         picture: Option<&str>,
     ) -> Result<()> {
-        let mut metadata = Metadata::new().name(name).display_name(name);
-        if let Some(about) = about.filter(|s| !s.is_empty()) {
-            metadata = metadata.about(about);
-        }
-        if let Some(url) = picture
-            .filter(|s| !s.is_empty())
-            .and_then(|p| Url::parse(p).ok())
-        {
-            metadata = metadata.picture(url);
-        }
-        if let Some(address) = self.claimed_handle.lock().unwrap().clone() {
-            metadata = metadata.nip05(address);
-        }
+        // Fetch-and-merge: kind-0 is replaceable, so a blind publish would
+        // wipe every field Sonar does not manage. Propagate the fetch error
+        // instead of publishing blind — never destroy a profile we could
+        // not read.
+        let me = self.engine.identity().keys().public_key();
+        let current = self.nostr.fetch_metadata(me, FETCH_TIMEOUT).await?;
+        let metadata = Self::merge_profile_metadata(
+            current.as_ref(),
+            name,
+            about,
+            picture,
+            self.claimed_handle.lock().unwrap().clone(),
+        );
         self.nostr.set_metadata(&metadata).await?;
         Ok(())
     }
@@ -2285,21 +2316,29 @@ impl SonarClient {
         about: Option<&str>,
         picture: Option<&str>,
     ) {
-        let mut metadata = Metadata::new().name(name).display_name(name);
-        if let Some(about) = about.filter(|s| !s.is_empty()) {
-            metadata = metadata.about(about);
-        }
-        if let Some(url) = picture
-            .filter(|s| !s.is_empty())
-            .and_then(|p| Url::parse(p).ok())
-        {
-            metadata = metadata.picture(url);
-        }
-        if let Some(address) = self.claimed_handle.lock().unwrap().clone() {
-            metadata = metadata.nip05(address);
-        }
         let nostr = self.nostr.clone();
+        let claimed = self.claimed_handle.lock().unwrap().clone();
+        let me = self.engine.identity().keys().public_key();
+        let name = name.to_string();
+        let about = about.map(str::to_string);
+        let picture = picture.map(str::to_string);
         tokio::spawn(async move {
+            // Skip (do not publish blind) when the current kind-0 cannot be
+            // fetched — the next relay connect retries.
+            let current = match nostr.fetch_metadata(me, FETCH_TIMEOUT).await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(%err, "skipping kind-0 republish: current profile fetch failed");
+                    return;
+                }
+            };
+            let metadata = Self::merge_profile_metadata(
+                current.as_ref(),
+                &name,
+                about.as_deref(),
+                picture.as_deref(),
+                claimed,
+            );
             if let Err(err) = nostr.set_metadata(&metadata).await {
                 tracing::warn!(%err, "background profile publish failed");
             }
@@ -8904,5 +8943,69 @@ mod tests {
             vec![expected],
             "pending invite must notify the conversation listener exactly once"
         );
+    }
+}
+
+#[cfg(test)]
+mod profile_merge_tests {
+    use super::*;
+
+    fn rich_remote() -> Metadata {
+        Metadata::new()
+            .name("vincenzo")
+            .display_name("Vincenzo")
+            .about("bitcoin dev")
+            .website(Url::parse("https://example.com").unwrap())
+            .banner(Url::parse("https://example.com/banner.png").unwrap())
+            .picture(Url::parse("https://example.com/pic.png").unwrap())
+            .nip05("vin@external.example")
+            .lud16("vin@walletofsatoshi.com")
+    }
+
+    #[test]
+    fn fresh_key_publishes_supplied_fields() {
+        let m = SonarClient::merge_profile_metadata(None, "alice", Some("hi"), Some("https://x/p.png"), None);
+        assert_eq!(m.name.as_deref(), Some("alice"));
+        assert_eq!(m.display_name.as_deref(), Some("alice"));
+        assert_eq!(m.about.as_deref(), Some("hi"));
+        assert!(m.picture.is_some());
+        assert!(m.nip05.is_none());
+    }
+
+    #[test]
+    fn rename_preserves_unmanaged_fields() {
+        let r = rich_remote();
+        let m = SonarClient::merge_profile_metadata(Some(&r), "new-name", None, None, None);
+        assert_eq!(m.name.as_deref(), Some("new-name"));
+        assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
+        assert_eq!(m.picture, r.picture);
+        assert_eq!(m.website, r.website);
+        assert_eq!(m.banner, r.banner);
+        assert_eq!(m.lud16.as_deref(), Some("vin@walletofsatoshi.com"));
+        assert_eq!(m.nip05.as_deref(), Some("vin@external.example"));
+    }
+
+    #[test]
+    fn claimed_handle_replaces_nip05() {
+        let r = rich_remote();
+        let m = SonarClient::merge_profile_metadata(Some(&r), "n", None, None, Some("n@sonarprivacy.xyz".into()));
+        assert_eq!(m.nip05.as_deref(), Some("n@sonarprivacy.xyz"));
+    }
+
+    #[test]
+    fn explicit_about_and_picture_override_remote() {
+        let r = rich_remote();
+        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some("new bio"), Some("https://x/new.png"), None);
+        assert_eq!(m.about.as_deref(), Some("new bio"));
+        assert_eq!(m.picture.unwrap().as_str(), "https://x/new.png");
+        assert_eq!(m.website, r.website);
+    }
+
+    #[test]
+    fn empty_args_never_wipe_remote_fields() {
+        let r = rich_remote();
+        let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
+        assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
+        assert_eq!(m.picture, r.picture);
     }
 }
