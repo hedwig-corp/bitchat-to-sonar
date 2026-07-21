@@ -3919,12 +3919,19 @@ func snUpdatedComposerDrafts(
 /// Boundary mirror for the composer send/mic toggle: true while the chat's
 /// draft trims to non-empty. Returns the input unchanged off the boundary so
 /// callers can avoid publishing on every keystroke (see composerDrafts).
+/// Single source of truth for "draft counts as text" -- shared by the
+/// composer's send/mic toggle (SNComposer.hasText) and the published boundary
+/// mirror so the two can never diverge.
+func snComposerHasText(_ text: String) -> Bool {
+    !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+}
+
 func snUpdatedComposerDraftHasText(
     flags: [String: Bool],
     chatId: String,
     text: String
 ) -> [String: Bool] {
-    let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    let hasText = snComposerHasText(text)
     guard (flags[chatId] ?? false) != hasText else { return flags }
     var next = flags
     next[chatId] = hasText
@@ -3960,7 +3967,7 @@ struct SNComposer: View {
     #endif
 
     private var slash: Bool { text.hasPrefix("/") }
-    private var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    private var hasText: Bool { snComposerHasText(text) }
     /// Soft-IME platforms only. macOS shares `SNComposer` but has no system
     /// keyboard occupying the transcript — do not steal hardware-keyboard focus.
     private var usesSoftKeyboard: Bool {
