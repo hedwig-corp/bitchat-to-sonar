@@ -7063,6 +7063,11 @@ fn blossom_upload_timeout(len: usize) -> Duration {
 /// arriving album never shows an empty home row.
 fn index_preview(message: &ChatMessage) -> String {
     if !message.content.is_empty() {
+        // Machine-sent JSON payloads (agents/bots, interop control messages)
+        // must not leak raw into chat-list rows or NSE banner bodies.
+        if looks_like_json_payload(&message.content) {
+            return "JSON payload".to_owned();
+        }
         return message.content.clone();
     }
     if message.sticker_ref.is_some() {
@@ -7090,6 +7095,19 @@ fn index_preview(message: &ChatMessage) -> String {
     } else {
         first.filename.clone()
     }
+}
+
+/// True when the content is a serialized JSON object/array — the shape bot
+/// and interop control messages arrive in. A leading-brace fast path keeps
+/// ordinary chat text allocation-free; only brace-prefixed text pays the
+/// parse check. The transcript bubble still renders the full raw text; this
+/// only guards the preview/banner copy.
+fn looks_like_json_payload(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
 }
 
 fn truncate_notification_preview(preview: &str) -> String {
@@ -7438,6 +7456,30 @@ mod tests {
         assert_eq!(relay_fetch_quorum(2), 2);
         assert_eq!(relay_fetch_quorum(3), 2);
         assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    #[test]
+    #[test]
+    fn index_preview_labels_json_payloads_without_leaking_raw_json() {
+        let msg = |content: &str| ChatMessage {
+            id: test_event_id(9),
+            group_id: GroupId::from_slice(&[1u8; 32]),
+            sender: Keys::generate().public_key(),
+            content: content.to_owned(),
+            created_at: Timestamp::from_secs(1),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::Text,
+        };
+        // Bot/agent JSON payloads preview as a label, never raw JSON.
+        assert_eq!(index_preview(&msg("{\"alert\":\"cpu at 90%\",\"host\":\"ocean\"}")), "JSON payload");
+        assert_eq!(index_preview(&msg("  {\"ok\":true}")), "JSON payload");
+        assert_eq!(index_preview(&msg("[1,2,3]")), "JSON payload");
+        // Brace-prefixed human text that is NOT valid JSON stays verbatim.
+        assert_eq!(index_preview(&msg("{ not json, just a brace")), "{ not json, just a brace");
+        assert_eq!(index_preview(&msg("hello {}")), "hello {}");
     }
 
     #[test]
