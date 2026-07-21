@@ -283,7 +283,7 @@ impl ConversationIndex {
                 Ok(ConversationSummary {
                     group_id_hex: row.get(0)?,
                     name: row.get(1)?,
-                    latest_content: row.get(2)?,
+                    latest_content: sanitize_preview_label(row.get(2)?),
                     latest_sender: row.get(3)?,
                     latest_at_secs: row.get::<_, i64>(4)? as u64,
                     latest_mine: row.get::<_, i32>(5)? != 0,
@@ -310,7 +310,7 @@ impl ConversationIndex {
                     Ok(ConversationSummary {
                         group_id_hex: row.get(0)?,
                         name: row.get(1)?,
-                        latest_content: row.get(2)?,
+                        latest_content: sanitize_preview_label(row.get(2)?),
                         latest_sender: row.get(3)?,
                         latest_at_secs: row.get::<_, i64>(4)? as u64,
                         latest_mine: row.get::<_, i32>(5)? != 0,
@@ -362,6 +362,18 @@ impl ConversationIndex {
         }
         Ok(())
     }
+}
+
+/// Re-label persisted JSON payloads on read so rows written before the
+/// index_preview guard self-heal without an index rebuild (Codex P2).
+fn sanitize_preview_label(content: String) -> String {
+    let t = content.trim_start();
+    if (t.starts_with('{') || t.starts_with('['))
+        && serde_json::from_str::<serde_json::Value>(t).is_ok()
+    {
+        return "JSON payload".to_owned();
+    }
+    content
 }
 
 #[cfg(test)]
