@@ -927,6 +927,10 @@ final class SonarAppStore: ObservableObject {
     /// persisted profiles change so `peerKeys(linkedToNpub:)` stays O(1) on the
     /// chat-open hot path instead of rescanning every contact.
     private var peerKeysByNpubHex: [String: Set<String>]?
+    /// Reverse of `peerKeysByNpubHex`: canonical peer key → stored npub string.
+    /// Built with `peerKeysIndex()` so `linkedNpub(forPeerKey:)` stays O(1) on
+    /// `dmRows` instead of scanning favorites per row.
+    private var npubByPeerKey: [String: String]?
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
@@ -3230,15 +3234,18 @@ final class SonarAppStore: ObservableObject {
 
     private func invalidatePeerKeysIndex() {
         peerKeysByNpubHex = nil
+        npubByPeerKey = nil
     }
 
     private func peerKeysIndex() -> [String: Set<String>] {
         if let cached = peerKeysByNpubHex { return cached }
         var index: [String: Set<String>] = [:]
+        var reverse: [String: String] = [:]
         func insert(_ peerKey: String, npub: String) {
             guard !peerKey.isEmpty,
                   let data = Self.nostrPubkeyData(npub) else { return }
             index[data.hexEncodedString().lowercased(), default: []].insert(peerKey)
+            reverse[peerKey] = npub
         }
         for (key, profile) in sonarProfiles {
             insert(canonicalPeerKey(PeerID(str: key)), npub: profile.npub)
@@ -3262,7 +3269,14 @@ final class SonarAppStore: ObservableObject {
             insert(bare, npub: nostr)
         }
         peerKeysByNpubHex = index
+        npubByPeerKey = reverse
         return index
+    }
+
+    /// peerKey → stored npub, co-built with `peerKeysIndex()`.
+    private func linkedNpubIndex() -> [String: String] {
+        _ = peerKeysIndex()
+        return npubByPeerKey ?? [:]
     }
 
     /// Live BLE route for a conversation — may differ from the canonical fold
@@ -3289,6 +3303,11 @@ final class SonarAppStore: ObservableObject {
             return profile.npub
         }
         let short = Self.canonicalStoredKey(key)
+        let byPeer = linkedNpubIndex()
+        if let npub = byPeer[short] ?? byPeer[key] {
+            return npub
+        }
+        // Index includes favorites; scan only on miss (stale / race).
         for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
             guard PeerID(publicKey: noiseKey).bare == short else { continue }
             return rel.peerNostrPublicKey
