@@ -998,11 +998,21 @@ final class SonarAppStore: ObservableObject {
     /// (`updateUIViewController` → `applySnapshot`) while typing.
     private var composerDrafts: [String: String] = [:]
 
+    /// Boundary-only published mirror of draft non-emptiness per chat. The draft
+    /// map above stays unpublished, but the composer's send/mic toggle must
+    /// re-render the moment a draft crosses empty <-> non-empty -- otherwise the
+    /// mic button lingers after typing starts and a tap on it records and sends
+    /// an empty voice note. Publishes only on the boundary (first char / clear),
+    /// never per keystroke.
+    @Published private(set) var composerDraftHasText: [String: Bool] = [:]
+
     func composerDraft(for chatId: String) -> String {
         composerDrafts[chatId] ?? ""
     }
 
     func setComposerDraft(_ text: String, for chatId: String) {
+        let nextFlags = snUpdatedComposerDraftHasText(flags: composerDraftHasText, chatId: chatId, text: text)
+        if nextFlags != composerDraftHasText { composerDraftHasText = nextFlags }
         let next = snUpdatedComposerDrafts(drafts: composerDrafts, chatId: chatId, text: text)
         guard next != composerDrafts else { return }
         composerDrafts = next

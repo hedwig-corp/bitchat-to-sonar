@@ -3916,6 +3916,21 @@ func snUpdatedComposerDrafts(
     return next
 }
 
+/// Boundary mirror for the composer send/mic toggle: true while the chat's
+/// draft trims to non-empty. Returns the input unchanged off the boundary so
+/// callers can avoid publishing on every keystroke (see composerDrafts).
+func snUpdatedComposerDraftHasText(
+    flags: [String: Bool],
+    chatId: String,
+    text: String
+) -> [String: Bool] {
+    let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    guard (flags[chatId] ?? false) != hasText else { return flags }
+    var next = flags
+    next[chatId] = hasText
+    return next
+}
+
 struct SNComposer: View {
     @Binding var text: String
     let placeholder: String
