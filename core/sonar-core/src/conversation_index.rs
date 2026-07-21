@@ -107,8 +107,10 @@ impl ConversationIndex {
         let mut stmt = self
             .db
             .prepare(
-                "SELECT group_id_hex, latest_content FROM conversation_summary
-                 WHERE substr(ltrim(latest_content), 1, 1) IN ('{', '[')",
+                // No SQL pre-filter: SQLite ltrim strips only ASCII spaces,
+                // while the Rust check below uses trim_start (tabs/newlines too).
+                // One row per group keeps the full scan bounded and tiny.
+                "SELECT group_id_hex, latest_content FROM conversation_summary",
             )
             .map_err(|e| crate::Error::Storage(format!("index repair prepare: {e}")))?;
         let rows: Vec<(String, String)> = stmt
