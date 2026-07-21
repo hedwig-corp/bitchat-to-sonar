@@ -1022,7 +1022,66 @@ impl MarmotEngine {
         }
 
         let raw_batch = limit.saturating_mul(4).clamp(32, 500);
-        let mut raw_offset = 0usize;
+        // Deep-history cursor pages must not walk every raw row from the
+        // newest one: created_at is monotonic non-increasing in this order,
+        // so binary-search the first row at/below the cursor second and scan
+        // forward from there. Without this, paging near the origin of a
+        // conversation with more than MESSAGE_PAGE_RAW_SCAN_LIMIT raw rows
+        // between the live edge and the cursor failed outright (and every
+        // top-edge attempt re-scanned thousands of rows), which surfaced as
+        // stuck/laggy backscroll with no network (e.g. airplane mode).
+        let mut raw_offset = match before_secs {
+            Some(cursor_secs) => {
+                let first = Pagination::with_sort_order(
+                    Some(1),
+                    Some(0),
+                    MessageSortOrder::CreatedAtFirst,
+                );
+                let newest = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(first)))?;
+                match newest.first() {
+                    None => 0,
+                    // Everything retained is already at/below the cursor.
+                    Some(m) if m.created_at.as_secs() <= cursor_secs => 0,
+                    Some(_) => {
+                        // lo (=0) is known to be newer than the cursor. Double
+                        // hi until it reaches a row at/below the cursor second
+                        // or runs past the end of storage.
+                        let mut lo = 0usize;
+                        let mut hi = raw_batch;
+                        loop {
+                            let probe = Pagination::with_sort_order(
+                                Some(1),
+                                Some(hi),
+                                MessageSortOrder::CreatedAtFirst,
+                            );
+                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
+                            match row.first() {
+                                Some(m) if m.created_at.as_secs() > cursor_secs => {
+                                    lo = hi;
+                                    hi = hi.saturating_mul(2);
+                                }
+                                _ => break,
+                            }
+                        }
+                        while lo + 1 < hi {
+                            let mid = lo + (hi - lo) / 2;
+                            let probe = Pagination::with_sort_order(
+                                Some(1),
+                                Some(mid),
+                                MessageSortOrder::CreatedAtFirst,
+                            );
+                            let row = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(probe)))?;
+                            match row.first() {
+                                Some(m) if m.created_at.as_secs() > cursor_secs => lo = mid,
+                                _ => hi = mid,
+                            }
+                        }
+                        hi
+                    }
+                }
+            }
+            None => 0,
+        };
         let mut raw_scanned = 0usize;
         let mut candidates = Vec::with_capacity(limit);
         // Once `limit` eligible chat rows have been seen, keep scanning until
