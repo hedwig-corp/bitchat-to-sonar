@@ -431,6 +431,7 @@ final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
 
     private static func isTransponderChatPush(_ userInfo: [AnyHashable: Any]) -> Bool {
         if isBreezPush(userInfo) { return false }
+        if SonarNotificationHandoff.isMarmotWake(from: userInfo) { return true }
         let source = (userInfo["source"] as? String)?.lowercased()
         if source == "transponder" || source == "marmot" { return true }
         if userInfo["mip05"] != nil || userInfo["transponder"] != nil || userInfo["wn_nse_prototype"] != nil {

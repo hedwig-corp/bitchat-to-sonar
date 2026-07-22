@@ -1352,8 +1352,10 @@ final class MarmotChatModel: ObservableObject {
             await self.loadLocalSummaries()
             // Route the actual gap-recovery sync through the shared
             // single-flight gate so a concurrent push-wake `refresh()` cannot
-            // double-enqueue `syncForce()` on the serial engine queue.
-            _ = self.ensureGapRecovery()
+            // double-enqueue `syncForce()` on the serial engine queue. Awaiting
+            // here keeps the passive indicator active through the real work;
+            // local paint remains independent and already completed above.
+            _ = await self.ensureGapRecovery().value
         }
     }
 

@@ -3976,6 +3976,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     ) {
         val id = conversationId.trim()
         if (id.isEmpty()) return
+        requestImmediateSync()
         val jump = SonarNotificationHandoff.normalizeJumpMessageId(jumpMessageId)
         if (openResolvedNotificationTarget(id, jump)) return
         scope.launch {

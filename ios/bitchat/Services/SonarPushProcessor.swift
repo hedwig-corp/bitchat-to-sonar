@@ -301,7 +301,7 @@ enum SonarPushProcessor {
             let conversationId = notif.groupIdHex.isEmpty
                 ? nil
                 : "marmot:" + notif.groupIdHex
-            var userInfo: [String: Any] = [:]
+            var userInfo: [String: Any] = [SonarNotificationKeys.marmotWake: true]
             if let conversationId {
                 userInfo[SonarNotificationKeys.conversationId] = conversationId
             }
@@ -409,9 +409,10 @@ enum SonarPushProcessor {
             let conversationId = summary.groupIdHex.isEmpty
                 ? nil
                 : "marmot:" + summary.groupIdHex
-            let userInfo: [String: Any] = conversationId.map {
-                [SonarNotificationKeys.conversationId: $0]
-            } ?? [:]
+            var userInfo: [String: Any] = [SonarNotificationKeys.marmotWake: true]
+            if let conversationId {
+                userInfo[SonarNotificationKeys.conversationId] = conversationId
+            }
 
             guard let routed = SonarLocalNotificationRouter.make(
                 idKey: summary.groupIdHex,
@@ -489,12 +490,14 @@ enum SonarPushProcessor {
             kind: .message,
             conversationTitle: nil,
             preview: nil,
-            prefs: mutedPreview
+            prefs: mutedPreview,
+            userInfo: [SonarNotificationKeys.marmotWake: true]
         ) else { return }
         NotificationService.shared.sendLocalNotification(
             title: routed.title,
             body: routed.body,
-            identifier: routed.identifier
+            identifier: routed.identifier,
+            userInfo: routed.userInfo
         )
     }
 
