@@ -277,7 +277,15 @@ enum SonarPushProcessor {
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
                 let throttleKey = notif.groupName.isEmpty ? notif.senderNpub : notif.groupName
-                guard SonarTrillThrottle.shared.admit(chatKey: throttleKey) else { continue }
+                guard SonarTrillThrottle.shared.admit(chatKey: throttleKey) else {
+                    // Throttled trills stay row-only, but the NSE banner for this
+                    // row must not linger — it predates host routing.
+                    await removeDeliveredNSEOwnedBanners(
+                        messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
+                        conversationId: notif.groupIdHex.isEmpty ? nil : "marmot:" + notif.groupIdHex
+                    )
+                    continue
+                }
                 sound = .trill
             }
 
@@ -388,7 +396,13 @@ enum SonarPushProcessor {
             // Receiver trill throttle: excess trills stay row-only.
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
-                guard SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) else { continue }
+                guard SonarTrillThrottle.shared.admit(chatKey: summary.groupIdHex) else {
+                    await removeDeliveredNSEOwnedBanners(
+                        messageIdHex: nil,
+                        conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex
+                    )
+                    continue
+                }
                 sound = .trill
             }
 

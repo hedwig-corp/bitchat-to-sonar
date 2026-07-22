@@ -95,9 +95,40 @@ enum SonarNSEDecoratePolicy {
     /// userInfo marker: still the privacy placeholder (host may wipe).
     static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
 
+    /// Pure `⚡TRILL|1|<id>` check mirroring core `parse_trill_line` —
+    /// version-locked, no trailing fields, hex-or-dash id (1-64 chars).
+    static func isTrillLine(_ content: String) -> Bool {
+        // Drain previews can arrive with a trailing newline — trim first or
+        // classification misses and the raw line leaks onto the banner.
+        let parts = content.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count == 3, parts[0] == "\u{26A1}TRILL", parts[1] == "1" else { return false }
+        let id = parts[2]
+        guard (1...64).contains(id.count) else { return false }
+        // ASCII-only: Character.isHexDigit also matches Unicode full-width
+        // hex, which core's parser would reject (mismatch = raw line leaks).
+        return id.utf8.allSatisfy { $0 == 0x2D || ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) || ($0 >= 0x41 && $0 <= 0x46) }
+    }
+
     /// Match SonarLocalNotificationRouter privacy: when names are off, never
     /// surface sender or group strings on the lock screen.
     static func render(input: Input, prefs: Prefs) -> Output {
+        // ⚡TRILL nudge: mirror core render_notification — never expose the raw
+        // control line on the lock screen; the body is fixed (no content to preview).
+        if isTrillLine(input.contentPreview) {
+            let sender = prefs.showNames ? senderLabel(for: input.senderRaw, cachedBestName: input.cachedBestName) : nil
+            let group = prefs.showNames ? meaningfulGroupName(input.groupName) : nil
+            let title: String
+            if let sender, let group, group != sender {
+                title = "\(sender) nudged \(group)"
+            } else if let sender {
+                title = "\(sender) nudged you"
+            } else if let group {
+                title = "Nudge in \(group)"
+            } else {
+                title = "Someone nudged you"
+            }
+            return Output(title: title, body: "\u{1F44B} They want your attention.")
+        }
         let body: String
         if prefs.showPreview {
             let preview = input.contentPreview.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -202,4 +202,44 @@ struct SonarNSEDecoratePolicyTests {
             ) == ids
         )
     }
+
+    @Test("trill banner never exposes the raw TRILL line")
+    func trillBannerHidesRawLine() {
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "", contentPreview: "\u{26A1}TRILL|1|deadbeef"),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(out.title == "Alice nudged you")
+        #expect(out.body == "\u{1F44B} They want your attention.")
+        #expect(!out.body.contains("TRILL|"))
+    }
+
+    @Test("trill with group renders nudged-group title even with preview off")
+    func trillGroupTitle() {
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "Lake Days", contentPreview: "\u{26A1}TRILL|1|abc-123"),
+            prefs: .init(showNames: true, showPreview: false)
+        )
+        #expect(out.title == "Alice nudged Lake Days")
+    }
+
+    @Test("trill with names off never surfaces sender or group")
+    func trillNamesOff() {
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "Secret Ops", contentPreview: "\u{26A1}TRILL|1|deadbeef"),
+            prefs: .init(showNames: false, showPreview: true)
+        )
+        #expect(out.title == "Someone nudged you")
+    }
+
+    @Test("malformed trill lines are not treated as trills")
+    func malformedTrillNotClassified() {
+        #expect(SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|abc-123"))
+        #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|2|abc"))
+        #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1"))
+        #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|abc|extra"))
+        #expect(!SonarNSEDecoratePolicy.isTrillLine("just a message"))
+        // Unicode full-width hex must not classify (core rejects it too).
+        #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|\u{FF41}\u{FF42}c"))
+    }
 }
