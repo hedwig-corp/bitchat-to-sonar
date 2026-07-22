@@ -828,6 +828,8 @@ private struct MacConversationPane: View {
                 } else {
                     store.sendDm(id, text)
                     let convo = store.conversationViewState(id)
+                    // Same-frame local echo, mirroring the iOS composer.
+                    convo.rebuildNow()
                     Task { @MainActor in
                         await convo.loadNewestIfNeeded()
                     }
@@ -852,6 +854,7 @@ private struct MacConversationPane: View {
                 } else {
                     store.sendSticker(id, sticker: sticker, packCoordinate: coord)
                     let convo = store.conversationViewState(id)
+                    convo.rebuildNow()
                     Task { @MainActor in
                         await convo.loadNewestIfNeeded()
                     }
