@@ -6,6 +6,7 @@
     <string name="account_restored_chats_start_empty">Account restored — chats start empty until you back up</string>
     <string name="active">%1$s active</string>
     <string name="adds_debug_detail_to_captured_logs">Adds debug detail to captured logs. Never includes your private key.</string>
+    <string name="ahead">%1$s ahead</string>
     <string name="anyone_with_this_key_controls_your">Anyone with this key controls your account and wallet. Only restore from your own backup.</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">close</string>
@@ -44,6 +45,7 @@
     <string name="audio_is_connected">Audio is connected</string>
     <string name="backup_chats">Backup chats</string>
     <string name="backup_failed_try_again_when_online">Backup failed — try again when online</string>
+    <string name="behind">%1$s behind</string>
     <string name="bluetooth_finds_people_around_you_even">Bluetooth finds people around you, even offline.</string>
     <string name="cancel">Cancel</string>
     <string name="chat_backup_uploaded">Chat backup uploaded</string>
@@ -167,6 +169,7 @@
     <string name="get_started">Get started</string>
     <string name="group_name">Group name</string>
     <string name="here_now">%1$s · %2$s here now</string>
+    <string name="hours">%1$d hours</string>
     <string name="i_already_have_a_key">I already have a key</string>
     <string name="i_understand_chats_on_this_phone_will">I understand chats on this phone will be erased</string>
     <string name="identity_key_sharing_payments_and_safety">Identity, key sharing, payments, and safety</string>
@@ -180,6 +183,7 @@
     <string name="let_someone_scan_this_to_add_you_keys">Let someone scan this to add you — keys are exchanged directly, never through a server.</string>
     <string name="lightning_wallet">Lightning wallet</string>
     <string name="loading_stickers">Loading stickers…</string>
+    <string name="local_time">Local time: %1$s</string>
     <string name="location_channels_action_open_settings">open settings</string>
     <string name="location_channels_action_remove_access">remove location access</string>
     <string name="location_channels_action_request">get location and my geohashes</string>
@@ -217,6 +221,7 @@
     <string name="logs_stay_on_this_device_until_you">Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.</string>
     <string name="mesh_peers_tooltip_new_messages">new messages</string>
     <string name="messages_travel_encrypted_over_the_open">Messages travel encrypted over the open internet instead.</string>
+    <string name="minutes">%1$d minutes</string>
     <string name="more_places_nearby">More places nearby</string>
     <string name="nearby">Nearby</string>
     <string name="nearby_bluetooth">nearby · Bluetooth</string>
@@ -257,6 +262,8 @@
     <string name="restore_account">Restore account</string>
     <string name="restore_your_account">Restore your account</string>
     <string name="restoring">Restoring...</string>
+    <string name="s_1_hour">1 hour</string>
+    <string name="s_1_minute">1 minute</string>
     <string name="safety_number">Safety number</string>
     <string name="sats">sats</string>
     <string name="save">Save</string>

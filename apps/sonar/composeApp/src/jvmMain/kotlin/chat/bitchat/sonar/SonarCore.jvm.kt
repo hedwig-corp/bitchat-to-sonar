@@ -90,6 +90,7 @@ actual object SonarCore {
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
                 installCoreLogging(diagnosticsVerbose())
                 node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
+                runCatching { node?.updateLocalTimezone(currentSystemTimeZoneId()) }
                 relayConnected = false
             }
             npub
@@ -130,6 +131,7 @@ actual object SonarCore {
             }
             installConversationListener()
             previousNode?.close()
+            runCatching { connected.updateLocalTimezone(currentSystemTimeZoneId()) }
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
             npub
@@ -462,6 +464,22 @@ actual object SonarCore {
             )
         }
     }
+
+    actual suspend fun updateLocalTimezone(ianaIdentifier: String): Unit = withContext(Dispatchers.IO) {
+        node?.updateLocalTimezone(ianaIdentifier)
+    }
+
+    actual suspend fun peerTimezones(memberPubkeys: List<String>): List<SonarPeerTimezone> =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext emptyList()
+            n.peerTimezones(memberPubkeys).map {
+                SonarPeerTimezone(
+                    senderNpub = it.senderNpub,
+                    ianaIdentifier = it.ianaTimezone,
+                    updatedAtSecs = it.updatedAtSecs.toLong(),
+                )
+            }
+        }
 
     actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {
         node?.markConversationRead(chatId)

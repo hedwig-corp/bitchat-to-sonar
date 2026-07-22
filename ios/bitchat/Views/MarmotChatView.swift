@@ -415,6 +415,9 @@ final class MarmotChatModel: ObservableObject {
     /// still re-enter so reclaim can retry.
     private var didFetchOwnProfileThisSession = false
     @Published var groups: [MarmotService.MarmotGroup] = []
+    /// Core-owned private timezone cache, hydrated from the local encrypted
+    /// index with group metadata. No relay/profile lookup is involved.
+    @Published private(set) var peerTimezonesByNpub: [String: MarmotService.PeerTimezone] = [:]
     @Published var pendingGroupInvites: [MarmotService.GroupInvite] = []
     @Published var pendingDirectChats: [String: Date] = [:]
     private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
@@ -438,14 +441,6 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
     @Published private(set) var relayConnected = false
-    /// True while a foreground/push-tap catch-up sync is running. Passive UI
-    /// signal only: it must never gate paint, sending, or scrolling.
-    @Published private(set) var syncingInFlight = false
-    /// The single in-flight foreground/push-tap catch-up refresh. Coalesces the
-    /// scenePhase-driven and notification-tap-driven refresh paths so they don't
-    /// both enqueue `syncForce()` on the serial engine queue (shared with sends)
-    /// and so `syncingInFlight` is owned by exactly one run. @MainActor-isolated.
-    private var refreshTask: Task<Void, Never>?
     /// True after the first local encrypted-DB hydration attempt finishes.
     /// Home uses this as its atomic reveal boundary; relay state is irrelevant.
     @Published private(set) var initialLocalHomeReady = false
@@ -488,6 +483,8 @@ final class MarmotChatModel: ObservableObject {
     /// Single-flight durable media resume. Core also claims per entry id; this
     /// stops stacking overlapping resume Tasks on flaky relay reconnects.
     private var mediaResumeTask: Task<Void, Never>?
+    /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
+    private var foregroundRefreshTask: Task<Void, Never>?
     /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
     /// paths share one in-flight task so rapid wakes cannot stack FETCH_TIMEOUT
     /// parks. The drained notifications are returned to awaiters (push titled
@@ -1610,20 +1607,10 @@ final class MarmotChatModel: ObservableObject {
     /// is single-flight in the background; `conversationChanged` + the polling
     /// drain loop repaint as rows land in local storage.
     func refreshAfterForeground() {
-        // Single-flight: if a foreground/push-tap catch-up is already running,
-        // let it finish instead of starting a second one. Both the scenePhase
-        // transition and a notification tap can call this; without coalescing
-        // they double-enqueue syncForce() on the serial engine queue and the
-        // first completion clears syncingInFlight while the other still runs.
-        if let existing = refreshTask, !existing.isCancelled {
-            return
-        }
-        refreshTask = Task { @MainActor [weak self] in
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.refreshTask = nil }
             guard await self.ensureConnected() else { return }
-            self.syncingInFlight = true
-            defer { self.syncingInFlight = false }
             guard await self.ensureRelayConnected() else {
                 await self.loadLocalSummaries()
                 return
@@ -1631,12 +1618,7 @@ final class MarmotChatModel: ObservableObject {
             try? await self.service.ensureSubscriptions()
             try? await self.service.drainPending()
             await self.loadLocalSummaries()
-            // Route the actual gap-recovery sync through the shared
-            // single-flight gate so a concurrent push-wake `refresh()` cannot
-            // double-enqueue `syncForce()` on the serial engine queue. Awaiting
-            // here keeps the passive indicator active through the real work;
-            // local paint remains independent and already completed above.
-            _ = await self.ensureGapRecovery().value
+            _ = self.ensureGapRecovery()
         }
     }
 
@@ -1911,6 +1893,7 @@ final class MarmotChatModel: ObservableObject {
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
+            await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             self.conversationSummariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
@@ -2084,6 +2067,7 @@ final class MarmotChatModel: ObservableObject {
                 pageLimit: Self.localSummaryPageLimit
             )
             let summaries = await service.conversationSummaries()
+            await refreshPeerTimezones(for: groups)
             let activeGroupIds = Set(groups.map(\.id))
             self.conversationSummariesByGroup = Dictionary(
                 uniqueKeysWithValues: summaries
@@ -2158,6 +2142,24 @@ final class MarmotChatModel: ObservableObject {
             self.errorText = Self.describe(error)
             return false
         }
+    }
+
+    private func refreshPeerTimezones(for groups: [MarmotService.MarmotGroup]) async {
+        let members = groups.flatMap(\.memberNpubs).filter { $0 != npub }
+        let cached = await service.peerTimezones(memberNpubs: members)
+        self.peerTimezonesByNpub = Dictionary(
+            uniqueKeysWithValues: cached.map { ($0.senderNpub, $0) }
+        )
+    }
+
+    func peerTimezone(for npub: String) -> MarmotService.PeerTimezone? {
+        peerTimezonesByNpub[npub]
+    }
+
+    /// Called for NSSystemTimeZoneDidChange and foreground reconciliation.
+    /// Sharing is bounded/backgrounded in core; visible clocks refresh locally.
+    func systemTimezoneDidChange() {
+        Task { await service.updateLocalTimezone() }
     }
 
     func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
@@ -4165,8 +4167,8 @@ final class MarmotChatModel: ObservableObject {
         }
         syncTask?.cancel()
         syncTask = nil
-        refreshTask?.cancel()
-        refreshTask = nil
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
         // Do not nil/cancel `gapRecoveryTask` here: UniFFI `syncForce` is not
         // abortable, and clearing the slot would allow a stacked second fetch.
         // Wipe paths bump generation explicitly below.
@@ -4339,6 +4341,7 @@ final class MarmotChatModel: ObservableObject {
         relayConnected = false
         npub = nil
         groups = []
+        peerTimezonesByNpub = [:]
         pendingGroupInvites = []
         messagesByGroup = [:]
         conversationSummariesByGroup = [:]
@@ -4363,8 +4366,8 @@ final class MarmotChatModel: ObservableObject {
         pushWakeDrainWaiters = 0
         pushWakeDrainActive = false
         pushWakeDrainBuffer = []
-        refreshTask?.cancel()
-        refreshTask = nil
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
         clearStickerCaches()
         // Profiles only: this runs from eraseChatsKeepIdentity() too, which
         // retains descriptors. Invalidating theirs here would drop an in-flight

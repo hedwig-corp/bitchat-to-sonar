@@ -1635,6 +1635,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     }
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
+    val peerTimezone = if (isGroup) null else state.peerTimezoneForChat(screen.id)
+    val peerClockNow = rememberMinuteClock(peerTimezone?.ianaIdentifier)
+    val peerLocalTime = peerTimezone
+        ?.let { peerLocalTimeSnapshot(it.ianaIdentifier, peerClockNow) }
+        ?.let { peerLocalTimeText(it, includeRelative = true) }
     val canManageGroup = state.canManageGroup(screen.id)
     // Resolve a human name for the peer or group (Marmot names can be blank).
     val peerName = screen.name.ifBlank {
@@ -1995,7 +2000,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             SNIcon(SNIconName.Lock, 11.dp, s.text2, weight = 2.4f)
                             Spacer(Modifier.width(5.dp))
                             Text(
-                                (if (verified) "Verified · " else "") + subTransport,
+                                peerLocalTime ?: ((if (verified) "Verified · " else "") + subTransport),
                                 color = s.text2, fontSize = 12.sp,
                                 maxLines = 1, overflow = TextOverflow.Ellipsis
                             )

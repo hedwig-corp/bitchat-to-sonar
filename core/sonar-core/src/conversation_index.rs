@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::marmot::MarmotEngine;
+use crate::timezone::CachedPeerTimezone;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct ConversationIndex {
     db: Connection,
@@ -195,6 +196,23 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
         }
 
+        if current < 3 {
+            // Private per-sender timezone metadata received over encrypted
+            // conversations (kind-449 timezone shares). Keyed by the sender's
+            // Nostr pubkey hex — a person has one system timezone regardless of
+            // how many conversations we share, and the sender only ever asserts
+            // their OWN zone. `CREATE TABLE IF NOT EXISTS` keeps the step
+            // idempotent under a non-atomic partial migration.
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS peer_timezone (
+                    sender_pubkey_hex TEXT PRIMARY KEY,
+                    iana_tz           TEXT NOT NULL,
+                    updated_at_secs   INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index create peer_timezone: {e}")))?;
+        }
+
         tx.execute(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1)",
             params![SCHEMA_VERSION],
@@ -369,6 +387,49 @@ impl ConversationIndex {
             .map_err(|e| crate::Error::Storage(format!("index summary: {e}")))
     }
 
+    /// Persist a peer-authored timezone share if it is newer than the cached
+    /// value. Returns true only when the visible value changed.
+    pub fn upsert_peer_timezone(
+        &self,
+        sender_pubkey_hex: &str,
+        zone: &str,
+        updated_at_secs: u64,
+    ) -> Result<bool> {
+        let changed = self
+            .db
+            .execute(
+                "INSERT INTO peer_timezone (sender_pubkey_hex, iana_tz, updated_at_secs)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(sender_pubkey_hex) DO UPDATE SET
+                    iana_tz = excluded.iana_tz,
+                    updated_at_secs = excluded.updated_at_secs
+                 WHERE excluded.updated_at_secs > peer_timezone.updated_at_secs",
+                params![sender_pubkey_hex, zone, updated_at_secs as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index timezone upsert: {e}")))?;
+        Ok(changed != 0)
+    }
+
+    /// Local-only lookup used by chat headers/member lists. This never scans
+    /// transcripts or waits on relay/profile state.
+    pub fn peer_timezone(&self, sender_pubkey_hex: &str) -> Result<Option<CachedPeerTimezone>> {
+        self.db
+            .query_row(
+                "SELECT iana_tz, updated_at_secs
+                 FROM peer_timezone
+                 WHERE sender_pubkey_hex = ?1",
+                params![sender_pubkey_hex],
+                |row| {
+                    Ok(CachedPeerTimezone {
+                        zone: row.get(0)?,
+                        updated_at_secs: row.get::<_, i64>(1)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| crate::Error::Storage(format!("index timezone read: {e}")))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.db
             .query_row("SELECT COUNT(*) FROM conversation_summary", [], |row| {
@@ -415,7 +476,6 @@ impl ConversationIndex {
 mod tests {
     use super::*;
 
-    #[test]
     #[test]
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
@@ -689,5 +749,78 @@ mod tests {
         // They are still messages: count, ordering and preview are untouched.
         assert_eq!(s.message_count, 3);
         assert_eq!(s.latest_at_secs, 300);
+    }
+
+    #[test]
+    fn peer_timezone_cache_rejects_stale_replays_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x33u8; 32];
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        assert!(idx
+            .upsert_peer_timezone("abc123", "America/New_York", 200)
+            .unwrap());
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "Europe/Zurich", 199)
+            .unwrap());
+        assert!(!idx
+            .upsert_peer_timezone("abc123", "Europe/Zurich", 200)
+            .unwrap());
+        assert_eq!(
+            idx.peer_timezone("abc123").unwrap(),
+            Some(CachedPeerTimezone {
+                zone: "America/New_York".into(),
+                updated_at_secs: 200,
+            })
+        );
+
+        drop(idx);
+        let reopened = ConversationIndex::open(&path, key).unwrap();
+        assert_eq!(
+            reopened.peer_timezone("abc123").unwrap(),
+            Some(CachedPeerTimezone {
+                zone: "America/New_York".into(),
+                updated_at_secs: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn migrates_v2_schema_adding_peer_timezone_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let key = [0x44u8; 32];
+        {
+            let db = Connection::open(&path).unwrap();
+            let hex_key = hex::encode(key);
+            db.execute_batch(&format!("PRAGMA key = \"x'{hex_key}'\";"))
+                .unwrap();
+            db.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE conversation_summary (
+                    group_id_hex TEXT PRIMARY KEY,
+                    name TEXT NOT NULL DEFAULT '',
+                    latest_content TEXT NOT NULL DEFAULT '',
+                    latest_sender TEXT NOT NULL DEFAULT '',
+                    latest_at_secs INTEGER NOT NULL DEFAULT 0,
+                    latest_mine INTEGER NOT NULL DEFAULT 0,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    unread_count INTEGER NOT NULL DEFAULT 0,
+                    version INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO schema_version(version) VALUES (2);",
+            )
+            .unwrap();
+        }
+
+        let idx = ConversationIndex::open(&path, key).unwrap();
+        assert!(idx
+            .upsert_peer_timezone("peer", "Pacific/Chatham", 42)
+            .unwrap());
+        assert_eq!(
+            idx.peer_timezone("peer").unwrap().unwrap().zone,
+            "Pacific/Chatham"
+        );
     }
 }

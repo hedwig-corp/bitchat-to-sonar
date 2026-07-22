@@ -1668,6 +1668,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32) throws  -> [MessageInfo]
 
     /**
+     * Batch local-only cache lookup for visible DM/group members.
+     */
+    func peerTimezones(memberPubkeys: [String]) throws  -> [PeerTimezoneInfo]
+
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
     func pendingGroupInvites() throws  -> [GroupInviteInfo]
@@ -1889,6 +1894,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func syncStateSnapshotJson() throws  -> String
 
     func uninstallStickerPack(coordinate: String) throws
+
+    /**
+     * Report this host's current system IANA timezone. The core validates it,
+     * remembers it for the node lifetime, and schedules encrypted kind-449
+     * shares to unique active group peers without blocking transcript reads.
+     */
+    func updateLocalTimezone(ianaTimezone: String) throws
 
     /**
      * True if `address` (full `name@domain`) currently resolves to `npub` via
@@ -2566,6 +2578,18 @@ open func messagesPage(groupIdHex: String, limit: UInt32, offset: UInt32)throws 
 }
 
     /**
+     * Batch local-only cache lookup for visible DM/group members.
+     */
+open func peerTimezones(memberPubkeys: [String])throws  -> [PeerTimezoneInfo]  {
+    return try  FfiConverterSequenceTypePeerTimezoneInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_peer_timezones(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceString.lower(memberPubkeys),$0
+    )
+})
+}
+
+    /**
      * Pending multi-member group invites awaiting accept/decline.
      */
 open func pendingGroupInvites()throws  -> [GroupInviteInfo]  {
@@ -3046,6 +3070,19 @@ open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithErro
     uniffi_sonar_ffi_fn_method_sonarnode_uninstall_sticker_pack(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(coordinate),$0
+    )
+}
+}
+
+    /**
+     * Report this host's current system IANA timezone. The core validates it,
+     * remembers it for the node lifetime, and schedules encrypted kind-449
+     * shares to unique active group peers without blocking transcript reads.
+     */
+open func updateLocalTimezone(ianaTimezone: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_update_local_timezone(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(ianaTimezone),$0
     )
 }
 }
@@ -4712,6 +4749,67 @@ public func FfiConverterTypeNoiseKeypairHex_lift(_ buf: RustBuffer) throws -> No
 #endif
 public func FfiConverterTypeNoiseKeypairHex_lower(_ value: NoiseKeypairHex) -> RustBuffer {
     return FfiConverterTypeNoiseKeypairHex.lower(value)
+}
+
+
+/**
+ * A peer's locally cached, privately shared IANA timezone.
+ */
+public struct PeerTimezoneInfo: Equatable, Hashable {
+    public var senderNpub: String
+    public var ianaTimezone: String
+    public var updatedAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(senderNpub: String, ianaTimezone: String, updatedAtSecs: UInt64) {
+        self.senderNpub = senderNpub
+        self.ianaTimezone = ianaTimezone
+        self.updatedAtSecs = updatedAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PeerTimezoneInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePeerTimezoneInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PeerTimezoneInfo {
+        return
+            try PeerTimezoneInfo(
+                senderNpub: FfiConverterString.read(from: &buf),
+                ianaTimezone: FfiConverterString.read(from: &buf),
+                updatedAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PeerTimezoneInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.senderNpub, into: &buf)
+        FfiConverterString.write(value.ianaTimezone, into: &buf)
+        FfiConverterUInt64.write(value.updatedAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePeerTimezoneInfo_lift(_ buf: RustBuffer) throws -> PeerTimezoneInfo {
+    return try FfiConverterTypePeerTimezoneInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePeerTimezoneInfo_lower(_ value: PeerTimezoneInfo) -> RustBuffer {
+    return FfiConverterTypePeerTimezoneInfo.lower(value)
 }
 
 
@@ -7478,6 +7576,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypePeerTimezoneInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [PeerTimezoneInfo]
+
+    public static func write(_ value: [PeerTimezoneInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypePeerTimezoneInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [PeerTimezoneInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [PeerTimezoneInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypePeerTimezoneInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [RecentMessagePageInfo]
 
@@ -8426,6 +8549,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_messages_page() != 43697) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_peer_timezones() != 26725) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_pending_group_invites() != 31608) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8532,6 +8658,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_update_local_timezone() != 16973) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_verify_nip05() != 52785) {

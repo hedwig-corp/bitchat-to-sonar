@@ -19,6 +19,65 @@ import UniformTypeIdentifiers
 import ImageIO
 #endif
 
+struct SNPeerLocalTimeDisplay: Equatable {
+    let timeText: String
+    let relativeText: String?
+
+    var subtitle: String {
+        relativeText.map { "\(timeText) · \($0)" } ?? timeText
+    }
+}
+
+enum SNPeerLocalTimeFormatter {
+    static func display(
+        zoneIdentifier: String,
+        at date: Date = Date(),
+        viewerTimeZone: TimeZone = .autoupdatingCurrent,
+        locale: Locale = .autoupdatingCurrent,
+        includeRelative: Bool
+    ) -> SNPeerLocalTimeDisplay? {
+        guard let peerTimeZone = TimeZone(identifier: zoneIdentifier) else { return nil }
+
+        let clock = DateFormatter()
+        clock.locale = locale
+        clock.timeZone = peerTimeZone
+        clock.dateStyle = .none
+        clock.timeStyle = .short
+        let timeText = clock.string(from: date)
+
+        guard includeRelative else {
+            return SNPeerLocalTimeDisplay(timeText: timeText, relativeText: nil)
+        }
+        let offsetSeconds = peerTimeZone.secondsFromGMT(for: date)
+            - viewerTimeZone.secondsFromGMT(for: date)
+        guard abs(offsetSeconds) >= 60 else {
+            return SNPeerLocalTimeDisplay(timeText: timeText, relativeText: nil)
+        }
+
+        let duration = DateComponentsFormatter()
+        duration.allowedUnits = [.hour, .minute]
+        duration.unitsStyle = .full
+        duration.maximumUnitCount = 2
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = locale
+        duration.calendar = calendar
+        guard let amount = duration.string(from: TimeInterval(abs(offsetSeconds))) else {
+            return SNPeerLocalTimeDisplay(timeText: timeText, relativeText: nil)
+        }
+        let template = offsetSeconds > 0
+            ? String(localized: "%@ ahead", locale: locale)
+            : String(localized: "%@ behind", locale: locale)
+        let relative = String.localizedStringWithFormat(template, amount)
+        return SNPeerLocalTimeDisplay(timeText: timeText, relativeText: relative)
+    }
+
+    static func nanosecondsUntilNextMinute(from date: Date = Date()) -> UInt64 {
+        let seconds = date.timeIntervalSince1970
+        let remaining = max(0.05, 60 - seconds.truncatingRemainder(dividingBy: 60))
+        return UInt64(remaining * 1_000_000_000)
+    }
+}
+
 /// Movie payload from the Photos picker delivered as a FILE: the transfer
 /// lands on disk and is copied into our own temp dir (the picker deletes its
 /// copy when the import closure returns), so a large video never buffers
@@ -93,6 +152,7 @@ struct SonarDMScreenContent: View {
     @State private var pickFile = false
     @State private var attachmentImportGeneration = 0
     @State private var previewPackCoordinate: String?
+    @State private var clockNow = Date()
 
     private static let maxInternetAttachmentBytes = 25 * 1024 * 1024
 
@@ -105,6 +165,30 @@ struct SonarDMScreenContent: View {
     private var walletReady: Bool {
         if case .ready = store.walletState { return true }
         return false
+    }
+
+    private var peerTimezoneIdentifier: String? {
+        guard !isMultiMemberMarmot else { return nil }
+        if let group = store.marmotGroup(forConversationId: peerId),
+           let ownNpub = store.marmot.npub,
+           let other = group.memberNpubs.first(where: { $0 != ownNpub }) {
+            return store.marmot.peerTimezone(for: other)?.ianaIdentifier
+        }
+        // Folded/plain BLE conversations resolve through the same persisted
+        // Noise↔Nostr account link used by the home-row identity fold.
+        if let npub = store.linkedNpubForConversation(peerId) {
+            return store.marmot.peerTimezone(for: npub)?.ianaIdentifier
+        }
+        return nil
+    }
+
+    private var peerLocalTime: SNPeerLocalTimeDisplay? {
+        guard let identifier = peerTimezoneIdentifier else { return nil }
+        return SNPeerLocalTimeFormatter.display(
+            zoneIdentifier: identifier,
+            at: clockNow,
+            includeRelative: true
+        )
     }
 
     /// Header sub: the network name prefixes the encryption line.
@@ -166,7 +250,11 @@ struct SonarDMScreenContent: View {
                     SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
                     SNHeaderTitle(name: peer.name, verified: verified) {
                         SNIcon(name: .lock, size: 11, weight: 2.4)
-                        Text(verbatim: (verified ? "Verified · " : "") + subTransport)
+                        if let peerLocalTime {
+                            Text(verbatim: peerLocalTime.subtitle)
+                        } else {
+                            Text(verbatim: (verified ? "Verified · " : "") + subTransport)
+                        }
                     }
                 }
                 .buttonStyle(.plain)
@@ -260,6 +348,15 @@ struct SonarDMScreenContent: View {
                     expectedNewestDate: store.expectedNewestMessageDate(peerId)
                 )
                 dmComposer
+            }
+        }
+        .task(id: peerTimezoneIdentifier) {
+            guard peerTimezoneIdentifier != nil else { return }
+            while !Task.isCancelled {
+                clockNow = Date()
+                try? await Task.sleep(
+                    nanoseconds: SNPeerLocalTimeFormatter.nanosecondsUntilNextMinute()
+                )
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())

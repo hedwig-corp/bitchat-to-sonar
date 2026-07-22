@@ -30,9 +30,6 @@ enum SonarNotificationKeys {
     static let peerID = "peerID"
     /// Stable local message id for Jump open-action (#372). Optional.
     static let messageId = "sonarMessageId"
-    /// Marks app-generated Marmot/Transponder banners whose tap must force
-    /// catch-up even though the original remote-push keys are no longer present.
-    static let marmotWake = "sonarMarmotWake"
 }
 
 /// Pure helpers for which delivered notifications belong to a conversation.
@@ -53,12 +50,6 @@ enum SonarNotificationHandoff {
         guard let id = userInfo[SonarNotificationKeys.messageId] as? String else { return nil }
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    static func isMarmotWake(from userInfo: [AnyHashable: Any]) -> Bool {
-        if let flag = userInfo[SonarNotificationKeys.marmotWake] as? Bool { return flag }
-        if let flag = userInfo[SonarNotificationKeys.marmotWake] as? NSNumber { return flag.boolValue }
-        return false
     }
 
     static func matches(userInfo: [AnyHashable: Any], conversationIds: Set<String>) -> Bool {

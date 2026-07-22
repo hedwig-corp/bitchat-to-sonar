@@ -847,6 +847,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private var localCoreReady = false
     var chats by mutableStateOf<List<SonarChat>>(initialChatSnapshot.first)
         private set
+    /** Encrypted timezone controls projected from the core's local cache. */
+    private var peerTimezonesByNpub by mutableStateOf<Map<String, SonarPeerTimezone>>(emptyMap())
+    private var lastSharedSystemTimezone: String? = null
     /** Monotonic counter bumped whenever [chatSnapshotMessagesByChat] is
      *  reassigned. Feeds the [visibleChats] memo key so the dedupe ordering
      *  (which depends on per-chat latest ts) re-runs when the snapshot changes. */
@@ -1078,7 +1081,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
-            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
+            messages = emptyList(); channelMsgs = emptyList(); chats = emptyList(); peerTimezonesByNpub = emptyMap(); lastSharedSystemTimezone = null; pendingMarmotChatNpubs = emptyMap(); pendingMarmotGroups = emptyMap(); clearChatSnapshot()
             retainedTranscriptByChat.clear()
             transcriptWindows.clear()
             // Leave the old composer before the delivery suspension is lifted.
@@ -1828,6 +1831,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     var sonarPeerProfiles by mutableStateOf<Map<String, SonarAnnounce>>(emptyMap())
         private set
     private val meshPeerRefreshQueue = ConflatedRefreshQueue(scope, ::refreshMeshRadioState)
+    private val timezoneRefreshQueue = ConflatedRefreshQueue(scope) { refreshPeerTimezones(chats) }
     /** Bumped at the start of every mesh snapshot refresh; older concurrent
      *  readers discard their result so a stale Default-dispatcher decode cannot
      *  overwrite a newer publish (queue + housekeeping + settle overlap). */
@@ -2432,6 +2436,18 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     fun isDirectMarmotChat(chat: SonarChat): Boolean =
         directMarmotPeerKey(chat, npub) != null
+
+    fun peerTimezoneForChat(chatId: String): SonarPeerTimezone? {
+        val peer = if (isMeshChat(chatId)) {
+            npubStringForPeer(meshPeerId(chatId))
+        } else {
+            chats.firstOrNull { it.id == chatId }?.let(::directMarmotPeerKey)
+        }
+        return peer?.let(::peerTimezone)
+    }
+
+    fun peerTimezone(memberNpub: String): SonarPeerTimezone? =
+        peerTimezonesByNpub[canonicalProfileKey(memberNpub)]
 
     private fun directMarmotPeerKey(chat: SonarChat): String? =
         directMarmotPeerKey(chat, npub)
@@ -4172,6 +4188,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     // reconnect. The relay wait below is bounded and background.
                     repaintFromLocal()
 
+                    reconcileLocalTimezone()
                     activeCatchupSyncs++
                     try {
                         // Foreground resume is a real wake event: force the
@@ -10933,6 +10950,31 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
+    }
+
+    private suspend fun reconcileLocalTimezone() {
+        if (!localCoreReady && !started) return
+        val identifier = currentSystemTimeZoneId()
+        if (identifier == lastSharedSystemTimezone) return
+        runCatching { SonarCore.updateLocalTimezone(identifier) }
+            .onSuccess { lastSharedSystemTimezone = identifier }
+    }
+
+    private suspend fun refreshPeerTimezones(currentChats: List<SonarChat>) {
+        val mine = canonicalProfileKey(npub)
+        val members = currentChats.asSequence()
+            .flatMap { it.members.asSequence() }
+            .map(::canonicalProfileKey)
+            .filter { it.isNotBlank() && it != mine }
+            .distinct()
+            .toList()
+        peerTimezonesByNpub = if (members.isEmpty()) {
+            emptyMap()
+        } else {
+            runCatching { SonarCore.peerTimezones(members) }
+                .getOrDefault(emptyList())
+                .associateBy { canonicalProfileKey(it.senderNpub) }
+        }
     }
 
     @OptIn(kotlinx.coroutines.FlowPreview::class)

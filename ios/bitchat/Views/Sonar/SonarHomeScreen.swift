@@ -57,7 +57,7 @@ struct SonarHomeScreen: View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 0) {
                 header
-                SNStatusChip(online: store.online, meshCount: store.meshCount, syncing: store.catchingUp) {
+                SNStatusChip(online: store.online, meshCount: store.meshCount) {
                     connSheet = true
                 }
                 ScrollView {

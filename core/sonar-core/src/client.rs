@@ -52,11 +52,25 @@ use crate::sticker_cache::{
     wipe_sticker_cache_for_db, StickerCache, MAX_STICKER_CACHE_BYTES,
     STICKER_CACHE_PREFETCH_IMAGE_LIMIT,
 };
+use crate::timezone::CachedPeerTimezone;
 use crate::{Error, Result};
 
 /// Blossom user-server-list event kind (BUD-03): the user's preferred blob
 /// servers, newest first.
 const BLOSSOM_SERVER_LIST_KIND: u16 = 10063;
+
+/// A single timezone-change pass is intentionally bounded. Current Marmot
+/// group limits are far below this, but the defensive cap keeps corrupt local
+/// membership state from creating an unbounded gift-wrap fan-out.
+const MAX_TIMEZONE_SHARE_RECIPIENTS: usize = 256;
+const TIMEZONE_SHARE_PUBLISH_ATTEMPTS: usize = 3;
+/// Accept modest clock skew, but never let a peer pin its cached timezone with
+/// an arbitrarily far-future rumor timestamp.
+const TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS: u64 = 5 * 60;
+
+fn bounded_timezone_share_timestamp(reported_at: u64, now: u64) -> u64 {
+    reported_at.min(now.saturating_add(TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS))
+}
 
 /// Fallback Blossom server when the user has published no kind-10063 list.
 /// Hedwig Blossom (`push.sonar.hedwig.sh`) accepts Marmot ciphertext as
@@ -998,145 +1012,6 @@ fn take_catchup_entry(
     queue.pop_front()
 }
 
-/// Drain up to `max` entries from the catch-up queue for ONE batched `#h`
-/// fetch. The preferred (open-chat) group always leads the batch when queued.
-/// Batching is the anti-starvation lever: one group per pass meant N groups
-/// needed N wake/sync cycles to repair; a batch clears the queue in ceil(N/max)
-/// passes at the same single bounded fetch per pass.
-fn take_catchup_batch(
-    queue: &mut VecDeque<(String, u64)>,
-    preferred: Option<&str>,
-    max: usize,
-) -> Vec<(String, u64)> {
-    let mut batch = Vec::new();
-    if max == 0 {
-        return batch;
-    }
-    if let Some(first) = take_catchup_entry(queue, preferred) {
-        batch.push(first);
-    }
-    while batch.len() < max {
-        match queue.pop_front() {
-            Some(entry) => batch.push(entry),
-            None => break,
-        }
-    }
-    batch
-}
-
-/// One era-bucket of catch-up groups fetched in a single batched `#h` request.
-#[derive(Debug, PartialEq, Eq)]
-struct CatchupBucket {
-    /// `(group_id, floor)` entries in this bucket, kept whole so a retryable
-    /// failure can requeue each group with its own floor.
-    entries: Vec<(String, u64)>,
-    /// Exact relay filter floor (lowest floor in the bucket minus the catch-up
-    /// lookback), or `None` for an unbounded full-history fetch. This value is
-    /// applied to `Filter::since` VERBATIM by `backfill_groups_since` (no
-    /// further overlap subtraction), so it equals the on-wire `since`.
-    since: Option<u64>,
-}
-
-/// Exact `since` for one bucket: the lowest floor minus `lookback`, applied
-/// once. Any zero floor (a group with no remote peer row stored) needs full
-/// history, so the bucket fetches unbounded.
-fn catchup_bucket_since(entries: &[(String, u64)], lookback: u64) -> Option<u64> {
-    let mut min_floor = u64::MAX;
-    for (_, floor) in entries {
-        if *floor == 0 {
-            return None;
-        }
-        min_floor = min_floor.min(*floor);
-    }
-    if min_floor == u64::MAX {
-        None
-    } else {
-        Some(min_floor.saturating_sub(lookback))
-    }
-}
-
-/// Partition a drained catch-up batch into per-era buckets. A single relay `#h`
-/// filter carries ONE `since`, so batching groups with distant floors into one
-/// fetch would force the newest group to replay the OLDEST group's history —
-/// e.g. one dormant group with a two-year-old floor dragging seven recent
-/// groups through a full-history scan. Bucketing bounds that: two groups share
-/// a bucket only when their floors are within `span` seconds (so intra-bucket
-/// over-fetch is at most `span`), and all zero-floor groups (genuine full
-/// history) share one unbounded bucket.
-///
-/// At most `max_buckets` buckets run this pass so per-pass relay work stays
-/// bounded and non-blocking. The bucket holding the FIRST (preferred/open-chat)
-/// batch entry is always kept; remaining slots go to the oldest-floor buckets
-/// (the most starved). Groups in dropped buckets are returned for requeue and
-/// make progress on a later pass, preserving the anti-starvation property.
-fn plan_catchup_buckets(
-    batch: Vec<(String, u64)>,
-    span: u64,
-    lookback: u64,
-    max_buckets: usize,
-) -> (Vec<CatchupBucket>, Vec<(String, u64)>) {
-    if batch.is_empty() || max_buckets == 0 {
-        return (Vec::new(), batch);
-    }
-    let lead_id = batch[0].0.clone();
-
-    // Zero floors need full history; bounded floors bucket by proximity.
-    let mut zero: Vec<(String, u64)> = Vec::new();
-    let mut bounded: Vec<(String, u64)> = Vec::new();
-    for entry in batch {
-        if entry.1 == 0 {
-            zero.push(entry);
-        } else {
-            bounded.push(entry);
-        }
-    }
-
-    // Greedy proximity buckets over floors, oldest first. Sorted ascending, so a
-    // bucket spans `[min, min + span]`.
-    bounded.sort_by_key(|(_, floor)| *floor);
-    let mut buckets: Vec<Vec<(String, u64)>> = Vec::new();
-    for entry in bounded {
-        let extend = buckets
-            .last()
-            .map(|cur| entry.1.saturating_sub(cur[0].1) <= span)
-            .unwrap_or(false);
-        if extend {
-            buckets.last_mut().unwrap().push(entry);
-        } else {
-            buckets.push(vec![entry]);
-        }
-    }
-    // All zero-floor groups share one unbounded bucket, appended last (most
-    // expensive, so lowest priority unless it holds the lead group).
-    if !zero.is_empty() {
-        buckets.push(zero);
-    }
-
-    // Order the lead group's bucket first, then the rest in oldest-first order.
-    let lead_pos = buckets
-        .iter()
-        .position(|b| b.iter().any(|(id, _)| id == &lead_id));
-    let mut order: Vec<usize> = (0..buckets.len()).collect();
-    if let Some(li) = lead_pos {
-        let at = order.iter().position(|&i| i == li).unwrap();
-        order.remove(at);
-        order.insert(0, li);
-    }
-
-    let mut kept: Vec<CatchupBucket> = Vec::new();
-    let mut requeue: Vec<(String, u64)> = Vec::new();
-    for (rank, idx) in order.into_iter().enumerate() {
-        let entries = std::mem::take(&mut buckets[idx]);
-        if rank < max_buckets {
-            let since = catchup_bucket_since(&entries, lookback);
-            kept.push(CatchupBucket { entries, since });
-        } else {
-            requeue.extend(entries);
-        }
-    }
-    (kept, requeue)
-}
-
 #[cfg(test)]
 fn map_mls_hex_to_nostr_hex(mls_hex: &str, pairs: &[(String, String)]) -> Option<String> {
     let clean = mls_hex.trim().to_ascii_lowercase();
@@ -1209,115 +1084,6 @@ const BACKFILL_TIMEOUT: Duration = Duration::from_secs(3);
 /// cases with dozens of empty-transcript groups from stacking serial timeouts.
 /// Excess groups are re-queued for the next sync.
 const MAX_BACKFILLS_PER_SYNC: usize = 8;
-
-/// Extra lookback below a group's catch-up floor. The floor is the newest
-/// LOCALLY stored peer chat row, whose `created_at` is sender-clock based, so a
-/// missed event can legitimately be OLDER than the floor: sender clock skew, or
-/// out-of-order delivery where a relay-delayed event arrives after a newer one
-/// was already persisted. The previous margin was only `SYNC_OVERLAP_SECS`
-/// (5 min); an event more than 5 min below an already-stored newer peer row was
-/// permanently skipped once it also aged past the 30-min live tail. One hour is
-/// bounded (MDK dedups replayed events, one batched fetch either way) and
-/// covers realistic skew/reordering; gaps beyond it remain the job of the
-/// watermark-rewind safety net.
-const GROUP_CATCHUP_FLOOR_LOOKBACK_SECS: u64 = 60 * 60;
-
-/// Groups drained from the catch-up queue per pass, then partitioned into
-/// per-era buckets. Reuses the empty-transcript repair cap: same shape.
-const GROUP_CATCHUP_BATCH: usize = MAX_BACKFILLS_PER_SYNC;
-
-/// Max floor spread within one catch-up bucket. Two groups fetch together only
-/// when their floors are within this window, bounding the intra-bucket
-/// over-fetch to the same magnitude as the lookback itself. Cleanly separates
-/// recently-active groups from dormant ones (whose floors are days/years older),
-/// so a dormant group's floor can never widen a recent group's scan.
-const GROUP_CATCHUP_BUCKET_SPAN_SECS: u64 = GROUP_CATCHUP_FLOOR_LOOKBACK_SECS;
-
-/// Max relay fetches per catch-up pass. A single `#h` filter carries one
-/// `since`, so distinct floor eras need distinct fetches; this caps them so a
-/// pass cannot stack `GROUP_CATCHUP_BATCH` bounded fetches onto the serialized
-/// engine queue. Two lets the common "active era + full-history/dormant era"
-/// split both progress in one pass; deeper fragmentation drains over successive
-/// throttled passes. Same-era batching still folds up to `GROUP_CATCHUP_BATCH`
-/// groups into a single fetch, so the batching win is preserved.
-const GROUP_CATCHUP_MAX_BUCKETS: usize = 2;
-
-/// Minimum spacing between catch-up passes. Wake-driven hosts run the pass on
-/// every drain/ensure cycle; during a live event burst that would stack a
-/// bounded relay fetch onto every tick of the serialized engine queue. The
-/// preferred (open-chat) group bypasses the throttle ONCE per preference change
-/// (see `GroupCatchupGate`) so chat-open repair runs now without a persistently
-/// failing preferred group defeating the throttle forever.
-const GROUP_CATCHUP_MIN_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Atomic gate for the per-group catch-up pass. Wake-driven hosts (heartbeat,
-/// wake loop, foreground sync, push) can call the pass concurrently — Compose
-/// does not serialize them the way iOS does — so the interval check and the
-/// single-flight claim must happen under ONE lock, or two callers both see an
-/// expired timestamp and start overlapping relay fetches.
-#[derive(Debug, Default)]
-struct GroupCatchupGate {
-    /// When the last pass that issued a relay fetch started; drives the interval
-    /// throttle. Only advanced by fetching passes, so an empty-queue pass does
-    /// not delay the next one.
-    last_started: Option<Instant>,
-    /// A pass is currently running; a second concurrent caller is rejected.
-    in_progress: bool,
-    /// The preferred (open-chat) group id that already spent its one-shot
-    /// interval bypass. Reset when the host changes the preferred chat, so a
-    /// newly opened chat gets exactly one immediate repair; a persistently
-    /// failing preferred group then falls back under the interval throttle
-    /// instead of forcing a fetch on every live wake.
-    bypass_consumed_for: Option<String>,
-}
-
-impl GroupCatchupGate {
-    /// Atomic check-and-claim. Returns true (claiming single-flight ownership via
-    /// `in_progress`) only if no pass is running AND either the interval elapsed
-    /// or the pending preferred group still has its one-shot bypass. Claiming a
-    /// bypass consumes it.
-    fn try_begin(
-        &mut self,
-        preferred_pending: Option<&str>,
-        now: Instant,
-        min_interval: Duration,
-    ) -> bool {
-        if self.in_progress {
-            return false;
-        }
-        let bypass = match preferred_pending {
-            Some(pref) => self.bypass_consumed_for.as_deref() != Some(pref),
-            None => false,
-        };
-        if !bypass {
-            if let Some(prev) = self.last_started {
-                if now.saturating_duration_since(prev) < min_interval {
-                    return false;
-                }
-            }
-        }
-        self.in_progress = true;
-        if bypass {
-            self.bypass_consumed_for = preferred_pending.map(|s| s.to_string());
-        }
-        true
-    }
-
-    /// Release single-flight ownership. `did_fetch` advances the throttle clock
-    /// only when the pass actually issued a relay fetch.
-    fn finish(&mut self, did_fetch: bool, now: Instant) {
-        self.in_progress = false;
-        if did_fetch {
-            self.last_started = Some(now);
-        }
-    }
-
-    /// The preferred (open) chat changed: grant the new chat a fresh one-shot
-    /// bypass.
-    fn reset_bypass(&mut self) {
-        self.bypass_consumed_for = None;
-    }
-}
 
 const SYNC_STATE_VERSION: u32 = 1;
 const SYNC_STATE_PROCESSED_EVENT_CAP: usize = 20_000;
@@ -1833,8 +1599,15 @@ pub struct SonarClient {
     /// Whether to join geohash-nearest relays on subscribe (real sessions); off
     /// for in-memory/test sessions so they stay network-free against a MockRelay.
     allow_geo_relays: bool,
-    /// Persistent conversation-summary index (None for in-memory sessions).
+    /// Local conversation-summary/control index. Persistent for device-backed
+    /// clients and SQLite in-memory for ephemeral/test clients.
     conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
+    /// The host-reported current system IANA timezone. It is process-local:
+    /// hosts report it after every node connect and whenever the OS changes it.
+    local_timezone: Arc<Mutex<Option<String>>>,
+    /// Per-recipient dedupe for this process. Entries are installed before a
+    /// background publish and removed on failure so the next trigger retries.
+    timezone_shared_with: Arc<Mutex<HashMap<String, String>>>,
     /// Host-registered callback fired when a conversation summary changes.
     change_listener: Arc<Mutex<Option<Arc<dyn ConversationChangeListener>>>>,
     /// In-memory store for invite link secrets and pending join requests.
@@ -1886,9 +1659,6 @@ pub struct SonarClient {
     claimed_handle: Arc<Mutex<Option<String>>>,
     /// Durable path for the claimed handle (None for in-memory sessions).
     handle_state_path: Option<PathBuf>,
-    /// Atomic throttle + single-flight gate for the per-group catch-up pass;
-    /// see `GroupCatchupGate`.
-    group_catchup_gate: Arc<Mutex<GroupCatchupGate>>,
 }
 
 impl Drop for SonarClient {
@@ -1954,6 +1724,7 @@ impl SonarClient {
     /// dropped. Intended for tests and ephemeral/anonymous sessions.
     pub async fn connect_in_memory(identity: Identity, relays: Vec<RelayUrl>) -> Result<Self> {
         let engine = MarmotEngine::in_memory(identity.clone());
+        let index = Arc::new(Mutex::new(ConversationIndex::open_in_memory()?));
         Self::with_engine(
             identity,
             relays,
@@ -1965,7 +1736,7 @@ impl SonarClient {
             None,
             None,
             StickerCache::disabled(),
-            None,
+            Some(index),
         )
         .await
     }
@@ -2381,6 +2152,8 @@ impl SonarClient {
             last_ensure_subscriptions_at,
             allow_geo_relays,
             conversation_index,
+            local_timezone: Arc::new(Mutex::new(None)),
+            timezone_shared_with: Arc::new(Mutex::new(HashMap::new())),
             change_listener: Arc::new(Mutex::new(None)),
             invite_links: Arc::new(crate::invite_link::InviteLinkStore::load(
                 invite_link_state_path,
@@ -2402,7 +2175,6 @@ impl SonarClient {
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
-            group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
         // sessions (allow_geo_relays=false) stay on the explicit `sync()` path so
@@ -2903,6 +2675,7 @@ impl SonarClient {
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after local group create");
         }
+        self.share_local_timezone_with_groups().await;
         Ok(group_id)
     }
 
@@ -2958,6 +2731,7 @@ impl SonarClient {
         if let Err(err) = self.resubscribe_marmot_groups_if_live().await {
             tracing::debug!(%err, "marmot group live resubscribe failed after membership update");
         }
+        self.share_local_timezone_with_groups().await;
         Ok(())
     }
 
@@ -3221,6 +2995,7 @@ impl SonarClient {
         let group_id_hex = hex::encode(group_id.as_slice());
         self.notify_conversation_changed(&group_id_hex);
         let _ = self.resubscribe_marmot_groups_if_live().await;
+        self.share_local_timezone_with_groups().await;
         Ok(group_id)
     }
 
@@ -5723,40 +5498,10 @@ impl SonarClient {
         );
     }
 
-    fn take_initial_group_message_catchup_batch(&self) -> Vec<(String, u64)> {
+    fn take_initial_group_message_catchup(&self) -> Option<(String, u64)> {
         let preferred = self.preferred_catchup_group.lock().unwrap().clone();
         let mut queue = self.initial_group_message_catchups.lock().unwrap();
-        take_catchup_batch(&mut queue, preferred.as_deref(), GROUP_CATCHUP_BATCH)
-    }
-
-    /// The preferred (open-chat) group id, if it is still waiting in the
-    /// catch-up queue. Used to spend its one-shot throttle bypass so chat-open
-    /// repair runs now.
-    fn pending_preferred_catchup(&self) -> Option<String> {
-        let pref = self.preferred_catchup_group.lock().unwrap().clone()?;
-        let queue = self.initial_group_message_catchups.lock().unwrap();
-        if queue.iter().any(|(id, _)| id == &pref) {
-            Some(pref)
-        } else {
-            None
-        }
-    }
-
-    /// Atomic check-and-claim wrapper around `GroupCatchupGate::try_begin`.
-    fn try_begin_catchup_pass(&self, preferred_pending: Option<&str>) -> bool {
-        self.group_catchup_gate.lock().unwrap().try_begin(
-            preferred_pending,
-            Instant::now(),
-            GROUP_CATCHUP_MIN_INTERVAL,
-        )
-    }
-
-    /// Release the catch-up pass claim; `did_fetch` advances the throttle clock.
-    fn finish_catchup_pass(&self, did_fetch: bool) {
-        self.group_catchup_gate
-            .lock()
-            .unwrap()
-            .finish(did_fetch, Instant::now());
+        take_catchup_entry(&mut queue, preferred.as_deref())
     }
 
     fn requeue_initial_group_message_catchup(&self, group_id: String, floor: u64) {
@@ -5795,78 +5540,30 @@ impl SonarClient {
             return Ok(MarmotProcessReport::default());
         }
         self.populate_initial_group_message_catchups_once();
-        // Atomic check-and-claim: enforce the inter-pass interval AND
-        // single-flight under one lock, so concurrent wake-driven callers
-        // (heartbeat, wake loop, foreground sync, push) cannot both start a
-        // pass. A pending preferred (open-chat) group bypasses the interval
-        // ONCE per preference change, so a persistently-failing preferred group
-        // cannot force a relay fetch on every live wake.
-        let preferred_pending = self.pending_preferred_catchup();
-        if !self.try_begin_catchup_pass(preferred_pending.as_deref()) {
+        let Some((group_id, floor)) = self.take_initial_group_message_catchup() else {
             return Ok(MarmotProcessReport::default());
-        }
-        // From here the pass is claimed; every early return must release it.
-        let batch = self.take_initial_group_message_catchup_batch();
-        if batch.is_empty() {
-            self.finish_catchup_pass(false);
-            return Ok(MarmotProcessReport::default());
-        }
+        };
 
-        // Partition into per-era buckets so one group's floor can never widen
-        // another era's scan, and cap the number of relay fetches this pass.
-        // Each bucket's `since` is its lowest floor minus the (single) catch-up
-        // lookback — the widened lookback covers clock-skewed / out-of-order
-        // events below a group's newest stored peer row.
-        let (buckets, dropped) = plan_catchup_buckets(
-            batch,
-            GROUP_CATCHUP_BUCKET_SPAN_SECS,
-            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
-            GROUP_CATCHUP_MAX_BUCKETS,
-        );
-        // Groups that didn't fit this pass go back to the queue immediately.
-        for (group_id, floor) in dropped {
-            self.requeue_initial_group_message_catchup(group_id, floor);
-        }
-
-        let mut aggregate = MarmotProcessReport::default();
-        let mut buckets = buckets.into_iter();
-        while let Some(bucket) = buckets.next() {
-            let group_ids: Vec<String> = bucket.entries.iter().map(|(id, _)| id.clone()).collect();
-            match self
-                .backfill_groups_since(
-                    &group_ids,
-                    bucket.since,
-                    "initial per-group message catch-up",
-                )
-                .await
-            {
-                Ok(report) => {
-                    if report.retryable_failures > 0 {
-                        for (group_id, floor) in bucket.entries {
-                            self.requeue_initial_group_message_catchup(group_id, floor);
-                        }
-                    }
-                    aggregate.absorb(report);
+        let group_ids = vec![group_id.clone()];
+        match self
+            .backfill_groups_since(
+                &group_ids,
+                Some(floor),
+                "initial per-group message catch-up",
+            )
+            .await
+        {
+            Ok(report) => {
+                if report.retryable_failures > 0 {
+                    self.requeue_initial_group_message_catchup(group_id, floor);
                 }
-                Err(err) => {
-                    // A fetch error is almost certainly transient (relay/network);
-                    // requeue this bucket and every bucket we haven't tried yet,
-                    // then stop stacking fetches this pass.
-                    for (group_id, floor) in bucket.entries {
-                        self.requeue_initial_group_message_catchup(group_id, floor);
-                    }
-                    for remaining in buckets.by_ref() {
-                        for (group_id, floor) in remaining.entries {
-                            self.requeue_initial_group_message_catchup(group_id, floor);
-                        }
-                    }
-                    self.finish_catchup_pass(true);
-                    return Err(err);
-                }
+                Ok(report)
+            }
+            Err(err) => {
+                self.requeue_initial_group_message_catchup(group_id, floor);
+                Err(err)
             }
         }
-        self.finish_catchup_pass(true);
-        Ok(aggregate)
     }
 
     async fn resubscribe_marmot_groups_if_live(&self) -> Result<()> {
@@ -5941,12 +5638,7 @@ impl SonarClient {
                 }
             }
         };
-        let mut cur = self.preferred_catchup_group.lock().unwrap();
-        if *cur != preferred {
-            *cur = preferred;
-            // A newly opened chat gets a fresh one-shot throttle bypass.
-            self.group_catchup_gate.lock().unwrap().reset_bypass();
-        }
+        *self.preferred_catchup_group.lock().unwrap() = preferred;
     }
 
     /// Re-subscribe with the current watermark and group set. Idempotent:
@@ -6345,8 +6037,9 @@ impl SonarClient {
             }
 
             // Intercept account-level gift wraps that are not Marmot MLS input
-            // before they reach the MLS engine: push-token shares (kind 447)
-            // and plain bitchat fallback DMs (NIP-17 kind 14).
+            // before they reach the MLS engine: push-token shares (kind 447),
+            // private timezone metadata (kind 449), and plain bitchat fallback
+            // DMs (NIP-17 kind 14).
             if event.kind == Kind::GiftWrap {
                 if let Ok(unwrapped) =
                     UnwrappedGift::from_gift_wrap(self.engine.identity().keys(), &event).await
@@ -6366,6 +6059,48 @@ impl SonarClient {
                                     event_created_at = event.created_at.as_secs(),
                                     context,
                                     "push token share needs retry"
+                                );
+                                report.record_retryable(event.created_at.as_secs());
+                            }
+                        }
+                        continue;
+                    }
+                    if unwrapped.rumor.kind.as_u16() == crate::timezone::KIND_TIMEZONE_SHARE {
+                        let now = Timestamp::now().as_secs();
+                        let received_at = bounded_timezone_share_timestamp(
+                            unwrapped.rumor.created_at.as_secs(),
+                            now,
+                        );
+                        match self.handle_timezone_share(
+                            &unwrapped.sender,
+                            &unwrapped.rumor.content,
+                            received_at,
+                        ) {
+                            Ok(changed) => {
+                                // A share from a sender not yet a known member
+                                // (welcome may arrive in this same batch,
+                                // ordered after us by event id) must stay
+                                // retryable. Marking it processed would
+                                // permanently suppress it via event dedup, and
+                                // the sender's per-recipient dedupe stops
+                                // re-sharing until a restart.
+                                if changed.is_empty() {
+                                    report.record_retryable(
+                                        event.created_at.as_secs(),
+                                    );
+                                } else {
+                                    changed_groups.extend(changed);
+                                    self.mark_sync_event_processed(&event.id);
+                                    report.record_processed();
+                                }
+                            }
+                            Err(err) => {
+                                tracing::debug!(
+                                    %err,
+                                    event_id = %event.id,
+                                    event_created_at = event.created_at.as_secs(),
+                                    context,
+                                    "timezone share cache write needs retry"
                                 );
                                 report.record_retryable(event.created_at.as_secs());
                             }
@@ -6523,7 +6258,13 @@ impl SonarClient {
                 }
             }
         }
+        let membership_may_have_changed = !changed_groups.is_empty();
         self.notify_conversations_changed(&changed_groups);
+        if membership_may_have_changed {
+            // Recipient dedupe makes this a no-op for ordinary message-only
+            // changes, while a received welcome/commit shares with new peers.
+            self.share_local_timezone_with_groups().await;
+        }
         // Signal-style receive-time warming: sticker attachments referenced by
         // freshly processed messages download in the background now, so opening
         // the chat later paints them from the local disk cache instead of doing
@@ -6567,11 +6308,7 @@ impl SonarClient {
             group_id_hexes.to_vec(),
         );
         if let Some(secs) = since_secs.filter(|secs| *secs > 0) {
-            // Applied VERBATIM: the caller owns any overlap/lookback margin (the
-            // per-group catch-up already reaches GROUP_CATCHUP_FLOOR_LOOKBACK_SECS
-            // below the group floor). Subtracting SYNC_OVERLAP_SECS again here
-            // would double the intended lookback.
-            filter = filter.since(Timestamp::from_secs(secs));
+            filter = filter.since(Timestamp::from_secs(secs.saturating_sub(SYNC_OVERLAP_SECS)));
         }
         let events = self
             .fetch_marmot_events_from_relay_quorum(filter, BACKFILL_TIMEOUT, context)
@@ -6790,6 +6527,193 @@ impl SonarClient {
                 tracing::warn!(%e, "index mark_read failed");
             }
             self.notify_conversation_changed(group_id_hex);
+        }
+    }
+
+    /// Update this device's current system IANA timezone and schedule a
+    /// private share to every unique active Marmot peer. The host calls this
+    /// after connect and on OS timezone-change notifications. Gift-wrap
+    /// publication runs in background tasks and never blocks chat paint.
+    pub async fn update_local_timezone(&self, zone: &str) -> Result<()> {
+        let payload = crate::timezone::encode_timezone_share_payload(zone)?;
+        let normalized = crate::timezone::parse_timezone_share_payload(&payload)
+            .expect("freshly encoded timezone payload must parse");
+        *self.local_timezone.lock().unwrap() = Some(normalized);
+        self.share_local_timezone_with_groups().await;
+        Ok(())
+    }
+
+    /// Batch local-only cache lookup for visible DM/group members.
+    pub fn peer_timezones(&self, peers: &[PublicKey]) -> Vec<(PublicKey, CachedPeerTimezone)> {
+        let Some(ref idx) = self.conversation_index else {
+            return Vec::new();
+        };
+        let idx = idx.lock().unwrap();
+        peers
+            .iter()
+            .filter_map(|peer| {
+                idx.peer_timezone(&peer.to_hex())
+                    .ok()
+                    .flatten()
+                    .map(|cached| (*peer, cached))
+            })
+            .collect()
+    }
+
+    /// Cache a validated peer-authored timezone only when the sender currently
+    /// shares at least one active encrypted conversation with us. Returns the
+    /// affected MLS group ids for local UI invalidation.
+    fn handle_timezone_share(
+        &self,
+        sender: &PublicKey,
+        content: &str,
+        updated_at_secs: u64,
+    ) -> Result<Vec<String>> {
+        let Some(zone) = crate::timezone::parse_timezone_share_payload(content) else {
+            tracing::debug!("ignoring malformed or unsupported timezone share");
+            return Ok(Vec::new());
+        };
+
+        let mut shared_group_ids = Vec::new();
+        for group in self.engine.groups()? {
+            let members = self.engine.members(&group.mls_group_id)?;
+            if members.contains(sender) {
+                shared_group_ids.push(hex::encode(group.mls_group_id.as_slice()));
+            }
+        }
+        if shared_group_ids.is_empty() {
+            tracing::debug!("ignoring timezone share from non-member");
+            return Ok(Vec::new());
+        }
+
+        let Some(ref idx) = self.conversation_index else {
+            return Ok(Vec::new());
+        };
+        let changed =
+            idx.lock()
+                .unwrap()
+                .upsert_peer_timezone(&sender.to_hex(), &zone, updated_at_secs)?;
+        if changed {
+            tracing::info!("cached private timezone from group member");
+            Ok(shared_group_ids)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Build at most one kind-449 gift wrap per unique active peer and hand
+    /// relay publication to background tasks. Per-recipient dedupe suppresses
+    /// ordinary sync/message triggers; failed sends are eligible for retry.
+    async fn share_local_timezone_with_groups(&self) {
+        let connected_relays = self
+            .nostr
+            .relays()
+            .await
+            .values()
+            .filter(|handle| handle.status() == RelayStatus::Connected)
+            .count();
+        if connected_relays == 0 {
+            return;
+        }
+
+        let Some(zone) = self.local_timezone.lock().unwrap().clone() else {
+            return;
+        };
+        let payload = match crate::timezone::encode_timezone_share_payload(&zone) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::debug!(%err, "local timezone became invalid before share");
+                return;
+            }
+        };
+        let me = self.engine.identity().public_key();
+        let mut recipients = HashSet::new();
+        let groups = match self.engine.groups() {
+            Ok(groups) => groups,
+            Err(err) => {
+                tracing::debug!(%err, "timezone share group list failed");
+                return;
+            }
+        };
+        for group in groups {
+            let Ok(members) = self.engine.members(&group.mls_group_id) else {
+                continue;
+            };
+            for member in members {
+                if member != me {
+                    recipients.insert(member);
+                }
+            }
+        }
+        let mut recipients: Vec<PublicKey> = recipients.into_iter().collect();
+        recipients.sort_by_key(PublicKey::to_hex);
+        if recipients.len() > MAX_TIMEZONE_SHARE_RECIPIENTS {
+            tracing::warn!(
+                recipients = recipients.len(),
+                cap = MAX_TIMEZONE_SHARE_RECIPIENTS,
+                "timezone share recipient cap reached"
+            );
+            recipients.truncate(MAX_TIMEZONE_SHARE_RECIPIENTS);
+        }
+
+        for recipient in recipients {
+            let recipient_hex = recipient.to_hex();
+            {
+                let mut shared = self.timezone_shared_with.lock().unwrap();
+                if shared.get(&recipient_hex) == Some(&zone) {
+                    continue;
+                }
+                shared.insert(recipient_hex.clone(), zone.clone());
+            }
+            let rumor = EventBuilder::new(
+                Kind::Custom(crate::timezone::KIND_TIMEZONE_SHARE),
+                payload.clone(),
+            )
+            .tags([Tag::public_key(recipient)])
+            .build(me);
+            let wrapped = match self.engine.gift_wrap_rumor(&recipient, rumor).await {
+                Ok(wrapped) => wrapped,
+                Err(err) => {
+                    self.remove_failed_timezone_share(&recipient_hex, &zone);
+                    tracing::debug!(%err, "timezone gift wrap failed");
+                    continue;
+                }
+            };
+            let nostr = self.nostr.clone();
+            let shared = self.timezone_shared_with.clone();
+            let published_zone = zone.clone();
+            tokio::spawn(async move {
+                let mut last_error = None;
+                for attempt in 0..TIMEZONE_SHARE_PUBLISH_ATTEMPTS {
+                    let result: Result<()> = match nostr.send_event(&wrapped).await {
+                        Ok(output) => require_relay_success(&output, "timezone share"),
+                        Err(err) => Err(err.into()),
+                    };
+                    match result {
+                        Ok(()) => return,
+                        Err(err) => {
+                            last_error = Some(err);
+                            if attempt + 1 < TIMEZONE_SHARE_PUBLISH_ATTEMPTS {
+                                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                            }
+                        }
+                    }
+                }
+                let mut sent = shared.lock().unwrap();
+                if sent.get(&recipient_hex) == Some(&published_zone) {
+                    sent.remove(&recipient_hex);
+                }
+                if let Some(err) = last_error {
+                    tracing::debug!(%err, "timezone share publish failed");
+                }
+            });
+        }
+    }
+
+    fn remove_failed_timezone_share(&self, recipient_hex: &str, zone: &str) {
+        let mut shared = self.timezone_shared_with.lock().unwrap();
+        if shared.get(recipient_hex).map(String::as_str) == Some(zone) {
+            shared.remove(recipient_hex);
         }
     }
 
@@ -9052,221 +8976,6 @@ mod tests {
     }
 
     #[test]
-    fn catchup_batch_leads_with_preferred_and_respects_cap() {
-        let mut q = VecDeque::from([
-            ("aaa".into(), 1u64),
-            ("bbb".into(), 2u64),
-            ("ccc".into(), 3u64),
-            ("ddd".into(), 4u64),
-        ]);
-        let batch = take_catchup_batch(&mut q, Some("ccc"), 3);
-        // Preferred group leads; the rest fill in queue order up to the cap.
-        assert_eq!(
-            batch.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
-            vec!["ccc", "aaa", "bbb"]
-        );
-        assert_eq!(q.front().map(|e| e.0.as_str()), Some("ddd"));
-        // Draining the remainder empties the queue; further takes are empty.
-        assert_eq!(take_catchup_batch(&mut q, None, 8).len(), 1);
-        assert!(take_catchup_batch(&mut q, None, 8).is_empty());
-        assert!(take_catchup_batch(&mut q, None, 0).is_empty());
-    }
-
-    #[test]
-    fn catchup_bucket_since_applies_lookback_exactly_once() {
-        // The bucket `since` reaches `lookback` below the LOWEST floor, applied
-        // once. `backfill_groups_since` uses this VERBATIM (no extra
-        // SYNC_OVERLAP_SECS subtraction), so this equals the on-wire filter
-        // `since`: effective floor is floor - lookback, not floor - lookback -
-        // SYNC_OVERLAP_SECS.
-        let now = 1_700_000_000u64;
-        let entries = vec![("a".to_string(), now), ("b".to_string(), now - 900)];
-        assert_eq!(
-            catchup_bucket_since(&entries, GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
-            Some(now - 900 - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS)
-        );
-        // Any zero floor (no remote peer row stored) needs full history.
-        let with_zero = vec![("a".to_string(), now), ("b".to_string(), 0)];
-        assert_eq!(
-            catchup_bucket_since(&with_zero, GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
-            None
-        );
-        assert_eq!(
-            catchup_bucket_since(&[], GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
-            None
-        );
-        // The widened lookback must cover at least the live tail, so an event
-        // the live subscription could have delivered is always re-fetchable.
-        assert!(GROUP_CATCHUP_FLOOR_LOOKBACK_SECS >= LIVE_GROUP_TAIL_SECS);
-    }
-
-    #[test]
-    fn catchup_buckets_isolate_distant_floors() {
-        // HIGH-1: a dormant group's old floor must NOT widen the scan of recent
-        // groups. Three groups active within the last few minutes plus one
-        // group whose newest stored row is a year old.
-        let now = 1_700_000_000u64;
-        let year = 365 * 24 * 60 * 60;
-        let batch = vec![
-            ("recent1".to_string(), now),
-            ("dormant".to_string(), now - year),
-            ("recent2".to_string(), now - 120),
-            ("recent3".to_string(), now - 300),
-        ];
-        let (buckets, dropped) = plan_catchup_buckets(
-            batch,
-            GROUP_CATCHUP_BUCKET_SPAN_SECS,
-            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
-            GROUP_CATCHUP_MAX_BUCKETS,
-        );
-        assert!(dropped.is_empty(), "two eras fit within the bucket cap");
-        assert_eq!(buckets.len(), 2);
-
-        // The lead group ("recent1") leads its bucket; the three recent groups
-        // share ONE bucket whose since is anchored on the recent floor, never on
-        // the year-old dormant floor.
-        let recent = &buckets[0];
-        let recent_ids: Vec<&str> = recent.entries.iter().map(|(id, _)| id.as_str()).collect();
-        assert!(recent_ids.contains(&"recent1"));
-        assert!(recent_ids.contains(&"recent2"));
-        assert!(recent_ids.contains(&"recent3"));
-        assert!(!recent_ids.contains(&"dormant"));
-        assert_eq!(
-            recent.since,
-            Some(now - 300 - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS),
-            "recent bucket floor is the recent minimum, not the dormant floor"
-        );
-
-        // The dormant group is alone, scanned only from its own floor.
-        let dormant = &buckets[1];
-        assert_eq!(
-            dormant
-                .entries
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["dormant"]
-        );
-        assert_eq!(
-            dormant.since,
-            Some(now - year - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS)
-        );
-    }
-
-    #[test]
-    fn catchup_buckets_zero_floor_isolated_and_capped() {
-        // Zero-floor (full-history) groups share one unbounded bucket, and the
-        // per-pass fetch count is capped: extra eras are dropped for requeue,
-        // never widening another era. Lead ("a") must always be kept.
-        let now = 1_700_000_000u64;
-        let hour = 60 * 60;
-        let batch = vec![
-            ("a".to_string(), now),             // lead, era 0
-            ("b".to_string(), now - 5 * hour),  // era 1
-            ("c".to_string(), now - 10 * hour), // era 2
-            ("z1".to_string(), 0),              // full history
-            ("z2".to_string(), 0),              // full history
-        ];
-        let (buckets, dropped) = plan_catchup_buckets(
-            batch,
-            GROUP_CATCHUP_BUCKET_SPAN_SECS,
-            GROUP_CATCHUP_FLOOR_LOOKBACK_SECS,
-            GROUP_CATCHUP_MAX_BUCKETS,
-        );
-        assert_eq!(buckets.len(), GROUP_CATCHUP_MAX_BUCKETS);
-        // Lead bucket first and holds "a".
-        assert!(buckets[0].entries.iter().any(|(id, _)| id == "a"));
-        // Every dropped group is requeued, and no bucket mixes eras (each kept
-        // bucket's since stays anchored on its own members).
-        assert!(!dropped.is_empty());
-        for b in &buckets {
-            if let Some(since) = b.since {
-                // No kept bucket reaches back to a zero-floor / unrelated era.
-                assert!(since >= now - 10 * hour - GROUP_CATCHUP_FLOOR_LOOKBACK_SECS);
-            }
-        }
-        // The two zero-floor groups, if kept, are together in one unbounded
-        // bucket; otherwise both are dropped together.
-        let kept_zero: Vec<&str> = buckets
-            .iter()
-            .flat_map(|b| b.entries.iter())
-            .filter(|(_, f)| *f == 0)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        let dropped_zero: Vec<&str> = dropped
-            .iter()
-            .filter(|(_, f)| *f == 0)
-            .map(|(id, _)| id.as_str())
-            .collect();
-        assert!(kept_zero.len() == 2 || dropped_zero.len() == 2);
-    }
-
-    #[test]
-    fn catchup_gate_one_shot_preferred_bypass() {
-        // HIGH-2: a persistently-failing preferred group bypasses the interval
-        // at most ONCE, then falls back under the throttle.
-        let mut gate = GroupCatchupGate::default();
-        let t0 = Instant::now();
-        let interval = Duration::from_secs(5);
-
-        // First pass: preferred pending, bypasses the (unset) interval, claims.
-        assert!(gate.try_begin(Some("open"), t0, interval));
-        gate.finish(true, t0); // simulates a fetch that failed and requeued.
-
-        // Second pass 1s later, preferred STILL pending (failure requeued it):
-        // the one-shot bypass is spent, so the interval now applies and rejects.
-        let t1 = t0 + Duration::from_secs(1);
-        assert!(!gate.try_begin(Some("open"), t1, interval));
-
-        // Once the interval elapses, the pass runs again under the throttle.
-        let t2 = t0 + Duration::from_secs(6);
-        assert!(gate.try_begin(Some("open"), t2, interval));
-        gate.finish(true, t2);
-
-        // Switching to a different open chat grants a fresh one-shot bypass.
-        gate.reset_bypass();
-        let t3 = t2 + Duration::from_secs(1);
-        assert!(gate.try_begin(Some("other"), t3, interval));
-        gate.finish(true, t3);
-    }
-
-    #[test]
-    fn catchup_gate_rejects_concurrent_pass() {
-        // MEDIUM: the check-and-claim is atomic — a second caller that arrives
-        // while a pass is in flight is rejected even though the interval looks
-        // expired, and can only proceed after the first releases.
-        let mut gate = GroupCatchupGate::default();
-        let t0 = Instant::now();
-        let interval = Duration::from_secs(5);
-
-        assert!(gate.try_begin(None, t0, interval));
-        // Concurrent caller, well past the interval: still rejected (in-flight).
-        let t1 = t0 + Duration::from_secs(60);
-        assert!(!gate.try_begin(None, t1, interval));
-
-        // After the first pass releases, the interval clock started at t1's
-        // finish; a caller inside the interval is throttled, one past it runs.
-        gate.finish(true, t1);
-        assert!(!gate.try_begin(None, t1 + Duration::from_secs(1), interval));
-        assert!(gate.try_begin(None, t1 + Duration::from_secs(6), interval));
-    }
-
-    #[test]
-    fn catchup_gate_empty_pass_does_not_throttle_next() {
-        // An empty-queue pass claims and releases without a fetch, so it must
-        // not advance the throttle clock and delay the next real pass.
-        let mut gate = GroupCatchupGate::default();
-        let t0 = Instant::now();
-        let interval = Duration::from_secs(5);
-
-        assert!(gate.try_begin(None, t0, interval));
-        gate.finish(false, t0); // empty queue, no fetch.
-
-        // Immediately after, a real pass is allowed (clock was not advanced).
-        assert!(gate.try_begin(None, t0 + Duration::from_millis(1), interval));
-    }
-
-    #[test]
     fn split_buffers_keep_group_events_when_giftwraps_flood() {
         let mut giftwraps: Vec<u32> = Vec::new();
         let mut groups: Vec<u32> = Vec::new();
@@ -9738,6 +9447,108 @@ mod tests {
             changed,
             vec![expected],
             "welcome must notify the conversation listener exactly once for the new group"
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_control_share_is_cached_and_never_enters_transcript() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let bob_kp = bob.engine.key_package_event(relays.clone()).unwrap();
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays)
+            .unwrap();
+        let group_id = creation.group.mls_group_id;
+        let (bob_pubkey, welcome) = creation
+            .welcomes
+            .into_iter()
+            .find(|(member, _)| *member == bob.identity().public_key())
+            .unwrap();
+        let welcome = alice.gift_wrap_welcome(&bob_pubkey, welcome).await.unwrap();
+        bob.process_marmot_events([welcome], "timezone test welcome")
+            .await;
+
+        let payload = crate::timezone::encode_timezone_share_payload("Europe/Zurich").unwrap();
+        let rumor = EventBuilder::new(Kind::Custom(crate::timezone::KIND_TIMEZONE_SHARE), payload)
+            .tags([Tag::public_key(bob_pubkey)])
+            .custom_created_at(Timestamp::from_secs(500))
+            .build(alice.identity().public_key());
+        let wrapped = alice.gift_wrap_rumor(&bob_pubkey, rumor).await.unwrap();
+        let (report, notifications) = bob
+            .process_marmot_events([wrapped], "timezone control")
+            .await;
+
+        assert_eq!(report.processed, 1);
+        assert!(notifications.is_empty());
+        assert!(bob.messages(&group_id).unwrap().is_empty());
+        let cached = bob.peer_timezones(&[alice.identity().public_key()]);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].1.zone, "Europe/Zurich");
+        assert_eq!(cached[0].1.updated_at_secs, 500);
+    }
+
+    #[tokio::test]
+    async fn timezone_share_future_timestamp_is_capped() {
+        let now = 1_000;
+        assert_eq!(bounded_timezone_share_timestamp(900, now), 900);
+        assert_eq!(
+            bounded_timezone_share_timestamp(u64::MAX, now),
+            now + TIMEZONE_SHARE_MAX_FUTURE_SKEW_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn timezone_share_from_non_member_is_ignored() {
+        let bob = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("bob starts");
+        let outsider = MarmotEngine::in_memory(Identity::generate());
+        let payload = crate::timezone::encode_timezone_share_payload("Asia/Kolkata").unwrap();
+        let rumor = EventBuilder::new(Kind::Custom(crate::timezone::KIND_TIMEZONE_SHARE), payload)
+            .tags([Tag::public_key(bob.identity().public_key())])
+            .build(outsider.identity().public_key());
+        let wrapped = outsider
+            .gift_wrap_rumor(&bob.identity().public_key(), rumor)
+            .await
+            .unwrap();
+        let (report, notifications) = bob
+            .process_marmot_events([wrapped], "outsider timezone")
+            .await;
+
+        // Non-member shares stay retryable (not permanently processed) so a
+        // welcome arriving later in the same batch can still match.
+        assert_eq!(report.processed, 0);
+        assert!(report.retryable_failures > 0);
+        assert!(notifications.is_empty());
+        assert!(bob
+            .peer_timezones(&[outsider.identity().public_key()])
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_timezone_update_validates_and_replaces_process_cache() {
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts");
+
+        client
+            .update_local_timezone("America/New_York")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.local_timezone.lock().unwrap().as_deref(),
+            Some("America/New_York")
+        );
+        assert!(client
+            .update_local_timezone("not a timezone")
+            .await
+            .is_err());
+        assert_eq!(
+            client.local_timezone.lock().unwrap().as_deref(),
+            Some("America/New_York")
         );
     }
 

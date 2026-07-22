@@ -327,6 +327,14 @@ pub struct GroupInfo {
     pub member_npubs: Vec<String>,
 }
 
+/// A peer's locally cached, privately shared IANA timezone.
+#[derive(uniffi::Record)]
+pub struct PeerTimezoneInfo {
+    pub sender_npub: String,
+    pub iana_timezone: String,
+    pub updated_at_secs: u64,
+}
+
 /// FFI-friendly pending group invite summary.
 #[derive(uniffi::Record)]
 pub struct GroupInviteInfo {
@@ -1309,6 +1317,33 @@ impl SonarNode {
                     id_hex: hex::encode(g.mls_group_id.as_slice()),
                     name: g.name,
                     member_npubs: members,
+                })
+            })
+            .collect()
+    }
+
+    /// Report this host's current system IANA timezone. The core validates it,
+    /// remembers it for the node lifetime, and schedules encrypted kind-449
+    /// shares to unique active group peers without blocking transcript reads.
+    pub fn update_local_timezone(&self, iana_timezone: String) -> FfiResult<()> {
+        self.runtime
+            .block_on(self.client.update_local_timezone(&iana_timezone))?;
+        Ok(())
+    }
+
+    /// Batch local-only cache lookup for visible DM/group members.
+    pub fn peer_timezones(&self, member_pubkeys: Vec<String>) -> FfiResult<Vec<PeerTimezoneInfo>> {
+        let members = parse_pubkeys(member_pubkeys, "timezone member pubkey")?;
+        self.client
+            .peer_timezones(&members)
+            .into_iter()
+            .map(|(sender, cached)| {
+                Ok(PeerTimezoneInfo {
+                    sender_npub: sender
+                        .to_bech32()
+                        .map_err(|e| SonarFfiError::Core(e.to_string()))?,
+                    iana_timezone: cached.zone,
+                    updated_at_secs: cached.updated_at_secs,
                 })
             })
             .collect()
