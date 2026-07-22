@@ -3082,6 +3082,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!reached) toast = "No one in Bluetooth range yet — your message will reach people as they connect."
             return
         }
+        // Optimistic local echo in the same frame as the tap (like the mesh
+        // path above and the Apple composers' rebuildNow); refreshChannel
+        // replaces it with the canonical row from core/storage.
+        val echo = SonarChannelMsg(randomMeshId(), nick.ifBlank { "you" }, "", t, mine = true, MeshRadio.nowSecs())
+        channelMsgs = visibleChannelMessages(channelMsgs + echo)
         scope.launch {
             try {
                 SonarCore.sendChannel(geohash, t)
@@ -3116,6 +3121,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Unblock this author before sending."
             return
         }
+        // Optimistic local echo; refreshGeoDm replaces it with the
+        // canonical row from core/storage.
+        messages = visibleGeoDmMessages(peerHex, messages + SonarMsg(randomMeshId(), npub, t, mine = true, SonarClock.nowSecs()))
         scope.launch {
             try {
                 SonarCore.sendGeoDm(geohash, peerHex, t)

@@ -3826,6 +3826,9 @@ final class SonarAppStore: ObservableObject {
         }
         ensureChannelSelected(chId)
         chatViewModel.sendMessage(text)
+        // The local echo is already in the timeline; repaint this frame
+        // instead of waiting on the throttled service republish.
+        objectWillChange.send()
     }
 
     func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) -> Bool {
@@ -5234,6 +5237,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     func sendDm(_ id: String, _ text: String) {
+        // Every send route lands a local echo synchronously; repaint this
+        // frame instead of waiting on the throttled service republish. One
+        // defer covers all early-return branches (mesh route, Marmot,
+        // pending) uniformly.
+        defer { objectWillChange.send() }
         // Route on the live BLE alias — canonical fold id may be a stale
         // fingerprint while the peer is connected under another Noise key.
         if let route = liveMeshRoutePeerId(for: id) {

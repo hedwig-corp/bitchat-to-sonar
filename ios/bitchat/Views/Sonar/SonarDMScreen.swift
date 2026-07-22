@@ -124,6 +124,9 @@ struct SonarDMScreenContent: View {
                 // independently after the send has entered the local-first
                 // transport/outbox path.
                 store.sendDm(peerId, text)
+                // Paint the local echo in this frame instead of waiting on the
+                // store invalidation debounce (background bursts keep it).
+                convo.rebuildNow()
                 Task { @MainActor in
                     await convo.loadNewestIfNeeded()
                 }
@@ -134,6 +137,7 @@ struct SonarDMScreenContent: View {
             },
             onSticker: { sticker, coord in
                 store.sendSticker(peerId, sticker: sticker, packCoordinate: coord)
+                convo.rebuildNow()
                 Task { @MainActor in
                     await convo.loadNewestIfNeeded()
                 }
