@@ -7417,7 +7417,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (outbox.contains(peerId)) {
-            enqueueOutbox(peerId, text)
+            val mid = randomMeshId()
+            echoMeshMessage(peerId, text, mid)
+            enqueueOutbox(peerId, text, mid)
             flushOutbox(peerId)
             toast = "Message queued and will send in order."
             return
@@ -7429,14 +7431,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 shouldUseMarmotRoute(peerId, raw) -> sendOverMarmot(peerId, raw, text)
                 canUseDirectNip17(peerId, raw) -> sendDirectNip17(peerId, raw, text)
                 else -> {
-                    enqueueOutbox(peerId, text)
+                    val mid = randomMeshId()
+                    echoMeshMessage(peerId, text, mid)
+                    enqueueOutbox(peerId, text, mid)
                     toast = "Out of range — add each other as favorites to continue over Nostr."
                 }
             }
             return
         }
         // Neither BLE mesh link nor npub available — queue for later delivery.
-        enqueueOutbox(peerId, text)
+        val mid = randomMeshId()
+        echoMeshMessage(peerId, text, mid)
+        enqueueOutbox(peerId, text, mid)
         toast = "Out of range — message queued and will send automatically."
     }
 
@@ -7500,26 +7506,51 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Send a BLE-mesh DM over the Noise link + optimistically echo it. */
-    private fun sendMesh(peerId: String, text: String): Boolean {
+    /** Send a BLE-mesh DM over the Noise link + optimistically echo it.
+     *  When [messageId] is provided (outbox delivery path), the echo was
+     *  already created by [echoMeshMessage]; we skip the duplicate row but
+     *  still send via BLE. */
+    private fun sendMesh(peerId: String, text: String, messageId: String? = null): Boolean {
         if (isMeshContactBlocked(peerId)) {
             toast = "Unblock this contact before sending."
             return false
         }
-        val mid = randomMeshId()
+        val mid = messageId ?: randomMeshId()
         val ok = MeshRadio.sendMeshDm(peerId, mid, text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
+        // Skip echo creation when it already exists (outbox delivery path —
+        // echo was created by echoMeshMessage when the message was first queued).
+        if (!meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
+            val stickerRef = meshParseStickerContent(text)?.let {
+                SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
+            }
+            val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
+            meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+            val canonicalPeerId = canonicalMeshPeerId(peerId)
+            processPayLines(meshChatId(canonicalPeerId), listOf(msg))
+        }
+        persistMesh(peerId)
+        val canonicalPeerId = canonicalMeshPeerId(peerId)
+        scope.launch { refreshOpenDm(canonicalPeerId) }
+        refreshMeshDmRows()
+        return true
+    }
+
+    /** Create a local mesh-DM echo so the message is visible in the chat
+     *  immediately, even when BLE is disconnected and the message is queued
+     *  in the outbox. The same [messageId] is stored in the outbox so
+     *  [flushOutboxNow] can deliver via BLE without creating a duplicate row. */
+    private fun echoMeshMessage(peerId: String, text: String, messageId: String) {
         val stickerRef = meshParseStickerContent(text)?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         }
-        val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
+        val msg = SonarMsg(messageId, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         processPayLines(meshChatId(canonicalPeerId), listOf(msg))
         persistMesh(peerId)
         scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
-        return true
     }
 
     private fun sendMeshMedia(peerId: String, data: ByteArray, filename: String, mime: String): Boolean {
@@ -7946,9 +7977,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     // ── Outbox queue (mirrors iOS MessageRouter outbox) ──
 
     /** Queue a message for [peerId] when no transport is available. Enforces
-     *  per-peer size limit (FIFO eviction) matching iOS behaviour. */
-    private fun enqueueOutbox(peerId: String, text: String) {
-        val result = outbox.enqueue(peerId, text, randomMeshId(), SonarClock.nowSecs())
+     *  per-peer size limit (FIFO eviction) matching iOS behaviour. Pass the
+     *  same [messageId] used by [echoMeshMessage] so [flushOutboxNow] delivers
+     *  via BLE without creating a duplicate transcript row. */
+    private fun enqueueOutbox(peerId: String, text: String, messageId: String = randomMeshId()) {
+        val result = outbox.enqueue(peerId, text, messageId, SonarClock.nowSecs())
         result.evicted?.let { evicted ->
             sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
         }
@@ -7990,7 +8023,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Try to send via the best available transport.
             val routePeerId = liveMeshRoutePeerId(peerId)
             val delivered = if (routePeerId != null) {
-                sendMesh(routePeerId, msg.content)
+                // Pass the existing messageId so sendMesh skips echo creation
+                // (the echo was already created by echoMeshMessage in sendDmAuto).
+                sendMesh(routePeerId, msg.content, msg.messageId)
             } else {
                 val raw = npubRawFor(peerId)
                 if (raw != null) {
