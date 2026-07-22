@@ -2610,6 +2610,10 @@ final class SonarAppStore: ObservableObject {
         // range and after the peer drops out of range.
         if let profile = resolvedSonarProfile(id),
            let name = marmot.displayName(forNpub: profile.npub) {
+            marmot.refreshProfileOnNameMismatch(
+                npub: profile.npub,
+                liveName: chatViewModel.meshService.peerNickname(peerID: peerID),
+            )
             return name
         }
         if let live = chatViewModel.meshService.peerNickname(peerID: peerID),

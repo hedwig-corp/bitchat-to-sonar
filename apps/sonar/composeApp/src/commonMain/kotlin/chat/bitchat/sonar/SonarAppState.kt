@@ -9060,12 +9060,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Display name for a mesh peer: prefer the live radar name, else a remembered
      *  one, else a short id. Remembers whatever it resolves. Triggers an async
      *  profile fetch when the name isn't cached yet. */
+    /** BLE-name vs kind-0 mismatch is a rename signal: refetch past the
+     *  in-flight guard. Capped to one forced refetch per PROFILE_MISS_TTL_SECS
+     *  so a permanently-different BLE handle cannot loop relay queries; the
+     *  miss TTL inside ensureProfile still throttles relays. */
+    private fun refreshProfileOnNameMismatch(npubValue: String, liveName: String?) {
+        val key = canonicalProfileKey(npubValue)
+        if (liveName.isNullOrBlank()) return
+        val cached = profilesByNpub[key]?.bestName ?: return
+        if (cached == liveName) return
+        val fetchedAt = profileFetchedAt[key] ?: 0L
+        if (SonarClock.nowSecs() - fetchedAt < PROFILE_MISS_TTL_SECS) return
+        profileFetches.remove(key)
+        profileFetchedAt.remove(key)
+        ensureProfile(key)
+    }
+
     private fun meshPeerName(peerId: String): String {
         val live = meshPeers.firstOrNull { it.id == "mesh:$peerId" }?.name
         val peerNpub = npubStringForPeer(peerId)
         val profileName = peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
         val remembered = meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }
+        if (peerNpub != null) refreshProfileOnNameMismatch(peerNpub, live)
         if (profileName == null && peerNpub != null) ensureProfile(peerNpub)
         // The linked account's LIVE kind-0 profile name wins over the BLE
         // nickname (transport metadata): a rename must reach the row both in
@@ -9090,7 +9107,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 meshChatNames[peerId] = name
                 return name
             }
-        if (peerNpub != null) ensureProfile(peerNpub)
+        if (peerNpub != null) {
+            refreshProfileOnNameMismatch(
+                peerNpub,
+                meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name,
+            )
+            ensureProfile(peerNpub)
+        }
         meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
             rememberMeshName(peerId, it)
             return it

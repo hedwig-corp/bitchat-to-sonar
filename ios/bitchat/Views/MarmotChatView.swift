@@ -2245,6 +2245,20 @@ final class MarmotChatModel: ObservableObject {
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
     /// raw npub in the chat list, header, and avatar. Retries (via the periodic
     /// `refresh()`) until the peer has published a profile.
+    /// BLE-name vs kind-0 mismatch is a rename signal: refetch past the
+    /// in-flight guard. Capped to one forced refetch per 30 min so a
+    /// permanently-different BLE handle cannot loop relay queries.
+    func refreshProfileOnNameMismatch(npub npubValue: String, liveName: String?) {
+        let key = SNMarmotProfileCache.canonicalKey(npubValue)
+        guard let liveName, !liveName.isEmpty else { return }
+        guard let cached = profilesByNpub[key]?.bestName, cached != liveName else { return }
+        if let fetchedAt = profileFetchedAt[key],
+           Date().timeIntervalSince(fetchedAt) < 30 * 60 { return }
+        profileFetches.remove(key)
+        profileFetchedAt.removeValue(forKey: key)
+        ensureProfile(key)
+    }
+
     func ensureProfile(_ npubToFetch: String) {
         let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
         let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
