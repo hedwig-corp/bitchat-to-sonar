@@ -5,8 +5,10 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.onClick
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -35,6 +37,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.PointerButton
+import androidx.compose.foundation.PointerMatcher
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -47,8 +51,12 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import chat.bitchat.sonar.CallScreen
+import chat.bitchat.sonar.ChatRowActionsSheet
+import chat.bitchat.sonar.DeleteChatSheet
+import chat.bitchat.sonar.DeleteTarget
 import chat.bitchat.sonar.HomeMessageRow
 import chat.bitchat.sonar.MeshRadio
+import chat.bitchat.sonar.MuteSheet
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChat
@@ -56,6 +64,7 @@ import chat.bitchat.sonar.PendingOpenConversation
 import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.SonarScreenHost
 import chat.bitchat.sonar.mergeHomeMessageRows
+import chat.bitchat.sonar.muteChatIdFor
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.ui.SonarTheme
 import chat.bitchat.sonar.ui.SNDot
@@ -142,11 +151,14 @@ fun DesktopApp() {
 fun SonarDesktopRoot(state: SonarAppState) {
     val s = sonar
     var detailRailOpen by remember { mutableStateOf(false) }
+    var pendingRowActions by remember { mutableStateOf<DeleteTarget?>(null) }
+    var pendingMute by remember { mutableStateOf<DeleteTarget?>(null) }
+    var pendingDelete by remember { mutableStateOf<DeleteTarget?>(null) }
     val hasDetail = state.screen is Screen.Chat || state.screen is Screen.Channel
     Surface(Modifier.fillMaxSize(), color = s.bg) {
         Box(Modifier.fillMaxSize()) {
             Row(Modifier.fillMaxSize()) {
-                DesktopSidebar(state)
+                DesktopSidebar(state) { pendingRowActions = it }
                 Box(Modifier.fillMaxHeight().width(1.dp).background(s.hairline))
                 Box(Modifier.weight(1f).fillMaxHeight()) {
                     if (state.isHome) {
@@ -179,6 +191,38 @@ fun SonarDesktopRoot(state: SonarAppState) {
             if (call != null) {
                 CallScreen(state, Screen.Call(call.chatId, call.peerName, call.video))
             }
+            // Row actions → mute / delete — the same shared sheets as phone HomeScreen.
+            pendingRowActions?.let { t ->
+                ChatRowActionsSheet(
+                    name = t.name,
+                    isGroup = t.isGroup,
+                    muted = state.isChatMuted(muteChatIdFor(t)),
+                    onMute = { pendingRowActions = null; pendingMute = t },
+                    onDelete = { pendingRowActions = null; pendingDelete = t },
+                    onClose = { pendingRowActions = null },
+                )
+            }
+            pendingMute?.let { t ->
+                val muteId = muteChatIdFor(t)
+                MuteSheet(
+                    name = t.name,
+                    muted = state.isChatMuted(muteId),
+                    onMute = { d -> state.muteChat(muteId, d); pendingMute = null },
+                    onUnmute = { state.unmuteChat(muteId); pendingMute = null },
+                    onClose = { pendingMute = null },
+                )
+            }
+            pendingDelete?.let { t ->
+                DeleteChatSheet(
+                    name = t.name,
+                    isGroup = t.isGroup,
+                    onDelete = {
+                        if (t.isMesh) state.deleteMeshDm(t.id) else state.deleteMarmotChat(t.id)
+                        pendingDelete = null
+                    },
+                    onClose = { pendingDelete = null },
+                )
+            }
         }
     }
 }
@@ -190,7 +234,7 @@ private fun SonarAppState.select(open: SonarAppState.() -> Unit) {
 }
 
 @Composable
-private fun DesktopSidebar(state: SonarAppState) {
+private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) -> Unit) {
     val s = sonar
     val savedChannels = state.channels.filter { gh ->
         gh != "mesh" && state.locationChannels.none { it.geohash == gh }
@@ -288,6 +332,7 @@ private fun DesktopSidebar(state: SonarAppState) {
                         DmRow(
                             selected = (state.screen as? Screen.Chat)?.id == homeRow.listKey,
                             name = row.name, preview = row.preview, mesh = true, verified = false,
+                            onRowActions = { onRowActions(DeleteTarget(row.peerId, row.name, isMesh = true, isGroup = false)) },
                         ) { state.select { openDm(row.peerId, row.name) } }
                     }
                     is HomeMessageRow.Marmot -> {
@@ -297,6 +342,9 @@ private fun DesktopSidebar(state: SonarAppState) {
                             selected = (state.screen as? Screen.Chat)?.id == chat.id,
                             name = row.title, preview = row.sub, mesh = false,
                             verified = row.verified,
+                            onRowActions = if (row.pending) null else {
+                                { onRowActions(DeleteTarget(chat.id, row.title, isMesh = false, isGroup = row.multiMember)) }
+                            },
                         ) { state.select { openChat(chat) } }
                     }
                 }
@@ -382,9 +430,17 @@ private fun ChannelRow(selected: Boolean, title: String, sub: String, mesh: Bool
 }
 
 @Composable
-private fun DmRow(selected: Boolean, name: String, preview: String, mesh: Boolean, verified: Boolean, onClick: () -> Unit) {
+private fun DmRow(
+    selected: Boolean,
+    name: String,
+    preview: String,
+    mesh: Boolean,
+    verified: Boolean,
+    onRowActions: (() -> Unit)? = null,
+    onClick: () -> Unit,
+) {
     val s = sonar
-    SidebarRow(selected, onClick) {
+    SidebarRow(selected, onClick, onRowActions) {
         SonarAvatar(name, 40.dp, presence = if (mesh) true else null)
         Spacer(Modifier.width(11.dp))
         Column(Modifier.weight(1f)) {
@@ -400,10 +456,12 @@ private fun DmRow(selected: Boolean, name: String, preview: String, mesh: Boolea
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SidebarRow(
     selected: Boolean,
     onClick: () -> Unit,
+    onRowActions: (() -> Unit)? = null,
     content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit,
 ) {
     val s = sonar
@@ -412,6 +470,14 @@ private fun SidebarRow(
             .clip(RoundedCornerShape(12.dp))
             .background(if (selected) s.accentSoft else Color.Transparent)
             .clickable(onClick = onClick)
+            // Right-click opens the same row-actions sheet as the phone long-press.
+            .then(
+                if (onRowActions != null) {
+                    Modifier.onClick(matcher = PointerMatcher.mouse(PointerButton.Secondary), onClick = onRowActions)
+                } else {
+                    Modifier
+                }
+            )
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         content = content,
