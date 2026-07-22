@@ -9067,7 +9067,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
         val remembered = meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }
         if (profileName == null && peerNpub != null) ensureProfile(peerNpub)
-        val name = live ?: profileName ?: remembered ?: ("mesh·" + peerId.take(6))
+        // The linked account's LIVE kind-0 profile name wins over the BLE
+        // nickname (transport metadata): a rename must reach the row both in
+        // range and after the peer drops out of range.
+        val name = profileName ?: live ?: remembered ?: ("mesh·" + peerId.take(6))
         if (!name.isKeyFallbackName()) rememberMeshName(peerId, name) else meshChatNames[peerId] = name
         return name
     }
@@ -9077,11 +9080,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (directMarmotTitle != null) {
             return homeListTitleForFoldedMeshRow(directMarmotTitle, "")
         }
-        meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
-            rememberMeshName(peerId, it)
-            return it
-        }
-        meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
+        // The linked account's LIVE kind-0 profile name wins over the BLE
+        // nickname (transport metadata): a rename must reach the row both in
+        // range and after the peer drops out of range.
         val peerNpub = npubStringForPeer(peerId)
         peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
@@ -9090,6 +9091,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return name
             }
         if (peerNpub != null) ensureProfile(peerNpub)
+        meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
+            rememberMeshName(peerId, it)
+            return it
+        }
+        meshChatNames[peerId]?.takeUnless { it.isKeyFallbackName() }?.let { return it }
         return homeListTitleForFoldedMeshRow(null, meshChatNames[peerId] ?: ("mesh·" + peerId.take(6)))
     }
 
