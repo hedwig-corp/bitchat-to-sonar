@@ -6476,9 +6476,9 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // so it's visible in the chat and can be retried later.
                 echoMeshMedia(meshPeerId(chatId), data, filename, mime)
                 toast = if (!fitsMesh) {
-                    "Image saved — too large for Bluetooth, will send over internet when available"
+                    "Image saved locally — too large for Bluetooth, resend when connected"
                 } else {
-                    "Image saved — will send when Bluetooth reconnects"
+                    "Image saved locally — resend when Bluetooth reconnects"
                 }
                 return
             }
@@ -6488,7 +6488,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (groupId == null) {
                 if (isMeshChat(chatId)) {
                     echoMeshMedia(meshPeerId(chatId), data, filename, mime)
-                    toast = "Image saved — will send when connection is available"
+                    toast = "Image saved locally — resend when connected"
                 } else {
                     toast = missingRouteMessage
                 }
@@ -7579,7 +7579,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mid = randomMeshId()
         val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
         val media = meshMediaFor(mediaUrl, mime, filename, data)
-        mediaCache[mediaUrl] = data
+        // Only cache ≤1 MB in memory (matches mediaData() convention);
+        // larger images render from the file-backed store below.
+        if (data.size <= 1024 * 1024) mediaCache[mediaUrl] = data
         scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
         meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
