@@ -9067,9 +9067,9 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  one, else a short id. Remembers whatever it resolves. Triggers an async
      *  profile fetch when the name isn't cached yet. */
     /** BLE-name vs kind-0 mismatch is a rename signal: refetch past the
-     *  in-flight guard. Capped to one forced refetch per PROFILE_MISS_TTL_SECS
-     *  so a permanently-different BLE handle cannot loop relay queries; the
-     *  miss TTL inside ensureProfile still throttles relays. */
+     *  in-flight guard. Capped to one forced refetch per 30-min stale-sweep
+     *  window (the profileFetches in-flight guard is the gate), so a
+     *  permanently-different BLE handle cannot loop relay queries. */
     private fun refreshProfileOnNameMismatch(npubValue: String, liveName: String?) {
         val key = canonicalProfileKey(npubValue)
         if (!shouldForceProfileRefetch(profilesByNpub[key]?.bestName, liveName, profileFetches.contains(key))) return
