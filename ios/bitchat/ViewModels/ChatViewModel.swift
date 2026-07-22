@@ -3375,10 +3375,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     func didDisconnectFromPeer(_ peerID: PeerID) {
         SecureLogger.debug("👋 Peer disconnected: \(peerID)", category: .session)
         
-        // Remove ephemeral session from identity manager
-        identityManager.removeEphemeralSession(peerID: peerID)
-
-        // If the open PM is tied to this short peer ID, switch UI context to the full Noise key (offline favorite)
+        // Derive the stable Noise key BEFORE removing the ephemeral session,
+        // otherwise getPeerPublicKeyData returns nil and we can't migrate.
+        // See issue #404 — this race was Mode A of the orphaning bug.
         var derivedStableKeyHex = shortIDToNoiseKey[peerID]
         if derivedStableKeyHex == nil,
            let key = meshService.getNoiseService().getPeerPublicKeyData(peerID) {
@@ -3386,9 +3385,13 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             shortIDToNoiseKey[peerID] = derivedStableKeyHex
         }
 
-        if let current = selectedPrivateChatPeer, current == peerID, let stableKeyHex = derivedStableKeyHex {
-            // Migrate messages view context to stable key so header shows favorite + Nostr globe
-            if let messages = privateChats[peerID] {
+        // ALWAYS migrate messages from the short BLE ID to the stable Noise
+        // key, regardless of whether this chat is currently open. This prevents
+        // messages from being orphaned under a stale short BLE ID when the peer
+        // reconnects with a rotated BLE address (new short ID).
+        // See issue #404 for the full bug analysis.
+        if let stableKeyHex = derivedStableKeyHex {
+            if let messages = privateChats[peerID], !messages.isEmpty {
                 if privateChats[stableKeyHex] == nil { privateChats[stableKeyHex] = [] }
                 let existing = Set((privateChats[stableKeyHex] ?? []).map { $0.id })
                 for msg in messages where !existing.contains(msg.id) {
@@ -3415,10 +3418,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                 unreadPrivateMessages.remove(peerID)
                 unreadPrivateMessages.insert(stableKeyHex)
             }
-            selectedPrivateChatPeer = stableKeyHex
-            objectWillChange.send()
+            // Only switch the open chat context if this was the selected peer
+            if let current = selectedPrivateChatPeer, current == peerID {
+                selectedPrivateChatPeer = stableKeyHex
+                objectWillChange.send()
+            }
         }
         
+        // Now safe to remove the ephemeral session — stable key derivation
+        // and message migration are complete.
+        identityManager.removeEphemeralSession(peerID: peerID)
+
         // Update peer list immediately and force UI refresh
         DispatchQueue.main.async { [weak self] in
             // UnifiedPeerService updates automatically via subscriptions
