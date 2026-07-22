@@ -6472,15 +6472,28 @@ class SonarAppState(private val scope: CoroutineScope) {
             val fitsMesh = data.size.toLong() <= MAX_MESH_ATTACHMENT_BYTES
             if (fitsMesh && sendMeshMedia(meshPeerId(chatId), data, filename, mime)) return
             if (resolveMarmotGroupId(chatId) == null) {
-                if (!fitsMesh) {
-                    toast = "Too large to send over Bluetooth — start the secure chat to send it."
+                // No BLE delivery and no Marmot route — echo the image locally
+                // so it's visible in the chat and can be retried later.
+                echoMeshMedia(meshPeerId(chatId), data, filename, mime)
+                toast = if (!fitsMesh) {
+                    "Image saved — too large for Bluetooth, will send over internet when available"
+                } else {
+                    "Image saved — will send when Bluetooth reconnects"
                 }
                 return
             }
         }
         scope.launch {
             val groupId = resolveMarmotGroupId(chatId)
-            if (groupId == null) { toast = missingRouteMessage; return@launch }
+            if (groupId == null) {
+                if (isMeshChat(chatId)) {
+                    echoMeshMedia(meshPeerId(chatId), data, filename, mime)
+                    toast = "Image saved — will send when connection is available"
+                } else {
+                    toast = missingRouteMessage
+                }
+                return@launch
+            }
             val pendingId = "pending-media-${randomMeshId()}"
             val pendingUrl = "$pendingMediaUrlPrefix${randomMeshId()}"
             val startedAtSecs = SonarClock.nowSecs()
@@ -7555,6 +7568,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         persistMesh(peerId)
         scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
+    }
+
+    /** Create a local mesh-DM media echo so the image is visible in the chat
+     *  immediately, even when no transport (BLE or Marmot) is available. Bytes
+     *  are cached + persisted so the image renders from local storage
+     *  (Signal-style local-first). Returns the messageId. */
+    private fun echoMeshMedia(peerId: String, data: ByteArray, filename: String, mime: String): String {
+        val routePeerId = liveMeshRoutePeerId(peerId) ?: peerId
+        val mid = randomMeshId()
+        val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
+        val media = meshMediaFor(mediaUrl, mime, filename, data)
+        mediaCache[mediaUrl] = data
+        scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
+        val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
+        meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
+        persistMesh(routePeerId)
+        scope.launch { refreshOpenDm(canonicalMeshPeerId(routePeerId)) }
+        refreshMeshDmRows()
+        return mid
     }
 
     /** Remove a mesh-DM echo after it was delivered via Marmot (White Noise) to
