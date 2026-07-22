@@ -7520,7 +7520,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
         // Skip echo creation when it already exists (outbox delivery path —
         // echo was created by echoMeshMessage when the message was first queued).
-        if (!meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
+        // Short-circuit: when messageId is null (direct send), mid is a fresh
+        // random UUID that can never match — skip the scan entirely.
+        if (messageId == null || !meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
