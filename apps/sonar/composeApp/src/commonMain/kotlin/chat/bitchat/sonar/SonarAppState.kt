@@ -7522,6 +7522,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         // echo was created by echoMeshMessage when the message was first queued).
         // Short-circuit: when messageId is null (direct send), mid is a fresh
         // random hex ID that can never match — skip the scan entirely.
+        // Scan all meshChats keys (not just peerId) because the echo may live
+        // under a different alias key than the route peerId used for delivery.
         if (messageId == null || !meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
@@ -7997,7 +7999,7 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  per-peer size limit (FIFO eviction) matching iOS behaviour. Pass the
      *  same [messageId] used by [echoMeshMessage] so [flushOutboxNow] delivers
      *  via BLE without creating a duplicate transcript row. */
-    private fun enqueueOutbox(peerId: String, text: String, messageId: String = randomMeshId()) {
+    private fun enqueueOutbox(peerId: String, text: String, messageId: String) {
         val result = outbox.enqueue(peerId, text, messageId, SonarClock.nowSecs())
         result.evicted?.let { evicted ->
             sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
