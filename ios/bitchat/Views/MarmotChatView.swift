@@ -328,6 +328,14 @@ final class MarmotChatModel: ObservableObject {
     @Published private(set) var sonarDescriptorMissesByNpub: [String: Date] = [:]
     /// True when the current node is relay-backed, not just the local DB node.
     @Published private(set) var relayConnected = false
+    /// True while a foreground/push-tap catch-up sync is running. Passive UI
+    /// signal only: it must never gate paint, sending, or scrolling.
+    @Published private(set) var syncingInFlight = false
+    /// The single in-flight foreground/push-tap catch-up refresh. Coalesces the
+    /// scenePhase-driven and notification-tap-driven refresh paths so they don't
+    /// both enqueue `syncForce()` on the serial engine queue (shared with sends)
+    /// and so `syncingInFlight` is owned by exactly one run. @MainActor-isolated.
+    private var refreshTask: Task<Void, Never>?
     /// True after the first local encrypted-DB hydration attempt finishes.
     /// Home uses this as its atomic reveal boundary; relay state is irrelevant.
     @Published private(set) var initialLocalHomeReady = false
@@ -370,8 +378,6 @@ final class MarmotChatModel: ObservableObject {
     /// Single-flight durable media resume. Core also claims per entry id; this
     /// stops stacking overlapping resume Tasks on flaky relay reconnects.
     private var mediaResumeTask: Task<Void, Never>?
-    /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
-    private var foregroundRefreshTask: Task<Void, Never>?
     /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
     /// paths share one in-flight task so rapid wakes cannot stack FETCH_TIMEOUT
     /// parks. The drained notifications are returned to awaiters (push titled
@@ -1321,10 +1327,20 @@ final class MarmotChatModel: ObservableObject {
     /// is single-flight in the background; `conversationChanged` + the polling
     /// drain loop repaint as rows land in local storage.
     func refreshAfterForeground() {
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = Task { [weak self] in
+        // Single-flight: if a foreground/push-tap catch-up is already running,
+        // let it finish instead of starting a second one. Both the scenePhase
+        // transition and a notification tap can call this; without coalescing
+        // they double-enqueue syncForce() on the serial engine queue and the
+        // first completion clears syncingInFlight while the other still runs.
+        if let existing = refreshTask, !existing.isCancelled {
+            return
+        }
+        refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            defer { self.refreshTask = nil }
             guard await self.ensureConnected() else { return }
+            self.syncingInFlight = true
+            defer { self.syncingInFlight = false }
             guard await self.ensureRelayConnected() else {
                 await self.loadLocalSummaries()
                 return
@@ -1332,7 +1348,12 @@ final class MarmotChatModel: ObservableObject {
             try? await self.service.ensureSubscriptions()
             try? await self.service.drainPending()
             await self.loadLocalSummaries()
-            _ = self.ensureGapRecovery()
+            // Route the actual gap-recovery sync through the shared
+            // single-flight gate so a concurrent push-wake `refresh()` cannot
+            // double-enqueue `syncForce()` on the serial engine queue. Awaiting
+            // here keeps the passive indicator active through the real work;
+            // local paint remains independent and already completed above.
+            _ = await self.ensureGapRecovery().value
         }
     }
 
@@ -3505,10 +3526,11 @@ final class MarmotChatModel: ObservableObject {
                     if !notifications.isEmpty {
                         await self.loadLocalSummaries()
                     }
-                    // Do not call retryOutbox here: it republishes in-flight
-                    // Pending and can stack fanouts / burn attempt budget.
-                    // Failed rows self-heal via core auto-retry; stranded
-                    // Pending is flushed on connect and idle ensureSubscriptions.
+                    // Advance historical per-group catch-up on live cycles too.
+                    // Steady live traffic keeps woke true; core throttles this
+                    // pass, so most ticks are a cheap no-op. Do not retry the
+                    // outbox here: that can republish in-flight Pending rows.
+                    try? await self.service.ensureSubscriptions()
                 } else {
                     #if DEBUG
                     // SONAR_BENCH: first wait cycle resolved with no buffered events
@@ -3555,8 +3577,8 @@ final class MarmotChatModel: ObservableObject {
         }
         syncTask?.cancel()
         syncTask = nil
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         // Do not nil/cancel `gapRecoveryTask` here: UniFFI `syncForce` is not
         // abortable, and clearing the slot would allow a stacked second fetch.
         // Wipe paths bump generation explicitly below.
@@ -3706,8 +3728,8 @@ final class MarmotChatModel: ObservableObject {
         pushWakeDrainWaiters = 0
         pushWakeDrainActive = false
         pushWakeDrainBuffer = []
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)

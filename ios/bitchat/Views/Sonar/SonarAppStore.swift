@@ -2688,10 +2688,14 @@ final class SonarAppStore: ObservableObject {
         preview: String? = nil,
         unreadCount: UInt64 = 1,
         messageId: String? = nil,
-        sound: SonarNotificationSound = .standard
+        sound: SonarNotificationSound = .standard,
+        marmotWake: Bool = false
     ) {
         guard !isForeground else { return }
         var userInfo: [String: Any] = [:]
+        if marmotWake {
+            userInfo[SonarNotificationKeys.marmotWake] = true
+        }
         if let conversationId {
             userInfo[SonarNotificationKeys.conversationId] = conversationId
         }
@@ -3667,6 +3671,10 @@ final class SonarAppStore: ObservableObject {
     var online: Bool {
         networkService.internetPathSatisfied && (relayManager.isConnected || marmot.relayConnected)
     }
+
+    /// True while a foreground/push-tap catch-up sync is in flight. Drives the
+    /// passive "Catching up…" subtitle on the status chip; never gates paint.
+    var catchingUp: Bool { marmot.syncingInFlight }
 
     var connectedRelayCount: Int { relayManager.relays.filter(\.isConnected).count }
 
