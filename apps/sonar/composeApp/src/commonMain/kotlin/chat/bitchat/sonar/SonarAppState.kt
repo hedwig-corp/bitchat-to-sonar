@@ -367,6 +367,12 @@ internal fun homeListTitleForFoldedMeshRow(
 /** Row title for a 1:1 Marmot chat: the counterpart's live kind-0 profile
  *  name wins; the creation-time MLS group name is only a placeholder until the
  *  profile lands, and a short npub is the last resort. */
+/** Rename-signal decision: force a kind-0 refetch only when the BLE name is
+ *  real, differs from the cached profile name, and no fetch is in flight or
+ *  recently done. */
+internal fun shouldForceProfileRefetch(cachedName: String?, liveName: String?, fetchInFlightOrRecent: Boolean): Boolean =
+    !liveName.isNullOrBlank() && cachedName != null && cachedName != liveName && !fetchInFlightOrRecent
+
 internal fun directChatRowTitle(profileName: String?, groupName: String, npubFallback: String): String =
     profileName?.takeIf { it.isNotBlank() } ?: groupName.ifBlank { npubFallback }
 
@@ -9066,13 +9072,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  miss TTL inside ensureProfile still throttles relays. */
     private fun refreshProfileOnNameMismatch(npubValue: String, liveName: String?) {
         val key = canonicalProfileKey(npubValue)
-        if (liveName.isNullOrBlank()) return
-        val cached = profilesByNpub[key]?.bestName ?: return
-        if (cached == liveName) return
-        val fetchedAt = profileFetchedAt[key] ?: 0L
-        if (SonarClock.nowSecs() - fetchedAt < PROFILE_MISS_TTL_SECS) return
-        profileFetches.remove(key)
-        profileFetchedAt.remove(key)
+        if (!shouldForceProfileRefetch(profilesByNpub[key]?.bestName, liveName, profileFetches.contains(key))) return
+        // Do NOT evict profileFetches first: a fetch may be in flight, and a
+        // duplicate completion could overwrite a fresher name. ensureProfile's
+        // in-flight guard + the 30-min stale sweep cap the forced refetch to
+        // one per sweep window — matching the iOS 30-min TTL.
         ensureProfile(key)
     }
 
@@ -9101,19 +9105,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         // nickname (transport metadata): a rename must reach the row both in
         // range and after the peer drops out of range.
         val peerNpub = npubStringForPeer(peerId)
+        // Check the rename signal BEFORE the profile early-return below —
+        // otherwise a cached bestName short-circuits and the mismatch refetch
+        // never fires on folded rows.
+        peerNpub?.let {
+            refreshProfileOnNameMismatch(it, meshPeers.firstOrNull { p -> p.id == meshChatId(peerId) }?.name)
+        }
         peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
             ?.let { name ->
                 meshChatNames[peerId] = name
                 return name
             }
-        if (peerNpub != null) {
-            refreshProfileOnNameMismatch(
-                peerNpub,
-                meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name,
-            )
-            ensureProfile(peerNpub)
-        }
+        if (peerNpub != null) ensureProfile(peerNpub)
         meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
             rememberMeshName(peerId, it)
             return it

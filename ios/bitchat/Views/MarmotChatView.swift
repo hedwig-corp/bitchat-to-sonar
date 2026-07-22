@@ -2252,10 +2252,11 @@ final class MarmotChatModel: ObservableObject {
         let key = SNMarmotProfileCache.canonicalKey(npubValue)
         guard let liveName, !liveName.isEmpty else { return }
         guard let cached = profilesByNpub[key]?.bestName, cached != liveName else { return }
-        if let fetchedAt = profileFetchedAt[key],
-           Date().timeIntervalSince(fetchedAt) < 30 * 60 { return }
-        profileFetches.remove(key)
-        profileFetchedAt.removeValue(forKey: key)
+        // Do NOT evict profileFetches first: a fetch may be in flight, and a
+        // duplicate completion could overwrite a fresher name. ensureProfile's
+        // in-flight guard + refreshStaleProfiles cap the forced refetch to one
+        // per 30-min window — matching Compose.
+        guard !profileFetches.contains(key) else { return }
         ensureProfile(key)
     }
 

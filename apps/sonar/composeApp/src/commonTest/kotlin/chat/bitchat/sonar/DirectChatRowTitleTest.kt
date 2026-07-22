@@ -30,6 +30,20 @@ class DirectChatRowTitleTest {
     }
 
     @Test
+    fun mismatchForcesRefetchOnlyWhenSignalIsReal() {
+        assertEquals(true, shouldForceProfileRefetch("Old Name", "New Name", fetchInFlightOrRecent = false))
+        assertEquals(false, shouldForceProfileRefetch("Same", "Same", fetchInFlightOrRecent = false))
+        assertEquals(false, shouldForceProfileRefetch(null, "New Name", fetchInFlightOrRecent = false))
+        assertEquals(false, shouldForceProfileRefetch("Old Name", null, fetchInFlightOrRecent = false))
+        assertEquals(false, shouldForceProfileRefetch("Old Name", "", fetchInFlightOrRecent = false))
+    }
+
+    @Test
+    fun inFlightOrRecentFetchBlocksForcedRefetch() {
+        assertEquals(false, shouldForceProfileRefetch("Old Name", "New Name", fetchInFlightOrRecent = true))
+    }
+
+    @Test
     fun blankProfileNameTreatedAsMissing() {
         assertEquals("Sonar DM Agent", directChatRowTitle("", "Sonar DM Agent", "npub1abc…"))
     }
