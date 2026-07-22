@@ -378,8 +378,6 @@ final class MarmotChatModel: ObservableObject {
     /// Single-flight durable media resume. Core also claims per entry id; this
     /// stops stacking overlapping resume Tasks on flaky relay reconnects.
     private var mediaResumeTask: Task<Void, Never>?
-    /// Foreground resume catch-up; cancelled by `stopPolling` / wipe.
-    private var foregroundRefreshTask: Task<Void, Never>?
     /// Single-flight forced gap recovery (`syncForce` + drain). Push/foreground
     /// paths share one in-flight task so rapid wakes cannot stack FETCH_TIMEOUT
     /// parks. The drained notifications are returned to awaiters (push titled
@@ -3579,8 +3577,8 @@ final class MarmotChatModel: ObservableObject {
         }
         syncTask?.cancel()
         syncTask = nil
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         // Do not nil/cancel `gapRecoveryTask` here: UniFFI `syncForce` is not
         // abortable, and clearing the slot would allow a stacked second fetch.
         // Wipe paths bump generation explicitly below.
@@ -3730,8 +3728,8 @@ final class MarmotChatModel: ObservableObject {
         pushWakeDrainWaiters = 0
         pushWakeDrainActive = false
         pushWakeDrainBuffer = []
-        foregroundRefreshTask?.cancel()
-        foregroundRefreshTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
