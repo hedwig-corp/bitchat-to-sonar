@@ -3826,6 +3826,9 @@ final class SonarAppStore: ObservableObject {
         }
         ensureChannelSelected(chId)
         chatViewModel.sendMessage(text)
+        // The local echo is already in the timeline; repaint this frame
+        // instead of waiting on the throttled service republish.
+        objectWillChange.send()
     }
 
     func sendStickerToChannel(_ chId: String, sticker: StickerInfo, packCoordinate: String) -> Bool {
@@ -5254,9 +5257,14 @@ final class SonarAppStore: ObservableObject {
         }
         if let profile = resolvedSonarProfile(id) {
             sendOverMarmot(text, npub: profile.npub)
+            objectWillChange.send()
             return
         }
         chatViewModel.sendPrivateMessage(text, to: PeerID(str: id))
+        // Same immediate repaint as the Marmot path (whose $messagesByGroup
+        // sink fires directly): mesh/pending routes otherwise wait on the
+        // throttled chatViewModel republish.
+        objectWillChange.send()
     }
 
     /// Cancel an in-flight Blossom upload for an optimistic media bubble.
