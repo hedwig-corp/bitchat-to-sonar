@@ -582,7 +582,7 @@ private fun HomeScreen(state: SonarAppState) {
 
 /** The id mute state is keyed on: the same conversation id notifications use
  *  (`mesh:<peerId>` for a mesh-folded row, the group id for a Marmot chat). */
-private fun muteChatIdFor(t: DeleteTarget): String =
+internal fun muteChatIdFor(t: DeleteTarget): String =
     if (t.isMesh) "mesh:" + t.id else t.id
 
 private fun channelName(geohash: String): String =
@@ -753,11 +753,11 @@ private fun WipeConfirmSheet(onWipe: () -> Unit, onClose: () -> Unit) {
     }
 }
 
-/** A chat the user long-pressed to delete or leave. */
-private data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean, val isGroup: Boolean)
+/** A chat the user long-pressed (phone) or right-clicked (desktop) to delete or leave. */
+internal data class DeleteTarget(val id: String, val name: String, val isMesh: Boolean, val isGroup: Boolean)
 
 @Composable
-private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
+internal fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit, onClose: () -> Unit) {
     val s = sonar
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
@@ -789,7 +789,7 @@ private fun DeleteChatSheet(name: String, isGroup: Boolean, onDelete: () -> Unit
 /** Long-press actions for a home chat row: mute (new) + the pre-existing
  *  delete/leave entry point, so muting does not displace deleting. */
 @Composable
-private fun ChatRowActionsSheet(
+internal fun ChatRowActionsSheet(
     name: String,
     isGroup: Boolean,
     muted: Boolean,
@@ -825,7 +825,7 @@ private fun ChatRowActionsSheet(
 /** Per-chat mute sheet (design MuteSheet): the duration ladder, or — when
  *  already muted — the bell-off state with Unmute/Cancel. */
 @Composable
-private fun MuteSheet(
+internal fun MuteSheet(
     name: String,
     muted: Boolean,
     onMute: (Long?) -> Unit,

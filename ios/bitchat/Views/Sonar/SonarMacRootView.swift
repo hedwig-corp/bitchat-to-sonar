@@ -212,6 +212,7 @@ private enum SonarMacSelection: Hashable {
 private struct SonarMacSidebar: View {
     @EnvironmentObject private var store: SonarAppStore
     @Binding var selection: SonarMacSelection
+    @State private var pendingDelete: SNDMRow?
     let onSearch: () -> Void
     let onCompose: () -> Void
     let onConnectivity: () -> Void
@@ -220,6 +221,36 @@ private struct SonarMacSidebar: View {
     private var savedChannels: [SNChannelItem] {
         let around = Set(store.channels.map(\.id))
         return store.savedChannels.filter { !around.contains($0.id) }
+    }
+
+    // Row actions shared with the iOS home context menu (SonarHomeScreen) and the
+    // Compose desktop right-click sheet: mute (duration ladder) + delete/leave.
+    @ViewBuilder
+    private func macRowActions(_ row: SNDMRow) -> some View {
+        if store.isChatMuted(row.id) {
+            Button { store.unmuteChat(row.id) } label: {
+                Label("Unmute", systemImage: "bell.slash.fill")
+            }
+        } else {
+            Menu {
+                macMuteOption(row, label: "1 hour", duration: 3600)
+                macMuteOption(row, label: "8 hours", duration: 8 * 3600)
+                macMuteOption(row, label: "1 day", duration: 24 * 3600)
+                macMuteOption(row, label: "1 week", duration: 7 * 24 * 3600)
+                macMuteOption(row, label: "Until I turn it back on", duration: nil)
+            } label: {
+                Label("Mute", systemImage: "bell.slash")
+            }
+        }
+        if !store.isPendingSecureChat(row.id) {
+            Button(role: .destructive) { pendingDelete = row } label: {
+                Label(store.isMultiMemberMarmotGroupId(row.id) ? "Leave group" : "Delete chat", systemImage: "trash")
+            }
+        }
+    }
+
+    private func macMuteOption(_ row: SNDMRow, label: String, duration: TimeInterval?) -> some View {
+        Button(label) { store.muteChat(row.id, for: duration) }
     }
 
     var body: some View {
@@ -290,6 +321,9 @@ private struct SonarMacSidebar: View {
                                     selection = .dm(row.id)
                                 }
                             }
+                            // Same row actions as the iOS home context menu and the
+                            // Compose desktop right-click: mute + delete/leave.
+                            .contextMenu { macRowActions(row) }
                         }
                     }
                 }
@@ -299,6 +333,24 @@ private struct SonarMacSidebar: View {
             profileFooter
         }
         .background(SonarTheme.surface.opacity(0.42))
+        .confirmationDialog(
+            "Delete this chat?",
+            isPresented: Binding(get: { pendingDelete != nil }, set: { if !$0 { pendingDelete = nil } }),
+            titleVisibility: .visible,
+            presenting: pendingDelete
+        ) { row in
+            Button(store.isMultiMemberMarmotGroupId(row.id) ? "Leave \(row.title)" : "Delete \(row.title)", role: .destructive) {
+                store.deleteChat(row.id)
+                if selection == .dm(row.id) { selection = .radar }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { row in
+            if store.isMultiMemberMarmotGroupId(row.id) {
+                Text("This sends a leave update to the group and removes the conversation from this device.")
+            } else {
+                Text("This removes the conversation from this device only. The other person isn't notified.")
+            }
+        }
     }
 
     private var selectedChannelId: String? {
