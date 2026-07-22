@@ -3765,14 +3765,16 @@ final class MarmotChatModel: ObservableObject {
 
     /// Short label for a 1:1 group: the other member's npub prefix.
     func title(for group: MarmotService.MarmotGroup) -> String {
-        if !group.name.isEmpty { return group.name }
         let others = otherMembers(in: group)
-        guard others.count == 1, let other = others.first else { return "Group chat" }
-        // Prefer the counterpart's resolved kind-0 profile name; fetch it if we
-        // haven't yet; fall back to a short npub until it lands.
+        guard others.count == 1, let other = others.first else {
+            return group.name.isEmpty ? "Group chat" : group.name
+        }
+        // A 1:1 group is titled by the counterpart's LIVE kind-0 profile name.
+        // The MLS group name is a creation-time snapshot (e.g. sonar-cli
+        // --group-name) and must not freeze the row or shadow a rename.
         if let name = displayName(forNpub: other) { return name }
         ensureProfile(other)
-        return String(other.prefix(12)) + "…"
+        return group.name.isEmpty ? String(other.prefix(12)) + "…" : group.name
     }
 
     func otherMembers(in group: MarmotService.MarmotGroup) -> [String] {

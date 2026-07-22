@@ -364,6 +364,12 @@ internal fun homeListTitleForFoldedMeshRow(
     meshDerivedName: String,
 ): String = directMarmotTitle ?: meshDerivedName
 
+/** Row title for a 1:1 Marmot chat: the counterpart's live kind-0 profile
+ *  name wins; the creation-time MLS group name is only a placeholder until the
+ *  profile lands, and a short npub is the last resort. */
+internal fun directChatRowTitle(profileName: String?, groupName: String, npubFallback: String): String =
+    profileName?.takeIf { it.isNotBlank() } ?: groupName.ifBlank { npubFallback }
+
 /** Fold only when both transports identify the same cryptographic account. */
 internal fun peerNpubHexMatchesLinkedPeer(
     groupCounterpartyNpubHex: String,
@@ -4396,15 +4402,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             return shortNpub(pending)
         }
         pendingMarmotGroups[chat.id]?.let { return it.name }
-        if (chat.name.isNotBlank()) return chat.name
         val others = otherMembers(chat)
-        if (others.size != 1) return "Group chat"
+        if (others.size != 1) return chat.name.ifBlank { "Group chat" }
         val other = others.first()
-        // Prefer the counterpart's resolved kind-0 profile name; fetch it once if
-        // not cached; fall back to a short npub until it lands.
-        profilesByNpub[canonicalProfileKey(other)]?.bestName?.let { return it }
-        ensureProfile(other)
-        return shortNpub(other)
+        // A 1:1 chat is titled by the counterpart's LIVE kind-0 profile name.
+        // The MLS group name is a creation-time snapshot (hosts may pass one,
+        // e.g. sonar-cli --group-name) and must not freeze the row, shadow a
+        // rename, or make two different contacts share one titled row.
+        return directChatRowTitle(
+            profileName = profilesByNpub[canonicalProfileKey(other)]?.bestName,
+            groupName = chat.name,
+            npubFallback = shortNpub(other),
+        ).also { if (profilesByNpub[canonicalProfileKey(other)] == null) ensureProfile(other) }
     }
 
     private fun shortNpub(value: String): String = shortNpubLabel(value)
