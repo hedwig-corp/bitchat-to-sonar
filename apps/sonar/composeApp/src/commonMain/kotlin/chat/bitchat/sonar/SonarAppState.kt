@@ -7521,7 +7521,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Skip echo creation when it already exists (outbox delivery path —
         // echo was created by echoMeshMessage when the message was first queued).
         // Short-circuit: when messageId is null (direct send), mid is a fresh
-        // random UUID that can never match — skip the scan entirely.
+        // random hex ID that can never match — skip the scan entirely.
         if (messageId == null || !meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
@@ -7553,6 +7553,21 @@ class SonarAppState(private val scope: CoroutineScope) {
         persistMesh(peerId)
         scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
+    }
+
+    /** Remove a mesh-DM echo after it was delivered via Marmot (White Noise) to
+     *  avoid a duplicate bubble in the merged mesh + White Noise view. The BLE
+     *  path deduplicates via [sendMesh]'s messageId skip; the NIP-17 path
+     *  deduplicates via appendMeshMessage's id guard. Only Marmot writes to a
+     *  separate store with a different ID, leaving the echo unreconciled. */
+    private fun removeMeshEcho(peerId: String, messageId: String) {
+        val msgs = meshChats[peerId] ?: return
+        val filtered = msgs.filterNot { it.id == messageId }
+        if (filtered.size != msgs.size) {
+            meshChats[peerId] = filtered
+            persistMesh(peerId)
+            refreshMeshDmRows()
+        }
     }
 
     private fun sendMeshMedia(peerId: String, data: ByteArray, filename: String, mime: String): Boolean {
@@ -8035,7 +8050,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                         shouldUseMarmotRoute(peerId, raw) -> {
                             val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
                             marmotGroupId = groupId
-                            groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
+                            val marmotOk = groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
+                            if (marmotOk) {
+                                // Marmot delivery creates its own row with a different ID;
+                                // remove the mesh echo to avoid a duplicate in the merged view.
+                                removeMeshEcho(peerId, msg.messageId)
+                            }
+                            marmotOk
                         }
                         canUseDirectNip17(peerId, raw) -> sendOutboxOverDirectNip17(peerId, raw, msg)
                         else -> false
