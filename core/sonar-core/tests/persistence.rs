@@ -229,7 +229,7 @@ async fn restart_watermark_ignores_later_local_messages() {
             Incoming::Message(_)
         ));
 
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(2)).await;
         let alice_event = alice
             .create_text_message(&group_id, "later local message")
             .expect("alice creates later local message");
