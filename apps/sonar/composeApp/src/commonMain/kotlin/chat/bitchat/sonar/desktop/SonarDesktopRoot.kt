@@ -5,10 +5,8 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.onClick
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -37,8 +35,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.pointer.PointerButton
-import androidx.compose.foundation.PointerMatcher
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -456,7 +452,11 @@ private fun DmRow(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+/** Right-click affordance for sidebar row actions. jvmMain opens the row-actions
+ *  sheet; other targets compile this file too, so their actual is a no-op (they
+ *  reach the same sheets via the phone HomeScreen long-press). */
+expect fun Modifier.desktopContextClick(onRowActions: (() -> Unit)?): Modifier
+
 @Composable
 private fun SidebarRow(
     selected: Boolean,
@@ -471,13 +471,8 @@ private fun SidebarRow(
             .background(if (selected) s.accentSoft else Color.Transparent)
             .clickable(onClick = onClick)
             // Right-click opens the same row-actions sheet as the phone long-press.
-            .then(
-                if (onRowActions != null) {
-                    Modifier.onClick(matcher = PointerMatcher.mouse(PointerButton.Secondary), onClick = onRowActions)
-                } else {
-                    Modifier
-                }
-            )
+            // Desktop-only API behind expect/actual — no-op on Android (see DesktopContextClick).
+            .desktopContextClick(onRowActions)
             .padding(horizontal = 10.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         content = content,
