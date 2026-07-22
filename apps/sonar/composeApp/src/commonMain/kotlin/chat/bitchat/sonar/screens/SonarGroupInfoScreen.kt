@@ -42,8 +42,13 @@ import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarJoinRequest
 import chat.bitchat.sonar.TransientBackHandler
+import chat.bitchat.sonar.currentSystemTimeZoneId
 import chat.bitchat.sonar.inviteLinkPreview
 import chat.bitchat.sonar.inviteUniversalLink
+import chat.bitchat.sonar.peerLocalTimeSnapshot
+import chat.bitchat.sonar.rememberMinuteClock
+import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.local_time
 import chat.bitchat.sonar.shareInviteText
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
@@ -59,6 +64,7 @@ import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import org.jetbrains.compose.resources.stringResource
 
 @Composable
 fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
@@ -67,6 +73,10 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     val chat = state.chats.firstOrNull { it.id == chatId }
     val groupName = chat?.let { state.chatTitle(it) } ?: "Group chat"
     val members = state.allGroupMemberContacts(chatId)
+    val hasVisibleTimezone = members.any { it.npub != state.npub && state.peerTimezone(it.npub) != null }
+    // The "You" row always renders local time from currentSystemTimeZoneId(),
+    // so the clock must run even when no peer has shared a timezone yet.
+    val clockNow = rememberMinuteClock(if (hasVisibleTimezone || members.isNotEmpty()) chatId else null)
 
     var showAddPeople by remember { mutableStateOf(false) }
     var addDraft by remember { mutableStateOf("") }
@@ -301,6 +311,14 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     members.forEachIndexed { index, member ->
                         val isYou = member.npub == state.npub
                         val isCreator = index == 0
+                        val memberTimezone = if (isYou) {
+                            currentSystemTimeZoneId()
+                        } else {
+                            state.peerTimezone(member.npub)?.ianaIdentifier
+                        }
+                        val memberLocalTime = memberTimezone
+                            ?.let { peerLocalTimeSnapshot(it, clockNow) }
+                            ?.timeText
                         Row(
                             Modifier.fillMaxWidth()
                                 .clip(RoundedCornerShape(12.dp))
@@ -325,6 +343,13 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                                         member.subtitle,
                                         color = s.text2, fontSize = 12.5.sp, lineHeight = 16.sp,
                                         maxLines = 1
+                                    )
+                                }
+                                if (memberLocalTime != null) {
+                                    Text(
+                                        stringResource(Res.string.local_time, memberLocalTime),
+                                        color = s.text2, fontSize = 12.5.sp, lineHeight = 16.sp,
+                                        maxLines = 1,
                                     )
                                 }
                             }

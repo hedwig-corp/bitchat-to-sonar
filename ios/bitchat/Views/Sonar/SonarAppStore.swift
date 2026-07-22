@@ -2125,6 +2125,13 @@ final class SonarAppStore: ObservableObject {
                 self?.storeInvalidations.invalidate()
             }
             .store(in: &cancellables)
+        NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.marmot.systemTimezoneDidChange()
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
         #if os(iOS)
         NotificationCenter.default.publisher(for: UIDevice.proximityStateDidChangeNotification)
             .receive(on: DispatchQueue.main)
@@ -3287,6 +3294,9 @@ final class SonarAppStore: ObservableObject {
         }
         updateReceiverAdvertising()
         if cameToForeground {
+            // Reconcile timezone even if Darwin coalesced the change
+            // notification while this process was suspended.
+            marmot.systemTimezoneDidChange()
             refreshKnownContactDescriptors()
             publishedCallDescriptor = false
             publishedBolt12Offer = nil
@@ -3625,14 +3635,10 @@ final class SonarAppStore: ObservableObject {
         preview: String? = nil,
         unreadCount: UInt64 = 1,
         messageId: String? = nil,
-        sound: SonarNotificationSound = .standard,
-        marmotWake: Bool = false
+        sound: SonarNotificationSound = .standard
     ) {
         guard !isForeground else { return }
         var userInfo: [String: Any] = [:]
-        if marmotWake {
-            userInfo[SonarNotificationKeys.marmotWake] = true
-        }
         if let conversationId {
             userInfo[SonarNotificationKeys.conversationId] = conversationId
         }
@@ -4641,10 +4647,6 @@ final class SonarAppStore: ObservableObject {
         networkService.internetPathSatisfied && (relayManager.isConnected || marmot.relayConnected)
     }
 
-    /// True while a foreground/push-tap catch-up sync is in flight. Drives the
-    /// passive "Catching up…" subtitle on the status chip; never gates paint.
-    var catchingUp: Bool { marmot.syncingInFlight }
-
     var connectedRelayCount: Int { relayManager.relays.filter(\.isConnected).count }
 
     var connectedRelaySummary: String {
@@ -5166,6 +5168,12 @@ final class SonarAppStore: ObservableObject {
     func marmotGroup(forConversationId id: String) -> MarmotService.MarmotGroup? {
         guard let groupId = marmotGroupId(id) else { return nil }
         return marmotGroup(byId: groupId)
+    }
+
+    /// Account identity linked to a folded/plain mesh conversation. Local-only:
+    /// verified Sonar announces/persisted favorites provide the mapping.
+    func linkedNpubForConversation(_ id: String) -> String? {
+        linkedNpub(forPeerKey: canonicalPeerKey(PeerID(str: id)))
     }
 
     func isMultiMemberMarmotGroupId(_ id: String) -> Bool {
