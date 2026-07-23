@@ -364,15 +364,15 @@ internal fun homeListTitleForFoldedMeshRow(
     meshDerivedName: String,
 ): String = directMarmotTitle ?: meshDerivedName
 
-/** Row title for a 1:1 Marmot chat: the counterpart's live kind-0 profile
- *  name wins; the creation-time MLS group name is only a placeholder until the
- *  profile lands, and a short npub is the last resort. */
 /** Rename-signal decision: force a kind-0 refetch only when the BLE name is
  *  real, differs from the cached profile name, and no fetch is in flight or
  *  recently done. */
 internal fun shouldForceProfileRefetch(cachedName: String?, liveName: String?, fetchInFlightOrRecent: Boolean): Boolean =
     !liveName.isNullOrBlank() && cachedName != null && cachedName != liveName && !fetchInFlightOrRecent
 
+/** Row title for a 1:1 Marmot chat: the counterpart's live kind-0 profile
+ *  name wins; the creation-time MLS group name is only a placeholder until the
+ *  profile lands, and a short npub is the last resort. */
 internal fun directChatRowTitle(profileName: String?, groupName: String, npubFallback: String): String =
     profileName?.takeIf { it.isNotBlank() } ?: groupName.ifBlank { npubFallback }
 
@@ -4481,7 +4481,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (isMeshRelevantNpub(key)) recomputeConversations()
             } else {
                 profileMissedAt[key] = SonarClock.nowSecs()
-                if (!hadCachedProfile) profileFetches.remove(key)
+                if (hadCachedProfile) {
+                    // A cached profile's forced refetch missed (offline relay
+                    // window). Stamp the attempt so sweepStaleProfiles() re-arms
+                    // the in-flight guard after the refresh TTL — matching iOS,
+                    // which stamps profileFetchedAt on cached-miss. Without this
+                    // the key wedges in profileFetches forever and rename
+                    // detection silently dies for that peer.
+                    profileFetchedAt[key] = SonarClock.nowSecs()
+                } else {
+                    profileFetches.remove(key)
+                }
             }
         }
     }
@@ -9063,9 +9073,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         return true
     }
 
-    /** Display name for a mesh peer: prefer the live radar name, else a remembered
-     *  one, else a short id. Remembers whatever it resolves. Triggers an async
-     *  profile fetch when the name isn't cached yet. */
     /** BLE-name vs kind-0 mismatch is a rename signal: refetch past the
      *  in-flight guard. Capped to one forced refetch per 30-min stale-sweep
      *  window (the profileFetches in-flight guard is the gate), so a
@@ -9080,6 +9087,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         ensureProfile(key)
     }
 
+    /** Display name for a mesh peer: the linked account's kind-0 profile name
+     *  wins over the BLE nickname (transport metadata); falls back to the live
+     *  radar name, a remembered name, then a short id. Remembers whatever it
+     *  resolves and triggers an async profile fetch when the name isn't cached. */
     private fun meshPeerName(peerId: String): String {
         val live = meshPeers.firstOrNull { it.id == "mesh:$peerId" }?.name
         val peerNpub = npubStringForPeer(peerId)
@@ -9105,12 +9116,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         // nickname (transport metadata): a rename must reach the row both in
         // range and after the peer drops out of range.
         val peerNpub = npubStringForPeer(peerId)
+        val live = meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name
         // Check the rename signal BEFORE the profile early-return below —
         // otherwise a cached bestName short-circuits and the mismatch refetch
         // never fires on folded rows.
-        peerNpub?.let {
-            refreshProfileOnNameMismatch(it, meshPeers.firstOrNull { p -> p.id == meshChatId(peerId) }?.name)
-        }
+        peerNpub?.let { refreshProfileOnNameMismatch(it, live) }
         peerNpub
             ?.let { profilesByNpub[canonicalProfileKey(it)]?.bestName }
             ?.let { name ->
@@ -9118,7 +9128,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return name
             }
         if (peerNpub != null) ensureProfile(peerNpub)
-        meshPeers.firstOrNull { it.id == meshChatId(peerId) }?.name?.let {
+        live?.let {
             rememberMeshName(peerId, it)
             return it
         }
