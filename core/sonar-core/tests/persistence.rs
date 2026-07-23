@@ -10,6 +10,7 @@ use nostr::RelayUrl;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use sonar_core::marmot::{DeliveryState, Incoming, MarmotEngine};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{sleep, Duration};
 
 /// A fixed 32-byte SQLCipher key (the host supplies this at runtime).
@@ -229,19 +230,26 @@ async fn restart_watermark_ignores_later_local_messages() {
             Incoming::Message(_)
         ));
 
-        sleep(Duration::from_secs(2)).await;
-        let alice_event = alice
-            .create_text_message(&group_id, "later local message")
-            .expect("alice creates later local message");
+        // Wait deterministically until the wall clock has advanced past
+        // bob_message_secs so alice_later_secs > bob_message_secs is
+        // guaranteed regardless of CI runner load (no fixed sleep).
+        while SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            <= bob_message_secs
+        {
+            sleep(Duration::from_millis(100)).await;
+        }
+        // Use the atomic create+process API so the local transcript row is
+        // written under the same MLS write guard as creation — eliminates the
+        // race where a separately-processed message could strand.
+        let (alice_event, alice_incoming) = alice
+            .create_and_process_text_message(&group_id, "later local message")
+            .expect("alice creates and processes later local message");
         let alice_later_secs = alice_event.created_at.as_secs();
         assert!(alice_later_secs > bob_message_secs);
-        assert!(matches!(
-            alice
-                .process_incoming(&alice_event)
-                .await
-                .expect("alice processes own message"),
-            Incoming::Message(_)
-        ));
+        assert!(matches!(alice_incoming, Incoming::Message(_)));
         assert_eq!(alice.latest_remote_event_secs(), bob_message_secs);
         assert!(
             alice.latest_message_secs() >= alice_later_secs,
