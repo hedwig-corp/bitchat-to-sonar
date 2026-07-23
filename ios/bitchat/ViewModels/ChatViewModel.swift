@@ -3415,10 +3415,17 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                         self.sentReadReceipts.remove(message.id)
                     }
 
-                    if self.privateChats[stableKeyHex] == nil { self.privateChats[stableKeyHex] = [] }
-                    let existing = Set((self.privateChats[stableKeyHex] ?? []).map { $0.id })
+                    // Build the merged transcript in a local variable, then
+                    // assign once. Each privateChats[key]?.append triggers
+                    // PrivateChatManager.didSet → persistChanges →
+                    // store.savePrivate (a full JSON write per call), so
+                    // appending N messages individually is O(N) disk writes
+                    // and O(N²) dictionary comparisons. Building locally and
+                    // assigning once collapses that to a single write.
+                    var merged = self.privateChats[stableKeyHex] ?? []
+                    let existing = Set(merged.map { $0.id })
                     for msg in messages where !existing.contains(msg.id) {
-                        let updated = BitchatMessage(
+                        merged.append(BitchatMessage(
                             id: msg.id,
                             sender: msg.sender,
                             content: msg.content,
@@ -3431,10 +3438,10 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
                             receivedViaInternet: msg.receivedViaInternet,
                             mentions: msg.mentions,
                             deliveryStatus: msg.deliveryStatus
-                        )
-                        self.privateChats[stableKeyHex]?.append(updated)
+                        ))
                     }
-                    self.privateChats[stableKeyHex]?.sort { $0.timestamp < $1.timestamp }
+                    merged.sort { $0.timestamp < $1.timestamp }
+                    self.privateChats[stableKeyHex] = merged
                     self.privateChats.removeValue(forKey: peerID)
                 }
                 if self.unreadPrivateMessages.contains(peerID) {
