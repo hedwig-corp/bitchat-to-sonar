@@ -615,6 +615,12 @@ extension ChatViewModel {
     ///     row `.failed` but leaves it visible so the user can retry.
     ///
     /// Verified 2026-07-22: the echo is correctly created before transport.
+    ///
+    /// TRACKED GAP (Android `SonarMediaOutbox`): Android auto-retries queued
+    /// mesh media on BLE reconnect and on periodic relay-tick via
+    /// `flushAllMediaOutbox()`. iOS has no media retry queue yet — failed
+    /// media stays `.failed` for manual resend. Follow-up: port
+    /// `SonarMediaOutbox` + `flushMediaOutboxNow` to `SonarAppStore`.
     func enqueueMediaMessage(content: String, targetPeer: PeerID?) -> BitchatMessage {
         let timestamp = Date()
         let message: BitchatMessage

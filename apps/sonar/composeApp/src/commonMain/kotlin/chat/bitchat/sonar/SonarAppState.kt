@@ -6477,15 +6477,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (resolveMarmotGroupId(chatId) == null) {
                 // No BLE delivery and no Marmot route — echo the image locally
                 // so it's visible in the chat and can be retried later.
-                val mid = echoMeshMedia(meshPeerId(chatId), data, filename, mime)
-                mediaOutbox.enqueue(
-                    peerId = meshPeerId(chatId),
-                    messageId = mid,
-                    mediaUrl = meshMediaUrl(meshPeerId(chatId), mid, filename),
-                    filename = filename,
-                    mime = mime,
-                    timestampSecs = SonarClock.nowSecs(),
-                )
+                queueMeshMediaForRetry(chatId, data, filename, mime)
                 toast = if (!fitsMesh) {
                     "Image saved locally — too large for Bluetooth, resend when connected"
                 } else {
@@ -6498,15 +6490,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val groupId = resolveMarmotGroupId(chatId)
             if (groupId == null) {
                 if (isMeshChat(chatId)) {
-                    val mid = echoMeshMedia(meshPeerId(chatId), data, filename, mime)
-                    mediaOutbox.enqueue(
-                        peerId = meshPeerId(chatId),
-                        messageId = mid,
-                        mediaUrl = meshMediaUrl(meshPeerId(chatId), mid, filename),
-                        filename = filename,
-                        mime = mime,
-                        timestampSecs = SonarClock.nowSecs(),
-                    )
+                    queueMeshMediaForRetry(chatId, data, filename, mime)
                     toast = "Image saved locally — resend when connected"
                 } else {
                     toast = missingRouteMessage
@@ -7554,9 +7538,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         // echo was created by echoMeshMessage when the message was first queued).
         // Short-circuit: when messageId is null (direct send), mid is a fresh
         // random hex ID that can never match — skip the scan entirely.
-        // Scan all meshChats keys (not just peerId) because the echo may live
-        // under a different alias key than the route peerId used for delivery.
-        if (messageId == null || !meshChats.values.any { msgs -> msgs.any { it.id == mid } }) {
+        // Scan only this peer's alias set (bounded, small) rather than all
+        // conversations, because the echo may live under a different alias key
+        // than the routePeerId used for delivery.
+        if (messageId == null || !meshPeerAliases(peerId).any { a -> meshChats[a]?.any { it.id == mid } == true }) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
@@ -7598,10 +7583,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mid = randomMeshId()
         val mediaUrl = meshMediaUrl(routePeerId, mid, filename)
         val media = meshMediaFor(mediaUrl, mime, filename, data)
-        // Only cache ≤1 MB in memory (matches mediaData() convention);
-        // larger images render from the file-backed store below.
-        if (data.size <= 1024 * 1024) mediaCache[mediaUrl] = data
-        scope.launch { MessageStore.saveMeshMedia(mediaUrl, data) }
+        // Hold bytes in memory until the durable save completes, then free
+        // large payloads (>1 MB) to avoid unbounded mediaCache growth. Small
+        // images stay cached for fast transcript rendering.
+        mediaCache[mediaUrl] = data
+        scope.launch {
+            MessageStore.saveMeshMedia(mediaUrl, data)
+            if (data.size > 1024 * 1024) mediaCache.remove(mediaUrl)
+        }
         val msg = SonarMsg(mid, npub, "", mine = true, tsSecs = MeshRadio.nowSecs(), media = listOf(media))
         meshChats[routePeerId] = meshChats[routePeerId].orEmpty() + msg
         persistMesh(routePeerId)
@@ -7622,7 +7611,25 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats[peerId] = filtered
             persistMesh(peerId)
             refreshMeshDmRows()
+        } else {
+            sonarLog("SonarMesh", "removeMeshEcho: no echo found for peer=${peerId.take(10)}… id=${messageId.take(8)}…")
         }
+    }
+
+    /** Echo a mesh-DM media attachment locally and enqueue it for retry.
+     *  Shared by the sync and async paths of [sendMediaAttachment] to avoid
+     *  duplicating the echo+enqueue sequence. Returns the messageId. */
+    private fun queueMeshMediaForRetry(chatId: String, data: ByteArray, filename: String, mime: String): String {
+        val mid = echoMeshMedia(meshPeerId(chatId), data, filename, mime)
+        mediaOutbox.enqueue(
+            peerId = meshPeerId(chatId),
+            messageId = mid,
+            mediaUrl = meshMediaUrl(meshPeerId(chatId), mid, filename),
+            filename = filename,
+            mime = mime,
+            timestampSecs = SonarClock.nowSecs(),
+        )
+        return mid
     }
 
     private fun sendMeshMedia(peerId: String, data: ByteArray, filename: String, mime: String): Boolean {
@@ -8203,6 +8210,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (outbox.isEmpty()) return
         for (peerId in outbox.peerIds()) {
             flushOutbox(peerId)
+        }
+    }
+
+    /** Flush media outbox for ALL peers that now have a reachable transport.
+     *  Mirrors [flushAllOutbox] so queued images retry on relay/Marmot route
+     *  availability, not only on BLE reconnect. */
+    private fun flushAllMediaOutbox() {
+        if (mediaOutbox.isEmpty()) return
+        for (peerId in mediaOutbox.peerIds()) {
+            flushMediaOutbox(peerId)
         }
     }
 
@@ -9728,6 +9745,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
         flushPendingMarmot() // a queued out-of-range send whose group just landed
         flushAllOutbox() // retry any outbox messages whose peer is now reachable
+        flushAllMediaOutbox() // retry any queued media whose peer is now reachable
         maybeNotify(changedPages, summaryByChat)
         // Marmot/Nostr chats refresh from the core; mesh chats are local and
         // refreshed by drainMeshDms(). A mesh-route DM merges both legs.
