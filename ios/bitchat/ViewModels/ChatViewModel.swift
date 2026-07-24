@@ -3374,66 +3374,102 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
     
     func didDisconnectFromPeer(_ peerID: PeerID) {
         SecureLogger.debug("👋 Peer disconnected: \(peerID)", category: .session)
-        
-        // Remove ephemeral session from identity manager
-        identityManager.removeEphemeralSession(peerID: peerID)
 
-        // If the open PM is tied to this short peer ID, switch UI context to the full Noise key (offline favorite)
-        var derivedStableKeyHex = shortIDToNoiseKey[peerID]
-        if derivedStableKeyHex == nil,
-           let key = meshService.getNoiseService().getPeerPublicKeyData(peerID) {
-            derivedStableKeyHex = PeerID(hexData: key)
-            shortIDToNoiseKey[peerID] = derivedStableKeyHex
-        }
+        let myPeerID = meshService.myPeerID
 
-        if let current = selectedPrivateChatPeer, current == peerID, let stableKeyHex = derivedStableKeyHex {
-            // Migrate messages view context to stable key so header shows favorite + Nostr globe
-            if let messages = privateChats[peerID] {
-                if privateChats[stableKeyHex] == nil { privateChats[stableKeyHex] = [] }
-                let existing = Set((privateChats[stableKeyHex] ?? []).map { $0.id })
-                for msg in messages where !existing.contains(msg.id) {
-                    let updated = BitchatMessage(
-                        id: msg.id,
-                        sender: msg.sender,
-                        content: msg.content,
-                        timestamp: msg.timestamp,
-                        isRelay: msg.isRelay,
-                        originalSender: msg.originalSender,
-                        isPrivate: msg.isPrivate,
-                        recipientNickname: msg.recipientNickname,
-                        senderPeerID: msg.senderPeerID == meshService.myPeerID ? meshService.myPeerID : stableKeyHex,
-                        receivedViaInternet: msg.receivedViaInternet,
-                        mentions: msg.mentions,
-                        deliveryStatus: msg.deliveryStatus
-                    )
-                    privateChats[stableKeyHex]?.append(updated)
-                }
-                privateChats[stableKeyHex]?.sort { $0.timestamp < $1.timestamp }
-                privateChats.removeValue(forKey: peerID)
-            }
-            if unreadPrivateMessages.contains(peerID) {
-                unreadPrivateMessages.remove(peerID)
-                unreadPrivateMessages.insert(stableKeyHex)
-            }
-            selectedPrivateChatPeer = stableKeyHex
-            objectWillChange.send()
-        }
-        
-        // Update peer list immediately and force UI refresh
+        // All privateChats / shortIDToNoiseKey / @Published mutations must run
+        // on the main thread. Although BLEService currently hops to main at
+        // every call site (notifyUI { Task { @MainActor in … } }), this
+        // DispatchQueue.main.async keeps the contract explicit and future-proof.
         DispatchQueue.main.async { [weak self] in
-            // UnifiedPeerService updates automatically via subscriptions
-            self?.objectWillChange.send()
-        }
-        
-        // Clear sent read receipts for this peer since they'll need to be resent after reconnection
-        // Only clear receipts for messages from this specific peer
-        if let messages = privateChats[peerID] {
-            for message in messages {
-                // Remove read receipts for messages FROM this peer (not TO this peer)
-                if message.senderPeerID == peerID {
-                    sentReadReceipts.remove(message.id)
+            guard let self = self else { return }
+
+            // Derive the stable Noise key inside the main block so that
+            // shortIDToNoiseKey reads/writes are main-serialized alongside
+            // every other main-owned dictionary in this method. The key data
+            // is still captured before removeEphemeralSession runs below.
+            var stableKey: String? = self.shortIDToNoiseKey[peerID]
+            if stableKey == nil,
+               let key = self.meshService.getNoiseService().getPeerPublicKeyData(peerID) {
+                stableKey = PeerID(hexData: key)
+                self.shortIDToNoiseKey[peerID] = stableKey
+            }
+
+            // ALWAYS migrate messages from the short BLE ID to the stable Noise
+            // key, regardless of whether this chat is currently open. This
+            // prevents messages from being orphaned under a stale short BLE ID
+            // when the peer reconnects with a rotated BLE address (new short ID).
+            // See issue #404 for the full bug analysis.
+            // Residual gap: if stableKey is nil (Noise session never established
+            // or already torn down), messages stay under the old short BLE ID.
+            // consolidateMessages does not scan for orphaned short IDs — tracked
+            // in REGRESSIONS.md (Unguarded) as a follow-up.
+            if let stableKeyHex = stableKey {
+                if let messages = self.privateChats[peerID], !messages.isEmpty {
+                    // Clear receipts for messages FROM this peer BEFORE removing
+                    // the source entry. After migration, senderPeerID is
+                    // rewritten to stableKeyHex, so the old peerID predicate
+                    // would no longer match — and removeValue nils the dict
+                    // lookup entirely.
+                    for message in messages where message.senderPeerID == peerID {
+                        self.sentReadReceipts.remove(message.id)
+                    }
+
+                    // Build the merged transcript in a local variable, then
+                    // assign once. Each privateChats[key]?.append triggers
+                    // PrivateChatManager.didSet → persistChanges →
+                    // store.savePrivate (a full JSON write per call), so
+                    // appending N messages individually is O(N) disk writes
+                    // and O(N²) dictionary comparisons. Building locally and
+                    // assigning once collapses that to a single write.
+                    var merged = self.privateChats[stableKeyHex] ?? []
+                    let existing = Set(merged.map { $0.id })
+                    for msg in messages where !existing.contains(msg.id) {
+                        merged.append(BitchatMessage(
+                            id: msg.id,
+                            sender: msg.sender,
+                            content: msg.content,
+                            timestamp: msg.timestamp,
+                            isRelay: msg.isRelay,
+                            originalSender: msg.originalSender,
+                            isPrivate: msg.isPrivate,
+                            recipientNickname: msg.recipientNickname,
+                            senderPeerID: msg.senderPeerID == myPeerID ? myPeerID : stableKeyHex,
+                            receivedViaInternet: msg.receivedViaInternet,
+                            mentions: msg.mentions,
+                            deliveryStatus: msg.deliveryStatus
+                        ))
+                    }
+                    merged.sort { $0.timestamp < $1.timestamp }
+                    self.privateChats[stableKeyHex] = merged
+                    self.privateChats.removeValue(forKey: peerID)
+                }
+                if self.unreadPrivateMessages.contains(peerID) {
+                    self.unreadPrivateMessages.remove(peerID)
+                    self.unreadPrivateMessages.insert(stableKeyHex)
+                }
+                // Only switch the open chat context if this was the selected peer
+                if let current = self.selectedPrivateChatPeer, current == peerID {
+                    self.selectedPrivateChatPeer = stableKeyHex
+                }
+            } else {
+                // stableKey is nil (Noise session never established or already
+                // torn down): messages stay under the old short BLE ID, so the
+                // entry survives and we can clear receipts normally.
+                if let messages = self.privateChats[peerID] {
+                    for message in messages where message.senderPeerID == peerID {
+                        self.sentReadReceipts.remove(message.id)
+                    }
                 }
             }
+
+            // Remove the ephemeral session after key derivation and migration
+            // are complete. removeEphemeralSession dispatches a barrier async
+            // internally; the key data above was already captured synchronously.
+            self.identityManager.removeEphemeralSession(peerID: peerID)
+
+            // UnifiedPeerService updates automatically via subscriptions
+            self.objectWillChange.send()
         }
     }
     
