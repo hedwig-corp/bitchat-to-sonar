@@ -774,7 +774,7 @@ impl MarmotEngine {
                 let unwrapped = UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
                 if unwrapped.rumor.kind == Kind::Custom(crate::invite_link::JOIN_REQUEST_RUMOR_KIND)
                 {
-                    return self.handle_join_request_rumor(&unwrapped.rumor);
+                    return self.handle_join_request_rumor(&unwrapped.sender, &unwrapped.rumor);
                 }
                 if unwrapped.rumor.kind != Kind::MlsWelcome {
                     return Ok(Incoming::None);
@@ -870,14 +870,32 @@ impl MarmotEngine {
 
     // ── Invite link join requests ──────────────────────────────────────
 
-    fn handle_join_request_rumor(&self, rumor: &UnsignedEvent) -> Result<Incoming> {
-        let payload = crate::invite_link::parse_join_request_rumor(rumor)?;
-        let group_id_bytes =
-            hex::decode(&payload.group_id).map_err(|e| Error::InvalidInput(e.to_string()))?;
+    /// `sender` is the seal pubkey from the gift wrap, the only authenticated
+    /// identity in a NIP-59 envelope. The rumor body is written by whoever holds
+    /// the invite link, so `requester_npub` inside it is not evidence of who is
+    /// asking. An admin approving a join request must be shown the seal author.
+    fn handle_join_request_rumor(
+        &self,
+        sender: &PublicKey,
+        rumor: &UnsignedEvent,
+    ) -> Result<Incoming> {
+        // Every malformed-body exit returns Ok(Incoming::None), never Err.
+        // Neither Error::Json nor Error::InvalidInput is terminal per
+        // `is_terminal_marmot_processing_error`, so an Err here would skip
+        // `mark_sync_event_processed` and leave the event to be refetched and
+        // re-fail on every sync forever. One junk rumor from a stranger is
+        // enough to pin the cursor, so unparseable input must be discarded.
+        let Ok(payload) = crate::invite_link::parse_join_request_rumor(rumor) else {
+            return Ok(Incoming::None);
+        };
+        let Ok(group_id_bytes) = hex::decode(&payload.group_id) else {
+            return Ok(Incoming::None);
+        };
         let group_id = GroupId::from_slice(&group_id_bytes);
 
-        let secret_hash_bytes = hex::decode(&payload.invite_secret_hash)
-            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        let Ok(secret_hash_bytes) = hex::decode(&payload.invite_secret_hash) else {
+            return Ok(Incoming::None);
+        };
         let mut secret_hash = [0u8; 32];
         if secret_hash_bytes.len() == 32 {
             secret_hash.copy_from_slice(&secret_hash_bytes);
@@ -885,8 +903,24 @@ impl MarmotEngine {
             return Ok(Incoming::None);
         }
 
-        let requester = PublicKey::from_bech32(&payload.requester_npub)
-            .map_err(|e| Error::InvalidInput(e.to_string()))?;
+        // Drop the request outright when the body disagrees with the seal
+        // author rather than silently rewriting it: an honest client always
+        // sets its own npub, so a mismatch is a spoofing attempt, not drift.
+        // `parse` (not `from_bech32`) matches how invite_link.rs decodes this
+        // same field, so a hex-encoded key from a non-Sonar client compares
+        // rather than erroring out.
+        let Ok(claimed) = PublicKey::parse(&payload.requester_npub) else {
+            return Ok(Incoming::None);
+        };
+        if claimed != *sender {
+            tracing::warn!(
+                %claimed,
+                %sender,
+                "dropping join request: requester_npub does not match gift-wrap seal author"
+            );
+            return Ok(Incoming::None);
+        }
+        let requester = *sender;
         let kp_event_id = payload
             .key_package_event_id
             .as_deref()
