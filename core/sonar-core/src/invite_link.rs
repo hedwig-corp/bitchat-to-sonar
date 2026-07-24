@@ -29,6 +29,17 @@ const MAX_INVITE_RELAYS: usize = 8;
 /// Conservative upper bound for a single relay URL in an invite token.
 const MAX_INVITE_RELAY_URL_LEN: usize = 512;
 
+/// Cap on pending join requests retained per group. An invite link is meant to
+/// be shared, so anyone who sees it holds `invite_secret` and can compute a
+/// valid `secret_hash`; without a cap, Sybil requesters flood an unbounded,
+/// disk-persisted list (each add rewrites the whole state file). Mirrors the
+/// `MAX_PENDING_SONAR` bound already used for the mesh identity buffer. This
+/// bounds memory and file size, retaining the newest N; the cap is FIFO, so a
+/// flood of fresh distinct-pubkey requests can still evict older genuine ones
+/// (an evicted requester can re-request). It does not rate-limit the per-new-
+/// requester state-file rewrite; see the persisted-write note in the PR.
+const MAX_PENDING_JOIN_REQUESTS_PER_GROUP: usize = 128;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteToken {
     pub group_id: Vec<u8>,
@@ -281,6 +292,11 @@ impl InviteLinkStore {
         {
             return Ok(());
         }
+        // Bounded FIFO: drop the oldest pending request once at capacity so a
+        // Sybil flood cannot grow the persisted state without limit.
+        while group_requests.len() >= MAX_PENDING_JOIN_REQUESTS_PER_GROUP {
+            group_requests.remove(0);
+        }
         group_requests.push(request);
         self.save_state(&state)
     }
@@ -507,6 +523,43 @@ mod tests {
         assert_eq!(reloaded.active_links(&group_id).len(), 1);
         assert_eq!(reloaded.pending_join_requests(&group_id).len(), 1);
         assert!(reloaded.validate_secret(&group_id, &sha256(&decoded.invite_secret)));
+    }
+
+    #[test]
+    fn pending_join_requests_are_capped_against_a_sybil_flood() {
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let store = InviteLinkStore::new();
+        let secret_hash = [9u8; 32];
+
+        // Anyone holding the (shared) invite link can compute a valid
+        // secret_hash, so a flood of distinct requester pubkeys would otherwise
+        // grow the persisted list without limit.
+        for i in 0..(MAX_PENDING_JOIN_REQUESTS_PER_GROUP * 3) {
+            let requester = Identity::generate().public_key();
+            store
+                .add_join_request(JoinRequest {
+                    requester,
+                    group_id: group_id.clone(),
+                    secret_hash,
+                    key_package_event_id: None,
+                    received_at: i as u64,
+                })
+                .expect("add join request");
+        }
+
+        let pending = store.pending_join_requests(&group_id);
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_JOIN_REQUESTS_PER_GROUP,
+            "pending join requests must be bounded regardless of flood size"
+        );
+        // FIFO: the oldest were dropped, the most recent retained.
+        assert!(
+            pending.iter().all(|r| r.received_at
+                >= (MAX_PENDING_JOIN_REQUESTS_PER_GROUP * 3
+                    - MAX_PENDING_JOIN_REQUESTS_PER_GROUP) as u64),
+            "the cap must retain the newest requests and drop the oldest"
+        );
     }
 
     fn sample_token() -> String {
