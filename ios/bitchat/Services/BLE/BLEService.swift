@@ -4195,11 +4195,13 @@ extension BLEService {
         // Sonar nodes flood it exactly like stock bitchat nodes do for
         // unknown types.
         if packet.type == SonarAnnouncePacket.packetType {
-            let knownInSession = collectionsQueue.sync { peers[senderID] != nil }
-            if !knownInSession && !shouldAcceptPeer(senderID, noisePublicKey: nil) {
-                SecureLogger.debug("🔋 Ignoring Sonar profile from non-chat peer in restricted BLE discovery: \(senderID.id.prefix(8))…", category: .session)
-                return
-            }
+            // Always forward to handleSonarAnnounce — it queues the 0x53 in
+            // pendingSonarAnnounces when the peer is not yet known from a
+            // verified 0x01 announce. Dropping it here (as the previous
+            // restricted-discovery early-return did) permanently loses the
+            // profile when 0x53 beats 0x01 on a fresh link, delaying Sonar
+            // discovery until the next announce cycle. The signature is
+            // verified later against the signing key installed by the 0x01.
             handleSonarAnnounce(packet, from: senderID)
         }
 
@@ -4515,8 +4517,13 @@ extension BLEService {
         guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
             queuePendingSonarAnnounce(packet, from: peerID)
             SecureLogger.debug("Queued Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
-            messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                self?.sendAnnounce(forceSend: true)
+            // Only announce back in normal discovery mode — in restricted mode
+            // (.knownOnly/.off), don't respond to unknown peers to avoid
+            // unbounded forced announcements from attacker-controlled traffic.
+            if discoveryMode == .normal {
+                messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                    self?.sendAnnounce(forceSend: true)
+                }
             }
             return
         }

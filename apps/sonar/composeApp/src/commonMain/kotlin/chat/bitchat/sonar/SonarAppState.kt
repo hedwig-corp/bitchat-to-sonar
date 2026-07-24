@@ -59,6 +59,8 @@ private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_L
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
+private const val MARMOT_ECHO_RECONCILE_POLL_MS = 100L
+private const val MARMOT_ECHO_RECONCILE_MAX_ATTEMPTS = 10
 
 /** Debug-device benchmark input supplied by the platform launcher. Keeping the
  * pack address explicit avoids shipping a user-visible fallback pack. */
@@ -907,7 +909,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             meshPeers = emptyList()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
-            meshChats.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
+            meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); meshDmRows = emptyList(); meshBroadcast = emptyList()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
@@ -974,7 +976,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
             // In-memory conversation state.
-            meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+            meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
             pendingMarmotGroups = emptyMap()
@@ -1642,6 +1644,9 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  don't live in the Rust core (that's Marmot/Nostr) — they ride the Noise
      *  link, so the app holds them. Chat id on the nav stack is "mesh:<peerId>". */
     private var meshChats = mutableMapOf<String, List<SonarMsg>>()
+    /** O(1) lookup for active mesh echo message IDs — avoids O(chats×msgs)
+     *  scan in [sendMesh]'s dedup check on the outbox-flush path. */
+    private val meshEchoIds = mutableSetOf<String>()
     // Observability for the White Noise (Marmot) fallback (logged in poll()).
     private var lastWnGroups = -1
     private var lastWnMsgs = -1
@@ -3388,7 +3393,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelPendingMarmotGroupSetups()
 
                 MessageStore.wipe()
-                meshChats.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
+                meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
                 pendingMarmotGroups = emptyMap()
@@ -7567,14 +7572,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mid = messageId ?: randomMeshId()
         val ok = MeshRadio.sendMeshDm(peerId, mid, text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
-        // Skip echo creation when it already exists (outbox delivery path —
-        // echo was created by echoMeshMessage when the message was first queued).
-        // Short-circuit: when messageId is null (direct send), mid is a fresh
-        // random hex ID that can never match — skip the scan entirely.
-        // Scan only this peer's alias set (bounded, small) rather than all
-        // conversations, because the echo may live under a different alias key
-        // than the routePeerId used for delivery.
-        if (messageId == null || !meshPeerAliases(peerId).any { a -> meshChats[a]?.any { it.id == mid } == true }) {
+        // Direct send (messageId == null): create the local echo now.
+        // Outbox delivery (messageId != null): the echo was already created by
+        // echoMeshMessage when the message was first queued, so never create a
+        // second row here — just stop tracking the id. Branching on null (not on
+        // a meshEchoIds membership test) closes a duplicate-on-restart hole:
+        // meshEchoIds is in-memory and empty after boot, but the echo survives in
+        // persisted meshChats, so a membership test would wrongly re-create it.
+        if (messageId == null) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
@@ -7582,6 +7587,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             meshChats[peerId] = meshChats[peerId].orEmpty() + msg
             val canonicalPeerId = canonicalMeshPeerId(peerId)
             processPayLines(meshChatId(canonicalPeerId), listOf(msg))
+        } else {
+            meshEchoIds.remove(messageId)
         }
         persistMesh(peerId)
         val canonicalPeerId = canonicalMeshPeerId(peerId)
@@ -7600,6 +7607,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         val msg = SonarMsg(messageId, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
+        meshEchoIds.add(messageId)
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         processPayLines(meshChatId(canonicalPeerId), listOf(msg))
         persistMesh(peerId)
@@ -7637,7 +7645,21 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  path deduplicates via [sendMesh]'s messageId skip; the NIP-17 path
      *  deduplicates via appendMeshMessage's id guard. Only Marmot writes to a
      *  separate store with a different ID, leaving the echo unreconciled. */
+    /** Mark a mesh echo as "Couldn't send" when its outbox entry is evicted
+     *  (per-peer queue overflow). Without this the echo looks like a normal
+     *  sent message even though it will never be delivered. */
+    private fun failMeshEcho(peerId: String, messageId: String) {
+        meshEchoIds.remove(messageId)
+        val msgs = meshChats[peerId] ?: return
+        meshChats[peerId] = msgs.map {
+            if (it.id == messageId) it.copy(state = "Couldn't send") else it
+        }
+        persistMesh(peerId)
+        refreshMeshDmRows()
+    }
+
     private fun removeMeshEcho(peerId: String, messageId: String) {
+        meshEchoIds.remove(messageId)
         val msgs = meshChats[peerId] ?: return
         val filtered = msgs.filterNot { it.id == messageId }
         if (filtered.size != msgs.size) {
@@ -8097,6 +8119,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun enqueueOutbox(peerId: String, text: String, messageId: String) {
         val result = outbox.enqueue(peerId, text, messageId, SonarClock.nowSecs())
         result.evicted?.let { evicted ->
+            failMeshEcho(peerId, evicted.messageId)
             sonarLog("SonarOutbox", "overflow for ${peerId.take(10)}… — evicted oldest id=${evicted.messageId.take(8)}…")
         }
         sonarLog("SonarOutbox", "queued for ${peerId.take(10)}… id=${result.message.messageId.take(8)}… queue=${result.depth}")
@@ -8148,10 +8171,25 @@ class SonarAppState(private val scope: CoroutineScope) {
                             val groupId = marmotGroupId ?: ensureMarmotGroupForOutbox(peerId, raw)
                             marmotGroupId = groupId
                             val marmotOk = groupId != null && sendOutboxOverMarmot(peerId, groupId, msg.content)
-                            if (marmotOk) {
-                                // Marmot delivery creates its own row with a different ID;
-                                // remove the mesh echo to avoid a duplicate in the merged view.
-                                removeMeshEcho(peerId, msg.messageId)
+                            if (marmotOk && groupId != null) {
+                                // Reconcile: poll for the canonical Marmot row before
+                                // removing the echo. Durable — if the process dies during
+                                // polling, the echo survives in persisted meshChats rather
+                                // than leaving a permanent duplicate from a blind delay.
+                                val chatId = meshChatId(canonicalMeshPeerId(peerId))
+                                scope.launch {
+                                    for (i in 0 until MARMOT_ECHO_RECONCILE_MAX_ATTEMPTS) {
+                                        delay(MARMOT_ECHO_RECONCILE_POLL_MS)
+                                        val canonicalExists = marmotMessagesForPeer(
+                                            peerId, chatId, transcriptGeneration
+                                        ).any { it.content == msg.content && it.senderNpub == npub }
+                                        if (canonicalExists) {
+                                            removeMeshEcho(peerId, msg.messageId)
+                                            return@launch
+                                        }
+                                    }
+                                    // Row not found after max attempts — keep echo (sticky > gap)
+                                }
                             }
                             marmotOk
                         }
@@ -8233,6 +8271,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             viaInternet = true,
         )
         appendMeshMessage(peerId, msg)
+        meshEchoIds.remove(queued.messageId) // delivered over NIP-17; no longer pending
         refreshOpenDm(peerId)
         return true
     }
