@@ -7381,6 +7381,7 @@ impl SonarClient {
         }
 
         let token_len = payload.encrypted_token.len();
+        let sender_hex = sender.to_hex();
         let cached = crate::push::CachedPushToken {
             encrypted_token_b64: payload.encrypted_token,
             server_pubkey,
@@ -7388,12 +7389,15 @@ impl SonarClient {
         {
             let mut cache = self.push_token_cache.lock().unwrap();
             // Bounded cache: reject oversized tokens and stop growing past the
-            // cap (defense-in-depth on top of the membership gate).
-            if !crate::push::should_cache_push_token(token_len, cache.len()) {
+            // cap, but always allow an in-place update for an already-cached
+            // member (e.g. a rotated token) so a full cache never pins a stale
+            // token. Defense-in-depth on top of the membership gate.
+            let already_cached = cache.contains_key(&sender_hex);
+            if !crate::push::should_cache_push_token(token_len, cache.len(), already_cached) {
                 tracing::debug!("dropping push token share (oversized token or cache full)");
                 return Ok(());
             }
-            cache.insert(sender.to_hex(), cached);
+            cache.insert(sender_hex, cached);
             crate::push::save_push_token_cache(self.push_token_cache_path.as_deref(), &cache)?;
         }
         // Event at info for the default export; sender npub only at debug so

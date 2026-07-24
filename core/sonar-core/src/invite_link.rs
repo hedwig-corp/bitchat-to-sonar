@@ -380,9 +380,15 @@ fn sanitize_invite_relays(relays: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for r in relays {
         let trimmed = r.trim();
-        if !trimmed.starts_with("wss://") {
+        // Require a wss:// scheme (reject ws://, http, bare hosts).
+        let Some(rest) = trimmed.strip_prefix("wss://") else {
             continue;
-        } // reject ws://, http, bare host
+        };
+        // Require a non-empty host segment (reject bare "wss://" / "wss:///path").
+        let host = rest.split('/').next().unwrap_or("");
+        if host.is_empty() {
+            continue;
+        }
         if trimmed.len() > MAX_INVITE_RELAY_URL_LEN {
             continue;
         }
@@ -594,5 +600,24 @@ mod tests {
 
         // The 9th wss relay (relay.i) should have been dropped
         assert!(!decoded.relays.iter().any(|r| r.contains("relay.i")));
+    }
+
+    #[test]
+    fn invite_relays_reject_hostless_and_bad_scheme() {
+        let token = InviteToken {
+            group_id: vec![1u8; 32],
+            group_name: "t".into(),
+            admin_npub: vec![2u8; 32],
+            relays: vec![
+                "wss://".into(),
+                "wss:///nohost".into(),
+                "ws://insecure".into(),
+                "wss://relay.good".into(),
+            ],
+            invite_secret: vec![3u8; 32],
+            created_at: 1,
+        };
+        let decoded = decode_invite_token(&encode_invite_token(&token).unwrap()).unwrap();
+        assert_eq!(decoded.relays, vec!["wss://relay.good"]);
     }
 }

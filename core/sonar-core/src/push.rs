@@ -41,8 +41,13 @@ pub(crate) const MAX_PUSH_TOKEN_CACHE_ENTRIES: usize = 256;
 /// Whether an incoming push-token share should be cached, given the
 /// encrypted_token length and the current cache size. Pure so it can be
 /// unit-tested independently of engine / group state.
-pub(crate) fn should_cache_push_token(encrypted_token_len: usize, cache_len: usize) -> bool {
-    encrypted_token_len <= MAX_ENCRYPTED_TOKEN_B64_LEN && cache_len < MAX_PUSH_TOKEN_CACHE_ENTRIES
+pub(crate) fn should_cache_push_token(
+    encrypted_token_len: usize,
+    cache_len: usize,
+    already_cached: bool,
+) -> bool {
+    encrypted_token_len <= MAX_ENCRYPTED_TOKEN_B64_LEN
+        && (already_cached || cache_len < MAX_PUSH_TOKEN_CACHE_ENTRIES)
 }
 
 pub(crate) fn platform_byte(platform: &str) -> crate::Result<u8> {
@@ -280,17 +285,23 @@ mod tests {
 
     #[test]
     fn should_cache_push_token_enforces_bounds() {
-        // Healthy inputs are cached.
-        assert!(should_cache_push_token(0, 0));
+        // Healthy inputs are cached (new entry).
+        assert!(should_cache_push_token(0, 0, false));
         assert!(should_cache_push_token(
             MAX_ENCRYPTED_TOKEN_B64_LEN,
-            MAX_PUSH_TOKEN_CACHE_ENTRIES - 1
+            MAX_PUSH_TOKEN_CACHE_ENTRIES - 1,
+            false
         ));
-        // Oversized encrypted token is rejected.
-        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0));
-        // Cache at / over the cap is rejected (no unbounded growth).
-        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES));
-        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1));
+        // Oversized encrypted token is rejected, even for an in-place update.
+        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0, false));
+        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0, true));
+        // A new entry at / over the cap is rejected (no unbounded growth).
+        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES, false));
+        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1, false));
+        // An in-place update for an already-cached member is allowed even at the
+        // cap (a full cache must never pin a stale / rotated token).
+        assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES, true));
+        assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1, true));
     }
 
     #[test]
