@@ -599,6 +599,28 @@ extension ChatViewModel {
     }
 
     @MainActor
+    /// Creates a local echo for an outgoing media message **before** any
+    /// transport send attempt.
+    ///
+    /// This mirrors the text-message echo in `sendPrivateMessage` and the
+    /// Android `echoMeshMedia()` pattern: a `BitchatMessage` with
+    /// `.sending` status is appended to `privateChats[peerID]` (or the
+    /// active channel timeline) so the media placeholder is visible
+    /// immediately, even when BLE is disconnected.
+    ///
+    /// When `sendFilePrivate` / `sendFileBroadcast` later fails:
+    ///   - If `meshMediaSendFallback` (internet relay) succeeds, the local
+    ///     echo is removed because the fallback path creates its own row.
+    ///   - If the fallback also fails, `handleMediaSendFailure` marks the
+    ///     row `.failed` but leaves it visible so the user can retry.
+    ///
+    /// Verified 2026-07-22: the echo is correctly created before transport.
+    ///
+    /// TRACKED GAP (Android `SonarMediaOutbox`): Android auto-retries queued
+    /// mesh media on BLE reconnect and on periodic relay-tick via
+    /// `flushAllMediaOutbox()`. iOS has no media retry queue yet — failed
+    /// media stays `.failed` for manual resend. Follow-up: port
+    /// `SonarMediaOutbox` + `flushMediaOutboxNow` to `SonarAppStore`.
     func enqueueMediaMessage(content: String, targetPeer: PeerID?) -> BitchatMessage {
         let timestamp = Date()
         let message: BitchatMessage
