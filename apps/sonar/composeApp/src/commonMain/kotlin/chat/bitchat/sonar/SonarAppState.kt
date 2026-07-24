@@ -7572,10 +7572,14 @@ class SonarAppState(private val scope: CoroutineScope) {
         val mid = messageId ?: randomMeshId()
         val ok = MeshRadio.sendMeshDm(peerId, mid, text)
         if (!ok) { toast = "Not connected over Bluetooth yet — stay close and try again"; return false }
-        // Skip echo creation when it already exists (outbox delivery path —
-        // echo was created by echoMeshMessage when the message was first queued).
-        // O(1) set lookup via meshEchoIds (was an O(chats×msgs) alias scan).
-        if (messageId == null || messageId !in meshEchoIds) {
+        // Direct send (messageId == null): create the local echo now.
+        // Outbox delivery (messageId != null): the echo was already created by
+        // echoMeshMessage when the message was first queued, so never create a
+        // second row here — just stop tracking the id. Branching on null (not on
+        // a meshEchoIds membership test) closes a duplicate-on-restart hole:
+        // meshEchoIds is in-memory and empty after boot, but the echo survives in
+        // persisted meshChats, so a membership test would wrongly re-create it.
+        if (messageId == null) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
@@ -7584,9 +7588,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             val canonicalPeerId = canonicalMeshPeerId(peerId)
             processPayLines(meshChatId(canonicalPeerId), listOf(msg))
         } else {
-            // Outbox delivery: the echo already exists (created by
-            // echoMeshMessage) and is now delivered over BLE. Stop tracking
-            // it so meshEchoIds only holds still-pending echoes.
             meshEchoIds.remove(messageId)
         }
         persistMesh(peerId)
