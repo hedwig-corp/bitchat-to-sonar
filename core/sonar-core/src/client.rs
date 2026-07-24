@@ -1549,6 +1549,17 @@ impl SyncState {
     }
 }
 
+/// Floor for a retry timestamp that may not be authenticated. Pure so it can be
+/// tested at a fixed instant; see `record_retryable` for why the floor exists.
+///
+/// A device clock before the epoch + lookback saturates the floor to 0 and the
+/// clamp becomes a no-op. That is the correct failure mode: with no trustworthy
+/// local clock there is no horizon to measure against, and refusing to rewind
+/// would be worse than rewinding too far.
+fn clamp_retryable_secs(event_secs: u64, now_secs: u64) -> u64 {
+    event_secs.max(now_secs.saturating_sub(GIFTWRAP_LOOKBACK_SECS))
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MarmotProcessReport {
     processed: usize,
@@ -1561,7 +1572,29 @@ impl MarmotProcessReport {
         self.processed += 1;
     }
 
+    /// `event_secs` is frequently a gift wrap's outer `created_at`, which NIP-59
+    /// leaves arbitrary and unauthenticated ("all other timestamps SHOULD be
+    /// tweaked"). Unclamped, a stranger sending one kind-1059 with `created_at:
+    /// 0` rewinds the persisted sync watermark to zero, which turns every later
+    /// sync into an unbounded full-history relay scan and disables the live
+    /// short-circuit.
+    ///
+    /// The floor is a deliberate trade, not a free win. Both fetch filters are
+    /// relative to the watermark, not to now (gift wraps use
+    /// `watermark - GIFTWRAP_LOOKBACK_SECS`, group messages only
+    /// `watermark - SYNC_OVERLAP_SECS`), so a rewind genuinely can reach further
+    /// back than this floor allows. What that costs is the deep retry of a
+    /// kind-445 older than the horizon, reachable via `backfill_groups`; what it
+    /// buys is that an unauthenticated timestamp can no longer move the cursor
+    /// arbitrarily far. A recent event is unaffected: `max` only ever raises a
+    /// stale value.
+    ///
+    /// Residual: an attacker can still pin the watermark at the floor by sending
+    /// one wrap per sync. Bounded at the horizon rather than the epoch, but not
+    /// eliminated; removing it means not deriving retry state from an
+    /// unauthenticated timestamp at all.
     fn record_retryable(&mut self, event_secs: u64) {
+        let event_secs = clamp_retryable_secs(event_secs, Timestamp::now().as_secs());
         self.retryable_failures += 1;
         self.oldest_retryable_secs = Some(
             self.oldest_retryable_secs
@@ -7559,6 +7592,96 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R: a gift wrap's outer `created_at` is unauthenticated and arbitrary per
+    /// NIP-59, and four inbound paths feed it straight into the retry watermark.
+    /// A stranger sending one kind-1059 with `created_at: 0` must not be able to
+    /// rewind the persisted sync cursor to the epoch, which would turn every
+    /// later sync into an unbounded full-history relay scan.
+    /// Fixed instant, so the exact assertions below cannot straddle a second
+    /// boundary the way a live `Timestamp::now()` can.
+    #[test]
+    fn hostile_giftwrap_timestamp_cannot_rewind_sync_watermark() {
+        const NOW: u64 = 1_800_000_000;
+        let horizon = NOW - GIFTWRAP_LOOKBACK_SECS;
+
+        // Exact, not a lower bound: a lower bound also passes against a floor of
+        // `now`, or any floor shallower than the horizon, neither of which is
+        // the intended behavior.
+        assert_eq!(
+            clamp_retryable_secs(0, NOW),
+            horizon,
+            "hostile created_at=0 must clamp to exactly the lookback horizon"
+        );
+        assert_eq!(
+            clamp_retryable_secs(1, NOW),
+            horizon,
+            "any pre-horizon timestamp clamps to the horizon"
+        );
+        assert_eq!(
+            clamp_retryable_secs(NOW - 600, NOW),
+            NOW - 600,
+            "a recent timestamp passes through untouched"
+        );
+        assert_eq!(
+            clamp_retryable_secs(NOW + 86_400, NOW),
+            NOW + 86_400,
+            "the clamp only raises stale values; a future timestamp is left to \
+             rewind_for_retry, which never advances the watermark"
+        );
+
+        // A clock before the epoch + lookback saturates the floor to 0. The
+        // clamp is then a no-op by design: with no trustworthy local clock
+        // there is no horizon to measure against.
+        assert_eq!(clamp_retryable_secs(0, 0), 0, "1970 clock: floor saturates");
+
+        // End to end through the real report and rewind path, at the same fixed
+        // instant, so the wiring is pinned and not just the pure function.
+        let mut report = MarmotProcessReport::default();
+        report.record_retryable(0);
+        let clamped = report.oldest_retryable_secs.expect("retryable recorded");
+        assert!(
+            clamped > 0,
+            "hostile created_at=0 reached the watermark unclamped"
+        );
+
+        let mut sync = SyncState {
+            path: None,
+            watermark_secs: Timestamp::now().as_secs() - 3600,
+            processed_event_ids: HashSet::new(),
+            processed_event_order: VecDeque::new(),
+            dirty: false,
+        };
+        sync.rewind_for_retry(clamped);
+        assert!(
+            sync.watermark_secs > 0,
+            "hostile created_at=0 rewound the persisted watermark to the epoch"
+        );
+    }
+
+    /// The clamp must not break real retries: a genuinely recent failed event
+    /// still rewinds the cursor so the next sync refetches it.
+    #[test]
+    fn recent_retryable_event_still_rewinds_watermark() {
+        let now = Timestamp::now().as_secs();
+        let mut report = MarmotProcessReport::default();
+        report.record_retryable(now - 600);
+
+        let mut sync = SyncState {
+            path: None,
+            watermark_secs: now - 60,
+            processed_event_ids: HashSet::new(),
+            processed_event_order: VecDeque::new(),
+            dirty: false,
+        };
+        sync.rewind_for_retry(report.oldest_retryable_secs.expect("retryable recorded"));
+
+        assert_eq!(
+            sync.watermark_secs,
+            now - 600 - SYNC_OVERLAP_SECS,
+            "a recent retryable event must still rewind the cursor to cover it"
+        );
+    }
 
     struct CancelledDownload;
 
