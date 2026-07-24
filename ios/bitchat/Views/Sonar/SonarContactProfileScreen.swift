@@ -104,6 +104,19 @@ struct SonarContactProfileScreen: View {
         return address
     }
 
+    /// Verification results are keyed by npub+address together, never by address
+    /// alone: the same handle can be claimed by any pubkey, so an address-only
+    /// key would let one contact's verdict answer for another's. Built in one
+    /// place because a hand-copied variant that dropped the npub silently made
+    /// the verified badge unreachable.
+    ///
+    /// Static and npub-explicit so callers that already resolved the npub do not
+    /// walk `resolvedNpub` again (it does several store lookups), and so the key
+    /// derivation is reachable from a test without constructing the screen.
+    static func nip05CacheKey(npub: String, address: String) -> String {
+        "\(SNMarmotProfileCache.canonicalKey(npub))|\(address)"
+    }
+
     /// Mesh BIP-353 first (only when the announce npub matches this contact),
     /// then verified kind-0 NIP-05 (never an unverified claim).
     private var paymentAddress: String? {
@@ -125,8 +138,8 @@ struct SonarContactProfileScreen: View {
                 return bip
             }
         }
-        let nip05Key = "\(contactNpub)|\(nip05Address ?? "")"
-        if let nip05 = nip05Address, nip05.contains("@"), nip05Verified[nip05Key] == true {
+        if let nip05 = nip05Address, nip05.contains("@"),
+           nip05Verified[Self.nip05CacheKey(npub: contactNpub, address: nip05)] == true {
             return nip05
         }
         return nil
@@ -152,7 +165,7 @@ struct SonarContactProfileScreen: View {
         guard let address = nip05Address else { return }
         let npub = resolvedNpub
         guard !npub.isEmpty else { return }
-        let cacheKey = "\(SNMarmotProfileCache.canonicalKey(npub))|\(address)"
+        let cacheKey = Self.nip05CacheKey(npub: npub, address: address)
         guard nip05Checks.insert(cacheKey).inserted else { return }
         Task { @MainActor in
             guard let ok = try? await store.marmot.verifyNip05(address: address, npub: npub) else { return }
@@ -196,8 +209,13 @@ struct SonarContactProfileScreen: View {
                             // Handle badge. checkmark.seal is deliberately NOT
                             // the shieldCheck used for manual safety-number
                             // verification — different trust semantics.
+                            // Key computed once per body pass: it walks
+                            // `resolvedNpub`, which does several store lookups.
+                            let verified = nip05Verified[
+                                Self.nip05CacheKey(npub: resolvedNpub, address: address)
+                            ] == true
                             HStack(spacing: 5) {
-                                if nip05Verified[address] == true {
+                                if verified {
                                     Image(systemName: "checkmark.seal.fill")
                                         .font(.system(size: 12, weight: .semibold))
                                         .foregroundColor(SonarTheme.accentDeep)
