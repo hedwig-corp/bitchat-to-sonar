@@ -20,6 +20,15 @@ pub const JOIN_REQUEST_RUMOR_KIND: u16 = 4445;
 pub(crate) const INVITE_LINK_STATE_FILE_SUFFIX: &str = ".sonar-invites.json";
 const INVITE_LINK_STATE_VERSION: u32 = 1;
 
+/// Max length of the hex payload following the `sinvite1` prefix (~4 KB JSON).
+/// Guards `hex::decode` / `serde_json` against hostile or accidental giant input.
+const MAX_INVITE_HEX_LEN: usize = 8192;
+
+/// Sanitization limits for invite-token relay lists.
+const MAX_INVITE_RELAYS: usize = 8;
+/// Conservative upper bound for a single relay URL in an invite token.
+const MAX_INVITE_RELAY_URL_LEN: usize = 512;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteToken {
     pub group_id: Vec<u8>,
@@ -334,10 +343,6 @@ pub fn encode_invite_token(token: &InviteToken) -> Result<String> {
     Ok(format!("sinvite1{}", hex::encode(&json)))
 }
 
-/// Max length of the hex payload following the `sinvite1` prefix (~4 KB JSON).
-/// Guards `hex::decode` / `serde_json` against hostile or accidental giant input.
-const MAX_INVITE_HEX_LEN: usize = 8192;
-
 /// Normalize any shareable invite representation into a bare `sinvite1…` token.
 ///
 /// Accepts the universal link (`https://<host>/join#sinvite1…`), the custom
@@ -367,13 +372,40 @@ pub fn normalize_invite_token(input: &str) -> Result<String> {
     Ok(format!("sinvite1{}", &after[..hex_len]))
 }
 
+/// Sanitize an attacker-supplied invite relay list: keep only `wss://` relays,
+/// dedupe case-insensitively, enforce a hard cap, and drop junk (`ws://`, bare
+/// hosts, http(s), overlong entries). Returns the safe, ordered, deduped list.
+fn sanitize_invite_relays(relays: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for r in relays {
+        let trimmed = r.trim();
+        if !trimmed.starts_with("wss://") {
+            continue;
+        } // reject ws://, http, bare host
+        if trimmed.len() > MAX_INVITE_RELAY_URL_LEN {
+            continue;
+        }
+        let key = trimmed.to_ascii_lowercase();
+        if seen.insert(key) {
+            out.push(trimmed.to_string());
+        }
+        if out.len() >= MAX_INVITE_RELAYS {
+            break;
+        } // hard cap
+    }
+    out
+}
+
 pub fn decode_invite_token(encoded: &str) -> Result<InviteToken> {
     let normalized = normalize_invite_token(encoded)?;
     let hex_str = normalized
         .strip_prefix("sinvite1")
         .ok_or_else(|| Error::InvalidInput("not a sinvite1 token".into()))?;
     let json = hex::decode(hex_str).map_err(|e| Error::InvalidInput(e.to_string()))?;
-    serde_json::from_slice(&json).map_err(|e| e.into())
+    let mut token: InviteToken = serde_json::from_slice(&json)?;
+    token.relays = sanitize_invite_relays(&token.relays);
+    Ok(token)
 }
 
 pub fn build_join_request_rumor(
@@ -514,5 +546,53 @@ mod tests {
         assert!(normalize_invite_token("  ").is_err());
         let huge = format!("sinvite1{}", "a".repeat(MAX_INVITE_HEX_LEN + 2));
         assert!(normalize_invite_token(&huge).is_err());
+    }
+
+    #[test]
+    fn invite_relays_are_sanitized() {
+        let token = InviteToken {
+            group_id: vec![1u8; 32],
+            group_name: "test".into(),
+            admin_npub: vec![2u8; 32],
+            relays: vec![
+                "wss://relay.a".into(),
+                "wss://relay.b".into(),
+                "ws://evil.insecure".into(),
+                "wss://relay.a".into(),
+                "http://nope".into(),
+                "wss://relay.c".into(),
+                "wss://relay.d".into(),
+                "wss://relay.e".into(),
+                "wss://relay.f".into(),
+                "wss://relay.g".into(),
+                "wss://relay.h".into(),
+                "wss://relay.i".into(),
+            ],
+            invite_secret: vec![3u8; 32],
+            created_at: 1,
+        };
+
+        let encoded = encode_invite_token(&token).expect("encode");
+        let decoded = decode_invite_token(&encoded).expect("decode");
+
+        // Should have exactly 8 relays (wss:// only, deduped, capped)
+        assert_eq!(decoded.relays.len(), 8);
+
+        // First two should be relay.a and relay.b in order
+        assert_eq!(decoded.relays[0], "wss://relay.a");
+        assert_eq!(decoded.relays[1], "wss://relay.b");
+
+        // No entry should start with ws:// or http
+        for relay in &decoded.relays {
+            assert!(!relay.starts_with("ws://") && !relay.starts_with("http"));
+        }
+
+        // No duplicates (case-insensitive)
+        let lowercased: Vec<String> = decoded.relays.iter().map(|r| r.to_ascii_lowercase()).collect();
+        let unique: std::collections::HashSet<_> = lowercased.iter().collect();
+        assert_eq!(unique.len(), 8);
+
+        // The 9th wss relay (relay.i) should have been dropped
+        assert!(!decoded.relays.iter().any(|r| r.contains("relay.i")));
     }
 }
