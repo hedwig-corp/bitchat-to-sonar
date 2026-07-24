@@ -120,15 +120,32 @@ impl NoiseSession {
     }
 
     /// Decrypt a bitchat transport message: strip the 4-byte BE nonce prefix,
-    /// align snow's receiving counter to it, then decrypt the ChaChaPoly body.
+    /// validate it against our own monotonic receive counter, then decrypt the
+    /// ChaChaPoly body. The wire nonce is NEVER trusted to drive the AEAD:
+    /// snow advances its own counter on each successful read_message. Replays
+    /// and out-of-order / gap messages are rejected before decryption.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         if ciphertext.len() < 4 + 16 {
             return Err(Error::Storage("noise: transport message too short".into()));
         }
-        let nonce =
+        let wire_nonce =
             u32::from_be_bytes([ciphertext[0], ciphertext[1], ciphertext[2], ciphertext[3]]);
         let body = &ciphertext[4..];
-        self.state.set_receiving_nonce(nonce as u64);
+
+        // Monotonic replay protection. The 4-byte prefix is the sender's snow
+        // sending counter (see encrypt); it must equal snow's OWN next receive
+        // counter. We never call set_receiving_nonce with the attacker-supplied
+        // value, so a captured ciphertext cannot decrypt twice: after the first
+        // successful decrypt the expected counter has advanced, and a replay
+        // (wire_nonce < expected) or a gap / out-of-order message
+        // (wire_nonce > expected) fails this check before the AEAD runs.
+        let expected = self.state.receiving_nonce();
+        if wire_nonce as u64 != expected {
+            return Err(Error::Storage(format!(
+                "noise: replay/out-of-order nonce {wire_nonce}, expected {expected}"
+            )));
+        }
+
         let mut buf = vec![0u8; body.len()];
         let len = self.state.read_message(body, &mut buf)?;
         buf.truncate(len);
@@ -190,5 +207,57 @@ mod tests {
         let mut ct = a_s.encrypt(b"secret").unwrap();
         ct[0] ^= 0xFF; // tamper
         assert!(b_s.decrypt(&ct).is_err());
+    }
+
+    #[test]
+    fn replay_of_captured_ciphertext_is_rejected() {
+        let a = NoiseKeypair::generate().unwrap();
+        let b = NoiseKeypair::generate().unwrap();
+        let mut ah = NoiseHandshake::initiator(&a.private).unwrap();
+        let mut bh = NoiseHandshake::responder(&b.private).unwrap();
+        let m1 = ah.write_message().unwrap();
+        bh.read_message(&m1).unwrap();
+        let m2 = bh.write_message().unwrap();
+        ah.read_message(&m2).unwrap();
+        let m3 = ah.write_message().unwrap();
+        bh.read_message(&m3).unwrap();
+        let mut a_s = ah.into_session().unwrap();
+        let mut b_s = bh.into_session().unwrap();
+
+        let ct = a_s.encrypt(b"once").unwrap();
+        // First decrypt succeeds.
+        assert_eq!(b_s.decrypt(&ct).unwrap(), b"once");
+        // Replaying the EXACT captured ciphertext must not decrypt again: the
+        // receiver counter has advanced to 1 but the replay still carries 0.
+        assert!(b_s.decrypt(&ct).is_err());
+    }
+
+    #[test]
+    fn out_of_order_and_gap_nonces_are_rejected() {
+        let a = NoiseKeypair::generate().unwrap();
+        let b = NoiseKeypair::generate().unwrap();
+        let mut ah = NoiseHandshake::initiator(&a.private).unwrap();
+        let mut bh = NoiseHandshake::responder(&b.private).unwrap();
+        let m1 = ah.write_message().unwrap();
+        bh.read_message(&m1).unwrap();
+        let m2 = bh.write_message().unwrap();
+        ah.read_message(&m2).unwrap();
+        let m3 = ah.write_message().unwrap();
+        bh.read_message(&m3).unwrap();
+        let mut a_s = ah.into_session().unwrap();
+        let mut b_s = bh.into_session().unwrap();
+
+        let ct0 = a_s.encrypt(b"zero").unwrap(); // carries nonce 0
+        let ct1 = a_s.encrypt(b"one").unwrap(); // carries nonce 1
+        // Out-of-order: receiving the second message first must fail
+        // (receiver expects nonce 0, the wire prefix says 1).
+        assert!(b_s.decrypt(&ct1).is_err());
+        // The first message is still accepted in order.
+        assert_eq!(b_s.decrypt(&ct0).unwrap(), b"zero");
+        // Now nonce 1 is expected, so the second message decrypts.
+        assert_eq!(b_s.decrypt(&ct1).unwrap(), b"one");
+        // Replaying either captured ciphertext is rejected.
+        assert!(b_s.decrypt(&ct0).is_err());
+        assert!(b_s.decrypt(&ct1).is_err());
     }
 }

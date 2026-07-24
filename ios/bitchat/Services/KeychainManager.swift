@@ -580,20 +580,41 @@ final class KeychainManager: KeychainManagerProtocol {
 
     // MARK: - Generic Data Storage (consolidated from KeychainHelper)
 
-    /// Save data with a custom service name
+    /// Save data with a custom service name.
+    ///
+    /// Account-Key Durability invariant #1: never delete-before-add. Update an
+    /// existing item in place, and add only when it is genuinely missing, so a
+    /// failure between operations can never leave the secret gone. Mirrors the
+    /// robust update-then-add pattern in saveDataWithResult(_:forKey:).
     func save(key: String, data: Data, service customService: String, accessible: CFString?) {
-        var query: [String: Any] = [
+        let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: customService,
-            kSecAttrAccount as String: key,
-            kSecValueData as String: data
+            kSecAttrAccount as String: key
         ]
-        if let accessible = accessible {
-            query[kSecAttrAccessible as String] = accessible
+        let updateAttributes: [String: Any] = [kSecValueData as String: data]
+
+        // 1. Update an existing item in place — never delete-before-add.
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, updateAttributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+        guard updateStatus == errSecItemNotFound else {
+            // Unexpected error (auth / device-locked): do NOT destroy the
+            // existing item. Bail out without deleting so the secret survives.
+            return
         }
 
-        SecItemDelete(query as CFDictionary)
-        SecItemAdd(query as CFDictionary, nil)
+        // 2. Item is genuinely missing: add it.
+        var addQuery = baseQuery
+        addQuery[kSecValueData as String] = data
+        addQuery[kSecAttrAccessible as String] = accessible ?? kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecAttrLabel as String] = "bitchat-\(key)"
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        if addStatus == errSecDuplicateItem {
+            // Race: another writer added it between our update and add. Retry the update.
+            _ = SecItemUpdate(baseQuery as CFDictionary, updateAttributes as CFDictionary)
+        }
     }
 
     /// Load data from a custom service

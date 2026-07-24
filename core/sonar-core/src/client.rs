@@ -7337,12 +7337,29 @@ impl SonarClient {
                 return Ok(());
             }
         };
+
+        // Authenticated-relationship gate: reject tokens from anyone who is not
+        // a member of at least one of our groups. A stranger gift-wrapping us
+        // must not pollute the cache, and an attacker-chosen server_pubkey must
+        // not become a send-time oracle / abuse vector.
+        if !self.is_known_group_member(sender) {
+            tracing::debug!("ignoring push token share from non-group-member");
+            return Ok(());
+        }
+
+        let token_len = payload.encrypted_token.len();
         let cached = crate::push::CachedPushToken {
             encrypted_token_b64: payload.encrypted_token,
             server_pubkey,
         };
         {
             let mut cache = self.push_token_cache.lock().unwrap();
+            // Bounded cache: reject oversized tokens and stop growing past the
+            // cap (defense-in-depth on top of the membership gate).
+            if !crate::push::should_cache_push_token(token_len, cache.len()) {
+                tracing::debug!("dropping push token share (oversized token or cache full)");
+                return Ok(());
+            }
             cache.insert(sender.to_hex(), cached);
             crate::push::save_push_token_cache(self.push_token_cache_path.as_deref(), &cache)?;
         }
@@ -7351,6 +7368,29 @@ impl SonarClient {
         tracing::info!("cached push token from group member");
         tracing::debug!(sender = %sender, "push token sender");
         Ok(())
+    }
+
+    /// Whether sender is a member of at least one of the local user's groups.
+    ///
+    /// Gates unauthenticated gift-wrapped payloads (e.g. kind-447 push-token
+    /// shares) so a stranger cannot pollute caches or influence send-time
+    /// behavior. Engine errors are treated as not-a-member (fail closed) and
+    /// never propagated: this is a best-effort accept-list, not a
+    /// protocol-critical decision, and a transient engine read failure must not
+    /// crash or drop the sync batch.
+    fn is_known_group_member(&self, sender: &PublicKey) -> bool {
+        let groups = match self.engine.groups() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        for group in &groups {
+            if let Ok(members) = self.engine.members(&group.mls_group_id) {
+                if members.contains(sender) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -7918,6 +7958,29 @@ mod tests {
         // At least one Connected relay: the DM can actually go out.
         assert!(should_share_push_tokens(1));
         assert!(should_share_push_tokens(5));
+    }
+
+    #[tokio::test]
+    async fn push_token_share_from_stranger_is_rejected() {
+        // An in-memory client with NO groups must not cache a kind-447 push-token
+        // share from a stranger (a sender who is a member of none of our groups).
+        let client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("in-memory client");
+        let stranger = Keys::generate().public_key();
+        let payload = serde_json::json!({
+            "encrypted_token": "dGVzdA==",
+            "server_pubkey": Keys::generate().public_key().to_hex(),
+        })
+        .to_string();
+        // A non-member share is ignored, not an error.
+        client
+            .handle_push_token_share(&stranger, &payload)
+            .expect("non-member share ignored");
+        assert!(
+            client.push_token_cache.lock().unwrap().is_empty(),
+            "stranger push token must not be cached"
+        );
     }
 
     #[tokio::test]
