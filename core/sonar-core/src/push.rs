@@ -31,6 +31,19 @@ pub(crate) const PUSH_TOKEN_CACHE_FILE_SUFFIX: &str = ".sonar-push-tokens.json";
 const PUSH_TOKEN_CACHE_VERSION: u32 = 1;
 pub(crate) const KIND_NOTIFICATION_REQUEST: u16 = 446;
 pub(crate) const KIND_PUSH_TOKEN_SHARE: u16 = 447;
+/// Maximum accepted length of an encrypted_token (base64) in a kind-447 share.
+/// Push-token blobs are tiny; anything larger is rejected to bound cache memory.
+pub(crate) const MAX_ENCRYPTED_TOKEN_B64_LEN: usize = 8192;
+/// Hard cap on the number of cached per-member push tokens. Group membership is
+/// bounded, so this is a defense-in-depth ceiling against a flood of shares.
+pub(crate) const MAX_PUSH_TOKEN_CACHE_ENTRIES: usize = 256;
+
+/// Whether an incoming push-token share should be cached, given the
+/// encrypted_token length and the current cache size. Pure so it can be
+/// unit-tested independently of engine / group state.
+pub(crate) fn should_cache_push_token(encrypted_token_len: usize, cache_len: usize) -> bool {
+    encrypted_token_len <= MAX_ENCRYPTED_TOKEN_B64_LEN && cache_len < MAX_PUSH_TOKEN_CACHE_ENTRIES
+}
 
 pub(crate) fn platform_byte(platform: &str) -> crate::Result<u8> {
     match platform {
@@ -264,6 +277,21 @@ struct PushTokenCacheEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn should_cache_push_token_enforces_bounds() {
+        // Healthy inputs are cached.
+        assert!(should_cache_push_token(0, 0));
+        assert!(should_cache_push_token(
+            MAX_ENCRYPTED_TOKEN_B64_LEN,
+            MAX_PUSH_TOKEN_CACHE_ENTRIES - 1
+        ));
+        // Oversized encrypted token is rejected.
+        assert!(!should_cache_push_token(MAX_ENCRYPTED_TOKEN_B64_LEN + 1, 0));
+        // Cache at / over the cap is rejected (no unbounded growth).
+        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES));
+        assert!(!should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1));
+    }
 
     #[test]
     fn push_token_cache_survives_reload() {
