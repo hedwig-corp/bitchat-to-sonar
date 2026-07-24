@@ -2605,6 +2605,17 @@ final class SonarAppStore: ObservableObject {
 
     private func peerDisplayName(_ id: String) -> String {
         let peerID = PeerID(str: id)
+        // The linked account's LIVE kind-0 profile name wins over the BLE
+        // nickname (transport metadata): a rename must reach the row both in
+        // range and after the peer drops out of range.
+        if let profile = resolvedSonarProfile(id),
+           let name = marmot.displayName(forNpub: profile.npub) {
+            marmot.refreshProfileOnNameMismatch(
+                npub: profile.npub,
+                liveName: chatViewModel.meshService.peerNickname(peerID: peerID),
+            )
+            return name
+        }
         if let live = chatViewModel.meshService.peerNickname(peerID: peerID),
            !live.isEmpty {
             return live
