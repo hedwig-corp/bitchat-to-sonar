@@ -608,6 +608,14 @@ final class KeychainManager: KeychainManagerProtocol {
         // 2. Item is genuinely missing: add it.
         var addQuery = baseQuery
         addQuery[kSecValueData as String] = data
+        // Default to AfterFirstUnlockThisDeviceOnly to match the account-key
+        // convention (see saveDataWithResult / the #13 BLE background-wake fix):
+        // a WhenUnlocked item is unreadable when the app is woken in the
+        // background with the screen locked. The ThisDeviceOnly suffix also
+        // keeps the item from being restored to a different device (it remains
+        // in same-device encrypted backups but is excluded from iCloud /
+        // cross-device restore) — intentional for a local-first account whose
+        // recovery path is the explicit nsec export.
         addQuery[kSecAttrAccessible as String] = accessible ?? kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         addQuery[kSecAttrLabel as String] = "bitchat-\(key)"
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
