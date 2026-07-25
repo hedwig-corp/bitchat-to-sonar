@@ -3388,7 +3388,7 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
             // shortIDToNoiseKey reads/writes are main-serialized alongside
             // every other main-owned dictionary in this method. The key data
             // is still captured before removeEphemeralSession runs below.
-            var stableKey: String? = self.shortIDToNoiseKey[peerID]
+            var stableKey: PeerID? = self.shortIDToNoiseKey[peerID]
             if stableKey == nil,
                let key = self.meshService.getNoiseService().getPeerPublicKeyData(peerID) {
                 stableKey = PeerID(hexData: key)
