@@ -7663,18 +7663,32 @@ class SonarAppState(private val scope: CoroutineScope) {
             val stickerRef = meshParseStickerContent(text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
-            val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
+            // "Sent" = local transport accepted only; a recipient receipt
+            // upgrades it to "Delivered" in drainMeshDeliveryReceipts.
+            val msg = SonarMsg(mid, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef, state = "Sent")
             meshChats[peerId] = meshChats[peerId].orEmpty() + msg
             val canonicalPeerId = canonicalMeshPeerId(peerId)
             processPayLines(meshChatId(canonicalPeerId), listOf(msg))
         } else {
             meshEchoIds.remove(messageId)
+            // The queued echo was painted with no transport; BLE has now accepted
+            // the frame, so promote it the same way a direct send is tagged.
+            markMeshRowState(peerId, messageId, "Sent")
         }
         persistMesh(peerId)
         val canonicalPeerId = canonicalMeshPeerId(peerId)
         scope.launch { refreshOpenDm(canonicalPeerId) }
         refreshMeshDmRows()
         return true
+    }
+
+    /** Retag an existing local mesh row. Used to promote a queued outbox echo to
+     *  "Sent" once BLE accepted the frame. No-op when the row is gone or already
+     *  carries that state, so it is safe to call on every flush. */
+    private fun markMeshRowState(peerId: String, messageId: String, state: String) {
+        val existing = meshChats[peerId].orEmpty()
+        if (existing.none { it.id == messageId && it.state != state }) return
+        meshChats[peerId] = existing.map { if (it.id == messageId) it.copy(state = state) else it }
     }
 
     /** Create a local mesh-DM echo so the message is visible in the chat
@@ -9366,11 +9380,22 @@ class SonarAppState(private val scope: CoroutineScope) {
                 MeshRadio.sendMeshDeliveryAck(m.peerId, m.messageId)
                 continue
             }
+            // The wire message id is sender-chosen, so only a peer's own earlier
+            // row may satisfy this — never one of ours. Re-ACK rather than drop
+            // silently: the peer is most likely re-sending because our first
+            // receipt was lost, and a second ack is what unsticks their row.
+            val incomingId = m.messageId.ifBlank { randomMeshId() }
+            if (m.messageId.isNotBlank() &&
+                meshChats[m.peerId].orEmpty().any { it.id == incomingId && !it.mine }
+            ) {
+                MeshRadio.sendMeshDeliveryAck(m.peerId, m.messageId)
+                continue
+            }
             val stickerRef = meshParseStickerContent(m.text)?.let {
                 SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
             }
             val msg = SonarMsg(
-                m.messageId.ifBlank { randomMeshId() }, m.peerId,
+                incomingId, m.peerId,
                 if (stickerRef != null) "" else m.text,
                 mine = false, m.tsSecs, stickerRef = stickerRef,
             )
@@ -9675,7 +9700,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             val id = m.messageId.ifBlank { randomMeshId() }
             // id is sender-chosen: a peer must not suppress its own incoming media
             // by reusing one of our outgoing row ids.
-            if (meshChats[m.peerId].orEmpty().any { it.id == id && !it.mine }) continue
+            if (m.messageId.isNotBlank() &&
+                meshChats[m.peerId].orEmpty().any { it.id == id && !it.mine }
+            ) {
+                // Already persisted by the first delivery, so ack immediately
+                // instead of routing through persistMesh's post-write ack.
+                MeshRadio.sendMeshDeliveryAck(m.peerId, m.messageId)
+                continue
+            }
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
             val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes

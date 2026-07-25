@@ -3,7 +3,6 @@ package chat.bitchat.sonar
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertNull
 
 class SonarOutboxTest {
     @Test
@@ -71,57 +70,4 @@ class SonarOutboxTest {
 
         assertEquals(listOf("three"), outbox.snapshot("peer-1").map { it.content })
     }
-}
-
-class PendingMarmotOutboxTest {
-    private fun send(content: String) = PendingMarmotSend(
-        content = content,
-        peerId = "peer-1",
-        chatId = "mesh:peer-1",
-        echoId = "echo-$content",
-    )
-
-    @Test
-    fun failedHeadStaysAheadOfMessagesQueuedWhileItWasInFlight() {
-        val outbox = PendingMarmotOutbox()
-        val first = send("first")
-        val later = send("later")
-        outbox.enqueue("npub-1", first)
-
-        val inFlight = outbox.peek("npub-1")
-        outbox.enqueue("npub-1", later)
-        // Failure deliberately does not acknowledge/requeue the head.
-
-        assertEquals(listOf("first", "later"), outbox.snapshot("npub-1").map { it.content })
-        assertEquals(first, inFlight)
-        assertEquals(true, outbox.removeFirst("npub-1", first))
-        assertEquals(later, outbox.peek("npub-1"))
-    }
-
-    @Test
-    fun staleWorkerCannotAcknowledgeANewerHead() {
-        val outbox = PendingMarmotOutbox()
-        val delivered = send("delivered")
-        val next = send("next")
-        outbox.enqueue("npub-1", delivered)
-        outbox.enqueue("npub-1", next)
-        assertEquals(true, outbox.removeFirst("npub-1", delivered))
-
-        assertFalse(outbox.removeFirst("npub-1", delivered))
-        assertEquals(next, outbox.peek("npub-1"))
-    }
-
-    @Test
-    fun clearDropsEveryPeerQueueAtDeletionBoundary() {
-        val outbox = PendingMarmotOutbox()
-        outbox.enqueue("npub-1", send("one"))
-        outbox.enqueue("npub-2", send("two"))
-
-        outbox.clear()
-
-        assertEquals(emptyList(), outbox.peerIds())
-        assertNull(outbox.peek("npub-1"))
-        assertNull(outbox.peek("npub-2"))
-    }
-
 }

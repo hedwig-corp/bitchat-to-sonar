@@ -194,7 +194,15 @@ object MeshGatt {
 
     // ── Lifecycle ──
 
+    /** "The radio is running." Every engine transition is gated on this, and
+     *  GATT callbacks arrive on binder threads, so it is set synchronously in
+     *  [startServer] — arming it on the handler thread instead dropped any
+     *  connect/discovery callback that landed before the handler drained. */
     @Volatile private var tickArmed = false
+    /** "The tick timer is posted." Separate from [tickArmed] because this one
+     *  exists only to stop two ticks rescheduling each other, which is a
+     *  handler-thread concern. */
+    @Volatile private var tickScheduled = false
     @Volatile private var requestedStartGeneration = -1L
 
     private val tick = object : Runnable {
@@ -208,6 +216,15 @@ object MeshGatt {
             // disconnect callbacks can accept a write/CCC op and never call
             // back, freezing that connection's op queue (and any sibling
             // instance still waiting to subscribe).
+            //
+            // This RESETS the route instead of merely unblocking the queue, and
+            // that is required, not defensive: the packet already went through
+            // Noise `encrypt`, which consumed a transport nonce. If those bytes
+            // never land, the peer's receive counter is permanently behind and
+            // every later message on the session fails to authenticate. Draining
+            // the next op over a desynchronized session would turn one lost
+            // write into a silently dead route. Do not "optimize" this back into
+            // a queue nudge.
             for (addr in clientWriting.toList()) {
                 val since = opInFlightSinceMs[addr] ?: continue
                 if (now - since >= OP_STUCK_MS) {
@@ -241,25 +258,34 @@ object MeshGatt {
                 }
             }
             transact { engine.onTick(now) }
-            if (tickArmed) handler.postDelayed(this, TICK_MS)
+            if (tickArmed) handler.postDelayed(this, TICK_MS) else tickScheduled = false
         }
     }
 
     private val armTick = Runnable {
         synchronized(txLock) {
-            if (requestedStartGeneration != deliveryGeneration.get() || tickArmed) return@Runnable
-            tickArmed = true
+            if (requestedStartGeneration != deliveryGeneration.get() ||
+                !tickArmed ||
+                tickScheduled
+            ) {
+                return@Runnable
+            }
+            tickScheduled = true
         }
         handler.postDelayed(tick, TICK_MS)
     }
 
     fun startServer() {
-        // Arm on the handler thread: start()/stop() are called off the main
-        // looper; (dis)arming serialized on the tick's own looper avoids two
-        // ticks rescheduling each other forever.
+        // The tick TIMER is armed on the handler thread (start()/stop() are
+        // called off the main looper, and serializing the scheduling on the
+        // tick's own looper avoids two ticks rescheduling each other forever).
+        // The RUNNING flag is not: it gates every engine transition, and GATT
+        // callbacks land on binder threads, so it must be visible before the
+        // first callback rather than whenever the handler next drains.
         engine.setWallClock(nowMs(), System.currentTimeMillis())
         synchronized(txLock) {
             requestedStartGeneration = deliveryGeneration.get()
+            tickArmed = true
         }
         handler.post(armTick)
         if (server != null) return
@@ -291,6 +317,7 @@ object MeshGatt {
         // an intentional privacy teardown can never turn into router retry.
         synchronized(txLock) {
             tickArmed = false
+            tickScheduled = false
             requestedStartGeneration = -1L
             deliveryGeneration.incrementAndGet()
             engine.reset()

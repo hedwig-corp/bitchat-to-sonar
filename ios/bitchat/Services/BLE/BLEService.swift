@@ -105,6 +105,13 @@ final class BLEService: NSObject {
     
     // 4. Efficient Message Deduplication
     private let messageDeduplicator = MessageDeduplicator()
+    /// Sender-scoped wire message ids of private files already persisted. The
+    /// packet-level deduplicator keys on the packet timestamp, so a re-sent file
+    /// passes it; without this a retry after a lost receipt would store the media
+    /// twice. Bounded FIFO — this only has to outlive a sender's retry window.
+    private var seenPrivateFileMessageIDs: [String] = []
+    private var seenPrivateFileMessageIDSet: Set<String> = []
+    private static let maxSeenPrivateFileMessageIDs = 512
     private var selfBroadcastMessageIDs: [String: (id: String, timestamp: Date)] = [:]
     private lazy var mediaDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -1362,6 +1369,20 @@ final class BLEService: NSObject {
         }
     }
 
+    /// Returns true when this exact (sender, wire message id) file was already
+    /// stored, so the caller should re-ACK and drop instead of storing it again.
+    private func isDuplicatePrivateFile(peerID: PeerID, messageID: String) -> Bool {
+        let key = "\(peerID.id)|\(messageID)"
+        if seenPrivateFileMessageIDSet.contains(key) { return true }
+        seenPrivateFileMessageIDSet.insert(key)
+        seenPrivateFileMessageIDs.append(key)
+        if seenPrivateFileMessageIDs.count > Self.maxSeenPrivateFileMessageIDs {
+            let evicted = seenPrivateFileMessageIDs.removeFirst()
+            seenPrivateFileMessageIDSet.remove(evicted)
+        }
+        return false
+    }
+
     private func handleFileTransfer(_ packet: BitchatPacket, from peerID: PeerID) {
         if peerID == myPeerID && packet.ttl != 0 { return }
 
@@ -1486,6 +1507,17 @@ final class BLEService: NSObject {
         }
 
         let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
+
+        // A re-send after a lost receipt must return a fresh ack, not a second row.
+        if isPrivateMessage,
+           let messageID = filePacket.messageID,
+           isDuplicatePrivateFile(peerID: peerID, messageID: messageID) {
+            sendDeliveryAck(for: messageID, to: peerID)
+            #if DEBUG
+            appendBleDebugReport("file duplicate re-ack message=\(messageID) peer=\(peerID.id)")
+            #endif
+            return
+        }
 
         if isPrivateMessage {
             updatePeerLastSeen(peerID)
