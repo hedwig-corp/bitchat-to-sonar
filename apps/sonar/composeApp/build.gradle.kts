@@ -309,8 +309,8 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 11
-        versionName = "0.1-alpha.11"
+        versionCode = 12
+        versionName = "0.1-alpha.12"
         buildConfigField(
             "String",
             "BREEZ_API_KEY",

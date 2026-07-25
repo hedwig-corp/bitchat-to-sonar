@@ -1,13 +1,14 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.11.0 (27)** · release tag **v0.1-alpha.11**
+Build: **Sonar 1.12.0 (28)** · release tag **v0.1-alpha.12**
 
-This build is a cross-platform alpha cut after Signal-style transcript pinning
-under the keyboard, Android relay diagnostics / mesh publish ANR fixes, macOS
-smoke delivery metrics, sticker black-placeholder recovery, and return-key
-newline consistency in composers. Opening a chat should still paint from local
-storage first; missed messages catch up in the background; payments and
-notifications should stay stable when the phone is locked or the app is killed.
+This build is a cross-platform alpha cut after live-edge transcript opens,
+mesh DM reliability (BLE disconnect / address rotation), gift-wrap join-request
+binding, Marmot send auto-retry, delete/leave chat local-first, media upload
+progress, trill/mute, and unread-badge + expand-control fixes. Opening a chat
+should paint from local storage first; fully-read DMs should land on the last
+message; missed messages catch up in the background; payments and notifications
+should stay stable when the phone is locked or the app is killed.
 
 If something crashes on launch, while locked, or right after sending a message,
 photo, or payment — that is the highest-priority report. If sync feels slow or
