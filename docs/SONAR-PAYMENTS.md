@@ -62,6 +62,33 @@ Direct sends require a valid BOLT12 offer from the peer's Sonar metadata. BLE
 payment capability bits may show the affordance while the descriptor is being
 fetched, but sending refuses until the concrete offer is available.
 
+### Descriptor cache durability (why "Send bitcoin" must not flicker)
+
+A resolved descriptor is the *only* payment route for a pure White Noise
+contact — a peer met over BLE also carries the `CAP_PAY` bit in their persisted
+profile, but an npub-only contact does not. Two invariants follow, and both
+have already caused an intermittent "the bitcoin payment option is not showing"
+report:
+
+1. **A relay miss must never evict a resolved descriptor.** `fetch_sonar_descriptor`
+   returns `Ok(None)` for an ordinary empty result — relays reconnecting after
+   background, the 10 s `FETCH_TIMEOUT` expiring, a relay that simply does not
+   hold the event. Treating that as "this peer has no offer" drops a known-good
+   BOLT12 offer and silently removes the payment row from a chat that was
+   payable a moment ago. Keep the last resolved descriptor and stamp only the
+   miss, so the short miss cooldown (not the long success TTL) drives the retry.
+   Compose: `SonarAppState.performDescriptorFetch`. iOS:
+   `MarmotChatModel.performDescriptorFetch` /
+   `MarmotChatModel.descriptorCacheAfterFetch`.
+2. **The cache is durable, not per-process.** Holding descriptors only in memory
+   hides the payment affordance on every cold start until a relay round-trip
+   lands. Persist them and hydrate at init so payments paint from local state
+   first (Signal-Comparable Performance Rule). Compose:
+   `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both are
+   account-scoped: wipe/identity replacement clears them, and a fetch started
+   under the previous identity is dropped by a generation guard rather than
+   persisted into the new account.
+
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,

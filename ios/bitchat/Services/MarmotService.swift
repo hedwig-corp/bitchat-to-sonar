@@ -238,7 +238,7 @@ final class MarmotService: @unchecked Sendable {
 
     /// Public Sonar capability descriptor discovered from a peer's npub.
     /// Contains stable protocol metadata only, never live call addresses.
-    struct SonarDescriptor: Sendable, Equatable {
+    struct SonarDescriptor: Sendable, Equatable, Codable {
         let schema: UInt32
         let calls: Bool
         let media: [String]

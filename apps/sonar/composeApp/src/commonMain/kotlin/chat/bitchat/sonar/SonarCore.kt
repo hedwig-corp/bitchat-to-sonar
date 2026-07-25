@@ -215,6 +215,10 @@ data class SonarDescriptor(
 
 internal const val PROFILE_CACHE_BLOB_KEY = "profiles.byNpub.v1"
 internal const val CHAT_SNAPSHOT_BLOB_KEY = "chats.snapshot.v1"
+/** Resolved Sonar descriptors, keyed by npub hex. Persisted so the payment /
+ *  call affordances paint from local state on cold start instead of waiting on
+ *  a relay round-trip (Signal-Comparable Performance Rule). */
+internal const val SONAR_DESCRIPTOR_CACHE_BLOB_KEY = "sonar.descriptors.v1"
 
 internal fun canonicalProfileKey(value: String): String {
     val clean = value.trim()
@@ -329,6 +333,74 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
             put(id, latest)
         }
     }
+
+/** Encode the resolved-descriptor cache (npub hex → descriptor) for durable
+ *  storage. Every string rides through [hexEnc] so an offer or capability token
+ *  can never corrupt the tab/newline framing. */
+internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
+    descriptors.entries
+        .mapNotNull { (key, descriptor) ->
+            val npubHex = normalizedDescriptorCacheKey(key) ?: return@mapNotNull null
+            npubHex to descriptor
+        }
+        .sortedBy { it.first }
+        .joinToString("\n") { (npubHex, d) ->
+            listOf(
+                npubHex,
+                d.schema.toString(),
+                if (d.calls) "1" else "0",
+                hexEnc(d.media.joinToString(",")),
+                hexEnc(d.signaling.joinToString(",")),
+                hexEnc(d.transports.joinToString(",")),
+                hexEnc(d.callIdentity),
+                profileField(d.bolt12Offer),
+                hexEnc(d.paymentReceipts.joinToString(",")),
+                d.publishedAtSecs.toString(),
+            ).joinToString("\t")
+        }
+
+internal fun decodeSonarDescriptorCache(blob: String): Map<String, SonarDescriptor> =
+    blob.lineSequence()
+        .mapNotNull { line ->
+            if (line.isBlank()) return@mapNotNull null
+            val parts = line.split("\t")
+            if (parts.size != 10) return@mapNotNull null
+            val npubHex = normalizedDescriptorCacheKey(parts[0]) ?: return@mapNotNull null
+            val schema = parts[1].toIntOrNull() ?: return@mapNotNull null
+            val calls = when (parts[2]) {
+                "1" -> true
+                "0" -> false
+                else -> return@mapNotNull null
+            }
+            val media = hexDec(parts[3])?.splitDescriptorList() ?: return@mapNotNull null
+            val signaling = hexDec(parts[4])?.splitDescriptorList() ?: return@mapNotNull null
+            val transports = hexDec(parts[5])?.splitDescriptorList() ?: return@mapNotNull null
+            val callIdentity = hexDec(parts[6]) ?: return@mapNotNull null
+            val bolt12Offer = profileFieldValue(parts[7]) ?: return@mapNotNull null
+            val receipts = hexDec(parts[8])?.splitDescriptorList() ?: return@mapNotNull null
+            val publishedAtSecs = parts[9].toLongOrNull() ?: return@mapNotNull null
+            npubHex to SonarDescriptor(
+                schema = schema,
+                calls = calls,
+                media = media,
+                signaling = signaling,
+                transports = transports,
+                callIdentity = callIdentity,
+                bolt12Offer = bolt12Offer.value,
+                paymentReceipts = receipts,
+                publishedAtSecs = publishedAtSecs,
+            )
+        }
+        .toMap()
+
+/** Descriptors are cached under the 32-byte pubkey as lowercase hex — the key
+ *  `paymentNpubHex` / `callDescriptorNpubHex` look up with. */
+private fun normalizedDescriptorCacheKey(value: String): String? =
+    value.trim().lowercase()
+        .takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
+
+private fun String.splitDescriptorList(): List<String> =
+    if (isEmpty()) emptyList() else split(",").filter { it.isNotBlank() }
 
 private fun profileField(value: String?): String =
     value?.let { "1" + hexEnc(it) } ?: "0"

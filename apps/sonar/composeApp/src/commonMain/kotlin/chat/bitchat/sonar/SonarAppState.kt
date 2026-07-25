@@ -863,12 +863,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity. */
-    var sonarDescriptorsByNpubHex by mutableStateOf<Map<String, SonarDescriptor>>(emptyMap())
+    /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity
+     *  and for the BOLT12 offer that unlocks "Send bitcoin". Hydrated from the
+     *  persisted cache so a cold start paints the payment affordance from local
+     *  state instead of waiting on a relay round-trip. */
+    var sonarDescriptorsByNpubHex by mutableStateOf(
+        decodeSonarDescriptorCache(SonarCore.loadBlob(SONAR_DESCRIPTOR_CACHE_BLOB_KEY))
+    )
         private set
     private val sonarDescriptorFetches = mutableSetOf<String>()
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
     private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()
+    /** Bumped on identity teardown so a descriptor fetch started under the old
+     *  account cannot land — and persist — after the wipe. */
+    private var descriptorCacheGeneration = 0
     private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
     val screen: Screen get() = stack.last()
 
@@ -930,7 +938,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
-            sonarDescriptorsByNpubHex = emptyMap()
+            sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCache(); descriptorCacheGeneration++
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
             needsSonarDescriptorPublish = false
@@ -2805,6 +2813,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ?.takeIf { isDirectMarmotChat(it) }
                 ?.let { otherMembers(it).singleOrNull() }
                 ?.let { canonicalNpubHex(it) }
+            // NOTE: a pending chat (XChat-Style Chat Startup Rule) is deliberately
+            // NOT payable even though we know the peer's npub: the ⚡PAY receipt
+            // lines need a real Marmot group, so paying here would settle on
+            // Lightning with no in-chat receipt. Tracked follow-up: queue the
+            // receipt through pendingDirectMarmotSends, then allow it.
         }
 
     private fun directPaymentOffer(chatId: String): String? {
@@ -3451,7 +3464,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
-                sonarDescriptorsByNpubHex = emptyMap()
+                sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCache(); descriptorCacheGeneration++
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
                 publishedSonarDescriptor = false
                 publishedSonarDescriptorBolt12Offer = null
@@ -4706,15 +4719,35 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun performDescriptorFetch(key: String) {
+        val generation = descriptorCacheGeneration
         val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+        // The cache is durable now, so a fetch started under the previous
+        // identity must not write (and persist) its contacts into the new
+        // account after a wipe/restore.
+        if (generation != descriptorCacheGeneration) {
+            sonarDescriptorFetches.remove(key)
+            return
+        }
         if (descriptor != null) {
             sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
             sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
             sonarDescriptorMissedAt.remove(key)
+            persistSonarDescriptorCache()
         } else {
+            // A miss is transient (relay reconnecting, FETCH_TIMEOUT, a relay
+            // that just doesn't hold the event) — never evict an already
+            // resolved descriptor, or the peer's BOLT12 offer disappears and a
+            // payable chat silently loses "Send bitcoin".
             sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
         }
         sonarDescriptorFetches.remove(key)
+    }
+
+    private fun persistSonarDescriptorCache() {
+        SonarCore.saveBlob(
+            SONAR_DESCRIPTOR_CACHE_BLOB_KEY,
+            encodeSonarDescriptorCache(sonarDescriptorsByNpubHex),
+        )
     }
 
     private fun refreshKnownContactDescriptors(clearMisses: Boolean = false) {
