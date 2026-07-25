@@ -998,11 +998,16 @@ pub mod file_packet {
                     out.extend_from_slice(mb);
                 }
             }
-            if let Some(message_id) = &self.message_id {
-                let id = message_id.as_bytes();
-                if id.is_empty() || id.len() > u16::MAX as usize {
-                    return None;
-                }
+            // Same asymmetry on the way out: an unusable id costs the receipt,
+            // not the transfer. Skipping the TLV degrades to legacy behaviour
+            // (the recipient simply returns no receipt) instead of failing a
+            // send the user asked for.
+            if let Some(id) = self
+                .message_id
+                .as_deref()
+                .map(str::as_bytes)
+                .filter(|id| !id.is_empty() && id.len() <= u16::MAX as usize)
+            {
                 out.push(T_MESSAGE_ID);
                 out.extend_from_slice(&(id.len() as u16).to_be_bytes());
                 out.extend_from_slice(id);
@@ -1080,11 +1085,15 @@ pub mod file_packet {
                     }
                     T_MIME_TYPE => mime_type = String::from_utf8(value.to_vec()).ok(),
                     T_MESSAGE_ID => {
-                        let decoded = String::from_utf8(value.to_vec()).ok()?;
-                        if decoded.is_empty() {
-                            return None;
-                        }
-                        message_id = Some(decoded);
+                        // Degrade, never fail: this is an OPTIONAL Sonar
+                        // extension whose only job is to enable a delivery
+                        // receipt. Rejecting the packet would let a malformed
+                        // hint destroy the media it was attached to — every
+                        // other optional field here degrades (T_MIME_TYPE uses
+                        // `.ok()`, unknown tags `continue`).
+                        message_id = String::from_utf8(value.to_vec())
+                            .ok()
+                            .filter(|id| !id.is_empty());
                     }
                     T_CONTENT => {
                         if content.len() + value.len() > MAX_PAYLOAD_BYTES {
@@ -1148,6 +1157,59 @@ pub mod file_packet {
 
 #[cfg(test)]
 mod tests {
+
+    /// An optional extension TLV must never be able to destroy the payload it
+    /// rides on. A peer (or a future version) emitting a malformed 0x05 must
+    /// cost the delivery receipt only — the media still has to arrive.
+    #[test]
+    fn malformed_optional_message_id_degrades_instead_of_dropping_the_file() {
+        use super::file_packet::FilePacket;
+
+        let good = FilePacket {
+            file_name: Some("photo.jpg".into()),
+            file_size: Some(3),
+            mime_type: Some("image/jpeg".into()),
+            message_id: Some("mid-1".into()),
+            content: vec![1, 2, 3],
+        };
+        let encoded = good.encode().expect("encode");
+        let round = FilePacket::decode(&encoded).expect("decode");
+        assert_eq!(round.message_id.as_deref(), Some("mid-1"));
+        assert_eq!(round.content, vec![1, 2, 3]);
+
+        // Hand-build a packet whose 0x05 value is invalid UTF-8, then one whose
+        // 0x05 value is empty. Both must decode with the content intact.
+        for bad_value in [vec![0xff, 0xfe], Vec::new()] {
+            let mut raw: Vec<u8> = Vec::new();
+            raw.push(0x03);
+            raw.extend_from_slice(&(10u16).to_be_bytes());
+            raw.extend_from_slice(b"image/jpeg");
+            raw.push(0x05);
+            raw.extend_from_slice(&(bad_value.len() as u16).to_be_bytes());
+            raw.extend_from_slice(&bad_value);
+            raw.push(0x04);
+            raw.extend_from_slice(&(3u32).to_be_bytes());
+            raw.extend_from_slice(&[1, 2, 3]);
+
+            let decoded = FilePacket::decode(&raw)
+                .expect("a malformed optional message id must not drop the file");
+            assert_eq!(decoded.content, vec![1, 2, 3]);
+            assert_eq!(decoded.message_id, None, "no receipt, but the media survives");
+            assert_eq!(decoded.mime_type.as_deref(), Some("image/jpeg"));
+        }
+
+        // Encoding is symmetric: an unusable id is skipped, not fatal.
+        let empty_id = FilePacket { message_id: Some(String::new()), ..good.clone() };
+        let encoded_empty = empty_id.encode().expect("an empty id must not fail the send");
+        assert_eq!(FilePacket::decode(&encoded_empty).unwrap().message_id, None);
+
+        let oversized = FilePacket {
+            message_id: Some("x".repeat(u16::MAX as usize + 1)),
+            ..good.clone()
+        };
+        let encoded_oversized = oversized.encode().expect("an oversized id must not fail the send");
+        assert_eq!(FilePacket::decode(&encoded_oversized).unwrap().message_id, None);
+    }
     use super::*;
 
     #[test]

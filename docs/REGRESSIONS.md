@@ -446,6 +446,39 @@ constant 43 bytes and the exact cliff is a 213-byte chunk.
 - *Using the exact 213-byte ceiling.* Zero headroom; any added header field
   crosses the cliff.
 
+## R-015 — An optional TLV must never destroy the payload it rides on
+
+**Invariant:** The `0x05` message-id TLV on a BLE file transfer exists only to
+enable a delivery receipt. A malformed, empty or oversized value must degrade to
+"no receipt" on both encode and decode, on both platforms — never fail the
+packet.
+
+**Breaks as:** a peer sends a photo and it silently never arrives, because the
+receiving decoder returned `nil` for the whole `FilePacket` over an unusable
+optional hint. On the sending side an unusable id failed `encode()`, which
+surfaces as "not connected" and no media sent.
+
+**Call sites:** `mesh.rs::file_packet::FilePacket::encode` / `decode` (the
+`T_MESSAGE_ID` arm) and `BitchatFilePacket.encode()` / `decode()` (the
+`.messageID` case). Both directions on both platforms — a one-sided fix leaves
+the pair asymmetric, which is worse than either behaviour alone.
+
+**Guarded by:** `mesh.rs::malformed_optional_message_id_degrades_instead_of_dropping_the_file`, `BitchatFilePacketTests.testUnusableMessageIDCostsTheReceiptNotTheTransfer`, `BitchatFilePacketTests.testMalformedMessageIDTLVStillDecodesTheFile`
+
+**Not guarded:** cross-implementation behaviour against stock bitchat, which does
+not know tag `0x05` at all — that path relies on unknown tags being skipped, and
+nothing here exercises a real stock decoder. iOS tests also do not run in CI.
+
+**History:** Introduced with the receipt feature: both sides rejected the packet
+on a bad id, so an optional extension could destroy the media. Found in review
+of #312.
+
+**Rejected:**
+- *Failing loudly so a bad id is noticed.* The id is chosen by the sender and
+  arrives unauthenticated; failing gives any peer a way to make our media vanish.
+- *Fixing only decode.* Encode returning nil aborts a send the user asked for,
+  for a field that carries no user content.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

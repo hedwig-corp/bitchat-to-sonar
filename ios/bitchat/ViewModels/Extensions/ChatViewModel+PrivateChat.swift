@@ -443,7 +443,14 @@ extension ChatViewModel {
                         messageID: messageID,
                         content: data
                     )
-                    guard packet.encode() != nil else {
+                    // Validate WITHOUT encoding. `packet.encode() != nil` here
+                    // ran a full TLV encode plus a Data copy of the ~1 MiB image
+                    // on the MainActor, threw it away, and left
+                    // `sendFilePrivate` to encode the same packet again — and it
+                    // could not have been replaced by checking that call's
+                    // return value, because it encodes asynchronously on
+                    // `messageQueue` and returns true before that can fail.
+                    guard packet.isEncodable else {
                         self.handleMediaSendFailure(messageID: messageID, reason: "Failed to encode image")
                         return
                     }
