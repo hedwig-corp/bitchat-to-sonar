@@ -2743,6 +2743,7 @@ final class SonarAppStore: ObservableObject {
         // that land via gap recovery after the drain list was returned.
         if marmot.pushWakeOwnsNotifications { return }
         for group in marmot.groups {
+            if marmot.isNoteToSelf(group) { continue }
             let convId = marmotConvId(forGroup: group.id)
             let title = marmot.title(for: group)
             for message in marmot.messagesByGroup[group.id] ?? [] where !message.isMine {
@@ -4445,12 +4446,14 @@ final class SonarAppStore: ObservableObject {
         for group in marmot.groups {
             let last = marmot.homeRowMessage(groupId: group.id)
             guard marmot.isDirectGroup(group) else {
+                let isNote = marmot.isNoteToSelf(group)
                 marmotRows.append(SNDMRow(
                     id: Self.marmotIDPrefix + group.id,
-                    title: marmot.title(for: group),
-                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? "Secure group · reaches anywhere",
+                    title: isNote ? "Note to Self" : marmot.title(for: group),
+                    preview: last.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) }
+                        ?? (isNote ? "Tap to open" : "Secure group · reaches anywhere"),
                     time: last.map { Self.listTime($0.createdAt) } ?? "",
-                    unread: (marmot.unreadByGroup[group.id] ?? 0) > 0,
+                    unread: isNote ? false : (marmot.unreadByGroup[group.id] ?? 0) > 0,
                     presence: false,
                     verified: false,
                     isMarmot: true,

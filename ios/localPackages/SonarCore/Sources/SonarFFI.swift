@@ -1543,6 +1543,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func drainPendingMarmot() throws  -> [DrainNotificationInfo]
 
     /**
+     * Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+     * Returns the group id as hex.
+     */
+    func ensureNoteToSelf() throws  -> String
+
+    /**
      * Re-subscribe with the current watermark and group set to self-heal
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
@@ -1587,6 +1593,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrls: [String]) throws  -> StickerPackInfo
 
     /**
+     * Return the Note to Self group id hex when already present.
+     */
+    func findNoteToSelf() throws  -> String?
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
     func geoDmMessages(geohash: String, peerHex: String) throws  -> [GeoMessageInfo]
@@ -1608,6 +1619,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func groups() throws  -> [GroupInfo]
 
     func installStickerPack(coordinate: String) throws
+
+    /**
+     * True when `group_id_hex` is this account's Note to Self conversation.
+     */
+    func isNoteToSelf(groupIdHex: String) throws  -> Bool
 
     /**
      * Leave a group and delete its local state after the leave proposal is sent.
@@ -2271,6 +2287,18 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
 }
 
     /**
+     * Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+     * Returns the group id as hex.
+     */
+open func ensureNoteToSelf()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_ensure_note_to_self(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * Re-subscribe with the current watermark and group set to self-heal
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
@@ -2375,6 +2403,17 @@ open func fetchStickerPack(authorPubkeyHex: String, identifier: String, relayUrl
 }
 
     /**
+     * Return the Note to Self group id hex when already present.
+     */
+open func findNoteToSelf()throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_find_note_to_self(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+    /**
      * The 1:1 geohash DM conversation with a participant, oldest first.
      */
 open func geoDmMessages(geohash: String, peerHex: String)throws  -> [GeoMessageInfo]  {
@@ -2430,6 +2469,18 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
         FfiConverterString.lower(coordinate),$0
     )
 }
+}
+
+    /**
+     * True when `group_id_hex` is this account's Note to Self conversation.
+     */
+open func isNoteToSelf(groupIdHex: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_is_note_to_self(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),$0
+    )
+})
 }
 
     /**
@@ -8266,6 +8317,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_note_to_self() != 19450) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8290,6 +8344,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_sticker_pack() != 19095) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_find_note_to_self() != 22477) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_geo_dm_messages() != 48140) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8303,6 +8360,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_is_note_to_self() != 61108) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {

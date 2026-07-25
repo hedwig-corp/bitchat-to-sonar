@@ -123,6 +123,10 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 /// How often a receive-prefetch await re-checks for an identity wipe.
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
+/// Wire marker for the solo Note to Self conversation. Stable across renames;
+/// apps must not treat name alone as identity.
+const SONAR_NOTE_TO_SELF_DESCRIPTION: &str = "sonar.note-to-self.v1";
+const SONAR_NOTE_TO_SELF_NAME: &str = "Note to Self";
 
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
@@ -2825,6 +2829,58 @@ impl SonarClient {
             self.relays.clone(),
         )?;
         self.publish_group_creation(creation).await
+    }
+
+    /// Ensure the Signal-style Note to Self conversation exists: a solo MLS
+    /// group marked with [`SONAR_NOTE_TO_SELF_DESCRIPTION`]. Local-only — no
+    /// KeyPackage fetch or welcome publish — so it can complete offline.
+    ///
+    /// Idempotent: returns the existing marked solo group when present.
+    pub async fn ensure_note_to_self(&self) -> Result<GroupId> {
+        if let Some(existing) = self.find_note_to_self_group()? {
+            return Ok(existing);
+        }
+        let creation = self.engine.create_group_with_description(
+            SONAR_NOTE_TO_SELF_NAME,
+            SONAR_NOTE_TO_SELF_DESCRIPTION,
+            Vec::new(),
+            self.relays.clone(),
+        )?;
+        self.publish_group_creation(creation).await
+    }
+
+    /// Return the Note to Self group id when a marked solo group already exists.
+    pub fn find_note_to_self_group(&self) -> Result<Option<GroupId>> {
+        let groups = self.engine.groups()?;
+        let me = self.identity().public_key();
+        for group in groups {
+            let members = self.engine.members(&group.mls_group_id)?;
+            if Self::is_note_to_self_group(&group, &members, &me) {
+                return Ok(Some(group.mls_group_id));
+            }
+        }
+        Ok(None)
+    }
+
+    /// True when `group` is this identity's Note to Self conversation.
+    pub fn is_note_to_self_group_id(&self, group_id: &GroupId) -> Result<bool> {
+        let groups = self.engine.groups()?;
+        let Some(group) = groups.into_iter().find(|g| g.mls_group_id == *group_id) else {
+            return Ok(false);
+        };
+        let members = self.engine.members(group_id)?;
+        let me = self.identity().public_key();
+        Ok(Self::is_note_to_self_group(&group, &members, &me))
+    }
+
+    fn is_note_to_self_group(
+        group: &group_types::Group,
+        members: &[PublicKey],
+        me: &PublicKey,
+    ) -> bool {
+        group.description == SONAR_NOTE_TO_SELF_DESCRIPTION
+            && members.len() == 1
+            && members.contains(me)
     }
 
     /// Scan active groups for an existing 1:1 DM with `peer`.

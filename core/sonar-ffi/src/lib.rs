@@ -854,6 +854,27 @@ impl SonarNode {
         Ok(hex::encode(group_id.as_slice()))
     }
 
+    /// Ensure the local Note to Self solo Marmot group exists. Offline-safe.
+    /// Returns the group id as hex.
+    pub fn ensure_note_to_self(&self) -> FfiResult<String> {
+        let group_id = self.runtime.block_on(self.client.ensure_note_to_self())?;
+        Ok(hex::encode(group_id.as_slice()))
+    }
+
+    /// Return the Note to Self group id hex when already present.
+    pub fn find_note_to_self(&self) -> FfiResult<Option<String>> {
+        Ok(self
+            .client
+            .find_note_to_self_group()?
+            .map(|id| hex::encode(id.as_slice())))
+    }
+
+    /// True when `group_id_hex` is this account's Note to Self conversation.
+    pub fn is_note_to_self(&self, group_id_hex: String) -> FfiResult<bool> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        Ok(self.client.is_note_to_self_group_id(&group_id)?)
+    }
+
     /// Start a multi-member Marmot group. `members` accepts npub or hex pubkeys.
     pub fn start_group(&self, members: Vec<String>, name: String) -> FfiResult<String> {
         let members = parse_pubkeys(members, "member pubkey")?;

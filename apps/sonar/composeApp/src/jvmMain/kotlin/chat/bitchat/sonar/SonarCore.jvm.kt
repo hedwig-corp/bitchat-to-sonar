@@ -140,6 +140,20 @@ actual object SonarCore {
         requireNode().startDm(peer.trim(), "")
     }
 
+    actual suspend fun ensureNoteToSelf(): String = withContext(Dispatchers.IO) {
+        requireNode().ensureNoteToSelf()
+    }
+
+    actual suspend fun findNoteToSelf(): String? = withContext(Dispatchers.IO) {
+        node?.findNoteToSelf()
+    }
+
+    actual suspend fun isNoteToSelf(chatId: String): Boolean = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext false
+        if (chatId.isBlank()) return@withContext false
+        n.isNoteToSelf(chatId)
+    }
+
     actual suspend fun startGroup(members: List<String>, name: String): String = withContext(Dispatchers.IO) {
         requireNode().startGroup(members.map { it.trim() }.filter { it.isNotEmpty() }, name.trim())
     }

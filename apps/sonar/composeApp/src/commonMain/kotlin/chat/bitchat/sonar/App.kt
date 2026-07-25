@@ -449,9 +449,12 @@ private fun HomeScreen(state: SonarAppState) {
                     // pinned on top as actionable banners. Sort keys are O(1)
                     // cached (meshDmRows precomputed, marmotRow cached row VM —
                     // pending rows use creation time, not epoch zero).
-                    val mergedRows = mergeHomeMessageRows(meshRows, chatRows) { chatId ->
-                        state.marmotRow(chatId).tsSecs
-                    }
+                    val mergedRows = pinNoteToSelfHomeRows(
+                        mergeHomeMessageRows(meshRows, chatRows) { chatId ->
+                            state.marmotRow(chatId).tsSecs
+                        },
+                        noteToSelfGroupId = state.noteToSelfId(),
+                    )
                     // The hairline hides under the last row of the list (design
                     // .bc-list .bc-row:last-child::after { display: none }).
                     val lastRowKey = mergedRows.lastOrNull()?.listKey

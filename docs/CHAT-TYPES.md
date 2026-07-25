@@ -32,7 +32,7 @@ a mesh peer and later learn their npub (from the 0x53 announce), the Bluetooth
 leg and the White Noise leg *fold* into a single thread. The reverse never
 happens — a pure Marmot contact with no BLE discovery stays a plain Marmot chat.
 
-That gives the two kinds:
+That gives the two kinds (plus Note to Self below):
 
 | | **Pure Marmot chat** | **Mesh-folded chat** |
 |---|---|---|
@@ -44,6 +44,20 @@ That gives the two kinds:
 | Bubble colour | indigo (internet) | per-message: cyan = travelled over mesh, indigo = internet (`SonarMsg.viaInternet`) |
 | Open path (Compose) | `SonarAppState.openChat` | `SonarAppState.openDm` |
 | Open path (iOS) | `SonarAppStore.openedDM` (group resolved directly) | `SonarAppStore.openedDM` (group resolved via fingerprint/npub mapping) |
+
+### Note to Self (solo Marmot)
+
+Signal-style chat with yourself. It is a **marked pure Marmot solo group**, not a
+self-DM (`Client::start_dm` rejects self) and never mesh-folded:
+
+- Wire marker: group description `sonar.note-to-self.v1` (name `"Note to Self"`).
+- Members: only the local identity. Created via `ensure_note_to_self()` — local
+  MLS create with empty member KeyPackages; offline-safe.
+- Always pinned at the top of the Messages list on both apps.
+- Full chat surface (text/media/stickers) through the normal Marmot transcript
+  path; notifications and unread badges are suppressed for this group.
+- Identity: prefer the description marker / `is_note_to_self` over the display
+  name so a rename cannot fork the conversation.
 
 ## The identity model (which id are you holding?)
 
