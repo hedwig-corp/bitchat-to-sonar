@@ -50,6 +50,12 @@ impl From<sonar_core::Error> for SonarFfiError {
     }
 }
 
+impl From<sonar_bitchat_v1::Error> for SonarFfiError {
+    fn from(err: sonar_bitchat_v1::Error) -> Self {
+        Self::Core(err.to_string())
+    }
+}
+
 type FfiResult<T> = Result<T, SonarFfiError>;
 
 /// Forwards conversation-change notifications from core threads to the FFI

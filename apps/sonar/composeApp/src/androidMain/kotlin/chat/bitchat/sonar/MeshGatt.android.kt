@@ -356,6 +356,47 @@ object MeshGatt {
                     TAG,
                     "ANNOUNCE '${event.nickname}' peerId=${event.peerIdHex} fp=${event.fingerprint.take(8)}… direct=${event.direct}",
                 )
+                val info = MeshAnnounceInfo(
+                    nickname = event.nickname,
+                    noisePublicKeyHex = "",
+                    signingPublicKeyHex = "",
+                    senderIdHex = event.peerIdHex,
+                )
+                onAnnounce.forEach { it(event.peerIdHex, info, event.fingerprint) }
+            }
+            is MeshEngineEvent.SonarPayload ->
+                onSonar.forEach { it(event.fingerprint, event.payload) }
+            is MeshEngineEvent.TextReceived ->
+                onText.forEach { it(event.fingerprint, event.messageId, event.content) }
+            is MeshEngineEvent.FileReceived -> {
+                val bytes = event.content
+                val mime = normalizedMime(event.mimeType, bytes) ?: continue
+                val name = safeFileName(event.fileName, mime, event.timestampMs)
+                onFile.forEach { it(event.fingerprint, "${event.transferKey}-file", name, mime, bytes) }
+            }
+            is MeshEngineEvent.BroadcastReceived -> {
+                android.util.Log.i(TAG, "rx broadcast from ${event.fingerprint.take(8)}: ${event.content.take(40)}")
+                val pm = MeshPublicMessage(
+                    content = event.content,
+                    senderIdHex = event.senderIdHex,
+                    timestampMs = event.timestampMs.toULong(),
+                )
+                onBroadcast.forEach { it(event.fingerprint, pm) }
+            }
+            is MeshEngineEvent.LinkEstablished -> {
+                android.util.Log.i(TAG, "✅ Noise link ESTABLISHED fp=${event.fingerprint.take(8)}…")
+                onLink.forEach { it(event.fingerprint) }
+            }
+        }
+    }
+
+    private fun dispatchEvents(out: MeshEngineOutput) {
+        for (event in out.events) when (event) {
+            is MeshEngineEvent.PeerAnnounced -> {
+                android.util.Log.i(
+                    TAG,
+                    "ANNOUNCE '${event.nickname}' peerId=${event.peerIdHex} fp=${event.fingerprint.take(8)}… direct=${event.direct}",
+                )
                 // Debug-only announce→Radar latency marker (PR #316 / R-008).
                 // Parsed with radar_peer_paint by scripts/bench/android-mesh-radar-bench.sh.
                 // Nick is URL-encoded so spaces/emoji stay one token for log parsers.

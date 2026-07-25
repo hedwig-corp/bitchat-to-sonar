@@ -18,6 +18,9 @@ pub enum Error {
     #[error("storage error: {0}")]
     Storage(String),
 
+    #[error("{0}")]
+    Bitchat(#[from] sonar_bitchat_v1::Error),
+
     #[error("event builder error: {0}")]
     EventBuilder(#[from] nostr::event::builder::Error),
 
