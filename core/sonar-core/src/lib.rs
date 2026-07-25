@@ -21,11 +21,16 @@ pub mod noise;
 pub mod notification;
 pub mod outbox;
 pub mod push;
+pub mod recovery;
 pub mod relay_directory;
 pub mod sonar_descriptor;
 pub mod sticker_cache;
 
 pub use error::Error;
+
+/// Re-exported so FFI/shell crates can surface healed-conversation notices
+/// without depending on the `recovery` module path directly.
+pub use recovery::ConversationReset;
 
 /// Re-exported so FFI/shell crates can name MLS group ids without depending
 /// on MDK directly.

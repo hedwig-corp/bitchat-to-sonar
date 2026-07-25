@@ -835,6 +835,14 @@ final class MarmotChatModel: ObservableObject {
             }
             throw MarmotService.ServiceError.core(replacementError)
         }
+        // Announce MLS state loss so surviving peers can re-invite us. Skip when
+        // Blossom restored Marmot state (MLS still valid). Must not run on fresh
+        // onboarding — only after an explicit nsec restore. performConnect already
+        // published a KeyPackage; the beacon's `k` tag points at that event.
+        // Failures are non-fatal (peers can still use the manual delete+restart path).
+        if backupOutcome != .restored {
+            try? await service.publishRecoveryBeaconBackground()
+        }
         return backupOutcome
     }
 

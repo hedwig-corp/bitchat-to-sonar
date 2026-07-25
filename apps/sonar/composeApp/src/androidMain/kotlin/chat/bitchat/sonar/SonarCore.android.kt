@@ -111,6 +111,12 @@ actual object SonarCore {
             previousNode?.close()
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
+            // Restore path only: importIdentity arms this flag so we announce
+            // MLS state loss after the fresh KeyPackage exists. Fresh onboarding
+            // must never arm it (outstanding-beacon auto-accepts group invites).
+            if (consumePendingRecoveryBeaconAnnounce()) {
+                runCatching { connected.publishRecoveryBeaconBackground() }
+            }
             npub
         }
     }
@@ -617,6 +623,42 @@ actual object SonarCore {
         runCatching { n.drainPendingMarmot().size }.getOrDefault(0)
     }
 
+    actual suspend fun drainConversationResets(): List<SonarConversationReset> =
+        withContext(Dispatchers.IO) {
+            val n = node ?: return@withContext emptyList()
+            runCatching {
+                n.drainConversationResets().map {
+                    SonarConversationReset(
+                        peerPubkeyHex = it.peerPubkeyHex,
+                        oldGroupIdHex = it.oldGroupIdHex,
+                        newGroupIdHex = it.newGroupIdHex,
+                        atSecs = it.atSecs.toLong(),
+                    )
+                }
+            }.getOrDefault(emptyList())
+        }
+
+    actual suspend fun hasOutstandingRecoveryBeacon(): Boolean = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext false
+        runCatching { n.hasOutstandingRecoveryBeacon() }.getOrDefault(false)
+    }
+
+    actual suspend fun publishRecoveryBeaconBackground() = withContext(Dispatchers.IO) {
+        val n = node ?: return@withContext
+        n.publishRecoveryBeaconBackground()
+    }
+
+    private fun armPendingRecoveryBeaconAnnounce() {
+        prefs().edit().putBoolean("recovery.announcePending", true).apply()
+    }
+
+    private fun consumePendingRecoveryBeaconAnnounce(): Boolean {
+        val prefs = prefs()
+        if (!prefs.getBoolean("recovery.announcePending", false)) return false
+        prefs.edit().putBoolean("recovery.announcePending", false).apply()
+        return true
+    }
+
     // ── Diagnostics (Settings → Diagnostics) ──
 
     private fun coreLogDirectory(): File =
@@ -815,6 +857,7 @@ actual object SonarCore {
             if (saved != null) return@withLock SonarIdentity.import(saved).npub()
             val identity = SonarIdentity.generate()
             AndroidSecrets.put("nsec", identity.nsec(), durable = true)
+            prefs().edit().putBoolean("recovery.announcePending", false).apply()
             identity.npub()
         }
     }
@@ -839,6 +882,11 @@ actual object SonarCore {
                     pubkeyHex = identity.pubkeyHex()
                     tryRestoreAccountBackupLocked(identity, marmotDir).also {
                         lastImportBackupOutcomeValue = it
+                        // Blossom restore brings MLS state back — skip the
+                        // recovery beacon. nsec-only (Missing/Failed) needs it.
+                        if (it != AccountBackupRestoreOutcome.Restored) {
+                            armPendingRecoveryBeaconAnnounce()
+                        }
                     }
                     npub
                 } catch (importError: Throwable) {
@@ -1097,6 +1145,8 @@ actual object SonarCore {
         }
         val id = SonarIdentity.generate()
         AndroidSecrets.put("nsec", id.nsec(), durable = true)
+        // Fresh onboarding must never inherit a stale restore-path arm flag.
+        prefs().edit().putBoolean("recovery.announcePending", false).apply()
         return id
     }
 

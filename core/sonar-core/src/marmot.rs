@@ -29,6 +29,7 @@ use sonar_stickers::{build_sticker_ref_tag, parse_sticker_ref_tag, StickerRef};
 use crate::call::signaling::CallControl;
 use crate::identity::Identity;
 use crate::outbox::OUTBOX_STATE_FILE_SUFFIX;
+use crate::recovery::RECOVERY_STATE_FILE_SUFFIX;
 use crate::{Error, Result};
 
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
@@ -38,6 +39,18 @@ pub const CHAT_RUMOR_KIND: u16 = 9;
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
 pub const KEY_PACKAGE_KIND: u16 = 30443;
+
+/// Marmot Recovery Beacon event kind (EXPERIMENTAL draft MIP, see
+/// `docs/mips/draft-recovery-beacon.md`).
+///
+/// Addressable (30000–39999) event signed by the account key and published by a
+/// client that lost local MLS state and restored from `nsec`. Surviving peers
+/// use it to auto re-invite the restored member into a fresh MLS group (MDK has
+/// no external-commit/ReInit rejoin, so recovery is always *new group + welcome
+/// via a fresh KeyPackage*). Non-Sonar Marmot clients ignore the kind, so it is
+/// wire-safe against White Noise interop. The kind number is provisional until
+/// coordinated with Marmot; keep it behind this constant.
+pub const RECOVERY_BEACON_KIND: u16 = 30447;
 
 /// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
 pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
@@ -1448,12 +1461,14 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
+        RECOVERY_STATE_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!("{name}{RECOVERY_STATE_FILE_SUFFIX}.tmp")));
     paths
 }
 

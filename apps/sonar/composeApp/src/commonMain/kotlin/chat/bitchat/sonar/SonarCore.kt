@@ -165,6 +165,17 @@ data class SonarProfile(
         displayName?.takeIf { it.isNotBlank() } ?: name?.takeIf { it.isNotBlank() }
 }
 
+/** A healed 1:1 conversation from the recovery beacon flow: after a peer
+ *  restored from nsec, the old MLS group was retired and a fresh one created.
+ *  Hosts fold [newGroupIdHex] into the same conversation as [oldGroupIdHex] and
+ *  render a "chat was reset" system row. Ids are MLS group id hex. */
+data class SonarConversationReset(
+    val peerPubkeyHex: String,
+    val oldGroupIdHex: String,
+    val newGroupIdHex: String,
+    val atSecs: Long,
+)
+
 /** A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
  *  NIP-05. `address` is the canonical lowercased `name@domain` that resolved. */
 data class SonarResolvedHandle(
@@ -657,6 +668,21 @@ expect object SonarCore {
      *  local storage. Fires [conversationChanged] per affected chat. Returns
      *  the number of incoming-message notifications drained. */
     suspend fun drainPendingMarmot(): Int
+
+    /** Drain healed-conversation notices produced by the recovery beacon flow.
+     *  Hosts render a "chat was reset" system row per entry and fold the new
+     *  group into the same conversation as the retired one. Local read — never
+     *  touches the network. */
+    suspend fun drainConversationResets(): List<SonarConversationReset>
+
+    /** True while a locally published recovery beacon is outstanding (we
+     *  restored from nsec and are waiting for a surviving peer to re-invite us).
+     *  Local read. */
+    suspend fun hasOutstandingRecoveryBeacon(): Boolean
+
+    /** Publish a recovery beacon after nsec restore. Call after KeyPackage
+     *  publish on the restore path only — never on fresh onboarding. */
+    suspend fun publishRecoveryBeaconBackground()
 
     /** JSON snapshot of relay/sync state (relay statuses, sync watermark,
      *  per-group catch-up floors) for the Diagnostics screen and the exported
