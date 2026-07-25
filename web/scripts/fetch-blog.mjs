@@ -21,6 +21,7 @@ import { writeFileSync } from 'node:fs';
 import { BLOG_PUBKEY_HEX, isBlogFeedConfigured } from '../src/lib/blog-data.js';
 import { fetchPostsFromNostr } from '../src/lib/blog-nostr.js';
 import { fetchAuthorProfile } from '../src/lib/blog-author.js';
+import { SONAR_BLOG } from '../src/lib/blog-content.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUT = resolve(HERE, '../src/lib/blog-content.js');
@@ -67,7 +68,13 @@ async function main() {
 		return;
 	}
 	// Keep `_ts` so the site can localize dates without re-parsing English strings.
-	const posts = raw;
+	// Merge committed seed + Nostr (Nostr-wins for shared ids, deduped), mirroring the
+	// runtime merge in routes/blog/+page.svelte ([...live, ...fallback]). A post
+	// committed to the seed ships even if it is not yet on Nostr, so the bake never
+	// silently strips a committed post.
+	const nostrIds = new Set(raw.map((p) => p.id));
+	const seedOnly = SONAR_BLOG.posts.filter((p) => !nostrIds.has(p.id));
+	const posts = [...raw, ...seedOnly].sort((a, b) => (b._ts ?? 0) - (a._ts ?? 0));
 	const author = await withTimeout(fetchAuthorProfile(), 15_000, 'fetchAuthorProfile').catch(
 		() => null
 	);
