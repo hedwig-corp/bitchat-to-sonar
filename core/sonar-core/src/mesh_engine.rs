@@ -69,15 +69,12 @@ const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
 /// sender ids rotate and can be attacker-minted, so an unbounded map is a
 /// slow leak. Clearing wholesale is safe — entries repopulate from the next
 /// verified announce.
-#[cfg(not(test))]
 const IDENTITY_MAP_CAP: usize = 4096;
-// Shrunk under test so the flood regression reaches the cap in a fraction of a
-// second: the eviction policy is independent of the exact bound, and debug-build
-// Ed25519 makes thousands of announce round-trips prohibitively slow otherwise.
-#[cfg(test)]
-const IDENTITY_MAP_CAP: usize = 64;
 /// A pinned identity refreshed within this window is protected from eviction at
-/// capacity. Any live peer re-announces far more often (every ~15-38s), so only
+/// capacity. Measured against `now_ms`, which is the MONOTONIC clock — `wall()`
+/// applies the wall-clock offset separately — so this window cannot be widened
+/// by a peer-supplied timestamp or a device clock jump.
+/// Any live peer re-announces far more often (every ~15-38s), so only
 /// genuinely absent peers are evictable; a flood of fresh identities cannot
 /// dislodge an active pin (the new identity is refused instead).
 const IDENTITY_PROTECT_MS: u64 = 5 * 60 * 1000;
@@ -245,6 +242,14 @@ pub struct Engine {
     /// floods `IDENTITY_MAP_CAP` throwaway announces to drop a live peer's pin
     /// and then rebinds its fingerprint to an attacker signing key.
     identity_lru: VecDeque<(String, u64)>,
+    /// Count of announces refused because every pin was protected. This file is
+    /// a pure state machine with no logging, so without a counter a saturated
+    /// pin map is an invisible cause of "that peer never shows up for me".
+    identity_refused: u64,
+    /// Pin-map bound, `IDENTITY_MAP_CAP` in production. A field rather than a
+    /// `cfg(test)` constant so tests exercise the same code path as production
+    /// with different data, instead of a different constant.
+    identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
     /// DMs queued for a peer with no live link, flushed on (re)establish.
@@ -302,6 +307,8 @@ impl Engine {
             signing_key_by_peer: HashMap::new(),
             fingerprint_by_peer: HashMap::new(),
             identity_lru: VecDeque::new(),
+            identity_refused: 0,
+            identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
             pending_sends: HashMap::new(),
             seen_broadcasts: HashSet::new(),
@@ -888,6 +895,7 @@ impl Engine {
         self.signing_key_by_peer.clear();
         self.fingerprint_by_peer.clear();
         self.identity_lru.clear();
+        self.identity_refused = 0;
         self.pending_sonar.clear();
         self.pending_sends.clear();
         self.seen_broadcasts.clear();
@@ -923,6 +931,13 @@ impl Engine {
     /// Returns `false` (evicting nothing) when the stalest pin is still within
     /// the protection window, i.e. every pin is recent, so the caller refuses
     /// the new identity rather than dropping a live peer's pin.
+    ///
+    /// Deliberately recency-only: keying protection on "is this peer bound to a
+    /// live link" instead would leave every relay-only peer evictable (only a
+    /// `direct`, full-TTL announce sets a binding), which hands the wipe-and-
+    /// rebind attack straight back for exactly the multi-hop peers the mesh
+    /// exists to reach. Removing the resulting new-peer refusal needs a
+    /// per-origin pin quota, not a weaker protection rule — see `identity_refused`.
     fn evict_stalest_identity(&mut self, now_ms: u64) -> bool {
         match self.identity_lru.front() {
             Some((_, last_seen)) if now_ms.saturating_sub(*last_seen) >= IDENTITY_PROTECT_MS => {}
@@ -933,6 +948,18 @@ impl Engine {
             self.fingerprint_by_peer.remove(&stale);
         }
         true
+    }
+
+    /// `(pinned identities, announces refused because every pin was protected)`.
+    /// Diagnostics only — a non-zero refusal count means the pin map is
+    /// saturated with live peers and new-peer discovery is degraded.
+    pub fn identity_pressure(&self) -> (usize, u64) {
+        (self.signing_key_by_peer.len(), self.identity_refused)
+    }
+
+    #[cfg(test)]
+    fn set_identity_map_cap(&mut self, cap: usize) {
+        self.identity_map_cap = cap;
     }
 
     fn bind_allowed(&self, bind: &PeerBinding) -> bool {
@@ -1304,14 +1331,16 @@ impl Engine {
                 // pin: the old wholesale `clear()` let an attacker flood
                 // IDENTITY_MAP_CAP throwaway announces to drop a victim's pin and
                 // then rebind its fingerprint to an attacker signing key.
-                if self.signing_key_by_peer.len() >= IDENTITY_MAP_CAP
+                // The refusal is counted, not silent — see `identity_refused`.
+                if self.signing_key_by_peer.len() >= self.identity_map_cap
                     && !self.evict_stalest_identity(now_ms)
                 {
+                    self.identity_refused += 1;
                     return;
                 }
                 self.signing_key_by_peer
                     .insert(sender_key.clone(), signing_hex.clone());
-                self.identity_lru.push_back((sender_key.clone(), now_ms));
+                self.note_identity_seen(&sender_key, now_ms);
             }
         }
         if !fp.is_empty() {
@@ -2490,13 +2519,44 @@ mod tests {
         );
     }
 
+    /// A genuine broadcast that a relay hop has TTL-decremented must still
+    /// verify. This holds only because `mesh::signing_bytes` zeroes `ttl` before
+    /// signing; pin it here so the broadcast gate can never silently take
+    /// multi-hop public chat down with it.
+    #[test]
+    fn relayed_signed_broadcast_still_verifies() {
+        let mut a = engine(1, "pixel");
+        let victim = engine(7, "victim");
+        let now = 1_000;
+        open_link(&mut a, "84:2F", 25, now);
+
+        let victim_noise = hex::decode(&victim.noise_public_hex).unwrap();
+        let ann = announce_from(&victim_noise, &victim.signer, "victim", DEFAULT_TTL, now);
+        a.on_client_rx("84:2F", 25, &ann, now);
+        let victim_fp = Engine::fingerprint_of(&victim.noise_public_hex);
+
+        let mut bytes = broadcast_from(victim.my_peer_id, "relayed hi", now, &victim.signer);
+        bytes[2] = DEFAULT_TTL - 3; // a relay hop mutated TTL in place
+        let out = a.on_client_rx("84:2F", 25, &bytes, now);
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AppEvent::BroadcastReceived { fingerprint, content, .. }
+                    if fingerprint == &victim_fp && content == "relayed hi"
+            )),
+            "TTL-decremented relayed broadcast must still verify and be delivered"
+        );
+    }
+
     /// The TOFU signing-key pin for an actively-announcing peer must survive a
     /// flood of throwaway identities. The old wholesale `clear()` at
     /// IDENTITY_MAP_CAP let an attacker evict the pin and then rebind the
     /// victim's fingerprint to an attacker-chosen signing key.
     #[test]
     fn identity_flood_cannot_evict_and_rebind_an_active_pin() {
+        const CAP: u32 = 64;
         let mut a = engine(1, "pixel");
+        a.set_identity_map_cap(CAP as usize);
         let victim = engine(7, "victim");
         let attacker = mesh::MeshSigner::from_seed(&[99u8; 32]);
         let now = 1_000;
@@ -2517,7 +2577,7 @@ mod tests {
 
         // Flood past capacity with distinct throwaway identities, all at `now`
         // (i.e. all within the protection window, the attacker's best case).
-        for i in 0..(IDENTITY_MAP_CAP as u32 + 8) {
+        for i in 0..(CAP + 8) {
             let mut nk = [0u8; 32];
             nk[..4].copy_from_slice(&i.to_le_bytes());
             nk[31] = 0xAA; // keep it distinct from the victim's key space
