@@ -10281,7 +10281,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                     if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
                         runCatching { SonarCore.sync() }
                     }
-                } else {
+                } else if (
+                    // Backgrounded on a platform that invalidates on background,
+                    // the down latch is [onProcessBackgrounded]'s own doing:
+                    // attaching here rebuilds (and closes) the node every beat
+                    // while the wake loop is still delivering over the live
+                    // sockets. The push wake and the foreground resume own that
+                    // rebuild instead. Desktop keeps reconnecting — its latch only
+                    // drops on a real failure and nothing else recovers it.
+                    RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+                        foreground = foreground,
+                        invalidatesOnBackground = RelayConnectionPolicy.shouldInvalidateOnBackground(),
+                    )
+                ) {
                     startRelayConnection()
                 }
                 // Coarse presence beat (~every 60 s), profile TTL sweep (~30 min).

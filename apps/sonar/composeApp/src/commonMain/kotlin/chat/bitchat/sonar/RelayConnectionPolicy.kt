@@ -60,6 +60,37 @@ object RelayConnectionPolicy {
      * fresh job.
      */
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
+
+    /**
+     * Whether the slow housekeeping heartbeat may start a relay attach.
+     *
+     * The heartbeat re-*enters* `startRelayConnection()` from scratch every beat,
+     * so [shouldRetrySupersededAttach] — which only stops the retry loop *inside*
+     * an already-running job — cannot hold it back. Left ungated it fights
+     * [shouldInvalidateOnBackground]: backgrounding drops the latch so the next
+     * wake rebuilds, the heartbeat reads that down latch as "reconnect now", and
+     * `connectRelays()` tears down and rebuilds the node (`SonarNode.connect` +
+     * `previousNode?.close()` + a KeyPackage republish) every beat for as long as
+     * the app stays backgrounded — closing the node the live wake loop,
+     * conversation listener, and in-flight sends are holding. On Android that is
+     * exactly the state the user is in when they expect a notification.
+     *
+     * A backgrounded process does not need this: its existing sockets keep
+     * feeding `waitForMarmotEvent` (the invalidate drops only the host latch, not
+     * the node), and a genuinely dead connection is rebuilt by the push wake or
+     * the next foreground resume — both of which #354 made responsible for it.
+     *
+     * Desktop must still reconnect while unfocused: `Main.kt` bridges every
+     * `windowLostFocus` to `setForeground(false)`, and there is no push wake to
+     * take over. It never invalidates on background, so its latch only goes down
+     * on a genuine failure — precisely the case the heartbeat has to recover.
+     * Hence [invalidatesOnBackground] is a parameter, not a direct
+     * [shouldInvalidateOnBackground] read: it keeps this a pure function whose
+     * whole matrix is assertable from `commonTest`, which compiles into every KMP
+     * test target and so cannot depend on one platform's actual.
+     */
+    fun shouldReconnectOnHeartbeat(foreground: Boolean, invalidatesOnBackground: Boolean): Boolean =
+        foreground || !invalidatesOnBackground
 }
 
 /** Android/iOS-style process background: true. Desktop focus loss: false. */

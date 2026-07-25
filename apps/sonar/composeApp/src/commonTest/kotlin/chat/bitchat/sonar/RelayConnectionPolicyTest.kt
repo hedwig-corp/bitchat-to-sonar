@@ -48,4 +48,42 @@ class RelayConnectionPolicyTest {
         // of rebuilding sockets the OS is suspending.
         assertFalse(RelayConnectionPolicy.shouldRetrySupersededAttach(foreground = false))
     }
+
+    @Test
+    fun backgrounded_heartbeat_does_not_rebuild_the_node_on_invalidating_platforms() {
+        // The heartbeat re-enters startRelayConnection() from scratch every beat,
+        // so shouldRetrySupersededAttach — which only guards the retry loop inside
+        // an already-running job — cannot hold it back. Ungated it reads the latch
+        // that onProcessBackgrounded() deliberately dropped as "reconnect now" and
+        // rebuilds the node every 60 s for as long as the app stays backgrounded,
+        // closing the node the live wake loop and conversation listener hold.
+        assertFalse(
+            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+                foreground = false,
+                invalidatesOnBackground = true,
+            ),
+        )
+    }
+
+    @Test
+    fun foreground_heartbeat_still_recovers_a_dead_connection() {
+        assertTrue(
+            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+                foreground = true,
+                invalidatesOnBackground = true,
+            ),
+        )
+    }
+
+    @Test
+    fun unfocused_heartbeat_still_reconnects_where_background_never_invalidates() {
+        // Desktop: focus loss reports foreground=false but keeps its node, so a
+        // down latch is a genuine failure and nothing else recovers it.
+        assertTrue(
+            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+                foreground = false,
+                invalidatesOnBackground = false,
+            ),
+        )
+    }
 }
