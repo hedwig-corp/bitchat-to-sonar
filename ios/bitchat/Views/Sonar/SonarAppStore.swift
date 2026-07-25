@@ -4115,6 +4115,16 @@ final class SonarAppStore: ObservableObject {
         (pendingMarmotNpub(for: id) != nil && marmotGroupId(id) == nil) || isPendingMarmotGroup(id)
     }
 
+    /// Whether this conversation's transcript or send path depends on the
+    /// Marmot local store. Pure-mesh bitchat chats ride `privateChats` over
+    /// BLE, so an account-level Marmot storage failure must not relabel them
+    /// as locked (their transcript and sends keep working).
+    func dmDependsOnMarmot(_ id: String) -> Bool {
+        marmotGroupId(id) != nil
+            || isPendingSecureChat(id)
+            || resolvedSonarProfile(id) != nil
+    }
+
     func marmotGroupId(_ id: String) -> String? {
         if isPendingMarmotGroup(id) { return nil }
         if let pendingNpub = pendingMarmotNpub(for: id),
@@ -5301,6 +5311,21 @@ final class SonarAppStore: ObservableObject {
 
         if let groupId, snIsFailedOptimisticStickerMessage(message) {
             retryFailedSticker(message, groupId: groupId)
+            return
+        }
+
+        // Platform-local failed TEXT echo (send failed before reaching the
+        // core outbox, e.g. node not connected). The id does not exist in the
+        // durable database, so core retryMessage cannot find it — re-send the
+        // retained content and drop the failed row once the new echo shows.
+        if let groupId, MarmotChatModel.isFailedOptimisticMessageId(message.id) {
+            guard let content = snRetryContent(message) else {
+                showToast("This message is no longer available to retry.")
+                return
+            }
+            marmot.send(content, to: groupId, onEchoVisible: { [weak self] in
+                self?.marmot.removeFailedOptimisticMessage(groupId: groupId, messageId: message.id)
+            })
             return
         }
 

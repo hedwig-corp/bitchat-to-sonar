@@ -62,6 +62,11 @@ struct SonarHomeScreen: View {
                 }
                 ScrollView {
                     VStack(spacing: 0) {
+                        if let failure = store.marmot.localStoreFailure {
+                            SNLocalStoreFailureBanner(detail: failure) {
+                                store.marmot.connectIfNeeded()
+                            }
+                        }
                         SNSectionLabel("Around you")
                         channelList
                         let saved = store.savedChannels

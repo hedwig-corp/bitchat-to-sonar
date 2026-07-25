@@ -98,6 +98,11 @@ enum SonarTheme {
         dark: Color(sonarHex: 0x41BC76, opacity: 0.17)
     )
     static let danger = Color(light: Color(sonarHex: 0xD43A3E), dark: Color(sonarHex: 0xF16A6A))
+    static let dangerDeep = Color(light: Color(sonarHex: 0xA82D31), dark: Color(sonarHex: 0xF79E9E))
+    static let dangerSoft = Color(
+        light: Color(sonarHex: 0xD43A3E, opacity: 0.12),
+        dark: Color(sonarHex: 0xF16A6A, opacity: 0.16)
+    )
 
     // ── Gold (bitcoin payments) ──
     static let goldFill = Color(light: Color(sonarHex: 0xE0941C), dark: Color(sonarHex: 0xF0B03A))
