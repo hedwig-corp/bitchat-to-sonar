@@ -85,16 +85,21 @@ struct SonarMessageBubbleView: View {
                 bubbleBody(isExpanded: isExpanded)
 
                 if isLongMessage {
-                    Button(isExpanded
-                           ? String(localized: "content.message.show_less")
-                           : String(localized: "content.message.show_more")) {
+                    Button {
                         if isExpanded { expandedMessageIDs.remove(message.id) }
                         else { expandedMessageIDs.insert(message.id) }
+                    } label: {
+                        // .plain hit-tests the label subtree — frame/contentShape must be inside it.
+                        Text(isExpanded
+                             ? String(localized: "content.message.show_less")
+                             : String(localized: "content.message.show_more"))
+                            .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                            .foregroundColor(SonarTheme.accentDeep)
+                            .padding(.horizontal, 6)
+                            .frame(minHeight: 44)
+                            .contentShape(Rectangle())
                     }
-                    .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                    .foregroundColor(SonarTheme.accentDeep)
                     .buttonStyle(.plain)
-                    .padding(.horizontal, 6)
                 }
 
                 if !lightningLinks.isEmpty || !cashuLinks.isEmpty {

@@ -30,7 +30,7 @@
 //! is opaque (Android: MAC address; iOS: CBPeripheral UUID — iOS never exposes
 //! MAC addresses).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 
@@ -92,6 +92,14 @@ const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
 /// slow leak. Clearing wholesale is safe — entries repopulate from the next
 /// verified announce.
 const IDENTITY_MAP_CAP: usize = 4096;
+/// A pinned identity refreshed within this window is protected from eviction at
+/// capacity. Measured against `now_ms`, which is the MONOTONIC clock — `wall()`
+/// applies the wall-clock offset separately — so this window cannot be widened
+/// by a peer-supplied timestamp or a device clock jump.
+/// Any live peer re-announces far more often (every ~15-38s), so only
+/// genuinely absent peers are evictable; a flood of fresh identities cannot
+/// dislodge an active pin (the new identity is refused instead).
+const IDENTITY_PROTECT_MS: u64 = 5 * 60 * 1000;
 /// Server discovery burst: the first notification pair is easy to lose during
 /// role setup, so announce three times with these delays after a subscribe.
 const DISCOVERY_BURST_DELAYS_MS: [u64; 3] = [0, 350, 1_200];
@@ -252,6 +260,23 @@ pub struct Engine {
     /// signing-key change is an impersonation).
     signing_key_by_peer: HashMap<String, String>,
     fingerprint_by_peer: HashMap<String, String>,
+    /// `(peer_key, last_seen_ms)` in least-recently-announced order (front =
+    /// stalest). Kept in lockstep with `signing_key_by_peer`'s keys so that at
+    /// capacity we evict only the single stalest pin, and only if it is older
+    /// than `IDENTITY_PROTECT_MS`. A pin refreshed within that window is never
+    /// evicted; when every pin is recent (a flood) the new identity is refused
+    /// instead. This defeats the wipe-and-rebind attack where an attacker
+    /// floods `IDENTITY_MAP_CAP` throwaway announces to drop a live peer's pin
+    /// and then rebinds its fingerprint to an attacker signing key.
+    identity_lru: VecDeque<(String, u64)>,
+    /// Count of announces refused because every pin was protected. This file is
+    /// a pure state machine with no logging, so without a counter a saturated
+    /// pin map is an invisible cause of "that peer never shows up for me".
+    identity_refused: u64,
+    /// Pin-map bound, `IDENTITY_MAP_CAP` in production. A field rather than a
+    /// `cfg(test)` constant so tests exercise the same code path as production
+    /// with different data, instead of a different constant.
+    identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
     seen_broadcasts: HashSet<String>,
@@ -306,6 +331,9 @@ impl Engine {
             recent_dials: HashMap::new(),
             signing_key_by_peer: HashMap::new(),
             fingerprint_by_peer: HashMap::new(),
+            identity_lru: VecDeque::new(),
+            identity_refused: 0,
+            identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
@@ -919,6 +947,8 @@ impl Engine {
         self.recent_dials.clear();
         self.signing_key_by_peer.clear();
         self.fingerprint_by_peer.clear();
+        self.identity_lru.clear();
+        self.identity_refused = 0;
         self.pending_sonar.clear();
         self.seen_broadcasts.clear();
         self.seen_files.clear();
@@ -935,6 +965,53 @@ impl Engine {
             None => true,
             Some(a) => !fingerprint.is_empty() && a.contains(&fingerprint.to_lowercase()),
         }
+    }
+
+    /// Move an already-pinned peer to the most-recently-seen end of the LRU and
+    /// stamp it with `now_ms`. Linear in the map size (≤ IDENTITY_MAP_CAP) but
+    /// called only once per re-announce (~every 15-38s per peer), so the scan is
+    /// negligible.
+    fn note_identity_seen(&mut self, sender_key: &str, now_ms: u64) {
+        if let Some(pos) = self.identity_lru.iter().position(|(k, _)| k == sender_key) {
+            self.identity_lru.remove(pos);
+        }
+        self.identity_lru.push_back((sender_key.to_string(), now_ms));
+    }
+
+    /// Evict the single stalest pinned identity if it is older than
+    /// `IDENTITY_PROTECT_MS`, removing it from both maps and the LRU in lockstep.
+    /// Returns `false` (evicting nothing) when the stalest pin is still within
+    /// the protection window, i.e. every pin is recent, so the caller refuses
+    /// the new identity rather than dropping a live peer's pin.
+    ///
+    /// Deliberately recency-only: keying protection on "is this peer bound to a
+    /// live link" instead would leave every relay-only peer evictable (only a
+    /// `direct`, full-TTL announce sets a binding), which hands the wipe-and-
+    /// rebind attack straight back for exactly the multi-hop peers the mesh
+    /// exists to reach. Removing the resulting new-peer refusal needs a
+    /// per-origin pin quota, not a weaker protection rule — see `identity_refused`.
+    fn evict_stalest_identity(&mut self, now_ms: u64) -> bool {
+        match self.identity_lru.front() {
+            Some((_, last_seen)) if now_ms.saturating_sub(*last_seen) >= IDENTITY_PROTECT_MS => {}
+            _ => return false,
+        }
+        if let Some((stale, _)) = self.identity_lru.pop_front() {
+            self.signing_key_by_peer.remove(&stale);
+            self.fingerprint_by_peer.remove(&stale);
+        }
+        true
+    }
+
+    /// `(pinned identities, announces refused because every pin was protected)`.
+    /// Diagnostics only — a non-zero refusal count means the pin map is
+    /// saturated with live peers and new-peer discovery is degraded.
+    pub fn identity_pressure(&self) -> (usize, u64) {
+        (self.signing_key_by_peer.len(), self.identity_refused)
+    }
+
+    #[cfg(test)]
+    fn set_identity_map_cap(&mut self, cap: usize) {
+        self.identity_map_cap = cap;
     }
 
     fn bind_allowed(&self, bind: &PeerBinding) -> bool {
@@ -1294,14 +1371,28 @@ impl Engine {
         let sender_key = sender_hex.to_lowercase();
         match self.signing_key_by_peer.get(&sender_key) {
             Some(existing) if !existing.eq_ignore_ascii_case(&signing_hex) => return,
-            Some(_) => {}
+            Some(_) => {
+                // Known peer re-announcing with its pinned key: refresh recency
+                // so a concurrent flood of new identities cannot evict it.
+                self.note_identity_seen(&sender_key, now_ms);
+            }
             None => {
-                if self.signing_key_by_peer.len() >= IDENTITY_MAP_CAP {
-                    self.signing_key_by_peer.clear();
-                    self.fingerprint_by_peer.clear();
+                // At capacity, evict only the single stalest pin, and only if it
+                // is older than the protection window. If every pin is recent (a
+                // flood), refuse this new identity rather than drop a live peer's
+                // pin: the old wholesale `clear()` let an attacker flood
+                // IDENTITY_MAP_CAP throwaway announces to drop a victim's pin and
+                // then rebind its fingerprint to an attacker signing key.
+                // The refusal is counted, not silent — see `identity_refused`.
+                if self.signing_key_by_peer.len() >= self.identity_map_cap
+                    && !self.evict_stalest_identity(now_ms)
+                {
+                    self.identity_refused += 1;
+                    return;
                 }
                 self.signing_key_by_peer
                     .insert(sender_key.clone(), signing_hex.clone());
+                self.note_identity_seen(&sender_key, now_ms);
             }
         }
         if !fp.is_empty() {
@@ -1433,13 +1524,31 @@ impl Engine {
             return;
         };
         let sender_hex = hex::encode(packet.sender_id);
+        let sender_key = sender_hex.to_lowercase();
+        // A broadcast is signed by its sender. If we hold that sender's pinned
+        // signing key (learned from their verified announce), the signature
+        // MUST verify: otherwise an attacker who reuses a known peer's public
+        // `sender_id` could have a forged message attributed to that peer's
+        // pinned fingerprint. Senders we have not yet heard announce from can
+        // carry no such pin, so they are attributed to the raw id below and
+        // never to a stolen fingerprint. (This is the verify-when-pinned half of
+        // `handle_sonar`'s gate; unlike sonar, an unpinned broadcast is still
+        // delivered under its raw id rather than buffered as pending.)
+        if let Some(signing_hex) = self.signing_key_by_peer.get(&sender_key) {
+            let Ok(signing_key) = hex::decode(signing_hex) else {
+                return;
+            };
+            if !mesh::verify_packet(packet, &signing_key) {
+                return;
+            }
+        }
         let key = format!("{}-{}", sender_hex, packet.timestamp);
         if !self.remember_broadcast(key) {
             return;
         }
         let fp = self
             .fingerprint_by_peer
-            .get(&sender_hex.to_lowercase())
+            .get(&sender_key)
             .cloned()
             .unwrap_or_else(|| sender_hex.clone());
         if !self.fp_allowed(&fp) {
@@ -2519,5 +2628,187 @@ mod tests {
             .count();
         assert_eq!(writes, 2, "one announce per instance link");
         assert_eq!(notifies, 1, "one announce per server connection");
+    }
+
+    /// Open a client link on `a` ready to receive `on_client_rx`.
+    fn open_link(a: &mut Engine, conn: &str, instance: i32, now: u64) {
+        a.on_dial_request(conn, now);
+        a.on_client_connected(conn, now);
+        a.on_instances_discovered(conn, &[instance], now);
+        a.on_subscribe_result(conn, instance, true, now);
+    }
+
+    fn announce_from(
+        noise_pub: &[u8],
+        signer: &mesh::MeshSigner,
+        nick: &str,
+        ttl: u8,
+        now: u64,
+    ) -> Vec<u8> {
+        let sender_hex = mesh::peer_id_from_noise_key(noise_pub);
+        let mut sender_id = [0u8; 8];
+        hex::decode_to_slice(&sender_hex, &mut sender_id).expect("peer id hex");
+        let announce = mesh::Announce {
+            nickname: nick.to_string(),
+            noise_public_key: noise_pub.to_vec(),
+            signing_public_key: signer.public_key().to_vec(),
+            direct_neighbors: None,
+        };
+        let mut p = mesh::Packet::new(msg_type::ANNOUNCE, ttl, now, sender_id);
+        p.payload = announce.encode().expect("announce encode");
+        assert!(mesh::sign_packet(&mut p, signer), "sign announce");
+        p.encode().expect("packet encode")
+    }
+
+    fn broadcast_from(sender_id: [u8; 8], text: &str, ts: u64, signer: &mesh::MeshSigner) -> Vec<u8> {
+        let mut p = mesh::Packet::new(msg_type::MESSAGE, DEFAULT_TTL, ts, sender_id);
+        p.payload = text.as_bytes().to_vec();
+        assert!(mesh::sign_packet(&mut p, signer), "sign broadcast");
+        p.encode().expect("packet encode")
+    }
+
+    /// A broadcast whose `sender_id` reuses a known peer's (public) id but is
+    /// signed by an attacker must not be attributed to that peer's pinned
+    /// fingerprint. Without the signature gate, `handle_broadcast` looked the
+    /// sender up in `fingerprint_by_peer` and emitted the forged content under
+    /// the victim's identity, then flooded it onward.
+    #[test]
+    fn forged_broadcast_reusing_a_pinned_sender_id_is_dropped() {
+        let mut a = engine(1, "pixel");
+        let victim = engine(7, "victim");
+        let attacker = mesh::MeshSigner::from_seed(&[42u8; 32]);
+        let now = 1_000;
+        open_link(&mut a, "84:2F", 25, now);
+
+        // Victim announces, so `a` pins its signing key and fingerprint.
+        let victim_noise = hex::decode(&victim.noise_public_hex).unwrap();
+        let ann = announce_from(&victim_noise, &victim.signer, "victim", DEFAULT_TTL, now);
+        a.on_client_rx("84:2F", 25, &ann, now);
+        let victim_fp = Engine::fingerprint_of(&victim.noise_public_hex);
+
+        // A genuine broadcast from the victim is received under its fingerprint.
+        let genuine = broadcast_from(victim.my_peer_id, "hi all", now, &victim.signer);
+        let out = a.on_client_rx("84:2F", 25, &genuine, now);
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AppEvent::BroadcastReceived { fingerprint, content, .. }
+                    if fingerprint == &victim_fp && content == "hi all"
+            )),
+            "victim's own signed broadcast should be delivered"
+        );
+
+        // A forged broadcast reusing the victim's sender_id but signed by the
+        // attacker must be dropped, not attributed to the victim.
+        let forged = broadcast_from(victim.my_peer_id, "forged", now + 5, &attacker);
+        let out = a.on_client_rx("84:2F", 25, &forged, now + 5);
+        assert!(
+            !out.events.iter().any(
+                |e| matches!(e, AppEvent::BroadcastReceived { content, .. } if content == "forged")
+            ),
+            "forged broadcast under a pinned peer's id must not be delivered"
+        );
+        assert!(
+            !out.commands.iter().any(|c| matches!(c, Command::WriteLink { .. })),
+            "forged broadcast must not be relayed onward"
+        );
+    }
+
+    /// A genuine broadcast that a relay hop has TTL-decremented must still
+    /// verify. This holds only because `mesh::signing_bytes` zeroes `ttl` before
+    /// signing; pin it here so the broadcast gate can never silently take
+    /// multi-hop public chat down with it.
+    #[test]
+    fn relayed_signed_broadcast_still_verifies() {
+        let mut a = engine(1, "pixel");
+        let victim = engine(7, "victim");
+        let now = 1_000;
+        open_link(&mut a, "84:2F", 25, now);
+
+        let victim_noise = hex::decode(&victim.noise_public_hex).unwrap();
+        let ann = announce_from(&victim_noise, &victim.signer, "victim", DEFAULT_TTL, now);
+        a.on_client_rx("84:2F", 25, &ann, now);
+        let victim_fp = Engine::fingerprint_of(&victim.noise_public_hex);
+
+        let mut bytes = broadcast_from(victim.my_peer_id, "relayed hi", now, &victim.signer);
+        bytes[2] = DEFAULT_TTL - 3; // a relay hop mutated TTL in place
+        let out = a.on_client_rx("84:2F", 25, &bytes, now);
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AppEvent::BroadcastReceived { fingerprint, content, .. }
+                    if fingerprint == &victim_fp && content == "relayed hi"
+            )),
+            "TTL-decremented relayed broadcast must still verify and be delivered"
+        );
+    }
+
+    /// The TOFU signing-key pin for an actively-announcing peer must survive a
+    /// flood of throwaway identities. The old wholesale `clear()` at
+    /// IDENTITY_MAP_CAP let an attacker evict the pin and then rebind the
+    /// victim's fingerprint to an attacker-chosen signing key.
+    #[test]
+    fn identity_flood_cannot_evict_and_rebind_an_active_pin() {
+        const CAP: u32 = 64;
+        let mut a = engine(1, "pixel");
+        a.set_identity_map_cap(CAP as usize);
+        let victim = engine(7, "victim");
+        let attacker = mesh::MeshSigner::from_seed(&[99u8; 32]);
+        let now = 1_000;
+        open_link(&mut a, "84:2F", 25, now);
+
+        let victim_noise = hex::decode(&victim.noise_public_hex).unwrap();
+        let victim_key = hex::encode(victim.my_peer_id);
+        let victim_signing = hex::encode(victim.signer.public_key());
+
+        // Pin the victim.
+        let ann = announce_from(&victim_noise, &victim.signer, "victim", DEFAULT_TTL, now);
+        a.on_client_rx("84:2F", 25, &ann, now);
+        assert_eq!(
+            a.signing_key_by_peer.get(&victim_key),
+            Some(&victim_signing),
+            "victim pinned"
+        );
+
+        // Flood past capacity with distinct throwaway identities, all at `now`
+        // (i.e. all within the protection window, the attacker's best case).
+        for i in 0..(CAP + 8) {
+            let mut nk = [0u8; 32];
+            nk[..4].copy_from_slice(&i.to_le_bytes());
+            nk[31] = 0xAA; // keep it distinct from the victim's key space
+            let seed = {
+                let mut s = [0u8; 32];
+                s[..4].copy_from_slice(&i.to_le_bytes());
+                s[30] = 0xBB;
+                s
+            };
+            let flood_signer = mesh::MeshSigner::from_seed(&seed);
+            let bytes = announce_from(&nk, &flood_signer, "flood", DEFAULT_TTL, now);
+            a.on_client_rx("84:2F", 25, &bytes, now);
+        }
+
+        // The victim's pin must still be intact after the flood.
+        assert_eq!(
+            a.signing_key_by_peer.get(&victim_key),
+            Some(&victim_signing),
+            "active victim pin survives the flood"
+        );
+
+        // The rebind attempt: reuse the victim's noise key (→ same sender_id and
+        // fingerprint) but carry the attacker's signing key. It must be rejected
+        // by the surviving pin.
+        let attacker_signing = hex::encode(attacker.public_key());
+        let rebind = announce_from(&victim_noise, &attacker, "imposter", DEFAULT_TTL, now);
+        a.on_client_rx("84:2F", 25, &rebind, now);
+        assert_eq!(
+            a.signing_key_by_peer.get(&victim_key),
+            Some(&victim_signing),
+            "rebind to the attacker signing key must be rejected"
+        );
+        assert_ne!(
+            a.signing_key_by_peer.get(&victim_key),
+            Some(&attacker_signing),
+            "attacker signing key must never own the victim's fingerprint"
+        );
     }
 }

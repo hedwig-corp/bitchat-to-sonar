@@ -60,6 +60,12 @@ private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_L
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
+
+/** Backoff before rebuilding an attach that an invalidate superseded mid-flight.
+ *  Short on purpose — the user is back in the foreground and the sockets we just
+ *  built are suspect — but non-zero so a fast background/foreground flap settles
+ *  before we spend another attach on it. */
+private const val RELAY_SUPERSEDED_RETRY_MS = 1_000L
 private const val MARMOT_ECHO_RECONCILE_POLL_MS = 100L
 private const val MARMOT_ECHO_RECONCILE_MAX_ATTEMPTS = 10
 
@@ -893,7 +899,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
-            relayStartupCompleted = false
+            resetStartupFlags()
             val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
             try {
             cancelPendingMarmotSetups()
@@ -1019,7 +1025,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             } finally {
                 resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
             }
-            relayStartupCompleted = false
+            resetStartupFlags()
             localCoreReady = true
             homeMessagesHydrated = true
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -1315,7 +1321,16 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Relay attach is independent from local startup. Failure retries here
      * while BLE, wallet, and local database services remain usable. */
     private var relayConnectJob: Job? = null
-    private var relayStartupCompleted = false
+
+    /** Relay-dependent one-shot startup has run — see [completeRelayStartup].
+     *  Separate from [localStartupCompleted] because a superseded attach
+     *  installs the node without attaching, and firing the publishes there would
+     *  burn the only chance to run them. */
+    private var relayStartupCompleted: Boolean = false
+
+    /** Local one-shot startup has run — see [completeLocalStartup]. Runs whatever
+     *  the attach produced, since the node is installed either way. */
+    private var localStartupCompleted: Boolean = false
     private var pollJob: Job? = null
     /** Consumer of the event-driven housekeeping cycle. Triggered by the core
      *  `conversationChanged` flow (primary) and a slow heartbeat (fallback);
@@ -3407,7 +3422,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 relayConnectJob = null
                 housekeepingJob = null
                 marmotWakeJob = null
-                relayStartupCompleted = false
+                resetStartupFlags()
                 toJoin.forEach { it.cancel() }
                 toJoin.forEach { job ->
                     runCatching { withTimeoutOrNull(3_000) { job.join() } }
@@ -3526,7 +3541,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 relayConnectJob = null
                 housekeepingJob = null
                 marmotWakeJob = null
-                relayStartupCompleted = false
+                resetStartupFlags()
                 toJoin.forEach { it.cancel() }
                 toJoin.forEach { job ->
                     runCatching { withTimeoutOrNull(3_000) { job.join() } }
@@ -3772,24 +3787,28 @@ class SonarAppState(private val scope: CoroutineScope) {
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
                 startRelayConnection()
-                if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
+                    // Local-first: never gate chat-list / channel paint on relay
+                    // reconnect. The relay wait below is bounded and background.
+                    repaintFromLocal()
+
                     activeCatchupSyncs++
                     try {
-                        // Foreground resume is a real wake event: force the batched
-                        // gap-recovery fetch (a message may have arrived while the
-                        // socket was torn down in the background). If relays are
-                        // still detached, wait bounded for reconnect before forcing
-                        // so the chip reflects a sync that actually ran.
+                        // Foreground resume is a real wake event: force the
+                        // batched gap-recovery fetch. Single-flight-guarded so a
+                        // notification tap's requestImmediateSync() coalesces
+                        // with this instead of double-enqueuing syncForce on the
+                        // serial engine queue. awaitRelay kicks the reconnect
+                        // needed after a background invalidate and waits bounded,
+                        // so an offline resume cannot hang here.
                         forcedCatchupSync(awaitRelay = true)
-                        drainDirectDms()
-                        refreshChats()
-                        recomputeConversations()
+                        repaintFromLocal()
+                        if (SonarCore.isRelayConnected()) {
+                            refreshKnownContactDescriptors(clearMisses = false)
+                        }
                     } finally {
                         activeCatchupSyncs--
                     }
-                    (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
-                    refreshPresenceCounts()
                 }
                 // Run a full housekeeping pass now rather than waiting for the
                 // next heartbeat (the old 4 s poll would have run within 4 s).
@@ -3798,6 +3817,33 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
         scope.launch { updateUnifyReceiver() }
+    }
+
+    /** Repaint every visible surface from local storage only — no relay work.
+     *  Run once before the relay wait (first paint) and again after gap
+     *  recovery lands (repaint), so both passes stay in sync when a new
+     *  surface is added. */
+    private suspend fun repaintFromLocal() {
+        drainDirectDms()
+        refreshChats()
+        recomputeConversations()
+        (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
+        refreshPresenceCounts()
+    }
+
+    /**
+     * The process left the foreground for real (Android `onStop`, iOS scene
+     * background) — not a transient pause behind a picker or permission dialog.
+     *
+     * Mobile can tear down websockets while we stay process-alive, so drop the
+     * host relay latch: the next push wake / foreground resume then reconnects
+     * instead of syncForce-ing against a dead node. Desktop window focus loss
+     * never reaches here ([RelayConnectionPolicy.shouldInvalidateOnBackground]
+     * is false on JVM and the desktop root does not install the hook).
+     */
+    fun onProcessBackgrounded() {
+        if (!RelayConnectionPolicy.shouldInvalidateOnBackground()) return
+        SonarCore.invalidateRelayConnection()
     }
 
     fun requestImmediateSync() {
@@ -4242,6 +4288,29 @@ class SonarAppState(private val scope: CoroutineScope) {
                     npub = result.getOrThrow()
                     SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 }
+                // The node is installed even when the attach was superseded, so
+                // local startup (listener, collectors, local refreshes) is correct
+                // either way and must not wait on a healthy latch.
+                completeLocalStartup()
+                // A successful connect that left the latch down was superseded by
+                // an invalidate landing mid-attach
+                // ([RelayConnectionPolicy.latchAfterAttach]), so we are not
+                // attached: the relay-dependent one-shots stay pending (see
+                // [completeRelayStartup]) until a real attach lands. Nothing else
+                // re-triggers this job in time either: every caller goes through
+                // startRelayConnection(), which no-ops while the job is alive, so a
+                // foreground resume racing the attach waits out
+                // awaitRelayConnectionBounded() and then sits on dead sockets until
+                // the heartbeat (up to 30 s). Retry while foreground; once genuinely
+                // backgrounded, stop — looping would rebuild sockets the OS is
+                // suspending, and the push wake / next resume start a fresh job.
+                if (!SonarCore.isRelayConnected()) {
+                    if (RelayConnectionPolicy.shouldRetrySupersededAttach(foreground)) {
+                        delay(RELAY_SUPERSEDED_RETRY_MS)
+                        continue
+                    }
+                    return@launch
+                }
                 completeRelayStartup()
                 return@launch
             }
@@ -4293,12 +4362,50 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private suspend fun completeRelayStartup() {
-        if (relayStartupCompleted) return
-        relayStartupCompleted = true
+    /** Clear both one-shot startup gates. Teardown / wipe / restart must reset
+     *  them together — leaving [localStartupCompleted] set across a wipe would
+     *  skip reinstalling the conversation listener. */
+    private fun resetStartupFlags() {
+        relayStartupCompleted = false
+        localStartupCompleted = false
+    }
+
+    /**
+     * One-shot startup that only needs the installed node, not live sockets.
+     *
+     * Runs on every attach outcome, including one an invalidate superseded: the
+     * node is installed either way and local reads already work through it, so
+     * the listener, the collectors and the local refreshes must not wait on a
+     * healthy latch. Nothing here publishes or fetches.
+     */
+    private suspend fun completeLocalStartup() {
+        if (localStartupCompleted) return
+        localStartupCompleted = true
         SonarCore.installConversationListener()
         collectConversationChanges()
         startMarmotWakeLoop()
+        updateBleDiscoveryPolicy()
+        runCatching { refreshChats() }
+        runCatching { recomputeConversations() }
+        drainPendingInviteTokens()
+        requestHousekeeping()
+    }
+
+    /**
+     * One-shot startup that needs live relays: profile hydrate/publish,
+     * descriptor publish, staged-media resume, and the `clearMisses` descriptor /
+     * member refreshes.
+     *
+     * Gated on an actually-attached node. Firing these after an attach a
+     * mid-attach invalidate superseded would spend the only attempt they get —
+     * [relayStartupCompleted] blocks a rerun, `runCatching` swallows their
+     * failures, and the retry replaces and closes the node under them. The
+     * session would then silently never publish its profile/descriptor or resume
+     * staged media.
+     */
+    private suspend fun completeRelayStartup() {
+        if (relayStartupCompleted) return
+        relayStartupCompleted = true
         // Fetch own kind-0 before any publish: after nsec restore the local
         // nick/handle sidecars are empty, and publishing blank/stale metadata
         // would replace the durable relay profile.
@@ -4312,17 +4419,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             runCatching { SonarCore.resumePendingMediaUploads() }
         }
-        updateBleDiscoveryPolicy()
         refreshKnownContactDescriptors(clearMisses = true)
         scope.launch {
             refreshChatMemberProfiles(clearMisses = true)
             delay(6_000)
             refreshChatMemberProfiles(clearMisses = true)
         }
-        runCatching { refreshChats() }
-        runCatching { recomputeConversations() }
-        drainPendingInviteTokens()
-        requestHousekeeping()
     }
 
     /**
@@ -4390,7 +4492,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun boot() {
         if (started || connecting) return
         connecting = true
-        relayStartupCompleted = false
+        resetStartupFlags()
         homeMessagesHydrated = false
         localCoreReady = false
         Notifier.ensureChannel()
