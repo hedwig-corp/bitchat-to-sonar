@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">digite uma mensagem...</string>
     <string name="content_input_nickname_placeholder">apelido</string>
     <string name="content_location_enable">habilitar localização</string>
+    <string name="content_message_collapsed">recolhido</string>
     <string name="content_message_copy">copiar mensagem</string>
+    <string name="content_message_expanded">expandido</string>
     <string name="content_message_show_less">mostrar menos</string>
     <string name="content_message_show_more">mostrar mais</string>
     <string name="content_notes_location_unavailable">localização indisponível</string>

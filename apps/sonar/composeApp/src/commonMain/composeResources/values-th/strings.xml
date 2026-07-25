@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">พิมพ์ข้อความ...</string>
     <string name="content_input_nickname_placeholder">ชื่อเล่น</string>
     <string name="content_location_enable">เปิดใช้งานตำแหน่ง</string>
+    <string name="content_message_collapsed">ย่อแล้ว</string>
     <string name="content_message_copy">คัดลอกข้อความ</string>
+    <string name="content_message_expanded">ขยายแล้ว</string>
     <string name="content_message_show_less">แสดงน้อยลง</string>
     <string name="content_message_show_more">แสดงเพิ่มเติม</string>
     <string name="content_notes_location_unavailable">ไม่มีข้อมูลตำแหน่ง</string>

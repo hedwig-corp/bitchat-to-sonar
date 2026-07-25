@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">skriv ett meddelande...</string>
     <string name="content_input_nickname_placeholder">smeknamn</string>
     <string name="content_location_enable">aktivera plats</string>
+    <string name="content_message_collapsed">kollapsad</string>
     <string name="content_message_copy">kopiera meddelande</string>
+    <string name="content_message_expanded">expanderad</string>
     <string name="content_message_show_less">visa mindre</string>
     <string name="content_message_show_more">visa mer</string>
     <string name="content_notes_location_unavailable">plats ej tillgänglig</string>

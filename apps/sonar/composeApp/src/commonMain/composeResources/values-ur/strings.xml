@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">پیغام ٹائپ کریں...</string>
     <string name="content_input_nickname_placeholder">نک نیم</string>
     <string name="content_location_enable">لوکیشن فعال کریں</string>
+    <string name="content_message_collapsed">سکیڑا گیا</string>
     <string name="content_message_copy">پیغام کاپی کریں</string>
+    <string name="content_message_expanded">پھیلایا گیا</string>
     <string name="content_message_show_less">کم دکھائیں</string>
     <string name="content_message_show_more">مزید دکھائیں</string>
     <string name="content_notes_location_unavailable">لوکیشن دستیاب نہیں</string>

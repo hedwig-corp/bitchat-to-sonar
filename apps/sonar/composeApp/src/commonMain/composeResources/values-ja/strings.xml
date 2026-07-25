@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">メッセージを入力...</string>
     <string name="content_input_nickname_placeholder">ニックネーム</string>
     <string name="content_location_enable">位置情報を有効化</string>
+    <string name="content_message_collapsed">折りたたみ済み</string>
     <string name="content_message_copy">メッセージをコピー</string>
+    <string name="content_message_expanded">展開済み</string>
     <string name="content_message_show_less">表示を減らす</string>
     <string name="content_message_show_more">さらに表示</string>
     <string name="content_notes_location_unavailable">位置情報を取得できません</string>

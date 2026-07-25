@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">typ een bericht...</string>
     <string name="content_input_nickname_placeholder">bijnaam</string>
     <string name="content_location_enable">locatie inschakelen</string>
+    <string name="content_message_collapsed">samengevouwen</string>
     <string name="content_message_copy">bericht kopiëren</string>
+    <string name="content_message_expanded">uitgevouwen</string>
     <string name="content_message_show_less">minder weergeven</string>
     <string name="content_message_show_more">meer weergeven</string>
     <string name="content_notes_location_unavailable">locatie niet beschikbaar</string>

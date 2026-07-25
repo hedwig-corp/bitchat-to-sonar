@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">mag-type ng mensahe...</string>
     <string name="content_input_nickname_placeholder">palayaw</string>
     <string name="content_location_enable">i-on ang lokasyon</string>
+    <string name="content_message_collapsed">nakasara</string>
     <string name="content_message_copy">kopyahin ang mensahe</string>
+    <string name="content_message_expanded">nakabukas</string>
     <string name="content_message_show_less">ipakita nang kaunti</string>
     <string name="content_message_show_more">ipakita pa</string>
     <string name="content_notes_location_unavailable">walang lokasyon</string>

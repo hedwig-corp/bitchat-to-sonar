@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">اكتب رسالة...</string>
     <string name="content_input_nickname_placeholder">لقب</string>
     <string name="content_location_enable">تفعيل الموقع</string>
+    <string name="content_message_collapsed">مطوي</string>
     <string name="content_message_copy">نسخ الرسالة</string>
+    <string name="content_message_expanded">موسّع</string>
     <string name="content_message_show_less">عرض أقل</string>
     <string name="content_message_show_more">عرض المزيد</string>
     <string name="content_notes_location_unavailable">الموقع غير متاح</string>

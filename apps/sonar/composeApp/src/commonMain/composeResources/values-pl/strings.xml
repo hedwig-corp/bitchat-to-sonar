@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">wpisz wiadomość...</string>
     <string name="content_input_nickname_placeholder">pseudonim</string>
     <string name="content_location_enable">włącz lokalizację</string>
+    <string name="content_message_collapsed">zwinięte</string>
     <string name="content_message_copy">kopiuj wiadomość</string>
+    <string name="content_message_expanded">rozwinięte</string>
     <string name="content_message_show_less">pokaż mniej</string>
     <string name="content_message_show_more">pokaż więcej</string>
     <string name="content_notes_location_unavailable">lokalizacja niedostępna</string>

@@ -113,7 +113,9 @@
     <string name="content_input_message_placeholder">type a message...</string>
     <string name="content_input_nickname_placeholder">nickname</string>
     <string name="content_location_enable">enable location</string>
+    <string name="content_message_collapsed">collapsed</string>
     <string name="content_message_copy">copy message</string>
+    <string name="content_message_expanded">expanded</string>
     <string name="content_message_show_less">show less</string>
     <string name="content_message_show_more">show more</string>
     <string name="content_notes_location_unavailable">location unavailable</string>

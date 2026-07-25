@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">bir mesaj yazın...</string>
     <string name="content_input_nickname_placeholder">takma ad</string>
     <string name="content_location_enable">konumu etkinleştir</string>
+    <string name="content_message_collapsed">daraltıldı</string>
     <string name="content_message_copy">mesajı kopyala</string>
+    <string name="content_message_expanded">genişletildi</string>
     <string name="content_message_show_less">daha az göster</string>
     <string name="content_message_show_more">daha fazla göster</string>
     <string name="content_notes_location_unavailable">konum kullanılamıyor</string>

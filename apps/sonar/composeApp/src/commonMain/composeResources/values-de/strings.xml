@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">nachricht eingeben...</string>
     <string name="content_input_nickname_placeholder">nickname</string>
     <string name="content_location_enable">standort aktivieren</string>
+    <string name="content_message_collapsed">eingeklappt</string>
     <string name="content_message_copy">nachricht kopieren</string>
+    <string name="content_message_expanded">ausgeklappt</string>
     <string name="content_message_show_less">weniger anzeigen</string>
     <string name="content_message_show_more">mehr anzeigen</string>
     <string name="content_notes_location_unavailable">standort nicht verfügbar</string>

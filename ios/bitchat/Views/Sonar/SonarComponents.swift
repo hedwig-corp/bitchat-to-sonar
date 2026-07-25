@@ -692,24 +692,10 @@ struct SNMsgBubble: View {
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
             if preview.isTruncated {
-                Button {
+                ShowMoreButton.sonar(isExpanded: isExpanded) {
                     if isExpanded { expandedMessageIDs.remove(m.id) }
                     else { expandedMessageIDs.insert(m.id) }
-                } label: {
-                    // Plain buttons only hit-test their label subtree, so the
-                    // frame and contentShape must live INSIDE the label —
-                    // applied to the Button wrapper they widen the layout box
-                    // and leave the blank part of the 44pt area unhittable.
-                    Text(isExpanded
-                         ? String(localized: "content.message.show_less")
-                         : String(localized: "content.message.show_more"))
-                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                        .foregroundColor(SonarTheme.accentDeep)
-                        .padding(.horizontal, 6)
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
             }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)

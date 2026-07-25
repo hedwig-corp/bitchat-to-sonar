@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">écris un message...</string>
     <string name="content_input_nickname_placeholder">pseudo</string>
     <string name="content_location_enable">activer la localisation</string>
+    <string name="content_message_collapsed">réduit</string>
     <string name="content_message_copy">copier le message</string>
+    <string name="content_message_expanded">développé</string>
     <string name="content_message_show_less">afficher moins</string>
     <string name="content_message_show_more">afficher plus</string>
     <string name="content_notes_location_unavailable">localisation indisponible</string>

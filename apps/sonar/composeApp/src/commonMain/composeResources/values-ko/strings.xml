@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">메시지를 입력하세요...</string>
     <string name="content_input_nickname_placeholder">닉네임</string>
     <string name="content_location_enable">위치 활성화</string>
+    <string name="content_message_collapsed">접힘</string>
     <string name="content_message_copy">메시지 복사</string>
+    <string name="content_message_expanded">확장됨</string>
     <string name="content_message_show_less">간략히 보기</string>
     <string name="content_message_show_more">더 보기</string>
     <string name="content_notes_location_unavailable">위치 사용 불가</string>

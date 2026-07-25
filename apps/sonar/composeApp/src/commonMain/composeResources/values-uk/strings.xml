@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">напиши повідомлення...</string>
     <string name="content_input_nickname_placeholder">нік</string>
     <string name="content_location_enable">увімкнути локацію</string>
+    <string name="content_message_collapsed">згорнуто</string>
     <string name="content_message_copy">скопіювати повідомлення</string>
+    <string name="content_message_expanded">розгорнуто</string>
     <string name="content_message_show_less">показати менше</string>
     <string name="content_message_show_more">показати більше</string>
     <string name="content_notes_location_unavailable">локація недоступна</string>

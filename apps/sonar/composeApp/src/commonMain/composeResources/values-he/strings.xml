@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">כתוב הודעה...</string>
     <string name="content_input_nickname_placeholder">כינוי</string>
     <string name="content_location_enable">הפעל מיקום</string>
+    <string name="content_message_collapsed">מכווץ</string>
     <string name="content_message_copy">העתק הודעה</string>
+    <string name="content_message_expanded">מורחב</string>
     <string name="content_message_show_less">הצג פחות</string>
     <string name="content_message_show_more">הצג עוד</string>
     <string name="content_notes_location_unavailable">המיקום לא זמין</string>

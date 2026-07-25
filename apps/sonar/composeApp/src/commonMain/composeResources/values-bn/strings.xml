@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">একটি বার্তা লিখুন...</string>
     <string name="content_input_nickname_placeholder">ডাকনাম</string>
     <string name="content_location_enable">লোকেশন চালু করুন</string>
+    <string name="content_message_collapsed">সংকুচিত</string>
     <string name="content_message_copy">বার্তা কপি করুন</string>
+    <string name="content_message_expanded">বিস্তৃত</string>
     <string name="content_message_show_less">কম দেখান</string>
     <string name="content_message_show_more">আরও দেখান</string>
     <string name="content_notes_location_unavailable">অবস্থান অনুপলব্ধ</string>
