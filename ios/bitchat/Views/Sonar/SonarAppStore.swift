@@ -412,6 +412,9 @@ struct SNMediaItem: Equatable {
     /// cells from these so the decoded image never reflows the transcript.
     var width: UInt32? = nil
     var height: UInt32? = nil
+    /// Optional duration hint for voice notes (milliseconds). Older records may
+    /// be nil; the playback engine probes metadata off the local file then.
+    var durationMs: UInt64? = nil
     var isImage: Bool { mime.hasPrefix("image/") }
     var isAudio: Bool { mime.hasPrefix("audio/") }
     var isGif: Bool {
@@ -1542,6 +1545,7 @@ final class SonarAppStore: ObservableObject {
         defaults.removeObject(forKey: Keys.legacyDemoState)
         callLogs = Self.loadCallLogs(from: defaults)
         syncNotificationPrefsToAppGroup()
+        configureVoicePlaybackSession()
 
         // Internet fallback for private mesh media sends: when the BLE route
         // drops between route selection and send, ChatViewModel hands the
@@ -2201,6 +2205,9 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func clearAccountBoundLocalStateForRestore() {
+        // Same teardown as wipe/erase — stop playback before media cache delete
+        // so a restore mid-play cannot keep the prior account's voice session.
+        VoiceNotePlaybackController.shared.clearAll()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -5028,7 +5035,7 @@ final class SonarAppStore: ObservableObject {
                             pay: pay
                         ))
                     case .notPay:
-                        let mediaItem = meshMediaItem(m.content)
+                        let mediaItem = meshMediaItem(m.content, conversationId: id)
                         let meshSticker = meshParseStickerContent(content: m.content).map {
                             MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
                         }
@@ -5127,7 +5134,7 @@ final class SonarAppStore: ObservableObject {
             case .notPay:
                 // BLE-mesh media (bitchat file transfer) arrives as an
                 // "[image] <name>" marker with the file already on disk.
-                let mediaItem = meshMediaItem(m.content)
+                let mediaItem = meshMediaItem(m.content, conversationId: id)
                 let meshSticker = meshParseStickerContent(content: m.content).map {
                     MarmotService.MarmotStickerRef(packCoordinate: $0.packCoordinate, shortcode: $0.shortcode, plaintextSha256: $0.plaintextSha256)
                 }
@@ -6147,6 +6154,8 @@ final class SonarAppStore: ObservableObject {
                     let upload = pending.remove(at: match.offset)
                     mediaImageCache[media.url] = upload.data
                     mediaImageCache.removeValue(forKey: upload.localURL)
+                    // Keep in-flight voice playback / listened keys across publish.
+                    SNVoiceAttachmentIdentity.alias(from: upload.localURL, to: media.url)
                     if let disk = Self.mediaCacheURL(for: media.url) {
                         try? upload.data.write(to: disk, options: [.atomic, .completeFileProtection])
                     }
@@ -6707,7 +6716,10 @@ final class SonarAppStore: ObservableObject {
 
     /// Resolve a bitchat file marker ("[image]/[file]/[voice] <name>") to a media
     /// item with the local on-disk path, if the file exists.
-    private func meshMediaItem(_ content: String) -> SNMediaItem? {
+    /// BLE-mesh media has no Marmot group; [conversationId] is the DM/chat id
+    /// and doubles as `SNMediaItem.groupId` so voice playback queue/rate/delete
+    /// stop can match the active item (empty groupId would miss the chat).
+    private func meshMediaItem(_ content: String, conversationId: String) -> SNMediaItem? {
         let kinds: [(prefix: String, mime: String, dirs: [String])] = [
             ("[image] ", "image/jpeg", ["images/incoming", "images/outgoing"]),
             ("[voice] ", "audio/mp4", ["voicenotes/incoming", "voicenotes/outgoing"]),
@@ -6729,7 +6741,7 @@ final class SonarAppStore: ObservableObject {
                     url: "",
                     mime: k.mime,
                     filename: safe,
-                    groupId: "",
+                    groupId: conversationId,
                     localPath: path,
                     width: bounds?.0,
                     height: bounds?.1
@@ -6754,6 +6766,58 @@ final class SonarAppStore: ObservableObject {
               FileManager.default.fileExists(atPath: disk.path)
         else { return nil }
         return disk
+    }
+
+    /// Wire the process-wide voice session: fold-aware logical ids + bounded
+    /// local queue. Rows only observe; this store owns lifecycle arbitration.
+    private func configureVoicePlaybackSession() {
+        SNVoicePlaybackIdentity.logicalIdForSource = { [weak self] sourceId in
+            guard let self else { return nil }
+            if let folded = self.foldedConversationId(forMarmotGroupId: sourceId) {
+                return folded
+            }
+            // Standalone Marmot chats use `marmot:<groupId>` in UI + deleteChat;
+            // keep voice logical ids on that same key so stop-on-delete matches.
+            let isMarmotSource =
+                self.marmot.groups.contains(where: { $0.id == sourceId })
+                || (!sourceId.hasPrefix(Self.marmotIDPrefix)
+                    && self.marmot.messagesByGroup[sourceId] != nil)
+            if isMarmotSource {
+                return self.marmotConvId(forGroup: sourceId)
+            }
+            return sourceId
+        }
+        VoiceNotePlaybackController.shared.configure(
+            queue: SonarVoicePlaybackQueue(store: self),
+            onPlaybackStarted: { _ in
+                // Listened state is persisted by the controller; receipts reuse
+                // existing conversation-read semantics elsewhere.
+            }
+        )
+    }
+
+    func voicePlaybackItem(
+        for message: SNMessage,
+        media: SNMediaItem,
+        mediaIndex: Int,
+        logicalConversationId: String
+    ) -> VoicePlaybackItem? {
+        guard let localURL = existingMediaURL(media) ?? mediaTransferState(media).localURL else {
+            return nil
+        }
+        return VoicePlaybackItem(
+            logicalConversationId: logicalConversationId,
+            sourceConversationId: media.groupId,
+            messageId: message.id,
+            attachmentId: snVoiceAttachmentId(
+                messageId: message.id,
+                mediaIndex: mediaIndex,
+                filename: media.filename,
+                url: media.url
+            ),
+            localFile: localURL,
+            durationHint: media.durationMs.map { TimeInterval($0) / 1000.0 }
+        )
     }
 
     func mediaTransferState(_ item: SNMediaItem) -> SNMediaTransferState {
@@ -8234,6 +8298,7 @@ final class SonarAppStore: ObservableObject {
             SecureLogger.debug("SonarCall: refusing call without BLE or White Noise route convId=\(convId.prefix(16))", category: .session)
             return
         }
+        VoiceNotePlaybackController.shared.stop(reason: .call)
         let callId = UUID().uuidString
         let name = callDisplayName(convId)
         // Show the ringing screen IMMEDIATELY so the tap is responsive — the iroh
@@ -8563,6 +8628,7 @@ final class SonarAppStore: ObservableObject {
                     }
                     try await self.marmot.callIncomingOffer(callId: callId, addrB64: nodeAddrB64, video: video)
                     await MainActor.run {
+                        VoiceNotePlaybackController.shared.stop(reason: .call)
                         self.activeCall = SNActiveCall(callId: callId, convId: conversationId, signalingVia: signalingVia, peerName: name, video: video, incoming: true, phase: .ringing, speakerOn: video)
                         self.sendSonarNotification(
                             kind: .call,
@@ -8643,6 +8709,22 @@ final class SonarAppStore: ObservableObject {
     /// await durable MLS purge so a stuck relay cannot keep the chat visible.
     func deleteChat(_ id: String) {
         discardRetainedConversation(id)
+        // Stop voice if the active note belongs to this logical conversation
+        // (or any folded source mapped under it) before local media is removed.
+        VoiceNotePlaybackController.shared.stopIfActiveItem(
+            matching: { [weak self] item in
+                guard let self else { return false }
+                if item.logicalConversationId == id || item.sourceConversationId == id {
+                    return true
+                }
+                // Prefixed chat id vs raw group id on the media item.
+                if let gid = self.marmotGroupId(id), item.sourceConversationId == gid {
+                    return true
+                }
+                return false
+            },
+            reason: .deleted
+        )
         if isPendingSecureChat(id) {
             pendingMarmotChats[id] = nil
             pendingMarmotGroups[id] = nil
@@ -8740,6 +8822,7 @@ final class SonarAppStore: ObservableObject {
     /// to start fresh (e.g. to drop a broken Marmot group) without re-running
     /// onboarding. Contrast with `wipe()`, which destroys everything.
     func eraseAllChats() {
+        VoiceNotePlaybackController.shared.clearAll()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8805,6 +8888,7 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func performWipe() async {
+        VoiceNotePlaybackController.shared.clearAll()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8959,5 +9043,68 @@ final class SonarAppStore: ObservableObject {
         case .partiallyDelivered(let reached, let total): return "Delivered to \(reached) of \(total)"
         case nil: return nil
         }
+    }
+}
+
+/// Bounded local voice queue from the already-published transcript projection.
+@MainActor
+final class SonarVoicePlaybackQueue: VoicePlaybackQueue {
+    private weak var store: SonarAppStore?
+
+    init(store: SonarAppStore) {
+        self.store = store
+    }
+
+    func next(after item: VoicePlaybackItem) -> VoicePlaybackItem? {
+        neighbor(of: item, direction: +1)
+    }
+
+    func previous(before item: VoicePlaybackItem) -> VoicePlaybackItem? {
+        neighbor(of: item, direction: -1)
+    }
+
+    private func neighbor(of item: VoicePlaybackItem, direction: Int) -> VoicePlaybackItem? {
+        guard let store else { return nil }
+        let candidates = store.localVoicePlaybackCandidates(logicalConversationId: item.logicalConversationId)
+        guard let idx = candidates.firstIndex(where: { $0.key == item.key }) else { return nil }
+        let nextIdx = idx + direction
+        guard candidates.indices.contains(nextIdx) else { return nil }
+        return candidates[nextIdx]
+    }
+}
+
+extension SonarAppStore {
+    /// Voice notes already present in the local transcript window for one
+    /// logical conversation. Never hits relay or scans full history.
+    @MainActor
+    func localVoicePlaybackCandidates(logicalConversationId: String) -> [VoicePlaybackItem] {
+        // Prefer the open transcript cache. Never call `conversationViewState`
+        // here — that would recreate + subscribe a closed chat just for queue
+        // lookups after the user left (zombie rebuilds until process exit).
+        let rows: [SNMessage]
+        if let existing = conversationViewStates[logicalConversationId] {
+            rows = existing.messages
+        } else {
+            rows = dmMsgs(
+                logicalConversationId,
+                limit: TransportConfig.sonarTranscriptPageCount
+            )
+        }
+        var out: [VoicePlaybackItem] = []
+        for message in rows {
+            for (index, media) in message.media.enumerated() where media.mime.hasPrefix("audio/") {
+                // Skip undownloaded notes — Next/autoplay must not fail on empty paths.
+                guard mediaTransferState(media).phase == .available else { continue }
+                if let item = voicePlaybackItem(
+                    for: message,
+                    media: media,
+                    mediaIndex: index,
+                    logicalConversationId: logicalConversationId
+                ) {
+                    out.append(item)
+                }
+            }
+        }
+        return out
     }
 }

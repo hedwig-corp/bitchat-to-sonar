@@ -61,6 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">#%1$s க்கான புக்மார்க் மாற்றவும்</string>
     <string name="content_accessibility_toggle_favorite">பிரியப்பட்ட நிலையை மாற்ற இருமுறை தட்டவும்</string>
     <string name="content_accessibility_view_fingerprint">குறியாக்க கைரேகையைப் பார்க்க தட்டவும்</string>
+    <string name="content_accessibility_voice_download">Download voice message</string>
+    <string name="content_accessibility_voice_downloading">Downloading voice message</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_retry">Retry downloading voice message</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
+    <string name="content_accessibility_voice_unheard">Unheard voice message</string>
     <string name="content_actions_block">தடுப்பு</string>
     <string name="content_actions_direct_message">நேரடி செய்தி</string>
     <string name="content_actions_hug">அடைகாக்க</string>
@@ -104,6 +113,8 @@
     <string name="content_notes_title">குறிப்புகள்</string>
     <string name="content_payment_cashu">Cashu மூலம் செலுத்தவும்</string>
     <string name="content_payment_lightning">Lightning மூலம் செலுத்தவும்</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">குறியாக்கம் அமைக்கப்படுகிறது</string>
     <string name="encryption_accessibility_failed">குறியாக்கம் தோல்வியடைந்தது</string>
     <string name="encryption_accessibility_not_encrypted">குறியாக்கம் செய்யப்படவில்லை</string>

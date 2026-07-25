@@ -149,6 +149,11 @@ data class SonarMedia(
     val isGif: Boolean get() =
         mimeType.equals("image/gif", ignoreCase = true) ||
             filename.endsWith(".gif", ignoreCase = true)
+    /** No wire-format duration/kind flag distinguishes a recorded voice note
+     *  from generic audio yet; this mirrors the heuristic [AudioBubble] has
+     *  always rendered on, so voice playback autoplay/queueing stays scoped to
+     *  exactly the attachments the voice-message bubble renders. */
+    val isAudio: Boolean get() = mimeType.startsWith("audio/")
 }
 
 /** A peer's Nostr profile (kind-0 metadata, NIP-01). A Marmot member's identity

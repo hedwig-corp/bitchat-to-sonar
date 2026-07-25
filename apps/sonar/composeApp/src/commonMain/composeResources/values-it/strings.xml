@@ -61,6 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">cambia segnalibro per #%1$s</string>
     <string name="content_accessibility_toggle_favorite">tocca due volte per cambiare stato preferito</string>
     <string name="content_accessibility_view_fingerprint">tocca per vedere l'impronta di cifratura</string>
+    <string name="content_accessibility_voice_download">Scarica messaggio vocale</string>
+    <string name="content_accessibility_voice_downloading">Download del messaggio vocale in corso</string>
+    <string name="content_accessibility_voice_pause">Metti in pausa il messaggio vocale</string>
+    <string name="content_accessibility_voice_play">Riproduci messaggio vocale</string>
+    <string name="content_accessibility_voice_playback">Riproduzione del messaggio vocale non riuscita</string>
+    <string name="content_accessibility_voice_retry">Riprova a scaricare il messaggio vocale</string>
+    <string name="content_accessibility_voice_seek">Scorri messaggio vocale</string>
+    <string name="content_accessibility_voice_speed">Cambia velocità di riproduzione</string>
+    <string name="content_accessibility_voice_unheard">Messaggio vocale non ascoltato</string>
     <string name="content_actions_block">blocca</string>
     <string name="content_actions_direct_message">messaggio diretto</string>
     <string name="content_actions_hug">abbraccia</string>
@@ -104,6 +113,8 @@
     <string name="content_notes_title">note</string>
     <string name="content_payment_cashu">paga con cashu</string>
     <string name="content_payment_lightning">paga con lightning</string>
+    <string name="content_voice_listened">Ascoltato</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">avvio crittografia</string>
     <string name="encryption_accessibility_failed">crittografia fallita</string>
     <string name="encryption_accessibility_not_encrypted">non crittografato</string>

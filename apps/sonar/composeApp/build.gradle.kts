@@ -219,6 +219,10 @@ kotlin {
             implementation("net.java.dev.jna:jna:5.14.0@aar")
             // QR encoding for shareable group invite links.
             implementation("com.google.zxing:core:3.5.3")
+            // Voice-note playback (issue #320): ExoPlayer + MediaSessionService
+            // so background/lock-screen/notification ownership matches Signal.
+            implementation(libs.androidx.media3.exoplayer)
+            implementation(libs.androidx.media3.session)
         }
         androidInstrumentedTest.dependencies {
             implementation(libs.androidx.test.runner)
@@ -247,6 +251,14 @@ kotlin {
                 implementation(libs.jna)
                 // QR encoding for shareable group invite links.
                 implementation("com.google.zxing:core:3.5.3")
+                // OpenJFX Media for controllable AAC/M4A voice-note playback
+                // (GPL+Classpath Exception). Classifier matches the host that
+                // compiles/runs the desktop target.
+                val fxClassifier = openjfxClassifier()
+                val fxVersion = libs.versions.openjfx.get()
+                implementation("org.openjfx:javafx-base:$fxVersion:$fxClassifier")
+                implementation("org.openjfx:javafx-graphics:$fxVersion:$fxClassifier")
+                implementation("org.openjfx:javafx-media:$fxVersion:$fxClassifier")
             }
         }
     }
@@ -473,4 +485,16 @@ tasks.matching {
         )
 }.configureEach {
     dependsOn(requireBreezApiKeyForRelease)
+}
+
+/** OpenJFX native classifier for the machine compiling/running the desktop target. */
+fun openjfxClassifier(): String {
+    val os = System.getProperty("os.name").lowercase()
+    val arch = System.getProperty("os.arch").lowercase()
+    return when {
+        os.contains("mac") && (arch.contains("aarch64") || arch.contains("arm64")) -> "mac-aarch64"
+        os.contains("mac") -> "mac"
+        os.contains("win") -> if (arch.contains("aarch64") || arch.contains("arm64")) "win-aarch64" else "win"
+        else -> if (arch.contains("aarch64") || arch.contains("arm64")) "linux-aarch64" else "linux"
+    }
 }

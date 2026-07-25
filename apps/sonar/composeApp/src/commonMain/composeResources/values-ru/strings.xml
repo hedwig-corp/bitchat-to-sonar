@@ -61,6 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">переключить закладку для #%1$s</string>
     <string name="content_accessibility_toggle_favorite">дважды тапни, чтобы переключить статус избранного</string>
     <string name="content_accessibility_view_fingerprint">нажми, чтобы увидеть криптографический отпечаток</string>
+    <string name="content_accessibility_voice_download">Скачать голосовое сообщение</string>
+    <string name="content_accessibility_voice_downloading">Скачивание голосового сообщения</string>
+    <string name="content_accessibility_voice_pause">Приостановить голосовое сообщение</string>
+    <string name="content_accessibility_voice_play">Воспроизвести голосовое сообщение</string>
+    <string name="content_accessibility_voice_playback">Не удалось воспроизвести голосовое сообщение</string>
+    <string name="content_accessibility_voice_retry">Повторить скачивание голосового сообщения</string>
+    <string name="content_accessibility_voice_seek">Перемотать голосовое сообщение</string>
+    <string name="content_accessibility_voice_speed">Изменить скорость воспроизведения</string>
+    <string name="content_accessibility_voice_unheard">Непрослушанное голосовое сообщение</string>
     <string name="content_actions_block">заблокировать</string>
     <string name="content_actions_direct_message">личное сообщение</string>
     <string name="content_actions_hug">обнять</string>
@@ -104,6 +113,8 @@
     <string name="content_notes_title">заметки</string>
     <string name="content_payment_cashu">оплатить через cashu</string>
     <string name="content_payment_lightning">оплатить через lightning</string>
+    <string name="content_voice_listened">Прослушано</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">устанавливается шифрование</string>
     <string name="encryption_accessibility_failed">шифрование не удалось</string>
     <string name="encryption_accessibility_not_encrypted">не зашифровано</string>

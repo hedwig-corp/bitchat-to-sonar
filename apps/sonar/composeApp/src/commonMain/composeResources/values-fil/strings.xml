@@ -61,6 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">i-toggle ang bookmark para sa #%1$s</string>
     <string name="content_accessibility_toggle_favorite">i-double tap para i-toggle ang paborito</string>
     <string name="content_accessibility_view_fingerprint">i-tap para makita ang fingerprint ng pag-encrypt</string>
+    <string name="content_accessibility_voice_download">Download voice message</string>
+    <string name="content_accessibility_voice_downloading">Downloading voice message</string>
+    <string name="content_accessibility_voice_pause">Pause voice message</string>
+    <string name="content_accessibility_voice_play">Play voice message</string>
+    <string name="content_accessibility_voice_playback">Voice message playback failed</string>
+    <string name="content_accessibility_voice_retry">Retry downloading voice message</string>
+    <string name="content_accessibility_voice_seek">Seek voice message</string>
+    <string name="content_accessibility_voice_speed">Change playback speed</string>
+    <string name="content_accessibility_voice_unheard">Unheard voice message</string>
     <string name="content_actions_block">i-block</string>
     <string name="content_actions_direct_message">diretsong mensahe</string>
     <string name="content_actions_hug">yakap</string>
@@ -104,6 +113,8 @@
     <string name="content_notes_title">mga tala</string>
     <string name="content_payment_cashu">magbayad gamit ang Cashu</string>
     <string name="content_payment_lightning">magbayad gamit ang Lightning</string>
+    <string name="content_voice_listened">Played</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">nagseset up ng pag-encrypt</string>
     <string name="encryption_accessibility_failed">nabigo ang pag-encrypt</string>
     <string name="encryption_accessibility_not_encrypted">walang pag-encrypt</string>

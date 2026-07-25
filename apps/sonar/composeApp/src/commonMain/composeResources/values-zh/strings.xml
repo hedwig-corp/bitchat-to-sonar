@@ -61,6 +61,15 @@
     <string name="content_accessibility_toggle_bookmark">切换 #%1$s 的书签</string>
     <string name="content_accessibility_toggle_favorite">双击切换收藏状态</string>
     <string name="content_accessibility_view_fingerprint">轻点查看加密指纹</string>
+    <string name="content_accessibility_voice_download">下载语音消息</string>
+    <string name="content_accessibility_voice_downloading">正在下载语音消息</string>
+    <string name="content_accessibility_voice_pause">暂停语音消息</string>
+    <string name="content_accessibility_voice_play">播放语音消息</string>
+    <string name="content_accessibility_voice_playback">语音消息播放失败</string>
+    <string name="content_accessibility_voice_retry">重试下载语音消息</string>
+    <string name="content_accessibility_voice_seek">拖动语音消息进度</string>
+    <string name="content_accessibility_voice_speed">更改播放速度</string>
+    <string name="content_accessibility_voice_unheard">未收听的语音消息</string>
     <string name="content_actions_block">屏蔽</string>
     <string name="content_actions_direct_message">私信</string>
     <string name="content_actions_hug">拥抱</string>
@@ -104,6 +113,8 @@
     <string name="content_notes_title">笔记</string>
     <string name="content_payment_cashu">通过 cashu 支付</string>
     <string name="content_payment_lightning">通过 lightning 支付</string>
+    <string name="content_voice_listened">已播放</string>
+    <string name="content_voice_playback_rate">%1$s×</string>
     <string name="encryption_accessibility_establishing">正在建立加密</string>
     <string name="encryption_accessibility_failed">加密失败</string>
     <string name="encryption_accessibility_not_encrypted">未加密</string>
