@@ -1775,14 +1775,14 @@ final class SonarAppStore: ObservableObject {
         // time to connect + handshake). Logs the target peerID + text so the
         // send/receive can be confirmed from device logs without UI automation.
         if onboarded, let text = defaults.string(forKey: "sonar.debug.sendMeshDM"), !text.isEmpty {
-            scheduleDebugMeshDM(text)
+            scheduleDebugMeshDM(text, peerPrefix: defaults.string(forKey: "sonar.debug.meshPeer"))
         }
         // `-sonar.debug.sendMeshImage 1`: send a generated test JPEG to the first
         // connected/reachable mesh peer ~12s after launch over the bitchat file
         // transfer path (type 0x22). Verifies Sonar→stock-bitchat BLE media interop
         // without UI automation (the phone must be unlocked + Sonar foreground).
         if onboarded, let flag = defaults.string(forKey: "sonar.debug.sendMeshImage"), !flag.isEmpty {
-            scheduleDebugMeshImage()
+            scheduleDebugMeshImage(peerPrefix: defaults.string(forKey: "sonar.debug.meshPeer"))
         }
         // `-sonar.debug.sendMarmot "<text>"`: force the White Noise (Marmot) path
         // to the first discovered Sonar peer ~25s after launch (after 0x53
@@ -1883,15 +1883,26 @@ final class SonarAppStore: ObservableObject {
     #endif
 
     #if DEBUG
-    private func scheduleDebugMeshDM(_ text: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+    private func scheduleDebugMeshDM(_ text: String, peerPrefix: String?, attempt: Int = 0) {
+        let trimmedPeerPrefix = peerPrefix?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedPeerPrefix = trimmedPeerPrefix?.isEmpty == false ? trimmedPeerPrefix : nil
+        let delay: Double = attempt == 0 ? 12 : 6
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             let my = self.chatViewModel.meshService.myPeerID
-            let target = self.chatViewModel.allPeers.first {
-                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            let target = self.chatViewModel.allPeers.first { peer in
+                let prefixMatches = normalizedPeerPrefix.map { prefix in
+                    peer.peerID.id.lowercased().hasPrefix(prefix)
+                } ?? true
+                return peer.peerID != my && prefixMatches && (peer.isConnected || peer.isReachable)
             }
             guard let peer = target else {
+                if attempt < 8 {
+                    self.scheduleDebugMeshDM(text, peerPrefix: peerPrefix, attempt: attempt + 1)
+                    return
+                }
                 SecureLogger.warning("🧪 debug.sendMeshDM: no connected peer to send to", category: .session)
+                self.writeDebugReport("sendMeshDM gave up — no matching connected/reachable peer")
                 return
             }
             SecureLogger.warning("🧪 debug.sendMeshDM: sending '\(text)' to peer \(peer.peerID.id) (\(peer.displayName))", category: .session)
@@ -1900,17 +1911,22 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    private func scheduleDebugMeshImage(attempt: Int = 0) {
+    private func scheduleDebugMeshImage(peerPrefix: String?, attempt: Int = 0) {
+        let trimmedPeerPrefix = peerPrefix?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedPeerPrefix = trimmedPeerPrefix?.isEmpty == false ? trimmedPeerPrefix : nil
         let delay: Double = attempt == 0 ? 12 : 6
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             let my = self.chatViewModel.meshService.myPeerID
-            let target = self.chatViewModel.allPeers.first {
-                $0.peerID != my && ($0.isConnected || $0.isReachable)
+            let target = self.chatViewModel.allPeers.first { peer in
+                let prefixMatches = normalizedPeerPrefix.map { prefix in
+                    peer.peerID.id.lowercased().hasPrefix(prefix)
+                } ?? true
+                return peer.peerID != my && prefixMatches && (peer.isConnected || peer.isReachable)
             }
             guard let peer = target else {
                 if attempt < 8 {
-                    self.scheduleDebugMeshImage(attempt: attempt + 1)
+                    self.scheduleDebugMeshImage(peerPrefix: peerPrefix, attempt: attempt + 1)
                 } else {
                     SecureLogger.warning("🧪 debug.sendMeshImage: no connected peer to send to", category: .session)
                     self.writeDebugReport("sendMeshImage gave up — no connected/reachable peer")
@@ -2129,6 +2145,11 @@ final class SonarAppStore: ObservableObject {
         // Validate before any destructive work. An invalid paste must leave the
         // current identity, chats, wallet, and push registrations untouched.
         _ = try SonarIdentity.import(nsec: key)
+
+        // Hold Marmot's send/setup suspension across wallet deletion and every
+        // host-owned cache mutation, not just the core database replacement.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
 
         #if os(iOS) || os(macOS)
         let bridged = wallet as? BridgedWallet
@@ -5844,6 +5865,20 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSetupTokens = [:]
     }
 
+    /// Cancel and join the pending group-creation/accept tasks. These call the
+    /// untracked `MarmotService.startGroup` / `acceptGroupInvite`, so a
+    /// destructive host mutation must wait for them instead of merely
+    /// cancelling them afterwards.
+    private func quiescePendingMarmotGroupSetups() async {
+        let tasks = Array(pendingMarmotGroupSetupTasks.values)
+        pendingMarmotGroupSetupTasks = [:]
+        pendingMarmotGroupSetupTokens = [:]
+        tasks.forEach { $0.cancel() }
+        for task in tasks {
+            _ = await task.value
+        }
+    }
+
     private func failedPendingMessage(_ message: SNMessage) -> SNMessage {
         SNMessage(
             id: message.id,
@@ -8750,6 +8785,19 @@ final class SonarAppStore: ObservableObject {
     /// to start fresh (e.g. to drop a broken Marmot group) without re-running
     /// onboarding. Contrast with `wipe()`, which destroys everything.
     func eraseAllChats() {
+        Task { @MainActor [weak self] in
+            await self?.performEraseAllChats()
+        }
+    }
+
+    private func performEraseAllChats() async {
+        // Quiesce Marmot sends before any host-side state is cleared. Otherwise
+        // a queued send can publish after the UI and databases were erased.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        // Group creation/accept run untracked FFI calls; join them before the
+        // store is erased so a late completion cannot recreate a group.
+        await quiescePendingMarmotGroupSetups()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8757,9 +8805,11 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
-        // White Noise / Marmot groups: wipe the encrypted DB then reconnect
-        // with the SAME identity so new secure chats still work.
-        Task { await marmot.eraseChatsKeepIdentity() }
+        // Order matters: quiesce sends first (lease held above), then clear all
+        // host/UI state so the chat list and any open transcript stop rendering
+        // backed rows, and only then erase the database — the UI must never
+        // paint rows whose backing store is mid-delete.
+        await marmot.eraseChatsKeepIdentity()
         // Drop queued sends + pay-scan state that referenced the erased chats.
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]
@@ -8815,6 +8865,15 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func performWipe() async {
+        // Treat the user's tap as the privacy boundary: suspend and join every
+        // Marmot text/media/setup task before wallet or host state changes.
+        let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
+        defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        // Group creation/accept run untracked FFI calls; join them before the
+        // store is wiped so a late completion cannot recreate a group.
+        await quiescePendingMarmotGroupSetups()
+        marmot.stopPolling()
+        await marmot.wipeDatabase()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8835,7 +8894,6 @@ final class SonarAppStore: ObservableObject {
             }
         }
         #endif
-        marmot.stopPolling()
         // Wipes Noise/Nostr keys, all keychain data (incl. marmot-nsec),
         // messages, favorites, verified fingerprints and the nickname.
         // panicClearAllData() also erases the on-disk MessageStore; call it
@@ -8844,9 +8902,6 @@ final class SonarAppStore: ObservableObject {
         chatViewModel.panicClearAllData()
         MessageStore.shared.wipeAll()
         _ = keychain.deleteIdentityKey(forKey: Keys.marmotNsecKeychainKey)
-        // Erase the encrypted Marmot (White Noise) SQLCipher database + its
-        // Keychain DB key; also resets in-memory Marmot state.
-        marmot.wipeDatabase()
         // Drop diagnostics logs too: at verbose level they can contain peer
         // npubs, so a panic wipe must not leave them on disk.
         SonarDiagnostics.clearLogs()

@@ -95,13 +95,24 @@ actual object MeshRadio {
 
     actual fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean =
         MeshLink.sendDm(peerId, messageId, text)
+    actual fun drainMeshSendFailures(): List<MeshSendFailure> = emptyList()
     actual fun sendMeshDmNow(peerId: String, messageId: String, text: String): Boolean =
         MeshLink.sendDmNow(peerId, messageId, text)
     actual fun hasMeshLink(peerId: String): Boolean = MeshLink.hasLink(peerId)
     actual fun localPeerIdHex(): String = MeshIdentity.peerIdHex
     actual fun drainMeshDm(): List<MeshDmIn> =
         MeshLink.drainDms().filter { isKnownPeer(it.peerId) }
+    actual fun sendMeshDeliveryAck(peerId: String, messageId: String): Boolean =
+        MeshLink.sendDeliveryAck(peerId, messageId)
+    actual fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt> =
+        MeshLink.drainDeliveryReceipts().filter { isKnownPeer(it.peerId) }
+    actual fun discardPendingDeliverySignals() {
+        // The desktop bridge has no asynchronous GATT completion boundary, so
+        // there are no buffered send failures; only receipts need dropping.
+        MeshLink.drainDeliveryReceipts()
+    }
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = false
+    actual fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure> = emptyList()
     actual fun drainMeshMedia(): List<MeshMediaIn> = emptyList()
     actual fun nowSecs(): Long = System.currentTimeMillis() / 1000
 

@@ -77,7 +77,11 @@ check_class_method() {
   awk -v class="$class" -v method="$method" '
     # Track the enclosing top-level declaration. Swift methods may live in an
     # `extension Foo`, so extensions count as part of the class body.
-    /^[[:space:]]*(public|internal|private|final|open|@[A-Za-z]+[[:space:]]+)*(class|struct|extension)[[:space:]]+[A-Za-z_]/ {
+    # Each modifier is followed by whitespace; grouping the separator INSIDE the
+    # repeated alternation is what lets `final class Foo` match. Without it the
+    # regex demanded `final` be immediately adjacent to `class`, so every
+    # `final class ...: XCTestCase` suite silently failed to resolve.
+    /^[[:space:]]*((public|internal|private|final|open|@[A-Za-z]+)[[:space:]]+)*(class|struct|extension)[[:space:]]+[A-Za-z_]/ {
       inclass = ($0 ~ ("(class|struct|extension)[[:space:]]+" class "([[:space:]]*[:{<]|[[:space:]]*$)"))
     }
     {
@@ -89,8 +93,12 @@ check_class_method() {
       if (line ~ /@Test|#\[test\]|#\[tokio::test\]/) { annotated = 1; disabled = 0; next }
 
       if (inclass && line ~ ("^(public |internal |private |suspend |inline |override )*(fun|func)[[:space:]]+" method "[[:space:]]*\\(")) {
-        if (annotated && !disabled) { found = 1; exit }
-        if (!annotated) { unannotated = 1 }
+        # XCTest discovers by the `test` prefix, not by an annotation, so a
+        # `func testFoo()` in a Swift suite IS an enabled test. Scoped to `func`
+        # so a Kotlin `fun testFoo()` still requires its @Test.
+        xctest = (line ~ /(^|[[:space:]])func[[:space:]]/ && method ~ /^test/)
+        if ((annotated || xctest) && !disabled) { found = 1; exit }
+        if (!annotated && !xctest) { unannotated = 1 }
         if (disabled) { was_disabled = 1 }
       }
       # An annotation only applies to the next declaration.

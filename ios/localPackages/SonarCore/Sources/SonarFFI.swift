@@ -631,10 +631,12 @@ public protocol MeshLinkEngineProtocol: AnyObject, Sendable {
 
     func reset()
 
+    func sendDeliveryAck(fingerprint: String, messageId: String, nowMs: Int64)  -> MeshEngineOutput?
+
     /**
      * None = no live route / oversized (never queues).
      */
-    func sendFile(fingerprint: String, content: Data, fileName: String, mimeType: String, nowMs: Int64)  -> MeshEngineOutput?
+    func sendFile(fingerprint: String, messageId: String, content: Data, fileName: String, mimeType: String, nowMs: Int64)  -> MeshEngineOutput?
 
     /**
      * None = the peer is rejected by the known-only policy. Queues when no
@@ -916,14 +918,26 @@ open func reset()  {try! rustCall() {
 }
 }
 
+open func sendDeliveryAck(fingerprint: String, messageId: String, nowMs: Int64) -> MeshEngineOutput?  {
+    return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_meshlinkengine_send_delivery_ack(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
+        FfiConverterInt64.lower(nowMs),$0
+    )
+})
+}
+
     /**
      * None = no live route / oversized (never queues).
      */
-open func sendFile(fingerprint: String, content: Data, fileName: String, mimeType: String, nowMs: Int64) -> MeshEngineOutput?  {
+open func sendFile(fingerprint: String, messageId: String, content: Data, fileName: String, mimeType: String, nowMs: Int64) -> MeshEngineOutput?  {
     return try!  FfiConverterOptionTypeMeshEngineOutput.lift(try! rustCall() {
     uniffi_sonar_ffi_fn_method_meshlinkengine_send_file(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(fingerprint),
+        FfiConverterString.lower(messageId),
         FfiConverterData.lower(content),
         FfiConverterString.lower(fileName),
         FfiConverterString.lower(mimeType),
@@ -4199,14 +4213,16 @@ public struct MeshFileInfo: Equatable, Hashable {
     public var fileName: String?
     public var fileSize: UInt64?
     public var mimeType: String?
+    public var messageId: String?
     public var content: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(fileName: String?, fileSize: UInt64?, mimeType: String?, content: Data) {
+    public init(fileName: String?, fileSize: UInt64?, mimeType: String?, messageId: String?, content: Data) {
         self.fileName = fileName
         self.fileSize = fileSize
         self.mimeType = mimeType
+        self.messageId = messageId
         self.content = content
     }
 
@@ -4229,6 +4245,7 @@ public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
                 fileName: FfiConverterOptionString.read(from: &buf),
                 fileSize: FfiConverterOptionUInt64.read(from: &buf),
                 mimeType: FfiConverterOptionString.read(from: &buf),
+                messageId: FfiConverterOptionString.read(from: &buf),
                 content: FfiConverterData.read(from: &buf)
         )
     }
@@ -4237,6 +4254,7 @@ public struct FfiConverterTypeMeshFileInfo: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.fileName, into: &buf)
         FfiConverterOptionUInt64.write(value.fileSize, into: &buf)
         FfiConverterOptionString.write(value.mimeType, into: &buf)
+        FfiConverterOptionString.write(value.messageId, into: &buf)
         FfiConverterData.write(value.content, into: &buf)
     }
 }
@@ -5735,7 +5753,9 @@ public enum MeshEngineEvent: Equatable, Hashable {
     )
     case textReceived(fingerprint: String, messageId: String, content: String
     )
-    case fileReceived(fingerprint: String, transferKey: String, fileName: String?, mimeType: String?, content: Data, timestampMs: Int64
+    case deliveryReceived(fingerprint: String, messageId: String
+    )
+    case fileReceived(fingerprint: String, transferKey: String, messageId: String?, fileName: String?, mimeType: String?, content: Data, timestampMs: Int64
     )
     case broadcastReceived(fingerprint: String, senderIdHex: String, content: String, timestampMs: Int64
     )
@@ -5771,13 +5791,16 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
         case 3: return .textReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf)
         )
 
-        case 4: return .fileReceived(fingerprint: try FfiConverterString.read(from: &buf), transferKey: try FfiConverterString.read(from: &buf), fileName: try FfiConverterOptionString.read(from: &buf), mimeType: try FfiConverterOptionString.read(from: &buf), content: try FfiConverterData.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        case 4: return .deliveryReceived(fingerprint: try FfiConverterString.read(from: &buf), messageId: try FfiConverterString.read(from: &buf)
         )
 
-        case 5: return .broadcastReceived(fingerprint: try FfiConverterString.read(from: &buf), senderIdHex: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        case 5: return .fileReceived(fingerprint: try FfiConverterString.read(from: &buf), transferKey: try FfiConverterString.read(from: &buf), messageId: try FfiConverterOptionString.read(from: &buf), fileName: try FfiConverterOptionString.read(from: &buf), mimeType: try FfiConverterOptionString.read(from: &buf), content: try FfiConverterData.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
         )
 
-        case 6: return .linkEstablished(fingerprint: try FfiConverterString.read(from: &buf)
+        case 6: return .broadcastReceived(fingerprint: try FfiConverterString.read(from: &buf), senderIdHex: try FfiConverterString.read(from: &buf), content: try FfiConverterString.read(from: &buf), timestampMs: try FfiConverterInt64.read(from: &buf)
+        )
+
+        case 7: return .linkEstablished(fingerprint: try FfiConverterString.read(from: &buf)
         )
 
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -5809,10 +5832,17 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
             FfiConverterString.write(content, into: &buf)
 
 
-        case let .fileReceived(fingerprint,transferKey,fileName,mimeType,content,timestampMs):
+        case let .deliveryReceived(fingerprint,messageId):
             writeInt(&buf, Int32(4))
             FfiConverterString.write(fingerprint, into: &buf)
+            FfiConverterString.write(messageId, into: &buf)
+
+
+        case let .fileReceived(fingerprint,transferKey,messageId,fileName,mimeType,content,timestampMs):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(fingerprint, into: &buf)
             FfiConverterString.write(transferKey, into: &buf)
+            FfiConverterOptionString.write(messageId, into: &buf)
             FfiConverterOptionString.write(fileName, into: &buf)
             FfiConverterOptionString.write(mimeType, into: &buf)
             FfiConverterData.write(content, into: &buf)
@@ -5820,7 +5850,7 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
 
 
         case let .broadcastReceived(fingerprint,senderIdHex,content,timestampMs):
-            writeInt(&buf, Int32(5))
+            writeInt(&buf, Int32(6))
             FfiConverterString.write(fingerprint, into: &buf)
             FfiConverterString.write(senderIdHex, into: &buf)
             FfiConverterString.write(content, into: &buf)
@@ -5828,7 +5858,7 @@ public struct FfiConverterTypeMeshEngineEvent: FfiConverterRustBuffer {
 
 
         case let .linkEstablished(fingerprint):
-            writeInt(&buf, Int32(6))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(fingerprint, into: &buf)
 
         }
@@ -7763,12 +7793,13 @@ public func meshDecodePrivateMessage(plaintext: Data) -> MeshPrivateMessage?  {
  * Encode a `BitchatFilePacket` TLV (bitchat-compatible). The result is the
  * payload of a 0x22 packet (private = Noise-encrypt it first, then fragment).
  */
-public func meshEncodeFilePacket(fileName: String?, fileSize: UInt64?, mimeType: String?, content: Data)throws  -> Data  {
+public func meshEncodeFilePacket(fileName: String?, fileSize: UInt64?, mimeType: String?, messageId: String?, content: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_func_mesh_encode_file_packet(
         FfiConverterOptionString.lower(fileName),
         FfiConverterOptionUInt64.lower(fileSize),
         FfiConverterOptionString.lower(mimeType),
+        FfiConverterOptionString.lower(messageId),
         FfiConverterData.lower(content),$0
     )
 })
@@ -8041,7 +8072,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_decode_private_message() != 53773) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_mesh_encode_file_packet() != 32345) {
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_file_packet() != 43342) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
@@ -8149,7 +8180,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_reset() != 11836) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_file() != 38273) {
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_delivery_ack() != 9952) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_file() != 26445) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_meshlinkengine_send_text() != 54890) {

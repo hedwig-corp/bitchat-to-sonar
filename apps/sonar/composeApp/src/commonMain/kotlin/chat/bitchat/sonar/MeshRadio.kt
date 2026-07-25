@@ -13,6 +13,50 @@ data class MeshPeer(val id: String, val name: String, val rssi: Int, val sonar: 
  *  conversation across rotation. Drained by the app into the mesh-chat store. */
 data class MeshDmIn(val peerId: String, val messageId: String, val text: String, val tsSecs: Long)
 
+/** An encrypted recipient receipt for a private text or media message. */
+data class MeshDeliveryReceipt(val peerId: String, val messageId: String)
+
+/** A mesh DM accepted synchronously whose Android GATT write later failed.
+ * The app removes its optimistic BLE echo and retries the original plaintext
+ * through the router-owned outbox. */
+data class MeshSendFailure(
+    val peerId: String,
+    val messageId: String,
+    val text: String,
+    val tsSecs: Long,
+)
+
+/** A mesh media transfer accepted synchronously whose Android GATT write or
+ * notification later failed. Original bytes stay app-owned for White Noise
+ * fallback; encrypted Noise frames are never replayed across sessions. */
+data class MeshMediaSendFailure(
+    val peerId: String,
+    val messageId: String,
+    val bytes: ByteArray,
+    val filename: String,
+    val mimeType: String,
+    val tsSecs: Long,
+) {
+    override fun equals(other: Any?): Boolean =
+        other is MeshMediaSendFailure &&
+            peerId == other.peerId &&
+            messageId == other.messageId &&
+            bytes.contentEquals(other.bytes) &&
+            filename == other.filename &&
+            mimeType == other.mimeType &&
+            tsSecs == other.tsSecs
+
+    override fun hashCode(): Int {
+        var result = peerId.hashCode()
+        result = 31 * result + messageId.hashCode()
+        result = 31 * result + bytes.contentHashCode()
+        result = 31 * result + filename.hashCode()
+        result = 31 * result + mimeType.hashCode()
+        result = 31 * result + tsSecs.hashCode()
+        return result
+    }
+}
+
 /** An incoming PUBLIC broadcast (the BLE "Mesh" channel) from another peer. The
  *  wire carries only content + sender peerID + timestamp; the display nickname is
  *  resolved from the sender's announce by the app. */
@@ -217,10 +261,13 @@ expect object MeshRadio {
      *  Decoded with [SonarAnnounce.decode] in shared code. */
     fun sonarPeers(): Map<String, ByteArray>
 
-    /** Send an encrypted DM over the BLE mesh to the peer with stable [peerId]
-     *  (fingerprint). Resolves the peer's CURRENT address/peerID at send time, so
-     *  delivery survives rotation. Returns false only if it could not be queued. */
+    /** Send an encrypted DM over a live BLE mesh route to stable [peerId].
+     * Returns false when no write can be started; later platform failures are
+     * exposed through [drainMeshSendFailures]. */
     fun sendMeshDm(peerId: String, messageId: String, text: String): Boolean
+    /** Pull (and clear) sends that crossed the synchronous API boundary but
+     * failed at Android's asynchronous GATT completion boundary. */
+    fun drainMeshSendFailures(): List<MeshSendFailure>
     /** Send an encrypted DM only if a Noise link is established right now.
      *  Unlike [sendMeshDm], this must not queue. Call signaling uses this so a
      *  stale OFFER/ANSWER/END is never delivered after the peer leaves BLE. */
@@ -232,9 +279,20 @@ expect object MeshRadio {
     fun localPeerIdHex(): String
     /** Pull (and clear) all mesh DMs received since the last call. */
     fun drainMeshDm(): List<MeshDmIn>
+    /** Confirm an incoming private message only after the app has persisted it. */
+    fun sendMeshDeliveryAck(peerId: String, messageId: String): Boolean
+    /** Pull (and clear) recipient receipts received since the last call. */
+    fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt>
+    /** Privacy teardown only. Ordinary [stop] (activity destroy, BLE policy
+     *  change) MUST keep undrained failure/receipt signals: with the Rust
+     *  engine no longer queuing plaintext, the app router is the only retry
+     *  owner, and dropping a failure leaves the row "Sent" forever. */
+    fun discardPendingDeliverySignals()
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean
+    /** Pull (and clear) asynchronously failed mesh media transfers. */
+    fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure>
     /** Pull (and clear) mesh media transfers received since the last call. */
     fun drainMeshMedia(): List<MeshMediaIn>
     /** Wall-clock seconds (platform clock) — for mesh message timestamps. */

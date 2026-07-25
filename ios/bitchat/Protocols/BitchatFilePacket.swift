@@ -15,6 +15,9 @@ struct BitchatFilePacket {
     var fileName: String?
     var fileSize: UInt64?
     var mimeType: String?
+    /// Optional Sonar chat message id. Older bitchat clients skip this unknown
+    /// TLV; upgraded peers use it for an encrypted recipient delivery receipt.
+    var messageID: String? = nil
     var content: Data
 
     /// Canonical TLV tags defined by the Android implementation.
@@ -23,16 +26,27 @@ struct BitchatFilePacket {
         case fileSize = 0x02
         case mimeType = 0x03
         case content = 0x04
+        case messageID = 0x05
+    }
+
+    /// The cheap half of `encode()`'s contract. Every way encoding can fail is a
+    /// size precondition on `content` / `fileSize`, so a caller that only needs
+    /// to know "would this encode?" can ask without paying for a full TLV encode
+    /// and a `Data` copy of the whole payload — which for a 1 MiB image on the
+    /// MainActor is not free.
+    var isEncodable: Bool {
+        let resolvedSize = fileSize ?? UInt64(content.count)
+        return resolvedSize <= UInt64(UInt32.max)
+            && resolvedSize <= UInt64(FileTransferLimits.maxPayloadBytes)
+            && content.count <= Int(UInt32.max)
+            && FileTransferLimits.isValidPayload(content.count)
     }
 
     /// Encodes the packet using v2 canonical TLVs (4-byte FILE_SIZE, 4-byte CONTENT length).
     /// Returns `nil` when fields exceed protocol limits (e.g., content > UInt32.max).
     func encode() -> Data? {
+        guard isEncodable else { return nil }
         let resolvedSize = fileSize ?? UInt64(content.count)
-        guard resolvedSize <= UInt64(UInt32.max) else { return nil }
-        guard resolvedSize <= UInt64(FileTransferLimits.maxPayloadBytes) else { return nil }
-        guard content.count <= Int(UInt32.max) else { return nil }
-        guard FileTransferLimits.isValidPayload(content.count) else { return nil }
 
         func appendBE<T: FixedWidthInteger>(_ value: T, into data: inout Data) {
             var big = value.bigEndian
@@ -57,6 +71,16 @@ struct BitchatFilePacket {
             encoded.append(mimeData)
         }
 
+        // Symmetric with decode: an unusable id costs the receipt, not the
+        // transfer, so the TLV is skipped rather than failing the send.
+        if let messageIDData = messageID?.data(using: .utf8),
+           !messageIDData.isEmpty,
+           messageIDData.count <= Int(UInt16.max) {
+            encoded.append(TLVType.messageID.rawValue)
+            appendBE(UInt16(messageIDData.count), into: &encoded)
+            encoded.append(messageIDData)
+        }
+
         encoded.append(TLVType.content.rawValue)
         appendBE(UInt32(content.count), into: &encoded)
         encoded.append(content)
@@ -72,6 +96,7 @@ struct BitchatFilePacket {
         var fileName: String?
         var fileSize: UInt64?
         var mimeType: String?
+        var messageID: String?
         var content = Data()
 
         while cursor < end {
@@ -132,6 +157,12 @@ struct BitchatFilePacket {
                 }
             case .mimeType:
                 mimeType = String(data: Data(value), encoding: .utf8)
+            case .messageID:
+                // Degrade, never fail: this optional Sonar extension only
+                // enables a delivery receipt, so a malformed hint must not
+                // destroy the media it rides on. Mirrors `mesh.rs`.
+                let decoded = String(data: Data(value), encoding: .utf8)
+                messageID = (decoded?.isEmpty == false) ? decoded : nil
             case .content:
                 let proposedSize = content.count + value.count
                 if proposedSize > FileTransferLimits.maxPayloadBytes {
@@ -149,6 +180,7 @@ struct BitchatFilePacket {
             fileName: fileName,
             fileSize: fileSize ?? UInt64(content.count),
             mimeType: mimeType,
+            messageID: messageID,
             content: content
         )
     }

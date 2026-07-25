@@ -2,7 +2,7 @@
 //!
 //! Every platform used to re-implement the same orchestration around the mesh
 //! protocol — announce/identity handling, dial policy, per-instance links,
-//! liveness, Noise session lifecycle, pending sends, relay — and every bug had
+//! liveness, Noise session lifecycle, fail-fast sends, relay — and every bug had
 //! to be found and fixed once per platform (see PR #291: zombie links, the
 //! multi-service-instance lottery, write-queue races). This module owns that
 //! machine once, deterministically:
@@ -57,12 +57,34 @@ pub const HEARTBEAT_MS: u64 = 30_000;
 /// the monotonic clock ran on — re-seed instead of culling for our downtime.
 pub const SWEEP_RESUME_GAP_MS: u64 = TICK_MS * 3;
 pub const MAX_SINGLE_GATT_PACKET_BYTES: usize = 480;
-pub const FRAGMENT_CHUNK_SIZE: usize = 350;
+/// One BLE write must stay inside bitchat's 256-byte block. A Pixel 10 reports a
+/// 517-byte MTU to an iPhone, but iOS can acknowledge a 512-byte characteristic
+/// write without ever surfacing it to `didReceiveWrite`. Measured: a 350-byte
+/// chunk encodes to exactly a 512-byte write for every fragment, which is what
+/// made Pixel -> iPhone media transfers vanish while Android logged success.
+pub const RELIABLE_GATT_WRITE_BYTES: usize = 256;
+/// `Fragment::encode_payload` adds `fragment::HEADER_SIZE` and the enclosing
+/// `0x20` packet adds its own header; both are fixed-width, so the per-write
+/// overhead is a constant (measured at 43 bytes for a recipient-addressed,
+/// unsigned fragment packet).
+const FRAGMENT_PACKET_OVERHEAD_BYTES: usize = 43;
+/// Headroom so a future header field cannot silently push fragments back over
+/// the block boundary — the failure mode is invisible (Android reports success,
+/// iOS never sees the write), so it must be impossible by construction rather
+/// than caught in the field. The exact ceiling is a 213-byte chunk (256 bytes on
+/// the wire); anything larger jumps to a 512-byte write.
+const FRAGMENT_SAFETY_MARGIN_BYTES: usize = 8;
+/// Derived, not tuned: the largest chunk that provably fits one reliable write.
+/// At 205 bytes a full 1 MiB transfer needs 5,116 fragments, comfortably under
+/// `fragment::MAX_FRAGMENTS` (8,192), and carries 28% more payload per write
+/// than the 160-byte value this replaces.
+/// Pinned by `every_fragment_write_stays_in_the_reliable_block`.
+pub const FRAGMENT_CHUNK_SIZE: usize =
+    RELIABLE_GATT_WRITE_BYTES - FRAGMENT_PACKET_OVERHEAD_BYTES - FRAGMENT_SAFETY_MARGIN_BYTES;
 pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
 const SEEN_CAP: usize = 1024;
-const MAX_PENDING_SENDS_PER_PEER: usize = 64;
 /// Minimum spacing between instance re-discoveries on one connection.
 const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
 /// Soft cap on the identity maps (signing key / fingerprint per sender id):
@@ -134,9 +156,14 @@ pub enum AppEvent {
         message_id: String,
         content: String,
     },
+    DeliveryReceived {
+        fingerprint: String,
+        message_id: String,
+    },
     FileReceived {
         fingerprint: String,
         transfer_key: String,
+        message_id: Option<String>,
         file_name: Option<String>,
         mime_type: Option<String>,
         content: Vec<u8>,
@@ -252,8 +279,6 @@ pub struct Engine {
     identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
-    /// DMs queued for a peer with no live link, flushed on (re)establish.
-    pending_sends: HashMap<String, Vec<(String, String)>>,
     seen_broadcasts: HashSet<String>,
     seen_files: HashSet<String>,
     reassembler: mesh::fragment::Reassembler,
@@ -310,7 +335,6 @@ impl Engine {
             identity_refused: 0,
             identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
-            pending_sends: HashMap::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
             reassembler: mesh::fragment::Reassembler::new(),
@@ -696,9 +720,9 @@ impl Engine {
 
     // ── App-facing sends ──
 
-    /// Send a DM by stable fingerprint. Sends over a live Noise route, else
-    /// QUEUES it (mesh links are intermittent; the flush happens on
-    /// re-establish). Returns None when policy rejects the peer.
+    /// Send a DM by stable fingerprint over a live Noise route. The engine must
+    /// never hide plaintext for a later reconnect: the app-owned outbox needs
+    /// an honest `None` so it can preserve ordering and choose another route.
     pub fn send_text(
         &mut self,
         fingerprint: &str,
@@ -711,13 +735,7 @@ impl Engine {
         }
         let mut out = Output::default();
         if !self.try_send_text(fingerprint, message_id, text, now_ms, &mut out) {
-            let q = self.pending_sends.entry(fingerprint.to_string()).or_default();
-            // Bound the queue: a peer that never comes back must not grow it
-            // forever. Oldest messages drop first (they'd be the stalest).
-            if q.len() >= MAX_PENDING_SENDS_PER_PEER {
-                q.remove(0);
-            }
-            q.push((message_id.to_string(), text.to_string()));
+            return None;
         }
         Some(out)
     }
@@ -747,12 +765,17 @@ impl Engine {
     pub fn send_file(
         &mut self,
         fingerprint: &str,
+        message_id: &str,
         content: &[u8],
         file_name: &str,
         mime_type: &str,
         now_ms: u64,
     ) -> Option<Output> {
-        if !self.fp_allowed(fingerprint) || content.is_empty() || content.len() > MAX_FILE_TRANSFER_BYTES {
+        if !self.fp_allowed(fingerprint)
+            || message_id.is_empty()
+            || content.is_empty()
+            || content.len() > MAX_FILE_TRANSFER_BYTES
+        {
             return None;
         }
         let route = self.sendable_route(fingerprint)?;
@@ -762,6 +785,7 @@ impl Engine {
             file_name: Some(file_name.to_string()),
             file_size: Some(content.len() as u64),
             mime_type: Some(mime_type.to_string()),
+            message_id: Some(message_id.to_string()),
             content: content.to_vec(),
         }
         .encode()?;
@@ -777,6 +801,35 @@ impl Engine {
         let bytes = packet.encode()?;
         let mut out = self.discovery_to_route(&route, now_ms);
         self.write_maybe_fragmented(&route, bytes, msg_type::FILE_TRANSFER, now_ms, &mut out);
+        Some(out)
+    }
+
+    /// Confirm that a decoded private text or file was accepted by the
+    /// recipient application. This uses bitchat's existing encrypted
+    /// `delivered` payload, so receipts expose no message metadata over BLE.
+    pub fn send_delivery_ack(
+        &mut self,
+        fingerprint: &str,
+        message_id: &str,
+        now_ms: u64,
+    ) -> Option<Output> {
+        if !self.fp_allowed(fingerprint) {
+            return None;
+        }
+        let route = self.sendable_route(fingerprint)?;
+        let peer_id = parse_id8(&self.route_peer_id(&route)?)?;
+        let plain = mesh::encode_delivered_plaintext(message_id)?;
+        let ciphertext = self.encrypt_on_route(&route, &plain)?;
+        let packet = mesh::encrypted_packet(
+            self.my_peer_id,
+            peer_id,
+            DEFAULT_TTL,
+            self.wall(now_ms),
+            ciphertext,
+        );
+        let bytes = packet.encode()?;
+        let mut out = Output::default();
+        self.write_maybe_fragmented(&route, bytes, msg_type::NOISE_ENCRYPTED, now_ms, &mut out);
         Some(out)
     }
 
@@ -897,7 +950,6 @@ impl Engine {
         self.identity_lru.clear();
         self.identity_refused = 0;
         self.pending_sonar.clear();
-        self.pending_sends.clear();
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();
@@ -1593,7 +1645,7 @@ impl Engine {
                     s.bind.peer_id_hex = Some(sender_hex.clone());
                 }
                 if hs.is_finished() {
-                    self.finish_noise_server(&conn, out, now_ms);
+                    self.finish_noise_server(&conn, out);
                 } else {
                     let m2 = match hs.write_message() {
                         Ok(m) => m,
@@ -1666,13 +1718,13 @@ impl Engine {
                     Some(NoiseState::Handshake { hs, .. }) if hs.is_finished()
                 );
                 if finished {
-                    self.finish_noise_client(&id, out, now_ms);
+                    self.finish_noise_client(&id, out);
                 }
             }
         }
     }
 
-    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output, now_ms: u64) {
+    fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output) {
         let Some(l) = self.links.get_mut(id) else {
             return;
         };
@@ -1688,13 +1740,13 @@ impl Engine {
                     .clone()
                     .or_else(|| l.bind.peer_id_hex.clone())
                     .unwrap_or_else(|| id.conn.clone());
-                self.link_established(&fp, out, now_ms);
+                self.link_established(&fp, out);
             }
             Err(_) => l.noise = None,
         }
     }
 
-    fn finish_noise_server(&mut self, conn: &str, out: &mut Output, now_ms: u64) {
+    fn finish_noise_server(&mut self, conn: &str, out: &mut Output) {
         let Some(s) = self.server_conns.get_mut(conn) else {
             return;
         };
@@ -1712,34 +1764,19 @@ impl Engine {
                     .clone()
                     .or_else(|| s.bind.peer_id_hex.clone())
                     .unwrap_or_else(|| conn.to_string());
-                self.link_established(&fp, out, now_ms);
+                self.link_established(&fp, out);
             }
             Err(_) => s.noise = None,
         }
     }
 
-    fn link_established(&mut self, fingerprint: &str, out: &mut Output, now_ms: u64) {
+    fn link_established(&mut self, fingerprint: &str, out: &mut Output) {
         if !self.fp_allowed(fingerprint) {
             return;
         }
         out.events.push(AppEvent::LinkEstablished {
             fingerprint: fingerprint.to_string(),
         });
-        // Flush DMs queued while there was no live link.
-        let queued = self.pending_sends.remove(fingerprint).unwrap_or_default();
-        let mut requeue: Vec<(String, String)> = Vec::new();
-        for (mid, text) in queued {
-            let mut o = Output::default();
-            if self.try_send_text(fingerprint, &mid, &text, now_ms, &mut o) {
-                out.merge(o);
-            } else {
-                requeue.push((mid, text));
-            }
-        }
-        if !requeue.is_empty() {
-            self.pending_sends
-                .insert(fingerprint.to_string(), requeue);
-        }
     }
 
     fn handle_encrypted(&mut self, origin: Origin, packet: &mesh::Packet, out: &mut Output) {
@@ -1778,13 +1815,6 @@ impl Engine {
         let Some((t, rest)) = mesh::split_noise_plaintext(&plain) else {
             return;
         };
-        if t != noise_payload::PRIVATE_MESSAGE {
-            // read receipts / delivered acks are surfaced at a later stage.
-            return;
-        }
-        let Some(pm) = mesh::PrivateMessage::decode(rest) else {
-            return;
-        };
         let id_fp = fp
             .or_else(|| match &origin {
                 Origin::Client(id) => self
@@ -1800,11 +1830,31 @@ impl Engine {
                 Origin::Client(id) => id.conn.clone(),
                 Origin::Server(conn) => conn.clone(),
             });
-        out.events.push(AppEvent::TextReceived {
-            fingerprint: id_fp,
-            message_id: pm.message_id,
-            content: pm.content,
-        });
+        match t {
+            noise_payload::PRIVATE_MESSAGE => {
+                let Some(pm) = mesh::PrivateMessage::decode(rest) else {
+                    return;
+                };
+                out.events.push(AppEvent::TextReceived {
+                    fingerprint: id_fp,
+                    message_id: pm.message_id,
+                    content: pm.content,
+                });
+            }
+            noise_payload::DELIVERED => {
+                let Ok(message_id) = String::from_utf8(rest.to_vec()) else {
+                    return;
+                };
+                if message_id.is_empty() {
+                    return;
+                }
+                out.events.push(AppEvent::DeliveryReceived {
+                    fingerprint: id_fp,
+                    message_id,
+                });
+            }
+            _ => {}
+        }
     }
 
     fn decrypt_on_origin(&mut self, origin: &Origin, ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -1900,6 +1950,7 @@ impl Engine {
         out.events.push(AppEvent::FileReceived {
             fingerprint: fp,
             transfer_key,
+            message_id: file.message_id,
             file_name: file.file_name,
             mime_type: file.mime_type,
             content: file.content,
@@ -2069,6 +2120,155 @@ mod tests {
             "B must receive the DM, got {got:?}"
         );
         let _ = link;
+    }
+
+    /// The failure this guards is invisible from the sending side: Android's GATT
+    /// stack reports success for a 512-byte write that iOS never surfaces to
+    /// `didReceiveWrite`, so the media simply never arrives and no error is
+    /// logged anywhere. Keeping every write inside the 256-byte block is what
+    /// makes it arrive, and that must hold for text and media, for the first
+    /// full-size fragment and the short trailing one, and after any future
+    /// change to the packet or fragment header.
+    #[test]
+    fn every_fragment_write_stays_in_the_reliable_block() {
+        // The derived chunk size is only correct while the measured per-write
+        // overhead is. Assert it directly so a header change fails here rather
+        // than silently pushing fragments into the 512-byte bucket in the field.
+        let frags = mesh::file_packet::fragment(
+            &vec![0u8; FRAGMENT_CHUNK_SIZE * 3],
+            [9u8; 8],
+            msg_type::NOISE_ENCRYPTED,
+            FRAGMENT_CHUNK_SIZE,
+        )
+        .expect("fragment");
+        let mut probe = mesh::Packet::new(msg_type::FRAGMENT, DEFAULT_TTL, 1_000, [1u8; 8]);
+        probe.recipient_id = Some([2u8; 8]);
+        probe.payload = frags[0].encode_payload();
+        let encoded = probe.encode().expect("encode").len();
+        assert_eq!(
+            encoded - FRAGMENT_CHUNK_SIZE,
+            FRAGMENT_PACKET_OVERHEAD_BYTES,
+            "per-write fragment overhead moved; re-measure FRAGMENT_PACKET_OVERHEAD_BYTES",
+        );
+        assert!(
+            encoded <= RELIABLE_GATT_WRITE_BYTES,
+            "a full-size fragment encodes to {encoded} bytes, over the reliable block",
+        );
+
+        // Sizes chosen to exercise an exact multiple of the chunk, a 1-byte
+        // trailing fragment, and a payload just past the single-write bound.
+        for payload_len in [
+            MAX_SINGLE_GATT_PACKET_BYTES + 1,
+            FRAGMENT_CHUNK_SIZE * 4,
+            FRAGMENT_CHUNK_SIZE * 4 + 1,
+            64 * 1024,
+        ] {
+            let mut a = engine(1, "pixel");
+            let mut b = engine(9, "iphone");
+            let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+            let media = vec![0x42; payload_len];
+            let send = a
+                .send_file(&fp_of(&b), "mid", &media, "photo.jpg", "image/jpeg", 3_000)
+                .expect("media route");
+            let mut writes = 0usize;
+            for command in &send.commands {
+                if let Command::WriteLink { bytes, .. } | Command::NotifyConn { bytes, .. } = command
+                {
+                    writes += 1;
+                    assert!(
+                        bytes.len() <= RELIABLE_GATT_WRITE_BYTES,
+                        "media payload {payload_len} produced a {}-byte write",
+                        bytes.len(),
+                    );
+                }
+            }
+            assert!(writes > 1, "payload {payload_len} should have fragmented");
+
+            // Text takes the same fragmentation path once it outgrows a single
+            // write, so it has to hold there too.
+            let long_text = "x".repeat(payload_len.min(32 * 1024));
+            let text = a
+                .send_text(&fp_of(&b), "text-mid", &long_text, 3_100)
+                .expect("text route");
+            for command in &text.commands {
+                if let Command::WriteLink { bytes, .. } | Command::NotifyConn { bytes, .. } = command
+                {
+                    assert!(
+                        bytes.len() <= RELIABLE_GATT_WRITE_BYTES,
+                        "text of {} chars produced a {}-byte write",
+                        long_text.len(),
+                        bytes.len(),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recipient_delivery_receipt_round_trips_for_text_and_media() {
+        let mut a = engine(1, "pixel");
+        let mut b = engine(9, "iphone");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let text_ack = b
+            .send_delivery_ack(&fp_of(&a), "text-mid", 2_000)
+            .expect("receipt route");
+        let mut a_events = Vec::new();
+        for command in text_ack.commands {
+            if let Command::NotifyConn { bytes, .. } = command {
+                a_events.extend(a.on_client_rx(&link.conn, link.instance, &bytes, 2_000).events);
+            }
+        }
+        assert!(a_events.iter().any(|event| matches!(
+            event,
+            AppEvent::DeliveryReceived { message_id, .. } if message_id == "text-mid"
+        )));
+
+        let media = vec![0x42; 4_096];
+        let send = a
+            .send_file(
+                &fp_of(&b),
+                "media-mid",
+                &media,
+                "photo.jpg",
+                "image/jpeg",
+                3_000,
+            )
+            .expect("media route");
+        assert!(send.commands.iter().all(|command| match command {
+            Command::WriteLink { bytes, .. } | Command::NotifyConn { bytes, .. } => {
+                bytes.len() <= RELIABLE_GATT_WRITE_BYTES
+            }
+            _ => true,
+        }));
+        let mut b_events = Vec::new();
+        for command in send.commands {
+            if let Command::WriteLink { bytes, .. } = command {
+                b_events.extend(b.on_server_rx("droid", &bytes, 3_000).events);
+            }
+        }
+        assert!(b_events.iter().any(|event| matches!(
+            event,
+            AppEvent::FileReceived { message_id, content, .. }
+                if message_id.as_deref() == Some("media-mid") && content == &media
+        )));
+
+        let media_ack = b
+            .send_delivery_ack(&fp_of(&a), "media-mid", 3_100)
+            .expect("media receipt route");
+        let mut receipt_events = Vec::new();
+        for command in media_ack.commands {
+            if let Command::NotifyConn { bytes, .. } = command {
+                receipt_events.extend(
+                    a.on_client_rx(&link.conn, link.instance, &bytes, 3_100).events,
+                );
+            }
+        }
+        assert!(receipt_events.iter().any(|event| matches!(
+            event,
+            AppEvent::DeliveryReceived { message_id, .. } if message_id == "media-mid"
+        )));
     }
 
     #[test]
@@ -2270,19 +2470,14 @@ mod tests {
     }
 
     #[test]
-    fn pending_send_flushes_on_establish() {
+    fn send_text_without_live_route_fails_instead_of_hiding_plaintext() {
         let mut a = engine(1, "pixel");
-        let mut b = engine(9, "peer");
+        let b = engine(9, "peer");
         let fp = fp_of(&b);
-        let out = a.send_text(&fp, "mid-q", "queued", 500).expect("queued ok");
-        assert!(out.commands.is_empty(), "no link yet: must queue");
-        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
-        // The establish pump already flushed; B must have received the DM.
-        // Re-drive: establish() asserted establishment; verify B got the text
-        // by checking A's queue drained and the route exists.
-        assert!(a.has_link(&fp));
-        assert!(a.pending_sends.get(&fp).is_none(), "queue must drain");
-        let _ = link;
+        assert!(
+            a.send_text(&fp, "mid-q", "must stay in app outbox", 500).is_none(),
+            "a missing live route must be visible to the app router"
+        );
     }
 
     #[test]

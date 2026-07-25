@@ -76,9 +76,10 @@ actual object MessageStore {
         }.toMap()
     }
 
-    actual suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>): Unit = withContext(Dispatchers.IO) {
-        runCatching { meshFile(peerKey).writeText(MessageCodec.encodeMeshEnvelope(peerKey, msgs)) }
-        Unit
+    actual suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>): Boolean = withContext(Dispatchers.IO) {
+        runCatching {
+            meshFile(peerKey).writeText(MessageCodec.encodeMeshEnvelope(peerKey, msgs))
+        }.isSuccess
     }
 
     actual suspend fun deleteMeshDm(peerKey: String): Unit = withContext(Dispatchers.IO) {
@@ -91,15 +92,19 @@ actual object MessageStore {
     private fun meshMediaFile(mediaUrl: String): File =
         File(meshMediaDir(), "${hashName("mesh-media:$mediaUrl")}.bin")
 
-    actual suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray): Unit = withContext(Dispatchers.IO) {
-        runCatching { meshMediaFile(mediaUrl).writeBytes(bytes) }
-        Unit
+    actual suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray): Boolean = withContext(Dispatchers.IO) {
+        runCatching { meshMediaFile(mediaUrl).writeBytes(bytes) }.isSuccess
     }
 
     actual suspend fun loadMeshMedia(mediaUrl: String): ByteArray? = withContext(Dispatchers.IO) {
         val f = meshMediaFile(mediaUrl)
         if (!f.exists()) return@withContext null
         runCatching { f.readBytes() }.getOrNull()
+    }
+
+    actual suspend fun deleteMeshMedia(mediaUrl: String): Unit = withContext(Dispatchers.IO) {
+        runCatching { meshMediaFile(mediaUrl).delete() }
+        Unit
     }
 
     actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {

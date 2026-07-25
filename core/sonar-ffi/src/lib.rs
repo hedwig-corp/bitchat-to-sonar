@@ -2171,6 +2171,7 @@ pub struct MeshFileInfo {
     pub file_name: Option<String>,
     pub file_size: Option<u64>,
     pub mime_type: Option<String>,
+    pub message_id: Option<String>,
     pub content: Vec<u8>,
 }
 
@@ -2527,12 +2528,14 @@ pub fn mesh_encode_file_packet(
     file_name: Option<String>,
     file_size: Option<u64>,
     mime_type: Option<String>,
+    message_id: Option<String>,
     content: Vec<u8>,
 ) -> FfiResult<Vec<u8>> {
     mesh::file_packet::FilePacket {
         file_name,
         file_size,
         mime_type,
+        message_id,
         content,
     }
     .encode()
@@ -2547,6 +2550,7 @@ pub fn mesh_decode_file_packet(bytes: Vec<u8>) -> Option<MeshFileInfo> {
         file_name: p.file_name,
         file_size: p.file_size,
         mime_type: p.mime_type,
+        message_id: p.message_id,
         content: p.content,
     })
 }
@@ -2763,7 +2767,7 @@ fn sticker_pack_info(pack: sonar_stickers::StickerPack) -> StickerPackInfo {
 // ── BLE mesh link engine ─────────────────────────────────────────────────────
 //
 // The platform-neutral link state machine (announce/identity, dial policy,
-// per-instance links, liveness, Noise lifecycle, pending sends, relay) lives
+// per-instance links, liveness, Noise lifecycle, fail-fast sends, relay) lives
 // in `sonar_core::mesh_engine`. Platform drivers feed it radio events and
 // execute the returned commands; timestamps are MONOTONIC milliseconds
 // supplied by the driver (the engine reads no clocks).
@@ -2818,9 +2822,14 @@ pub enum MeshEngineEvent {
         message_id: String,
         content: String,
     },
+    DeliveryReceived {
+        fingerprint: String,
+        message_id: String,
+    },
     FileReceived {
         fingerprint: String,
         transfer_key: String,
+        message_id: Option<String>,
         file_name: Option<String>,
         mime_type: Option<String>,
         content: Vec<u8>,
@@ -2915,9 +2924,17 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                     message_id,
                     content,
                 },
+                mesh_engine::AppEvent::DeliveryReceived {
+                    fingerprint,
+                    message_id,
+                } => MeshEngineEvent::DeliveryReceived {
+                    fingerprint,
+                    message_id,
+                },
                 mesh_engine::AppEvent::FileReceived {
                     fingerprint,
                     transfer_key,
+                    message_id,
                     file_name,
                     mime_type,
                     content,
@@ -2925,6 +2942,7 @@ fn engine_output(out: mesh_engine::Output) -> MeshEngineOutput {
                 } => MeshEngineEvent::FileReceived {
                     fingerprint,
                     transfer_key,
+                    message_id,
                     file_name,
                     mime_type,
                     content,
@@ -3119,13 +3137,32 @@ impl MeshLinkEngine {
     pub fn send_file(
         &self,
         fingerprint: String,
+        message_id: String,
         content: Vec<u8>,
         file_name: String,
         mime_type: String,
         now_ms: i64,
     ) -> Option<MeshEngineOutput> {
         self.lock()
-            .send_file(&fingerprint, &content, &file_name, &mime_type, ms(now_ms))
+            .send_file(
+                &fingerprint,
+                &message_id,
+                &content,
+                &file_name,
+                &mime_type,
+                ms(now_ms),
+            )
+            .map(engine_output)
+    }
+
+    pub fn send_delivery_ack(
+        &self,
+        fingerprint: String,
+        message_id: String,
+        now_ms: i64,
+    ) -> Option<MeshEngineOutput> {
+        self.lock()
+            .send_delivery_ack(&fingerprint, &message_id, ms(now_ms))
             .map(engine_output)
     }
 

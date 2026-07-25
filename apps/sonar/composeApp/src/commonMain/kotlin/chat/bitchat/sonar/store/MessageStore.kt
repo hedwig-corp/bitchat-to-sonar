@@ -32,13 +32,15 @@ expect object MessageStore {
      *  (fingerprint). Hydrated into memory at launch so mesh DMs survive restart. */
     suspend fun loadAllMeshDms(): Map<String, List<SonarMsg>>
     /** Write-through a single peer's BLE-mesh transcript (called on every append). */
-    suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>)
+    suspend fun saveMeshDm(peerKey: String, msgs: List<SonarMsg>): Boolean
     /** Delete a single peer's BLE-mesh transcript file (per-chat delete). */
     suspend fun deleteMeshDm(peerKey: String)
     /** Save local bytes for a mesh media attachment referenced by `mesh-media:*`. */
-    suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray)
+    suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray): Boolean
     /** Load local bytes for a mesh media attachment referenced by `mesh-media:*`. */
     suspend fun loadMeshMedia(mediaUrl: String): ByteArray?
+    /** Delete the local bytes for a mesh media attachment (failed/abandoned send). */
+    suspend fun deleteMeshMedia(mediaUrl: String)
     suspend fun wipe()
 }
 

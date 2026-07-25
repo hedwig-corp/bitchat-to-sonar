@@ -105,6 +105,13 @@ final class BLEService: NSObject {
     
     // 4. Efficient Message Deduplication
     private let messageDeduplicator = MessageDeduplicator()
+    /// Sender-scoped wire message ids of private files already persisted. The
+    /// packet-level deduplicator keys on the packet timestamp, so a re-sent file
+    /// passes it; without this a retry after a lost receipt would store the media
+    /// twice. Bounded FIFO — this only has to outlive a sender's retry window.
+    private var seenPrivateFileMessageIDs: [String] = []
+    private var seenPrivateFileMessageIDSet: Set<String> = []
+    private static let maxSeenPrivateFileMessageIDs = 512
     private var selfBroadcastMessageIDs: [String: (id: String, timestamp: Date)] = [:]
     private lazy var mediaDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -1362,6 +1369,20 @@ final class BLEService: NSObject {
         }
     }
 
+    /// Returns true when this exact (sender, wire message id) file was already
+    /// stored, so the caller should re-ACK and drop instead of storing it again.
+    private func isDuplicatePrivateFile(peerID: PeerID, messageID: String) -> Bool {
+        let key = "\(peerID.id)|\(messageID)"
+        if seenPrivateFileMessageIDSet.contains(key) { return true }
+        seenPrivateFileMessageIDSet.insert(key)
+        seenPrivateFileMessageIDs.append(key)
+        if seenPrivateFileMessageIDs.count > Self.maxSeenPrivateFileMessageIDs {
+            let evicted = seenPrivateFileMessageIDs.removeFirst()
+            seenPrivateFileMessageIDSet.remove(evicted)
+        }
+        return false
+    }
+
     private func handleFileTransfer(_ packet: BitchatPacket, from peerID: PeerID) {
         if peerID == myPeerID && packet.ttl != 0 { return }
 
@@ -1405,6 +1426,9 @@ final class BLEService: NSObject {
 
         guard accepted else {
             SecureLogger.warning("🚫 Dropping file transfer from unverified or unknown peer \(peerID.id.prefix(8))…", category: .security)
+            #if DEBUG
+            appendBleDebugReport("file rejected peer=\(peerID.id) reason=unverified")
+            #endif
             return
         }
 
@@ -1424,6 +1448,9 @@ final class BLEService: NSObject {
 
         guard let filePacket = BitchatFilePacket.decode(packet.payload) else {
             SecureLogger.error("❌ Failed to decode file transfer payload", category: .session)
+            #if DEBUG
+            appendBleDebugReport("file rejected peer=\(peerID.id) reason=file-packet-decode bytes=\(packet.payload.count)")
+            #endif
             return
         }
 
@@ -1441,6 +1468,24 @@ final class BLEService: NSObject {
         guard mime.matches(data: filePacket.content) else {
             let prefix = filePacket.content.prefix(20).map { String(format: "%02x", $0) }.joined(separator: " ")
             SecureLogger.warning("🚫 MAGIC REJECT: MIME='\(mime)' size=\(filePacket.content.count)b prefix=[\(prefix)] from \(peerID.id.prefix(8))...", category: .security)
+            return
+        }
+
+        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
+
+        // A re-send after a lost receipt must return a fresh ack, not a second
+        // row — and this has to run BEFORE the quota sweep and the file write.
+        // `saveIncomingFile` picks a unique name, so a retry would otherwise
+        // leave an orphan copy that nothing references while its bytes count
+        // against the incoming-files quota, evicting older attachments that
+        // live transcripts still point at.
+        if isPrivateMessage,
+           let messageID = filePacket.messageID,
+           isDuplicatePrivateFile(peerID: peerID, messageID: messageID) {
+            sendDeliveryAck(for: messageID, to: peerID)
+            #if DEBUG
+            appendBleDebugReport("file duplicate re-ack message=\(messageID) peer=\(peerID.id)")
+            #endif
             return
         }
 
@@ -1479,13 +1524,15 @@ final class BLEService: NSObject {
             marker = "[file] \(fileName)"
         }
 
-        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
-
         if isPrivateMessage {
             updatePeerLastSeen(peerID)
         }
 
         let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
+        // The sender-supplied messageID is receipt-only: it is echoed back in the
+        // delivery receipt, but is deliberately NOT used as this local row's id,
+        // because a peer could otherwise pick an id that collides with one of my
+        // own rows in this conversation.
         let message = BitchatMessage(
             sender: senderNickname,
             content: marker,
@@ -1499,8 +1546,47 @@ final class BLEService: NSObject {
 
         SecureLogger.debug("📁 Stored incoming media from \(peerID.id.prefix(8))… -> \(destination.lastPathComponent)", category: .session)
 
+        #if DEBUG
+        appendBleDebugReport(
+            "file stored peer=\(peerID.id) message=\(filePacket.messageID ?? "none") bytes=\(filePacket.content.count) name=\(destination.lastPathComponent)"
+        )
+        #endif
+
+        // The receipt must not outrun the transcript write-through. The
+        // conversation row lands via `didReceiveMessage` → `privateChats`
+        // `didSet` → `MessageStore.savePrivate`, which only *enqueues* the
+        // disk write, so ack after that write has actually drained. Otherwise
+        // being killed in between leaves the sender on "Delivered" for a row
+        // the recipient loses at restart. Older senders omit the optional
+        // message id and keep the legacy no-receipt behavior.
+        let ackMessageID = isPrivateMessage ? filePacket.messageID : nil
         notifyUI { [weak self] in
-            self?.delegate?.didReceiveMessage(message)
+            guard let self else { return }
+            self.delegate?.didReceiveMessage(message)
+            guard let messageID = ackMessageID else { return }
+            MessageStore.shared.afterPendingWrites(for: peerID) { [weak self] persisted in
+                guard let self else { return }
+                // Queue drainage proves the write RAN, not that it landed: a full
+                // or unavailable disk fails inside MessageStore. Acking anyway
+                // would leave the sender on "Delivered" for a row this device
+                // loses at restart, which is the exact inversion the receipt
+                // exists to prevent. Staying silent instead lets the sender's
+                // row remain "Sent" and be retried.
+                guard persisted else {
+                    SecureLogger.error(
+                        "📁 Withholding delivery receipt: transcript write failed for \(peerID.id.prefix(8))…",
+                        category: .session
+                    )
+                    #if DEBUG
+                    self.appendBleDebugReport("file ack withheld (write failed) message=\(messageID) peer=\(peerID.id)")
+                    #endif
+                    return
+                }
+                self.sendDeliveryAck(for: messageID, to: peerID)
+                #if DEBUG
+                self.appendBleDebugReport("file ack message=\(messageID) peer=\(peerID.id)")
+                #endif
+            }
         }
     }
     
@@ -4108,6 +4194,9 @@ extension BLEService {
             // Reassembled packet validation
             let innerSender = PeerID(hexData: originalPacket.senderID)
             if !validatePacket(originalPacket, from: innerSender) {
+                #if DEBUG
+                appendBleDebugReport("fragment rejected id=\(String(format: "%016llx", fragU64)) reason=validation")
+                #endif
                 // Cleanup below
             } else {
                 SecureLogger.debug("✅ Reassembled packet id=\(String(format: "%016llx", fragU64)) type=\(originalPacket.type) bytes=\(reassembled.count)", category: .session)
@@ -4116,6 +4205,9 @@ extension BLEService {
             }
         } else {
             SecureLogger.error("❌ Failed to decode reassembled packet (type=\(originalType), total=\(total))", category: .session)
+            #if DEBUG
+            appendBleDebugReport("fragment rejected id=\(String(format: "%016llx", fragU64)) reason=decode")
+            #endif
         }
 
         // Critical section: Cleanup completed assembly
@@ -5191,4 +5283,46 @@ extension BLEService {
         }
         dynamicRSSIThreshold = threshold
     }
+
+    #if DEBUG
+    private func appendBleDebugReport(_ line: String) {
+        SonarBleDebugReport.append(line)
+    }
+    #endif
 }
+
+#if DEBUG
+/// Pullable physical-device trace for BLE fragment/file events. Unified logging
+/// is not always reachable over a paired wireless CoreDevice tunnel, so this
+/// writes a small rotating file instead. DEBUG-only and never on a Release path.
+enum SonarBleDebugReport {
+    private static let lock = NSLock()
+    private static let maxBytes = 512 * 1024
+    private static var handle: FileHandle?
+
+    static func append(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let url = try? FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("sonar-debug.txt") else { return }
+        if handle == nil {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            handle = try? FileHandle(forWritingTo: url)
+        }
+        guard let handle else { return }
+        // Truncate rather than grow without bound; a long media run would
+        // otherwise fill the container during a debug session.
+        if (try? handle.seekToEnd()).map({ $0 > UInt64(maxBytes) }) == true {
+            try? handle.truncate(atOffset: 0)
+        }
+        handle.write(data)
+    }
+}
+#endif

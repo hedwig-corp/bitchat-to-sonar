@@ -466,6 +466,13 @@ final class MarmotChatModel: ObservableObject {
     private var localTranscriptPreservesOlderEdgeGroups: Set<String> = []
     /// Serializes outgoing sends so rapid-fire messages arrive in order.
     private var sendChain: Task<Void, Never>?
+    /** Deletion increments this generation and awaits the tail task. Tasks
+     * still queued behind an in-flight core call then retire without sending. */
+    private var sendGeneration: UInt64 = 0
+    private var sendsSuspendedForAccountMutation = false
+    /// Media uploads and retries intentionally run independently from the text
+    /// ordering chain, but deletion still owns and joins their lifetimes.
+    private var independentAccountTasks: [UUID: Task<Void, Never>] = [:]
     /// Shared with the render window (`SNConversationTranscriptWindow`) so a
     /// reconciled echo can be recognized and dropped at that layer too.
     nonisolated static let optimisticIDPrefix = "optimistic-"
@@ -2578,7 +2585,7 @@ final class MarmotChatModel: ObservableObject {
 
     func startChat(with peer: String) {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return }
         let clean = SNMarmotProfileCache.canonicalKey(trimmed)
         guard !clean.isEmpty else { return }
         if directGroup(forNpub: clean) != nil { return }
@@ -2591,7 +2598,7 @@ final class MarmotChatModel: ObservableObject {
 
     func startChatReturningId(with peer: String) async -> String? {
         let trimmed = peer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return nil }
         let clean = SNMarmotProfileCache.canonicalKey(trimmed)
         guard !clean.isEmpty else { return nil }
         if let existing = directGroup(forNpub: clean) {
@@ -2603,8 +2610,9 @@ final class MarmotChatModel: ObservableObject {
 
         pendingDirectChats[clean] = Date()
         let setupToken = UUID()
+        let generation = sendGeneration
         let setupTask = Task { @MainActor [weak self] in
-            await self?.performDirectChatSetup(with: clean)
+            await self?.performDirectChatSetup(with: clean, generation: generation)
         }
         directChatSetupTasks[clean] = (setupToken, setupTask)
         let groupId = await setupTask.value
@@ -2615,16 +2623,28 @@ final class MarmotChatModel: ObservableObject {
         return groupId
     }
 
-    private func performDirectChatSetup(with npub: String) async -> String? {
+    private func performDirectChatSetup(with npub: String, generation: UInt64) async -> String? {
+        guard !Task.isCancelled,
+              generation == sendGeneration,
+              !sendsSuspendedForAccountMutation
+        else { return nil }
         guard await ensureRelayConnected() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
         }
+        guard !Task.isCancelled,
+              generation == sendGeneration,
+              !sendsSuspendedForAccountMutation
+        else { return nil }
         if let existing = directGroup(forNpub: npub) {
             return existing.id
         }
         do {
             let groupId = try await service.startDirectMessage(with: npub, name: "")
+            guard !Task.isCancelled,
+                  generation == sendGeneration,
+                  !sendsSuspendedForAccountMutation
+            else { return nil }
             await loadLocalPage(groupId: groupId, mode: .newestPage)
             Task { [weak self] in
                 await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
@@ -2643,7 +2663,7 @@ final class MarmotChatModel: ObservableObject {
         onFailure: (() -> Void)? = nil
     ) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return }
         errorText = nil
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
@@ -2656,9 +2676,14 @@ final class MarmotChatModel: ObservableObject {
         appendOptimistic(echo, to: groupId)
         onEchoVisible?()
         let prev = sendChain
+        let generation = sendGeneration
         sendChain = Task { [weak self] in
             _ = await prev?.result
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
             do {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
@@ -2686,6 +2711,11 @@ final class MarmotChatModel: ObservableObject {
         // already transferred/removed. Mesh→WN flush uses `sendQueuedText`.
         var allOk = true
         for text in trimmed {
+            // A batch spans multiple awaits, so an erase can begin between items.
+            // Each iteration assigns a NEW sendChain tail, which a quiesce that
+            // already snapshotted the chain would never see — so re-check here
+            // instead of relying on the entry guard alone.
+            guard !sendsSuspendedForAccountMutation, !Task.isCancelled else { return false }
             var succeeded = false
             let echo = MarmotService.MarmotMessage(
                 id: Self.optimisticIDPrefix + UUID().uuidString,
@@ -2697,16 +2727,23 @@ final class MarmotChatModel: ObservableObject {
             )
             appendOptimistic(echo, to: groupId)
             let previous = sendChain
+            let generation = sendGeneration
             let queuedSend = Task { [weak self] in
                 _ = await previous?.result
-                guard let self else { return }
+                guard let self,
+                      !Task.isCancelled,
+                      self.sendGeneration == generation,
+                      !self.sendsSuspendedForAccountMutation
+                else { return }
                 do {
                     guard await self.ensureConnected(timeoutSeconds: 2) else {
                         throw MarmotService.ServiceError.notConnected
                     }
+                    guard self.isCurrentAccountWork(generation) else { return }
                     try await self.service.sendText(groupId: groupId, text: text)
                     succeeded = true
                 } catch {
+                    guard self.isCurrentAccountWork(generation) else { return }
                     self.discardOptimistic(id: echo.id, from: groupId)
                     self.errorText = Self.describe(error)
                 }
@@ -2723,19 +2760,26 @@ final class MarmotChatModel: ObservableObject {
     /// task's own success flag (Compose / `sendQueuedSticker` parity).
     func sendQueuedText(groupId: String, text: String) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
+        guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return false }
         var succeeded = false
         let previous = sendChain
+        let generation = sendGeneration
         let queuedSend = Task { [weak self] in
             _ = await previous?.result
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
             do {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                guard self.isCurrentAccountWork(generation) else { return }
                 try await self.service.sendText(groupId: groupId, text: trimmed)
                 succeeded = true
             } catch {
+                guard self.isCurrentAccountWork(generation) else { return }
                 self.errorText = Self.describe(error)
             }
         }
@@ -2779,20 +2823,47 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    private func isCurrentAccountWork(_ generation: UInt64) -> Bool {
+        !Task.isCancelled &&
+            generation == sendGeneration &&
+            !sendsSuspendedForAccountMutation
+    }
+
+    /// Media uploads stay parallel, while their task ownership is explicit so
+    /// account deletion can cancel and join every operation before wiping.
+    private func launchIndependentAccountWork(
+        _ operation: @escaping @MainActor (MarmotChatModel, UInt64) async -> Void
+    ) {
+        guard !sendsSuspendedForAccountMutation else { return }
+        let taskID = UUID()
+        let generation = sendGeneration
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.independentAccountTasks[taskID] = nil }
+            guard self.isCurrentAccountWork(generation) else { return }
+            await operation(self, generation)
+        }
+        independentAccountTasks[taskID] = task
+    }
+
     /// Retry a core-backed failed row without creating a second transcript row
     /// or re-running MLS encryption. The core flips the durable row back to
     /// pending before republishing the original encrypted wrapper event.
     func retryMessage(messageId: String) {
+        guard !sendsSuspendedForAccountMutation else { return }
         errorText = nil
-        Task {
+        launchIndependentAccountWork { model, generation in
             do {
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await model.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                let groupId = try await service.retryMessage(messageId: messageId)
-                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                guard model.isCurrentAccountWork(generation) else { return }
+                let groupId = try await model.service.retryMessage(messageId: messageId)
+                guard model.isCurrentAccountWork(generation) else { return }
+                await model.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
             } catch {
-                errorText = Self.describe(error)
+                guard model.isCurrentAccountWork(generation) else { return }
+                model.errorText = Self.describe(error)
             }
         }
     }
@@ -2818,6 +2889,7 @@ final class MarmotChatModel: ObservableObject {
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
+        guard !sendsSuspendedForAccountMutation else { return }
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -2835,26 +2907,28 @@ final class MarmotChatModel: ObservableObject {
                 )
             ]
         )
-        Task {
+        launchIndependentAccountWork { model, generation in
             var echoVisible = false
-            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+            let listener = SNMediaUploadListener { [weak model] pendingId, fraction in
                 Task { @MainActor in
-                    self?.noteMediaUploadProgress(pendingId, fraction)
+                    model?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
-            registerMediaUploadListener(echo.id, listener)
+            model.registerMediaUploadListener(echo.id, listener)
             do {
                 // Wait for a local Marmot node (`isConnected`), not relay
                 // (`isRelayConnected`). Blossom PUTs do not need relays; kind-445
                 // publish still goes through the durable outbox after the URL
                 // exists. Without this short wait, cold-start media can fail
                 // with notConnected before staging.
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await model.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                noteMediaUploadProgress(echo.id, 0)
-                appendOptimistic(echo, to: groupId)
+                guard model.isCurrentAccountWork(generation) else { return }
+                await model.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                guard model.isCurrentAccountWork(generation) else { return }
+                model.noteMediaUploadProgress(echo.id, 0)
+                model.appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
                 #if DEBUG
@@ -2864,7 +2938,7 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                try await service.sendMediaWithProgress(
+                try await model.service.sendMediaWithProgress(
                     groupId: groupId,
                     data: data,
                     filename: filename,
@@ -2880,9 +2954,10 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                clearMediaUploadListener(echo.id)
+                model.clearMediaUploadListener(echo.id)
+                guard model.isCurrentAccountWork(generation) else { return }
                 onComplete?()
-                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+                await model.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
                 #if DEBUG
                 SecureLogger.info(
@@ -2894,11 +2969,15 @@ final class MarmotChatModel: ObservableObject {
                     // Owner (resume or prior send) still uploading — keep echo.
                     return
                 }
-                clearMediaUploadListener(echo.id)
-                discardOptimistic(id: echo.id, from: groupId)
+                // Release the listener and drop the echo even when the account
+                // moved on; only the user-visible failure row and errorText are
+                // skipped for retired work.
+                model.clearMediaUploadListener(echo.id)
+                model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
                 }
+                guard model.isCurrentAccountWork(generation) else { return }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -2908,11 +2987,11 @@ final class MarmotChatModel: ObservableObject {
                         isMine: true,
                         media: echo.media
                     )
-                    pendingOptimistic[groupId, default: []].append(failed)
-                    messagesByGroup[groupId, default: []].append(failed)
+                    model.pendingOptimistic[groupId, default: []].append(failed)
+                    model.messagesByGroup[groupId, default: []].append(failed)
                 }
                 onFailure?()
-                self.errorText = Self.describe(error)
+                model.errorText = Self.describe(error)
             }
         }
     }
@@ -2930,7 +3009,10 @@ final class MarmotChatModel: ObservableObject {
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
-        guard !items.isEmpty, items.count == localPreviewURLs.count else { return }
+        guard !sendsSuspendedForAccountMutation,
+              !items.isEmpty,
+              items.count == localPreviewURLs.count
+        else { return }
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
             senderNpub: npub ?? "",
@@ -2948,22 +3030,24 @@ final class MarmotChatModel: ObservableObject {
                 )
             }
         )
-        Task {
+        launchIndependentAccountWork { model, generation in
             var echoVisible = false
-            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+            let listener = SNMediaUploadListener { [weak model] pendingId, fraction in
                 Task { @MainActor in
-                    self?.noteMediaUploadProgress(pendingId, fraction)
+                    model?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
-            registerMediaUploadListener(echo.id, listener)
+            model.registerMediaUploadListener(echo.id, listener)
             do {
                 // Same as sendMedia: local node only — not `ensureRelayConnected`.
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await model.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                noteMediaUploadProgress(echo.id, 0)
-                appendOptimistic(echo, to: groupId)
+                guard model.isCurrentAccountWork(generation) else { return }
+                await model.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                guard model.isCurrentAccountWork(generation) else { return }
+                model.noteMediaUploadProgress(echo.id, 0)
+                model.appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
                 #if DEBUG
@@ -2974,7 +3058,7 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                try await service.sendMediaMultiWithProgress(
+                try await model.service.sendMediaMultiWithProgress(
                     groupId: groupId,
                     items: items,
                     caption: caption,
@@ -2988,9 +3072,10 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                clearMediaUploadListener(echo.id)
+                model.clearMediaUploadListener(echo.id)
+                guard model.isCurrentAccountWork(generation) else { return }
                 onComplete?()
-                await refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
+                await model.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
                 #if DEBUG
                 SecureLogger.info(
@@ -3001,11 +3086,15 @@ final class MarmotChatModel: ObservableObject {
                 if Self.isMediaUploadInFlight(error) {
                     return
                 }
-                clearMediaUploadListener(echo.id)
-                discardOptimistic(id: echo.id, from: groupId)
+                // Release the listener and drop the echo even when the account
+                // moved on; only the user-visible failure row and errorText are
+                // skipped for retired work.
+                model.clearMediaUploadListener(echo.id)
+                model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
                 }
+                guard model.isCurrentAccountWork(generation) else { return }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -3015,11 +3104,11 @@ final class MarmotChatModel: ObservableObject {
                         isMine: true,
                         media: echo.media
                     )
-                    pendingOptimistic[groupId, default: []].append(failed)
-                    messagesByGroup[groupId, default: []].append(failed)
+                    model.pendingOptimistic[groupId, default: []].append(failed)
+                    model.messagesByGroup[groupId, default: []].append(failed)
                 }
                 onFailure?()
-                self.errorText = Self.describe(error)
+                model.errorText = Self.describe(error)
             }
         }
     }
@@ -3033,6 +3122,7 @@ final class MarmotChatModel: ObservableObject {
         onComplete: (() -> Void)? = nil,
         onFailure: (() -> Void)? = nil
     ) {
+        guard !sendsSuspendedForAccountMutation else { return }
         errorText = nil
         let echo = MarmotService.MarmotMessage(
             id: Self.optimisticIDPrefix + UUID().uuidString,
@@ -3051,9 +3141,14 @@ final class MarmotChatModel: ObservableObject {
         onEchoVisible?()
 
         let previous = sendChain
+        let generation = sendGeneration
         sendChain = Task { [weak self] in
             _ = await previous?.result
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
             do {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
@@ -3102,11 +3197,17 @@ final class MarmotChatModel: ObservableObject {
         shortcode: String,
         plaintextSha256: String
     ) async -> Bool {
+        guard !sendsSuspendedForAccountMutation else { return false }
         var succeeded = false
         let previous = sendChain
+        let generation = sendGeneration
         let queuedSend = Task { [weak self] in
             _ = await previous?.result
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
             do {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
@@ -3683,22 +3784,65 @@ final class MarmotChatModel: ObservableObject {
         installedPackCoordinates = []
     }
 
+    /** Stop every send/setup task and await the tail before deleting state.
+     * Cancelling without awaiting is insufficient because the FFI operation
+     * already in progress may complete non-cancellably. The send-chain tail
+     * joins every predecessor; the generation check retires queued successors. */
+    @discardableResult
+    private func quiesceAccountWork() async -> Bool {
+        guard !sendsSuspendedForAccountMutation else { return false }
+        sendsSuspendedForAccountMutation = true
+        sendGeneration &+= 1
+        let chain = sendChain
+        sendChain = nil
+        chain?.cancel()
+
+        let setups = directChatSetupTasks.values.map(\.task)
+        directChatSetupTasks = [:]
+        pendingDirectChats = [:]
+        setups.forEach { $0.cancel() }
+
+        let independentTasks = Array(independentAccountTasks.values)
+        independentAccountTasks = [:]
+        independentTasks.forEach { $0.cancel() }
+
+        if let chain { await chain.value }
+        for setup in setups { _ = await setup.value }
+        for task in independentTasks { await task.value }
+        return true
+    }
+
+    private func resumeAccountWork(ifOwned ownsMutation: Bool) {
+        if ownsMutation {
+            sendsSuspendedForAccountMutation = false
+        }
+    }
+
+    /// Keep the model quiesced across host-owned cache/wallet deletion too.
+    /// The returned lease must be passed to [resumeAccountWorkAfterHostMutation].
+    func suspendAccountWorkForHostMutation() async -> Bool {
+        await quiesceAccountWork()
+    }
+
+    func resumeAccountWorkAfterHostMutation(_ mutationLease: Bool) {
+        resumeAccountWork(ifOwned: mutationLease)
+    }
+
     /// Panic-wipe the encrypted Marmot database + its Keychain key and reset
     /// in-memory state. Called from the emergency-wipe path.
-    func wipeDatabase() {
+    func wipeDatabase() async {
+        let mutationLease = await quiesceAccountWork()
+        defer { resumeAccountWork(ifOwned: mutationLease) }
         stopPolling()
         invalidateGapRecovery()
         conversationRefreshTask?.cancel()
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
-        let service = self.service
         clearIdentityScopedState()
-        Task {
-            do {
-                try await service.wipeDatabase()
-            } catch {
-                SecureLogger.error(error, context: "Marmot panic wipe failed", category: .session)
-            }
+        do {
+            try await service.wipeDatabase()
+        } catch {
+            SecureLogger.error(error, context: "Marmot panic wipe failed", category: .session)
         }
     }
 
@@ -3707,6 +3851,8 @@ final class MarmotChatModel: ObservableObject {
     /// operation is injected so tests can verify ordering without touching the
     /// developer's real application-support directory.
     func prepareForIdentityReplacement(wipeDatabase: () async throws -> Void) async throws {
+        let mutationLease = await quiesceAccountWork()
+        defer { resumeAccountWork(ifOwned: mutationLease) }
         stopPolling()
         invalidateGapRecovery()
         clearIdentityScopedState()
@@ -3766,6 +3912,8 @@ final class MarmotChatModel: ObservableObject {
     /// store is opened and our KeyPackage is republished — new secure chats
     /// keep working. Used by "erase all chats" (not the full panic wipe).
     func eraseChatsKeepIdentity() async {
+        let mutationLease = await quiesceAccountWork()
+        defer { resumeAccountWork(ifOwned: mutationLease) }
         let wasPolling = syncTask != nil
         stopPolling()
         conversationRefreshTask?.cancel()

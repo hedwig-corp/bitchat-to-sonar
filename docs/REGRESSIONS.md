@@ -402,6 +402,83 @@ the send echo was cleared before the canonical row merged.
 
 ---
 
+## R-014 — Every BLE fragment write stays inside the reliable 256-byte block
+
+**Invariant:** No single GATT write the mesh engine emits may exceed
+`RELIABLE_GATT_WRITE_BYTES` (256). `FRAGMENT_CHUNK_SIZE` must stay *derived* from
+that budget minus the measured per-write overhead and a safety margin — never
+hand-tuned to a literal.
+
+**Breaks as:** a Pixel sends media to an iPhone, Android's GATT callbacks all
+report success, and the file never arrives. Nothing is logged as an error on
+either device. iOS acknowledges a 512-byte characteristic write at the link
+layer without ever surfacing it to `didReceiveWrite`, so the fragments are
+accepted and dropped. Text long enough to fragment fails the same way.
+
+**Call sites:** `mesh_engine.rs::write_maybe_fragmented` (the only producer of
+fragment writes; both the `WriteLink` client path and the `NotifyConn` server
+path go through it). Hosts must write the emitted bytes verbatim —
+`MeshGatt.writePacket` / `notify` on Compose, `BLEService` on Apple.
+
+**Guarded by:** `mesh_engine.rs::every_fragment_write_stays_in_the_reliable_block`
+
+**Not guarded:** the host side. Nothing asserts Android or CoreBluetooth actually
+writes what the engine emitted, so host-side re-chunking or an added envelope
+would slip through. Also unguarded: that 256 is still the reliable bucket on
+future hardware — that came from Pixel 10 / iPhone 14 Pro Max tracing, not from
+a spec.
+
+**History:** Shipped as `FRAGMENT_CHUNK_SIZE = 350`, which encoded to exactly a
+512-byte write for every fragment — the failing size. First repaired by dropping
+to a literal 160 (a 2.2x round-trip cost with no stated derivation), then
+replaced with the derived 205 after measuring that the per-write overhead is a
+constant 43 bytes and the exact cliff is a 213-byte chunk.
+
+**Rejected:**
+- *Capping at the GATT write layer instead, where the MTU is known.* The limit is
+  not the MTU — it is bitchat's PKCS#7 block set (`BLOCK_SIZES` in `mesh.rs`). A
+  221-byte raw fragment pads up to 512 because `optimal_block_size` adds a
+  16-byte AEAD allowance, so the constraint has to be applied where fragments are
+  cut, not where they are written.
+- *Keeping a hand-tuned literal with a comment.* The failure is invisible from
+  both ends, so a future header field silently re-breaking it is the likely
+  regression. Deriving it makes that a failing test instead.
+- *Using the exact 213-byte ceiling.* Zero headroom; any added header field
+  crosses the cliff.
+
+## R-015 — An optional TLV must never destroy the payload it rides on
+
+**Invariant:** The `0x05` message-id TLV on a BLE file transfer exists only to
+enable a delivery receipt. A malformed, empty or oversized value must degrade to
+"no receipt" on both encode and decode, on both platforms — never fail the
+packet.
+
+**Breaks as:** a peer sends a photo and it silently never arrives, because the
+receiving decoder returned `nil` for the whole `FilePacket` over an unusable
+optional hint. On the sending side an unusable id failed `encode()`, which
+surfaces as "not connected" and no media sent.
+
+**Call sites:** `mesh.rs::file_packet::FilePacket::encode` / `decode` (the
+`T_MESSAGE_ID` arm) and `BitchatFilePacket.encode()` / `decode()` (the
+`.messageID` case). Both directions on both platforms — a one-sided fix leaves
+the pair asymmetric, which is worse than either behaviour alone.
+
+**Guarded by:** `mesh.rs::malformed_optional_message_id_degrades_instead_of_dropping_the_file`, `BitchatFilePacketTests.testUnusableMessageIDCostsTheReceiptNotTheTransfer`, `BitchatFilePacketTests.testMalformedMessageIDTLVStillDecodesTheFile`
+
+**Not guarded:** cross-implementation behaviour against stock bitchat, which does
+not know tag `0x05` at all — that path relies on unknown tags being skipped, and
+nothing here exercises a real stock decoder. iOS tests also do not run in CI.
+
+**History:** Introduced with the receipt feature: both sides rejected the packet
+on a bad id, so an optional extension could destroy the media. Found in review
+of #312.
+
+**Rejected:**
+- *Failing loudly so a bad id is noticed.* The id is chosen by the sender and
+  arrives unauthenticated; failing gives any peer a way to make our media vanish.
+- *Fixing only decode.* Encode returning nil aborts a send the user asked for,
+  for a field that carries no user content.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -418,6 +495,14 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
 - **Compose side of R-006 (Bluetooth-adapter-off).** Compose has no `ACTION_STATE_CHANGED` receiver — nothing pushes adapter-off into `MeshRadio`, whose `stop()` has the right teardown but only runs on discovery-policy changes. Android links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, so whether R-006 applies there is unproven; needs a Pixel with a peer in range to confirm. `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
 - **iOS NIP-05 verified badge cache key.** `nip05Verified` is keyed by `"canonicalKey(npub)|address"`, but the badge branch in `SonarContactProfileScreen.swift` read it by `address` alone, so the lookup always missed and the checkmark never rendered while the handle text rendered unconditionally. Verified and forged handles were therefore indistinguishable. Fixed by routing all three sites through one `static func nip05CacheKey(npub:address:)` (PR #411), which is deliberately static and npub-explicit so it is reachable without constructing the screen — unlike the `SonarAppStore` gaps above. `Nip05BadgeCacheKeyTests` pins that one handle claimed by two different keys yields two different entries. **The citation is weak on purpose:** iOS tests do not run in CI (see below), so nothing verifies it still passes. What is *not* pinned is the call-site wiring — a fourth site hand-building the key again, or the badge reading a different key than `verifyHandleIfNeeded` writes, is exactly the original bug and no test would catch it. Compose is structurally immune (`SonarContactProfileScreen.kt` scopes the state with `remember(peerNpub, nip05)`), so there is no Android mirror to pin.
+- **Apple media sends must not lose the account gate to an automerge.** Rebasing this change onto main dropped every `isCurrentAccountWork(generation)` check from `MarmotChatModel.sendMedia`/`sendMediaMulti` while keeping main's bare `ensureConnected`/`appendOptimistic`/`service.…` calls inside the PR's escaping `launchIndependentAccountWork { model, generation in … }` closure. The bare calls do not compile (`implicit use of 'self' in closure`), so the breakage was loud; the *silent* half is that a closure receiving `generation` and never checking it turns the account-mutation gate into a no-op on exactly the two paths it was added for. Both are restored: the calls are `model.`-qualified and the guards bracket every suspension point, with the listener release and echo discard deliberately running even for retired work so only the user-visible failure row is skipped. Every `sendChain` producer must carry the gate, not just the ones that looked like the pattern: `send(_ texts:to:)` and `sendQueuedText` assigned new chain tails with no generation/suspension check, and a batch spanning multiple awaits keeps assigning tails *after* a quiesce has already snapshotted the chain — so it could publish against the old account while the wipe proceeded. The batch also re-checks between items. Unpinned — iOS tests do not run in CI and no test constructs `MarmotChatModel` with a controllable send, so the only thing standing between this and a silent regression is that the uncompilable form fails loudly next to it.
+- **Sender-chosen mesh message ids are receipt-only.** The BLE file-transfer packet now carries an optional `message_id` TLV so the recipient can return an encrypted `delivered` receipt. That id arrives unauthenticated inside the Noise payload, so it must never become the identity of a *local* row: on Apple the incoming media row keeps its own generated `BitchatMessage.id` and the wire id is used only for `sendDeliveryAck`, and on Compose every id match that can withdraw or suppress a row is gated on `it.mine` (`drainMeshMedia` duplicate check, `drainMeshSendFailures`, both matches in `drainMeshMediaSendFailures`). Without those guards a peer could pick an id colliding with one of our outgoing rows and either suppress its own incoming media or have our failure path delete/evict that row. Nothing pins this: all four Compose sites need a constructed `SonarAppState`, and the Apple site needs a `BLEService` with a live peer. Close it with an injectable receive seam plus a two-device test where the peer deliberately reuses a known local id.
+- **Ordinary `MeshRadio.stop()` must not discard undrained delivery signals.** With the Rust engine no longer queuing plaintext (`pending_sends` removed for fail-fast `send_text`), the app router is the only retry owner, and `MainActivity.onDestroy()` calls `stop()` — so an ordinary activity teardown mid-send must still hand the router its failure or the row stays "Sent" with its bytes neither delivered nor re-queued. **This took two attempts:** moving the inbox clear out of `stop()` into `MeshRadio.discardPendingDeliverySignals()` was not enough, because `stop()` also incremented the single `deliveryGeneration`, and `reportSendFailures` filtered on it — so the failure was still dropped, just one layer lower. The two jobs are now separate counters: `deliveryGeneration` advances on every `stop()` (a delayed `WriteLink`/`NotifyConn` must never inject stale ciphertext into a restarted radio's queue) while `privacyEpoch` advances only in `MeshGatt.discardAcceptedDeliveries()`, and only the latter gates reporting. Order-independent: whichever of `stop()` / discard runs first, the epoch check drops a report that must not land. Unpinned on both platforms — `stop()` needs a real BLE stack, and the regression is the *call-site and counter wiring*, which is exactly what broke twice.
+- **Lost wakeup in the per-peer Marmot fallback flush owner.** `flushPendingMarmot` skips a peer whose `pendingMarmotFlushJobs[npubHex]` is still `isActive`, and `Job.isActive` stays true while the owner's `finally` runs. A send enqueued in that window therefore sat in `pendingMarmotSends` with no owner until an unrelated trigger fired. The owner now re-arms from `finally` when its peer queue is non-empty again. Safe unconditionally in this shape because the snapshot is removed up front and a failed send marks its echo "Couldn't send" rather than being requeued, so re-arming cannot spin. Unpinned: `flushPendingMarmot` needs a constructed `SonarAppState` with an injectable send.
+- **Do not re-add a Marmot fallback FIFO without a caller.** The rebase onto main kept main's `mutableMapOf<String, MutableList<PendingMeshMarmotSend>>` for the folded-mesh Marmot fallback while a typed `PendingMarmotOutbox` + `PendingMarmotOutboxTest` rode along from the pre-rebase design with zero production callers. A green test over dead code is exactly the overclaim this ledger forbids, so both were deleted rather than wired. The behaviour that ships is main's: a failed fallback send marks its echo "Couldn't send" and is dropped, and because `createSendEcho` defaults `viaInternet = true` the row satisfies `sonarCanRetryMessage`, so the user gets a retry affordance instead of a silent loss. If ordered auto-retry is wanted later it needs a TTL (the deleted type had none, unlike `SonarOutbox`) and a real caller in `flushPendingMarmot` — and the re-arm below then needs its `drainedQueueEmpty` guard back, because a retained failing head would otherwise spin.
+- **Android asynchronous BLE send failures.** `MeshGatt` now carries app-owned text/media metadata beside every queued GATT write/notification, resets the Noise route on a rejected, failed, disconnected, or stuck operation, and exposes one failure for router fallback. Intentional shutdown advances a delivery generation and clears already-buffered app failures so erased plaintext/media cannot be resurrected as a fallback send. Pixel 10 / iPhone 14 Pro Max tracing also reproduced two Android platform hazards: duplicate MTU callbacks started service discovery twice and enqueued every CCC subscription twice (the target instance then failed with GATT status 1), while 512-byte characteristic writes reported success without ever reaching iOS `didReceiveWrite`. Discovery is now single-flight and the shared Rust fragment size keeps every encoded media frame at or below 256 bytes; `recipient_delivery_receipt_round_trips_for_text_and_media` pins the frame ceiling and receipt codec. No JVM test can drive `BluetoothGattCallback`, so the callback ordering still needs an Android driver seam. Keep a physical Pixel/iPhone smoke that covers duplicate callbacks, a media transfer, and a link drop mid-fragment.
+- **Marmot fallback lifecycle.** Compose now keeps failed per-peer fallback sends at the head of a typed FIFO, stops the mesh radio, and cancels plus joins setup/fallback/general-outbox jobs before chat erase, account restore, or full wipe. Text, sticker, retry, and media core calls also share the account-mutation gate. `PendingMarmotOutboxTest` pins FIFO ownership and exact-head removal, but no test constructs `SonarAppState` to prove the lifecycle boundary. Apple already serializes text/sticker sends through one chain and now also owns parallel media/retry and direct-chat setup tasks, holding their suspension through host cache/wallet deletion. Existing tests construct `MarmotChatModel`, but cannot inject a controllable send, and no test constructs `SonarAppStore` to pin the full boundary. Close both with injectable app-state/service seams.
+- **Sender-side no-receipt timeout is the last piece of BLE delivery state.** Receivers on Apple and Compose Android carry the sender's optional media message id, persist the file/transcript, and return the encrypted `delivered` receipt, so senders distinguish transport acceptance (`Sent`) from recipient persistence (`Delivered`) for text and media. The receiver halves that make a sender retry safe are in place: Compose dedups incoming text and media by the sender-chosen wire id (never matching one of our own rows) and **re-ACKs** a duplicate; Apple keeps a bounded sender-scoped `seenPrivateFileMessageIDs` set — needed because packet dedup keys on `senderID-timestamp-type`, which a retry does not collide with. Two follow-on corrections were needed there: the Apple duplicate check has to run **before** `enforceIncomingFilesQuota` and `saveIncomingFile`, or a retry leaves an orphan copy nothing references while its bytes evict older attachments live transcripts still point at; and the ack must be gated on the transcript write actually reaching disk — `MessageStore.write` swallowed the error, so queue drainage proved only that the write *ran*, and a full disk produced "Delivered" on the sender for a row the recipient loses at restart. `afterPendingWrites(for:)` now returns that outcome and the receipt is withheld on failure. What remains is the *sender* half: a bounded no-receipt timeout that re-enters the ordered outbox under the same id and gives up as "Couldn't send", gated on peers that have proven they ack (a stock bitchat peer never returns a media receipt, so an ungated timeout would spam it or wrongly fail a delivered message). Until then a row whose receipt is lost stays `Sent`, recoverable only by the user re-sending. None of the receiver dedup/re-ACK/durability paths is pinned: they need a constructed `SonarAppState`, or a `BLEService` plus an injectable failing store. Compose Desktop handles text receipts but returns `false` for `sendMeshMedia`; native macOS shares the Apple media implementation — an explicit platform gap, not evidence desktop media passed this path.
 - **Duplicate-send.** Nothing pins "one tap produces exactly one canonical row". Worth adding if the duplicate bubble in #290 ever proves to be two real canonical rows rather than an echo — that was investigated and left unproven.
 - **iOS expand-button hit target (#357, PR #358).** The invariant is "the Show more / Show less control is a full 44pt tap target on all three iOS bubble surfaces" — `SNMsgBubble` (`SonarComponents.swift`), `SonarMessageBubbleView`, `TextMessageView`. It is enforced *only* by view-tree shape: `.buttonStyle(.plain)` hit-tests the button's **label subtree**, so `.frame(minHeight: 44)` and `.contentShape(Rectangle())` must sit inside the `label:` closure. Chained onto the `Button` wrapper instead — which is what the `Button(<title>) { <action> }` convenience initializer invites — they widen the layout box and leave the blank part of the 44pt area dead. That is exactly how #358's first attempt failed review while looking correct. Three hand-maintained copies, so a fourth surface can silently get it wrong; the structural fix is a shared `ShowMoreButton` / `.expandHitTarget()` modifier, not a test. No test pins it and none would run: iOS tests are not in CI (see below), and hit-region behaviour needs a UI test rather than a unit test. Compose is structurally immune — in `MessageBubble` (`App.kt`) `heightIn(min = 44.dp)` sits outside `clickable`, so the constraint propagates into the clickable node. **Also unpinned:** the iOS control exposes no expanded/collapsed accessibility state, where Compose sets `stateDescription`; closing that needs new localized strings (none exist in `Localizable.xcstrings`), and Compose hardcodes English there too.
 - **Mesh-folded chat id resolution.** Group-keyed state (`unreadByChat`, snapshots, read-marking) must be resolved through `transcriptGroupIds`, never indexed with a `mesh:` route id — and position/count logic must not trust a mesh chat's first painted feed before it catches up with `latestKnownMessageSecs` (the BLE window publishes before the White Noise leg merges). Both broke the unread divider for mesh chats only (PR #303, commits 070c00f3e + 80feb4ade); no test pins either invariant. `transcriptGroupIds` needs instance state, so pinning likely means extracting the resolver or an in-process store test. See `docs/CHAT-TYPES.md`.

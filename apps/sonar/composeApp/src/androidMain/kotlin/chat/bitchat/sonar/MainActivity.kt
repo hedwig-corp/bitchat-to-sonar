@@ -5,6 +5,9 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewTreeObserver
 import androidx.activity.ComponentActivity
@@ -21,11 +24,19 @@ class MainActivity : ComponentActivity() {
         const val STICKER_BENCHMARK_IMAGE_LIMIT = "sonar_sticker_image_limit"
         const val STICKER_BENCHMARK_IMAGE_OFFSET = "sonar_sticker_image_offset"
         const val STICKER_BENCHMARK_RELAYS = "sonar_sticker_relays"
+        const val DEBUG_MESH_DM = "sonar.debug.send_mesh_dm"
+        const val DEBUG_MESH_IMAGE = "sonar.debug.send_mesh_image"
+        const val DEBUG_MESH_PEER = "sonar.debug.mesh_peer"
+        const val DEBUG_MESH_TIMEOUT_MS = 45_000L
+        const val DEBUG_MESH_RETRY_MS = 1_000L
+        const val DEBUG_MESH_TAG = "SonarBleDebug"
     }
 
     @Volatile
     private var firstLocalStateReady = false
     private var postFirstDrawStartupScheduled = false
+    private val debugHandler = Handler(Looper.getMainLooper())
+    private var debugMeshGeneration = 0L
 
     /** Every runtime permission the app needs, requested together so Android
      *  shows them in one sequence (firing three separate launchers in onCreate
@@ -125,6 +136,7 @@ class MainActivity : ComponentActivity() {
         handleShareIntent(intent)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
+        maybeDebugMeshSend(intent)
     }
 
     /** Debug-only: `adb shell am start -n chat.bitchat.sonar/.MainActivity \
@@ -183,6 +195,105 @@ class MainActivity : ComponentActivity() {
         handleShareIntent(intent)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
+        maybeDebugMeshSend(intent)
+    }
+
+    /**
+     * Debug-only physical-device seam for deterministic BLE interop runs:
+     *
+     * `adb shell am start -n chat.bitchat.sonar/.MainActivity -f 0x14000000 \
+     *   --es sonar.debug.send_mesh_dm "ble-e2e-<run-id>"`
+     *
+     * `adb shell am start -n chat.bitchat.sonar/.MainActivity -f 0x14000000 \
+     *   --ez sonar.debug.send_mesh_image true --es sonar.debug.mesh_peer <fingerprint-prefix>`
+     *
+     * The hook waits for a verified Noise route rather than racing discovery,
+     * sends to the first live mesh peer, and logs one correlated terminal result.
+     * Release builds cannot enter this path.
+     */
+    private fun maybeDebugMeshSend(intent: Intent?) {
+        if (!BuildConfig.DEBUG || intent == null) return
+        val text = intent.getStringExtra(DEBUG_MESH_DM)?.takeIf(String::isNotBlank)
+        val sendImage = intent.getBooleanExtra(DEBUG_MESH_IMAGE, false)
+        val peerPrefix = intent.getStringExtra(DEBUG_MESH_PEER)?.trim()?.lowercase()?.takeIf(String::isNotEmpty)
+        if (text == null && !sendImage) return
+        intent.removeExtra(DEBUG_MESH_DM)
+        intent.removeExtra(DEBUG_MESH_IMAGE)
+        intent.removeExtra(DEBUG_MESH_PEER)
+
+        val generation = ++debugMeshGeneration
+        val startedAt = SystemClock.elapsedRealtime()
+        val runId = "${System.currentTimeMillis()}-$generation"
+        android.util.Log.i(
+            DEBUG_MESH_TAG,
+            "run=$runId waiting kind=${if (sendImage) "image" else "text"} peer=${peerPrefix ?: "any"}",
+        )
+
+        fun attempt() {
+            if (generation != debugMeshGeneration || isFinishing || isDestroyed) return
+            val peer = MeshRadio.peers().firstOrNull { candidate ->
+                val fingerprint = candidate.id.removePrefix("mesh:")
+                (peerPrefix == null || fingerprint.lowercase().startsWith(peerPrefix)) &&
+                    MeshRadio.hasMeshLink(fingerprint)
+            }
+            if (peer == null) {
+                if (SystemClock.elapsedRealtime() - startedAt < DEBUG_MESH_TIMEOUT_MS) {
+                    debugHandler.postDelayed(::attempt, DEBUG_MESH_RETRY_MS)
+                } else {
+                    android.util.Log.e(DEBUG_MESH_TAG, "run=$runId failed reason=no_verified_mesh_peer")
+                }
+                return
+            }
+
+            val peerId = peer.id.removePrefix("mesh:")
+            val messageId = "ble-debug-$runId"
+            val accepted = if (sendImage) {
+                val bytes = debugMeshJpeg(runId)
+                MeshRadio.sendMeshMedia(
+                    peerId = peerId,
+                    messageId = messageId,
+                    bytes = bytes,
+                    filename = "$messageId.jpg",
+                    mimeType = "image/jpeg",
+                ).also {
+                    android.util.Log.i(
+                        DEBUG_MESH_TAG,
+                        "run=$runId kind=image peer=${peerId.take(16)} message=$messageId bytes=${bytes.size} accepted=$it",
+                    )
+                }
+            } else {
+                MeshRadio.sendMeshDm(peerId, messageId, text.orEmpty()).also {
+                    android.util.Log.i(
+                        DEBUG_MESH_TAG,
+                        "run=$runId kind=text peer=${peerId.take(16)} message=$messageId accepted=$it",
+                    )
+                }
+            }
+            if (!accepted) {
+                android.util.Log.e(DEBUG_MESH_TAG, "run=$runId failed reason=driver_rejected_send")
+            }
+        }
+
+        debugHandler.post(::attempt)
+    }
+
+    private fun debugMeshJpeg(runId: String): ByteArray {
+        val bitmap = android.graphics.Bitmap.createBitmap(240, 240, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        canvas.drawColor(android.graphics.Color.rgb(22, 38, 56))
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.rgb(65, 211, 189)
+            textAlign = android.graphics.Paint.Align.CENTER
+            textSize = 25f
+        }
+        canvas.drawText("Sonar BLE", 120f, 105f, paint)
+        paint.textSize = 15f
+        canvas.drawText(runId.takeLast(18), 120f, 140f, paint)
+        return java.io.ByteArrayOutputStream().use { output ->
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, output)
+            bitmap.recycle()
+            output.toByteArray()
+        }
     }
 
     private fun handleInviteIntent(intent: Intent?) {
@@ -265,6 +376,8 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        debugMeshGeneration++
+        debugHandler.removeCallbacksAndMessages(null)
         MeshRadio.stop()
         super.onDestroy()
     }
