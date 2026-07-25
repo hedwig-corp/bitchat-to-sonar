@@ -17,16 +17,19 @@
 //!   sonar_ble_peers_json()     -> *malloc'd UTF-8 JSON array of fresh mesh peers
 //!   sonar_ble_free(ptr)        -> free a string returned above
 //!   sonar_ble_stop()           -> stop scanning + clear state
+//!   sonar_ble_subscription_token() -> identity of the active GATT subscriber
+//!   sonar_ble_notify(...)      -> enqueue for that subscriber, fail-fast otherwise
+//!   sonar_ble_drain_tx_results_json() -> native notify acceptance/failure results
 
-use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
-use btleplug::platform::Manager;
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
 use bluster::gatt::event::{Event, Response};
 use bluster::gatt::service::Service;
 use bluster::Peripheral;
+use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
+use btleplug::platform::Manager;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{c_char, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -49,11 +52,64 @@ static ADVERTISING: AtomicBool = AtomicBool::new(false);
 /// Drained by the JVM, which decodes the announce to name + dedupe a peer — this
 /// is how the desktop learns a phone that connected to it (the phone suppresses
 /// its own advertising while connected, so scanning alone can't see it).
-static RX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+struct RxPacket {
+    subscription_token: u64,
+    bytes: Vec<u8>,
+}
+
+static RX_PACKETS: Lazy<Mutex<Vec<RxPacket>>> = Lazy::new(|| Mutex::new(Vec::new()));
 
 /// Packets the JVM mesh engine wants pushed to subscribed centrals (Noise
 /// handshake replies, encrypted DMs). The advertise loop drains + notifies them.
-static TX_PACKETS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+struct TxPacket {
+    subscription_token: u64,
+    delivery_id: u64,
+    bytes: Vec<u8>,
+}
+
+static TX_PACKETS: Lazy<Mutex<VecDeque<TxPacket>>> = Lazy::new(|| Mutex::new(VecDeque::new()));
+const MAX_TX_PACKETS: usize = 256;
+
+struct TxResult {
+    delivery_id: u64,
+    accepted: bool,
+}
+
+static TX_RESULTS: Lazy<Mutex<Vec<TxResult>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+fn record_tx_result(delivery_id: u64, accepted: bool) {
+    if delivery_id == 0 {
+        return;
+    }
+    if let Ok(mut results) = TX_RESULTS.lock() {
+        results.push(TxResult {
+            delivery_id,
+            accepted,
+        });
+    }
+}
+
+fn enqueue_tx_packet(queue: &mut VecDeque<TxPacket>, packet: TxPacket) -> bool {
+    if queue.len() >= MAX_TX_PACKETS {
+        return false;
+    }
+    queue.push_back(packet);
+    true
+}
+
+fn fail_pending_tx() {
+    let delivery_ids: Vec<u64> = TX_PACKETS
+        .lock()
+        .map(|mut q| {
+            q.drain(..)
+                .filter_map(|packet| (packet.delivery_id != 0).then_some(packet.delivery_id))
+                .collect()
+        })
+        .unwrap_or_default();
+    for delivery_id in delivery_ids {
+        record_tx_result(delivery_id, false);
+    }
+}
 
 fn hex_encode(b: &[u8]) -> String {
     let mut s = String::with_capacity(b.len() * 2);
@@ -108,7 +164,10 @@ pub extern "C" fn sonar_ble_start() {
     std::thread::Builder::new()
         .name("sonar-ble-scan".into())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
                     RUNNING.store(false, Ordering::SeqCst);
@@ -155,20 +214,51 @@ pub extern "C" fn sonar_ble_peers_json() -> *mut c_char {
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// JSON array of hex-encoded packets written to our GATT characteristic by
-/// connected centrals (their announce / handshake), draining the queue. The JVM
-/// decodes these to learn + name the peer. Free with [`sonar_ble_free`].
+/// JSON array of packets written to our GATT characteristic, each paired with
+/// the CoreBluetooth subscription token active when the write arrived. The JVM
+/// rejects packets from replaced links before touching Noise state.
 #[no_mangle]
 pub extern "C" fn sonar_ble_drain_rx_json() -> *mut c_char {
     let items: Vec<serde_json::Value> = RX_PACKETS
         .lock()
-        .map(|mut q| q.drain(..).map(|b| serde_json::Value::String(hex_encode(&b))).collect())
+        .map(|mut q| {
+            q.drain(..)
+                .map(|packet| {
+                    serde_json::json!({
+                        "token": packet.subscription_token,
+                        "data": hex_encode(&packet.bytes),
+                    })
+                })
+                .collect()
+        })
         .unwrap_or_default();
     let json = serde_json::Value::Array(items).to_string();
     CString::new(json).unwrap_or_default().into_raw()
 }
 
-/// Free a string returned by [`sonar_ble_peers_json`] / [`sonar_ble_drain_rx_json`].
+/// JSON array of tracked native notify outcomes. An accepted result means
+/// CoreBluetooth accepted the value through `updateValue`; a failed result means
+/// the subscription changed or advertising stopped before that boundary.
+#[no_mangle]
+pub extern "C" fn sonar_ble_drain_tx_results_json() -> *mut c_char {
+    let items: Vec<serde_json::Value> = TX_RESULTS
+        .lock()
+        .map(|mut q| {
+            q.drain(..)
+                .map(|result| {
+                    serde_json::json!({
+                        "id": result.delivery_id,
+                        "accepted": result.accepted,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let json = serde_json::Value::Array(items).to_string();
+    CString::new(json).unwrap_or_default().into_raw()
+}
+
+/// Free a string returned by a `sonar_ble_*_json` function.
 ///
 /// # Safety
 /// `ptr` must be a pointer previously returned by this library, or null.
@@ -198,7 +288,9 @@ async fn scan_loop() {
     // Scan FILTERED to the bitchat service (like the Android app) — far more
     // reliable than scanning everything and checking the parsed service UUID,
     // which CoreBluetooth often reports empty (especially while also advertising).
-    let filter = ScanFilter { services: vec![BITCHAT_SERVICE] };
+    let filter = ScanFilter {
+        services: vec![BITCHAT_SERVICE],
+    };
     match central.start_scan(filter.clone()).await {
         Ok(_) => dbg_log("scan_loop: scan started (bitchat filter)"),
         Err(e) => dbg_log(&format!("scan_loop: start_scan ERR {e}")),
@@ -220,7 +312,9 @@ async fn scan_loop() {
             let total = DEVICES.lock().map(|d| d.len()).unwrap_or(0);
             dbg_log(&format!(
                 "scan: rescan stop={:?} start={:?} (total devices seen={})",
-                stop.is_ok(), start.is_ok(), total
+                stop.is_ok(),
+                start.is_ok(),
+                total
             ));
             last_rescan = Instant::now();
         }
@@ -242,7 +336,9 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
         | CentralEvent::DeviceDisconnected(id) => id.clone(),
         _ => return,
     };
-    let Ok(p) = central.peripheral(&id).await else { return };
+    let Ok(p) = central.peripheral(&id).await else {
+        return;
+    };
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
@@ -254,7 +350,12 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
             id.to_string(),
-            Seen { name, rssi, bitchat, at: Instant::now() },
+            Seen {
+                name,
+                rssi,
+                bitchat,
+                at: Instant::now(),
+            },
         );
     }
 }
@@ -273,7 +374,10 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
     } else {
         Some(std::slice::from_raw_parts(ptr, len).to_vec())
     };
-    dbg_log(&format!("set_announce: {} bytes", next.as_ref().map(|v| v.len()).unwrap_or(0)));
+    dbg_log(&format!(
+        "set_announce: {} bytes",
+        next.as_ref().map(|v| v.len()).unwrap_or(0)
+    ));
     if let Ok(mut a) = ANNOUNCE.lock() {
         *a = next;
     }
@@ -289,7 +393,10 @@ pub extern "C" fn sonar_ble_start_advertising() {
     std::thread::Builder::new()
         .name("sonar-ble-adv".into())
         .spawn(|| {
-            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => {
                     ADVERTISING.store(false, Ordering::SeqCst);
@@ -300,6 +407,7 @@ pub extern "C" fn sonar_ble_start_advertising() {
                 if let Err(e) = run_peripheral().await {
                     dbg_log(&format!("advertise: ERR {e}"));
                 }
+                fail_pending_tx();
                 ADVERTISING.store(false, Ordering::SeqCst);
             });
         })
@@ -311,21 +419,51 @@ pub extern "C" fn sonar_ble_stop_advertising() {
     ADVERTISING.store(false, Ordering::SeqCst);
 }
 
-/// Queue a raw packet to notify to subscribed centrals (the JVM mesh engine sends
-/// Noise handshake replies + encrypted DMs this way). The advertise loop flushes it.
+/// Non-zero identity of the currently subscribed central connection.
+#[no_mangle]
+pub extern "C" fn sonar_ble_subscription_token() -> u64 {
+    if ADVERTISING.load(Ordering::SeqCst) {
+        bluster::subscription_token()
+    } else {
+        0
+    }
+}
+
+/// Queue a raw packet for exactly the subscription that owns its Noise session.
+/// Returns 1 only when accepted; the advertise loop preserves FIFO order and
+/// retries CoreBluetooth backpressure without dropping ciphertext.
 ///
 /// # Safety
 /// `ptr` must point to `len` readable bytes, or be null.
 #[no_mangle]
-pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
-    if ptr.is_null() || len == 0 {
-        return;
+pub unsafe extern "C" fn sonar_ble_notify(
+    ptr: *const u8,
+    len: usize,
+    expected_subscription_token: u64,
+    delivery_id: u64,
+) -> i32 {
+    if ptr.is_null() || len == 0 || expected_subscription_token == 0 {
+        return 0;
+    }
+    if sonar_ble_subscription_token() != expected_subscription_token {
+        return 0;
     }
     let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
     if let Ok(mut q) = TX_PACKETS.lock() {
-        if q.len() < 256 {
-            q.push(bytes);
+        if enqueue_tx_packet(
+            &mut q,
+            TxPacket {
+                subscription_token: expected_subscription_token,
+                delivery_id,
+                bytes,
+            },
+        ) {
+            1
+        } else {
+            0
         }
+    } else {
+        0
     }
 }
 
@@ -334,6 +472,7 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);
 
     let peripheral = Peripheral::new().await?;
+    fail_pending_tx();
 
     // CoreBluetooth silently ignores addService:/startAdvertising: until the
     // CBPeripheralManager is powered on — so WAIT for power-on BEFORE registering
@@ -372,40 +511,66 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     dbg_log("advertise: started (bitchat service)");
 
     fn announce() -> Vec<u8> {
-        ANNOUNCE.lock().ok().and_then(|a| a.clone()).unwrap_or_default()
+        ANNOUNCE
+            .lock()
+            .ok()
+            .and_then(|a| a.clone())
+            .unwrap_or_default()
     }
 
     let mut last_notify = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
     while ADVERTISING.load(Ordering::SeqCst) {
-        // Push our announce to any subscribed central every ~2s. bluster's
-        // CoreBluetooth backend has no didSubscribe callback, so instead of
-        // sending on-subscribe we just keep notifying; updateValue only reaches
-        // subscribed centrals, so a phone that just subscribed picks up the next
-        // tick and then shows this desktop as a peer.
+        // Push our announce to any subscribed central every ~2s. The periodic
+        // repeat covers reconnect timing and CoreBluetooth notification
+        // backpressure; a phone that just subscribed picks up the next tick.
         if last_notify.elapsed() >= Duration::from_secs(2) {
             let ann = announce();
             if !ann.is_empty() {
                 let sent = peripheral.notify(&ann);
-                dbg_log(&format!("advertise: notify announce ({} bytes) sent={}", ann.len(), sent));
+                dbg_log(&format!(
+                    "advertise: notify announce ({} bytes) sent={}",
+                    ann.len(),
+                    sent
+                ));
             }
             last_notify = Instant::now();
         }
         // Flush packets the JVM mesh engine queued (handshake replies, DMs).
-        let tx: Vec<Vec<u8>> = TX_PACKETS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
-        for pkt in tx {
-            peripheral.notify(&pkt);
+        // A token change makes queued ciphertext cryptographically stale; drop
+        // it. CoreBluetooth backpressure is retried from the head without
+        // allowing later Noise nonces to overtake it.
+        loop {
+            let next = TX_PACKETS.lock().ok().and_then(|mut q| q.pop_front());
+            let Some(pkt) = next else { break };
+            if pkt.subscription_token != peripheral.subscription_token() {
+                record_tx_result(pkt.delivery_id, false);
+                continue;
+            }
+            if !peripheral.notify_for_subscription(&pkt.bytes, pkt.subscription_token) {
+                if let Ok(mut q) = TX_PACKETS.lock() {
+                    q.push_front(pkt);
+                }
+                break;
+            }
+            record_tx_result(pkt.delivery_id, true);
         }
         // Drain packets centrals wrote to us (bluster's event channel is a no-op
         // on macOS; we patched it to queue writes — take them here).
         let writes = peripheral.take_writes();
         if !writes.is_empty() {
-            dbg_log(&format!("advertise: rx {} write packet(s) from central", writes.len()));
+            dbg_log(&format!(
+                "advertise: rx {} write packet(s) from central",
+                writes.len()
+            ));
             if let Ok(mut q) = RX_PACKETS.lock() {
-                for w in writes {
+                for (subscription_token, bytes) in writes {
                     if q.len() < 256 {
-                        q.push(w);
+                        q.push(RxPacket {
+                            subscription_token,
+                            bytes,
+                        });
                     }
                 }
             }
@@ -422,7 +587,10 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
                 Event::WriteRequest(req) => {
                     // The central's packets (its announce / handshake). Discovery
                     // doesn't consume them yet; ack so it isn't left hanging.
-                    dbg_log(&format!("advertise: rx write {} bytes from central", req.data.len()));
+                    dbg_log(&format!(
+                        "advertise: rx write {} bytes from central",
+                        req.data.len()
+                    ));
                     let _ = req.response.send(Response::Success(vec![]));
                 }
                 Event::NotifyUnsubscribe => {}
@@ -432,5 +600,68 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let _ = peripheral.stop_advertising().await;
+    peripheral.reset_subscriptions();
+    fail_pending_tx();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_tracked_transmissions_report_failure() {
+        TX_RESULTS.lock().unwrap().clear();
+        let mut packets = TX_PACKETS.lock().unwrap();
+        packets.clear();
+        packets.push_back(TxPacket {
+            subscription_token: 7,
+            delivery_id: 41,
+            bytes: vec![1, 2, 3],
+        });
+        packets.push_back(TxPacket {
+            subscription_token: 7,
+            delivery_id: 0,
+            bytes: vec![4, 5, 6],
+        });
+        drop(packets);
+
+        fail_pending_tx();
+
+        assert!(TX_PACKETS.lock().unwrap().is_empty());
+        let results = TX_RESULTS.lock().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].delivery_id, 41);
+        assert!(!results[0].accepted);
+    }
+
+    #[test]
+    fn native_transmit_queue_is_bounded_and_fifo() {
+        let mut queue = VecDeque::new();
+        for delivery_id in 1..=MAX_TX_PACKETS as u64 {
+            assert!(enqueue_tx_packet(
+                &mut queue,
+                TxPacket {
+                    subscription_token: 7,
+                    delivery_id,
+                    bytes: vec![delivery_id as u8],
+                },
+            ));
+        }
+
+        assert!(!enqueue_tx_packet(
+            &mut queue,
+            TxPacket {
+                subscription_token: 7,
+                delivery_id: MAX_TX_PACKETS as u64 + 1,
+                bytes: vec![0],
+            },
+        ));
+        assert_eq!(queue.len(), MAX_TX_PACKETS);
+        assert_eq!(queue.pop_front().map(|packet| packet.delivery_id), Some(1));
+        assert_eq!(
+            queue.pop_back().map(|packet| packet.delivery_id),
+            Some(MAX_TX_PACKETS as u64),
+        );
+    }
 }

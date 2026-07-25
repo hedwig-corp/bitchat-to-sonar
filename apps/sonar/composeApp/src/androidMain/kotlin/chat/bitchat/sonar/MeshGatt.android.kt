@@ -618,6 +618,7 @@ object MeshGatt {
     /** When the in-flight op was issued, for the tick's stuck-op recovery. */
     private val opInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
+    @Synchronized
     private fun writePacket(gatt: BluetoothGatt, ch: BluetoothGattCharacteristic, packet: ByteArray) {
         clientWriteQueue.getOrPut(gatt.device.address) { java.util.concurrent.ConcurrentLinkedQueue() }
             .add(GattOp.WriteChar(ch, packet))
@@ -650,6 +651,18 @@ object MeshGatt {
             android.util.Log.w(TAG, "gatt op not accepted for $addr — skipping")
             opInFlightSinceMs.remove(addr)
             clientWriting.remove(addr)
+            if (next.delivery != null) cleanupClient(addr, extraDelivery = next.delivery)
+            else pumpClientWrites(addr)
+        }
+    }
+
+    @Synchronized
+    private fun completeClientWrite(addr: String, status: Int) {
+        val completed = clientInFlight.remove(addr)
+        clientWriting.remove(addr)
+        if (status != BluetoothGatt.GATT_SUCCESS && completed?.delivery != null) {
+            cleanupClient(addr, extraDelivery = completed.delivery)
+        } else {
             pumpClientWrites(addr)
         }
     }
@@ -683,16 +696,24 @@ object MeshGatt {
     /** When the in-flight notify was issued, for the tick's stuck recovery. */
     private val notifyInFlightSinceMs = ConcurrentHashMap<String, Long>()
 
+    @Synchronized
     private fun notify(device: BluetoothDevice, packet: ByteArray) {
-        serverNotifyQueue.getOrPut(device.address) { java.util.concurrent.ConcurrentLinkedQueue() }.add(packet)
-        pumpServerNotify(device.address)
+        val addr = device.address
+        val accepted = serverNotifyQueue
+            .getOrPut(addr) { BoundedFifo(MAX_PENDING_GATT_PACKETS) }
+            .tryAdd(OutboundPacket(packet))
+        if (!accepted) {
+            android.util.Log.w(TAG, "dropping discovery packet: server queue full for $addr")
+            return
+        }
+        pumpServerNotify(addr)
     }
 
     @Synchronized
     private fun pumpServerNotify(addr: String) {
         if (serverNotifying.contains(addr)) return
         val q = serverNotifyQueue[addr] ?: return
-        val next = q.poll() ?: return
+        val next = q.removeFirstOrNull() ?: return
         val s = server ?: return
         val ch = characteristic ?: return
         val device = serverDevices[addr] ?: return
@@ -701,6 +722,18 @@ object MeshGatt {
         if (!issueNotify(s, device, ch, next)) {
             notifyInFlightSinceMs.remove(addr)
             serverNotifying.remove(addr)
+            if (next.delivery != null) cleanupServer(addr, extraDelivery = next.delivery)
+            else pumpServerNotify(addr)
+        }
+    }
+
+    @Synchronized
+    private fun completeServerNotify(addr: String, status: Int) {
+        val completed = serverInFlight.remove(addr)
+        serverNotifying.remove(addr)
+        if (status != BluetoothGatt.GATT_SUCCESS && completed?.delivery != null) {
+            cleanupServer(addr, extraDelivery = completed.delivery)
+        } else {
             pumpServerNotify(addr)
         }
     }

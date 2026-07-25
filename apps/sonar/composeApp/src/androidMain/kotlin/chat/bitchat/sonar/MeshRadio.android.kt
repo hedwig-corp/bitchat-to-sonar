@@ -89,10 +89,17 @@ actual object MeshRadio {
 
     /** Incoming decrypted mesh DMs, buffered until the app drains them. */
     private val meshDmInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshDmIn>()
+    /** DMs accepted synchronously whose later GATT callback/disconnect failed. */
+    private val meshSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshSendFailure>()
+    /** Media accepted synchronously whose later fragment/callback failed. */
+    private val meshMediaSendFailureInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaSendFailure>()
     /** Incoming private mesh file transfers, buffered until the app drains them. */
     private val meshMediaInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshMediaIn>()
     /** Incoming public Mesh-channel broadcasts, buffered until drained. */
     private val meshBroadcastInbox = java.util.concurrent.ConcurrentLinkedQueue<MeshBroadcastIn>()
+    /** Fingerprints whose Noise link (re)established, buffered until the app
+     *  drains them to flush queued outbox / favorite-control work on re-link. */
+    private val meshLinkUpInbox = java.util.concurrent.ConcurrentLinkedQueue<String>()
 
     init {
         // The String identity from MeshGatt is the peer's STABLE fingerprint
@@ -102,6 +109,12 @@ actual object MeshRadio {
         MeshGatt.addMessageListener { fingerprint, messageId, text ->
             if (!isKnownPeer(fingerprint)) return@addMessageListener
             meshDmInbox.add(MeshDmIn(fingerprint, messageId, text, System.currentTimeMillis() / 1000))
+        }
+        MeshGatt.addSendFailureListener { failure ->
+            if (isKnownPeer(failure.peerId)) meshSendFailureInbox.add(failure)
+        }
+        MeshGatt.addMediaSendFailureListener { failure ->
+            if (isKnownPeer(failure.peerId)) meshMediaSendFailureInbox.add(failure)
         }
         MeshGatt.addFileListener { fingerprint, messageId, filename, mime, bytes ->
             if (!isKnownPeer(fingerprint)) return@addFileListener
@@ -132,8 +145,13 @@ actual object MeshRadio {
             announcedSeen[fingerprint] = System.currentTimeMillis()
             if (previous != peer) notifyPeerUpdate()
         }
-        // Keep a peer fresh while its encrypted link is (re)established.
-        MeshGatt.addLinkListener { fingerprint -> announcedSeen[fingerprint] = System.currentTimeMillis() }
+        // Keep a peer fresh while its encrypted link is (re)established, and
+        // surface the re-link so the app flushes queued work for that peer
+        // (outbox + favorite controls) even for chats that aren't open.
+        MeshGatt.addLinkListener { fingerprint ->
+            announcedSeen[fingerprint] = System.currentTimeMillis()
+            if (isKnownPeer(fingerprint)) meshLinkUpInbox.add(fingerprint)
+        }
     }
 
     private val ctx: Context get() = AppContextHolder.ctx
@@ -373,6 +391,15 @@ actual object MeshRadio {
 
     actual fun hasMeshLink(peerId: String): Boolean = MeshGatt.hasLink(peerId)
 
+    actual fun drainMeshLinkUps(): List<String> {
+        val out = ArrayList<String>()
+        while (true) {
+            val fp = meshLinkUpInbox.poll() ?: break
+            if (isKnownPeer(fp)) out.add(fp)
+        }
+        return out
+    }
+
     actual fun localPeerIdHex(): String = MeshGatt.nodeId().toHexLower()
 
     actual fun drainMeshDm(): List<MeshDmIn> {
@@ -384,8 +411,26 @@ actual object MeshRadio {
         return out
     }
 
+    actual fun drainMeshSendFailures(): List<MeshSendFailure> {
+        val out = ArrayList<MeshSendFailure>()
+        while (true) {
+            val failure = meshSendFailureInbox.poll() ?: break
+            if (isKnownPeer(failure.peerId)) out.add(failure)
+        }
+        return out
+    }
+
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean =
         MeshGatt.sendFileToPeer(peerId, messageId, bytes, filename, mimeType)
+
+    actual fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure> {
+        val out = ArrayList<MeshMediaSendFailure>()
+        while (true) {
+            val failure = meshMediaSendFailureInbox.poll() ?: break
+            if (isKnownPeer(failure.peerId)) out.add(failure)
+        }
+        return out
+    }
 
     actual fun drainMeshMedia(): List<MeshMediaIn> {
         val out = ArrayList<MeshMediaIn>()

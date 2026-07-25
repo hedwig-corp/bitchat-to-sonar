@@ -7,4 +7,8 @@ pub mod gatt;
 mod peripheral;
 mod uuid;
 
-pub use self::{error::*, peripheral::Peripheral, uuid::*};
+pub use self::{
+    error::*,
+    peripheral::{subscription_token, Peripheral},
+    uuid::*,
+};

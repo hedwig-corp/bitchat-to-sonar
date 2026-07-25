@@ -77,7 +77,7 @@ fun CallScreen(state: SonarAppState, screen: Screen.Call) {
     val chatId = call?.chatId ?: screen.peerId
     val isMeshRoute = chatId.startsWith("mesh:")
     val rawPeer = chatId.removePrefix("mesh:")
-    val mesh = run { state.payVersion; isMeshRoute && state.dmInRange(rawPeer) }
+    val mesh = run { state.payVersion; state.meshLinkVersion; isMeshRoute && state.dmInRange(rawPeer) }
 
     val camOn = call?.camOn ?: false
 

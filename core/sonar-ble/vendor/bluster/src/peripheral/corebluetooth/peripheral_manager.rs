@@ -4,7 +4,13 @@ use std::{
     sync::{Once, ONCE_INIT},
 };
 
-use objc::{class, declare::ClassDecl, msg_send, runtime::{BOOL, Class, NO, Object, Protocol, Sel, YES}, sel, sel_impl};
+use objc::{
+    class,
+    declare::ClassDecl,
+    msg_send,
+    runtime::{Class, Object, Protocol, Sel, BOOL, NO, YES},
+    sel, sel_impl,
+};
 use objc_foundation::{
     INSArray, INSData, INSDictionary, INSString, NSArray, NSData, NSDictionary, NSObject, NSString,
 };
@@ -20,7 +26,8 @@ use super::{
     events::{
         peripheral_manager_did_add_service_error, peripheral_manager_did_receive_read_request,
         peripheral_manager_did_receive_write_requests,
-        peripheral_manager_did_start_advertising_error, peripheral_manager_did_update_state,
+        peripheral_manager_did_start_advertising_error, peripheral_manager_did_subscribe,
+        peripheral_manager_did_unsubscribe, peripheral_manager_did_update_state,
     },
     ffi::{
         dispatch_queue_create, nil, CBAdvertisementDataLocalNameKey,
@@ -46,6 +53,7 @@ pub struct PeripheralManager {
 
 impl PeripheralManager {
     pub fn new() -> Self {
+        super::events::reset_subscriptions();
         REGISTER_DELEGATE_CLASS.call_once(|| {
             let mut decl =
                 ClassDecl::new(PERIPHERAL_MANAGER_DELEGATE_CLASS_NAME, class!(NSObject)).unwrap();
@@ -83,6 +91,16 @@ impl PeripheralManager {
                     sel!(peripheralManager:didReceiveWriteRequests:),
                     peripheral_manager_did_receive_write_requests
                         as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object),
+                );
+                decl.add_method(
+                    sel!(peripheralManager:central:didSubscribeToCharacteristic:),
+                    peripheral_manager_did_subscribe
+                        as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object, *mut Object),
+                );
+                decl.add_method(
+                    sel!(peripheralManager:central:didUnsubscribeFromCharacteristic:),
+                    peripheral_manager_did_unsubscribe
+                        as extern "C" fn(&mut Object, Sel, *mut Object, *mut Object, *mut Object),
                 );
             }
 
@@ -218,27 +236,51 @@ impl PeripheralManager {
     // Returns false if no characteristic exists yet or CoreBluetooth's transmit
     // queue is full (retry later). This is the notify path upstream bluster lacks.
     pub fn notify(self: &Self, data: &[u8]) -> bool {
+        self.notify_for_subscription(data, super::events::subscription_token())
+    }
+
+    /// Notify only the central that owns [expected_subscription_token]. Holding a
+    /// retained CBCentral and passing it explicitly prevents a subscribe race from
+    /// fanning private ciphertext out through CoreBluetooth's `nil` target list.
+    pub fn notify_for_subscription(
+        self: &Self,
+        data: &[u8],
+        expected_subscription_token: u64,
+    ) -> bool {
         let chr = NOTIFY_CHAR.load(Ordering::SeqCst);
         if chr.is_null() {
             return false;
         }
+        let central = match super::events::subscribed_central(expected_subscription_token) {
+            Some(central) => central,
+            None => return false,
+        };
         unsafe {
             let peripheral_manager = *self
                 .peripheral_manager_delegate
                 .get_ivar::<*mut Object>(PERIPHERAL_MANAGER_IVAR);
             let value = NSData::with_bytes(data);
+            let centrals = NSArray::from_vec(vec![central]);
             let ok: BOOL = msg_send![peripheral_manager,
                 updateValue: value
                 forCharacteristic: chr
-                onSubscribedCentrals: nil];
+                onSubscribedCentrals: centrals];
             ok.into_bool()
         }
+    }
+
+    pub fn subscription_token(self: &Self) -> u64 {
+        super::events::subscription_token()
+    }
+
+    pub fn reset_subscriptions(self: &Self) {
+        super::events::reset_subscriptions();
     }
 
     // PATCH (Sonar): drain the bytes written to our characteristic by connected
     // centrals (their announce / handshake packets). Upstream bluster discarded
     // them; see events::WRITE_QUEUE.
-    pub fn take_writes(self: &Self) -> Vec<Vec<u8>> {
+    pub fn take_writes(self: &Self) -> Vec<(u64, Vec<u8>)> {
         super::events::WRITE_QUEUE
             .lock()
             .map(|mut q| std::mem::take(&mut *q))

@@ -1589,7 +1589,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // bubbles colour by the leg they travelled (`m.viaInternet`).
     val isMeshRoute = screen.id.startsWith("mesh:")
     val peerId = screen.id.removePrefix("mesh:")
-    val inRange = run { state.payVersion; isMeshRoute && state.dmInRange(peerId) }
+    val inRange = run { state.payVersion; state.meshLinkVersion; isMeshRoute && state.dmInRange(peerId) }
     // Do we know this peer's White Noise account (npub)? Then a Bluetooth chat
     // continues over the internet when out of range — they're a White Noise
     // account, not a "Sonar-only" peer. A plain bitchat peer (no npub) can't.
