@@ -1492,8 +1492,11 @@ final class BLEService: NSObject {
         }
 
         let ts = Date(timeIntervalSince1970: Double(packet.timestamp) / 1000)
+        // The sender-supplied messageID is receipt-only: it is echoed back in the
+        // delivery receipt, but is deliberately NOT used as this local row's id,
+        // because a peer could otherwise pick an id that collides with one of my
+        // own rows in this conversation.
         let message = BitchatMessage(
-            id: filePacket.messageID,
             sender: senderNickname,
             content: marker,
             timestamp: ts,
@@ -2995,11 +2998,6 @@ extension BLEService: CBPeripheralManagerDelegate {
                 let peekType = combined[1]
                 if peekType != MessageType.announce.rawValue {
                     SecureLogger.debug("📥 Accumulated write from central \(centralUUID): size=\(combined.count) (+\(appendedBytes)) bytes (type=\(peekType)), offsets=\(offsets)", category: .session)
-                    #if DEBUG
-                    appendBleDebugReport(
-                        "raw write central=\(centralUUID) size=\(combined.count) appended=\(appendedBytes) type=\(peekType) offsets=\(offsets)"
-                    )
-                    #endif
                 }
             }
 
@@ -3007,12 +3005,6 @@ extension BLEService: CBPeripheralManagerDelegate {
             if let packet = BinaryProtocol.decode(combined) {
                 // Clear buffer on success
                 pendingWriteBuffers.removeValue(forKey: centralUUID)
-
-                #if DEBUG
-                if packet.type != MessageType.announce.rawValue {
-                    appendBleDebugReport("raw decoded central=\(centralUUID) type=\(packet.type) bytes=\(combined.count)")
-                }
-                #endif
 
                 let claimedSenderID = PeerID(hexData: packet.senderID)
 
@@ -3066,9 +3058,6 @@ extension BLEService: CBPeripheralManagerDelegate {
                     handleReceivedPacket(packet, from: claimedSenderID)
                 }
             } else {
-                #if DEBUG
-                appendBleDebugReport("raw pending central=\(centralUUID) bytes=\(combined.count) appended=\(appendedBytes)")
-                #endif
                 // If buffer grows suspiciously large, reset to avoid memory leak
                 if combined.count > TransportConfig.blePendingWriteBufferCapBytes { // cap for safety
                     pendingWriteBuffers.removeValue(forKey: centralUUID)
@@ -4067,14 +4056,6 @@ extension BLEService {
         let originalType = packet.payload[12]
         let fragmentData = packet.payload.suffix(from: 13)
 
-        #if DEBUG
-        if index == 0 {
-            appendBleDebugReport(
-                "fragment start id=\(String(format: "%016llx", fragU64)) sender=\(peerID.id) total=\(total) type=\(originalType)"
-            )
-        }
-        #endif
-
         // Sanity checks - add reasonable upper bound on total to prevent DoS
         guard total > 0 && total <= 10000 && index >= 0 && index < total else { return }
 
@@ -4146,12 +4127,6 @@ extension BLEService {
 
         // Heavy work outside lock: reassemble and decode
         guard shouldReassemble, let fragments = fragmentsToReassemble else { return }
-
-        #if DEBUG
-        appendBleDebugReport(
-            "fragment complete id=\(String(format: "%016llx", fragU64)) sender=\(peerID.id) total=\(total)"
-        )
-        #endif
 
         var reassembled = Data()
         for i in 0..<total {
@@ -5257,29 +5232,44 @@ extension BLEService {
     }
 
     #if DEBUG
-    private static let bleDebugReportLock = NSLock()
-
-    /// Pullable physical-device trace for fragment and file persistence events.
-    /// This intentionally bypasses unified logging, which is not always
-    /// available over a paired wireless CoreDevice tunnel.
     private func appendBleDebugReport(_ line: String) {
-        Self.bleDebugReportLock.lock()
-        defer { Self.bleDebugReportLock.unlock() }
-        guard let base = try? FileManager.default.url(
+        SonarBleDebugReport.append(line)
+    }
+    #endif
+}
+
+#if DEBUG
+/// Pullable physical-device trace for BLE fragment/file events. Unified logging
+/// is not always reachable over a paired wireless CoreDevice tunnel, so this
+/// writes a small rotating file instead. DEBUG-only and never on a Release path.
+enum SonarBleDebugReport {
+    private static let lock = NSLock()
+    private static let maxBytes = 512 * 1024
+    private static var handle: FileHandle?
+
+    static func append(_ line: String) {
+        guard let data = (line + "\n").data(using: .utf8) else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let url = try? FileManager.default.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true
-        ) else { return }
-        let url = base.appendingPathComponent("sonar-debug.txt")
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-        } else {
-            try? data.write(to: url, options: .atomic)
+        ).appendingPathComponent("sonar-debug.txt") else { return }
+        if handle == nil {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            handle = try? FileHandle(forWritingTo: url)
         }
+        guard let handle else { return }
+        // Truncate rather than grow without bound; a long media run would
+        // otherwise fill the container during a debug session.
+        if (try? handle.seekToEnd()).map({ $0 > UInt64(maxBytes) }) == true {
+            try? handle.truncate(atOffset: 0)
+        }
+        handle.write(data)
     }
-    #endif
 }
+#endif

@@ -8788,7 +8788,6 @@ final class SonarAppStore: ObservableObject {
         // Group creation/accept run untracked FFI calls; join them before the
         // store is erased so a late completion cannot recreate a group.
         await quiescePendingMarmotGroupSetups()
-        await marmot.eraseChatsKeepIdentity()
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -8796,6 +8795,11 @@ final class SonarAppStore: ObservableObject {
         conversationViewStates.removeAll()
         // Mesh DMs + public/channel transcripts (in-memory + on-disk store).
         chatViewModel.clearAllConversations()
+        // Order matters: quiesce sends first (lease held above), then clear all
+        // host/UI state so the chat list and any open transcript stop rendering
+        // backed rows, and only then erase the database — the UI must never
+        // paint rows whose backing store is mid-delete.
+        await marmot.eraseChatsKeepIdentity()
         // Drop queued sends + pay-scan state that referenced the erased chats.
         openingDMTasks.values.forEach { $0.cancel() }
         openingDMTasks = [:]

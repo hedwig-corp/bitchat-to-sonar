@@ -106,6 +106,11 @@ actual object MeshRadio {
         MeshLink.sendDeliveryAck(peerId, messageId)
     actual fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt> =
         MeshLink.drainDeliveryReceipts().filter { isKnownPeer(it.peerId) }
+    actual fun discardPendingDeliverySignals() {
+        // The desktop bridge has no asynchronous GATT completion boundary, so
+        // there are no buffered send failures; only receipts need dropping.
+        MeshLink.drainDeliveryReceipts()
+    }
     actual fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean = false
     actual fun drainMeshMediaSendFailures(): List<MeshMediaSendFailure> = emptyList()
     actual fun drainMeshMedia(): List<MeshMediaIn> = emptyList()

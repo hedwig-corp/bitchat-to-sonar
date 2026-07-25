@@ -242,13 +242,14 @@ actual object MeshRadio {
         try { scanner?.stopScan(scanCallback) } catch (_: Throwable) {}
         try { advertiser?.stopAdvertising(advCallback) } catch (_: Throwable) {}
         MeshGatt.stop()
-        // The driver invalidates delayed callbacks first; failures already
-        // handed to the app are then cancelled with this intentional shutdown.
+        seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
+        notifyPeerUpdate()
+    }
+
+    actual fun discardPendingDeliverySignals() {
         meshSendFailureInbox.clear()
         meshMediaSendFailureInbox.clear()
         meshDeliveryInbox.clear()
-        seen.clear(); lastSeen.clear(); announcedPeers.clear(); announcedSeen.clear()
-        notifyPeerUpdate()
     }
 
     private fun restartRadioForPolicy() {

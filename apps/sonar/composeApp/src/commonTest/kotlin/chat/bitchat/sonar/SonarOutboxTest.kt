@@ -123,4 +123,5 @@ class PendingMarmotOutboxTest {
         assertNull(outbox.peek("npub-1"))
         assertNull(outbox.peek("npub-2"))
     }
+
 }

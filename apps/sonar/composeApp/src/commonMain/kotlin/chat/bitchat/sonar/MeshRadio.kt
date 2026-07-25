@@ -283,6 +283,11 @@ expect object MeshRadio {
     fun sendMeshDeliveryAck(peerId: String, messageId: String): Boolean
     /** Pull (and clear) recipient receipts received since the last call. */
     fun drainMeshDeliveryReceipts(): List<MeshDeliveryReceipt>
+    /** Privacy teardown only. Ordinary [stop] (activity destroy, BLE policy
+     *  change) MUST keep undrained failure/receipt signals: with the Rust
+     *  engine no longer queuing plaintext, the app router is the only retry
+     *  owner, and dropping a failure leaves the row "Sent" forever. */
+    fun discardPendingDeliverySignals()
     /** Send a private BLE file transfer to a live mesh peer. This does not queue:
      * callers should fall back to White Noise or show a route error when false. */
     fun sendMeshMedia(peerId: String, messageId: String, bytes: ByteArray, filename: String, mimeType: String): Boolean

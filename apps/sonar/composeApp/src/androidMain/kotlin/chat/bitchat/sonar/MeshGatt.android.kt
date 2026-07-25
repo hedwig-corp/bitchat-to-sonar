@@ -994,15 +994,24 @@ object MeshGatt {
     /** Incremented by [stop] so delayed callbacks cannot escape a completed
      * radio lifecycle and resurrect app-owned plaintext after erase/wipe. */
     private val deliveryGeneration = java.util.concurrent.atomic.AtomicLong()
+    private const val REPORTED_ATTEMPT_TTL_MS = 5 * 60_000L
+    private const val REPORTED_ATTEMPT_MAX = 512
+    @Volatile private var lastReportedSweepMs = 0L
     private val reportedDeliveryAttempts = ConcurrentHashMap<Long, Long>()
 
     private fun reportSendFailures(deliveries: List<OutboundDelivery>) {
         val now = System.currentTimeMillis()
-        if (reportedDeliveryAttempts.size > 512) {
-            reportedDeliveryAttempts.forEach { (attemptId, reportedAt) ->
-                if (now - reportedAt > 5 * 60_000L) {
-                    reportedDeliveryAttempts.remove(attemptId, reportedAt)
-                }
+        if (reportedDeliveryAttempts.size > REPORTED_ATTEMPT_MAX ||
+            now - lastReportedSweepMs >= REPORTED_ATTEMPT_TTL_MS) {
+            lastReportedSweepMs = now
+            reportedDeliveryAttempts.entries.removeIf { (_, reportedAt) ->
+                now - reportedAt > REPORTED_ATTEMPT_TTL_MS
+            }
+            if (reportedDeliveryAttempts.size > REPORTED_ATTEMPT_MAX) {
+                reportedDeliveryAttempts.entries
+                    .sortedByDescending { it.value }
+                    .drop(REPORTED_ATTEMPT_MAX)
+                    .forEach { (attemptId, _) -> reportedDeliveryAttempts.remove(attemptId) }
             }
         }
         val activeGeneration = deliveryGeneration.get()

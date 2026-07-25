@@ -687,21 +687,7 @@ extension ChatViewModel {
     /// Correlated, pullable evidence for physical-device BLE runs. Keeping this
     /// in the debug build avoids depending on a live unified-log stream.
     private func appendBleDebugReport(_ line: String) {
-        guard let base = try? FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ) else { return }
-        let url = base.appendingPathComponent("sonar-debug.txt")
-        guard let data = (line + "\n").data(using: .utf8) else { return }
-        if let handle = try? FileHandle(forWritingTo: url) {
-            handle.seekToEndOfFile()
-            handle.write(data)
-            try? handle.close()
-        } else {
-            try? data.write(to: url, options: .atomic)
-        }
+        SonarBleDebugReport.append(line)
     }
     #endif
 

@@ -180,11 +180,11 @@ object MeshLink {
             runCatching {
                 val plain = s.noise.decrypt(ciphertext)
                 when (plain.firstOrNull()?.toInt()?.and(0xff)) {
-                    0x01 -> meshDecodePrivateMessage(plain)?.let { pm ->
+                    MeshNoisePayload.PRIVATE_MESSAGE -> meshDecodePrivateMessage(plain)?.let { pm ->
                         sonarLog("MeshLink", "RX DM from ${nameByFp[fp] ?: fp.take(8)} (${pm.content.length} chars)")
                         rxDms.add(MeshDmIn(fp, pm.messageId, pm.content, System.currentTimeMillis() / 1000))
                     }
-                    0x03 -> plain.copyOfRange(1, plain.size).decodeToString().takeIf(String::isNotEmpty)?.let { messageId ->
+                    MeshNoisePayload.DELIVERED -> plain.copyOfRange(1, plain.size).decodeToString().takeIf(String::isNotEmpty)?.let { messageId ->
                         sonarLog("MeshLink", "RX delivery receipt from ${nameByFp[fp] ?: fp.take(8)} id=${messageId.take(12)}")
                         rxDeliveries.add(MeshDeliveryReceipt(fp, messageId))
                     }
@@ -212,7 +212,7 @@ object MeshLink {
         val peerId = peerIdByFp[fp] ?: return false
         return synchronized(s) {
             runCatching {
-                val plain = byteArrayOf(0x03) + messageId.encodeToByteArray()
+                val plain = byteArrayOf(MeshNoisePayload.DELIVERED.toByte()) + messageId.encodeToByteArray()
                 val ct = s.noise.encrypt(plain)
                 BleBridge.notify(MeshIdentity.buildPacket(TYPE_NOISE_ENCRYPTED.toUByte(), peerId, ct))
                 true

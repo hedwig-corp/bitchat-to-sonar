@@ -909,6 +909,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             onboarded = false; started = false
             MeshRadio.stop()
             MeshRadio.setMeshNickname("")
+            MeshRadio.discardPendingDeliverySignals()
             MeshRadio.setLocalSonarAnnounce(null); sonarPeerProfiles = emptyMap()
             meshPeers = emptyList()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
@@ -983,7 +984,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelPendingMarmotGroupSetups()
             // Local transcripts on disk (mesh DMs, channels, geo DMs).
             MessageStore.wipe()
-            // In-memory conversation state.
+            // In-memory conversation state. Undrained BLE failure/receipt
+            // signals reference erased rows, so drop them here (never in the
+            // ordinary MeshRadio.stop() path).
+            MeshRadio.discardPendingDeliverySignals()
             meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
             persistMeshNames() // clear the on-disk name cache too, else boot resurrects erased names
             pendingMarmotChatNpubs = emptyMap()
@@ -3414,6 +3418,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelPendingMarmotGroupSetups()
 
                 MessageStore.wipe()
+                MeshRadio.discardPendingDeliverySignals()
                 meshChats.clear(); meshEchoIds.clear(); meshChatNames.clear(); pendingMarmotSends.clear(); pendingDirectMarmotSends.clear(); pendingMarmotGroupSends.clear(); outbox.clear()
                 persistMeshNames()
                 pendingMarmotChatNpubs = emptyMap()
@@ -7676,11 +7681,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  immediately, even when BLE is disconnected and the message is queued
      *  in the outbox. The same [messageId] is stored in the outbox so
      *  [flushOutboxNow] can deliver via BLE without creating a duplicate row. */
-    private fun echoMeshMessage(peerId: String, text: String, messageId: String) {
+    private fun echoMeshMessage(
+        peerId: String,
+        text: String,
+        messageId: String,
+        timestampSecs: Long = MeshRadio.nowSecs(),
+    ) {
         val stickerRef = meshParseStickerContent(text)?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         }
-        val msg = SonarMsg(messageId, npub, if (stickerRef != null) "" else text, mine = true, MeshRadio.nowSecs(), stickerRef = stickerRef)
+        val msg = SonarMsg(messageId, npub, if (stickerRef != null) "" else text, mine = true, timestampSecs, stickerRef = stickerRef)
         meshChats[peerId] = meshChats[peerId].orEmpty() + msg
         meshEchoIds.add(messageId)
         val canonicalPeerId = canonicalMeshPeerId(peerId)
@@ -8235,6 +8245,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             val group = marmotGroupForNpub(npubHex.hexToBytesOrEmpty()) ?: continue
             pendingMarmotSends.remove(npubHex)
             val job = scope.launch {
+                var drainedQueueEmpty = false
                 try {
                     for (send in sends) {
                         val peerId = meshPeerId(send.meshChatId)
@@ -8265,6 +8276,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                     val owner = currentCoroutineContext()[Job]
                     if (pendingMarmotFlushJobs[npubHex] === owner) {
                         pendingMarmotFlushJobs.remove(npubHex)
+                        // Job.isActive is still true while this finally runs, so a
+                        // send enqueued during the drain was skipped by
+                        // flushPendingMarmot and left with no owner. Re-arm now.
+                        // Unconditionally safe in this shape: the snapshot was
+                        // removed up front and a failed send marks its echo
+                        // "Couldn't send" instead of being requeued, so the
+                        // re-arm cannot spin on a permanently failing head.
+                        if (!pendingMarmotSends[npubHex].isNullOrEmpty()) flushPendingMarmot()
                     }
                 }
             }
@@ -9458,7 +9477,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             ) continue
             for (alias in aliases) {
                 val before = meshChats[alias].orEmpty()
-                val after = before.filterNot { it.id == failure.messageId }
+                val after = before.filterNot { it.mine && it.id == failure.messageId }
                 if (after.size != before.size) {
                     meshChats[alias] = after
                     touched += alias
@@ -9473,6 +9492,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 else -> {
                     val canonicalPeerId = canonicalMeshPeerId(peerId)
+                    // The optimistic row was withdrawn above. Re-paint it as a
+                    // queued echo under the same id and original timestamp:
+                    // flushOutboxNow -> sendMesh takes its `messageId != null`
+                    // branch, which deliberately creates no row, so without this
+                    // the retried message is delivered but never painted again.
+                    echoMeshMessage(canonicalPeerId, failure.text, failure.messageId, failure.tsSecs)
                     enqueueOutbox(canonicalPeerId, failure.text, failure.messageId, failure.tsSecs)
                     flushOutbox(canonicalPeerId)
                 }
@@ -9512,13 +9537,13 @@ class SonarAppState(private val scope: CoroutineScope) {
             ) continue
             for (alias in aliases) {
                 val before = meshChats[alias].orEmpty()
-                before.filter { it.id == failure.messageId }
+                before.filter { it.mine && it.id == failure.messageId }
                     .flatMap { it.media }
                     .forEach { media ->
                         mediaCache.remove(media.url)
                         orphanedMediaUrls += media.url
                     }
-                val after = before.filterNot { it.id == failure.messageId }
+                val after = before.filterNot { it.mine && it.id == failure.messageId }
                 if (after.size != before.size) {
                     meshChats[alias] = after
                     touched += alias
@@ -9648,7 +9673,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         for (m in incoming) {
             if (isMeshContactBlocked(m.peerId)) continue
             val id = m.messageId.ifBlank { randomMeshId() }
-            if (meshChats[m.peerId].orEmpty().any { it.id == id }) continue
+            // id is sender-chosen: a peer must not suppress its own incoming media
+            // by reusing one of our outgoing row ids.
+            if (meshChats[m.peerId].orEmpty().any { it.id == id && !it.mine }) continue
             val mediaUrl = meshMediaUrl(m.peerId, id, m.filename)
             val media = meshMediaFor(mediaUrl, m.mimeType, m.filename, m.bytes)
             mediaCache[mediaUrl] = m.bytes
