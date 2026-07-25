@@ -697,9 +697,9 @@ struct SNMsgBubble: View {
                     else { expandedMessageIDs.insert(m.id) }
                 } label: {
                     // Plain buttons only hit-test their label subtree, so the
-                    // frame and contentShape must live INSIDE the label: on the
-                    // last bubble the text-selection gesture above otherwise
-                    // swallows taps that land in the blank 44pt area.
+                    // frame and contentShape must live INSIDE the label —
+                    // applied to the Button wrapper they widen the layout box
+                    // and leave the blank part of the 44pt area unhittable.
                     Text(isExpanded
                          ? String(localized: "content.message.show_less")
                          : String(localized: "content.message.show_more"))
