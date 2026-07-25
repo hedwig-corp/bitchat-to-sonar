@@ -3350,66 +3350,106 @@ impl SonarClient {
                 if member == &my_pubkey {
                     continue;
                 }
-                let Some(info) = tokens.get(&member.to_hex()) else {
+                let Some(devices) = tokens.get(&member.to_hex()) else {
                     continue;
                 };
-                let rumor = EventBuilder::new(
-                    Kind::Custom(crate::push::KIND_NOTIFICATION_REQUEST),
-                    &info.encrypted_token_b64,
-                )
-                .tags([
-                    Tag::custom(TagKind::custom("v"), ["mip05-v1"]),
-                    Tag::custom(TagKind::custom("encoding"), ["base64"]),
-                ])
-                .build(my_pubkey);
+                // Fan out to every cached device (iPhone + Mac, etc.).
+                for info in devices
+                    .values()
+                    .filter(|info| crate::push::is_cached_token_active(info))
+                {
+                    let rumor = EventBuilder::new(
+                        Kind::Custom(crate::push::KIND_NOTIFICATION_REQUEST),
+                        &info.encrypted_token_b64,
+                    )
+                    .tags([
+                        Tag::custom(TagKind::custom("v"), ["mip05-v1"]),
+                        Tag::custom(TagKind::custom("encoding"), ["base64"]),
+                    ])
+                    .build(my_pubkey);
 
-                let seal_builder =
-                    match EventBuilder::seal(&identity_keys, &info.server_pubkey, rumor).await {
+                    let seal_builder = match EventBuilder::seal(
+                        &identity_keys,
+                        &info.server_pubkey,
+                        rumor,
+                    )
+                    .await
+                    {
                         Ok(b) => b,
                         Err(e) => {
-                            tracing::debug!(member = %member, %e, "push notify seal failed");
+                            tracing::debug!(
+                                member = %member,
+                                device_id = %info.device_id,
+                                %e,
+                                "push notify seal failed"
+                            );
                             continue;
                         }
                     };
-                let seal = match seal_builder.sign(&identity_keys).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(member = %member, %e, "push notify sign seal failed");
-                        continue;
+                    let seal = match seal_builder.sign(&identity_keys).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::debug!(
+                                member = %member,
+                                device_id = %info.device_id,
+                                %e,
+                                "push notify sign seal failed"
+                            );
+                            continue;
+                        }
+                    };
+                    let ephemeral = Keys::generate();
+                    let content = match nip44::encrypt(
+                        ephemeral.secret_key(),
+                        &info.server_pubkey,
+                        seal.as_json(),
+                        nip44::Version::default(),
+                    ) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::debug!(
+                                member = %member,
+                                device_id = %info.device_id,
+                                %e,
+                                "push notify encrypt failed"
+                            );
+                            continue;
+                        }
+                    };
+                    let wrapped = match EventBuilder::new(Kind::GiftWrap, content)
+                        .tags([Tag::public_key(info.server_pubkey)])
+                        .custom_created_at(Timestamp::now())
+                        .sign_with_keys(&ephemeral)
+                    {
+                        Ok(w) => w,
+                        Err(e) => {
+                            tracing::debug!(
+                                member = %member,
+                                device_id = %info.device_id,
+                                %e,
+                                "push notify sign failed"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(e) = nostr.send_event(&wrapped).await {
+                        tracing::debug!(
+                            member = %member,
+                            device_id = %info.device_id,
+                            %e,
+                            "push notify send failed"
+                        );
+                    } else {
+                        // Keep the event at info for the default diagnostics export,
+                        // but the recipient npub only at debug (verbose) — the
+                        // default profile must stay free of peer identifiers.
+                        tracing::info!("push notification sent to transponder");
+                        tracing::debug!(
+                            member = %member,
+                            device_id = %info.device_id,
+                            "push notification recipient"
+                        );
                     }
-                };
-                let ephemeral = Keys::generate();
-                let content = match nip44::encrypt(
-                    ephemeral.secret_key(),
-                    &info.server_pubkey,
-                    seal.as_json(),
-                    nip44::Version::default(),
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::debug!(member = %member, %e, "push notify encrypt failed");
-                        continue;
-                    }
-                };
-                let wrapped = match EventBuilder::new(Kind::GiftWrap, content)
-                    .tags([Tag::public_key(info.server_pubkey)])
-                    .custom_created_at(Timestamp::now())
-                    .sign_with_keys(&ephemeral)
-                {
-                    Ok(w) => w,
-                    Err(e) => {
-                        tracing::debug!(member = %member, %e, "push notify sign failed");
-                        continue;
-                    }
-                };
-                if let Err(e) = nostr.send_event(&wrapped).await {
-                    tracing::debug!(member = %member, %e, "push notify send failed");
-                } else {
-                    // Keep the event at info for the default diagnostics export,
-                    // but the recipient npub only at debug (verbose) — the
-                    // default profile must stay free of peer identifiers.
-                    tracing::info!("push notification sent to transponder");
-                    tracing::debug!(member = %member, "push notification recipient");
                 }
             }
         });
@@ -7246,15 +7286,18 @@ impl SonarClient {
         platform: &str,
         token: &[u8],
         server_npub: &str,
+        device_id: &str,
     ) -> Result<()> {
         use crate::push;
 
         let server_pubkey = PublicKey::parse(server_npub)?;
         let plat = push::platform_byte(platform)?;
         let (content, _) = push::encode_notification_request(plat, token, &server_pubkey)?;
+        let device_id = push::validate_installation_device_id(device_id)?;
 
         // Store our own registration so we can share it with group members.
         let own_reg = push::OwnPushRegistration {
+            device_id,
             encrypted_token_b64: content.clone(),
             server_pubkey,
         };
@@ -7310,6 +7353,7 @@ impl SonarClient {
         let payload = crate::push::PushTokenSharePayload {
             encrypted_token: reg.encrypted_token_b64.clone(),
             server_pubkey: reg.server_pubkey.to_hex(),
+            device_id: Some(reg.device_id.clone()),
         };
         let payload_json = match serde_json::to_string(&payload) {
             Ok(j) => j,
@@ -7385,7 +7429,7 @@ impl SonarClient {
         let cached = crate::push::CachedPushToken {
             encrypted_token_b64: payload.encrypted_token,
             server_pubkey,
-        };
+        );
         {
             let mut cache = self.push_token_cache.lock().unwrap();
             // Bounded cache: reject oversized tokens and stop growing past the
@@ -7403,7 +7447,7 @@ impl SonarClient {
         // Event at info for the default export; sender npub only at debug so
         // the default diagnostics profile carries no peer identifiers.
         tracing::info!("cached push token from group member");
-        tracing::debug!(sender = %sender, "push token sender");
+        tracing::debug!(sender = %sender, device_id = %device_id, "push token sender");
         Ok(())
     }
 
@@ -8122,6 +8166,7 @@ mod tests {
             .expect("client without relays");
         let server_pubkey = Keys::generate().public_key();
         *client.own_push_registration.lock().unwrap() = Some(crate::push::OwnPushRegistration {
+            device_id: "test-device".to_owned(),
             encrypted_token_b64: "dGVzdA==".to_owned(),
             server_pubkey,
         });
@@ -9606,7 +9651,12 @@ mod tests {
         let server_pubkey = Keys::generate().public_key();
 
         client
-            .register_push_token("apns", b"device-token", &server_pubkey.to_hex())
+            .register_push_token(
+                "apns",
+                b"device-token",
+                &server_pubkey.to_hex(),
+                "test-installation",
+            )
             .await
             .expect("push registration should only cache and share the token");
 
@@ -9618,6 +9668,7 @@ mod tests {
             .expect("own push registration cached");
 
         assert_eq!(own.server_pubkey, server_pubkey);
+        assert_eq!(own.device_id, "test-installation");
         assert!(!own.encrypted_token_b64.is_empty());
     }
 

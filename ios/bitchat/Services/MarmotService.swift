@@ -431,7 +431,7 @@ final class MarmotService: @unchecked Sendable {
             #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             SonarPushRegistration.shared.setSonarNode(node)
             #endif
             return true
@@ -489,7 +489,7 @@ final class MarmotService: @unchecked Sendable {
             #endif
             service.nodeLock.unlock()
             service.installConversationListener(on: node)
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             SonarPushRegistration.shared.setSonarNode(node)
             #endif
             service.sessionGeneration = service.sessionGeneration &+ 1
@@ -1363,7 +1363,7 @@ final class MarmotService: @unchecked Sendable {
         #endif
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             SonarPushRegistration.shared.clearSonarNode()
             #endif
             service.nodeLock.lock()

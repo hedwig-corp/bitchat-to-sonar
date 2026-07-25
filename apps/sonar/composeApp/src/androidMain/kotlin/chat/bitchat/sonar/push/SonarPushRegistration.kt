@@ -3,6 +3,7 @@ package chat.bitchat.sonar.push
 import android.content.Context
 import android.net.Uri
 import android.os.SystemClock
+import android.util.AtomicFile
 import android.util.Log
 import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
@@ -10,7 +11,9 @@ import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
 import com.google.firebase.messaging.FirebaseMessaging
+import java.io.File
 import java.security.MessageDigest
+import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -29,6 +32,7 @@ object SonarPushRegistration {
     private const val MAX_RETRIES = 3
     private const val DEFAULT_NDS_HOST = "nds.sonar.hedwig.sh"
     private const val WEBHOOK_MARKER_VERSION = "android-fcm-explicit-token-v2"
+
     /**
      * Persisted only for diagnostics (iOS `breez_webhook_marker` parity in
      * `SonarPushRegistration.swift`); NEVER used as a cross-launch skip — Boltz
@@ -37,10 +41,12 @@ object SonarPushRegistration {
      * place on success, removed on [unregister].
      */
     private const val WEBHOOK_MARKER_PREF_KEY = "breez_webhook_marker"
+    private const val INSTALLATION_ID_FILE = "sonar-push-installation-id"
     private const val WEBHOOK_IN_FLIGHT_TIMEOUT_MS = 30_000L
     private const val WEBHOOK_REGISTRATION_TIMEOUT_MS = 20_000L
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val webhookLock = Any()
+    private val installationIdLock = Any()
 
     // Same app-private "sonar" prefs used by WalletBridge.android.kt.
     private fun prefs() = AppContextHolder.ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -146,12 +152,14 @@ object SonarPushRegistration {
             var backoff = 2_000L
             for (attempt in 1..MAX_RETRIES) {
                 try {
+                    val deviceId = installationDeviceId()
                     SonarCore.start()
                     SonarCore.connectRelays()
                     SonarCore.registerPushToken(
                         platform = "fcm",
                         token = fcmToken.toByteArray(Charsets.UTF_8),
                         serverNpub = transponderNpub,
+                        deviceId = deviceId,
                     )
                     Log.d(TAG, "Transponder: MIP-05 push token registered")
                     return@launch
@@ -162,6 +170,35 @@ object SonarPushRegistration {
                 }
             }
         }
+    }
+
+    /**
+     * A random id in no-backup storage stays stable across FCM rotation but is
+     * not restored onto a second physical device. AtomicFile prevents a crash
+     * during first write from leaving a truncated id that would churn cache keys.
+     */
+    private fun installationDeviceId(): String = synchronized(installationIdLock) {
+        val file = AtomicFile(File(AppContextHolder.ctx.noBackupFilesDir, INSTALLATION_ID_FILE))
+        val stored = runCatching {
+            file.openRead().bufferedReader(Charsets.UTF_8).use { it.readText().trim() }
+        }.getOrNull()
+        if (!stored.isNullOrEmpty()) {
+            runCatching { UUID.fromString(stored).toString() }.getOrNull()?.let {
+                return@synchronized it
+            }
+            Log.w(TAG, "Push installation id is corrupt; replacing it")
+        }
+
+        val generated = UUID.randomUUID().toString()
+        val output = file.startWrite()
+        try {
+            output.write(generated.toByteArray(Charsets.UTF_8))
+            file.finishWrite(output)
+        } catch (e: Exception) {
+            file.failWrite(output)
+            throw e
+        }
+        generated
     }
 
     private fun registerBreezWebhook(fcmToken: String, offer: String) {

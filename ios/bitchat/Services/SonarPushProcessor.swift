@@ -17,15 +17,34 @@
 // For more information, see <https://unlicense.org>
 //
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 import Foundation
 import UIKit
 import UserNotifications
 import os
 import SonarCore
+#if os(iOS)
+import UIKit
+#endif
 
 private struct SonarPushTimeoutError: Error {}
+
+enum SonarPushBackgroundResult {
+    case newData
+    case noData
+    case failed
+
+    #if os(iOS)
+    var uiResult: UIBackgroundFetchResult {
+        switch self {
+        case .newData: return .newData
+        case .noData: return .noData
+        case .failed: return .failed
+        }
+    }
+    #endif
+}
 
 enum SonarPushProcessor {
 
@@ -49,20 +68,19 @@ enum SonarPushProcessor {
     private static var marmotWakeNeedsRerun = false
 
     /// Classify and process a remote notification payload.
-    /// Returns true if the push was handled, false otherwise.
     @MainActor
     static func process(
         userInfo: [AnyHashable: Any],
         marmot: MarmotChatModel?,
         wallet: SonarWalletProviding?,
-        fetchCompletionHandler: @escaping (UIBackgroundFetchResult) -> Void
+        completion: @escaping (SonarPushBackgroundResult) -> Void
     ) {
         let source = userInfo["source"] as? String ?? ""
 
         if source == "breez" || userInfo["notification_type"] != nil {
-            processBreezWakeup(wallet: wallet, completionHandler: fetchCompletionHandler)
+            processBreezWakeup(wallet: wallet, completion: completion)
         } else {
-            processMarmotWakeup(marmot: marmot, completionHandler: fetchCompletionHandler)
+            processMarmotWakeup(marmot: marmot, completion: completion)
         }
     }
 
@@ -71,7 +89,7 @@ enum SonarPushProcessor {
     @MainActor
     private static func processMarmotWakeup(
         marmot: MarmotChatModel?,
-        completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+        completion: @escaping (SonarPushBackgroundResult) -> Void
     ) {
         log.info("Processing Marmot push wakeup")
         let prefs = SonarNotificationPreferenceStore.loadMerged()
@@ -83,7 +101,7 @@ enum SonarPushProcessor {
                 log.info("Marmot not available, notifications disabled")
             }
             showFallbackNotification(prefs: prefs)
-            completionHandler(.newData)
+            completion(.newData)
             return
         }
 
@@ -462,24 +480,24 @@ enum SonarPushProcessor {
     @MainActor
     private static func processBreezWakeup(
         wallet: SonarWalletProviding?,
-        completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+        completion: @escaping (SonarPushBackgroundResult) -> Void
     ) {
         log.info("Processing Breez push wakeup (silent)")
 
         guard let wallet else {
             log.info("Wallet not available for Breez wakeup")
-            completionHandler(.noData)
+            completion(.noData)
             return
         }
 
         guard case .ready = wallet.state else {
             log.info("Wallet not ready for Breez wakeup")
-            completionHandler(.noData)
+            completion(.noData)
             return
         }
 
         log.info("Breez wakeup: wallet already running, SDK will process event")
-        completionHandler(.newData)
+        completion(.newData)
     }
 
     // MARK: - Helpers

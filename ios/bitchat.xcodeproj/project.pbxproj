@@ -36,6 +36,7 @@
 		A6E3EA7F2E7706720032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA7E2E7706720032EA8A /* Tor */; };
 		A6E3EA812E7706A80032EA8A /* Tor in Frameworks */ = {isa = PBXBuildFile; productRef = A6E3EA802E7706A80032EA8A /* Tor */; };
 		C023033AECF95641458DD2F7 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = D890FFFCA89747657296AB29 /* FirebaseMessaging */; };
+		C023033AECF95641458DD2F8 /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = D890FFFCA89747657296AB2A /* FirebaseMessaging */; };
 		E0A1B2C3D4E5F6012345678D /* ../relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */; };
 		E0A1B2C3D4E5F6012345678E /* ../relays/online_relays_gps.csv in Resources */ = {isa = PBXBuildFile; fileRef = E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */; };
 		E1264FD4C6E442FAAD407CCC /* SonarNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = C771D3214DFE24F42D724BF4 /* SonarNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -209,6 +210,7 @@
 				A15C0DE000000000000000A5 /* SonarCore in Frameworks */,
 				A15C0DE100000000000000B5 /* WalletKit in Frameworks */,
 				A15C0DE200000000000000C5 /* TranscriptEngine in Frameworks */,
+				C023033AECF95641458DD2F8 /* FirebaseMessaging in Frameworks */,
 			);
 		};
 		B5A5CC493FFB3D8966548140 /* Frameworks */ = {
@@ -332,6 +334,7 @@
 				A15C0DE000000000000000A3 /* SonarCore */,
 				A15C0DE100000000000000B3 /* WalletKit */,
 				A15C0DE200000000000000C3 /* TranscriptEngine */,
+				D890FFFCA89747657296AB2A /* FirebaseMessaging */,
 			);
 			productName = bitchat_macOS;
 			productReference = 8F3A7C058C2C8E1A06C8CF8B /* Sonar.app */;
@@ -1316,6 +1319,11 @@
 			productName = P256K;
 		};
 		D890FFFCA89747657296AB29 /* FirebaseMessaging */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 418698187D457440F125E654 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
+			productName = FirebaseMessaging;
+		};
+		D890FFFCA89747657296AB2A /* FirebaseMessaging */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 418698187D457440F125E654 /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseMessaging;

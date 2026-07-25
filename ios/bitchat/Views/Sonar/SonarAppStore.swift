@@ -1678,7 +1678,7 @@ final class SonarAppStore: ObservableObject {
                 self.updateReceiverAdvertising()
                 self.publishPaymentMetadataIfNeeded()
                 self.updateWalletPaymentObservation()
-                #if os(iOS)
+                #if os(iOS) || os(macOS)
                 if configured, let bridged = self.wallet as? BridgedWallet {
                     SonarPushRegistration.shared.retryBreezWebhookIfNeeded(wallet: bridged.walletService)
                 }
@@ -2132,9 +2132,7 @@ final class SonarAppStore: ObservableObject {
 
         #if os(iOS) || os(macOS)
         let bridged = wallet as? BridgedWallet
-        #if os(iOS)
         await SonarPushRegistration.shared.prepareForAccountReplacement(wallet: bridged?.walletService)
-        #endif
         do {
             if let bridged {
                 try await bridged.prepareForIdentityReplacement()
@@ -3617,7 +3615,7 @@ final class SonarAppStore: ObservableObject {
             // offer is available. Descriptor publishing can be skipped when the
             // offer is unchanged or the relay is offline, but Boltz webhook
             // state still needs this per-launch unregister -> register self-heal.
-            #if os(iOS)
+            #if os(iOS) || os(macOS)
             if let offer, let bridged = self.wallet as? BridgedWallet {
                 SonarPushRegistration.shared.ensureBreezWebhook(offer: offer, wallet: bridged.walletService)
             }

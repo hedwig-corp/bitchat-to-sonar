@@ -1701,8 +1701,9 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * `platform`: `"apns"` or `"fcm"`.
      * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
      * `server_npub`: the transponder's npub (bech32 or hex).
+     * `device_id`: host-persisted installation id, stable across token rotation.
      */
-    func registerPushToken(platform: String, token: Data, serverNpub: String) throws
+    func registerPushToken(platform: String, token: Data, serverNpub: String, deviceId: String) throws
 
     /**
      * Remove members from an existing group.
@@ -2629,13 +2630,15 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
      * `platform`: `"apns"` or `"fcm"`.
      * `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
      * `server_npub`: the transponder's npub (bech32 or hex).
+     * `device_id`: host-persisted installation id, stable across token rotation.
      */
-open func registerPushToken(platform: String, token: Data, serverNpub: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+open func registerPushToken(platform: String, token: Data, serverNpub: String, deviceId: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_register_push_token(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(platform),
         FfiConverterData.lower(token),
-        FfiConverterString.lower(serverNpub),$0
+        FfiConverterString.lower(serverNpub),
+        FfiConverterString.lower(deviceId),$0
     )
 }
 }
@@ -8350,7 +8353,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 15279) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_remove_group_members() != 5580) {

@@ -6,12 +6,64 @@
 // For more information, see <https://unlicense.org>
 //
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 import XCTest
 @testable import Sonar
 
 final class SonarPushRegistrationTests: XCTestCase {
+
+    func testInstallationDeviceIdPersistsAcrossTokenRotation() throws {
+        let keychain = MockKeychain()
+        let expected = "550e8400-e29b-41d4-a716-446655440000"
+
+        let first = SonarPushRegistration.loadOrCreateInstallationDeviceId(
+            keychain: keychain,
+            makeId: { expected }
+        )
+        let second = SonarPushRegistration.loadOrCreateInstallationDeviceId(
+            keychain: keychain,
+            makeId: {
+                XCTFail("persisted installation id should be reused")
+                return "00000000-0000-0000-0000-000000000000"
+            }
+        )
+
+        XCTAssertEqual(first, expected)
+        XCTAssertEqual(second, expected)
+    }
+
+    func testInstallationDeviceIdDefersOnKeychainReadFailure() {
+        let keychain = MockKeychain()
+        keychain.simulatedReadError = .deviceLocked
+
+        XCTAssertNil(SonarPushRegistration.loadOrCreateInstallationDeviceId(
+            keychain: keychain,
+            makeId: {
+                XCTFail("must not mint an unstable id while Keychain is unavailable")
+                return UUID().uuidString
+            }
+        ))
+    }
+
+    func testInstallationDeviceIdReplacesCorruptStoredValue() {
+        let keychain = MockKeychain()
+        XCTAssertTrue(
+            keychain.saveIdentityKey(
+                Data("not-a-uuid".utf8),
+                forKey: "sonar-push-installation-id"
+            )
+        )
+        let expected = "550e8400-e29b-41d4-a716-446655440000"
+
+        XCTAssertEqual(
+            SonarPushRegistration.loadOrCreateInstallationDeviceId(
+                keychain: keychain,
+                makeId: { expected }
+            ),
+            expected
+        )
+    }
 
     func testNormalizedNdsUrlFallsBackForMissingOrTruncatedValues() {
         XCTAssertEqual(

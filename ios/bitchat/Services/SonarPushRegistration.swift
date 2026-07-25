@@ -10,7 +10,7 @@
 // For more information, see <https://unlicense.org>
 //
 
-#if os(iOS)
+#if os(iOS) || os(macOS)
 
 import Foundation
 import os
@@ -31,13 +31,16 @@ final class SonarPushRegistration: @unchecked Sendable {
     private var cachedFCMToken: String?
     private var cachedOffer: String?
     private var sonarNode: SonarNode?
+    private var cachedInstallationDeviceId: String?
     private let queue = DispatchQueue(label: "chat.bitchat.sonar.push.registration")
+    private let keychain: KeychainManagerProtocol
 
     /// Persisted only for diagnostics; do not use it as a cross-launch skip.
     /// Boltz owns the authoritative offer webhook state, and a stale local marker
     /// can otherwise suppress the unregister -> register self-heal.
     private static let webhookMarkerKey = "breez_webhook_marker"
     private static let webhookMarkerVersion = "ios-fcm-explicit-token-v2"
+    private static let installationDeviceIdKey = "sonar-push-installation-id"
     private static let defaultNdsHost = "nds.sonar.hedwig.sh"
     private static let webhookInFlightTimeout: TimeInterval = 30
     private static let webhookRegistrationAttempts = 3
@@ -61,7 +64,9 @@ final class SonarPushRegistration: @unchecked Sendable {
         Self.normalizedNdsUrl(Bundle.main.infoDictionary?["NDS_URL"] as? String)
     }
 
-    private init() {}
+    init(keychain: KeychainManagerProtocol = KeychainManager()) {
+        self.keychain = keychain
+    }
 
     // MARK: - Public
 
@@ -182,12 +187,58 @@ final class SonarPushRegistration: @unchecked Sendable {
 
     private static let maxRetries = 3
 
+    private func installationDeviceId() -> String? {
+        if let cachedInstallationDeviceId { return cachedInstallationDeviceId }
+        let deviceId = Self.loadOrCreateInstallationDeviceId(keychain: keychain)
+        cachedInstallationDeviceId = deviceId
+        return deviceId
+    }
+
+    /// Device-only persistence keeps one logical installation stable when APNs
+    /// rotates its token, without restoring the id onto a second device from a
+    /// backup. Keychain access failures defer registration instead of minting a
+    /// different id on every locked/background retry.
+    static func loadOrCreateInstallationDeviceId(
+        keychain: KeychainManagerProtocol,
+        makeId: () -> String = { UUID().uuidString.lowercased() }
+    ) -> String? {
+        switch keychain.getIdentityKeyWithResult(forKey: installationDeviceIdKey) {
+        case .success(let data):
+            if let stored = String(data: data, encoding: .utf8),
+               let uuid = UUID(uuidString: stored) {
+                return uuid.uuidString.lowercased()
+            }
+            log.warning("Push installation id is corrupt; replacing it")
+        case .itemNotFound:
+            break
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError(_):
+            log.warning("Push installation id unavailable; deferring registration")
+            return nil
+        }
+
+        let generated = makeId().lowercased()
+        guard let uuid = UUID(uuidString: generated) else {
+            log.error("Push installation id generator returned an invalid UUID")
+            return nil
+        }
+        let canonical = uuid.uuidString.lowercased()
+        guard case .success = keychain.saveIdentityKeyWithResult(
+            Data(canonical.utf8),
+            forKey: installationDeviceIdKey
+        ) else {
+            log.warning("Push installation id could not be persisted; deferring registration")
+            return nil
+        }
+        return canonical
+    }
+
     private func registerTransponderIfReady(token: Data) {
         guard !transponderNpub.isEmpty else { return }
         guard let node = sonarNode else {
             Self.log.info("Transponder: SonarNode not ready, will retry after setSonarNode")
             return
         }
+        guard let deviceId = installationDeviceId() else { return }
         let npub = self.transponderNpub
         DispatchQueue.global(qos: .utility).async {
             var backoff: UInt32 = 2
@@ -196,7 +247,8 @@ final class SonarPushRegistration: @unchecked Sendable {
                     try node.registerPushToken(
                         platform: "apns",
                         token: token,
-                        serverNpub: npub
+                        serverNpub: npub,
+                        deviceId: deviceId
                     )
                     Self.log.info("Transponder: MIP-05 push token registered")
                     return
