@@ -664,6 +664,66 @@ in-flight sync uninterruptible) -> this fix.
 
 ---
 
+## R-017 — Unread accounting counts only rows the transcript renders
+
+**Invariant:** `conversation_summary.unread_count` increments only for incoming
+messages a host actually paints as a transcript row. Any event hidden from the
+transcript (⚡PAYDONE settlements, ☎CALL signaling, non-kind-9 application
+rumors) must not raise it.
+
+**Breaks as:** "opening a chat lands in the middle of the conversation and I
+have to scroll down". Also phantom unread badges on chats where nothing visible
+arrived (a missed call alone marks the chat unread).
+
+**Why:** Both hosts place the Signal-style unread divider by walking
+`unread_count` **visible** incoming rows back from the tail
+(`TranscriptDisplayPolicy.firstUnreadTranscriptIndex`,
+`SNMsgList.resolveUnreadAnchor`). Counting an invisible event has no row to
+consume, so the walk overshoots by one real message per hidden event — and when
+the budget exceeds the visible incoming rows in the loaded window, the open
+lands on the oldest one in it. Core already classifies exactly what hosts hide
+(`MessageClassification::PayDone` / `CallControl`, consumed by iOS
+`SonarAppStore.payMapping` → `.hidden` and the Compose `ChatScreen` feed
+filter); only the unread counter ignored it.
+
+**Call sites:** `client.rs::upsert_index_for_message` (the `counts_unread`
+argument of `ConversationIndex::upsert_summary`) and
+`marmot.rs::process_group_message` (kind-9 gate). Shared core — both apps
+consume it; no host change, so the platforms cannot drift apart here.
+
+**Guarded by:** `client.rs::hidden_control_lines_do_not_count_as_unread_at_the_index_call_site`
+
+**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`
+
+**Enforced by the compiler:** `counts_unread` has **no default** on
+`upsert_summary`; a new call site cannot silently fall back to counting
+everything.
+
+**Not guarded:** the host walk itself against a real core count (needs a
+constructible `SonarAppState` / `SonarAppStore` — see Unguarded), and the
+residual case where a legitimately large unread budget exceeds the loaded
+window, which still anchors on the oldest visible incoming row. Existing
+inflated counts on installed devices self-heal on the next chat open, since
+`mark_read` zeroes the counter; nothing tests that migration.
+
+**History:** #303 introduced the unread-anchored open; the counter it consumes
+had been "every non-mine message" since the conversation index landed, so the
+disagreement shipped with the feature and surfaces only in chats carrying
+calls/payments. Layout-side mid-history opens are R-009 — a different mechanism
+with the same symptom, which is why both need reading before touching open
+behaviour.
+
+**Rejected:**
+- *Filtering control lines host-side before counting.* The hosts do not have the
+  hidden rows to subtract — they were never fetched into the window — and it
+  would have to be written twice, the exact shape of the cross-platform drift
+  this ledger tracks.
+- *Also suppressing `latest_content` / `latest_at_secs` for control lines.* A
+  call or settlement is a real conversation event; keeping chat-list recency
+  intact is deliberate, and changing ordering is a separate product call.
+- *Dropping non-kind-9 rumors at the index instead of at `process_incoming`.*
+  They would still ring a notification for a row no host can render.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

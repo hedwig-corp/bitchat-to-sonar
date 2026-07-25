@@ -3292,6 +3292,9 @@ impl SonarClient {
                     &message.sender.to_string(),
                     message.created_at.as_secs(),
                     message.mine,
+                    // Own send: never unread either way, but keep the flag
+                    // honest so the argument means one thing at both sites.
+                    message.classification.is_transcript_visible(),
                 ) {
                     tracing::warn!(%e, "deferred index upsert failed");
                 }
@@ -6819,6 +6822,11 @@ impl SonarClient {
             &message.sender.to_string(),
             message.created_at.as_secs(),
             message.mine,
+            // Hidden control lines (⚡PAYDONE / ☎CALL) must not raise unread:
+            // hosts place the unread divider by walking `unread_count` VISIBLE
+            // incoming rows back from the tail, so counting a row that never
+            // renders opens the chat that much further up its history.
+            message.classification.is_transcript_visible(),
         ) {
             tracing::warn!(%e, "index upsert failed");
         }
@@ -7966,6 +7974,61 @@ mod tests {
         assert_eq!(relay_fetch_quorum(2), 2);
         assert_eq!(relay_fetch_quorum(3), 2);
         assert_eq!(relay_fetch_quorum(5), 2);
+    }
+
+    /// R: the unread divider is placed by walking `unread_count` VISIBLE
+    /// incoming rows back from the transcript tail, so an unread event that no
+    /// host renders (☎CALL signaling, ⚡PAYDONE settlement) opens the chat one
+    /// real message further up its history — the "chat opens in the middle,
+    /// I have to scroll down" report. Pins the real index call site, not just
+    /// the classification helper it consults.
+    #[tokio::test]
+    async fn hidden_control_lines_do_not_count_as_unread_at_the_index_call_site() {
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let group_hex = hex::encode(group_id.as_slice());
+        let peer = Keys::generate().public_key();
+        let incoming = |seed: u8, secs: u64, content: &str| ChatMessage {
+            id: test_event_id(seed),
+            group_id: group_id.clone(),
+            sender: peer,
+            content: content.to_owned(),
+            created_at: Timestamp::from_secs(secs),
+            mine: false,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of(content),
+        };
+
+        client.upsert_index_for_message(&incoming(1, 100, "hey"), Some("Chat"));
+        client.upsert_index_for_message(&incoming(2, 200, "☎CALL|1|END|c3a1|declined"), Some("Chat"));
+        client.upsert_index_for_message(&incoming(3, 300, "⚡PAYDONE|1|abc-123"), Some("Chat"));
+
+        let summary = client
+            .conversation_summary(&group_hex)
+            .expect("summary exists");
+        assert_eq!(
+            summary.unread_count, 1,
+            "only the visible incoming message may raise unread"
+        );
+        assert_eq!(summary.message_count, 3, "control lines are still messages");
+
+        // A ⚡PAY receipt DOES render a bubble, so it must keep counting.
+        client.upsert_index_for_message(&incoming(4, 400, "⚡PAY|1|abc-123|21"), Some("Chat"));
+        assert_eq!(
+            client
+                .conversation_summary(&group_hex)
+                .expect("summary exists")
+                .unread_count,
+            2
+        );
     }
 
     #[test]

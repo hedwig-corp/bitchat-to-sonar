@@ -186,6 +186,18 @@ impl MessageClassification {
         }
         Self::Text
     }
+
+    /// True when every host renders this message as a transcript row.
+    ///
+    /// `PayDone` / `CallControl` are protocol control lines that both apps hide
+    /// (iOS `SonarAppStore.payMapping` → `.hidden`, Compose `ChatScreen`'s feed
+    /// filter). They must therefore not count toward `unread_count`: the
+    /// unread divider is placed by counting `unread_count` **visible** incoming
+    /// rows back from the tail, so each invisible unread event pushes the open
+    /// position one real message further into history.
+    pub fn is_transcript_visible(&self) -> bool {
+        !matches!(self, Self::PayDone { .. } | Self::CallControl)
+    }
 }
 
 /// A decrypted application message, mapped to a small FFI-friendly shape.
@@ -812,6 +824,16 @@ impl MarmotEngine {
     fn process_group_message(&self, event: &Event) -> Result<Incoming> {
         match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
             MessageProcessingResult::ApplicationMessage(msg) => {
+                // Only kind-9 chat rumors are chat messages. MDK also delivers
+                // other application kinds (reactions/deletes from White Noise
+                // peers) which `messages()` / `messages_page()` filter out of
+                // the transcript — surfacing them as `Incoming::Message` would
+                // index them, count them as unread and ring a notification for
+                // a row no host can ever render. MDK has already persisted the
+                // rumor, so future features can still read it from storage.
+                if msg.kind.as_u16() != CHAT_RUMOR_KIND {
+                    return Ok(Incoming::None);
+                }
                 Ok(Incoming::Message(self.to_chat_message(msg)))
             }
             MessageProcessingResult::Commit { mls_group_id }
@@ -1613,5 +1635,25 @@ mod classification_tests {
         );
         assert_eq!(C::of("☎CALL|not-a-version|X|y"), C::Text);
         assert_eq!(C::of("☎CALLING you later"), C::Text);
+    }
+
+    #[test]
+    fn only_host_rendered_classes_are_transcript_visible() {
+        // Whatever the transcript hides must not be counted as unread, or the
+        // unread divider lands that many real messages further back.
+        assert!(C::Text.is_transcript_visible());
+        assert!(C::PayReceipt {
+            payment_id: "abc-123".into(),
+            amount_sats: 21,
+        }
+        .is_transcript_visible());
+        assert!(!C::CallControl.is_transcript_visible());
+        assert!(!C::PayDone {
+            payment_id: "abc-123".into(),
+            preimage_hex: None,
+        }
+        .is_transcript_visible());
+        // A malformed control line renders as text, so it stays countable.
+        assert!(C::of("☎CALL|not-a-version|X|y").is_transcript_visible());
     }
 }
