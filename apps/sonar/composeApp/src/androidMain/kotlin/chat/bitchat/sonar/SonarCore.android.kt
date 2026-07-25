@@ -985,8 +985,9 @@ actual object SonarCore {
     }
 
     actual suspend fun deleteChat(chatId: String): Unit = withContext(Dispatchers.IO) {
-        runCatching { node?.deleteGroup(chatId) }
-        Unit
+        // Must propagate failures: a swallowed delete leaves MLS state behind so
+        // `start_dm` / `marmotGroupForNpub` reuse the dead chat.
+        requireNode().deleteGroup(chatId)
     }
 
     // ── Push token registration (MIP-05) ──

@@ -400,6 +400,40 @@ the send echo was cleared before the canonical row merged.
 - *Unbounded full-history fetch on every wake.* Violates the Signal-Comparable Performance Rule; the batched/bucketed catch-up keeps per-pass work bounded.
 
 
+
+## R-011 — Delete chat then start again mints a new MLS DM
+
+**Invariant:** After a local per-chat delete of a 1:1 Marmot DM, the next
+`start_dm` / `startChat` for that peer creates a **new** MLS group id (fresh
+KeyPackage welcome). Healthy reuse still applies when the group was not deleted.
+
+**Breaks as:** User deletes a dead chat (e.g. peer nsec-restored) and starts
+again from Search/contact, but messages still encrypt into the old undecryptable
+group — peer never sees them.
+
+**Call sites:** core `SonarClient::delete_group` + `SonarClient::start_dm`; iOS
+`SonarAppStore.deleteChat` / `MarmotChatModel.deleteGroup`; Compose
+`SonarAppState.deleteMarmotChat` / `SonarCore.deleteChat`
+
+**Guarded by:** `delete_then_start_dm_creates_new_group`
+
+**Also guarded by:** `start_dm_reuses_existing_direct_group` (healthy reuse must
+still hold), `delete_group_removes_a_single_chat_locally`
+
+**Partly guarded:** App-layer await/error-propagation and pending-setup cancel
+are compile-checked on both platforms but not exercised by a UI test. iOS tests
+still do not run in CI. Multi-member leave → re-invite is not pinned here.
+
+**History:** Delete UI existed but fire-and-forget / swallowed `deleteGroup`
+errors left MLS state behind while UI mappings cleared → `find_dm_group_with`
+and `marmotGroupForNpub` / `directGroup(forNpub:)` reused the corpse.
+
+**Rejected:**
+- *`start_dm_force_new` API.* Papers over incomplete delete; easy to call on
+  every start and split healthy chats into duplicates.
+- *UI-only "Restart conversation" without durable MLS purge.* Same reuse path
+  wins as soon as `groups()` still contains the old id.
+
 ---
 
 ## Unguarded

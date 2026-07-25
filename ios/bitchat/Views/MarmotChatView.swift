@@ -2606,21 +2606,34 @@ final class MarmotChatModel: ObservableObject {
     }
 
     private func performDirectChatSetup(with npub: String) async -> String? {
+        if Task.isCancelled { return nil }
         guard await ensureRelayConnected() else {
             self.errorText = "Not connected yet — try again in a moment."
             return nil
         }
+        if Task.isCancelled { return nil }
         if let existing = directGroup(forNpub: npub) {
             return existing.id
         }
         do {
             let groupId = try await service.startDirectMessage(with: npub, name: "")
+            if Task.isCancelled {
+                // Delete raced setup: drop the freshly created group so the next
+                // intentional startChat mints a clean MLS conversation.
+                do {
+                    try await service.deleteGroup(groupId: groupId)
+                } catch {
+                    self.errorText = Self.describe(error)
+                }
+                return nil
+            }
             await loadLocalPage(groupId: groupId, mode: .newestPage)
             Task { [weak self] in
                 await self?.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             }
             return groupId
         } catch {
+            if Task.isCancelled { return nil }
             self.errorText = Self.describe(error)
             return nil
         }

@@ -4888,24 +4888,39 @@ class SonarAppState(private val scope: CoroutineScope) {
             toast = "Group is still setting up."
             return
         }
+        if (isPendingMarmotChat(chatId)) {
+            val pendingNpub = pendingMarmotNpub(chatId)
+            pendingMarmotChatNpubs = pendingMarmotChatNpubs - chatId
+            pendingNpub?.let { npub ->
+                pendingMarmotSends.remove(canonicalNpubHex(npub) ?: npub)
+                cancelPendingMarmotSetup(chatId, canonicalNpubHex(npub) ?: npub)
+            }
+            discardRetainedTranscript(chatId)
+            if ((stack.lastOrNull() as? Screen.Chat)?.id == chatId && stack.size > 1) {
+                endTranscriptSession()
+                stack = stack.dropLast(1)
+                restoreRevealedChatOrClear()
+            }
+            return
+        }
         val wasOpen = (stack.lastOrNull() as? Screen.Chat)?.id == chatId
         val isGroup = chats.firstOrNull { it.id == chatId }?.let { !isDirectMarmotChat(it) } == true
         // A deduped direct row can represent several duplicate Marmot groups for
         // the same peer; delete the whole set so hidden duplicates don't resurface.
         val deleteIds = if (isGroup) listOf(chatId) else directMarmotChatIds(chatId)
-        val deleteIdSet = deleteIds.toSet()
-        chats = chats.filterNot { it.id in deleteIdSet }
+        // Cancel in-flight start_dm setup for this peer before durable delete so
+        // a racing setup cannot recreate/reuse the group we are removing.
         for (id in deleteIds) {
-            notificationSeenMessageIds.remove(id)
-            notificationLatestSecs.remove(id)
-            stagedChangedPages.remove(id)
-            failedChangedPageReads.remove(id)
-            discardRetainedTranscript(id)
-        }
-        if (wasOpen && stack.size > 1) {
-            endTranscriptSession()
-            stack = stack.dropLast(1) // pop WITHOUT refresh
-            restoreRevealedChatOrClear()
+            val peer = chats.firstOrNull { it.id == id }?.let { directMarmotPeerKey(it) }
+                ?: continue
+            val hex = canonicalNpubHex(peer) ?: peer
+            pendingMarmotChatNpubs.entries
+                .filter { (_, pending) ->
+                    canonicalNpubHex(pending.peerNpub) == hex || pending.peerNpub == peer
+                }
+                .map { it.key }
+                .forEach { pendingId -> cancelPendingMarmotSetup(pendingId, hex) }
+            startingMarmotChats.remove(hex)
         }
         scope.launch {
             try {
@@ -4913,6 +4928,26 @@ class SonarAppState(private val scope: CoroutineScope) {
                     SonarCore.leaveGroup(chatId)
                 } else {
                     for (id in deleteIds) SonarCore.deleteChat(id)
+                }
+                val deleteIdSet = deleteIds.toSet()
+                chats = chats.filterNot { it.id in deleteIdSet }
+                for (id in deleteIds) {
+                    notificationSeenMessageIds.remove(id)
+                    notificationLatestSecs.remove(id)
+                    stagedChangedPages.remove(id)
+                    failedChangedPageReads.remove(id)
+                    discardRetainedTranscript(id)
+                    groupFoldMap.remove(id)
+                    foldedGroupIds = foldedGroupIds - id
+                    foldedGroupPeerIds = foldedGroupPeerIds - id
+                    unreadByChat = unreadByChat - id
+                }
+                persistGroupFolds()
+                clearChatSnapshot()
+                if (wasOpen && stack.size > 1) {
+                    endTranscriptSession()
+                    stack = stack.dropLast(1)
+                    restoreRevealedChatOrClear()
                 }
             } catch (t: Throwable) {
                 toast = if (isGroup) "couldn't leave group: ${t.message}" else "couldn't delete chat: ${t.message}"
@@ -4935,40 +4970,60 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             ).distinctBy { it.id }
         val foldedGroupIdsToDelete = foldedGroups.mapTo(hashSetOf()) { it.id }
-        aliases.forEach { alias ->
-            meshChats.remove(alias)
-            meshChatNames.remove(alias)
-            discardRetainedTranscript(meshChatId(alias))
-        }
-        discardRetainedTranscript(chatId)
-        meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
-        if (foldedGroupIdsToDelete.isNotEmpty()) {
-            chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
-            foldedGroupIds = foldedGroupIds - foldedGroupIdsToDelete
-            foldedGroupPeerIds = foldedGroupPeerIds.filterKeys { it !in foldedGroupIdsToDelete }
-            foldedGroupIdsToDelete.forEach {
-                groupFoldMap.remove(it)
-                notificationSeenMessageIds.remove(it)
-                notificationLatestSecs.remove(it)
-                stagedChangedPages.remove(it)
-                failedChangedPageReads.remove(it)
-                unreadByChat = unreadByChat - it
-                discardRetainedTranscript(it)
+        // Cancel in-flight start_dm for folded peers before durable WN purge.
+        for (group in foldedGroups) {
+            directMarmotPeerKey(group)?.let { peer ->
+                val hex = canonicalNpubHex(peer) ?: peer
+                pendingMarmotChatNpubs.entries
+                    .filter { (_, pending) ->
+                        canonicalNpubHex(pending.peerNpub) == hex || pending.peerNpub == peer
+                    }
+                    .map { it.key }
+                    .forEach { pendingId -> cancelPendingMarmotSetup(pendingId, hex) }
+                startingMarmotChats.remove(hex)
             }
-            persistGroupFolds()
-            clearChatSnapshot()
-        }
-        updateBleDiscoveryPolicy()
-        if (wasOpen && stack.size > 1) {
-            endTranscriptSession()
-            stack = stack.dropLast(1)
-            restoreRevealedChatOrClear()
         }
         scope.launch {
-            aliases.forEach { MessageStore.deleteMeshDm(it) }
-            foldedGroups.forEach { group ->
-                runCatching { SonarCore.deleteChat(group.id) }
-                    .onFailure { toast = "couldn't delete chat: ${it.message}" }
+            // Purge folded White Noise legs first so a failed MLS delete cannot
+            // leave a reusable corpse after the mesh leg is already erased.
+            try {
+                for (group in foldedGroups) {
+                    SonarCore.deleteChat(group.id)
+                }
+            } catch (t: Throwable) {
+                toast = "couldn't delete chat: ${t.message}"
+                if (foldedGroups.isNotEmpty()) refreshChats()
+                return@launch
+            }
+            aliases.forEach { alias ->
+                meshChats.remove(alias)
+                meshChatNames.remove(alias)
+                discardRetainedTranscript(meshChatId(alias))
+                MessageStore.deleteMeshDm(alias)
+            }
+            discardRetainedTranscript(chatId)
+            meshDmRows = meshDmRows.filterNot { row -> row.peerId in aliases }
+            if (foldedGroupIdsToDelete.isNotEmpty()) {
+                chats = chats.filterNot { it.id in foldedGroupIdsToDelete }
+                foldedGroupIds = foldedGroupIds - foldedGroupIdsToDelete
+                foldedGroupPeerIds = foldedGroupPeerIds.filterKeys { it !in foldedGroupIdsToDelete }
+                foldedGroupIdsToDelete.forEach {
+                    groupFoldMap.remove(it)
+                    notificationSeenMessageIds.remove(it)
+                    notificationLatestSecs.remove(it)
+                    stagedChangedPages.remove(it)
+                    failedChangedPageReads.remove(it)
+                    unreadByChat = unreadByChat - it
+                    discardRetainedTranscript(it)
+                }
+                persistGroupFolds()
+                clearChatSnapshot()
+            }
+            updateBleDiscoveryPolicy()
+            if (wasOpen && stack.size > 1) {
+                endTranscriptSession()
+                stack = stack.dropLast(1)
+                restoreRevealedChatOrClear()
             }
             if (foldedGroups.isNotEmpty()) refreshChats()
         }
