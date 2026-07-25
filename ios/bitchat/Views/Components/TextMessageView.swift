@@ -17,12 +17,15 @@ struct TextMessageView: View {
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Precompute heavy token scans once per row
+            // Precompute heavy token scans once per row. `isLong` and
+            // `isExpanded` live at this scope, not inside the HStack, because
+            // the expand/collapse button below is a second consumer — scoping
+            // them narrower silently ran hasVeryLongToken twice per row.
             let cashuLinks = message.content.extractCashuLinks()
             let lightningLinks = message.content.extractLightningLinks()
+            let isLong = (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty
+            let isExpanded = expandedMessageIDs.contains(message.id)
             HStack(alignment: .top, spacing: 0) {
-                let isLong = (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty
-                let isExpanded = expandedMessageIDs.contains(message.id)
                 Text(viewModel.formatMessageAsText(message, colorScheme: colorScheme))
                     .fixedSize(horizontal: false, vertical: true)
                     .lineLimit(isLong && !isExpanded ? TransportConfig.uiLongMessageLineLimit : nil)
@@ -38,8 +41,7 @@ struct TextMessageView: View {
             }
             
             // Expand/Collapse for very long messages
-            if (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty {
-                let isExpanded = expandedMessageIDs.contains(message.id)
+            if isLong {
                 let labelKey = isExpanded ? LocalizedStringKey("content.message.show_less") : LocalizedStringKey("content.message.show_more")
                 Button {
                     if isExpanded { expandedMessageIDs.remove(message.id) }
