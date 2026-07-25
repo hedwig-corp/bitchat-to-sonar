@@ -10,6 +10,12 @@ data class SonarChat(
     val members: List<String>,
 )
 
+/** One recency-ordered local Home row returned from a SQL-bounded core page. */
+data class SonarLocalConversationRow(
+    val chat: SonarChat,
+    val summary: SonarConversationSummary,
+)
+
 /** Pending multi-member group invite awaiting explicit accept/decline. */
 data class SonarGroupInvite(
     val id: String,
@@ -259,6 +265,7 @@ internal fun encodeChatSnapshot(
     chats: List<SonarChat>,
     messagesByChat: Map<String, List<SonarMsg>>,
     latestByChat: Map<String, Long> = emptyMap(),
+    rowLimit: Int? = null,
 ): String =
     buildString {
         // Order is part of this metadata-only snapshot: it is the last locally
@@ -266,7 +273,7 @@ internal fun encodeChatSnapshot(
         // while the encrypted core database opens. Only the thread-style latest
         // timestamp is cached for cross-transport sorting; message bodies stay
         // out of this preferences blob.
-        chats.forEach { chat ->
+        chats.asSequence().let { rows -> rowLimit?.let(rows::take) ?: rows }.forEach { chat ->
             append("c\t")
             append(hexEnc(chat.id)).append('\t')
             append(hexEnc(chat.name)).append('\t')
@@ -276,9 +283,12 @@ internal fun encodeChatSnapshot(
         }
     }
 
-internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String, List<SonarMsg>>> {
+internal fun decodeChatSnapshot(
+    blob: String,
+    rowLimit: Int? = null,
+): Pair<List<SonarChat>, Map<String, List<SonarMsg>>> {
     val chats = mutableListOf<SonarChat>()
-    blob.lineSequence().forEach { line ->
+    blob.lineSequence().let { rows -> rowLimit?.let(rows::take) ?: rows }.forEach { line ->
         if (line.isBlank()) return@forEach
         val parts = line.split('\t')
         when (parts.firstOrNull()) {
@@ -299,9 +309,9 @@ internal fun decodeChatSnapshot(blob: String): Pair<List<SonarChat>, Map<String,
 }
 
 /** Latest local message timestamp per chat from the metadata-only snapshot. */
-internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
+internal fun decodeChatSnapshotLatest(blob: String, rowLimit: Int? = null): Map<String, Long> =
     buildMap {
-        blob.lineSequence().forEach { line ->
+        blob.lineSequence().let { rows -> rowLimit?.let(rows::take) ?: rows }.forEach { line ->
             val parts = line.split('\t')
             if (parts.firstOrNull() != "c" || parts.size != 5) return@forEach
             val id = hexDec(parts[1]) ?: return@forEach
@@ -607,6 +617,13 @@ expect object SonarCore {
     /** Precomputed conversation summaries from the core-owned index, ordered
      *  by latest message timestamp (newest first). */
     suspend fun conversationSummaries(): List<SonarConversationSummary>
+
+    /** Reconcile all local group metadata after bounded first paint. */
+    suspend fun reconcileConversationIndex()
+
+    /** Bounded newest-first local Home page. Membership is resolved only for
+     *  the selected rows, so cold paint is independent of account size. */
+    suspend fun localConversationPage(limit: Int, offset: Int = 0): List<SonarLocalConversationRow>
 
     /** Reset unread count for a chat to 0. */
     suspend fun markConversationRead(chatId: String)

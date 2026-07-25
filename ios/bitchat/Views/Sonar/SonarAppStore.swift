@@ -1439,7 +1439,6 @@ final class SonarAppStore: ObservableObject {
     private var publishedBolt12Offer: String?
     private var publishingPaymentMetadata = false
     private var needsPaymentMetadataPublish = false
-    private var refreshedKnownDescriptorsForRelaySession = false
     private var incomingWalletTask: Task<Void, Never>?
 
     convenience init() {
@@ -1641,9 +1640,10 @@ final class SonarAppStore: ObservableObject {
                 self.ensureCallStarted()
                 self.publishPaymentMetadataIfNeeded(force: true)
                 self.drainPendingInviteLinks()
-                guard !self.refreshedKnownDescriptorsForRelaySession else { return }
-                self.refreshedKnownDescriptorsForRelaySession = true
-                self.refreshKnownContactDescriptors(clearMisses: true)
+                if case .dm(let id) = self.path.last,
+                   let row = self.dmRows.first(where: { $0.id == id }) {
+                    self.rearmRelayMetadataForVisibleHomeRow(row)
+                }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -2361,7 +2361,10 @@ final class SonarAppStore: ObservableObject {
         guard changed else { return }
         updateReceiverAdvertising()
         if cameToForeground {
-            refreshKnownContactDescriptors()
+            if case .dm(let id) = path.last,
+               let row = dmRows.first(where: { $0.id == id }) {
+                rearmRelayMetadataForVisibleHomeRow(row)
+            }
             publishedCallDescriptor = false
             publishedBolt12Offer = nil
             publishPaymentMetadataIfNeeded(force: true)
@@ -3090,16 +3093,6 @@ final class SonarAppStore: ObservableObject {
         if profile.capabilities & SonarCapability.payments != 0 {
             marmot.ensureSonarDescriptor(npub)
         }
-    }
-
-    /// Refresh Sonar descriptors for every persisted fingerprint↔npub link so
-    /// payment and call capabilities stay current for contacts discovered over
-    /// BLE even when they're out of range. Called at boot and on foreground
-    /// return; `ensureSonarDescriptor`'s 15-minute TTL avoids redundant fetches.
-    private func refreshKnownContactDescriptors(clearMisses: Bool = false) {
-        let npubs = sonarProfilesByFingerprint.values.map(\.npub)
-        guard !npubs.isEmpty else { return }
-        marmot.refreshDescriptors(forKnownNpubs: npubs, clearMisses: clearMisses)
     }
 
     private func persistSonarProfiles() {
@@ -4376,6 +4369,26 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Messages (home rows)
 
+    /// Start profile resolution only when SwiftUI materializes a Home row (or
+    /// when the conversation opens). `dmRows` itself stays a pure local model
+    /// projection because it evaluates every conversation for sorting.
+    func ensureProfileForHomeRow(_ row: SNDMRow) {
+        if let pendingNpub = pendingMarmotNpub(for: row.id) {
+            marmot.ensureProfile(pendingNpub)
+            marmot.ensureSonarDescriptor(pendingNpub)
+        } else if let groupId = row.marmotGroupId {
+            marmot.ensureProfileForGroup(groupId)
+        }
+    }
+
+    func rearmRelayMetadataForVisibleHomeRow(_ row: SNDMRow) {
+        if let pendingNpub = pendingMarmotNpub(for: row.id) {
+            marmot.rearmRelayMetadata(pendingNpub)
+        } else if let groupId = row.marmotGroupId {
+            marmot.rearmRelayMetadataForGroup(groupId)
+        }
+    }
+
     var dmRows: [SNDMRow] {
         // Mesh/bitchat chats, deduplicated by fingerprint (the same peer can
         // appear under a short mesh ID and its stable Noise key).
@@ -4580,7 +4593,6 @@ final class SonarAppStore: ObservableObject {
         }
         let pendingRows = pendingMarmotChats.compactMap { id, pending -> SNDMRow? in
             guard marmotGroup(forNpub: pending.npub) == nil else { return nil }
-            marmot.ensureProfile(pending.npub)
             return SNDMRow(
                 id: id,
                 title: marmot.displayName(forNpub: pending.npub) ?? Self.shortNpub(pending.npub),
@@ -7151,6 +7163,9 @@ final class SonarAppStore: ObservableObject {
             ?? marmotGroupId(id)
             ?? sonarProfile.flatMap { marmotGroup(forNpub: $0.npub)?.id }
         let hasMarmotGroup = groupId != nil
+        if let groupId {
+            marmot.ensureProfileForGroup(groupId)
+        }
         if !hasMarmotGroup {
             chatViewModel.startPrivateChat(with: PeerID(str: id))
         }
@@ -8780,7 +8795,6 @@ final class SonarAppStore: ObservableObject {
         publishedCallDescriptor = false
         publishingPaymentMetadata = false
         needsPaymentMetadataPublish = false
-        refreshedKnownDescriptorsForRelaySession = false
         clearCallLogs()
         // The node is recreated by eraseChatsKeepIdentity → reset call state so
         // the iroh endpoint rebinds (the marmot.$npub sink calls ensureCallStarted).
@@ -8876,7 +8890,6 @@ final class SonarAppStore: ObservableObject {
         publishedCallDescriptor = false
         publishingPaymentMetadata = false
         needsPaymentMetadataPublish = false
-        refreshedKnownDescriptorsForRelaySession = false
         pendingMarmotSends = [:]
         pendingMarmotChats = [:]
         pendingMarmotGroups = [:]

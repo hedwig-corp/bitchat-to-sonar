@@ -13,6 +13,7 @@ pub mod geohash;
 pub mod handles;
 pub mod identity;
 pub mod invite_link;
+mod live_event_spool;
 pub mod marmot;
 pub mod media_staging;
 pub mod mesh;

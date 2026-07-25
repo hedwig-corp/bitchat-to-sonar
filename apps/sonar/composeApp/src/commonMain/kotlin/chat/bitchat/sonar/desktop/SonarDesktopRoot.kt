@@ -333,6 +333,9 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
                     }
                     is HomeMessageRow.Marmot -> {
                         val chat = homeRow.chat
+                        LaunchedEffect(chat.id, state.relayGeneration) {
+                            state.rearmRelayMetadataForChat(chat)
+                        }
                         val row = state.marmotRow(chat.id)
                         DmRow(
                             selected = (state.screen as? Screen.Chat)?.id == chat.id,

@@ -485,6 +485,9 @@ private fun HomeScreen(state: SonarAppState) {
                             }
                             is HomeMessageRow.Marmot -> {
                                 val chat = homeRow.chat
+                                LaunchedEffect(chat.id, state.relayGeneration) {
+                                    state.rearmRelayMetadataForChat(chat)
+                                }
                                 // O(1) precomputed row model — no per-row disk read or
                                 // O(chats) walk during composition (Signal cached row VM).
                                 val row = state.marmotRow(chat.id)

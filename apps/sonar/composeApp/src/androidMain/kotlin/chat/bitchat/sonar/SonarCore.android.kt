@@ -427,6 +427,37 @@ actual object SonarCore {
         }
     }
 
+    actual suspend fun reconcileConversationIndex() = withContext(Dispatchers.IO) {
+        node?.reconcileConversationIndex()
+        Unit
+    }
+
+    actual suspend fun localConversationPage(limit: Int, offset: Int): List<SonarLocalConversationRow> =
+        withContext(Dispatchers.IO) {
+            require(limit >= 0) { "localConversationPage limit must be non-negative" }
+            require(offset >= 0) { "localConversationPage offset must be non-negative" }
+            val n = node ?: return@withContext emptyList()
+            n.localConversationPage(limit.toUInt(), offset.toUInt()).map { row ->
+                SonarLocalConversationRow(
+                    chat = SonarChat(
+                        id = row.group.idHex,
+                        name = row.group.name,
+                        members = row.group.memberNpubs,
+                    ),
+                    summary = SonarConversationSummary(
+                        groupIdHex = row.summary.groupIdHex,
+                        name = row.summary.name,
+                        latestContent = row.summary.latestContent,
+                        latestSenderNpub = row.summary.latestSenderNpub,
+                        latestAtSecs = row.summary.latestAtSecs.toLong(),
+                        latestMine = row.summary.latestMine,
+                        messageCount = row.summary.messageCount.toLong(),
+                        unreadCount = row.summary.unreadCount.toLong(),
+                    ),
+                )
+            }
+        }
+
     actual suspend fun markConversationRead(chatId: String) = withContext(Dispatchers.IO) {
         node?.markConversationRead(chatId)
         Unit
@@ -591,8 +622,13 @@ actual object SonarCore {
     }
 
     actual suspend fun ensureSubscriptions() = withContext(Dispatchers.IO) {
-        runCatching { node?.ensureSubscriptions() }
-        Unit
+        try {
+            node?.ensureSubscriptions()
+            Unit
+        } catch (error: Throwable) {
+            relayConnected = false
+            throw error
+        }
     }
 
     actual suspend fun retryOutbox() = withContext(Dispatchers.IO) {

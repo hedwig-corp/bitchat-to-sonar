@@ -264,7 +264,7 @@ private struct SonarMacSidebar: View {
             searchRow
 
             ScrollView {
-                VStack(spacing: 0) {
+                LazyVStack(spacing: 0) {
                     MacSidebarDiscoverRow(
                         selected: selection == .radar,
                         meshCount: store.meshCount

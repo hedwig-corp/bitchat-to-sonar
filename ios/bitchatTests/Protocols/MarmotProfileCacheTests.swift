@@ -9,6 +9,53 @@ import Testing
 
 struct MarmotProfileCacheTests {
     @Test
+    func metadataRearmRejectsStaleCompletionAndKeepsReplacementCurrent() {
+        var tokens = SNMetadataDemandTokens()
+        let oldRequest = tokens.begin(for: "peer")
+
+        // Foreground/relay re-arm invalidates the outstanding fetch before it
+        // starts the replacement request for the same visible peer.
+        tokens.invalidate("peer")
+        let replacement = tokens.begin(for: "peer")
+
+        #expect(!tokens.isCurrent(oldRequest, for: "peer"))
+        #expect(tokens.isCurrent(replacement, for: "peer"))
+    }
+
+    @Test
+    func metadataTokensFenceEachPeerAndAccountResetWithoutTokenReuse() {
+        var tokens = SNMetadataDemandTokens()
+        let alice = tokens.begin(for: "alice")
+        let bob = tokens.begin(for: "bob")
+
+        #expect(tokens.isCurrent(alice, for: "alice"))
+        #expect(tokens.isCurrent(bob, for: "bob"))
+
+        tokens.invalidateAll()
+        let nextAlice = tokens.begin(for: "alice")
+
+        #expect(!tokens.isCurrent(alice, for: "alice"))
+        #expect(!tokens.isCurrent(bob, for: "bob"))
+        #expect(nextAlice != alice)
+        #expect(tokens.isCurrent(nextAlice, for: "alice"))
+    }
+
+    @Test
+    func offscreenHomeRowsDoNotDemandProfiles() {
+        var demand = SNVisibleRowDemand()
+
+        let firstAppearance = demand.appeared("visible")
+        #expect(firstAppearance)
+        #expect(demand.contains("visible"))
+        #expect(!demand.contains("offscreen"))
+        let duplicateAppearance = demand.appeared("visible")
+        #expect(!duplicateAppearance)
+
+        demand.disappeared("visible")
+        #expect(!demand.contains("visible"))
+    }
+
+    @Test
     func onboardedHomeWaitsForFirstCoherentLocalHydration() {
         #expect(!snShouldRevealLocalHome(onboarded: true, initialLocalHomeReady: false))
         #expect(snShouldRevealLocalHome(onboarded: true, initialLocalHomeReady: true))
@@ -251,5 +298,56 @@ struct MarmotProfileCacheTests {
         // Entry exactly at cutoff is NOT stale (filter uses strict <).
         let stale = MarmotChatModel.staleKeys(from: fetchedAt, cutoff: cutoff)
         #expect(stale.isEmpty)
+    }
+
+    @Test
+    func profileMissIsThrottledUntilRetryIntervalExpires() {
+        let now = Date()
+        let key = "npub1missing"
+        let missedAt = [key: now.addingTimeInterval(-30)]
+
+        #expect(!MarmotChatModel.profileFetchAllowed(
+            key: key,
+            ownKey: nil,
+            inFlightOrFresh: [],
+            missedAt: missedAt,
+            now: now,
+            missRetryInterval: 60
+        ))
+        #expect(MarmotChatModel.profileFetchAllowed(
+            key: key,
+            ownKey: nil,
+            inFlightOrFresh: [],
+            missedAt: missedAt,
+            now: now.addingTimeInterval(30),
+            missRetryInterval: 60
+        ))
+    }
+
+    @Test
+    func profileFetchRejectsOwnAndInFlightKeys() {
+        let now = Date()
+        #expect(!MarmotChatModel.profileFetchAllowed(
+            key: "me",
+            ownKey: "me",
+            inFlightOrFresh: [],
+            missedAt: [:],
+            now: now,
+            missRetryInterval: 60
+        ))
+        #expect(!MarmotChatModel.profileFetchAllowed(
+            key: "peer",
+            ownKey: "me",
+            inFlightOrFresh: ["peer"],
+            missedAt: [:],
+            now: now,
+            missRetryInterval: 60
+        ))
+    }
+
+    @Test
+    func preRelayVisibleDemandDoesNotStartAProfileOrDescriptorMiss() {
+        #expect(!MarmotChatModel.relayMetadataDemandAllowed(isRelayConnected: false))
+        #expect(MarmotChatModel.relayMetadataDemandAllowed(isRelayConnected: true))
     }
 }

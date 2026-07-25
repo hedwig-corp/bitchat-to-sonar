@@ -1,14 +1,41 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::marmot::MarmotEngine;
 use crate::Result;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct ConversationIndex {
     db: Connection,
+}
+
+#[derive(Debug)]
+struct ReconciledGroup {
+    group_id_hex: String,
+    name: String,
+    /// MDK-maintained group metadata. Unlike a transcript lookup this is
+    /// available while reconciling membership and gives incomplete index rows
+    /// a useful recency key before their preview is materialized.
+    latest_at_secs: u64,
+}
+
+#[derive(Debug)]
+struct MaterializedSummary {
+    group_id_hex: String,
+    latest: Option<MaterializedMessage>,
+}
+
+#[derive(Debug)]
+struct MaterializedMessage {
+    content: String,
+    sender: String,
+    at_secs: u64,
+    mine: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,7 +201,9 @@ impl ConversationIndex {
                     latest_at_secs  INTEGER NOT NULL DEFAULT 0,
                     latest_mine     INTEGER NOT NULL DEFAULT 0,
                     message_count   INTEGER NOT NULL DEFAULT 0,
-                    unread_count    INTEGER NOT NULL DEFAULT 0
+                    unread_count    INTEGER NOT NULL DEFAULT 0,
+                    version         INTEGER NOT NULL DEFAULT 0,
+                    materialized    INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE INDEX IF NOT EXISTS idx_summary_recency
                     ON conversation_summary(latest_at_secs DESC);",
@@ -193,6 +222,17 @@ impl ConversationIndex {
                     ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
             )
             .map_err(|e| crate::Error::Storage(format!("index add version column: {e}")))?;
+        }
+
+        if current < 3 && !Self::has_column(&tx, "conversation_summary", "materialized")? {
+            // Existing summary rows already came from real message/index
+            // updates. Only startup reconciliation creates explicit incomplete
+            // placeholders, so the migration default is complete.
+            tx.execute_batch(
+                "ALTER TABLE conversation_summary
+                    ADD COLUMN materialized INTEGER NOT NULL DEFAULT 1;",
+            )
+            .map_err(|e| crate::Error::Storage(format!("index add materialized column: {e}")))?;
         }
 
         tx.execute(
@@ -215,7 +255,8 @@ impl ConversationIndex {
             .query_map([], |row| row.get::<_, String>(1))
             .map_err(|e| crate::Error::Storage(format!("index table_info query: {e}")))?;
         for name in names {
-            let name = name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
+            let name =
+                name.map_err(|e| crate::Error::Storage(format!("index table_info row: {e}")))?;
             if name == column {
                 return Ok(true);
             }
@@ -235,8 +276,8 @@ impl ConversationIndex {
         self.db
             .execute(
                 "INSERT INTO conversation_summary
-                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count, version)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 1)
+                    (group_id_hex, name, latest_content, latest_sender, latest_at_secs, latest_mine, message_count, unread_count, version, materialized)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 1, 1)
                  ON CONFLICT(group_id_hex) DO UPDATE SET
                     name = CASE WHEN ?2 != '' THEN ?2 ELSE name END,
                     latest_content = CASE WHEN ?5 >= latest_at_secs THEN ?3 ELSE latest_content END,
@@ -245,7 +286,8 @@ impl ConversationIndex {
                     latest_mine = CASE WHEN ?5 >= latest_at_secs THEN ?6 ELSE latest_mine END,
                     message_count = message_count + 1,
                     unread_count = CASE WHEN ?6 = 0 THEN unread_count + 1 ELSE unread_count END,
-                    version = version + 1",
+                    version = version + 1,
+                    materialized = 1",
                 params![
                     group_id_hex,
                     name,
@@ -305,30 +347,63 @@ impl ConversationIndex {
     }
 
     pub fn summaries_ordered(&self) -> Result<Vec<ConversationSummary>> {
+        self.summaries_ordered_limit(None)
+    }
+
+    /// Newest conversation summaries with an optional SQL-side row limit.
+    ///
+    /// Chat-list first paint uses this to select the small set of transcript
+    /// windows it will hydrate. Applying the limit in SQLite is important: a
+    /// caller asking for five rows must not first materialize every summary (or
+    /// scan every group's messages) just to truncate the result afterward.
+    pub fn summaries_ordered_limit(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationSummary>> {
+        self.summaries_ordered_page(limit, 0)
+    }
+
+    /// A bounded newest-first local page. Both limit and offset are applied by
+    /// SQLite so a first-paint caller never allocates every conversation just
+    /// to retain the visible window.
+    pub fn summaries_ordered_page(
+        &self,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Result<Vec<ConversationSummary>> {
         let mut stmt = self
             .db
             .prepare(
                 "SELECT group_id_hex, name, latest_content, latest_sender,
                         latest_at_secs, latest_mine, message_count, unread_count, version
                  FROM conversation_summary
-                 ORDER BY latest_at_secs DESC",
+                 ORDER BY latest_at_secs DESC, group_id_hex ASC
+                 LIMIT ?1 OFFSET ?2",
             )
             .map_err(|e| crate::Error::Storage(format!("index summaries prepare: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok(ConversationSummary {
-                    group_id_hex: row.get(0)?,
-                    name: row.get(1)?,
-                    latest_content: row.get(2)?,
-                    latest_sender: row.get(3)?,
-                    latest_at_secs: row.get::<_, i64>(4)? as u64,
-                    latest_mine: row.get::<_, i32>(5)? != 0,
-                    message_count: row.get::<_, i64>(6)? as u64,
-                    unread_count: row.get::<_, i64>(7)? as u64,
-                    version: row.get::<_, i64>(8)? as u64,
-                })
-            })
+            .query_map(
+                params![
+                    limit.map_or(i64::MAX, |value| {
+                        i64::try_from(value).unwrap_or(i64::MAX)
+                    }),
+                    i64::try_from(offset).unwrap_or(i64::MAX),
+                ],
+                |row| {
+                    Ok(ConversationSummary {
+                        group_id_hex: row.get(0)?,
+                        name: row.get(1)?,
+                        latest_content: row.get(2)?,
+                        latest_sender: row.get(3)?,
+                        latest_at_secs: row.get::<_, i64>(4)? as u64,
+                        latest_mine: row.get::<_, i32>(5)? != 0,
+                        message_count: row.get::<_, i64>(6)? as u64,
+                        unread_count: row.get::<_, i64>(7)? as u64,
+                        version: row.get::<_, i64>(8)? as u64,
+                    })
+                },
+            )
             .map_err(|e| crate::Error::Storage(format!("index summaries query: {e}")))?;
 
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -393,11 +468,95 @@ impl ConversationIndex {
                     .map_err(|e| {
                         crate::Error::Storage(format!("index materialize unread reset: {e}"))
                     })?;
-            } else {
-                self.ensure_group(&group_id_hex, &group.name)?;
+                }
             }
         }
-        Ok(())
+
+        for group in groups {
+            tx.execute(
+                "INSERT OR IGNORE INTO conversation_summary
+                    (group_id_hex, name, latest_at_secs, materialized)
+                 VALUES (?1, ?2, ?3, 0)",
+                params![group.group_id_hex, group.name, group.latest_at_secs as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index reconcile ensure: {e}")))?;
+            tx.execute(
+                "UPDATE conversation_summary
+                 SET name = ?2,
+                     latest_at_secs = CASE
+                         WHEN ?3 > latest_at_secs THEN ?3
+                         ELSE latest_at_secs
+                     END,
+                     materialized = CASE
+                         WHEN ?3 > latest_at_secs THEN 0
+                         ELSE materialized
+                     END,
+                     version = version + 1
+                 WHERE group_id_hex = ?1
+                   AND (name != ?2 OR ?3 > latest_at_secs)",
+                params![group.group_id_hex, group.name, group.latest_at_secs as i64],
+            )
+            .map_err(|e| crate::Error::Storage(format!("index reconcile name: {e}")))?;
+        }
+
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index reconcile commit: {e}")))
+    }
+
+    fn apply_materialized_rows(&self, rows: &[MaterializedSummary]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .db
+            .unchecked_transaction()
+            .map_err(|e| crate::Error::Storage(format!("index materialize begin: {e}")))?;
+        for row in rows {
+            if let Some(latest) = &row.latest {
+                tx.execute(
+                    "UPDATE conversation_summary
+                     SET latest_content = ?2,
+                         latest_sender = ?3,
+                         latest_at_secs = ?4,
+                         latest_mine = ?5,
+                         message_count = 1,
+                         unread_count = 0,
+                         version = version + 1,
+                         materialized = 1
+                     WHERE group_id_hex = ?1 AND materialized = 0",
+                    params![
+                        row.group_id_hex,
+                        latest.content,
+                        latest.sender,
+                        latest.at_secs as i64,
+                        latest.mine as i32,
+                    ],
+                )
+                .map_err(|e| crate::Error::Storage(format!("index materialize row: {e}")))?;
+            } else {
+                tx.execute(
+                    "UPDATE conversation_summary
+                     SET materialized = 1
+                     WHERE group_id_hex = ?1 AND materialized = 0",
+                    params![row.group_id_hex],
+                )
+                .map_err(|e| crate::Error::Storage(format!("index materialize empty: {e}")))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| crate::Error::Storage(format!("index materialize commit: {e}")))
+    }
+
+    #[cfg(test)]
+    fn is_materialized(&self, group_id_hex: &str) -> bool {
+        self.db
+            .query_row(
+                "SELECT materialized FROM conversation_summary WHERE group_id_hex = ?1",
+                params![group_id_hex],
+                |row| row.get::<_, i32>(0),
+            )
+            .unwrap_or(0)
+            != 0
     }
 }
 
@@ -469,6 +628,76 @@ mod tests {
     }
 
     #[test]
+    fn ordered_limit_selects_only_the_newest_rows() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        for n in 0..25 {
+            idx.upsert_summary(
+                &format!("group_{n:02}"),
+                "Chat",
+                "message",
+                "sender",
+                n,
+                true,
+            )
+            .unwrap();
+        }
+
+        let summaries = idx.summaries_ordered_limit(Some(5)).unwrap();
+        assert_eq!(summaries.len(), 5);
+        assert_eq!(summaries[0].group_id_hex, "group_24");
+        assert_eq!(summaries[4].group_id_hex, "group_20");
+    }
+
+    #[test]
+    fn ordered_page_applies_offset_inside_sqlite() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        for n in 0..12 {
+            idx.upsert_summary(
+                &format!("group_{n:02}"),
+                "Chat",
+                "message",
+                "sender",
+                n,
+                true,
+            )
+            .unwrap();
+        }
+
+        let page = idx.summaries_ordered_page(Some(3), 4).unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|row| row.group_id_hex.as_str())
+                .collect::<Vec<_>>(),
+            vec!["group_07", "group_06", "group_05"]
+        );
+    }
+
+    #[test]
+    fn reconciled_placeholder_page_uses_local_group_recency_not_lexical_id() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        let mut groups = (0..32)
+            .map(|index| ReconciledGroup {
+                group_id_hex: format!("a{index:03}"),
+                name: format!("Chat {index}"),
+                latest_at_secs: index,
+            })
+            .collect::<Vec<_>>();
+        // Lexically last and therefore outside the old first-16 repair page,
+        // but newest according to MDK's local group metadata.
+        groups.push(ReconciledGroup {
+            group_id_hex: "z-newest".into(),
+            name: "Newest".into(),
+            latest_at_secs: 10_000,
+        });
+
+        idx.reconcile_rows(&groups).unwrap();
+        let page = idx.summaries_ordered_page(Some(16), 0).unwrap();
+
+        assert_eq!(page.first().unwrap().group_id_hex, "z-newest");
+        assert!(!idx.is_materialized("z-newest"));
+    }
+
+    #[test]
     fn upsert_only_updates_when_newer() {
         let idx = ConversationIndex::open_in_memory().unwrap();
 
@@ -522,6 +751,148 @@ mod tests {
         let s = idx.summary("g1").unwrap().unwrap();
         assert_eq!(s.name, "Chat");
         assert_eq!(s.latest_content, "msg");
+    }
+
+    #[test]
+    fn reconcile_repairs_partial_index_without_overwriting_existing_state() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("existing", "Old name", "kept", "peer", 100, false)
+            .unwrap();
+        idx.upsert_summary("stale", "Gone", "old", "peer", 50, true)
+            .unwrap();
+
+        idx.reconcile_rows(&[
+            ReconciledGroup {
+                group_id_hex: "existing".into(),
+                name: "Current name".into(),
+                latest_at_secs: 90,
+            },
+            ReconciledGroup {
+                group_id_hex: "missing".into(),
+                name: "New chat".into(),
+                latest_at_secs: 200,
+            },
+        ])
+        .unwrap();
+
+        assert!(idx.summary("stale").unwrap().is_none());
+        let existing = idx.summary("existing").unwrap().unwrap();
+        assert_eq!(existing.name, "Current name");
+        assert_eq!(existing.latest_content, "kept");
+        assert_eq!(existing.unread_count, 1);
+        assert!(idx.is_materialized("existing"));
+
+        let placeholder = idx.summary("missing").unwrap().unwrap();
+        assert_eq!(placeholder.name, "New chat");
+        assert_eq!(placeholder.latest_content, "");
+        assert!(!idx.is_materialized("missing"));
+
+        idx.apply_materialized_rows(&[MaterializedSummary {
+            group_id_hex: "missing".into(),
+            latest: Some(MaterializedMessage {
+                content: "newest".into(),
+                sender: "peer".into(),
+                at_secs: 200,
+                mine: false,
+            }),
+        }])
+        .unwrap();
+
+        let missing = idx.summary("missing").unwrap().unwrap();
+        assert_eq!(missing.latest_content, "newest");
+        assert_eq!(missing.unread_count, 0);
+        assert_eq!(missing.message_count, 1);
+        assert!(idx.is_materialized("missing"));
+    }
+
+    #[test]
+    fn reconcile_rehydrates_materialized_summary_when_mdk_recency_advances() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.upsert_summary("existing", "Chat", "at 100", "peer", 100, false)
+            .unwrap();
+        assert!(idx.is_materialized("existing"));
+
+        idx.reconcile_rows(&[ReconciledGroup {
+            group_id_hex: "existing".into(),
+            name: "Chat".into(),
+            latest_at_secs: 200,
+        }])
+        .unwrap();
+
+        let pending = idx.summary("existing").unwrap().unwrap();
+        assert_eq!(pending.latest_at_secs, 200);
+        assert_eq!(pending.latest_content, "at 100");
+        assert!(!idx.is_materialized("existing"));
+
+        idx.apply_materialized_rows(&[MaterializedSummary {
+            group_id_hex: "existing".into(),
+            latest: Some(MaterializedMessage {
+                content: "at 200".into(),
+                sender: "peer".into(),
+                at_secs: 200,
+                mine: false,
+            }),
+        }])
+        .unwrap();
+
+        let refreshed = idx.summary("existing").unwrap().unwrap();
+        assert_eq!(refreshed.latest_at_secs, 200);
+        assert_eq!(refreshed.latest_content, "at 200");
+        assert!(idx.is_materialized("existing"));
+    }
+
+    #[test]
+    fn startup_reconcile_keeps_every_chat_visible_without_materializing_transcripts() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        let groups = (0..1_000)
+            .map(|index| ReconciledGroup {
+                group_id_hex: format!("{index:064x}"),
+                name: format!("Chat {index}"),
+                latest_at_secs: index,
+            })
+            .collect::<Vec<_>>();
+
+        idx.reconcile_rows(&groups).unwrap();
+
+        let summaries = idx.summaries_ordered().unwrap();
+        assert_eq!(summaries.len(), groups.len());
+        assert!(groups
+            .iter()
+            .all(|group| !idx.is_materialized(&group.group_id_hex)));
+    }
+
+    #[test]
+    fn reconcile_rolls_back_every_change_when_one_insert_fails() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        idx.ensure_group("stale", "Must survive rollback").unwrap();
+        idx.db
+            .execute_batch(
+                "CREATE TRIGGER abort_reconcile
+                 BEFORE INSERT ON conversation_summary
+                 WHEN NEW.group_id_hex = 'missing_b'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'forced reconcile failure');
+                 END;",
+            )
+            .unwrap();
+
+        let result = idx.reconcile_rows(&[
+            ReconciledGroup {
+                group_id_hex: "missing_a".into(),
+                name: "A".into(),
+                latest_at_secs: 1,
+            },
+            ReconciledGroup {
+                group_id_hex: "missing_b".into(),
+                name: "B".into(),
+                latest_at_secs: 2,
+            },
+        ]);
+
+        assert!(result.is_err());
+        assert!(idx.summary("stale").unwrap().is_some());
+        assert!(idx.summary("missing_a").unwrap().is_none());
+        assert!(idx.summary("missing_b").unwrap().is_none());
     }
 
     #[test]
@@ -599,6 +970,7 @@ mod tests {
         assert_eq!(s.latest_content, "old msg");
         assert_eq!(s.message_count, 3);
         assert_eq!(s.version, 0, "pre-migration rows start at version 0");
+        assert!(idx.is_materialized("g1"));
 
         idx.upsert_summary("g1", "Chat", "new msg", "peer", 200, false)
             .unwrap();
@@ -641,7 +1013,7 @@ mod tests {
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
-        // Reopen: schema_version is now 2, migration is a no-op.
+        // Reopen: schema_version is now current, migration is a no-op.
         drop(idx);
         let idx = ConversationIndex::open(&path, key).expect("reopen must not fail");
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);

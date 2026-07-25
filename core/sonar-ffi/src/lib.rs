@@ -624,6 +624,15 @@ pub struct ConversationSummaryInfo {
     pub version: u64,
 }
 
+/// One bounded chat-list row: local group identity/members plus its core-owned
+/// summary. This avoids the old cold-start `groups()` + all-summary sweep while
+/// still giving hosts everything needed to paint a direct/group title.
+#[derive(uniffi::Record)]
+pub struct LocalConversationRowInfo {
+    pub group: GroupInfo,
+    pub summary: ConversationSummaryInfo,
+}
+
 #[uniffi::export]
 pub fn sonar_notification_classify_content(content: String) -> SonarNotificationKindInfo {
     notification_kind_info(core_notification_kind(&content))
@@ -1311,16 +1320,44 @@ impl SonarNode {
         self.client
             .conversation_summaries()
             .into_iter()
-            .map(|s| ConversationSummaryInfo {
-                group_id_hex: s.group_id_hex,
-                name: s.name,
-                latest_content: s.latest_content,
-                latest_sender_npub: s.latest_sender,
-                latest_at_secs: s.latest_at_secs,
-                latest_mine: s.latest_mine,
-                message_count: s.message_count,
-                unread_count: s.unread_count,
-                version: s.version,
+            .map(conversation_summary_info)
+            .collect()
+    }
+
+    /// Refresh complete local group visibility after the host's bounded first
+    /// paint. This performs no relay work and no full-history scan.
+    pub fn reconcile_conversation_index(&self) -> FfiResult<()> {
+        self.client.reconcile_conversation_index()?;
+        Ok(())
+    }
+
+    /// Recency-ordered bounded local chat-list page. Membership reads are made
+    /// only for the selected rows, never for every account conversation.
+    pub fn local_conversation_page(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> FfiResult<Vec<LocalConversationRowInfo>> {
+        self.client
+            .conversation_summaries_page(limit as usize, offset as usize)
+            .into_iter()
+            .map(|summary| {
+                let group_id = parse_group_id(&summary.group_id_hex)?;
+                let member_npubs = self
+                    .client
+                    .members(&group_id)?
+                    .into_iter()
+                    .map(|pk| pk.to_bech32().expect("npub encoding cannot fail"))
+                    .collect();
+                let group = GroupInfo {
+                    id_hex: summary.group_id_hex.clone(),
+                    name: summary.name.clone(),
+                    member_npubs,
+                };
+                Ok(LocalConversationRowInfo {
+                    group,
+                    summary: conversation_summary_info(summary),
+                })
             })
             .collect()
     }
@@ -2631,6 +2668,22 @@ fn direct_dm_info(m: sonar_core::client::DirectDm) -> DirectDmInfo {
         sender_pubkey_hex: m.sender_pubkey,
         content: m.content,
         created_at_secs: m.created_at,
+    }
+}
+
+fn conversation_summary_info(
+    summary: sonar_core::conversation_index::ConversationSummary,
+) -> ConversationSummaryInfo {
+    ConversationSummaryInfo {
+        group_id_hex: summary.group_id_hex,
+        name: summary.name,
+        latest_content: summary.latest_content,
+        latest_sender_npub: summary.latest_sender,
+        latest_at_secs: summary.latest_at_secs,
+        latest_mine: summary.latest_mine,
+        message_count: summary.message_count,
+        unread_count: summary.unread_count,
+        version: summary.version,
     }
 }
 

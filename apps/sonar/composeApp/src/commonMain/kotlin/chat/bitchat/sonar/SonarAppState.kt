@@ -62,6 +62,17 @@ private const val RELAY_RECONNECT_RETRY_MS = 10_000L
 private const val MARMOT_ECHO_RECONCILE_POLL_MS = 100L
 private const val MARMOT_ECHO_RECONCILE_MAX_ATTEMPTS = 10
 
+internal fun relayMetadataDemandAllowed(isRelayConnected: Boolean): Boolean = isRelayConnected
+
+internal fun clearRelayMetadataThrottle(
+    key: String,
+    missedAt: MutableMap<String, Long>,
+    inFlight: MutableSet<String>,
+) {
+    missedAt.remove(key)
+    inFlight.remove(key)
+}
+
 /** Debug-device benchmark input supplied by the platform launcher. Keeping the
  * pack address explicit avoids shipping a user-visible fallback pack. */
 data class StickerBenchmarkRequest(
@@ -759,8 +770,8 @@ class SonarAccountRestoreException(
 
 class SonarAppState(private val scope: CoroutineScope) {
     private val initialChatSnapshotBlob = SonarCore.loadBlob(CHAT_SNAPSHOT_BLOB_KEY)
-    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob)
-    private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob)
+    private val initialChatSnapshot = decodeChatSnapshot(initialChatSnapshotBlob, LOCAL_SUMMARY_CHAT_LIMIT)
+    private val initialChatSnapshotLatest = decodeChatSnapshotLatest(initialChatSnapshotBlob, LOCAL_SUMMARY_CHAT_LIMIT)
     private val initialGroupFoldMap = decodeGroupFoldMap(SonarCore.loadBlob(GROUP_FOLDS_BLOB_KEY))
     private val initialFoldedGroupIds: Set<String> = initialChatSnapshot.first
         .mapTo(hashSetOf()) { it.id }
@@ -3745,7 +3756,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
                 startRelayConnection()
-                if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
                     activeCatchupSyncs++
                     try {
@@ -4205,7 +4215,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!started || relayConnectJob?.isActive == true) return
         relayConnectJob = scope.launch {
             while (isActive && started) {
-                if (!SonarCore.isRelayConnected()) {
+                val attachedThisRun = !SonarCore.isRelayConnected()
+                if (attachedThisRun) {
                     val result = runCatching { SonarCore.connectRelays() }
                     if (result.isFailure) {
                         toast = "relay connect failed: ${result.exceptionOrNull()?.message}"
@@ -4214,6 +4225,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                     }
                     npub = result.getOrThrow()
                     SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
+                    rearmRelayMetadataAfterAttach()
                 }
                 completeRelayStartup()
                 return@launch
@@ -4286,12 +4298,6 @@ class SonarAppState(private val scope: CoroutineScope) {
             runCatching { SonarCore.resumePendingMediaUploads() }
         }
         updateBleDiscoveryPolicy()
-        refreshKnownContactDescriptors(clearMisses = true)
-        scope.launch {
-            refreshChatMemberProfiles(clearMisses = true)
-            delay(6_000)
-            refreshChatMemberProfiles(clearMisses = true)
-        }
         runCatching { refreshChats() }
         runCatching { recomputeConversations() }
         drainPendingInviteTokens()
@@ -4360,6 +4366,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         return plan.shouldPublishNickname && handleSeeded
     }
 
+    /** A relay attachment starts a fresh metadata-demand generation. Only the
+     * currently composed Home rows and the open conversation observe it, so a
+     * reconnect cannot turn into an all-contact sweep. */
+    private fun rearmRelayMetadataAfterAttach() {
+        relayGeneration++
+        (screen as? Screen.Chat)?.let { open ->
+            chats.firstOrNull { it.id == open.id }?.let(::rearmRelayMetadataForChat)
+        }
+    }
+
     fun boot() {
         if (started || connecting) return
         connecting = true
@@ -4386,6 +4402,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 refreshChats()
                 recomputeConversations()
                 homeMessagesHydrated = true
+                // Yield the first bounded frame before reconciling all group
+                // metadata. The follow-up refresh may enumerate the account,
+                // but it can no longer delay local Home visibility.
+                launch {
+                    kotlinx.coroutines.yield()
+                    runCatching { SonarCore.reconcileConversationIndex() }
+                    runCatching { refreshChats() }
+                    runCatching { recomputeConversations() }
+                }
 
                 // Local usability begins here. These services must work through
                 // a relay outage; relay attach/retry runs independently below.
@@ -4438,30 +4463,42 @@ class SonarAppState(private val scope: CoroutineScope) {
         ).also { if (profilesByNpub[canonicalProfileKey(other)] == null) ensureProfile(other) }
     }
 
+    /** Demand-load metadata for one visible/open conversation. */
+    fun ensureProfileForChat(chat: SonarChat) {
+        pendingMarmotNpub(chat.id)?.let {
+            ensureProfile(it)
+            ensureSonarDescriptor(it)
+            return
+        }
+        val counterpart = otherMembers(chat).singleOrNull() ?: return
+        if (chat.name.isBlank()) ensureProfile(counterpart)
+        ensureSonarDescriptor(counterpart)
+    }
+
+    /** A new relay generation invalidates negative and in-flight throttles for
+     * one composed/open row, then immediately issues fresh demand. Stale fetch
+     * completions are generation-gated below so they cannot clobber the retry. */
+    fun rearmRelayMetadataForChat(chat: SonarChat) {
+        val counterpart = pendingMarmotNpub(chat.id) ?: otherMembers(chat).singleOrNull() ?: return
+        val profileKey = canonicalProfileKey(counterpart)
+        if (profileKey.isNotBlank()) {
+            clearRelayMetadataThrottle(profileKey, profileMissedAt, profileFetches)
+            ensureProfile(counterpart)
+        }
+        canonicalNpubHex(counterpart)?.lowercase()?.let { descriptorKey ->
+            clearRelayMetadataThrottle(
+                descriptorKey,
+                sonarDescriptorMissedAt,
+                sonarDescriptorFetches,
+            )
+            ensureSonarDescriptorHex(descriptorKey)
+        }
+    }
+
     private fun shortNpub(value: String): String = shortNpubLabel(value)
 
     fun groupAuthorName(message: SonarMsg, isGroup: Boolean): String? {
         return resolveGroupAuthorName(message, isGroup, profilesByNpub, ::ensureProfile)
-    }
-
-    /** Re-fetch kind-0 profiles for every conversation member, optionally
-     *  clearing the miss throttles first. Fetches fired while the relays were
-     *  still connecting MISS and get throttled — this gives them a prompt
-     *  second chance once connectivity arrives, instead of leaving npub
-     *  titles until the ~30min housekeeping sweep. Bounded: distinct members
-     *  of current chats + mesh links only. */
-    private fun refreshChatMemberProfiles(clearMisses: Boolean) {
-        if (clearMisses) {
-            profileMissedAt.clear()
-            profileFetches.clear()
-        }
-        val mine = canonicalProfileKey(npub)
-        (chats.asSequence().flatMap { it.members.asSequence() } +
-            meshChats.keys.asSequence().mapNotNull { npubStringForPeer(it) })
-            .map { canonicalProfileKey(it) }
-            .filter { it.isNotBlank() && it != mine }
-            .distinct()
-            .forEach { ensureProfile(it) }
     }
 
     /** Fetch + cache a peer's kind-0 profile, so their name replaces the
@@ -4469,6 +4506,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun ensureProfile(otherNpub: String) {
         val key = canonicalProfileKey(otherNpub)
         if (key.isBlank() || key == canonicalProfileKey(npub)) return
+        if (!relayMetadataDemandAllowed(SonarCore.isRelayConnected())) return
         // Throttle re-fetches after a miss: chatTitle() calls this on every
         // list render, so without a TTL a peer with no kind-0 profile (or an
         // offline relay window) triggers a relay query per recomposition.
@@ -4476,11 +4514,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (missedAt != null && SonarClock.nowSecs() - missedAt < PROFILE_MISS_TTL_SECS) return
         val hadCachedProfile = profilesByNpub.containsKey(key) || profilesByNpub.containsKey(otherNpub)
         if (!profileFetches.add(key)) return        // fetch already in flight
+        val demandGeneration = relayGeneration
         scope.launch {
             val p = SonarCore.fetchProfile(key)
+            if (demandGeneration != relayGeneration) return@launch
+            val relayReadyAfterFetch = SonarCore.isRelayConnected()
             // Log the outcome only — a resolved display name is PII and this
             // tees into the user-shareable diagnostics bundle.
-            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → ${if (p?.bestName != null) "HIT" else "MISS"}")
+            val outcome = when {
+                p?.bestName != null -> "HIT"
+                relayReadyAfterFetch -> "MISS"
+                else -> "DEFERRED"
+            }
+            sonarLog("SonarProfile", "kind-0 fetch ${key.take(12)}… → $outcome")
             if (p?.bestName != null) {
                 // Drop a legacy entry under the caller's ORIGINAL key only when
                 // it differs from the canonical one — when the caller already
@@ -4495,7 +4541,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 profileMissedAt.remove(key)
                 persistProfileCache()
                 if (isMeshRelevantNpub(key)) recomputeConversations()
-            } else {
+            } else if (relayReadyAfterFetch) {
                 profileMissedAt[key] = SonarClock.nowSecs()
                 if (hadCachedProfile) {
                     // A cached profile's forced refetch missed (offline relay
@@ -4535,6 +4581,7 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private fun ensureSonarDescriptorHex(npubHex: String) {
         val key = npubHex.lowercase()
+        if (!relayMetadataDemandAllowed(SonarCore.isRelayConnected())) return
         val now = SonarClock.nowSecs()
         val fetchedAt = sonarDescriptorFetchedAt[key]
         if (sonarDescriptorsByNpubHex[key] != null && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
@@ -4543,8 +4590,9 @@ class SonarAppState(private val scope: CoroutineScope) {
         val missedAt = sonarDescriptorMissedAt[key]
         if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return
         if (!sonarDescriptorFetches.add(key)) return
+        val demandGeneration = relayGeneration
         scope.launch {
-            performDescriptorFetch(key)
+            performDescriptorFetch(key, demandGeneration)
         }
     }
 
@@ -4560,6 +4608,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (hasBolt12 && fetchedAt != null && now - fetchedAt < SONAR_DESCRIPTOR_TTL_SECS) {
             return cached
         }
+        if (!SonarCore.isRelayConnected()) return cached
         val missedAt = sonarDescriptorMissedAt[key]
         if (!bypassRecentMiss && missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) {
             return sonarDescriptorsByNpubHex[key]
@@ -4569,25 +4618,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         return sonarDescriptorsByNpubHex[key]
     }
 
-    private suspend fun performDescriptorFetch(key: String) {
+    private suspend fun performDescriptorFetch(key: String, demandGeneration: Int? = null) {
         val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+        if (demandGeneration != null && demandGeneration != relayGeneration) return
         if (descriptor != null) {
             sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
             sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
             sonarDescriptorMissedAt.remove(key)
-        } else {
+        } else if (SonarCore.isRelayConnected()) {
             sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
         }
         sonarDescriptorFetches.remove(key)
-    }
-
-    private fun refreshKnownContactDescriptors(clearMisses: Boolean = false) {
-        for (npubHex in linkByFp.values) {
-            if (clearMisses) {
-                sonarDescriptorMissedAt.remove(npubHex.lowercase())
-            }
-            ensureSonarDescriptorHex(npubHex)
-        }
     }
 
     private fun persistProfileCache() {
@@ -4600,6 +4641,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Paint BEFORE push (Signal-Android): ChatScreen must never mount on
         // empty home leftover messages, then rebuild when the page lands.
         clearNotificationsForChat(chat.id)
+        ensureProfileForChat(chat)
         val generation = beginTranscriptSession(chat.id)
         resolveMarmotGroupId(chat.id)?.let { groupId ->
             scope.launch { runCatching { SonarCore.preferCatchupGroup(groupId) } }
@@ -9146,7 +9188,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!linkByFp[peerId].equals(npubHex, ignoreCase = true)) {
                 linkByFp[peerId] = npubHex
                 persistLinks()
-                refreshKnownContactDescriptors()
+                ensureSonarDescriptorHex(npubHex)
             }
         }
         socialState = meshPeerAliases(peerId).fold(socialState) { state, alias ->
@@ -9513,7 +9555,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun persistChatSnapshot() {
         SonarCore.saveBlob(
             CHAT_SNAPSHOT_BLOB_KEY,
-            encodeChatSnapshot(chats, chatSnapshotMessagesByChat, chatSnapshotLatestByChat),
+            encodeChatSnapshot(
+                chats,
+                chatSnapshotMessagesByChat,
+                chatSnapshotLatestByChat,
+                rowLimit = LOCAL_SUMMARY_CHAT_LIMIT,
+            ),
         )
     }
 
@@ -9587,14 +9634,38 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private suspend fun refreshChatsInner() {
-        val previousOrder = chats.map { it.id }
-        val loadedChats = SonarCore.chats()
-        val localChats = if (localCoreReady || started || loadedChats.isNotEmpty()) loadedChats else chats
+        val coldLocalPaint = localCoreReady && !homeMessagesHydrated
+        val previousOrder = (if (coldLocalPaint) chats.take(LOCAL_SUMMARY_CHAT_LIMIT) else chats)
+            .map { it.id }
+        // This bounded core call also materializes only the selected incomplete
+        // summaries. Run it before reading the row page so its preview/unread
+        // projection is coherent in the same first publication.
+        val coldPages = if (coldLocalPaint) runCatching {
+            SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
+        }.getOrDefault(emptyList()) else emptyList()
+        val firstPage = if (coldLocalPaint) {
+            runCatching { SonarCore.localConversationPage(LOCAL_SUMMARY_CHAT_LIMIT) }
+                .getOrDefault(emptyList())
+        } else {
+            emptyList()
+        }
+        // Cold paint must not enumerate `groups()` and then fetch membership for
+        // every account conversation. The core page applies recency + LIMIT in
+        // SQLite and resolves members only for visible-window candidates. A
+        // later housekeeping pass reconciles the remaining rows.
+        val loadedChats = if (coldLocalPaint) firstPage.map { it.chat } else SonarCore.chats()
+        val localChats = when {
+            coldLocalPaint && loadedChats.isEmpty() -> chats.take(LOCAL_SUMMARY_CHAT_LIMIT)
+            localCoreReady || started || loadedChats.isNotEmpty() -> loadedChats
+            else -> chats
+        }
         val activeIds = localChats.mapTo(hashSetOf()) { it.id }
-        val summaries = if (localChats.isEmpty()) emptyList() else runCatching {
-            SonarCore.conversationSummaries()
-        }.getOrDefault(emptyList())
-        val pages = if (localChats.isEmpty()) emptyList() else runCatching {
+        val summaries = when {
+            localChats.isEmpty() -> emptyList()
+            coldLocalPaint -> firstPage.map { it.summary }
+            else -> runCatching { SonarCore.conversationSummaries() }.getOrDefault(emptyList())
+        }
+        val pages = if (localChats.isEmpty()) emptyList() else if (coldLocalPaint) coldPages else runCatching {
                 SonarCore.recentMessagePages(LOCAL_SUMMARY_CHAT_LIMIT, LOCAL_SUMMARY_PAGE_LIMIT)
         }.getOrDefault(emptyList())
         val hydration = hydrateLocalConversationRows(
@@ -9616,13 +9687,17 @@ class SonarAppState(private val scope: CoroutineScope) {
             latestSecs = { hydration.latestByChat[it] ?: 0L },
             previousOrder = previousOrder,
         )
-        persistChatSnapshot()
-        refreshUnreadCounts()
-        for (c in chats) {
-            c.members.forEach {
-                if (it != npub && it.isNotBlank()) ensureSonarDescriptor(it)
-            }
+        if (!coldLocalPaint) {
+            // Never replace the complete crash fallback with a five-row cold
+            // window. The deferred reconciliation pass persists the full model.
+            persistChatSnapshot()
+            refreshUnreadCounts()
+        } else {
+            applyUnreadCounts(summaries)
         }
+        // Relay metadata is demand-driven by visible/open rows and pay/call
+        // actions. Do not sweep every member here: a local database refresh
+        // must stay local-first and bounded even for large contact lists.
         groupInvites = runCatching { SonarCore.pendingGroupInvites() }.getOrDefault(emptyList())
         resolvePendingMarmotChats()
     }
@@ -9774,8 +9849,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // ensureSubscriptions / sync are relay-connection upkeep — keep a
                 // wall-clock cadence (was every 4 s / every 60 s on the old tick).
                 if (SonarCore.isRelayConnected()) {
-                    runCatching { SonarCore.ensureSubscriptions() }
-                    if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
+                    val subscriptionsReady = runCatching { SonarCore.ensureSubscriptions() }.isSuccess
+                    if (!subscriptionsReady || !SonarCore.isRelayConnected()) {
+                        startRelayConnection()
+                    } else if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
                         runCatching { SonarCore.sync() }
                     }
                 } else {
@@ -9840,8 +9917,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         // need a page fetch + ☎CALL / pay re-scan. Everything else is skipped —
         // this replaces the old O(chats) messagesPage()+re-parse every 4 s.
         val changedPages = scanChangedChatsForCallPay(summaryByChat)
-        // Resolve kind-0 profiles for chat members so chats show names, not npubs.
-        for (c in chats) c.members.forEach { if (it != npub) ensureProfile(it) }
+        // Kind-0 profiles are intentionally demand-driven by composed Home rows
+        // and the open transcript. Sweeping every member here caused a cold
+        // account with many groups to issue dozens of relay queries before the
+        // visible rows had settled, competing with message catch-up and sends.
         flushPendingMarmot() // a queued out-of-range send whose group just landed
         flushAllOutbox() // retry any outbox messages whose peer is now reachable
         flushAllMediaOutbox() // retry any queued media whose peer is now reachable

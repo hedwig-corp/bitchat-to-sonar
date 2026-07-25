@@ -1614,6 +1614,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      */
     func leaveGroup(groupIdHex: String) throws
 
+    /**
+     * Recency-ordered bounded local chat-list page. Membership reads are made
+     * only for the selected rows, never for every account conversation.
+     */
+    func localConversationPage(limit: UInt32, offset: UInt32) throws  -> [LocalConversationRowInfo]
+
     func markConversationRead(groupIdHex: String)
 
     /**
@@ -1693,6 +1699,12 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * DB only and does not wait on relay sync or full-history scans.
      */
     func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32) throws  -> [RecentMessagePageInfo]
+
+    /**
+     * Refresh complete local group visibility after the host's bounded first
+     * paint. This performs no relay work and no full-history scan.
+     */
+    func reconcileConversationIndex() throws
 
     /**
      * Encrypt a device push token to the transponder and cache/share it with
@@ -2443,6 +2455,20 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
 }
 }
 
+    /**
+     * Recency-ordered bounded local chat-list page. Membership reads are made
+     * only for the selected rows, never for every account conversation.
+     */
+open func localConversationPage(limit: UInt32, offset: UInt32)throws  -> [LocalConversationRowInfo]  {
+    return try  FfiConverterSequenceTypeLocalConversationRowInfo.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_local_conversation_page(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(limit),
+        FfiConverterUInt32.lower(offset),$0
+    )
+})
+}
+
 open func markConversationRead(groupIdHex: String)  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_mark_conversation_read(
             self.uniffiCloneHandle(),
@@ -2620,6 +2646,17 @@ open func recentMessagePages(groupLimit: UInt32, pageLimit: UInt32)throws  -> [R
         FfiConverterUInt32.lower(pageLimit),$0
     )
 })
+}
+
+    /**
+     * Refresh complete local group visibility after the host's bounded first
+     * paint. This performs no relay work and no full-history scan.
+     */
+open func reconcileConversationIndex()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_reconcile_conversation_index(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
 
     /**
@@ -3932,6 +3969,65 @@ public func FfiConverterTypeJoinRequestInfo_lift(_ buf: RustBuffer) throws -> Jo
 #endif
 public func FfiConverterTypeJoinRequestInfo_lower(_ value: JoinRequestInfo) -> RustBuffer {
     return FfiConverterTypeJoinRequestInfo.lower(value)
+}
+
+
+/**
+ * One bounded chat-list row: local group identity/members plus its core-owned
+ * summary. This avoids the old cold-start `groups()` + all-summary sweep while
+ * still giving hosts everything needed to paint a direct/group title.
+ */
+public struct LocalConversationRowInfo: Equatable, Hashable {
+    public var group: GroupInfo
+    public var summary: ConversationSummaryInfo
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(group: GroupInfo, summary: ConversationSummaryInfo) {
+        self.group = group
+        self.summary = summary
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LocalConversationRowInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLocalConversationRowInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LocalConversationRowInfo {
+        return
+            try LocalConversationRowInfo(
+                group: FfiConverterTypeGroupInfo.read(from: &buf),
+                summary: FfiConverterTypeConversationSummaryInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LocalConversationRowInfo, into buf: inout [UInt8]) {
+        FfiConverterTypeGroupInfo.write(value.group, into: &buf)
+        FfiConverterTypeConversationSummaryInfo.write(value.summary, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalConversationRowInfo_lift(_ buf: RustBuffer) throws -> LocalConversationRowInfo {
+    return try FfiConverterTypeLocalConversationRowInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLocalConversationRowInfo_lower(_ value: LocalConversationRowInfo) -> RustBuffer {
+    return FfiConverterTypeLocalConversationRowInfo.lower(value)
 }
 
 
@@ -7304,6 +7400,31 @@ fileprivate struct FfiConverterSequenceTypeJoinRequestInfo: FfiConverterRustBuff
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeLocalConversationRowInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [LocalConversationRowInfo]
+
+    public static func write(_ value: [LocalConversationRowInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLocalConversationRowInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LocalConversationRowInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LocalConversationRowInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLocalConversationRowInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeMediaInfo: FfiConverterRustBuffer {
     typealias SwiftType = [MediaInfo]
 
@@ -8308,6 +8429,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_local_conversation_page() != 62804) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8348,6 +8472,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_reconcile_conversation_index() != 58072) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_register_push_token() != 63602) {
