@@ -100,8 +100,24 @@ final class MessageStore {
     /// disk. The internal queue is serial, so FIFO ordering gives the
     /// guarantee — used by paths that must not acknowledge a message to the
     /// network before its transcript row is durable.
-    func afterPendingWrites(_ completion: @escaping () -> Void) {
-        io.async(execute: completion)
+    /// Outcome of the most recent transcript write per peer. Only touched on the
+    /// serial `io` queue.
+    private var lastPrivateWriteSucceeded: [String: Bool] = [:]
+
+    /// Run `completion` once every write enqueued before this call has hit disk,
+    /// passing whether this peer's transcript write actually succeeded. The
+    /// serial queue gives the ordering; the flag gives durability — draining the
+    /// queue alone proves only that the attempt ran, and a full or unavailable
+    /// disk makes it fail silently. Callers that acknowledge a message to the
+    /// network MUST gate on the flag, or the sender shows "Delivered" for a row
+    /// the recipient loses at restart.
+    ///
+    /// `false` when no write for this peer was seen (nothing to be durable
+    /// about, so nothing may be acknowledged).
+    func afterPendingWrites(for peerID: PeerID, _ completion: @escaping (Bool) -> Void) {
+        io.async { [weak self] in
+            completion(self?.lastPrivateWriteSucceeded[peerID.id] ?? false)
+        }
     }
 
     /// Replace the stored transcript for a peer (used to mirror an in-memory
@@ -244,16 +260,25 @@ final class MessageStore {
 
     private func writePrivate(peerID: PeerID, messages: [BitchatMessage]) {
         let envelope = StoredPrivateChat(peerID: peerID, messages: messages)
-        guard let data = try? encoder.encode(envelope) else { return }
-        write(data, to: privateFileURL(for: peerID))
+        guard let data = try? encoder.encode(envelope) else {
+            lastPrivateWriteSucceeded[peerID.id] = false
+            return
+        }
+        // Recorded on the serial `io` queue, so `afterPendingWrites(for:)` —
+        // which runs on that same queue after every enqueued write — observes
+        // the outcome of the write it was waiting on.
+        lastPrivateWriteSucceeded[peerID.id] = write(data, to: privateFileURL(for: peerID))
     }
 
-    private func write(_ data: Data, to url: URL) {
+    @discardableResult
+    private func write(_ data: Data, to url: URL) -> Bool {
         do {
             try data.write(to: url, options: [.atomic])
             applyProtection(to: url)
+            return true
         } catch {
             SecureLogger.error("MessageStore write failed: \(error)", category: .session)
+            return false
         }
     }
 

@@ -247,6 +247,9 @@ actual object MeshRadio {
     }
 
     actual fun discardPendingDeliverySignals() {
+        // Suppress driver-side deliveries first so a failure posted while we are
+        // clearing cannot land back in the inbox we just emptied.
+        MeshGatt.discardAcceptedDeliveries()
         meshSendFailureInbox.clear()
         meshMediaSendFailureInbox.clear()
         meshDeliveryInbox.clear()

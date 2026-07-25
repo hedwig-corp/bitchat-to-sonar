@@ -129,6 +129,7 @@ object MeshGatt {
     private sealed interface OutboundDelivery {
         val attemptId: Long
         val generation: Long
+        val privacyEpoch: Long
         val peerId: String
         val messageId: String
         val tsSecs: Long
@@ -137,6 +138,7 @@ object MeshGatt {
     private data class TextDelivery(
         override val attemptId: Long,
         override val generation: Long,
+        override val privacyEpoch: Long,
         override val peerId: String,
         override val messageId: String,
         val text: String,
@@ -146,6 +148,7 @@ object MeshGatt {
     private data class MediaDelivery(
         override val attemptId: Long,
         override val generation: Long,
+        override val privacyEpoch: Long,
         override val peerId: String,
         override val messageId: String,
         val bytes: ByteArray,
@@ -309,12 +312,25 @@ object MeshGatt {
         characteristic = ch
     }
 
+    /** Privacy teardown only. Suppresses every already-accepted delivery so a
+     *  failure posted before an erase/wipe cannot hand erased plaintext back to
+     *  the router. Deliberately NOT part of [stop]: an ordinary stop still owes
+     *  the app its failures. Order-independent with respect to [stop] — whichever
+     *  runs first, the epoch check in [reportSendFailures] drops the report. */
+    fun discardAcceptedDeliveries() {
+        synchronized(txLock) { privacyEpoch.incrementAndGet() }
+    }
+
     fun stop() {
         handler.removeCallbacks(armTick)
         handler.removeCallbacks(tick)
-        // Invalidate every accepted delivery before draining the platform
-        // queues. This also makes already-posted failure callbacks no-ops, so
-        // an intentional privacy teardown can never turn into router retry.
+        // Advance the command generation so a delayed WriteLink/NotifyConn cannot
+        // inject stale ciphertext into a restarted radio's queue. This does NOT
+        // suppress failure reporting: the queues are drained below and those
+        // failures still reach the router, because with the engine no longer
+        // queuing plaintext, dropping one leaves the row "Sent" with its bytes
+        // neither delivered nor re-queued. Only discardAcceptedDeliveries()
+        // suppresses reports, and only for an explicit privacy teardown.
         synchronized(txLock) {
             tickArmed = false
             tickScheduled = false
@@ -358,9 +374,9 @@ object MeshGatt {
 
     fun sendTextToPeer(fingerprint: String, messageId: String, text: String): Boolean {
         return transactDelivery(
-            delivery = { generation ->
+            delivery = { generation, epoch ->
                 TextDelivery(
-                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId, text,
+                    nextDeliveryAttempt.incrementAndGet(), generation, epoch, fingerprint, messageId, text,
                     System.currentTimeMillis() / 1000,
                 )
             },
@@ -370,9 +386,9 @@ object MeshGatt {
     /** Immediate send for real-time controls. Never queues. */
     fun sendTextToPeerNow(fingerprint: String, messageId: String, text: String): Boolean {
         return transactDelivery(
-            delivery = { generation ->
+            delivery = { generation, epoch ->
                 TextDelivery(
-                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId, text,
+                    nextDeliveryAttempt.incrementAndGet(), generation, epoch, fingerprint, messageId, text,
                     System.currentTimeMillis() / 1000,
                 )
             },
@@ -385,9 +401,9 @@ object MeshGatt {
         val mime = normalizedMime(mimeType, bytes) ?: return false
         val safeName = safeFileName(filename, mime, System.currentTimeMillis())
         val out = transactDelivery(
-            delivery = { generation ->
+            delivery = { generation, epoch ->
                 MediaDelivery(
-                    nextDeliveryAttempt.incrementAndGet(), generation, fingerprint, messageId,
+                    nextDeliveryAttempt.incrementAndGet(), generation, epoch, fingerprint, messageId,
                     bytes.copyOf(), filename, mime, System.currentTimeMillis() / 1000,
                 )
             },
@@ -441,13 +457,13 @@ object MeshGatt {
     /** Capture the privacy generation under the same lock as encryption and
      * queueing, so stop() cannot split generation capture from acceptance. */
     private fun transactDelivery(
-        delivery: (Long) -> OutboundDelivery,
+        delivery: (Long, Long) -> OutboundDelivery,
         block: () -> MeshEngineOutput?,
     ): MeshEngineOutput? {
         val out: MeshEngineOutput?
         synchronized(txLock) {
             if (!tickArmed) return null
-            val acceptedDelivery = delivery(deliveryGeneration.get())
+            val acceptedDelivery = delivery(deliveryGeneration.get(), privacyEpoch.get())
             out = block()
             out?.let { executeCommands(it, acceptedDelivery) }
         }
@@ -1021,6 +1037,15 @@ object MeshGatt {
     /** Incremented by [stop] so delayed callbacks cannot escape a completed
      * radio lifecycle and resurrect app-owned plaintext after erase/wipe. */
     private val deliveryGeneration = java.util.concurrent.atomic.AtomicLong()
+    /** Separate from [deliveryGeneration] because the two answer different
+     * questions. [deliveryGeneration] must advance on EVERY [stop] so a delayed
+     * GATT command cannot inject stale ciphertext into a restarted radio's queue.
+     * Whether a failure may still be handed to the app is a different question:
+     * an ordinary stop (`MainActivity.onDestroy`) still owes the router its
+     * failures — the engine no longer queues, so dropping one leaves the row
+     * "Sent" with its plaintext neither delivered nor re-queued. Only an explicit
+     * privacy discard may suppress them, so only that advances this. */
+    private val privacyEpoch = java.util.concurrent.atomic.AtomicLong()
     private const val REPORTED_ATTEMPT_TTL_MS = 5 * 60_000L
     private const val REPORTED_ATTEMPT_MAX = 512
     @Volatile private var lastReportedSweepMs = 0L
@@ -1041,9 +1066,9 @@ object MeshGatt {
                     .forEach { (attemptId, _) -> reportedDeliveryAttempts.remove(attemptId) }
             }
         }
-        val activeGeneration = deliveryGeneration.get()
+        val activePrivacyEpoch = privacyEpoch.get()
         deliveries.asSequence()
-            .filter { it.generation == activeGeneration }
+            .filter { it.privacyEpoch == activePrivacyEpoch }
             .distinctBy { it.attemptId }
             .forEach { delivery ->
                 if (reportedDeliveryAttempts.putIfAbsent(delivery.attemptId, now) != null) return@forEach
@@ -1052,7 +1077,7 @@ object MeshGatt {
                     // Listeners only append to lock-free inboxes and never re-enter
                     // the engine, so holding txLock here cannot invert its locks.
                     synchronized(txLock) {
-                        if (delivery.generation != deliveryGeneration.get()) return@synchronized
+                        if (delivery.privacyEpoch != privacyEpoch.get()) return@synchronized
                         when (delivery) {
                             is TextDelivery -> onSendFailure.forEach { listener ->
                                 runCatching {

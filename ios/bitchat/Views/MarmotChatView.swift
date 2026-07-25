@@ -2711,6 +2711,11 @@ final class MarmotChatModel: ObservableObject {
         // already transferred/removed. Mesh→WN flush uses `sendQueuedText`.
         var allOk = true
         for text in trimmed {
+            // A batch spans multiple awaits, so an erase can begin between items.
+            // Each iteration assigns a NEW sendChain tail, which a quiesce that
+            // already snapshotted the chain would never see — so re-check here
+            // instead of relying on the entry guard alone.
+            guard !sendsSuspendedForAccountMutation, !Task.isCancelled else { return false }
             var succeeded = false
             let echo = MarmotService.MarmotMessage(
                 id: Self.optimisticIDPrefix + UUID().uuidString,
@@ -2722,16 +2727,23 @@ final class MarmotChatModel: ObservableObject {
             )
             appendOptimistic(echo, to: groupId)
             let previous = sendChain
+            let generation = sendGeneration
             let queuedSend = Task { [weak self] in
                 _ = await previous?.result
-                guard let self else { return }
+                guard let self,
+                      !Task.isCancelled,
+                      self.sendGeneration == generation,
+                      !self.sendsSuspendedForAccountMutation
+                else { return }
                 do {
                     guard await self.ensureConnected(timeoutSeconds: 2) else {
                         throw MarmotService.ServiceError.notConnected
                     }
+                    guard self.isCurrentAccountWork(generation) else { return }
                     try await self.service.sendText(groupId: groupId, text: text)
                     succeeded = true
                 } catch {
+                    guard self.isCurrentAccountWork(generation) else { return }
                     self.discardOptimistic(id: echo.id, from: groupId)
                     self.errorText = Self.describe(error)
                 }
@@ -2748,19 +2760,26 @@ final class MarmotChatModel: ObservableObject {
     /// task's own success flag (Compose / `sendQueuedSticker` parity).
     func sendQueuedText(groupId: String, text: String) async -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
+        guard !trimmed.isEmpty, !sendsSuspendedForAccountMutation else { return false }
         var succeeded = false
         let previous = sendChain
+        let generation = sendGeneration
         let queuedSend = Task { [weak self] in
             _ = await previous?.result
-            guard let self else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.sendGeneration == generation,
+                  !self.sendsSuspendedForAccountMutation
+            else { return }
             do {
                 guard await self.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
+                guard self.isCurrentAccountWork(generation) else { return }
                 try await self.service.sendText(groupId: groupId, text: trimmed)
                 succeeded = true
             } catch {
+                guard self.isCurrentAccountWork(generation) else { return }
                 self.errorText = Self.describe(error)
             }
         }

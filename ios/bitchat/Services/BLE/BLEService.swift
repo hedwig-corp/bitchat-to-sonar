@@ -1471,6 +1471,24 @@ final class BLEService: NSObject {
             return
         }
 
+        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
+
+        // A re-send after a lost receipt must return a fresh ack, not a second
+        // row — and this has to run BEFORE the quota sweep and the file write.
+        // `saveIncomingFile` picks a unique name, so a retry would otherwise
+        // leave an orphan copy that nothing references while its bytes count
+        // against the incoming-files quota, evicting older attachments that
+        // live transcripts still point at.
+        if isPrivateMessage,
+           let messageID = filePacket.messageID,
+           isDuplicatePrivateFile(peerID: peerID, messageID: messageID) {
+            sendDeliveryAck(for: messageID, to: peerID)
+            #if DEBUG
+            appendBleDebugReport("file duplicate re-ack message=\(messageID) peer=\(peerID.id)")
+            #endif
+            return
+        }
+
         // BCH-01-002: Enforce storage quota before saving
         enforceIncomingFilesQuota(reservingBytes: filePacket.content.count)
 
@@ -1504,19 +1522,6 @@ final class BLEService: NSObject {
             marker = "[image] \(fileName)"
         case .file:
             marker = "[file] \(fileName)"
-        }
-
-        let isPrivateMessage = PeerID(hexData: packet.recipientID) == myPeerID
-
-        // A re-send after a lost receipt must return a fresh ack, not a second row.
-        if isPrivateMessage,
-           let messageID = filePacket.messageID,
-           isDuplicatePrivateFile(peerID: peerID, messageID: messageID) {
-            sendDeliveryAck(for: messageID, to: peerID)
-            #if DEBUG
-            appendBleDebugReport("file duplicate re-ack message=\(messageID) peer=\(peerID.id)")
-            #endif
-            return
         }
 
         if isPrivateMessage {
@@ -1559,8 +1564,24 @@ final class BLEService: NSObject {
             guard let self else { return }
             self.delegate?.didReceiveMessage(message)
             guard let messageID = ackMessageID else { return }
-            MessageStore.shared.afterPendingWrites { [weak self] in
+            MessageStore.shared.afterPendingWrites(for: peerID) { [weak self] persisted in
                 guard let self else { return }
+                // Queue drainage proves the write RAN, not that it landed: a full
+                // or unavailable disk fails inside MessageStore. Acking anyway
+                // would leave the sender on "Delivered" for a row this device
+                // loses at restart, which is the exact inversion the receipt
+                // exists to prevent. Staying silent instead lets the sender's
+                // row remain "Sent" and be retried.
+                guard persisted else {
+                    SecureLogger.error(
+                        "📁 Withholding delivery receipt: transcript write failed for \(peerID.id.prefix(8))…",
+                        category: .session
+                    )
+                    #if DEBUG
+                    self.appendBleDebugReport("file ack withheld (write failed) message=\(messageID) peer=\(peerID.id)")
+                    #endif
+                    return
+                }
                 self.sendDeliveryAck(for: messageID, to: peerID)
                 #if DEBUG
                 self.appendBleDebugReport("file ack message=\(messageID) peer=\(peerID.id)")
