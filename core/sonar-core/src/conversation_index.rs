@@ -374,8 +374,15 @@ impl ConversationIndex {
         let groups = engine.groups()?;
         for group in &groups {
             let group_id_hex = hex::encode(group.mls_group_id.as_slice());
-            let page = engine.messages_page(&group.mls_group_id, 1, 0)?;
-            if let Some(msg) = page.first() {
+            // Raw page: the preview only needs content/sender/timestamp, so
+            // never pay the per-group reaction aggregation scan here. Scan a
+            // few rows so a mesh-referencing ⚡REACT fallback line (a reaction,
+            // not a chat message) never becomes the row preview/recency.
+            let page = engine.messages_page_raw(&group.mls_group_id, 8, 0)?;
+            if let Some(msg) = page
+                .iter()
+                .find(|m| !m.content.starts_with(crate::marmot::MESH_REACTION_LINE_PREFIX))
+            {
                 let sender = msg.sender.to_string();
                 self.upsert_summary(
                     &group_id_hex,

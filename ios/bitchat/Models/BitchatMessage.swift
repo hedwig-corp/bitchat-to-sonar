@@ -8,6 +8,15 @@
 
 import Foundation
 
+/// One aggregated emoji reaction on a message: how many people currently
+/// react with `emoji`, and whether the local user is one of them.
+/// Signal-tapback semantics: one reaction per person, toggling replaces.
+struct MessageReaction: Codable, Hashable {
+    let emoji: String
+    let count: Int
+    let mine: Bool
+}
+
 /// Represents a user-visible message in the BitChat system.
 /// Handles both broadcast messages and private encrypted messages,
 /// with support for mentions, replies, and delivery tracking.
@@ -28,7 +37,12 @@ final class BitchatMessage: Codable {
     let receivedViaInternet: Bool?
     let mentions: [String]?  // Array of mentioned nicknames
     var deliveryStatus: DeliveryStatus? // Delivery tracking
-    
+    /// Aggregated emoji reactions. Derived at fold time from ⚡REACT control
+    /// lines stored in the same transcript (see SonarReactionMessage), so it is
+    /// intentionally NOT persisted (excluded from CodingKeys) and NOT part of
+    /// the binary transport payload — decoding always defaults to [].
+    var reactions: [MessageReaction] = []
+
     // Cached formatted text (not included in Codable)
     private var _cachedFormattedText: [String: AttributedString] = [:]
     
@@ -59,7 +73,8 @@ final class BitchatMessage: Codable {
         senderPeerID: PeerID? = nil,
         receivedViaInternet: Bool? = nil,
         mentions: [String]? = nil,
-        deliveryStatus: DeliveryStatus? = nil
+        deliveryStatus: DeliveryStatus? = nil,
+        reactions: [MessageReaction] = []
     ) {
         self.id = id ?? UUID().uuidString
         self.sender = sender
@@ -73,6 +88,7 @@ final class BitchatMessage: Codable {
         self.receivedViaInternet = receivedViaInternet
         self.mentions = mentions
         self.deliveryStatus = deliveryStatus ?? (isPrivate ? .sending : nil)
+        self.reactions = reactions
     }
 }
 
@@ -91,7 +107,8 @@ extension BitchatMessage: Equatable {
                lhs.senderPeerID == rhs.senderPeerID &&
                lhs.receivedViaInternet == rhs.receivedViaInternet &&
                lhs.mentions == rhs.mentions &&
-               lhs.deliveryStatus == rhs.deliveryStatus
+               lhs.deliveryStatus == rhs.deliveryStatus &&
+               lhs.reactions == rhs.reactions
     }
 }
 

@@ -563,3 +563,127 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
         "acknowledged direct DMs are not duplicated by the gift-wrap lookback"
     );
 }
+
+#[tokio::test]
+async fn reactions_toggle_replace_and_aggregate_across_devices() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("alice connects");
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    bob.publish_key_package().await.expect("bob publishes kp");
+    let alice_group = alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice starts dm");
+    alice
+        .send_text(&alice_group, "React to this!")
+        .await
+        .expect("alice sends");
+
+    bob.sync().await.expect("bob syncs");
+    let bob_group = bob.groups().expect("bob groups")[0].mls_group_id.clone();
+    let bob_view = bob.messages(&bob_group).expect("bob messages");
+    assert_eq!(bob_view.len(), 1);
+    let target = bob_view[0].id;
+
+    // Bob reacts. Local-first: his own transcript aggregates immediately,
+    // before any relay round-trip.
+    bob.toggle_reaction(&bob_group, &target, "👍")
+        .await
+        .expect("bob reacts");
+    let bob_view = bob.messages(&bob_group).expect("bob messages");
+    assert_eq!(
+        bob_view.len(),
+        1,
+        "reaction must not become a transcript row"
+    );
+    assert_eq!(bob_view[0].reactions.len(), 1);
+    assert_eq!(bob_view[0].reactions[0].emoji, "👍");
+    assert_eq!(bob_view[0].reactions[0].count, 1);
+    assert!(bob_view[0].reactions[0].mine);
+
+    // Alice syncs and sees Bob's reaction on her own message (mine=false).
+    let mut alice_reactions = Vec::new();
+    for _ in 0..20 {
+        alice.sync().await.expect("alice syncs");
+        alice_reactions = alice.messages(&alice_group).expect("alice messages")[0]
+            .reactions
+            .clone();
+        if !alice_reactions.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(alice_reactions.len(), 1, "alice sees bob's reaction");
+    assert_eq!(alice_reactions[0].emoji, "👍");
+    assert_eq!(alice_reactions[0].count, 1);
+    assert!(!alice_reactions[0].mine);
+
+    // Alice reacts with the same emoji: both current reactions aggregate.
+    alice
+        .toggle_reaction(&alice_group, &target, "👍")
+        .await
+        .expect("alice reacts");
+    let alice_view = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(alice_view[0].reactions.len(), 1);
+    assert_eq!(alice_view[0].reactions[0].count, 2);
+    assert!(alice_view[0].reactions[0].mine);
+
+    // Toggling the same emoji again clears only Alice's reaction, even within
+    // the same wall-clock second (seq tie-break).
+    alice
+        .toggle_reaction(&alice_group, &target, "👍")
+        .await
+        .expect("alice untoggles");
+    let alice_view = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(alice_view[0].reactions.len(), 1);
+    assert_eq!(alice_view[0].reactions[0].count, 1);
+    assert!(
+        !alice_view[0].reactions[0].mine,
+        "alice's own reaction cleared"
+    );
+
+    // A different emoji replaces (Signal semantics: one reaction per person).
+    bob.toggle_reaction(&bob_group, &target, "❤️")
+        .await
+        .expect("bob replaces");
+    let bob_view = bob.messages(&bob_group).expect("bob messages");
+    assert_eq!(bob_view[0].reactions.len(), 1, "old emoji replaced");
+    assert_eq!(bob_view[0].reactions[0].emoji, "❤️");
+    assert_eq!(bob_view[0].reactions[0].count, 1);
+    assert!(bob_view[0].reactions[0].mine);
+
+    // Alice converges on the replacement after sync; re-sync is idempotent.
+    let mut converged = Vec::new();
+    for _ in 0..20 {
+        alice.sync().await.expect("alice re-syncs");
+        converged = alice.messages(&alice_group).expect("alice messages")[0]
+            .reactions
+            .clone();
+        if converged.len() == 1 && converged[0].emoji == "❤️" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(converged.len(), 1);
+    assert_eq!(converged[0].emoji, "❤️");
+    assert_eq!(converged[0].count, 1);
+    assert!(!converged[0].mine);
+    alice.sync().await.expect("alice re-syncs again");
+    let alice_view = alice.messages(&alice_group).expect("alice messages");
+    assert_eq!(
+        alice_view[0].reactions, converged,
+        "duplicate sync is idempotent"
+    );
+    assert_eq!(
+        alice_view.len(),
+        1,
+        "reactions never created transcript rows"
+    );
+}

@@ -559,6 +559,55 @@ private struct SNMessageStatusFooter: View {
     }
 }
 
+/// Signal-style quick tapback choices, shown before the full emoji picker.
+let snQuickReactions = ["❤️", "👍", "👎", "😂", "😮", "😢"]
+
+/// Compact `emoji count` chip row under a bubble (count hidden when 1, the
+/// local user's reaction highlighted with the accent). Tap a chip to toggle
+/// that emoji.
+struct SNReactionChips: View {
+    let reactions: [MessageReaction]
+    let mine: Bool
+    var onToggle: ((String) -> Void)? = nil
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(reactions, id: \.self) { reaction in
+                Button {
+                    onToggle?(reaction.emoji)
+                } label: {
+                    HStack(spacing: 3) {
+                        Text(verbatim: reaction.emoji)
+                            .font(.system(size: 13))
+                        if reaction.count > 1 {
+                            Text(verbatim: "\(reaction.count)")
+                                .font(SonarTheme.uiFont(size: 11, weight: .semibold))
+                                .foregroundColor(reaction.mine ? SonarTheme.accentDeep : SonarTheme.text2)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        Capsule()
+                            .fill(reaction.mine ? SonarTheme.accentSoft : SonarTheme.surface2)
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    reaction.mine ? SonarTheme.accent : SonarTheme.hairline,
+                                    lineWidth: 1
+                                )
+                            )
+                    )
+                }
+                .buttonStyle(SNScaleStyle(scale: 0.94))
+                .disabled(onToggle == nil)
+                .accessibilityLabel("\(reaction.emoji), \(reaction.count) \(reaction.count == 1 ? "reaction" : "reactions")")
+            }
+        }
+        .padding(.top, 3)
+        .padding(mine ? .trailing : .leading, 6)
+    }
+}
+
 struct SNMsgBubble: View {
     let m: SNMessage
     let preview: SonarTranscriptTextPreview
@@ -570,6 +619,11 @@ struct SNMsgBubble: View {
     let maxBubbleWidth: CGFloat
     /// Tap another participant's name/bubble to open a private DM (channels).
     var onTapAuthor: ((SNMessage) -> Void)? = nil
+    /// Toggle an emoji reaction on this message (nil = reactions unavailable,
+    /// e.g. public channels). Also enables the tapback row in the long-press menu.
+    var onToggleReaction: ((String) -> Void)? = nil
+    /// Open the full emoji picker to react ("+" in the tapback row).
+    var onMoreReactions: (() -> Void)? = nil
 
     @Environment(\.openURL) private var openURL
 
@@ -657,7 +711,11 @@ struct SNMsgBubble: View {
                     .lineSpacing(16 * 0.2)
                     .foregroundColor(bubbleText)
                     .tint(mine ? bubbleText : SonarTheme.accentDeep)
-                    .textSelection(.enabled)
+                    // Text selection's own long-press would swallow the
+                    // tapback long-press, so the two are mutually exclusive
+                    // (Compose mirrors this): Copy moves into the bubble-wide
+                    // context menu below whenever reactions are available.
+                    .textSelection(onToggleReaction == nil ? .enabled : .disabled)
                 HStack(spacing: 3) {
                     Text(verbatim: m.time)
                         .font(SonarTheme.uiFont(size: 10.5))
@@ -691,6 +749,45 @@ struct SNMsgBubble: View {
                     .fill(bubbleFill)
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
+            .contentShape(bubbleShape)
+            .contextMenu {
+                // Tapback row: quick emoji + full picker, on the platform
+                // long-press affordance (keeps link taps + copy intact).
+                if let onToggleReaction {
+                    if #available(iOS 17.0, macOS 14.0, *) {
+                        ControlGroup {
+                            ForEach(snQuickReactions, id: \.self) { emoji in
+                                Button { onToggleReaction(emoji) } label: { Text(verbatim: emoji) }
+                            }
+                        }
+                        .controlGroupStyle(.palette)
+                    } else {
+                        ForEach(snQuickReactions, id: \.self) { emoji in
+                            Button { onToggleReaction(emoji) } label: { Text(verbatim: emoji) }
+                        }
+                    }
+                    if let onMoreReactions {
+                        Button {
+                            onMoreReactions()
+                        } label: {
+                            Label("More reactions…", systemImage: "face.smiling")
+                        }
+                    }
+                    Divider()
+                    Button {
+                        SNMsgBubble.copyToClipboard(m.text)
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                    if let url = firstURL {
+                        Button {
+                            openURL(url)
+                        } label: {
+                            Label("Open link", systemImage: "safari")
+                        }
+                    }
+                }
+            }
             if preview.isTruncated {
                 Button(isExpanded
                        ? String(localized: "content.message.show_less")
@@ -703,6 +800,9 @@ struct SNMsgBubble: View {
                 .buttonStyle(.plain)
                 .frame(minHeight: 44)
                 .padding(.horizontal, 6)
+            }
+            if !m.reactions.isEmpty {
+                SNReactionChips(reactions: m.reactions, mine: mine, onToggle: onToggleReaction)
             }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
@@ -1353,6 +1453,10 @@ struct SNMsgList: View {
     /// this — hydration can publish one transport leg before the folded White
     /// Noise groups merge in, and the missing rows are exactly the unread ones.
     var expectedNewestDate: Date? = nil
+    /// Toggle an emoji reaction on a message (nil = reactions unavailable).
+    var onToggleReaction: ((SNMessage, String) -> Void)? = nil
+    /// Open the full emoji picker to react to a message.
+    var onMoreReactions: ((SNMessage) -> Void)? = nil
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -1614,7 +1718,13 @@ struct SNMsgList: View {
                                     showState: m.mine && (i == msgs.count - 1 || m.state == "Couldn't send"),
                                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                                     maxBubbleWidth: geo.size.width * 0.78,
-                                    onTapAuthor: onTapAuthor
+                                    onTapAuthor: onTapAuthor,
+                                    onToggleReaction: onToggleReaction == nil
+                                        ? nil
+                                        : { emoji in onToggleReaction?(m, emoji) },
+                                    onMoreReactions: onMoreReactions == nil
+                                        ? nil
+                                        : { onMoreReactions?(m) }
                                 )
                             }
                             }

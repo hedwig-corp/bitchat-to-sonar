@@ -124,6 +124,8 @@ const STICKER_REF_PREFETCH_CONCURRENCY: usize = 2;
 const STICKER_PREFETCH_CANCEL_POLL: Duration = Duration::from_millis(25);
 const SONAR_DIRECT_DM_DESCRIPTION: &str = "sonar.direct-dm.v1";
 
+use crate::marmot::MESH_REACTION_LINE_PREFIX;
+
 /// Shared HTTP client for Blossom media downloads. Built once so every blob
 /// reuses keep-alive connections + the TLS session cache instead of paying a
 /// fresh connect + handshake per download (the White Noise reference client
@@ -3237,6 +3239,11 @@ impl SonarClient {
     /// state; it does not gate transcript visibility.
     pub async fn send_text(&self, group_id: &GroupId, text: &str) -> Result<()> {
         let local_started = Instant::now();
+        // A mesh-referencing reaction riding this leg as a ⚡REACT control
+        // line is a reaction, not user text: it must not clobber the sender's
+        // chat-list preview and must not fire a "new message" push wakeup
+        // (mirrors the receive-side drain special-case).
+        let is_mesh_reaction_line = text.starts_with(MESH_REACTION_LINE_PREFIX);
         // One MLS write guard covers encrypt + local-row write, so a
         // concurrently drained commit cannot land in between now that sends
         // no longer share the host's serialized engine queue with sync.
@@ -3264,6 +3271,10 @@ impl SonarClient {
         let publish_ack =
             self.spawn_outbox_publish(message.id.to_hex(), group_id_hex.clone(), event);
         self.notify_conversation_changed(&group_id_hex);
+        if is_mesh_reaction_line {
+            self.spawn_reaction_bookkeeping(event_id);
+            return Ok(());
+        }
         // Deferred bookkeeping: index + sync-state disk writes don't block
         // the caller so the next send can start immediately.
         self.spawn_send_bookkeeping(group_name, message, event_id);
@@ -4458,8 +4469,9 @@ impl SonarClient {
     }
 
     fn record_delivery_for_incoming(&self, incoming: &Incoming) {
-        let Incoming::Message(message) = incoming else {
-            return;
+        let message = match incoming {
+            Incoming::Message(message) | Incoming::Reaction(message) => message,
+            _ => return,
         };
         if !message.mine {
             return;
@@ -5651,7 +5663,9 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(
-                |group| match engine.messages_page(&group.mls_group_id, 1, 0) {
+                // Raw page: an emptiness probe must never pay the per-group
+                // reaction aggregation scan (cold-start sync path).
+                |group| match engine.messages_page_raw(&group.mls_group_id, 1, 0) {
                     Ok(page) if page.is_empty() => Some(hex::encode(group.nostr_group_id)),
                     _ => None,
                 },
@@ -5689,8 +5703,10 @@ impl SonarClient {
         groups
             .into_iter()
             .filter_map(|group| {
+                // Raw page: an emptiness probe must never pay the per-group
+                // reaction aggregation scan (cold-start sync path).
                 let has_local_chat = engine
-                    .messages_page(&group.mls_group_id, 1, 0)
+                    .messages_page_raw(&group.mls_group_id, 1, 0)
                     .map(|page| !page.is_empty())
                     .unwrap_or(false);
                 if !has_local_chat {
@@ -6455,10 +6471,34 @@ impl SonarClient {
                     self.mark_sync_event_processed(&event.id);
                     report.record_processed();
                 }
+                Ok(ref incoming @ Incoming::Reaction(ref message)) => {
+                    // Reactions update the transcript aggregates only: refresh
+                    // the conversation so open UIs refetch, but never index
+                    // (chat-list preview) or notify.
+                    self.record_delivery_for_incoming(incoming);
+                    changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                    self.mark_sync_event_processed(&event.id);
+                    report.record_processed();
+                }
                 Ok(ref incoming @ Incoming::Message(ref message)) => {
                     self.record_delivery_for_incoming(incoming);
                     if let Some(sticker_ref) = &message.sticker_ref {
                         sticker_refs.push(sticker_ref.clone());
+                    }
+                    // Mesh-referencing reactions ride the Marmot fallback leg
+                    // as `⚡REACT|…` control lines inside a normal kind-9 (a
+                    // kind-7 e-tag cannot reference a mesh message id). Treat
+                    // them like kind-7 reactions: refresh only — no chat-list
+                    // preview/unread churn and no notification. Trust note: a
+                    // peer could prefix ordinary text to skip their own
+                    // message's notification, which only suppresses their own
+                    // send (content is peer-controlled anyway) and the app
+                    // layers hide `⚡REACT|` lines from transcripts regardless.
+                    if message.content.starts_with(MESH_REACTION_LINE_PREFIX) {
+                        changed_groups.insert(hex::encode(message.group_id.as_slice()));
+                        self.mark_sync_event_processed(&event.id);
+                        report.record_processed();
+                        continue;
                     }
                     let cached_name = group_names
                         .get(message.group_id.as_slice())
@@ -8012,6 +8052,7 @@ mod tests {
             media,
             sticker_ref: None,
             classification: crate::marmot::MessageClassification::Text,
+            reactions: Vec::new(),
         };
         // Caption/text always wins.
         assert_eq!(

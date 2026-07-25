@@ -1853,6 +1853,16 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func verifyNip05(address: String, npub: String) throws  -> Bool
 
     /**
+     * Toggle the local user's emoji reaction on a message (Signal tapback
+     * semantics): reacting with the same emoji again clears it, a different
+     * emoji replaces it. Aggregated state comes back on
+     * `MessageInfo.reactions` from the message read paths.
+     */
+    func toggleReaction(groupIdHex: String, targetMessageIdHex: String, emoji: String) throws
+
+    func uninstallStickerPack(coordinate: String) throws
+
+    /**
      * Block until a live Marmot event (welcome or group message) has been pushed
      * by the relay subscriptions, or `timeout_secs` elapses. Returns true if
      * there is something to drain. Touches NO MLS state, so the host may call it
@@ -2957,6 +2967,22 @@ open func syncStateSnapshotJson()throws  -> String  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+
+    /**
+     * Toggle the local user's emoji reaction on a message (Signal tapback
+     * semantics): reacting with the same emoji again clears it, a different
+     * emoji replaces it. Aggregated state comes back on
+     * `MessageInfo.reactions` from the message read paths.
+     */
+open func toggleReaction(groupIdHex: String, targetMessageIdHex: String, emoji: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_toggle_reaction(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupIdHex),
+        FfiConverterString.lower(targetMessageIdHex),
+        FfiConverterString.lower(emoji),$0
+    )
+}
 }
 
 open func uninstallStickerPack(coordinate: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -4484,6 +4510,11 @@ public struct MessageInfo: Equatable, Hashable {
      * Precomputed content classification (pay/call control vs plain text).
      */
     public var classification: MessageClassInfo
+    /**
+     * Aggregated emoji reactions on this message, sorted by
+     * (count desc, emoji asc). Empty when nobody reacted.
+     */
+    public var reactions: [ReactionInfo]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -4502,7 +4533,11 @@ public struct MessageInfo: Equatable, Hashable {
          */stickerRef: StickerRefInfo?,
         /**
          * Precomputed content classification (pay/call control vs plain text).
-         */classification: MessageClassInfo) {
+         */classification: MessageClassInfo,
+        /**
+         * Aggregated emoji reactions on this message, sorted by
+         * (count desc, emoji asc). Empty when nobody reacted.
+         */reactions: [ReactionInfo]) {
         self.idHex = idHex
         self.senderNpub = senderNpub
         self.content = content
@@ -4512,6 +4547,7 @@ public struct MessageInfo: Equatable, Hashable {
         self.media = media
         self.stickerRef = stickerRef
         self.classification = classification
+        self.reactions = reactions
     }
 
 
@@ -4538,7 +4574,8 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
                 deliveryState: FfiConverterString.read(from: &buf),
                 media: FfiConverterSequenceTypeMediaInfo.read(from: &buf),
                 stickerRef: FfiConverterOptionTypeStickerRefInfo.read(from: &buf),
-                classification: FfiConverterTypeMessageClassInfo.read(from: &buf)
+                classification: FfiConverterTypeMessageClassInfo.read(from: &buf),
+                reactions: FfiConverterSequenceTypeReactionInfo.read(from: &buf)
         )
     }
 
@@ -4552,6 +4589,7 @@ public struct FfiConverterTypeMessageInfo: FfiConverterRustBuffer {
         FfiConverterSequenceTypeMediaInfo.write(value.media, into: &buf)
         FfiConverterOptionTypeStickerRefInfo.write(value.stickerRef, into: &buf)
         FfiConverterTypeMessageClassInfo.write(value.classification, into: &buf)
+        FfiConverterSequenceTypeReactionInfo.write(value.reactions, into: &buf)
     }
 }
 
@@ -4695,6 +4733,73 @@ public func FfiConverterTypeProfileInfo_lift(_ buf: RustBuffer) throws -> Profil
 #endif
 public func FfiConverterTypeProfileInfo_lower(_ value: ProfileInfo) -> RustBuffer {
     return FfiConverterTypeProfileInfo.lower(value)
+}
+
+
+/**
+ * FFI-friendly aggregated reaction state for one emoji on one message.
+ */
+public struct ReactionInfo: Equatable, Hashable {
+    public var emoji: String
+    public var count: UInt32
+    /**
+     * True when the local identity's current reaction is this emoji.
+     */
+    public var mine: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(emoji: String, count: UInt32,
+        /**
+         * True when the local identity's current reaction is this emoji.
+         */mine: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.mine = mine
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ReactionInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReactionInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReactionInfo {
+        return
+            try ReactionInfo(
+                emoji: FfiConverterString.read(from: &buf),
+                count: FfiConverterUInt32.read(from: &buf),
+                mine: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReactionInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.emoji, into: &buf)
+        FfiConverterUInt32.write(value.count, into: &buf)
+        FfiConverterBool.write(value.mine, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionInfo_lift(_ buf: RustBuffer) throws -> ReactionInfo {
+    return try FfiConverterTypeReactionInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionInfo_lower(_ value: ReactionInfo) -> RustBuffer {
+    return FfiConverterTypeReactionInfo.lower(value)
 }
 
 
@@ -7379,6 +7484,31 @@ fileprivate struct FfiConverterSequenceTypeMessageInfo: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeReactionInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ReactionInfo]
+
+    public static func write(_ value: [ReactionInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeReactionInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ReactionInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ReactionInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeReactionInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeRecentMessagePageInfo: FfiConverterRustBuffer {
     typealias SwiftType = [RecentMessagePageInfo]
 
@@ -8423,6 +8553,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_state_snapshot_json() != 50844) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_toggle_reaction() != 4569) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_uninstall_sticker_pack() != 43475) {

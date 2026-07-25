@@ -14,6 +14,7 @@
 //!   has been published; see MDK docs.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::Path;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
@@ -34,6 +35,29 @@ use crate::{Error, Result};
 /// Kind used for the inner chat rumor inside a 445 (matches White Noise / the
 /// MDK examples: NIP-C7-style chat message).
 pub const CHAT_RUMOR_KIND: u16 = 9;
+
+/// Kind used for the inner reaction rumor inside a 445 (NIP-25). The rumor
+/// content is the emoji itself; an empty content clears the sender's previous
+/// reaction on the same target (last-write-wins per sender, see
+/// [`MarmotEngine::attach_reactions`]).
+pub const REACTION_RUMOR_KIND: u16 = 7;
+
+/// Upper bound (in Unicode scalar values) accepted for a reaction emoji.
+/// Generous enough for ZWJ sequences / skin tones / flags, small enough to
+/// reject text smuggled through a reaction rumor.
+pub const REACTION_EMOJI_MAX_CHARS: usize = 16;
+
+/// App-layer mesh reaction control line (`⚡REACT|1|<meshMsgId>|<emoji>|<verb>`).
+/// It rides the Marmot fallback leg as normal kind-9 content when the peer is
+/// out of BLE range. Such rows stay in transcript pages (the apps fold them
+/// onto their mesh targets) but must never drive chat recency, previews, or
+/// per-chat resync floors — they are reactions, not chat messages.
+pub(crate) const MESH_REACTION_LINE_PREFIX: &str = "⚡REACT|";
+
+/// True when a stored kind-9 row is really a mesh-referencing reaction line.
+fn is_mesh_reaction_row(content: &str) -> bool {
+    content.starts_with(MESH_REACTION_LINE_PREFIX)
+}
 
 /// Marmot KeyPackage event kind (MIP-00). nostr 0.44 has no named constant
 /// for the modern addressable kind (Kind::MlsKeyPackage is the legacy 443).
@@ -188,6 +212,16 @@ impl MessageClassification {
     }
 }
 
+/// Aggregated reaction state for one emoji on one message: how many members'
+/// current reaction is this emoji, and whether one of them is the local user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: u32,
+    /// True when the local identity's current reaction is this emoji.
+    pub mine: bool,
+}
+
 /// A decrypted application message, mapped to a small FFI-friendly shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -207,6 +241,9 @@ pub struct ChatMessage {
     /// Content classification (pay/call control vs plain text), precomputed so
     /// hosts never parse `content` on the render path.
     pub classification: MessageClassification,
+    /// Aggregated kind-7 reactions targeting this message, sorted by
+    /// (count desc, emoji asc). Empty unless a read path attached them.
+    pub reactions: Vec<ReactionSummary>,
 }
 
 /// Compare render messages in the stable newest-first order used by transcript
@@ -255,6 +292,12 @@ pub struct RecentMessagePage {
 pub enum Incoming {
     /// A decrypted chat message (already persisted in MDK storage).
     Message(ChatMessage),
+    /// A decrypted kind-7 reaction rumor (already persisted in MDK storage).
+    /// `content` is the emoji (empty = the sender cleared their reaction) and
+    /// the target message id is in the rumor's `e` tag. Reactions never create
+    /// transcript rows or user notifications; the UI refreshes via
+    /// conversation-changed invalidation.
+    Reaction(ChatMessage),
     /// A group-membership/welcome change was applied; no chat content.
     GroupUpdated(GroupId),
     /// A multi-member welcome was stored and is waiting for user acceptance.
@@ -302,6 +345,10 @@ macro_rules! dispatch {
     };
 }
 
+/// Aggregated per-sender reaction state for one group (see
+/// [`MarmotEngine::latest_reactions_by_sender`]).
+type ReactionMap = HashMap<(EventId, PublicKey), LatestReaction>;
+
 /// The Marmot engine: one per identity, owns MLS group state via MDK.
 pub struct MarmotEngine {
     storage: Storage,
@@ -313,6 +360,12 @@ pub struct MarmotEngine {
     /// is never held across an await, so a concurrent send waits for at most
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
+    /// Per-group reaction aggregate cache, keyed by group id bytes. Reactions
+    /// are read on every transcript page but change rarely, so the bounded
+    /// kind-7 scan runs once per group and is invalidated whenever a kind-7
+    /// rumor is processed for that group (own send echo or remote receive).
+    /// Keeps the Signal-comparable read paths free of repeated history scans.
+    reactions_cache: std::sync::Mutex<HashMap<Vec<u8>, std::sync::Arc<ReactionMap>>>,
 }
 
 impl MarmotEngine {
@@ -323,6 +376,7 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            reactions_cache: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -371,6 +425,7 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            reactions_cache: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -630,6 +685,46 @@ impl MarmotEngine {
         Ok((event, incoming))
     }
 
+    /// Encrypt a NIP-25 reaction into a signed kind-445 event for `group_id`.
+    /// The kind-7 rumor carries the emoji as content and the target message id
+    /// as an `e` tag. An empty `emoji` clears the sender's previous reaction on
+    /// `target` (our in-group removal convention; aggregation is
+    /// last-write-wins per sender).
+    ///
+    /// Rumor timestamps have seconds resolution, so a quick toggle (react →
+    /// clear within one second) would make last-write-wins nondeterministic.
+    /// Each reaction therefore carries a per-(sender, target) monotonic `seq`
+    /// tag derived from the sender's own previous reaction; aggregation orders
+    /// by (seq, created_at, id).
+    pub fn create_reaction_message(
+        &self,
+        group_id: &GroupId,
+        target: &EventId,
+        emoji: &str,
+    ) -> Result<Event> {
+        let emoji = emoji.trim();
+        if emoji.chars().count() > REACTION_EMOJI_MAX_CHARS {
+            return Err(Error::InvalidInput(format!(
+                "reaction emoji too long ({} chars, max {REACTION_EMOJI_MAX_CHARS})",
+                emoji.chars().count()
+            )));
+        }
+        let seq = self
+            .latest_reactions_by_sender(group_id)?
+            .get(&(*target, self.identity.public_key()))
+            .map(|r| r.seq.saturating_add(1))
+            .unwrap_or(1);
+        let rumor = EventBuilder::new(Kind::Custom(REACTION_RUMOR_KIND), emoji)
+            .tags([
+                Tag::event(*target),
+                Tag::custom(TagKind::custom("seq"), [seq.to_string()]),
+            ])
+            .build(self.identity.public_key());
+        let event = dispatch!(&self.storage, |mdk| mdk
+            .create_message(group_id, rumor, None))?;
+        Ok(event)
+    }
+
     // ── Encrypted media (Marmot MIP-04) ───────────────────────────────────
     //
     // MDK does the crypto (key from the group exporter secret) and the `imeta`
@@ -812,7 +907,12 @@ impl MarmotEngine {
     fn process_group_message(&self, event: &Event) -> Result<Incoming> {
         match dispatch!(&self.storage, |mdk| mdk.process_message(event))? {
             MessageProcessingResult::ApplicationMessage(msg) => {
-                Ok(Incoming::Message(self.to_chat_message(msg)))
+                if msg.kind.as_u16() == REACTION_RUMOR_KIND {
+                    self.invalidate_reactions_cache(&msg.mls_group_id);
+                    Ok(Incoming::Reaction(self.to_chat_message(msg)))
+                } else {
+                    Ok(Incoming::Message(self.to_chat_message(msg)))
+                }
             }
             MessageProcessingResult::Commit { mls_group_id }
             | MessageProcessingResult::PendingProposal { mls_group_id } => {
@@ -965,7 +1065,7 @@ impl MarmotEngine {
     /// Decrypted message history for a group (storage-backed).
     pub fn messages(&self, group_id: &GroupId) -> Result<Vec<ChatMessage>> {
         let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, None))?;
-        Ok(msgs
+        let mut messages: Vec<ChatMessage> = msgs
             .into_iter()
             // Only surface real chat messages (kind-9). MDK's store ALSO keeps
             // non-chat entries (group-membership / commit / proposal / reaction
@@ -973,14 +1073,31 @@ impl MarmotEngine {
             // as empty message bubbles in the UI.
             .filter(|m| m.kind.as_u16() == CHAT_RUMOR_KIND)
             .map(|m| self.to_chat_message(m))
-            .collect())
+            .collect();
+        self.attach_reactions(group_id, &mut messages)?;
+        Ok(messages)
+    }
+
+    /// Bounded decrypted chat-message window for a group, newest window first
+    /// before caller-side display sorting, with aggregated reactions attached.
+    pub fn messages_page(
+        &self,
+        group_id: &GroupId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        let mut messages = self.messages_page_raw(group_id, limit, offset)?;
+        self.attach_reactions(group_id, &mut messages)?;
+        Ok(messages)
     }
 
     /// Bounded decrypted chat-message window for a group, newest window first
     /// before caller-side display sorting. Offset counts chat messages, not raw
     /// MDK storage rows, because MDK stores commits/proposals beside kind-9
-    /// application messages.
-    pub fn messages_page(
+    /// application messages. Reactions are NOT attached; internal scan loops
+    /// and preview-only readers use this so the kind-7 aggregation never runs
+    /// where its result would be discarded.
+    pub(crate) fn messages_page_raw(
         &self,
         group_id: &GroupId,
         limit: usize,
@@ -1177,7 +1294,157 @@ impl MarmotEngine {
 
         candidates.sort_unstable_by(compare_message_cursor_desc);
         candidates.truncate(limit);
+        self.attach_reactions(group_id, &mut candidates)?;
         Ok(candidates)
+    }
+
+    // ── Reactions (NIP-25 kind-7 rumors) ──────────────────────────────────
+    //
+    // MDK stores kind-7 rumors beside kind-9 chat rows; they never become
+    // transcript rows. Aggregation is last-write-wins per (target, sender):
+    // a member's newest kind-7 for a target is their current reaction, and an
+    // empty content clears it. The scan is bounded to the same newest-first
+    // window as transcript paging, so reactions never trigger a full-history
+    // scan on the read path (Signal-comparable local-first rule).
+
+    /// Latest kind-7 reaction per (target message, sender) inside the bounded
+    /// newest-first scan window. Cached per group; the scan reruns only after
+    /// [`Self::invalidate_reactions_cache`] (a kind-7 was processed).
+    ///
+    /// Known v1 limitation: the scan window is the newest
+    /// [`MESSAGE_PAGE_RAW_SCAN_LIMIT`] raw rows — reactions on (or from)
+    /// history older than that window do not aggregate, matching the bounded
+    /// window transcript paging itself uses.
+    fn latest_reactions_by_sender(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<std::sync::Arc<ReactionMap>> {
+        let cache_key = group_id.as_slice().to_vec();
+        if let Some(cached) = self.reactions_cache.lock().unwrap().get(&cache_key) {
+            return Ok(cached.clone());
+        }
+        let mut latest: ReactionMap = HashMap::new();
+        let mut raw_offset = 0usize;
+        let mut raw_scanned = 0usize;
+        while raw_scanned < MESSAGE_PAGE_RAW_SCAN_LIMIT {
+            let remaining_scan = MESSAGE_PAGE_RAW_SCAN_LIMIT - raw_scanned;
+            let batch_limit = 500.min(remaining_scan);
+            let page = Pagination::with_sort_order(
+                Some(batch_limit),
+                Some(raw_offset),
+                MessageSortOrder::CreatedAtFirst,
+            );
+            let msgs = dispatch!(&self.storage, |mdk| mdk.get_messages(group_id, Some(page)))?;
+            if msgs.is_empty() {
+                break;
+            }
+
+            let raw_len = msgs.len();
+            raw_scanned += raw_len;
+            raw_offset += raw_len;
+            for m in msgs {
+                if m.kind.as_u16() != REACTION_RUMOR_KIND {
+                    continue;
+                }
+                let Some(target) = reaction_target(&m.tags) else {
+                    continue;
+                };
+                let emoji = m.content.trim();
+                if emoji.chars().count() > REACTION_EMOJI_MAX_CHARS {
+                    // Ignore text smuggled through a reaction rumor.
+                    continue;
+                }
+                let candidate = LatestReaction {
+                    seq: reaction_seq(&m.tags),
+                    created_at: m.created_at,
+                    id: m.id,
+                    emoji: emoji.to_string(),
+                };
+                let key = (target, m.pubkey);
+                let newer = match latest.get(&key) {
+                    // A sender's reactions on one target are ordered by their
+                    // own monotonic seq; created_at then id break ties so
+                    // replays converge on the same winner on every device.
+                    Some(current) => candidate.ordering_key() > current.ordering_key(),
+                    None => true,
+                };
+                if newer {
+                    latest.insert(key, candidate);
+                }
+            }
+            if raw_len < batch_limit {
+                break;
+            }
+        }
+        let map = std::sync::Arc::new(latest);
+        self.reactions_cache
+            .lock()
+            .unwrap()
+            .insert(cache_key, map.clone());
+        Ok(map)
+    }
+
+    /// Drop the cached reaction aggregate for `group_id`. Called whenever a
+    /// kind-7 rumor is processed for the group (own echo or remote receive)
+    /// and when the group is deleted.
+    fn invalidate_reactions_cache(&self, group_id: &GroupId) {
+        self.reactions_cache
+            .lock()
+            .unwrap()
+            .remove(group_id.as_slice());
+    }
+
+    /// Attach aggregated reaction summaries to each message in `messages`.
+    /// Reads the cached per-group aggregate (one bounded kind-7 scan on cache
+    /// miss); no-op when the group has none.
+    pub fn attach_reactions(&self, group_id: &GroupId, messages: &mut [ChatMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let latest = self.latest_reactions_by_sender(group_id)?;
+        if latest.is_empty() {
+            return Ok(());
+        }
+        let me = self.identity.public_key();
+        // target -> emoji -> (count, mine)
+        let mut per_target: HashMap<EventId, HashMap<String, (u32, bool)>> = HashMap::new();
+        for ((target, sender), reaction) in latest.iter() {
+            if reaction.emoji.is_empty() {
+                continue; // cleared reaction
+            }
+            let entry = per_target
+                .entry(*target)
+                .or_default()
+                .entry(reaction.emoji.clone())
+                .or_insert((0, false));
+            entry.0 += 1;
+            entry.1 |= *sender == me;
+        }
+        for message in messages.iter_mut() {
+            let Some(by_emoji) = per_target.get(&message.id) else {
+                continue;
+            };
+            let mut summaries: Vec<ReactionSummary> = by_emoji
+                .iter()
+                .map(|(emoji, (count, mine))| ReactionSummary {
+                    emoji: emoji.clone(),
+                    count: *count,
+                    mine: *mine,
+                })
+                .collect();
+            summaries.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.emoji.cmp(&b.emoji)));
+            message.reactions = summaries;
+        }
+        Ok(())
+    }
+
+    /// The local identity's current reaction on `target`, if any.
+    pub fn my_reaction(&self, group_id: &GroupId, target: &EventId) -> Result<Option<String>> {
+        let latest = self.latest_reactions_by_sender(group_id)?;
+        Ok(latest
+            .get(&(*target, self.identity.public_key()))
+            .map(|r| r.emoji.clone())
+            .filter(|emoji| !emoji.is_empty()))
     }
 
     /// Latest local transcript windows for the most recent groups. This is the
@@ -1195,8 +1462,16 @@ impl MarmotEngine {
 
         let mut pages = Vec::new();
         for group in self.groups()? {
-            let messages = self.messages_page(&group.mls_group_id, page_limit, 0)?;
-            let Some(latest_created_at) = messages.iter().map(|m| m.created_at).max() else {
+            let messages = self.messages_page_raw(&group.mls_group_id, page_limit, 0)?;
+            // Recency comes from real chat rows only: a mesh-referencing
+            // ⚡REACT fallback line must never bump/reorder a conversation
+            // (the rows stay in the page so hosts can fold them).
+            let Some(latest_created_at) = messages
+                .iter()
+                .filter(|m| !is_mesh_reaction_row(&m.content))
+                .map(|m| m.created_at)
+                .max()
+            else {
                 continue;
             };
             pages.push(RecentMessagePage {
@@ -1212,6 +1487,12 @@ impl MarmotEngine {
                 .then_with(|| a.group_id.as_slice().cmp(b.group_id.as_slice()))
         });
         pages.truncate(group_limit);
+        // Attach reactions only to the surviving top groups so chat-list
+        // hydration never pays the kind-7 scan for groups it discards.
+        for page in &mut pages {
+            let group_id = page.group_id.clone();
+            self.attach_reactions(&group_id, &mut page.messages)?;
+        }
         Ok(pages)
     }
 
@@ -1330,7 +1611,14 @@ impl MarmotEngine {
             raw_scanned += raw_len;
             raw_offset += raw_len;
             for m in msgs {
-                if m.kind.as_u16() == CHAT_RUMOR_KIND && m.pubkey != me {
+                // A remote ⚡REACT fallback row is a reaction, not a chat
+                // message: letting it advance this floor could hide an earlier
+                // missed peer message from relay resync (the same failure
+                // class as the sync-watermark pinning bug).
+                if m.kind.as_u16() == CHAT_RUMOR_KIND
+                    && m.pubkey != me
+                    && !is_mesh_reaction_row(&m.content)
+                {
                     return Some(m.created_at.as_secs());
                 }
             }
@@ -1348,6 +1636,7 @@ impl MarmotEngine {
     /// deleting a conversation in Signal/iMessage). Idempotent.
     pub fn delete_group(&self, group_id: &GroupId) -> Result<()> {
         let _mls = self.mls_write();
+        self.invalidate_reactions_cache(group_id);
         Ok(dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?)
     }
 
@@ -1412,8 +1701,49 @@ impl MarmotEngine {
             },
             media,
             sticker_ref,
+            reactions: Vec::new(),
         }
     }
+}
+
+/// A sender's newest kind-7 reaction on one target message.
+struct LatestReaction {
+    seq: u64,
+    created_at: Timestamp,
+    id: EventId,
+    emoji: String,
+}
+
+impl LatestReaction {
+    /// Total order for last-write-wins: the sender's own monotonic `seq`
+    /// dominates (single-writer per sender), then timestamp, then event id.
+    fn ordering_key(&self) -> (u64, Timestamp, [u8; 32]) {
+        (self.seq, self.created_at, *self.id.as_bytes())
+    }
+}
+
+/// Target message id of a reaction rumor: the first `e` tag, per NIP-25.
+fn reaction_target(tags: &Tags) -> Option<EventId> {
+    tags.iter().find_map(|t| {
+        let slice = t.as_slice();
+        if slice.first().map(|s| s.as_str()) != Some("e") {
+            return None;
+        }
+        slice.get(1).and_then(|hex| EventId::from_hex(hex).ok())
+    })
+}
+
+/// Per-sender monotonic sequence tag on a reaction rumor; 0 when absent.
+fn reaction_seq(tags: &Tags) -> u64 {
+    tags.iter()
+        .find_map(|t| {
+            let slice = t.as_slice();
+            if slice.first().map(|s| s.as_str()) != Some("seq") {
+                return None;
+            }
+            slice.get(1).and_then(|v| v.parse::<u64>().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// The database file plus the SQLite sidecar files that may exist alongside it.
@@ -1613,5 +1943,63 @@ mod classification_tests {
         );
         assert_eq!(C::of("☎CALL|not-a-version|X|y"), C::Text);
         assert_eq!(C::of("☎CALLING you later"), C::Text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tags(v: Vec<Vec<&str>>) -> Tags {
+        Tags::from_list(
+            v.into_iter()
+                .map(|t| Tag::parse(t).expect("valid tag"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn reaction_target_reads_first_e_tag() {
+        let id = EventId::all_zeros();
+        let t = tags(vec![
+            vec!["seq", "3"],
+            vec!["e", &id.to_hex()],
+            vec!["e", &EventId::from_slice(&[1u8; 32]).unwrap().to_hex()],
+        ]);
+        assert_eq!(reaction_target(&t), Some(id));
+    }
+
+    #[test]
+    fn reaction_target_ignores_malformed_tags() {
+        let t = tags(vec![vec!["e", "not-hex"], vec!["p", "abc"]]);
+        assert_eq!(reaction_target(&t), None);
+        assert_eq!(reaction_target(&Tags::new()), None);
+    }
+
+    #[test]
+    fn reaction_seq_defaults_to_zero_and_parses() {
+        assert_eq!(reaction_seq(&Tags::new()), 0);
+        assert_eq!(reaction_seq(&tags(vec![vec!["seq", "42"]])), 42);
+        assert_eq!(reaction_seq(&tags(vec![vec!["seq", "nope"]])), 0);
+    }
+
+    #[test]
+    fn latest_reaction_ordering_prefers_seq_over_timestamp() {
+        let older_but_higher_seq = LatestReaction {
+            seq: 2,
+            created_at: Timestamp::from_secs(100),
+            id: EventId::all_zeros(),
+            emoji: String::new(),
+        };
+        let newer_but_lower_seq = LatestReaction {
+            seq: 1,
+            created_at: Timestamp::from_secs(200),
+            id: EventId::from_slice(&[9u8; 32]).unwrap(),
+            emoji: "👍".into(),
+        };
+        // The sender's own monotonic counter wins: a clear (seq 2) issued in
+        // the same second as the reaction (seq 1) must stay the winner even
+        // if event ids or coarse timestamps would say otherwise.
+        assert!(older_but_higher_seq.ordering_key() > newer_but_lower_seq.ordering_key());
     }
 }

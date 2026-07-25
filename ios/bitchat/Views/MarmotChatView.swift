@@ -1875,8 +1875,12 @@ final class MarmotChatModel: ObservableObject {
     }
 
     func homeRowMessage(groupId: String) -> MarmotService.MarmotMessage? {
+        // ⚡REACT fallback lines are reactions, not chat messages: the core
+        // conversation index already excludes them from the summary, but the
+        // in-memory loaded page still has them, so they must never win here
+        // either — a tapback must not drive this row's recency/preview.
         snMarmotHomeRowMessage(
-            loaded: messagesByGroup[groupId]?.last,
+            loaded: messagesByGroup[groupId]?.last(where: { !SonarReactionMessage.isReactionLine($0.content) }),
             summary: conversationSummariesByGroup[groupId]
         )
     }
@@ -2623,6 +2627,22 @@ final class MarmotChatModel: ObservableObject {
         } catch {
             self.errorText = Self.describe(error)
             return nil
+        }
+    }
+
+    /// Toggle our NIP-25 emoji reaction on a message (Signal tapback semantics
+    /// in the core: same emoji clears, different emoji replaces). The core's
+    /// blocking call runs off-main inside MarmotService; the bounded page
+    /// reload paints the updated aggregates when it returns.
+    func toggleReaction(groupId: String, messageId: String, emoji: String) {
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.service.toggleReaction(groupId: groupId, messageId: messageId, emoji: emoji)
+                await self.loadLocalPage(groupId: groupId)
+            } catch {
+                SecureLogger.error("Marmot toggleReaction failed: \(error)", category: .session)
+            }
         }
     }
 
