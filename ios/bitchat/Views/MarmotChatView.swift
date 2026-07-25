@@ -2880,24 +2880,26 @@ final class MarmotChatModel: ObservableObject {
         )
         launchIndependentAccountWork { model, generation in
             var echoVisible = false
-            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+            let listener = SNMediaUploadListener { [weak model] pendingId, fraction in
                 Task { @MainActor in
-                    self?.noteMediaUploadProgress(pendingId, fraction)
+                    model?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
-            registerMediaUploadListener(echo.id, listener)
+            model.registerMediaUploadListener(echo.id, listener)
             do {
                 // Wait for a local Marmot node (`isConnected`), not relay
                 // (`isRelayConnected`). Blossom PUTs do not need relays; kind-445
                 // publish still goes through the durable outbox after the URL
                 // exists. Without this short wait, cold-start media can fail
                 // with notConnected before staging.
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await model.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                noteMediaUploadProgress(echo.id, 0)
-                appendOptimistic(echo, to: groupId)
+                guard model.isCurrentAccountWork(generation) else { return }
+                await model.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                guard model.isCurrentAccountWork(generation) else { return }
+                model.noteMediaUploadProgress(echo.id, 0)
+                model.appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
                 #if DEBUG
@@ -2907,7 +2909,7 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                try await service.sendMediaWithProgress(
+                try await model.service.sendMediaWithProgress(
                     groupId: groupId,
                     data: data,
                     filename: filename,
@@ -2923,7 +2925,8 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                clearMediaUploadListener(echo.id)
+                model.clearMediaUploadListener(echo.id)
+                guard model.isCurrentAccountWork(generation) else { return }
                 onComplete?()
                 await model.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
@@ -2937,11 +2940,15 @@ final class MarmotChatModel: ObservableObject {
                     // Owner (resume or prior send) still uploading — keep echo.
                     return
                 }
-                clearMediaUploadListener(echo.id)
-                discardOptimistic(id: echo.id, from: groupId)
+                // Release the listener and drop the echo even when the account
+                // moved on; only the user-visible failure row and errorText are
+                // skipped for retired work.
+                model.clearMediaUploadListener(echo.id)
+                model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
                 }
+                guard model.isCurrentAccountWork(generation) else { return }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
@@ -2996,20 +3003,22 @@ final class MarmotChatModel: ObservableObject {
         )
         launchIndependentAccountWork { model, generation in
             var echoVisible = false
-            let listener = SNMediaUploadListener { [weak self] pendingId, fraction in
+            let listener = SNMediaUploadListener { [weak model] pendingId, fraction in
                 Task { @MainActor in
-                    self?.noteMediaUploadProgress(pendingId, fraction)
+                    model?.noteMediaUploadProgress(pendingId, fraction)
                 }
             }
-            registerMediaUploadListener(echo.id, listener)
+            model.registerMediaUploadListener(echo.id, listener)
             do {
                 // Same as sendMedia: local node only — not `ensureRelayConnected`.
-                guard await ensureConnected(timeoutSeconds: 2) else {
+                guard await model.ensureConnected(timeoutSeconds: 2) else {
                     throw MarmotService.ServiceError.notConnected
                 }
-                await loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
-                noteMediaUploadProgress(echo.id, 0)
-                appendOptimistic(echo, to: groupId)
+                guard model.isCurrentAccountWork(generation) else { return }
+                await model.loadLocalPage(groupId: groupId, mode: .preserveHistoricalWindow)
+                guard model.isCurrentAccountWork(generation) else { return }
+                model.noteMediaUploadProgress(echo.id, 0)
+                model.appendOptimistic(echo, to: groupId)
                 echoVisible = true
                 onEchoVisible?()
                 #if DEBUG
@@ -3020,7 +3029,7 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                try await service.sendMediaMultiWithProgress(
+                try await model.service.sendMediaMultiWithProgress(
                     groupId: groupId,
                     items: items,
                     caption: caption,
@@ -3034,7 +3043,8 @@ final class MarmotChatModel: ObservableObject {
                     category: .session
                 )
                 #endif
-                clearMediaUploadListener(echo.id)
+                model.clearMediaUploadListener(echo.id)
+                guard model.isCurrentAccountWork(generation) else { return }
                 onComplete?()
                 await model.refreshWhenConnected(groupId: groupId, hydrateBeforeSync: false)
             } catch {
@@ -3047,11 +3057,15 @@ final class MarmotChatModel: ObservableObject {
                 if Self.isMediaUploadInFlight(error) {
                     return
                 }
-                clearMediaUploadListener(echo.id)
-                discardOptimistic(id: echo.id, from: groupId)
+                // Release the listener and drop the echo even when the account
+                // moved on; only the user-visible failure row and errorText are
+                // skipped for retired work.
+                model.clearMediaUploadListener(echo.id)
+                model.discardOptimistic(id: echo.id, from: groupId)
                 if Self.isMediaUploadCancelled(error) {
                     return
                 }
+                guard model.isCurrentAccountWork(generation) else { return }
                 if echoVisible {
                     let failed = MarmotService.MarmotMessage(
                         id: Self.failedOptimisticIDPrefix + UUID().uuidString,
