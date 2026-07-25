@@ -145,8 +145,15 @@ class SonarPushProcessingService : Service() {
         val owner = marmotWakeLock.withLock {
             // Only an in-flight owner can be joined: a leftover completed (or
             // cancelled-with-the-service) Deferred must not swallow this wake.
+            // An owner that already closed its rerun gate has cleared the slot,
+            // so a late delivery becomes a new owner instead of setting a flag
+            // nobody will read.
             marmotWakeInFlight?.takeIf { it.isActive }?.also { marmotWakeNeedsRerun = true }
-                ?: scope.async { runMarmotWakeSync() }.also { marmotWakeInFlight = it }
+                ?: run {
+                    val generation = ++marmotWakeOwnerGeneration
+                    scope.async { runMarmotWakeSync(generation) }
+                        .also { marmotWakeInFlight = it }
+                }
         }
         return owner.await()
     }
@@ -154,12 +161,11 @@ class SonarPushProcessingService : Service() {
     /** Owner body: reconnect + force the batched fetch, repeating while another
      *  push landed mid-drain. Failures surface through [Deferred.await] to every
      *  joined wake, which each fall back to the generic notification. */
-    private suspend fun runMarmotWakeSync(): Boolean {
+    private suspend fun runMarmotWakeSync(generation: Long): Boolean {
         try {
-            var synced: Boolean
-            do {
+            while (true) {
                 marmotWakeLock.withLock { marmotWakeNeedsRerun = false }
-                synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
+                val synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
                     SonarCore.start()
                     // Doze/freeze can leave the host latch true after sockets die.
                     // Without this, connectRelays() no-ops and syncForce talks to a
@@ -177,18 +183,39 @@ class SonarPushProcessingService : Service() {
                     // leaving the pushed message unfetched.
                     SonarCore.syncForce()
                 } != null
-            } while (marmotWakeLock.withLock { marmotWakeNeedsRerun })
-            return synced
+                // Close the rerun gate and retire this owner in ONE locked
+                // section. Checking the flag, releasing, then clearing the slot
+                // leaves a window where a delivery still sees an active owner and
+                // sets a flag that owner will never read — its message goes
+                // unfetched while it inherits synced=true and skips the fallback
+                // notification.
+                val retired = marmotWakeLock.withLock {
+                    if (marmotWakeNeedsRerun) {
+                        false
+                    } else {
+                        retireWake(generation)
+                        true
+                    }
+                }
+                if (retired) return synced
+            }
         } finally {
             // Must run even when the service scope is cancelled mid-wake, or the
-            // stale owner would be joined by the next process-alive wake.
+            // stale owner would be joined by the next process-alive wake. No-op
+            // once the loop retired us, so it cannot clear a newer owner.
             withContext(NonCancellable) {
-                marmotWakeLock.withLock {
-                    marmotWakeInFlight = null
-                    marmotWakeNeedsRerun = false
-                }
+                marmotWakeLock.withLock { retireWake(generation) }
             }
         }
+    }
+
+    /** Clear the owner slot iff [generation] is still the installed owner, so a
+     *  retired wake's cleanup cannot evict the owner that replaced it. Caller
+     *  must hold [marmotWakeLock]. */
+    private fun retireWake(generation: Long) {
+        if (marmotWakeOwnerGeneration != generation) return
+        marmotWakeInFlight = null
+        marmotWakeNeedsRerun = false
     }
 
     /** Render titled notifications for every unread conversation from local
@@ -365,6 +392,12 @@ class SonarPushProcessingService : Service() {
          *  drain, so the owner runs one more fetch before completing — otherwise
          *  the joining push's own message can be missed. */
         private var marmotWakeNeedsRerun = false
+
+        /** Identifies the installed owner so a retiring wake only clears its own
+         *  slot. Without it, the `finally` cleanup of a wake that already retired
+         *  normally could null out the owner a later delivery installed, and two
+         *  owners would reconnect concurrently again. */
+        private var marmotWakeOwnerGeneration = 0L
 
         // Marmot push-triggered background sync budget.
         // On a cold wake the core must start, connect relays, and reach EOSE

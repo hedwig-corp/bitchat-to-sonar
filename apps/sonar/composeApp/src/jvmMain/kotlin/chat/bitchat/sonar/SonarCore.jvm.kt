@@ -53,6 +53,13 @@ actual object SonarCore {
     private var node: SonarNode? = null
     @Volatile private var relayConnected = false
     private val relayEpoch = AtomicLong(0)
+
+    /** Serializes {read epoch, write latch} in [connectRelays] against {bump
+     *  epoch, clear latch} in [invalidateRelayConnection] — see the Android
+     *  actual. Desktop never invalidates on focus loss
+     *  ([RelayConnectionPolicy.shouldInvalidateOnBackground] is false here), so
+     *  this is parity insurance rather than a live race today. */
+    private val relayLatchLock = Any()
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
     @Volatile private var lastImportBackupOutcomeValue: AccountBackupRestoreOutcome =
@@ -114,8 +121,13 @@ actual object SonarCore {
             val previousNode = node
             node = connected
             // A mid-attach invalidate wins: keep the latch down so the next
-            // connect rebuilds against fresh sockets.
-            relayConnected = RelayConnectionPolicy.latchAfterAttach(attachEpoch, relayEpoch.get())
+            // connect rebuilds against fresh sockets. Read-and-write under
+            // relayLatchLock so an invalidate cannot slip between the epoch read
+            // and this assignment.
+            synchronized(relayLatchLock) {
+                relayConnected =
+                    RelayConnectionPolicy.latchAfterAttach(attachEpoch, relayEpoch.get())
+            }
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
@@ -126,9 +138,13 @@ actual object SonarCore {
 
     actual fun invalidateRelayConnection() {
         // Non-suspend: bump the epoch so an attach already inside [lock] cannot
-        // restore the latch when it completes, then drop the latch itself.
-        relayEpoch.incrementAndGet()
-        relayConnected = RelayConnectionPolicy.afterInvalidate()
+        // restore the latch when it completes, then drop the latch itself. Both
+        // steps under relayLatchLock so a completing attach cannot interleave
+        // between them and write a stale `true` afterwards.
+        synchronized(relayLatchLock) {
+            relayEpoch.incrementAndGet()
+            relayConnected = RelayConnectionPolicy.afterInvalidate()
+        }
     }
 
     actual fun isRelayConnected(): Boolean = relayConnected
