@@ -106,12 +106,17 @@ Public geohash channels have no nudge action.
 
 ## Known gaps
 
-- **iOS killed-app distinct sound**: the Transponder push payload is opaque to
-  the NSE (`ios/SonarNotificationService/NotificationService.swift`), which
-  cannot decrypt to classify. A killed-app trill therefore presents as the
-  generic "New Sonar message" notification. Foreground and background-drain
-  paths do classify and use the trill sound. Follow-up: NSE-side classification
-  once the payload carries a category marker.
+- **iOS killed-app trill**: closed. The APNs payload itself stays opaque, but
+  the NSE (`ios/SonarNotificationService/NotificationService.swift`) opens the
+  App Group chat DB, drains, and classifies the decrypted content locally:
+  `SonarNSEDecoratePolicy.render` produces the nudged-you banner (never the
+  raw `⚡TRILL` line) and marks `isTrill`, which selects the distinct
+  `sonar_trill.wav` sound. Remaining fallback: if hydrate fails (store busy,
+  missing credentials, NSE time expiry) the generic placeholder banner and
+  sound are delivered — by design, never a raw line. The killed-app path also
+  does not enforce the receiver alert throttle across NSE wakes (each push
+  banners independently; the sender-side 8 s cooldown still bounds well-behaved
+  clients).
 - Mute does not sync across linked devices (see above).
 - Old clients render the raw `⚡TRILL|1|<id>` line as text — same accepted
   wart as `⚡PAY` before it shipped.

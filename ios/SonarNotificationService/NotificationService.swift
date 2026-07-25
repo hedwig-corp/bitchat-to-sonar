@@ -45,6 +45,11 @@ class NotificationService: SDKNotificationService {
     private static let notificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
     )
+    /// Resolved by the system against the app bundle (which ships
+    /// sonar_trill.wav), not the appex bundle — same as notificationSound.
+    private static let trillNotificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_trill.wav")
+    )
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var bestAttemptContent: UNMutableNotificationContent?
@@ -457,7 +462,7 @@ class NotificationService: SDKNotificationService {
         )
         content.title = rendered.title
         content.body = rendered.body
-        content.sound = notificationSound
+        content.sound = rendered.isTrill ? trillNotificationSound : notificationSound
         content.categoryIdentifier = "sonar.message"
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active

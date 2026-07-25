@@ -232,6 +232,26 @@ struct SonarNSEDecoratePolicyTests {
         #expect(out.title == "Someone nudged you")
     }
 
+    @Test("trill render marks isTrill so the NSE attaches the trill sound")
+    func trillRenderMarksIsTrill() {
+        let trill = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "", contentPreview: "\u{26A1}TRILL|1|deadbeef"),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(trill.isTrill)
+        // Names-off still classifies — the sound is not a privacy leak.
+        let namesOff = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "", contentPreview: "\u{26A1}TRILL|1|deadbeef"),
+            prefs: .init(showNames: false, showPreview: false)
+        )
+        #expect(namesOff.isTrill)
+        let plain = SonarNSEDecoratePolicy.render(
+            input: .init(senderRaw: "Alice", groupName: "", contentPreview: "hello"),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(!plain.isTrill)
+    }
+
     @Test("malformed trill lines are not treated as trills")
     func malformedTrillNotClassified() {
         #expect(SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|abc-123"))

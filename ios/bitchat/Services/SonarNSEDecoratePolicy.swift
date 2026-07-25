@@ -50,6 +50,9 @@ enum SonarNSEDecoratePolicy {
     struct Output: Equatable {
         var title: String
         var body: String
+        /// Content classified as a ⚡TRILL nudge — the NSE must attach the
+        /// distinct trill sound instead of the generic message sound.
+        var isTrill: Bool = false
     }
 
     /// Drop placeholder 1:1 names so the banner title is the peer, not
@@ -127,7 +130,11 @@ enum SonarNSEDecoratePolicy {
             } else {
                 title = "Someone nudged you"
             }
-            return Output(title: title, body: "\u{1F44B} They want your attention.")
+            return Output(
+                title: title,
+                body: "\u{1F44B} They want your attention.",
+                isTrill: true
+            )
         }
         let body: String
         if prefs.showPreview {
