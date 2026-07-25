@@ -39,6 +39,8 @@ expect object MessageStore {
     suspend fun saveMeshMedia(mediaUrl: String, bytes: ByteArray): Boolean
     /** Load local bytes for a mesh media attachment referenced by `mesh-media:*`. */
     suspend fun loadMeshMedia(mediaUrl: String): ByteArray?
+    /** Delete the local bytes for a mesh media attachment (failed/abandoned send). */
+    suspend fun deleteMeshMedia(mediaUrl: String)
     suspend fun wipe()
 }
 

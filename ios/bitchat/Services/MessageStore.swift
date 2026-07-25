@@ -96,6 +96,14 @@ final class MessageStore {
         io.sync { readPrivate(at: privateFileURL(for: peerID))?.messages ?? [] }
     }
 
+    /// Run `completion` once every write enqueued before this call has hit
+    /// disk. The internal queue is serial, so FIFO ordering gives the
+    /// guarantee — used by paths that must not acknowledge a message to the
+    /// network before its transcript row is durable.
+    func afterPendingWrites(_ completion: @escaping () -> Void) {
+        io.async(execute: completion)
+    }
+
     /// Replace the stored transcript for a peer (used to mirror an in-memory
     /// array exactly, e.g. after consolidation/dedup).
     func savePrivate(peerID: PeerID, messages: [BitchatMessage]) {

@@ -91,6 +91,11 @@ actual object MessageStore {
         runCatching { f.readBytes() }.getOrNull()
     }
 
+    actual suspend fun deleteMeshMedia(mediaUrl: String): Unit = withContext(Dispatchers.IO) {
+        runCatching { meshMediaFile(mediaUrl).delete() }
+        Unit
+    }
+
     actual suspend fun wipe(): Unit = withContext(Dispatchers.IO) {
         runCatching { root().deleteRecursively() }
         Unit

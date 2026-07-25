@@ -5855,6 +5855,20 @@ final class SonarAppStore: ObservableObject {
         pendingMarmotGroupSetupTokens = [:]
     }
 
+    /// Cancel and join the pending group-creation/accept tasks. These call the
+    /// untracked `MarmotService.startGroup` / `acceptGroupInvite`, so a
+    /// destructive host mutation must wait for them instead of merely
+    /// cancelling them afterwards.
+    private func quiescePendingMarmotGroupSetups() async {
+        let tasks = Array(pendingMarmotGroupSetupTasks.values)
+        pendingMarmotGroupSetupTasks = [:]
+        pendingMarmotGroupSetupTokens = [:]
+        tasks.forEach { $0.cancel() }
+        for task in tasks {
+            _ = await task.value
+        }
+    }
+
     private func failedPendingMessage(_ message: SNMessage) -> SNMessage {
         SNMessage(
             id: message.id,
@@ -8771,6 +8785,9 @@ final class SonarAppStore: ObservableObject {
         // a queued send can publish after the UI and databases were erased.
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        // Group creation/accept run untracked FFI calls; join them before the
+        // store is erased so a late completion cannot recreate a group.
+        await quiescePendingMarmotGroupSetups()
         await marmot.eraseChatsKeepIdentity()
         path = []
         unreadCountAtOpenByDM.removeAll()
@@ -8838,6 +8855,9 @@ final class SonarAppStore: ObservableObject {
         // Marmot text/media/setup task before wallet or host state changes.
         let marmotMutationLease = await marmot.suspendAccountWorkForHostMutation()
         defer { marmot.resumeAccountWorkAfterHostMutation(marmotMutationLease) }
+        // Group creation/accept run untracked FFI calls; join them before the
+        // store is wiped so a late completion cannot recreate a group.
+        await quiescePendingMarmotGroupSetups()
         marmot.stopPolling()
         await marmot.wipeDatabase()
         path = []

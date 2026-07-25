@@ -1512,17 +1512,25 @@ final class BLEService: NSObject {
         )
         #endif
 
+        // The receipt must not outrun the transcript write-through. The
+        // conversation row lands via `didReceiveMessage` → `privateChats`
+        // `didSet` → `MessageStore.savePrivate`, which only *enqueues* the
+        // disk write, so ack after that write has actually drained. Otherwise
+        // being killed in between leaves the sender on "Delivered" for a row
+        // the recipient loses at restart. Older senders omit the optional
+        // message id and keep the legacy no-receipt behavior.
+        let ackMessageID = isPrivateMessage ? filePacket.messageID : nil
         notifyUI { [weak self] in
-            self?.delegate?.didReceiveMessage(message)
-        }
-        // A media send is delivered only after the complete fragment train was
-        // decoded, validated, and persisted locally. Older senders omit the
-        // optional message id and simply retain the legacy no-receipt behavior.
-        if isPrivateMessage, let messageID = filePacket.messageID {
-            sendDeliveryAck(for: messageID, to: peerID)
-            #if DEBUG
-            appendBleDebugReport("file ack message=\(messageID) peer=\(peerID.id)")
-            #endif
+            guard let self else { return }
+            self.delegate?.didReceiveMessage(message)
+            guard let messageID = ackMessageID else { return }
+            MessageStore.shared.afterPendingWrites { [weak self] in
+                guard let self else { return }
+                self.sendDeliveryAck(for: messageID, to: peerID)
+                #if DEBUG
+                self.appendBleDebugReport("file ack message=\(messageID) peer=\(peerID.id)")
+                #endif
+            }
         }
     }
     
