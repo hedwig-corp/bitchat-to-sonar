@@ -15,6 +15,7 @@ import uniffi.sonar_ffi.SonarNode
 import uniffi.sonar_ffi.wipeMarmotDatabase
 import java.io.File
 import java.security.SecureRandom
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.locks.ReentrantLock
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
@@ -51,6 +52,14 @@ actual object SonarCore {
     private val installedStickerMutationLock = ReentrantLock(true)
     private var node: SonarNode? = null
     @Volatile private var relayConnected = false
+    private val relayEpoch = AtomicLong(0)
+
+    /** Serializes {read epoch, write latch} in [connectRelays] against {bump
+     *  epoch, clear latch} in [invalidateRelayConnection] — see the Android
+     *  actual. Desktop never invalidates on focus loss
+     *  ([RelayConnectionPolicy.shouldInvalidateOnBackground] is false here), so
+     *  this is parity insurance rather than a live race today. */
+    private val relayLatchLock = Any()
     @Volatile private var npub: String = ""
     @Volatile private var pubkeyHex: String = ""
     @Volatile private var lastImportBackupOutcomeValue: AccountBackupRestoreOutcome =
@@ -90,7 +99,10 @@ actual object SonarCore {
     actual suspend fun connectRelays(): String = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         lock.withLock {
-            if (relayConnected) return@withLock npub
+            if (RelayConnectionPolicy.wouldSkipConnect(relayConnected)) return@withLock npub
+            // Snapshot the epoch before the long attach: a mid-attach invalidate
+            // bumps it, so the completing connect must not restore the latch.
+            val attachEpoch = relayEpoch.get()
             val identity = loadOrCreateIdentity()
             npub = identity.npub()
             pubkeyHex = identity.pubkeyHex()
@@ -108,12 +120,30 @@ actual object SonarCore {
             val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
             val previousNode = node
             node = connected
-            relayConnected = true
+            // A mid-attach invalidate wins: keep the latch down so the next
+            // connect rebuilds against fresh sockets. Read-and-write under
+            // relayLatchLock so an invalidate cannot slip between the epoch read
+            // and this assignment.
+            synchronized(relayLatchLock) {
+                relayConnected =
+                    RelayConnectionPolicy.latchAfterAttach(attachEpoch, relayEpoch.get())
+            }
             installConversationListener()
             previousNode?.close()
             runCatching { connected.retryOutbox() }
             runCatching { connected.publishKeyPackageBackground() }
             npub
+        }
+    }
+
+    actual fun invalidateRelayConnection() {
+        // Non-suspend: bump the epoch so an attach already inside [lock] cannot
+        // restore the latch when it completes, then drop the latch itself. Both
+        // steps under relayLatchLock so a completing attach cannot interleave
+        // between them and write a stale `true` afterwards.
+        synchronized(relayLatchLock) {
+            relayEpoch.incrementAndGet()
+            relayConnected = RelayConnectionPolicy.afterInvalidate()
         }
     }
 

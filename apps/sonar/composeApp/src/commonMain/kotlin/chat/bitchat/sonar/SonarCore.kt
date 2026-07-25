@@ -444,6 +444,18 @@ expect object SonarCore {
      *  while the relay connection is established. */
     suspend fun connectRelays(): String
 
+    /**
+     * Clear the host-side "relays attached" latch so the next [connectRelays]
+     * rebuilds sockets.
+     *
+     * Doze / process freeze can tear down websocket sockets while this latch
+     * stays true. Push wakes then no-op [connectRelays] and `syncForce` against
+     * a dead node — so background delivery fails while a killed-app cold start
+     * (fresh process, latch false) still works. Call on background and at the
+     * start of every push wake.
+     */
+    fun invalidateRelayConnection()
+
     /** True only after [connectRelays] installed the relay-backed node. Local
      * database reads remain available while this is false. */
     fun isRelayConnected(): Boolean

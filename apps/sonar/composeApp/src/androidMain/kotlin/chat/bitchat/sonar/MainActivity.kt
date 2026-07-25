@@ -240,6 +240,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        SonarLifecycle.appVisible = true
+    }
+
     override fun onResume() {
         super.onResume()
         SonarLifecycle.onForeground?.invoke(true)
@@ -248,6 +253,15 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         super.onPause()
         SonarLifecycle.onForeground?.invoke(false)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        SonarLifecycle.appVisible = false
+        // onPause also fires for a picker/permission dialog overlay; onStop is
+        // the real "not visible" signal. A configuration change (rotation)
+        // restarts the activity without suspending sockets.
+        if (!isChangingConfigurations) SonarLifecycle.onProcessBackground?.invoke()
     }
 
     override fun onDestroy() {

@@ -163,8 +163,18 @@ enum SonarPushProcessor {
         // content-available), but some wakes still relaunch the host — without
         // this delay the host steals the lock and NSE stays on the generic
         // placeholder.
-        if UIApplication.shared.applicationState != .active {
+        let appState = UIApplication.shared.applicationState
+        if appState != .active {
             try? await Task.sleep(nanoseconds: 2_500_000_000)
+        }
+        // #354: invalidate the stale relay latch first — a process-alive
+        // background can leave relayConnected true after sockets die, so
+        // ensureConnected() would no-op and refresh() would drain nothing.
+        // Gate on `.background`, NOT on `.active`: `.inactive` (Control Center,
+        // a system prompt) is still foreground with live sockets, and rebuilding
+        // there would close a node polling/sends/media still hold.
+        if RelayConnectionPolicy.shouldInvalidateOnPushWake(appVisible: appState != .background) {
+            marmot.invalidateRelayConnection()
         }
         _ = await marmot.ensureConnected()
         let baselineHydrated = await marmot.loadLocalSummaries()
