@@ -29,6 +29,30 @@ const MAX_INVITE_RELAYS: usize = 8;
 /// Conservative upper bound for a single relay URL in an invite token.
 const MAX_INVITE_RELAY_URL_LEN: usize = 512;
 
+/// Cap on pending join requests retained per group. An invite link is meant to
+/// be shared, so anyone who sees it holds `invite_secret` and can compute a
+/// valid `secret_hash`; without a cap, Sybil requesters flood an unbounded,
+/// disk-persisted list (each add rewrites the whole state file). Mirrors the
+/// `MAX_PENDING_SONAR` bound already used for the mesh identity buffer. This
+/// bounds memory and file size; at capacity it protects recent requests (see
+/// `JOIN_REQUEST_PROTECT_SECS`) and evicts the oldest one outside that window,
+/// and if every pending request is recent it refuses the new one without a disk
+/// write — so a genuine requester arriving minutes after the link is shared
+/// survives a later Sybil flood instead of being FIFO-evicted out from under
+/// the admin. It does not rate-limit the per-new-requester state-file rewrite,
+/// which still happens once per accepted (non-refused) request.
+const MAX_PENDING_JOIN_REQUESTS_PER_GROUP: usize = 128;
+/// A pending join request younger than this is protected from eviction at
+/// capacity, mirroring the mesh identity map's `IDENTITY_PROTECT_MS`. Blind FIFO
+/// evicts exactly the request an admin wants — the genuine requester arrives
+/// minutes after the link is shared, a Sybil flood arrives later — and an evicted
+/// request never reaches the admin UI at all. One hour is long enough that a
+/// genuine request survives a flood burst and the admin's next check, short
+/// enough that the list still recycles rather than blocking new joins forever.
+/// `received_at` is stamped locally on receipt, not by the requester, so it
+/// cannot be forged.
+const JOIN_REQUEST_PROTECT_SECS: u64 = 60 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InviteToken {
     pub group_id: Vec<u8>,
@@ -281,6 +305,21 @@ impl InviteLinkStore {
         {
             return Ok(());
         }
+        // At capacity, drop the oldest request that is outside the protection
+        // window. If every pending request is recent, refuse the new one rather
+        // than evict a genuine requester the admin has not seen yet — and refuse
+        // without touching disk, so a flood cannot force a rewrite per attempt.
+        while group_requests.len() >= MAX_PENDING_JOIN_REQUESTS_PER_GROUP {
+            let evictable = group_requests
+                .iter()
+                .position(|r| request.received_at.saturating_sub(r.received_at) >= JOIN_REQUEST_PROTECT_SECS);
+            match evictable {
+                Some(pos) => {
+                    group_requests.remove(pos);
+                }
+                None => return Ok(()),
+            }
+        }
         group_requests.push(request);
         self.save_state(&state)
     }
@@ -507,6 +546,86 @@ mod tests {
         assert_eq!(reloaded.active_links(&group_id).len(), 1);
         assert_eq!(reloaded.pending_join_requests(&group_id).len(), 1);
         assert!(reloaded.validate_secret(&group_id, &sha256(&decoded.invite_secret)));
+    }
+
+    #[test]
+    fn pending_join_requests_are_capped_against_a_sybil_flood() {
+        let group_id = GroupId::from_slice(&[7u8; 32]);
+        let store = InviteLinkStore::new();
+        let secret_hash = [9u8; 32];
+
+        // Anyone holding the (shared) invite link can compute a valid
+        // secret_hash, so a flood of distinct requester pubkeys would otherwise
+        // grow the persisted list without limit.
+        for i in 0..(MAX_PENDING_JOIN_REQUESTS_PER_GROUP * 3) {
+            let requester = Identity::generate().public_key();
+            store
+                .add_join_request(JoinRequest {
+                    requester,
+                    group_id: group_id.clone(),
+                    secret_hash,
+                    key_package_event_id: None,
+                    received_at: i as u64,
+                })
+                .expect("add join request");
+        }
+
+        let pending = store.pending_join_requests(&group_id);
+        assert_eq!(
+            pending.len(),
+            MAX_PENDING_JOIN_REQUESTS_PER_GROUP,
+            "pending join requests must be bounded regardless of flood size"
+        );
+        // Protect-then-refuse: with every request within the protection window,
+        // the first MAX_PENDING_JOIN_REQUESTS_PER_GROUP are retained and the
+        // flood past the cap is refused outright (oldest kept, newest refused).
+        assert!(
+            pending
+                .iter()
+                .all(|r| r.received_at < MAX_PENDING_JOIN_REQUESTS_PER_GROUP as u64),
+            "the cap must retain the earliest requests and refuse the later flood"
+        );
+    }
+
+    #[test]
+    fn pending_join_requests_recycle_once_the_protection_window_passes() {
+        let group_id = GroupId::from_slice(&[8u8; 32]);
+        let store = InviteLinkStore::new();
+        let secret_hash = [9u8; 32];
+
+        // Fill to capacity with requests received at t=0.
+        for _ in 0..MAX_PENDING_JOIN_REQUESTS_PER_GROUP {
+            store
+                .add_join_request(JoinRequest {
+                    requester: Identity::generate().public_key(),
+                    group_id: group_id.clone(),
+                    secret_hash,
+                    key_package_event_id: None,
+                    received_at: 0,
+                })
+                .expect("add join request");
+        }
+
+        // A request arriving after the protection window evicts the stalest
+        // entry rather than being refused, so a full list never blocks new
+        // joins permanently.
+        let latecomer = Identity::generate().public_key();
+        store
+            .add_join_request(JoinRequest {
+                requester: latecomer,
+                group_id: group_id.clone(),
+                secret_hash,
+                key_package_event_id: None,
+                received_at: JOIN_REQUEST_PROTECT_SECS + 1,
+            })
+            .expect("add join request");
+
+        let pending = store.pending_join_requests(&group_id);
+        assert_eq!(pending.len(), MAX_PENDING_JOIN_REQUESTS_PER_GROUP);
+        assert!(
+            pending.iter().any(|r| r.requester == latecomer),
+            "a request past the protection window must evict a stale entry, not be refused"
+        );
     }
 
     fn sample_token() -> String {
