@@ -142,6 +142,21 @@ import kotlin.math.sin
  *  pulling Android lifecycle APIs into commonMain. */
 object SonarLifecycle {
     @Volatile var onForeground: ((Boolean) -> Unit)? = null
+
+    /**
+     * Android only: true between `MainActivity.onStart` and `onStop`. Read by
+     * the push wake, which must not tear down a healthy relay node while the
+     * user is actively in the app.
+     *
+     * Compose Desktop never writes this — window focus is not visibility, and
+     * desktop has no push wake to gate. Do not read it off Android without
+     * first giving that platform a real visibility signal; it is permanently
+     * false there.
+     */
+    @Volatile var appVisible: Boolean = false
+
+    /** Real process background (Android `onStop`), not a transient pause. */
+    @Volatile var onProcessBackground: (() -> Unit)? = null
     @Volatile private var onInviteLink: ((String) -> Unit)? = null
     private val pendingInviteLinks = mutableListOf<String>()
 
@@ -228,6 +243,7 @@ fun App(
     }
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
+        SonarLifecycle.onProcessBackground = { state.onProcessBackgrounded() }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
         SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
     }

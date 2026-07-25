@@ -1055,7 +1055,11 @@ final class MarmotChatModel: ObservableObject {
                 SecureLogger.info("SONAR_BENCH t3_relay_connected", category: .session)
                 #endif
                 self.errorText = nil
-                self.relayConnected = true
+                // Mirror the service latch rather than assuming true: a
+                // background invalidate landing mid-attach leaves it down (see
+                // RelayConnectionPolicy.latchAfterAttach), and this published
+                // flag gates reachability + the online chip in SonarAppStore.
+                self.relayConnected = self.service.isRelayConnected()
                 // Start the drain loop BEFORE any publish: message receive must
                 // never wait on identity publishes. The publishes below used to
                 // hold the serial engine queue for their per-relay OK waits and
@@ -1114,6 +1118,12 @@ final class MarmotChatModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return service.isRelayConnected()
+    }
+
+    /// Drop the host-side relay latch (see `MarmotService.invalidateRelayConnection`).
+    func invalidateRelayConnection() {
+        service.invalidateRelayConnection()
+        relayConnected = false
     }
 
     #if DEBUG

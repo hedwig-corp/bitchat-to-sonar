@@ -362,6 +362,9 @@ final class MarmotService: @unchecked Sendable {
     private var identity: SonarIdentity?
     private var node: SonarNode?
     private var relayConnected = false
+    /// Bumped by `invalidateRelayConnection()` so an attach that began before a
+    /// background suspension cannot latch `relayConnected` when it completes.
+    private var relayEpoch: UInt64 = 0
     private var sessionGeneration: UInt64 = 0
     #if os(iOS)
     /// Cross-process exclusive lock — held while `node` is open so the NSE
@@ -395,6 +398,11 @@ final class MarmotService: @unchecked Sendable {
             service.sessionGeneration = service.sessionGeneration &+ 1
             return (identity, service.sessionGeneration)
         }
+        // Snapshot the relay epoch before the long attach: a background
+        // invalidate landing mid-connect must win over this connect's latch.
+        nodeLock.lock()
+        let attachEpoch = relayEpoch
+        nodeLock.unlock()
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
         #if os(iOS)
         // Reuse connectLocal's lock when present — a second blocking flock on a
@@ -425,7 +433,10 @@ final class MarmotService: @unchecked Sendable {
             service.setIdentity(identity)
             service.nodeLock.lock()
             service.node = node
-            service.relayConnected = true
+            service.relayConnected = RelayConnectionPolicy.latchAfterAttach(
+                startEpoch: attachEpoch,
+                currentEpoch: service.relayEpoch
+            )
             #if os(iOS)
             service.installStoreLockHold(storeLockHold)
             #endif
@@ -539,6 +550,17 @@ final class MarmotService: @unchecked Sendable {
         let connected = node != nil && relayConnected
         nodeLock.unlock()
         return connected
+    }
+
+    /// Clear the host-side relay latch so the next `connect()` rebuilds sockets.
+    /// Background suspension / doze can tear down websockets while this flag
+    /// stays true; push wakes then skip reconnect and sync against a dead node
+    /// (killed-app works because a fresh process starts with the latch false).
+    func invalidateRelayConnection() {
+        nodeLock.lock()
+        relayEpoch = relayEpoch &+ 1
+        relayConnected = RelayConnectionPolicy.afterInvalidate()
+        nodeLock.unlock()
     }
 
     /// `nsec1...` backup export of the connected identity (nil before `connect`).

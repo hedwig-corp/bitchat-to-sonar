@@ -2330,6 +2330,7 @@ final class SonarAppStore: ObservableObject {
     func setForeground(_ foreground: Bool) {
         let changed = isForeground != foreground
         let cameToForeground = foreground && !isForeground
+        let wentToBackground = !foreground && isForeground
         isForeground = foreground
         #if canImport(UIKit)
         // Tear the Breez node down before suspension so it never holds a SQLite
@@ -2359,6 +2360,15 @@ final class SonarAppStore: ObservableObject {
         #endif
         updateNearbyScanning()
         guard changed else { return }
+        // Ask the policy rather than inlining the decision, so the Compose
+        // mirror (SonarAppState.onProcessBackgrounded) and this call site stay
+        // one rule and RelayConnectionPolicyTests guards a real caller. iOS can
+        // keep us process-alive (BLE) after tearing down sockets, so the latch
+        // must drop for the push wake / foreground resume to reconnect; a
+        // focus-loss-only platform returns false here and keeps its node.
+        if wentToBackground, RelayConnectionPolicy.shouldInvalidateOnBackground() {
+            marmot.invalidateRelayConnection()
+        }
         updateReceiverAdvertising()
         if cameToForeground {
             refreshKnownContactDescriptors()

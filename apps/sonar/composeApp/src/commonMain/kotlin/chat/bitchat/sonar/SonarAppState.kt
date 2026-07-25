@@ -59,6 +59,12 @@ private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_L
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
+
+/** Backoff before rebuilding an attach that an invalidate superseded mid-flight.
+ *  Short on purpose — the user is back in the foreground and the sockets we just
+ *  built are suspect — but non-zero so a fast background/foreground flap settles
+ *  before we spend another attach on it. */
+private const val RELAY_SUPERSEDED_RETRY_MS = 1_000L
 private const val MARMOT_ECHO_RECONCILE_POLL_MS = 100L
 private const val MARMOT_ECHO_RECONCILE_MAX_ATTEMPTS = 10
 
@@ -3745,24 +3751,28 @@ class SonarAppState(private val scope: CoroutineScope) {
             else if (AppLock.isEnabled()) locked = true   // genuine app-switch → re-lock
             if (started) {
                 startRelayConnection()
-                if (SonarCore.isRelayConnected()) refreshKnownContactDescriptors(clearMisses = false)
                 scope.launch {
+                    // Local-first: never gate chat-list / channel paint on relay
+                    // reconnect. The relay wait below is bounded and background.
+                    repaintFromLocal()
+
                     activeCatchupSyncs++
                     try {
-                        // Foreground resume is a real wake event: force the batched
-                        // gap-recovery fetch (a message may have arrived while the
-                        // socket was torn down in the background). If relays are
-                        // still detached, wait bounded for reconnect before forcing
-                        // so the chip reflects a sync that actually ran.
+                        // Foreground resume is a real wake event: force the
+                        // batched gap-recovery fetch. Single-flight-guarded so a
+                        // notification tap's requestImmediateSync() coalesces
+                        // with this instead of double-enqueuing syncForce on the
+                        // serial engine queue. awaitRelay kicks the reconnect
+                        // needed after a background invalidate and waits bounded,
+                        // so an offline resume cannot hang here.
                         forcedCatchupSync(awaitRelay = true)
-                        drainDirectDms()
-                        refreshChats()
-                        recomputeConversations()
+                        repaintFromLocal()
+                        if (SonarCore.isRelayConnected()) {
+                            refreshKnownContactDescriptors(clearMisses = false)
+                        }
                     } finally {
                         activeCatchupSyncs--
                     }
-                    (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
-                    refreshPresenceCounts()
                 }
                 // Run a full housekeeping pass now rather than waiting for the
                 // next heartbeat (the old 4 s poll would have run within 4 s).
@@ -3771,6 +3781,33 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         // Unify receiver is foreground-only (matches iOS) — react immediately.
         scope.launch { updateUnifyReceiver() }
+    }
+
+    /** Repaint every visible surface from local storage only — no relay work.
+     *  Run once before the relay wait (first paint) and again after gap
+     *  recovery lands (repaint), so both passes stay in sync when a new
+     *  surface is added. */
+    private suspend fun repaintFromLocal() {
+        drainDirectDms()
+        refreshChats()
+        recomputeConversations()
+        (screen as? Screen.Channel)?.let { refreshChannel(it.geohash) }
+        refreshPresenceCounts()
+    }
+
+    /**
+     * The process left the foreground for real (Android `onStop`, iOS scene
+     * background) — not a transient pause behind a picker or permission dialog.
+     *
+     * Mobile can tear down websockets while we stay process-alive, so drop the
+     * host relay latch: the next push wake / foreground resume then reconnects
+     * instead of syncForce-ing against a dead node. Desktop window focus loss
+     * never reaches here ([RelayConnectionPolicy.shouldInvalidateOnBackground]
+     * is false on JVM and the desktop root does not install the hook).
+     */
+    fun onProcessBackgrounded() {
+        if (!RelayConnectionPolicy.shouldInvalidateOnBackground()) return
+        SonarCore.invalidateRelayConnection()
     }
 
     fun requestImmediateSync() {
@@ -4215,7 +4252,27 @@ class SonarAppState(private val scope: CoroutineScope) {
                     npub = result.getOrThrow()
                     SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                 }
+                // The node is installed even when the attach was superseded, so
+                // finish startup either way — it is idempotent, and local reads
+                // already work through the installed node.
                 completeRelayStartup()
+                // A successful connect that left the latch down was superseded by
+                // an invalidate landing mid-attach
+                // ([RelayConnectionPolicy.latchAfterAttach]), so we are not
+                // attached. Nothing else re-triggers this job in time: every
+                // caller goes through startRelayConnection(), which no-ops while
+                // the job is alive, so a foreground resume racing the attach waits
+                // out awaitRelayConnectionBounded() and then sits on dead sockets
+                // until the heartbeat (up to 30 s). Retry while foreground; once
+                // genuinely backgrounded, stop — looping would rebuild sockets the
+                // OS is suspending, and the push wake / next resume start a fresh
+                // job.
+                if (!SonarCore.isRelayConnected() &&
+                    RelayConnectionPolicy.shouldRetrySupersededAttach(foreground)
+                ) {
+                    delay(RELAY_SUPERSEDED_RETRY_MS)
+                    continue
+                }
                 return@launch
             }
         }
