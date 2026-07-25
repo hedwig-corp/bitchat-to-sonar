@@ -42,19 +42,14 @@ struct TextMessageView: View {
             
             // Expand/Collapse for very long messages
             if isLong {
-                let labelKey = isExpanded ? LocalizedStringKey("content.message.show_less") : LocalizedStringKey("content.message.show_more")
-                Button {
+                ShowMoreButton(
+                    isExpanded: isExpanded,
+                    font: .bitchatSystem(size: 11, weight: .medium, design: .monospaced),
+                    color: Color.blue
+                ) {
                     if isExpanded { expandedMessageIDs.remove(message.id) }
                     else { expandedMessageIDs.insert(message.id) }
-                } label: {
-                    // .plain hit-tests the label subtree — frame/contentShape must be inside it.
-                    Text(labelKey)
-                        .font(.bitchatSystem(size: 11, weight: .medium, design: .monospaced))
-                        .foregroundColor(Color.blue)
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
                 .padding(.top, 4)
             }
 

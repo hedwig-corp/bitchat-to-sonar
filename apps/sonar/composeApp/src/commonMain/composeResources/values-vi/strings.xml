@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">nhập tin nhắn...</string>
     <string name="content_input_nickname_placeholder">biệt danh</string>
     <string name="content_location_enable">bật vị trí</string>
+    <string name="content_message_collapsed">đã thu gọn</string>
     <string name="content_message_copy">sao chép tin nhắn</string>
+    <string name="content_message_expanded">đã mở rộng</string>
     <string name="content_message_show_less">thu gọn</string>
     <string name="content_message_show_more">mở rộng</string>
     <string name="content_notes_location_unavailable">không có dữ liệu vị trí</string>

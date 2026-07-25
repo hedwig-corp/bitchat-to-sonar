@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">scrivi un messaggio...</string>
     <string name="content_input_nickname_placeholder">nickname</string>
     <string name="content_location_enable">attiva posizione</string>
+    <string name="content_message_collapsed">compresso</string>
     <string name="content_message_copy">copia messaggio</string>
+    <string name="content_message_expanded">espanso</string>
     <string name="content_message_show_less">mostra meno</string>
     <string name="content_message_show_more">mostra di più</string>
     <string name="content_notes_location_unavailable">posizione non disponibile</string>

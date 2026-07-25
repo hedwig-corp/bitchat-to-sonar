@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">输入消息...</string>
     <string name="content_input_nickname_placeholder">昵称</string>
     <string name="content_location_enable">启用位置</string>
+    <string name="content_message_collapsed">已折叠</string>
     <string name="content_message_copy">复制消息</string>
+    <string name="content_message_expanded">已展开</string>
     <string name="content_message_show_less">收起</string>
     <string name="content_message_show_more">展开</string>
     <string name="content_notes_location_unavailable">位置不可用</string>

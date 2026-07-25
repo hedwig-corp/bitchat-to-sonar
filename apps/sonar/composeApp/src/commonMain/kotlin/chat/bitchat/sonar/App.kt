@@ -104,6 +104,10 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.Placeholder
 import androidx.compose.ui.text.PlaceholderVerticalAlign
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.content_message_collapsed
+import chat.bitchat.sonar.resources.content_message_expanded
+import chat.bitchat.sonar.resources.content_message_show_less
+import chat.bitchat.sonar.resources.content_message_show_more
 import chat.bitchat.sonar.resources.sonar_icon
 import chat.bitchat.sonar.screens.SonarOnboardingScreen
 import chat.bitchat.sonar.screens.shouldCloseEmojiTrayOnComposerFocus
@@ -112,6 +116,7 @@ import chat.bitchat.sonar.ui.authorColor
 import chat.bitchat.sonar.ui.bcHue
 import chat.bitchat.sonar.ui.SNDot
 import org.jetbrains.compose.resources.painterResource
+import org.jetbrains.compose.resources.stringResource
 import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SNTone
 import chat.bitchat.sonar.ui.SNTrail
@@ -2612,16 +2617,33 @@ private fun MessageBubble(
                     )
                 }
                 if (preview.truncated) {
+                    // Deliberately inside the truncated branch: only these rows
+                    // have the control, so hoisting to the top of MessageBubble
+                    // would turn two lookups on *some* rows into four on *every*
+                    // row. `stringResource` is remember-backed and synchronous on
+                    // Android/JVM (CMP 1.7.3 uses the blocking resource state),
+                    // so two per truncated row is already the floor. `semantics {}`
+                    // is not a composable scope, hence the local vals.
+                    val expandLabel = stringResource(
+                        if (expanded) Res.string.content_message_show_less
+                        else Res.string.content_message_show_more,
+                    )
+                    val expandState = stringResource(
+                        if (expanded) Res.string.content_message_expanded
+                        else Res.string.content_message_collapsed,
+                    )
                     Text(
-                        if (expanded) "Show less" else "Show more",
+                        expandLabel,
                         color = if (m.mine) onMine else s.accentDeep,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier
+                            // heightIn stays OUTSIDE clickable so the 44pt
+                            // constraint propagates into the clickable node —
+                            // the structural equivalent of iOS keeping frame +
+                            // contentShape inside the Button label (#358).
                             .heightIn(min = 44.dp)
-                            .semantics {
-                                stateDescription = if (expanded) "Expanded" else "Collapsed"
-                            }
+                            .semantics { stateDescription = expandState }
                             .clickable(role = Role.Button) { expanded = !expanded }
                             .padding(top = 8.dp),
                     )

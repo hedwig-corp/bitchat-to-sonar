@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">ஒரு செய்தியைத் தட்டச்சு செய்க...</string>
     <string name="content_input_nickname_placeholder">புனைப் பெயர்</string>
     <string name="content_location_enable">இடத்தை இயக்கு</string>
+    <string name="content_message_collapsed">சுருக்கப்பட்டது</string>
     <string name="content_message_copy">செய்தியை நகலெடு</string>
+    <string name="content_message_expanded">விரிவாக்கப்பட்டது</string>
     <string name="content_message_show_less">குறைவாக காட்ட</string>
     <string name="content_message_show_more">மேலும் காட்ட</string>
     <string name="content_notes_location_unavailable">இடம் கிடைக்கவில்லை</string>

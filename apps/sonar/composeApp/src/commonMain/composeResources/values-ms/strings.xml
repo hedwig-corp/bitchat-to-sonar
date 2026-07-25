@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">ketik pesan...</string>
     <string name="content_input_nickname_placeholder">nama panggilan</string>
     <string name="content_location_enable">aktifkan lokasi</string>
+    <string name="content_message_collapsed">dikuncupkan</string>
     <string name="content_message_copy">salin pesan</string>
+    <string name="content_message_expanded">dikembangkan</string>
     <string name="content_message_show_less">tampilkan lebih sedikit</string>
     <string name="content_message_show_more">tampilkan lebih banyak</string>
     <string name="content_notes_location_unavailable">lokasi tidak tersedia</string>

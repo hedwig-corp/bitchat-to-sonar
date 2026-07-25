@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">संदेश लिखें...</string>
     <string name="content_input_nickname_placeholder">उपनाम</string>
     <string name="content_location_enable">लोकेशन सक्षम करें</string>
+    <string name="content_message_collapsed">संक्षिप्त</string>
     <string name="content_message_copy">संदेश कॉपी करें</string>
+    <string name="content_message_expanded">विस्तृत</string>
     <string name="content_message_show_less">कम दिखाएँ</string>
     <string name="content_message_show_more">और दिखाएँ</string>
     <string name="content_notes_location_unavailable">लोकेशन उपलब्ध नहीं</string>

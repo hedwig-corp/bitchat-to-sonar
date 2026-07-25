@@ -97,7 +97,9 @@
     <string name="content_input_message_placeholder">напиши сообщение...</string>
     <string name="content_input_nickname_placeholder">ник</string>
     <string name="content_location_enable">включить локацию</string>
+    <string name="content_message_collapsed">свёрнуто</string>
     <string name="content_message_copy">копировать сообщение</string>
+    <string name="content_message_expanded">развёрнуто</string>
     <string name="content_message_show_less">показать меньше</string>
     <string name="content_message_show_more">показать больше</string>
     <string name="content_notes_location_unavailable">локация недоступна</string>
