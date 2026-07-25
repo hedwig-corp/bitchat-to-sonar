@@ -41,15 +41,18 @@ struct TextMessageView: View {
             if (message.content.count > TransportConfig.uiLongMessageLengthThreshold || message.content.hasVeryLongToken(threshold: TransportConfig.uiVeryLongTokenThreshold)) && cashuLinks.isEmpty {
                 let isExpanded = expandedMessageIDs.contains(message.id)
                 let labelKey = isExpanded ? LocalizedStringKey("content.message.show_less") : LocalizedStringKey("content.message.show_more")
-                Button(labelKey) {
+                Button {
                     if isExpanded { expandedMessageIDs.remove(message.id) }
                     else { expandedMessageIDs.insert(message.id) }
+                } label: {
+                    // .plain hit-tests the label subtree — frame/contentShape must be inside it.
+                    Text(labelKey)
+                        .font(.bitchatSystem(size: 11, weight: .medium, design: .monospaced))
+                        .foregroundColor(Color.blue)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                 }
-                .font(.bitchatSystem(size: 11, weight: .medium, design: .monospaced))
-                .foregroundColor(Color.blue)
                 .buttonStyle(.plain)
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
                 .padding(.top, 4)
             }
 

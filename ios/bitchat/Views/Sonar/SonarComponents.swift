@@ -692,22 +692,24 @@ struct SNMsgBubble: View {
                     .shadow(color: mine ? .clear : Color(sonarHex: 0x0A232D, opacity: 0.07), radius: 0.75, y: 1)
             )
             if preview.isTruncated {
-                Button(isExpanded
-                       ? String(localized: "content.message.show_less")
-                       : String(localized: "content.message.show_more")) {
+                Button {
                     if isExpanded { expandedMessageIDs.remove(m.id) }
                     else { expandedMessageIDs.insert(m.id) }
+                } label: {
+                    // Plain buttons only hit-test their label subtree, so the
+                    // frame and contentShape must live INSIDE the label: on the
+                    // last bubble the text-selection gesture above otherwise
+                    // swallows taps that land in the blank 44pt area.
+                    Text(isExpanded
+                         ? String(localized: "content.message.show_less")
+                         : String(localized: "content.message.show_more"))
+                        .font(SonarTheme.uiFont(size: 12, weight: .semibold))
+                        .foregroundColor(SonarTheme.accentDeep)
+                        .padding(.horizontal, 6)
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
                 }
-                .font(SonarTheme.uiFont(size: 12, weight: .semibold))
-                .foregroundColor(SonarTheme.accentDeep)
                 .buttonStyle(.plain)
-                .frame(minHeight: 44)
-                .padding(.horizontal, 6)
-                // Plain buttons only hit-test their label content: without an
-                // explicit contentShape the 44pt min-height area is dead, and
-                // on the last bubble the text-selection gesture above swallows
-                // the tap. Claim the whole padded area for the button.
-                .contentShape(Rectangle())
             }
             if showState, let stateText = m.state {
                 SNMessageStatusFooter(stateText: stateText, via: m.via, onRetry: onRetry)
