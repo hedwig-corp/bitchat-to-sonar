@@ -81,29 +81,81 @@ const PEER_TTL: Duration = Duration::from_secs(30);
 /// then ages out even though it's still nearby.
 const RESCAN_EVERY: Duration = Duration::from_secs(6);
 
+/// Where the diagnostic log lives. NOT a fixed path in a world-writable shared
+/// directory: this file records what radios are near the user, which is location
+/// data. It goes in the per-user state dir, owner-readable only.
+fn dbg_log_path() -> Option<std::path::PathBuf> {
+    let base = if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
+        std::path::PathBuf::from(dir)
+    } else {
+        let home = std::env::var_os("HOME")?;
+        let home = std::path::PathBuf::from(home);
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            home.join("Library/Logs")
+        } else {
+            home.join(".local/state")
+        }
+    };
+    let dir = base.join("sonar");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("sonar-ble.log"))
+}
+
+/// Stop appending past this size. An advertisement flood must not be able to
+/// fill the user's disk (or RAM, when the state dir is a tmpfs).
+const DBG_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Diagnostic log (only when SONAR_BLE_DEBUG is set) — appends to a file so it's
 /// readable regardless of how the app is launched (a jpackage app has no stdout).
+///
+/// Never log a raw device address or advertised name: on BlueZ the peripheral id
+/// is the BDADDR, and a list of nearby MACs localizes a machine better than most
+/// IP geolocation. Callers pass [`peer_tag`] output instead.
 fn dbg_log(msg: &str) {
     if std::env::var_os("SONAR_BLE_DEBUG").is_none() {
         return;
     }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/sonar-ble.log")
+    let Some(path) = dbg_log_path() else { return };
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 0600 so another local user cannot read the proximity trail, and
+        // O_NOFOLLOW so a pre-planted symlink cannot redirect the append.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(mut f) = opts.open(&path) {
+        if f.metadata().map(|m| m.len()).unwrap_or(0) >= DBG_LOG_MAX_BYTES {
+            return;
+        }
         let _ = writeln!(f, "{msg}");
     }
+}
+
+/// Short, non-reversible-at-a-glance tag for a device id, so the debug log can
+/// distinguish "this device again" from "a new device" without recording the
+/// address itself.
+fn peer_tag(id: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", (h >> 32) as u32)
 }
 
 #[derive(Clone)]
 struct Seen {
     name: Option<String>,
     rssi: i16,
-    bitchat: bool,
     at: Instant,
 }
+
+/// Ceiling on tracked devices. Only reached under an advertisement flood, since
+/// real radar populations are single digits.
+const MAX_TRACKED_DEVICES: usize = 256;
 
 static DEVICES: Lazy<Mutex<HashMap<String, Seen>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -148,16 +200,15 @@ pub extern "C" fn sonar_ble_peers_json() -> *mut c_char {
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Ok(mut d) = DEVICES.lock() {
         d.retain(|_, s| now.duration_since(s.at) < PEER_TTL);
+        // Every entry is a bitchat advertiser by construction: handle_event drops
+        // everything else before inserting. The `bitchat` field is kept in the
+        // JSON for wire compatibility with the JVM reader.
         for (id, s) in d.iter() {
-            // Only surface bitchat-mesh advertisers as radar peers.
-            if !s.bitchat {
-                continue;
-            }
             items.push(serde_json::json!({
                 "id": id,
                 "name": s.name,
                 "rssi": s.rssi,
-                "bitchat": s.bitchat,
+                "bitchat": true,
             }));
         }
     }
@@ -244,8 +295,19 @@ async fn init_central() -> Option<btleplug::platform::Adapter> {
     adapters.into_iter().next()
 }
 
-/// True when this peripheral's advertisement actually carries the bitchat mesh
-/// service, either as an advertised service UUID or as a service-data key.
+/// True when this peripheral is believed to offer the bitchat mesh service,
+/// from the advertised service UUIDs or a service-data key.
+///
+/// NOT an authentication boundary. The service UUID is a public constant and
+/// nothing here is signed, so anyone can advertise it and land on the radar.
+/// The real trust boundary is the signed announce verified in MeshLink.pump,
+/// and sends refuse without an established Noise session. Do not build
+/// authorization on top of this returning true.
+///
+/// Note on BlueZ: `services` comes from the daemon's cached UUIDs property for
+/// the device, which can include services learned from an earlier GATT
+/// connection, so this means "BlueZ believes this device offers the service",
+/// not strictly "it advertised in this scan window".
 ///
 /// Unused outside tests on CoreBluetooth, which enforces the ScanFilter itself
 /// (see `handle_event`).
@@ -276,27 +338,50 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     // including already-paired peripherals that never advertised our service, so
     // the filter is a hint rather than a guarantee. Trusting it there labeled a
     // Logitech mouse as a bitchat mesh peer, which made MeshRadio.peers() report
-    // a phantom "nearby phone" on the radar. Re-check the advertisement instead.
+    // a phantom "nearby phone" on the radar. Re-check the reported services
+    // instead (a plausibility filter, not authentication: see advertises_bitchat).
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     let bitchat = true;
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let bitchat = props.as_ref().map(advertises_bitchat).unwrap_or(false);
     if !bitchat {
+        // Enough to tell "seen but filtered out" from "never seen" when someone
+        // reports a missing phone, without recording who or what was nearby.
         dbg_log(&format!(
-            "ignoring non-bitchat device {id} name={name:?} services={:?} service_data={:?}",
-            props.as_ref().map(|pr| pr.services.clone()).unwrap_or_default(),
-            props
-                .as_ref()
-                .map(|pr| pr.service_data.keys().cloned().collect::<Vec<_>>())
-                .unwrap_or_default(),
+            "ignoring non-bitchat device {} services={}",
+            peer_tag(&id.to_string()),
+            props.as_ref().map(|pr| pr.services.len()).unwrap_or(0),
         ));
         return;
     }
-    dbg_log(&format!("discovered BITCHAT peer {id} rssi={rssi}"));
+    dbg_log(&format!(
+        "discovered BITCHAT peer {} rssi={rssi}",
+        peer_tag(&id.to_string())
+    ));
     if let Ok(mut d) = DEVICES.lock() {
+        // Prune HERE, in the writer, not only in sonar_ble_peers_json: both JVM
+        // callers of that reader short-circuit past it once a named mesh peer
+        // exists (MeshRadio.peers / hasActivePeer), so relying on the reader let
+        // the map grow for the life of the session. BLE addresses rotate for
+        // privacy, so a single nearby radio produces a new key every few minutes.
+        let now = Instant::now();
+        d.retain(|_, s| now.duration_since(s.at) < PEER_TTL);
+        // Hard cap as well: the bitchat service UUID is public and unauthenticated,
+        // so anyone can mint fresh entries faster than the TTL expires them. Drop
+        // the oldest rather than refusing the newest, so a flood cannot pin the map
+        // to stale devices and hide a real phone.
+        if d.len() >= MAX_TRACKED_DEVICES && !d.contains_key(&id.to_string()) {
+            if let Some(oldest) = d
+                .iter()
+                .min_by_key(|(_, s)| s.at)
+                .map(|(k, _)| k.clone())
+            {
+                d.remove(&oldest);
+            }
+        }
         d.insert(
             id.to_string(),
-            Seen { name, rssi, bitchat, at: Instant::now() },
+            Seen { name, rssi, at: Instant::now() },
         );
     }
 }
@@ -321,10 +406,26 @@ pub unsafe extern "C" fn sonar_ble_set_announce(ptr: *const u8, len: usize) {
     }
 }
 
+/// Whether this build can play the peripheral/advertise role at all, so the host
+/// can tell the user "scan only" instead of presenting a desktop that silently
+/// never becomes discoverable. See `run_peripheral`: the GATT side channel it
+/// needs exists only in bluster's CoreBluetooth backend.
+#[no_mangle]
+pub extern "C" fn sonar_ble_advertising_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "ios"))
+}
+
 /// Begin advertising the bitchat service (peripheral role) so phones discover
 /// this desktop and, on subscribe, receive the announce. Idempotent.
 #[no_mangle]
 pub extern "C" fn sonar_ble_start_advertising() {
+    // Bail before spawning a thread and a multi-thread tokio runtime for a call
+    // that cannot succeed. MeshRadio.start() runs on every discovery-mode change,
+    // known-peer-set change and foreground transition.
+    if !sonar_ble_advertising_supported() {
+        dbg_log("advertise: unsupported on this platform, scan-only");
+        return;
+    }
     if ADVERTISING.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -525,6 +626,36 @@ mod tests {
     #[test]
     fn empty_advertisement_is_not_a_mesh_peer() {
         assert!(!advertises_bitchat(&props_with(vec![])));
+    }
+
+    /// The advertise capability must match the platform that actually has the
+    /// peripheral implementation, since the host uses this to decide whether to
+    /// promise discoverability.
+    #[test]
+    fn advertising_supported_matches_platform() {
+        assert_eq!(
+            sonar_ble_advertising_supported(),
+            cfg!(any(target_os = "macos", target_os = "ios"))
+        );
+    }
+
+    /// On a platform without the peripheral role, the stub must report failure
+    /// rather than silently appearing to advertise.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn stub_peripheral_reports_unsupported() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        assert!(rt.block_on(run_peripheral()).is_err());
+        assert!(!ADVERTISING.load(Ordering::SeqCst));
+    }
+
+    /// The debug log must never be a fixed path in a shared directory: it records
+    /// which radios are near the user.
+    #[test]
+    fn debug_log_is_not_in_shared_tmp() {
+        if let Some(p) = dbg_log_path() {
+            assert!(!p.starts_with("/tmp"), "log path must not be in /tmp: {p:?}");
+        }
     }
 
     /// Some advertisers carry the service only as a service-data key.

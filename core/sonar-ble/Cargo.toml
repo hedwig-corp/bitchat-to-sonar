@@ -33,3 +33,7 @@ serde_json = "1"
 # CBUUID, which CoreBluetooth rejects ("invalid parameters"). See vendor/bluster.
 bluster = { path = "vendor/bluster" }
 uuid08 = { package = "uuid", version = "0.8" }  # bluster's UUID type (its API predates uuid 1.x)
+
+# O_NOFOLLOW + 0600 on the diagnostic log (see dbg_log).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

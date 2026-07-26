@@ -59,7 +59,11 @@ jobs:
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: core
+          # sonar-ble is a detached workspace with its own target/, so it needs
+          # its own cache entry or every run rebuilds btleplug + bluster + dbus.
+          workspaces: |
+            core
+            core/sonar-ble
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -80,6 +84,14 @@ jobs:
           diff -u \
             packages/transcript-engine-policy/golden/inset-follow.json \
             ios/localPackages/TranscriptEngine/Tests/Resources/inset-follow.json
+
+      # The BLE scan-filter regression this guards is BlueZ-specific, and the
+      # predicate it tests is dead code on CoreBluetooth. Running these only in
+      # the macOS core-tests job would leave the Linux behavior unguarded on
+      # Linux, so run them here too.
+      - name: Test the desktop BLE bridge (BlueZ path)
+        run: cargo test
+        working-directory: core/sonar-ble
 
       - name: Run JVM unit tests (builds desktop Rust core + BLE bridge + UniFFI bindings)
         # The BLE bridge is built for real here (no SONAR_SKIP_BLE) so the Linux

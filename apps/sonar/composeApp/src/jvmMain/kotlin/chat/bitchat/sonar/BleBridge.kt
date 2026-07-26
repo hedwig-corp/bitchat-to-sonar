@@ -12,6 +12,7 @@ private interface BleLib : Library {
     fun sonar_ble_peers_json(): Pointer?
     fun sonar_ble_free(ptr: Pointer?)
     fun sonar_ble_set_announce(data: ByteArray?, len: Long)
+    fun sonar_ble_advertising_supported(): Boolean
     fun sonar_ble_start_advertising()
     fun sonar_ble_stop_advertising()
     fun sonar_ble_drain_rx_json(): Pointer?
@@ -35,6 +36,14 @@ object BleBridge {
 
     /** True when the native BLE library loaded for this OS/arch. */
     val available: Boolean get() = lib != null
+
+    /**
+     * True when this platform can also play the peripheral role (advertise + GATT
+     * server). False on Linux/Windows, where only the scan radar works, so callers
+     * must not treat [available] as "phones can discover this desktop".
+     */
+    val advertisingSupported: Boolean
+        get() = runCatching { lib?.sonar_ble_advertising_supported() == true }.getOrDefault(false)
 
     private fun load(): BleLib? = runCatching {
         val mapped = System.mapLibraryName("sonar_ble") // libsonar_ble.dylib / .so / sonar_ble.dll

@@ -25,7 +25,7 @@ composeApp/src/
 | Profiles / verify safety numbers    |   ✅    |   ✅    |
 | Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
 | BLE mesh: discovery (scan)         |   ✅    |   ✅ macOS (CoreBluetooth) + Linux (BlueZ) |
-| BLE mesh: advertise + GATT server  |   ✅    |   ✅ macOS only, ⚪️ not implemented on Linux/Windows |
+| BLE mesh: advertise + GATT server  |   ✅    |   ✅ macOS only, ⚪️ not implemented on Linux (Windows: crate does not build) |
 | BLE mesh — messaging (DMs/broadcast)|   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
 | Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
@@ -44,8 +44,8 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
     built by the same `meshBuildAnnounce` Rust function the phones use, so the
     phone shows the desktop as a named peer. **macOS only**. The notify /
     write-drain side channel this role is built on is a Sonar patch that exists
-    solely in bluster's CoreBluetooth backend, so on Linux the advertise calls
-    report unavailable and only the scan radar runs. Bringing it to BlueZ means
+    solely in bluster's CoreBluetooth backend. On Linux `sonar_ble_advertising_supported()`
+    returns false, the host skips the advertise path, and only the scan radar runs. Bringing it to BlueZ means
     wiring bluster's cross-platform `gatt::event` channel, tracked separately.
 
   What this means on Linux in practice: a nearby phone with the mesh screen open

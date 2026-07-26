@@ -1,7 +1,8 @@
 # Vendored + patched bluster 0.2.0
 
-Vendored from crates.io `bluster v0.2.0` (MIT licensed, see `LICENSE`). Three
-patches, described below.
+Vendored from crates.io `bluster v0.2.0` (MIT licensed, see `LICENSE`). The Sonar
+changes are listed below. Every Sonar edit is marked `PATCH (Sonar)` at its
+site; grep for that marker before assuming a hunk is upstream.
 
 ## 1. CoreBluetooth advertises service UUIDs as `NSString` (macOS)
 
@@ -40,5 +41,14 @@ Each of the four calls is annotated `method_call::<(), _, _, _>(…)`, which is 
 annotation rustc's own diagnostic suggests. No behavior change: `()` is what the
 fallback resolved to anyway.
 
-Patches 1 and 2 touch only the macOS (CoreBluetooth) path; patch 3 touches only
-the Linux (BlueZ) path. Everything else is upstream `bluster` verbatim.
+## 4. Other CoreBluetooth changes
+
+`src/peripheral/corebluetooth/characteristic_flags.rs` also advertises
+write-WITHOUT-response, and `src/peripheral/corebluetooth/events.rs` fills in
+callbacks that upstream left as stubs. Both are Sonar changes rather than
+upstream code.
+
+Patches 1, 2 and 4 touch only the macOS (CoreBluetooth) path; patch 3 touches only
+the Linux (BlueZ) path. Anything without a `PATCH (Sonar)` marker should be
+upstream `bluster`, but verify with the marker rather than trusting this list to
+be exhaustive when rebasing the vendor drop.
