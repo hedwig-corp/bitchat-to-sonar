@@ -48,6 +48,12 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
     report unavailable and only the scan radar runs. Bringing it to BlueZ means
     wiring bluster's cross-platform `gatt::event` channel, tracked separately.
 
+  What this means on Linux in practice: a nearby phone with the mesh screen open
+  **is** discovered, with live signal strength. But a peer's *name* comes from
+  the signed announce the phone writes over GATT — which needs the peripheral
+  role — so the radar shows an unnamed "nearby phone" and mesh DMs do not form.
+  macOS gets named peers and DMs; Linux gets presence only.
+
   (`bluster` is vendored + patched; see
   `core/sonar-ble/vendor/bluster/SONAR_PATCH.md`.) Still to come:
   the **Noise-over-GATT message transport** (encrypted DMs/broadcast over the
