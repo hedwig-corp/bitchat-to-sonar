@@ -632,6 +632,49 @@ final class MarmotChatModel: ObservableObject {
         #endif
     }
 
+    /// Awaitable sibling of `suspendStoreForBackground()` for background-wake
+    /// completion (silent push): guarantees the SQLCipher handle + App Group
+    /// flock are released BEFORE the caller invokes the fetch completion
+    /// handler, so iOS never suspends the process holding locked files
+    /// (RunningBoard 0xdead10cc). `closeNode()` is idempotent and clears its
+    /// own fence, so a later foreground resume reconnects normally.
+    func closeStoreAfterBackgroundWake() async {
+        #if os(iOS)
+        // Quiesce the drain/polling + relay-reconnect machinery BEFORE the
+        // close: the wake's ensureConnected() ran performConnect →
+        // startPolling(), and after closeNode() the polling loop's
+        // ensureSubscriptions error path schedules scheduleRelayConnect(),
+        // which would reopen the SQLCipher store while still backgrounded —
+        // re-exposing the 0xdead10cc kill this close exists to prevent.
+        // Foreground resume restarts polling via view onAppear/performConnect.
+        // refreshTask is deliberately left running: it may be a legitimate
+        // foreground resume that reconnectIfForegroundAfterWakeClose settles.
+        syncTask?.cancel()
+        syncTask = nil
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
+        await service.closeNode()
+        #endif
+    }
+
+    /// Post-close recheck for the push-wake path. If the user foregrounded
+    /// WHILE `closeNode()` was draining, the scene-phase resume already
+    /// started a refresh whose connect attempt was rejected behind the
+    /// `nodeClosing` fence — and `refreshAfterForeground()`'s single-flight
+    /// latch would discard a plain re-kick while that doomed task is still
+    /// polling toward its timeout. Settle the in-flight refresh first, then
+    /// re-kick only when the app is foreground AND still disconnected.
+    func reconnectIfForegroundAfterWakeClose() async {
+        #if os(iOS)
+        if let existing = refreshTask {
+            _ = await existing.value
+        }
+        guard UIApplication.shared.applicationState != .background else { return }
+        guard !service.isConnected() else { return }
+        refreshAfterForeground()
+        #endif
+    }
+
     func prepareIdentityForOnboarding() async -> Bool {
         if npub != nil || service.isConnected() { return true }
         guard !busy else { return false }
@@ -922,6 +965,9 @@ final class MarmotChatModel: ObservableObject {
         if !busy { connectIfNeeded() }
         let start = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
+            // Honor cancellation: the push-wake rerun deadline relies on it
+            // (withTimeout's group waits for the child after cancelAll()).
+            if Task.isCancelled { return false }
             if service.isConnected() { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
@@ -1121,6 +1167,9 @@ final class MarmotChatModel: ObservableObject {
         connectRelaysIfNeeded()
         let start = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
+            // Honor cancellation: see ensureConnected — the wake rerun
+            // deadline propagates through withTimeout's cancelAll().
+            if Task.isCancelled { return false }
             if service.isRelayConnected() { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }

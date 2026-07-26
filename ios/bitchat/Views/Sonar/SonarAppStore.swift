@@ -886,6 +886,11 @@ final class SonarAppStore: ObservableObject {
     /// Whether the app is in the foreground (set by BitchatApp scenePhase).
     /// Receiver advertising is gated on this AND a ready wallet.
     private var isForeground = true
+    /// Set when a background launch (silent push / BLE wake) deferred the
+    /// initial Marmot connect (0xdead10cc guard in init). Consumed by the
+    /// first foreground signal, which must run the resume even though
+    /// `isForeground` never flipped off its `true` default.
+    private var deferredLaunchConnect = false
     /// The extra Unify payer scan is useful only while Radar is visible. Keep
     /// this separate from the mesh radio, which remains available for chats.
     private var isNearbyVisible = false
@@ -1739,7 +1744,26 @@ final class SonarAppStore: ObservableObject {
         applyBLEDiscoveryPolicy()
 
         if onboarded {
+            // Skip the eager Marmot connect on BACKGROUND launches (silent
+            // push / BLE wake): scenePhase starts at .background there, so the
+            // onChange suspend hook never fires and nothing would close the
+            // SQLCipher store before suspension — RunningBoard kills the app
+            // for holding locked files (0xdead10cc). The Marmot push-wake path
+            // connects on demand via ensureConnected() and closes after the
+            // wake; the first real foreground resume reconnects through
+            // refreshAfterForeground() → ensureConnected().
+            #if canImport(UIKit)
+            if UIApplication.shared.applicationState != .background {
+                marmot.connectIfNeeded()
+            } else {
+                // The first foreground signal must run the deferred resume:
+                // `isForeground` defaults to true, so setForeground(true) sees
+                // no change and would skip refreshAfterForeground() entirely.
+                deferredLaunchConnect = true
+            }
+            #else
             marmot.connectIfNeeded()
+            #endif
             if locationManager.permissionState == .authorized {
                 locationManager.refreshChannels()
             }
@@ -2377,6 +2401,15 @@ final class SonarAppStore: ObservableObject {
         // Foreground reconnect is driven by refreshAfterForeground / ensureConnected.
         if !foreground {
             marmot.suspendStoreForBackground()
+        }
+        // A background launch defers the initial Marmot connect (0xdead10cc
+        // guard in init); the first foreground signal must run the full resume
+        // even when `isForeground` never flipped off its `true` default — the
+        // `changed` guard below would otherwise skip it and leave Home stale.
+        // Idempotent: connectIfNeeded/refreshAfterForeground single-flight.
+        if foreground && deferredLaunchConnect {
+            deferredLaunchConnect = false
+            marmot.refreshAfterForeground()
         }
         #endif
         updateNearbyScanning()
