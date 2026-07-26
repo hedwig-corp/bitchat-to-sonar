@@ -1,14 +1,13 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.0 (28)** · release tag **v0.1-alpha.12**
+Build: **Sonar 1.12.1 (29)** · Apple hotfix on **v0.1-alpha.12** (+ #446)
 
-This build is a cross-platform alpha cut after live-edge transcript opens,
-mesh DM reliability (BLE disconnect / address rotation), gift-wrap join-request
-binding, Marmot send auto-retry, delete/leave chat local-first, media upload
-progress, trill/mute, and unread-badge + expand-control fixes. Opening a chat
-should paint from local storage first; fully-read DMs should land on the last
-message; missed messages catch up in the background; payments and notifications
-should stay stable when the phone is locked or the app is killed.
+Hotfix over alpha.12: close the Marmot store on background wakes so iOS does
+not jetsam the app with `0xdead10cc` (file protection / locked SQLite) when a
+push or background session touches encrypted chat state. Opening a chat should
+still paint from local storage first; missed messages catch up in the
+background; payments and notifications should stay stable when the phone is
+locked or the app is killed.
 
 If something crashes on launch, while locked, or right after sending a message,
 photo, or payment — that is the highest-priority report. If sync feels slow or
