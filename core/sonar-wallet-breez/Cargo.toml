@@ -1,0 +1,37 @@
+[package]
+name = "sonar-wallet-breez"
+description = "Breez SDK Liquid implementation of the sonar-wallet interface"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+publish = false
+
+# Build island (own workspace, `exclude`d from core/Cargo.toml): breez ships a
+# forked rusqlite/libsqlite3-sys 0.36 (`links = "sqlite3"`, plain bundled
+# SQLite) that cannot share a cargo graph with the main workspace's SQLCipher
+# libsqlite3-sys (mdk-sqlite-storage) — and must never share a binary with it
+# either (SQLCipher symbol shadowing). See core/Cargo.toml for the full note.
+[workspace]
+
+[[bin]]
+name = "sonar-wallet-cli"
+path = "src/bin/sonar-wallet-cli.rs"
+
+[dependencies]
+sonar-wallet = { path = "../sonar-wallet" }
+breez-sdk-liquid = { git = "https://github.com/breez/breez-sdk-liquid", tag = "0.12.4" }
+async-trait = "0.1"
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
+hex = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Mirror breez-sdk-liquid's own workspace patch (their MuSig-capable
+# secp256k1-zkp fork, used in Boltz cooperative swap claims). A git
+# dependency's workspace [patch] does not propagate to consumers, so replicate
+# it here to keep swap behavior identical to upstream binary releases.
+[patch.crates-io]
+secp256k1-zkp = { git = "https://github.com/breez/rust-secp256k1-zkp.git", rev = "eac2e479255a6e32b5588bc25ee53c642fdd8395" }

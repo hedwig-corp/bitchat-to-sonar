@@ -41,3 +41,31 @@ jobs:
 
       - name: Test relay smoke classification
         run: scripts/smoke/test-relay-smoke-classifier.sh
+
+  wallet-breez-island:
+    # sonar-wallet-breez is excluded from the core workspace (breez ships a
+    # plain-SQLite libsqlite3-sys that cannot share a cargo graph with our
+    # SQLCipher one), so `cargo test --workspace` above never sees it. Build and
+    # test it separately, or the Breez backend rots silently.
+    name: Wallet Breez island
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Update Rust toolchain
+        run: rustup update stable && rustup default stable
+
+      - name: Install protoc
+        # tonic-build 0.8 (via breez-sdk-liquid) needs a protobuf compiler.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core/sonar-wallet-breez
+
+      - name: Run wallet island tests
+        run: cargo test
+        working-directory: core/sonar-wallet-breez

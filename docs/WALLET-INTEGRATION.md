@@ -1,4 +1,33 @@
-# Wallet integration (Breez SDK Liquid via unify-wallet)
+# Wallet integration
+
+> **Direction of travel (2026-07):** the wallet contract now lives in Rust as
+> `core/sonar-wallet` (`WalletBackend` trait + nsec→seed derivation +
+> destination classification), with Breez SDK Liquid implementing it in
+> `core/sonar-wallet-breez`. The per-platform Breez integrations described
+> below are what ships today; they are scheduled for replacement by that
+> interface over a staged PR train (desktop → Android → iOS app → iOS
+> notification extension). Plan:
+> [`docs/plans/2026-07-27-sonar-wallet-interface-crate.md`](plans/2026-07-27-sonar-wallet-interface-crate.md).
+>
+> Two constraints that will not go away, and that any wallet work must respect:
+>
+> 1. **`sonar-wallet-breez` is a build island, not a workspace member.**
+>    `breez-sdk-liquid` ships a forked `libsqlite3-sys` (`links = "sqlite3"`,
+>    plain bundled SQLite) that cannot coexist in one cargo graph with the
+>    SQLCipher `libsqlite3-sys` the Marmot store uses — and must not share a
+>    binary with it either, which is the symbol-shadowing class that once broke
+>    iOS Marmot encryption. On iOS the Breez backend therefore has to ship as a
+>    separate dynamic framework (roughly the isolation the prebuilt
+>    `breez-sdk-liquid-swift` xcframework already provides), and `sonar-cli`
+>    can never link it — the headless proof is
+>    `core/sonar-wallet-breez/src/bin/sonar-wallet-cli.rs`.
+> 2. **The wallet seed derivation is wallet identity.**
+>    HKDF-SHA256(nsec secret, salt `"sonar-wallet"`, info `"sonar-bolt12-v1"`,
+>    32 bytes) handed to Breez as the *raw* seed — never via a BIP39 mnemonic,
+>    which derives a different wallet. Pinned by a golden vector shared with
+>    `ios/bitchatTests/Services/SonarWalletDerivationTests.swift`.
+
+## Current iOS integration (Breez SDK Liquid via unify-wallet)
 
 Sonar embeds a Lightning wallet (Breez SDK Liquid, BOLT12/BIP-353 capable)
 by reusing the wallet slice of the **unify-wallet** KMP codebase instead of
