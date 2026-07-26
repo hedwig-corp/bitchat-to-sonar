@@ -19,6 +19,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.IntentCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -350,7 +354,10 @@ class MainActivity : ComponentActivity() {
      *
      * The URI read grant is scoped to this intent, so the bytes are pulled here
      * rather than lazily from the picker screen — by the time the user chooses
-     * a recipient the permission may be gone.
+     * a recipient the permission may be gone. The grant is tied to the Activity,
+     * not to the calling thread, so the (potentially network-backed, up to 25 MiB)
+     * reads run on [Dispatchers.IO] instead of blocking the main thread; a pure
+     * text share with no URIs is still submitted synchronously to add no latency.
      */
     private fun handleShareIntent(intent: Intent?) {
         val action = intent?.action
@@ -365,19 +372,40 @@ class MainActivity : ComponentActivity() {
                     ?: emptyList()
         }
 
-        val files = readSharedFiles(uris)
-
-        // Consume the payload: onCreate re-reads the launch intent after every
-        // activity recreation (rotation, process death), which would re-offer a
-        // share the user already sent. Same pattern as handleNotificationIntent.
+        // Consume the payload from the in-process Intent. This covers onNewIntent
+        // re-delivery of the same Intent and same-process activity recreation
+        // (rotation), which would otherwise re-offer a share the user already
+        // sent. removeExtra mutates only this in-process Intent, not the task's
+        // stored root intent, so a share re-offered after a cold start (process
+        // death + task restore) is a known remaining gap. Same pattern as
+        // handleNotificationIntent.
         intent.removeExtra(Intent.EXTRA_TEXT)
         intent.removeExtra(Intent.EXTRA_STREAM)
 
-        if (text == null && files.files.isEmpty()) {
-            if (files.rejectedCount > 0) SonarLifecycle.submitSharedContent(SharedContent(null, files))
+        // Pure text share: there is no content:// I/O to do, so submit
+        // synchronously and avoid adding any latency before the picker opens.
+        if (uris.isEmpty()) {
+            if (text == null) return
+            SonarLifecycle.submitSharedContent(SharedContent(text, DroppedFiles(emptyList(), 0)))
             return
         }
-        SonarLifecycle.submitSharedContent(SharedContent(text, files))
+
+        // The content:// URIs can be backed by remote providers (Google Photos,
+        // Drive) and total up to 25 MiB, so read them off the main thread to
+        // avoid an ANR. The URI read grant is scoped to this Activity, not to
+        // the calling thread, so resolving the bytes on Dispatchers.IO stays
+        // within the grant.
+        // Only the read goes to IO. The submit stays on the main dispatcher
+        // because it lands in `handleSharedContent`, which writes Compose state
+        // and mutates the navigation stack.
+        lifecycleScope.launch {
+            val files = withContext(Dispatchers.IO) { readSharedFiles(uris) }
+            if (text == null && files.files.isEmpty()) {
+                if (files.rejectedCount > 0) SonarLifecycle.submitSharedContent(SharedContent(null, files))
+                return@launch
+            }
+            SonarLifecycle.submitSharedContent(SharedContent(text, files))
+        }
     }
 
     /**

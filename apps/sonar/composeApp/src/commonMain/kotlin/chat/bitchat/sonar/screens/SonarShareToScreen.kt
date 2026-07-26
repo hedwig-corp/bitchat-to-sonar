@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -49,10 +50,14 @@ import chat.bitchat.sonar.ui.sonar
 fun SonarShareToScreen(state: SonarAppState) {
     val s = sonar
     val share = state.pendingShare
-    // The share resolves (sent or cancelled) while this screen is still on the
-    // back stack for one frame — render nothing rather than crash on null.
+    // The share can resolve (sent or cancelled) while this screen is still
+    // composed for one frame. Render nothing rather than crash on null, and pop
+    // so this can never become a dead end with no back control. Safe to pop
+    // unconditionally: SonarScreenHost renders exactly one screen, so reaching
+    // here means ShareTo is the current screen.
     if (share == null) {
         Box(Modifier.fillMaxSize().background(s.bg))
+        LaunchedEffect(Unit) { state.back() }
         return
     }
 

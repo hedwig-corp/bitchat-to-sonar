@@ -262,6 +262,31 @@ enum SonarShareInbox {
     }
 }
 
+/// Decide whether a share-sheet attachment is a *file* to stage, given what its
+/// provider conforms to.
+///
+/// Pure and boolean-only so it is testable without an `NSItemProvider`.
+///
+/// The subtlety this exists for: `public.plain-text` and `public.url` both
+/// conform to `public.data`. A naive "does it conform to public.data?" check
+/// therefore matches a plain Safari link share, and the link gets staged as a
+/// file *on top of* the text already extracted from the same provider —
+/// producing a duplicate attachment, or a spurious "couldn't be attached"
+/// when the coercion fails. So the generic `public.data` fallback is only
+/// honoured for providers that are neither text nor a non-file URL.
+func snShouldStageAsFile(
+    isConcreteFileType: Bool,
+    isText: Bool,
+    isNonFileURL: Bool,
+    isData: Bool
+) -> Bool {
+    // Images, movies, audio, PDFs and file URLs are always content to stage,
+    // even though they conform to public.data too.
+    if isConcreteFileType { return true }
+    if isText || isNonFileURL { return false }
+    return isData
+}
+
 /// Filenames arrive from other apps and are attacker-influenced. Keep only a
 /// single safe path component so a staged item can never escape its payload
 /// directory.

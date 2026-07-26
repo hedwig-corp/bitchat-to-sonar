@@ -202,10 +202,27 @@ final class ShareViewController: UIViewController {
         payloadID: String,
         completion: @escaping (StagedFiles) -> Void
     ) {
+        let concreteTypes = [
+            UTType.image.identifier,
+            UTType.movie.identifier,
+            UTType.audio.identifier,
+            UTType.pdf.identifier,
+            UTType.fileURL.identifier,
+        ]
+        // The decision itself lives in `snShouldStageAsFile` so it is testable
+        // without an NSItemProvider — see SonarSharePayloadTests.
         let fileProviders = providers.filter { provider in
-            Self.fileTypeIdentifiers.contains {
-                provider.hasItemConformingToTypeIdentifier($0)
-            }
+            let isFileURL = provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            return snShouldStageAsFile(
+                isConcreteFileType: concreteTypes.contains {
+                    provider.hasItemConformingToTypeIdentifier($0)
+                },
+                isText: provider.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+                    || provider.hasItemConformingToTypeIdentifier(UTType.text.identifier),
+                isNonFileURL: provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
+                    && !isFileURL,
+                isData: provider.hasItemConformingToTypeIdentifier(UTType.data.identifier)
+            )
         }
         guard !fileProviders.isEmpty else {
             completion(StagedFiles())

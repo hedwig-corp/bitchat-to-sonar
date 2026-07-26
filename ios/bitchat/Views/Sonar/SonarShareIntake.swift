@@ -83,9 +83,18 @@ extension SonarAppStore {
         else {
             return
         }
+        // Read the timestamp before clearing the keys so a payload staged days
+        // ago (e.g. before an app upgrade) is not re-offered as a fresh share.
+        let writtenAt = defaults.object(forKey: "sharedContentDate") as? Date
         defaults.removeObject(forKey: "sharedContent")
         defaults.removeObject(forKey: "sharedContentType")
         defaults.removeObject(forKey: "sharedContentDate")
+
+        // Older than the SonarShareInbox staleness window: the keys are cleared
+        // but the payload is dropped instead of being offered again.
+        if let writtenAt, Date().timeIntervalSince(writtenAt) > SonarShareInbox.staleAfterSeconds {
+            return
+        }
 
         // A shared invite link means "join", not "send" — same as before.
         if let token = InviteShare.token(fromText: content) {
@@ -157,25 +166,45 @@ extension SonarAppStore {
             let result = await Task.detached(priority: .userInitiated) {
                 snReadAttachments(fileURLs, maxTotalBytes: limit)
             }.value
-            // The bytes are in memory now; the staged copies are dead weight
-            // whatever happens next.
-            SonarShareInbox.discard(payloadID, appGroupID: groupID)
 
             guard !result.attachments.isEmpty else {
                 showToast(result.oversizedCount > 0
                     ? "File is too large to send"
                     : "Couldn't attach that file")
+                // Too large or unreadable is not transient — a retry against a
+                // different recipient would fail identically, so drop the
+                // staged copies rather than leaking them until the 24h prune.
+                SonarShareInbox.discard(payloadID, appGroupID: groupID)
                 return
             }
+
+            // Restoring the picker after a route failure must NOT re-offer the
+            // text: it was already sent above, and a second pick would deliver
+            // it twice. Only the files are still pending.
+            let filesOnlyRetry = SNPendingShare(
+                payload: SonarSharePayload(
+                    version: share.payload.version,
+                    id: share.payload.id,
+                    createdAt: share.payload.createdAt,
+                    text: nil,
+                    items: share.payload.items,
+                    droppedCount: share.payload.droppedCount
+                ),
+                fileURLs: fileURLs
+            )
 
             switch await prepareMediaRoute(conversationID) {
             case .ready:
                 break
             case .unavailable:
                 showToast("This contact must be online to receive files")
+                // Transient failure — keep the staged files and restore the
+                // picker so the user can retry instead of losing the payload.
+                pendingShare = filesOnlyRetry
                 return
             case .failed:
                 showToast("Couldn't set up a secure file transfer")
+                pendingShare = filesOnlyRetry
                 return
             }
 
@@ -190,6 +219,9 @@ extension SonarAppStore {
                     sent += 1
                 }
             }
+            // At least one send was attempted, so the staged copies are now dead
+            // weight — discard only after the loop, never on a route failure.
+            SonarShareInbox.discard(payloadID, appGroupID: groupID)
             // `droppedCount` covers what the extension could not stage at all,
             // so a partly-delivered multi-file share never looks complete.
             let offered = result.attachments.count + result.rejectedCount + droppedCount

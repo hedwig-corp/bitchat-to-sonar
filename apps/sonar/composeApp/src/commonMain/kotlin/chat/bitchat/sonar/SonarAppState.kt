@@ -9042,6 +9042,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         pendingShare = content
+        // Never stack two ShareTo pickers: a second share arriving while one is
+        // already up would leave a stale ShareTo behind after sendPendingShare's
+        // single back(). Drop any existing ShareTo entries before pushing.
+        if (stack.any { it is Screen.ShareTo }) {
+            stack = stack.filterNot { it is Screen.ShareTo }
+        }
         push(Screen.ShareTo)
     }
 

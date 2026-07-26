@@ -72,6 +72,76 @@ struct SonarSharePayloadTests {
         #expect(SonarShareInbox.maxStagedItems == snMaxImportedAttachments)
     }
 
+    // MARK: - What counts as a file to stage
+
+    /// The regression this pins: `public.plain-text` and `public.url` both
+    /// conform to `public.data` (verified: `UTType.url.conforms(to: .data)` is
+    /// true). A plain "does it conform to public.data?" check therefore matched
+    /// a Safari link share, and the link was staged as a file on top of the
+    /// text already extracted from the same provider — a duplicate attachment,
+    /// or a spurious "1 file couldn't be attached" on the commonest flow.
+    @Test
+    func linkShareIsNotAlsoStagedAsAFile() {
+        // A Safari link provider: URL + data, not a file URL.
+        #expect(!snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: false,
+            isNonFileURL: true,
+            isData: true
+        ))
+    }
+
+    @Test
+    func plainTextShareIsNotAlsoStagedAsAFile() {
+        #expect(!snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: true,
+            isNonFileURL: false,
+            isData: true
+        ))
+    }
+
+    @Test
+    func concreteFileTypesAlwaysStage() {
+        // A photo conforms to public.data as well; the concrete match must win
+        // so tightening the fallback never stops real attachments shipping.
+        #expect(snShouldStageAsFile(
+            isConcreteFileType: true,
+            isText: false,
+            isNonFileURL: false,
+            isData: true
+        ))
+        // A file URL is content even though it is also a URL.
+        #expect(snShouldStageAsFile(
+            isConcreteFileType: true,
+            isText: false,
+            isNonFileURL: false,
+            isData: false
+        ))
+    }
+
+    @Test
+    func opaqueDataStillStagesThroughTheFallback() {
+        // An arbitrary document with no more specific conformance — the reason
+        // the public.data fallback exists at all.
+        #expect(snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: false,
+            isNonFileURL: false,
+            isData: true
+        ))
+    }
+
+    @Test
+    func providerMatchingNothingIsNotStaged() {
+        #expect(!snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: false,
+            isNonFileURL: false,
+            isData: false
+        ))
+    }
+
     // MARK: - Filenames
 
     @Test
