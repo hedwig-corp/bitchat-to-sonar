@@ -161,7 +161,9 @@ enum SNMarmotDescriptorCache {
                   [String: MarmotService.SonarDescriptor].self, from: data
               )
         else { return [:] }
-        return descriptors
+        // A blob written before the cap existed can be over the limit; bound it
+        // here so the live map starts bounded without needing a write.
+        return capped(descriptors)
     }
 
     static func save(
@@ -2627,7 +2629,14 @@ final class MarmotChatModel: ObservableObject {
                 } else {
                     self.sonarDescriptorMissesByNpub[npubToFetch] = nil
                 }
-                SNMarmotDescriptorCache.save(self.sonarDescriptorsByNpub, to: self.defaults)
+                // A miss leaves the cache byte-identical, so skip the encode.
+                // `save` runs a full JSON encode of the whole dictionary on the
+                // MainActor; a boot/foreground refresh sweep would otherwise do
+                // that once per missed contact for no state change. Compose's
+                // miss branch does not persist either.
+                if !outcome.missed {
+                    SNMarmotDescriptorCache.save(self.sonarDescriptorsByNpub, to: self.defaults)
+                }
             }
         } catch {
             await MainActor.run {

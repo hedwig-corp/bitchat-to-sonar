@@ -868,7 +868,9 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  persisted cache so a cold start paints the payment affordance from local
      *  state instead of waiting on a relay round-trip. */
     var sonarDescriptorsByNpubHex by mutableStateOf(
-        decodeSonarDescriptorCache(SonarCore.loadBlob(SONAR_DESCRIPTOR_CACHE_BLOB_KEY))
+        boundedSonarDescriptorCache(
+            decodeSonarDescriptorCache(SonarCore.loadBlob(SONAR_DESCRIPTOR_CACHE_BLOB_KEY))
+        )
     )
         private set
     private val sonarDescriptorFetches = mutableSetOf<String>()
