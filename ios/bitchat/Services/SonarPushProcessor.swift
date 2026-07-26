@@ -119,15 +119,89 @@ enum SonarPushProcessor {
 
             var overall: UIBackgroundFetchResult = .noData
             var clearNSEPlaceholders = false
-            repeat {
-                marmotWakeNeedsRerun = false
-                let outcome = await runMarmotWakeup(marmot: marmot, prefs: prefs)
-                overall = mergeFetchResult(overall, outcome.fetchResult)
-                clearNSEPlaceholders = clearNSEPlaceholders || outcome.shouldClearNSEPlaceholders
-            } while marmotWakeNeedsRerun
+            // Outer loop: a push that arrives WHILE the store is being closed
+            // sets marmotWakeNeedsRerun after the inner drain loop exited —
+            // re-enter and drain it (reopening the node on demand) instead of
+            // dropping it until the next wake. Reruns are bounded to the ~30s
+            // iOS background window: only re-enter with enough headroom and
+            // shrink the sync timeout (plus skip the cold-launch NSE yield) to
+            // what remains, so the wake completes before iOS expires it.
+            let wakeStart = Date()
+            var syncTimeout = TransportConfig.marmotPushSyncTimeoutSeconds
+            var skipNSEYield = false
+            var keepDraining = true
+            while keepDraining {
+                repeat {
+                    marmotWakeNeedsRerun = false
+                    let outcome: MarmotWakeOutcome
+                    if skipNSEYield {
+                        // Rerun: bound the WHOLE reconnect+sync to the
+                        // remaining window — ensureConnected() and refresh()'s
+                        // ensureRelayConnected() can spend 10s+10s before the
+                        // bounded sync even starts. On overrun, fail the rerun
+                        // and fall through to the close; the push syncs on the
+                        // next wake/foreground.
+                        do {
+                            outcome = try await withTimeout(seconds: syncTimeout) {
+                                await runMarmotWakeup(
+                                    marmot: marmot,
+                                    prefs: prefs,
+                                    syncTimeoutSeconds: syncTimeout,
+                                    skipNSEYield: true
+                                )
+                            }
+                        } catch {
+                            log.warning("Coalesced Marmot rerun exceeded wake window: \(error)")
+                            outcome = MarmotWakeOutcome(fetchResult: .failed, shouldClearNSEPlaceholders: false)
+                        }
+                    } else {
+                        outcome = await runMarmotWakeup(
+                            marmot: marmot,
+                            prefs: prefs,
+                            syncTimeoutSeconds: syncTimeout,
+                            skipNSEYield: false
+                        )
+                    }
+                    overall = mergeFetchResult(overall, outcome.fetchResult)
+                    clearNSEPlaceholders = clearNSEPlaceholders || outcome.shouldClearNSEPlaceholders
+                } while marmotWakeNeedsRerun
 
-            if clearNSEPlaceholders {
-                removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: nsePlaceholderSnapshot)
+                if clearNSEPlaceholders {
+                    removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: nsePlaceholderSnapshot)
+                    clearNSEPlaceholders = false
+                }
+                // A background wake opened the SQLCipher store (ensureConnected),
+                // but scenePhase never transitions on a background launch, so no
+                // suspend hook will close it. Release the node BEFORE the fetch
+                // completion handler lets iOS suspend us — suspending while
+                // holding the WAL/flock is the RunningBoard 0xdead10cc kill.
+                // Gate on .background only: .active/.inactive means the user can
+                // see the app and the foreground path owns the node.
+                guard UIApplication.shared.applicationState == .background else { break }
+                await marmot.closeStoreAfterBackgroundWake()
+                if UIApplication.shared.applicationState != .background {
+                    // The user foregrounded WHILE closeNode() awaited — the
+                    // scene-phase resume raced our close and could have failed
+                    // to reconnect behind the nodeClosing fence. The foreground
+                    // path owns the node now: settle any doomed in-flight
+                    // refresh and re-kick the resume (no-op if the concurrent
+                    // reconnect already landed). Foreground sync also covers
+                    // any push that arrived during the close.
+                    await marmot.reconnectIfForegroundAfterWakeClose()
+                    keepDraining = false
+                } else {
+                    let remaining = Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
+                    keepDraining = marmotWakeNeedsRerun && remaining > Self.marmotWakeRerunMinSeconds
+                    if keepDraining {
+                        skipNSEYield = true
+                        syncTimeout = min(
+                            TransportConfig.marmotPushSyncTimeoutSeconds,
+                            max(3, remaining - 2)
+                        )
+                    } else if marmotWakeNeedsRerun {
+                        log.info("Skipping coalesced Marmot rerun — \(Int(remaining))s left in wake window")
+                    }
+                }
             }
             return overall
         }
@@ -143,10 +217,19 @@ enum SonarPushProcessor {
         let shouldClearNSEPlaceholders: Bool
     }
 
+    /// iOS gives a silent-push wake ~30s of background execution
+    /// (TransportConfig documents the window); keep 2s of margin.
+    private static let marmotWakeWindowSeconds: Double = 28
+    /// Below this much remaining window a coalesced rerun cannot pay even a
+    /// shrunk sync — skip it; the push syncs on the next wake/foreground.
+    private static let marmotWakeRerunMinSeconds: Double = 8
+
     @MainActor
     private static func runMarmotWakeup(
         marmot: MarmotChatModel,
-        prefs: SonarLocalNotificationPrefs
+        prefs: SonarLocalNotificationPrefs,
+        syncTimeoutSeconds: Double = TransportConfig.marmotPushSyncTimeoutSeconds,
+        skipNSEYield: Bool = false
     ) async -> MarmotWakeOutcome {
         // Ownership is held by the outer single-flight loop so trailing
         // refreshes share one notified-ID set.
@@ -164,7 +247,7 @@ enum SonarPushProcessor {
         // this delay the host steals the lock and NSE stays on the generic
         // placeholder.
         let appState = UIApplication.shared.applicationState
-        if appState != .active {
+        if !skipNSEYield && appState != .active {
             try? await Task.sleep(nanoseconds: 2_500_000_000)
         }
         // #354: invalidate the stale relay latch first — a process-alive
@@ -183,7 +266,7 @@ enum SonarPushProcessor {
         var drained: [DrainNotificationInfo] = []
         var synced = false
         do {
-            drained = try await withTimeout(seconds: TransportConfig.marmotPushSyncTimeoutSeconds) {
+            drained = try await withTimeout(seconds: syncTimeoutSeconds) {
                 await marmot.refresh()
             }
             synced = true
