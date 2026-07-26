@@ -644,6 +644,24 @@ class TranscriptDisplayPolicyTest {
         assertEquals(-1, firstUnreadTranscriptIndex(rows, 2))
     }
 
+    @Test
+    fun emptyReadIsUntrustedWhenLocalMetadataKnowsMessages() {
+        val page = listOf(message("a", 1))
+        // The reported black transcript: core is up, the store answers empty,
+        // but local metadata remembers a message — that read must not be painted.
+        assertTrue(transcriptReadIsUntrusted(emptyList(), coreStarted = true, knownLatestSecs = 1_700_000L))
+        // Failed read is always untrusted, whatever the metadata says.
+        assertTrue(transcriptReadIsUntrusted(null, coreStarted = true, knownLatestSecs = 0L))
+        // Core not started yet: an empty page proves nothing (cold launch).
+        assertTrue(transcriptReadIsUntrusted(emptyList(), coreStarted = false, knownLatestSecs = 0L))
+        // A genuinely empty conversation must still be paintable, or a new chat
+        // would hold a stale window forever.
+        assertFalse(transcriptReadIsUntrusted(emptyList(), coreStarted = true, knownLatestSecs = 0L))
+        // Any non-empty page is local truth.
+        assertFalse(transcriptReadIsUntrusted(page, coreStarted = true, knownLatestSecs = 1_700_000L))
+        assertFalse(transcriptReadIsUntrusted(page, coreStarted = false, knownLatestSecs = 0L))
+    }
+
     private fun coreRow(content: String, klass: SonarMsgClass) = SonarMsg(
         id = "m-${content.hashCode()}",
         senderNpub = "npub",

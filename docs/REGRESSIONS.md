@@ -754,6 +754,67 @@ behaviour.
 - *Dropping non-kind-9 rumors at the index instead of at `process_incoming`.*
   They would still ring a notification for a row no host can render.
 
+## R-015 — An unreadable local store must never paint as an empty conversation
+
+**Invariant:** A local transcript read that returns nothing is only painted when
+the store was actually readable. "Core is not readable yet" and "this
+conversation has no messages" must not reach the UI as the same answer, and an
+empty window must never be cached as a conversation's contents.
+
+**Breaks as:** Opening a chat shows a black transcript — header, verified
+banner and composer, no rows — and the messages appear seconds later when an
+unrelated sync event repaints. Typing works throughout, which is what makes it
+read as a rendering bug rather than a loading one.
+
+**Why:** `SonarCore.messagesCursorPage` / `messagesPage` answered `emptyList()`
+when `node` was null (still booting after a cold launch, or being replaced),
+which is indistinguishable from a genuinely empty conversation. The transcript
+committed that as the page, and `refreshTranscriptGroupWindow` then *cached* the
+empty window — after which `current != null` short-circuited every later refresh
+and the chat stayed blank until something else published rows. The `!started`
+fallback did not cover it, because `started` is true well before every read path
+has a node.
+
+**Call sites:** Compose `SonarCore.android.kt` / `SonarCore.jvm.kt`
+(`messagesPage` / `messagesCursorPage` now `requireNode()`);
+`TranscriptDisplayPolicy.transcriptReadIsUntrusted` consumed by
+`SonarAppState.refreshTranscriptGroupWindow`;
+`SonarAppState.scheduleBlankTranscriptRecovery` wired into `openChat`, `openDm`
+and `restoreTranscriptSession`. iOS: not implemented — see platform gap.
+
+**Guarded by:** `TranscriptDisplayPolicyTest.emptyReadIsUntrustedWhenLocalMetadataKnowsMessages`
+
+**Coverage (honest):** the cited test pins the pure trust decision, including
+that a genuinely empty conversation stays paintable (or a new chat would hold a
+stale window forever). It does **not** pin that `refreshTranscriptGroupWindow`
+consults it, that the empty window is no longer cached, that the read APIs throw
+instead of returning empty, or the bounded recovery loop — all four need a
+constructible `SonarAppState` (see Unguarded). The recovery budget
+(8 s, 100 ms → 800 ms backoff) is a judgement call, not a measured one.
+
+**Platform gap:** iOS is untouched and has the same class of hole — the
+cold-launch first-open hydrate can show blank there too (noted while landing
+#303). The Apple read path needs the same "unreadable ≠ empty" distinction; not
+implemented here because this fix is Compose/Android-side, and the report was an
+Android device.
+
+**History:** Reported with screenshots: chat open on a black transcript, rows
+appearing "after a while". Distinct from R-014 (which mis-*places* the divider
+on a populated transcript) and from R-009 (which mis-*scrolls* one) — all three
+surface to the user as "the chat opened wrong", which is why the first two fixes
+did not touch this path.
+
+**Rejected:**
+- *Waiting for a readable store before `push`.* Keeps the user on Home with a
+  dead tap; the Signal-Comparable Performance Rule wants the chat open
+  immediately, painting whatever local state exists.
+- *Letting the next sync/poll repaint it.* That is exactly today's behaviour and
+  what produced the reported delay — it ties first paint to a network-driven
+  event.
+- *Returning `emptyList()` but flagging a boolean alongside it.* Every caller
+  would have to remember to check the flag; throwing routes through the
+  `runCatching { … }.getOrNull()` both call sites already have.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

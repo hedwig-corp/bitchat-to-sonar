@@ -429,8 +429,11 @@ actual object SonarCore {
         withContext(Dispatchers.IO) {
             require(limit > 0) { "messagesPage limit must be greater than zero" }
             require(offset >= 0) { "messagesPage offset must be non-negative" }
-            val n = node ?: return@withContext emptyList()
-            n.messagesPage(chatId, limit.toUInt(), offset.toUInt()).map { it.toCommon() }
+            // NOT `?: emptyList()`: "the store is not readable" and "this
+            // conversation has no messages" must not answer the same. Callers
+            // read this as local truth and paint it — an empty list from a
+            // missing node blanks a transcript that has history on disk.
+            requireNode().messagesPage(chatId, limit.toUInt(), offset.toUInt()).map { it.toCommon() }
         }
 
     actual suspend fun recentMessagePages(groupLimit: Int, pageLimit: Int): List<SonarRecentTranscriptPage> =
@@ -474,8 +477,11 @@ actual object SonarCore {
         beforeIdHex: String?,
         limit: Int,
     ): List<SonarMsg> = withContext(Dispatchers.IO) {
-        val n = node ?: return@withContext emptyList()
-        n.messagesCursorPage(
+        // Throws rather than answering `emptyList()` with no node: this is the
+        // transcript's local read, and both call sites already treat a failure
+        // as "unreadable, keep the current rows". An empty list would instead
+        // be committed as the conversation's contents (blank chat).
+        requireNode().messagesCursorPage(
             chatId,
             beforeSecs?.toULong(),
             beforeIdHex,

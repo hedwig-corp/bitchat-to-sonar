@@ -415,6 +415,30 @@ private fun isGraphemeExtension(codePoint: Int): Boolean =
  * they keep the string decode. [isCallControl] is injected because parsing a
  * ☎CALL line is an FFI call the pure policy layer must not make itself.
  */
+/**
+ * Whether a local transcript read may be painted as the conversation's contents.
+ *
+ * An empty page is ambiguous. The store answers with the same empty list when
+ * it cannot be read yet — core still booting, node being replaced — as when the
+ * conversation genuinely holds nothing, and painting the ambiguous case blanks a
+ * chat that has history on disk (black transcript until the next sync event
+ * repaints it). Local sort metadata survives that window, so treat an empty page
+ * as untrusted whenever it says this conversation has messages.
+ *
+ * [fetched] is null when the read failed outright. [knownLatestSecs] is the
+ * newest timestamp local metadata remembers for the group, 0 when it knows of
+ * none — a genuinely empty conversation therefore still reads as trustworthy.
+ */
+internal fun transcriptReadIsUntrusted(
+    fetched: List<SonarMsg>?,
+    coreStarted: Boolean,
+    knownLatestSecs: Long,
+): Boolean {
+    if (fetched == null) return true
+    if (fetched.isNotEmpty()) return false
+    return !coreStarted || knownLatestSecs > 0L
+}
+
 internal fun isTranscriptVisibleRow(
     msg: SonarMsg,
     isCallControl: (String) -> Boolean,
