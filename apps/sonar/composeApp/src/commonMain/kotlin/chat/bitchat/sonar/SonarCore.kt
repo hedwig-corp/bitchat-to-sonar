@@ -218,7 +218,7 @@ internal const val CHAT_SNAPSHOT_BLOB_KEY = "chats.snapshot.v1"
 /** Resolved Sonar descriptors, keyed by npub hex. Persisted so the payment /
  *  call affordances paint from local state on cold start instead of waiting on
  *  a relay round-trip (Signal-Comparable Performance Rule). */
-internal const val SONAR_DESCRIPTOR_CACHE_BLOB_KEY = "sonar.descriptors.v1"
+internal const val SONAR_DESCRIPTOR_CACHE_BLOB_KEY = "sonar.descriptors.v2"
 
 internal fun canonicalProfileKey(value: String): String {
     val clean = value.trim()
@@ -364,12 +364,12 @@ internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor
                 npubHex,
                 d.schema.toString(),
                 if (d.calls) "1" else "0",
-                hexEnc(d.media.joinToString(",")),
-                hexEnc(d.signaling.joinToString(",")),
-                hexEnc(d.transports.joinToString(",")),
+                encodeDescriptorList(d.media),
+                encodeDescriptorList(d.signaling),
+                encodeDescriptorList(d.transports),
                 hexEnc(d.callIdentity),
                 profileField(d.bolt12Offer),
-                hexEnc(d.paymentReceipts.joinToString(",")),
+                encodeDescriptorList(d.paymentReceipts),
                 d.publishedAtSecs.toString(),
             ).joinToString("\t")
         }
@@ -387,12 +387,12 @@ internal fun decodeSonarDescriptorCache(blob: String): Map<String, SonarDescript
                 "0" -> false
                 else -> return@mapNotNull null
             }
-            val media = hexDec(parts[3])?.splitDescriptorList() ?: return@mapNotNull null
-            val signaling = hexDec(parts[4])?.splitDescriptorList() ?: return@mapNotNull null
-            val transports = hexDec(parts[5])?.splitDescriptorList() ?: return@mapNotNull null
+            val media = decodeDescriptorList(parts[3]) ?: return@mapNotNull null
+            val signaling = decodeDescriptorList(parts[4]) ?: return@mapNotNull null
+            val transports = decodeDescriptorList(parts[5]) ?: return@mapNotNull null
             val callIdentity = hexDec(parts[6]) ?: return@mapNotNull null
             val bolt12Offer = profileFieldValue(parts[7]) ?: return@mapNotNull null
-            val receipts = hexDec(parts[8])?.splitDescriptorList() ?: return@mapNotNull null
+            val receipts = decodeDescriptorList(parts[8]) ?: return@mapNotNull null
             val publishedAtSecs = parts[9].toLongOrNull() ?: return@mapNotNull null
             npubHex to SonarDescriptor(
                 schema = schema,
@@ -414,8 +414,17 @@ private fun normalizedDescriptorCacheKey(value: String): String? =
     value.trim().lowercase()
         .takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
 
-private fun String.splitDescriptorList(): List<String> =
-    if (isEmpty()) emptyList() else split(",").filter { it.isNotBlank() }
+/** Hex-encode each element separately and join the HEX with ",". Hex output is
+ *  `[0-9a-f]` only, so the separator can never occur inside an encoded element
+ *  and a list round-trips element-for-element even when a value contains a
+ *  comma. Joining before encoding would silently split such a value in two. */
+private fun encodeDescriptorList(values: List<String>): String =
+    values.joinToString(",") { hexEnc(it) }
+
+private fun decodeDescriptorList(token: String): List<String>? {
+    if (token.isEmpty()) return emptyList()
+    return token.split(",").map { hexDec(it) ?: return null }
+}
 
 private fun profileField(value: String?): String =
     value?.let { "1" + hexEnc(it) } ?: "0"

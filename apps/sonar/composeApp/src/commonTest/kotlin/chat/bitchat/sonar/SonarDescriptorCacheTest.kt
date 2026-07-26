@@ -2,6 +2,7 @@ package chat.bitchat.sonar
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -46,6 +47,47 @@ class SonarDescriptorCacheTest {
 
         assertEquals(1, decoded.size)
         assertEquals(hostile, decoded[npubHex])
+    }
+
+    /** A comma inside a list element must not split it into two elements.
+     *
+     *  The core's `is_protocol_token` keeps commas out of these lists today, so
+     *  this is not reachable from the wire — but the encoder's contract is an
+     *  exact round-trip, and the earlier join-then-encode form broke it. Under
+     *  that form `signaling = ["marmot,x"]` reloaded as `["marmot", "x"]`, which
+     *  would flip `supportsCurrentCalls` from false to true across a restart. */
+    @Test
+    fun commasInsideListElementsDoNotSplitThem() {
+        val hostile = descriptor(
+            media = listOf("voice,video"),
+        ).copy(
+            signaling = listOf("marmot,x"),
+            transports = listOf("iroh,x"),
+            paymentReceipts = listOf("a,b", "c"),
+        )
+        assertFalse(hostile.supportsCurrentCalls)
+
+        val decoded = decodeSonarDescriptorCache(encodeSonarDescriptorCache(mapOf(npubHex to hostile)))
+
+        assertEquals(hostile, decoded[npubHex])
+        assertEquals(listOf("marmot,x"), decoded[npubHex]?.signaling)
+        assertEquals(listOf("a,b", "c"), decoded[npubHex]?.paymentReceipts)
+        // The round-trip must not manufacture the exact tokens calls require.
+        assertFalse(decoded.getValue(npubHex).supportsCurrentCalls)
+    }
+
+    @Test
+    fun roundTripsEmptyLists() {
+        val bare = descriptor().copy(
+            media = emptyList(),
+            signaling = emptyList(),
+            transports = emptyList(),
+            paymentReceipts = emptyList(),
+        )
+
+        val decoded = decodeSonarDescriptorCache(encodeSonarDescriptorCache(mapOf(npubHex to bare)))
+
+        assertEquals(bare, decoded[npubHex])
     }
 
     @Test
