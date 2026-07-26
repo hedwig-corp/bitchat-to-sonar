@@ -178,7 +178,9 @@ enum SNMarmotDescriptorCache {
     }
 
     /// Keep the freshest descriptors when over the cap (newest `publishedAt`).
-    private static func capped(
+    /// Applied to the LIVE model map as well as to `save`, so the in-memory
+    /// dictionary cannot grow without bound and make every fetch re-encode more.
+    static func capped(
         _ descriptors: [String: MarmotService.SonarDescriptor]
     ) -> [String: MarmotService.SonarDescriptor] {
         guard descriptors.count > entryLimit else { return descriptors }
@@ -2619,6 +2621,7 @@ final class MarmotChatModel: ObservableObject {
                     self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
                 }
                 self.sonarDescriptorsByNpub[npubToFetch] = outcome.descriptor
+                self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.capped(self.sonarDescriptorsByNpub)
                 if outcome.missed {
                     self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
                 } else {

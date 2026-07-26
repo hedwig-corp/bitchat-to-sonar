@@ -146,6 +146,35 @@ class SonarDescriptorCacheTest {
         )
     }
 
+    /** The cap has to bound the LIVE map, not just the encoder output —
+     *  otherwise `sonarDescriptorsByNpubHex` grows forever and every fetch
+     *  re-encodes more of it on the Main dispatcher. */
+    @Test
+    fun boundingPrunesTheLiveMapItself() {
+        val overCap = SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT + 50
+        val live = (0 until overCap).associate { i ->
+            i.toString(16).padStart(64, '0') to descriptor(publishedAtSecs = i.toLong())
+        }
+
+        val bounded = boundedSonarDescriptorCache(live)
+
+        assertEquals(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT, bounded.size)
+        assertEquals(null, bounded[0.toString(16).padStart(64, '0')])
+        assertEquals(
+            (overCap - 1).toLong(),
+            bounded[(overCap - 1).toString(16).padStart(64, '0')]?.publishedAtSecs,
+        )
+    }
+
+    @Test
+    fun boundingIsIdentityBelowTheCap() {
+        val under = (0 until 10).associate { i ->
+            i.toString(16).padStart(64, '0') to descriptor(publishedAtSecs = i.toLong())
+        }
+
+        assertEquals(under, boundedSonarDescriptorCache(under))
+    }
+
     /** Ties on publishedAtSecs break on the key, so the persisted blob does not
      *  churn between runs for an unchanged cache. */
     @Test

@@ -4732,7 +4732,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (descriptor != null) {
-            sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
+            sonarDescriptorsByNpubHex =
+                boundedSonarDescriptorCache(sonarDescriptorsByNpubHex + (key to descriptor))
             sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
             sonarDescriptorMissedAt.remove(key)
             persistSonarDescriptorCache()

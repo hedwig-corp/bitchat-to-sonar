@@ -345,20 +345,38 @@ internal const val SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT = 1024
  *  storage. Every string rides through [hexEnc] so an offer or capability token
  *  can never corrupt the tab/newline framing. Over the cap, the freshest
  *  descriptors win. */
-internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
-    descriptors.entries
-        .mapNotNull { (key, descriptor) ->
-            val npubHex = normalizedDescriptorCacheKey(key) ?: return@mapNotNull null
-            npubHex to descriptor
-        }
-        // Newest first so the cap keeps the freshest descriptors, with the key
-        // as tiebreak so the pruned set (and the blob) is deterministic.
+/** Prune a descriptor cache to [SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT], keeping the
+ *  freshest by `publishedAtSecs` with the npub key as tiebreak so the result is
+ *  deterministic.
+ *
+ *  Apply this to the LIVE map, not only to the encoder's output: capping only
+ *  what gets serialized leaves the in-memory map growing without bound, and the
+ *  encode runs on the Main dispatcher, so every fetch would re-encode an
+ *  ever-larger map on the render path. */
+internal fun boundedSonarDescriptorCache(
+    descriptors: Map<String, SonarDescriptor>,
+): Map<String, SonarDescriptor> {
+    if (descriptors.size <= SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT) return descriptors
+    return descriptors.entries
         .sortedWith(
-            compareByDescending<Pair<String, SonarDescriptor>> { it.second.publishedAtSecs }
-                .thenBy { it.first }
+            compareByDescending<Map.Entry<String, SonarDescriptor>> { it.value.publishedAtSecs }
+                .thenBy { it.key }
         )
         .take(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT)
-        .sortedBy { it.first }
+        .associate { it.key to it.value }
+}
+
+internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
+    boundedSonarDescriptorCache(
+        descriptors.entries
+            .mapNotNull { (key, descriptor) ->
+                val npubHex = normalizedDescriptorCacheKey(key) ?: return@mapNotNull null
+                npubHex to descriptor
+            }
+            .toMap()
+    )
+        .entries
+        .sortedBy { it.key }
         .joinToString("\n") { (npubHex, d) ->
             listOf(
                 npubHex,
