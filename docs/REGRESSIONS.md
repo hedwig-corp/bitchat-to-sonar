@@ -784,13 +784,24 @@ and `restoreTranscriptSession`. iOS: not implemented — see platform gap.
 
 **Guarded by:** `TranscriptDisplayPolicyTest.emptyReadIsUntrustedWhenLocalMetadataKnowsMessages`
 
-**Coverage (honest):** the cited test pins the pure trust decision, including
-that a genuinely empty conversation stays paintable (or a new chat would hold a
-stale window forever). It does **not** pin that `refreshTranscriptGroupWindow`
-consults it, that the empty window is no longer cached, that the read APIs throw
-instead of returning empty, or the bounded recovery loop — all four need a
-constructible `SonarAppState` (see Unguarded). The recovery budget
-(8 s, 100 ms → 800 ms backoff) is a judgement call, not a measured one.
+**Also guarded by:** `TranscriptDisplayPolicyTest.blankRecoveryRunsWhenEmptinessCannotBeProven`, `TranscriptDisplayPolicyTest.blankRecoverySkipsAConversationProvenEmpty`
+
+**Coverage (honest):** the cited tests pin the pure trust decision (including
+that a genuinely empty conversation stays paintable, or a new chat would hold a
+stale window forever) and the recovery gate. They do **not** pin that
+`refreshTranscriptGroupWindow` consults the first, that the empty window is no
+longer cached, that the read APIs throw instead of returning empty, that mesh
+recovery resolves through `localTranscriptRowsForChat`, or the retry loop itself
+— all of which need a constructible `SonarAppState` (see Unguarded). The
+recovery budget (8 s, 100 ms → 800 ms backoff) is a judgement call, not a
+measured one.
+
+**Two ways the recovery can miss, both deliberate:** its read must resolve the
+conversation's real sources (a mesh route id is not a Marmot group id — hand it
+to a group-page read and every retry answers "no messages"), and its gate must
+not treat "we cannot tell yet" as "genuinely empty" (the mesh snapshot is keyed
+by group id, so a cold-launch mesh route knows of no history until `chats` /
+`npubRawFor` resolve). Both were live in the first cut of this fix.
 
 **Platform gap:** iOS is untouched and has the same class of hole — the
 cold-launch first-open hydrate can show blank there too (noted while landing

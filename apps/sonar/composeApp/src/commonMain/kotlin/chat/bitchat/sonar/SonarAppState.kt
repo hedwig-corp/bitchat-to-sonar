@@ -9070,6 +9070,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun transcriptKnownNonEmpty(chatId: String): Boolean =
         localLatestTs(chatId) > 0L || transcriptGroupIds(chatId).any { localLatestTs(it) > 0L }
 
+    /** Whether this conversation's transport legs are known yet. A mesh route
+     *  resolves its folded White Noise groups through `chats` / `npubRawFor`,
+     *  neither of which is populated on a cold launch; a plain Marmot chat id is
+     *  its own source, so it is always resolved. */
+    private fun transcriptSourcesResolved(chatId: String): Boolean =
+        !isMeshChat(chatId) || transcriptGroupIds(chatId).isNotEmpty()
+
     /**
      * The same local rows the open path would read for [chatId].
      *
@@ -9106,7 +9113,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      * [BLANK_TRANSCRIPT_RETRY_BUDGET_MS].
      */
     private fun scheduleBlankTranscriptRecovery(chatId: String, generation: Long) {
-        if (!transcriptKnownNonEmpty(chatId)) return
+        val shouldRecover = shouldRecoverBlankTranscript(
+            knownNonEmpty = transcriptKnownNonEmpty(chatId),
+            coreStarted = started,
+            sourcesResolved = transcriptSourcesResolved(chatId),
+        )
+        if (!shouldRecover) return
         scope.launch {
             var waitedMs = 0L
             var stepMs = BLANK_TRANSCRIPT_RETRY_START_MS
@@ -9122,7 +9134,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                     mergePendingMediaUploads(chatId, localTranscriptRowsForChat(chatId, generation)),
                 )
                 val visible = visibleMessagesForChat(chatId, local)
-                if (visible.isEmpty()) continue
+                if (visible.isEmpty()) {
+                    // Rows exist but the social filter hides all of them (blocked
+                    // contact). The store answered — retrying cannot change it.
+                    if (local.isNotEmpty()) return@launch
+                    continue
+                }
                 if (!isCurrentTranscriptSession(chatId, generation)) return@launch
                 publishOpenTranscript(chatId, visible)
                 markTranscriptHydrated(chatId)

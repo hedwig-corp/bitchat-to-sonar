@@ -453,3 +453,24 @@ internal fun isTranscriptVisibleRow(
     if (pay != null && pay !is PayLine.Pay) return false
     return !isCallControl(msg.content)
 }
+
+/**
+ * Whether a transcript that opened blank should keep re-reading local storage.
+ *
+ * The gate exists to avoid retrying on a conversation that is genuinely empty —
+ * a chat just created has nothing to find. But absence of evidence is not
+ * evidence of absence: before the core has started, or before a mesh route's
+ * folded White Noise sources resolve, "we know of no messages" only means the
+ * metadata has not loaded. Recovering in that state costs a handful of local
+ * page reads; skipping it leaves the chat black until an unrelated sync event
+ * repaints, which is the bug this recovery exists for.
+ *
+ * [sourcesResolved] is false only while a conversation's transport legs are
+ * still unresolved (a mesh route with no folded group yet); a plain Marmot chat
+ * is its own source and is therefore always resolved.
+ */
+internal fun shouldRecoverBlankTranscript(
+    knownNonEmpty: Boolean,
+    coreStarted: Boolean,
+    sourcesResolved: Boolean,
+): Boolean = knownNonEmpty || !coreStarted || !sourcesResolved

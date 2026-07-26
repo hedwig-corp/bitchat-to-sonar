@@ -742,4 +742,45 @@ class TranscriptDisplayPolicyTest {
         assertTrue(isTranscriptVisibleRow(meshText, noCallControl))
         assertFalse(isTranscriptVisibleRow(meshText) { it == "hey" }, "injected call-control gate applies")
     }
+
+    @Test
+    fun blankRecoveryRunsWhenEmptinessCannotBeProven() {
+        // Known history: always recover.
+        assertTrue(
+            shouldRecoverBlankTranscript(
+                knownNonEmpty = true,
+                coreStarted = true,
+                sourcesResolved = true,
+            )
+        )
+        // Cold launch: metadata may simply not be loaded yet.
+        assertTrue(
+            shouldRecoverBlankTranscript(
+                knownNonEmpty = false,
+                coreStarted = false,
+                sourcesResolved = true,
+            )
+        )
+        // Mesh route whose folded White Noise group has not resolved yet — the
+        // case the mesh recovery fix exists for.
+        assertTrue(
+            shouldRecoverBlankTranscript(
+                knownNonEmpty = false,
+                coreStarted = true,
+                sourcesResolved = false,
+            )
+        )
+    }
+
+    @Test
+    fun blankRecoverySkipsAConversationProvenEmpty() {
+        // Core up, sources resolved, no history known: a genuinely new chat.
+        assertFalse(
+            shouldRecoverBlankTranscript(
+                knownNonEmpty = false,
+                coreStarted = true,
+                sourcesResolved = true,
+            )
+        )
+    }
 }
