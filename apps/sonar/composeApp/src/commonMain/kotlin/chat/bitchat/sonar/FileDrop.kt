@@ -14,6 +14,33 @@ internal data class DroppedFiles(
     val rejectedCount: Int,
 )
 
+/**
+ * One "share into Sonar" gesture from the system share sheet: optional
+ * text/link plus already-read file bytes.
+ *
+ * The bytes are eager rather than lazy because Android scopes the
+ * `content://` read grant to the delivering intent — by the time the user
+ * picks a recipient the permission can already be gone.
+ */
+internal data class SharedContent(
+    val text: String?,
+    val files: DroppedFiles,
+) {
+    val isEmpty: Boolean
+        get() = text.isNullOrBlank() && files.files.isEmpty()
+
+    /** One-line description for the picker's preview strip. */
+    val summary: String
+        get() = when {
+            !text.isNullOrBlank() -> text
+            files.files.size == 1 -> files.files[0].filename
+            else -> "${files.files.size} files"
+        }
+}
+
+/** A `sinvite1` token followed by its hex payload, anywhere in the input. */
+internal val INVITE_TOKEN_IN_TEXT = Regex("sinvite1[0-9a-fA-F]{2,}")
+
 internal const val MAX_INTERNET_ATTACHMENT_BYTES = 25L * 1024L * 1024L
 internal const val MAX_MESH_ATTACHMENT_BYTES = 1L * 1024L * 1024L
 internal const val MAX_DROPPED_FILES = MAX_ALBUM_PHOTOS

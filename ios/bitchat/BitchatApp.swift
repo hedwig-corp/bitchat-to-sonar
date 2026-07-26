@@ -21,7 +21,6 @@ import FirebaseMessaging
 @main
 struct BitchatApp: App {
     static let bundleID = Bundle.main.bundleIdentifier ?? "chat.bitchat"
-    static let groupID = "group.\(bundleID)"
 
     // The Sonar UI is the app root. The store owns the real backends
     // (ChatViewModel: mesh + Nostr + geohash channels, MarmotChatModel:
@@ -210,7 +209,9 @@ struct BitchatApp: App {
     }
 
     private func handleURL(_ url: URL) {
-        if url.scheme == "bitchat" && url.host == "share" {
+        // The share extension opens `sonar://share` right after staging;
+        // `bitchat://share` stays accepted for older staged payloads.
+        if (url.scheme == "sonar" || url.scheme == "bitchat") && url.host == "share" {
             checkForSharedContent()
         } else if let token = InviteShare.token(from: url) {
             // Covers both sonar://invite/sinvite1… and https://<host>/join#sinvite1…
@@ -218,49 +219,15 @@ struct BitchatApp: App {
         }
     }
 
+    /// Hand anything the share extension staged to the recipient picker.
+    ///
+    /// This used to send immediately via `chatViewModel.sendMessage`, which
+    /// with no private chat selected broadcasts to the **public mesh** — a
+    /// shared link went out to everyone in range instead of the person the
+    /// user meant. The app now always asks who it goes to.
     private func checkForSharedContent() {
-        // Check app group for shared content from extension
-        guard let userDefaults = UserDefaults(suiteName: BitchatApp.groupID) else {
-            return
-        }
-
-        guard let sharedContent = userDefaults.string(forKey: "sharedContent"),
-              let sharedDate = userDefaults.object(forKey: "sharedContentDate") as? Date else {
-            return
-        }
-
-        // Only process if shared within configured window
-        if Date().timeIntervalSince(sharedDate) < TransportConfig.uiShareAcceptWindowSeconds {
-            let contentType = userDefaults.string(forKey: "sharedContentType") ?? "text"
-
-            // Clear the shared content
-            userDefaults.removeObject(forKey: "sharedContent")
-            userDefaults.removeObject(forKey: "sharedContentType")
-            userDefaults.removeObject(forKey: "sharedContentDate")
-            // No need to force synchronize here
-
-            // Send the shared content immediately on the main queue
-            DispatchQueue.main.async {
-                // An invite link shared into Sonar means "join", not "send".
-                if let token = InviteShare.token(fromText: sharedContent) {
-                    self.sonarStore.submitInviteLink(token)
-                    return
-                }
-                if contentType == "url" {
-                    // Try to parse as JSON first
-                    if let data = sharedContent.data(using: .utf8),
-                       let urlData = try? JSONSerialization.jsonObject(with: data) as? [String: String],
-                       let url = urlData["url"] {
-                        // Send plain URL
-                        self.chatViewModel.sendMessage(url)
-                    } else {
-                        // Fallback to simple URL
-                        self.chatViewModel.sendMessage(sharedContent)
-                    }
-                } else {
-                    self.chatViewModel.sendMessage(sharedContent)
-                }
-            }
+        Task { @MainActor in
+            sonarStore.ingestPendingShares()
         }
     }
 }

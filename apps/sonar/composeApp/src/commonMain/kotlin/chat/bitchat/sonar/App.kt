@@ -181,18 +181,18 @@ object SonarLifecycle {
         queued.forEach(handler)
     }
 
-    @Volatile private var onSharedText: ((String) -> Unit)? = null
-    private val pendingSharedTexts = mutableListOf<String>()
+    @Volatile private var onSharedContent: ((SharedContent) -> Unit)? = null
+    private val pendingSharedContent = mutableListOf<SharedContent>()
 
-    fun submitSharedText(text: String) {
-        val handler = onSharedText
-        if (handler != null) handler(text) else pendingSharedTexts.add(text)
+    internal fun submitSharedContent(content: SharedContent) {
+        val handler = onSharedContent
+        if (handler != null) handler(content) else pendingSharedContent.add(content)
     }
 
-    fun installSharedTextHandler(handler: (String) -> Unit) {
-        onSharedText = handler
-        val queued = pendingSharedTexts.toList()
-        pendingSharedTexts.clear()
+    internal fun installSharedContentHandler(handler: (SharedContent) -> Unit) {
+        onSharedContent = handler
+        val queued = pendingSharedContent.toList()
+        pendingSharedContent.clear()
         queued.forEach(handler)
     }
 
@@ -250,7 +250,7 @@ fun App(
         SonarLifecycle.onForeground = { state.setForeground(it) }
         SonarLifecycle.onProcessBackground = { state.onProcessBackgrounded() }
         SonarLifecycle.installInviteLinkHandler { state.requestJoinViaLink(it) }
-        SonarLifecycle.installSharedTextHandler { state.handleSharedText(it) }
+        SonarLifecycle.installSharedContentHandler { state.handleSharedContent(it) }
     }
     // Notification taps must wait for a coherent local chat list so folded
     // group → mesh remapping and openChat paint from real rows. Clear the
@@ -353,6 +353,7 @@ internal fun SonarScreenHost(state: SonarAppState) {
         is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
         is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
         is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
+        is Screen.ShareTo -> chat.bitchat.sonar.screens.SonarShareToScreen(state)
         is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
         is Screen.GeoDm -> GeoDmScreen(state, sc)
         is Screen.Call -> CallScreen(state, sc)

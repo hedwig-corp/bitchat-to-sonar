@@ -996,6 +996,10 @@ final class SonarAppStore: ObservableObject {
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
+    /// Content handed over by the iOS share extension, awaiting a recipient.
+    /// Drives the "Send to…" picker — see `SonarShareIntake`.
+    @Published var pendingShare: SNPendingShare?
+
     /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
     /// Survives leaving a chat and returning within the same process; cleared on send.
     /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate

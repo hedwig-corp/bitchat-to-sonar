@@ -118,6 +118,7 @@
 		A6E32D1B2E762EA70032EA8A /* Exceptions for "bitchat" folder in "bitchatShareExtension" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				Services/SonarSharePayload.swift,
 				Services/TransportConfig.swift,
 			);
 			target = 57CA17A36A2532A6CFF367BB /* bitchatShareExtension */;
@@ -140,7 +141,8 @@
 		A6E32D232E762EAB0032EA8A /* Exceptions for "bitchatShareExtension" folder in "bitchatShareExtension" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
-				ShareViewController.swift,
+				Info.plist,
+				bitchatShareExtension.entitlements,
 			);
 			target = 57CA17A36A2532A6CFF367BB /* bitchatShareExtension */;
 		};
@@ -385,8 +387,12 @@
 			buildConfigurationList = E4EA6DC648DF55FF84032EB5 /* Build configuration list for PBXNativeTarget "bitchatShareExtension" */;
 			buildPhases = (
 				0A08E70F08F55FD5BA8C7EF3 /* Sources */,
+				A15C0DE300000000000000F0 /* Resources */,
 			);
 			buildRules = (
+			);
+			fileSystemSynchronizedGroups = (
+				A6E32D212E762EAB0032EA8A /* bitchatShareExtension */,
 			);
 			name = bitchatShareExtension;
 			productName = bitchatShareExtension;
@@ -529,6 +535,11 @@
 			);
 		};
 		C5E027A72ECCDFE200BD6012 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			files = (
+			);
+		};
+		A15C0DE300000000000000F0 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
 			);

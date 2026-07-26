@@ -333,6 +333,8 @@ sealed interface Screen {
     data object Profile : Screen
     data object Nearby : Screen
     data object Search : Screen
+    /** Recipient picker for content arriving from the system share sheet. */
+    data object ShareTo : Screen
     // id "mesh:<peerId>" = a BLE-mesh DM (Noise link); otherwise a Marmot group.
     // pay=true auto-opens the payment sheet (radar "Send sats").
     data class Chat(val id: String, val name: String, val pay: Boolean = false) : Screen
@@ -9013,18 +9015,59 @@ class SonarAppState(private val scope: CoroutineScope) {
         queued.forEach { requestJoinViaLink(it) }
     }
 
-    var sharedText: String? by mutableStateOf(null)
+    /** Content from the system share sheet awaiting a recipient. */
+    internal var pendingShare: SharedContent? by mutableStateOf(null)
         private set
 
-    fun handleSharedText(text: String) {
-        sharedText = text
-        push(Screen.Search)
+    /**
+     * Route content shared into Sonar to the recipient picker.
+     *
+     * This used to drop the shared text into the Search *query field*, which
+     * looked like a search for the link rather than a way to send it, and had
+     * no path at all for files.
+     */
+    internal fun handleSharedContent(content: SharedContent) {
+        // A Sonar invite link shared back into Sonar means "join", not "send".
+        val token = content.text?.let { INVITE_TOKEN_IN_TEXT.find(it)?.value }
+        if (token != null && content.files.files.isEmpty()) {
+            requestJoinViaLink(token)
+            return
+        }
+        if (content.isEmpty) {
+            toast = if (content.files.rejectedCount > 0) {
+                "Couldn't attach that file."
+            } else {
+                "Nothing to share."
+            }
+            return
+        }
+        pendingShare = content
+        push(Screen.ShareTo)
     }
 
-    fun consumeSharedText(): String? {
-        val text = sharedText
-        sharedText = null
-        return text
+    fun cancelPendingShare() {
+        pendingShare = null
+    }
+
+    /**
+     * Send the pending share into [chatId], then open that chat.
+     *
+     * Text goes first so a link with attachments reads as a caption above its
+     * files, matching the order a composer send produces.
+     */
+    fun sendPendingShare(chat: SonarChat) {
+        val content = pendingShare ?: return
+        pendingShare = null
+        // Leave the picker before opening the chat so Back from the chat lands
+        // on Home rather than re-showing the resolved share.
+        back()
+        openChat(chat)
+        content.text?.takeIf { it.isNotBlank() }?.let { send(chat.id, it) }
+        if (content.files.files.isNotEmpty()) {
+            sendDroppedAttachments(chat.id, content.files)
+        } else if (content.files.rejectedCount > 0) {
+            toast = "Some files couldn't be attached."
+        }
     }
 
     fun acceptGroupInvite(inviteId: String) {

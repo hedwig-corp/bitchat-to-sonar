@@ -268,7 +268,9 @@ enum TransportConfig {
 
     // Share extension
     static let uiShareExtensionDismissDelaySeconds: TimeInterval = 2.0
-    static let uiShareAcceptWindowSeconds: TimeInterval = 30.0
+    // The old 30 s accept window silently dropped a share the user did not
+    // open the app for in time. Staged payloads now expire via
+    // `SonarShareInbox.staleAfterSeconds` instead.
     static let uiMigrationCutoffSeconds: TimeInterval = 24 * 60 * 60
 
     // Gossip Sync Configuration

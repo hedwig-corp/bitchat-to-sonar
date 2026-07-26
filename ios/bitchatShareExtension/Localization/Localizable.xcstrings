@@ -1,236 +1,119 @@
 {
   "sourceLanguage": "en",
   "strings": {
-    "share.fallback.shared_link_title": {
+    "share.status.failed_to_stage": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "shared Link",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
         "ar": {
           "stringUnit": {
             "state": "translated",
-            "value": "رابط مشترك",
-            "comment": "Fallback title when saving a shared link"
+            "value": "تعذّر تجهيز ما شاركته",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "geteilter link",
-            "comment": "Fallback title when saving a shared link"
+            "value": "geteilter inhalt konnte nicht vorbereitet werden",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
-        "es": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "enlace compartido",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "fr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "lien partagé",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "he": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "קישור משותף",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "id": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "tautan dibagikan",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "it": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "link condiviso",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "ja": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "共有リンク",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "ne": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "साझा गरिएको लिङ्क",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "link compartilhado",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "поделился ссылкой",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "uk": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "спільне посилання",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "分享的链接",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "공유된 링크",
-            "comment": "Fallback title when saving a shared link"
-          }
-        },
-        "tr": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "paylaşılan bağlantı",
-            "comment": "Fallback title when saving a shared link"
-          }
-        }
-      }
-    },
-    "share.status.failed_to_encode": {
-      "extractionState": "manual",
-      "localizations": {
         "en": {
           "stringUnit": {
             "state": "translated",
-            "value": "failed to encode link",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "ar": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "تعذر ترميز الرابط",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "de": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "link konnte nicht codiert werden",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "couldn't prepare what you shared",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "no se pudo codificar el enlace",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "no se pudo preparar lo que compartiste",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "fr": {
           "stringUnit": {
             "state": "translated",
-            "value": "échec de l'encodage du lien",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "impossible de préparer le contenu partagé",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "he": {
           "stringUnit": {
             "state": "translated",
-            "value": "לא ניתן לקודד את הקישור",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "לא ניתן היה להכין את מה ששיתפת",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "gagal mengodekan tautan",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "tidak bisa menyiapkan konten yang dibagikan",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "it": {
           "stringUnit": {
             "state": "translated",
-            "value": "impossibile codificare il link",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "impossibile preparare il contenuto condiviso",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "リンクのエンコードに失敗しました",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "ne": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "लिङ्क सङ्केत गर्न सकेन",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "falha ao codificar link",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "не удалось закодировать ссылку",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "uk": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "не вдалося закодувати посилання",
-            "comment": "Shown when the share payload cannot be encoded"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "无法编码链接",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "共有された内容を準備できませんでした",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "링크를 인코딩하는 데 실패했습니다",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "공유한 내용을 준비하지 못했습니다",
+            "comment": "Shown when the shared content cannot be written to the shared container"
+          }
+        },
+        "ne": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "साझा गरिएको सामग्री तयार गर्न सकिएन",
+            "comment": "Shown when the shared content cannot be written to the shared container"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "não foi possível preparar o conteúdo compartilhado",
+            "comment": "Shown when the shared content cannot be written to the shared container"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "не удалось подготовить отправленное",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "bağlantı kodlanamadı",
-            "comment": "Shown when the share payload cannot be encoded"
+            "value": "paylaşılan içerik hazırlanamadı",
+            "comment": "Shown when the shared content cannot be written to the shared container"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "не вдалося підготувати надіслане",
+            "comment": "Shown when the shared content cannot be written to the shared container"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "无法准备分享的内容",
+            "comment": "Shown when the shared content cannot be written to the shared container"
           }
         }
       }
@@ -469,236 +352,470 @@
         }
       }
     },
-    "share.status.shared_link": {
+    "share.status.open_sonar_to_send": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ shared link to bitchat",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
         "ar": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ تم إرسال الرابط إلى bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "افتح sonar لاختيار محادثة",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ link zu bitchat geteilt",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "öffne sonar, um einen chat zu wählen",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "open sonar to choose a chat",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ enlace compartido con bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "abre sonar para elegir un chat",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "fr": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ lien partagé vers bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "ouvre sonar pour choisir une conversation",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "he": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ הקישור נשלח אל bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "פתח את sonar כדי לבחור צ'אט",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ tautan dikirim ke bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "buka sonar untuk memilih obrolan",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "it": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ link inviato a bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "apri sonar per scegliere una chat",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchatにリンクを共有",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
-        "ne": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ bitchat मा लिङ्क पठाइयो",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ link enviado para bitchat",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ ссылка отправлена в bitchat",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
-        "uk": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ посилання надіслано в bitchat",
-            "comment": "Confirmation after successfully sharing a link"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ 已将链接分享至 bitchat",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "sonar を開いてチャットを選択してください",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchat으로 링크를 공유했습니다",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "sonar를 열어 채팅을 선택하세요",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "ne": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "च्याट छान्न sonar खोल्नुहोस्",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "abra o sonar para escolher uma conversa",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "откройте sonar, чтобы выбрать чат",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchat'e bağlantı paylaşıldı",
-            "comment": "Confirmation after successfully sharing a link"
+            "value": "sohbet seçmek için sonar'ı aç",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "відкрийте sonar, щоб обрати чат",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "打开 sonar 选择聊天",
+            "comment": "Shown when the app could not be opened automatically and the user must open Sonar"
           }
         }
       }
     },
-    "share.status.shared_text": {
+    "share.status.opening_sonar": {
       "extractionState": "manual",
       "localizations": {
-        "en": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ shared text to bitchat",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
         "ar": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ تم إرسال النص إلى bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "جارٍ فتح sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "de": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ text zu bitchat geteilt",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "sonar wird geöffnet…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "opening sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "es": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ texto compartido con bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "abriendo sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "fr": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ texte partagé vers bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "ouverture de sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "he": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ הטקסט נשלח אל bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "פותח את sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "id": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ teks dikirim ke bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "membuka sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "it": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ testo inviato a bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "apertura di sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "ja": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchatにテキストを共有",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
-        "ne": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ bitchat मा पाठ पठाइयो",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
-        "pt-BR": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ texto enviado para bitchat",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
-        "ru": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ текст отправлен в bitchat",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
-        "uk": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ текст надіслано в bitchat",
-            "comment": "Confirmation after successfully sharing text"
-          }
-        },
-        "zh-Hans": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "✓ 已将文本分享至 bitchat",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "sonar を開いています…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "ko": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchat으로 텍스트를 공유했습니다",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "sonar 여는 중…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "ne": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "sonar खोल्दै…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "abrindo o sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "открываем sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
           }
         },
         "tr": {
           "stringUnit": {
             "state": "translated",
-            "value": "✓ bitchat'e metin paylaşıldı",
-            "comment": "Confirmation after successfully sharing text"
+            "value": "sonar açılıyor…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "відкриваємо sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在打开 sonar…",
+            "comment": "Shown when the extension is handing off to the Sonar app"
+          }
+        }
+      }
+    },
+    "share.status.preparing": {
+      "extractionState": "manual",
+      "localizations": {
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "جارٍ التحضير…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "wird vorbereitet…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "preparing…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "preparando…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "préparation…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "מכין…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "menyiapkan…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "preparazione…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "準備中…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "준비 중…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "ne": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "तयारी हुँदै…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "preparando…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "подготовка…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "hazırlanıyor…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "підготовка…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "正在准备…",
+            "comment": "Shown while the share extension stages the shared content"
+          }
+        }
+      }
+    },
+    "share.status.too_large": {
+      "extractionState": "manual",
+      "localizations": {
+        "ar": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "الملف كبير جدًا للمشاركة",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "datei ist zu groß zum teilen",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "file is too large to share",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "el archivo es demasiado grande para compartir",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "le fichier est trop volumineux à partager",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "he": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "הקובץ גדול מדי לשיתוף",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "id": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "file terlalu besar untuk dibagikan",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "it": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "il file è troppo grande da condividere",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "ファイルが大きすぎて共有できません",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "파일이 너무 커서 공유할 수 없습니다",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "ne": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "फाइल साझा गर्न धेरै ठूलो छ",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "pt-BR": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "o arquivo é grande demais para compartilhar",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "файл слишком большой для отправки",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "tr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "dosya paylaşmak için çok büyük",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "uk": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "файл завеликий для надсилання",
+            "comment": "Shown when the shared files exceed the size limit"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "文件太大，无法分享",
+            "comment": "Shown when the shared files exceed the size limit"
           }
         }
       }

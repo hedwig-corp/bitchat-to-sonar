@@ -18,6 +18,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.IntentCompat
 
 class MainActivity : ComponentActivity() {
 
@@ -343,10 +344,125 @@ class MainActivity : ComponentActivity() {
         SonarLifecycle.submitInviteLink(candidate)
     }
 
+    /**
+     * System share sheet hand-off. Text and links arrive in EXTRA_TEXT; photos,
+     * videos and documents arrive as content:// URIs in EXTRA_STREAM.
+     *
+     * The URI read grant is scoped to this intent, so the bytes are pulled here
+     * rather than lazily from the picker screen — by the time the user chooses
+     * a recipient the permission may be gone.
+     */
     private fun handleShareIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND) return
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
-        SonarLifecycle.submitSharedText(text)
+        val action = intent?.action
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        val uris: List<android.net.Uri> = when (action) {
+            Intent.ACTION_SEND ->
+                listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, android.net.Uri::class.java))
+            else ->
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                    ?: emptyList()
+        }
+
+        val files = readSharedFiles(uris)
+
+        // Consume the payload: onCreate re-reads the launch intent after every
+        // activity recreation (rotation, process death), which would re-offer a
+        // share the user already sent. Same pattern as handleNotificationIntent.
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.removeExtra(Intent.EXTRA_STREAM)
+
+        if (text == null && files.files.isEmpty()) {
+            if (files.rejectedCount > 0) SonarLifecycle.submitSharedContent(SharedContent(null, files))
+            return
+        }
+        SonarLifecycle.submitSharedContent(SharedContent(text, files))
+    }
+
+    /**
+     * Copy shared content:// URIs into memory, bounded by the largest cap any
+     * send route accepts. The chosen chat's real transport cap is enforced
+     * again at send time.
+     */
+    private fun readSharedFiles(uris: List<android.net.Uri>): DroppedFiles {
+        if (uris.isEmpty()) return DroppedFiles(emptyList(), 0)
+        val out = ArrayList<DroppedFile>()
+        var rejected = maxOf(0, uris.size - MAX_DROPPED_FILES)
+        var remaining = MAX_INTERNET_ATTACHMENT_BYTES
+
+        for (uri in uris.take(MAX_DROPPED_FILES)) {
+            val bytes = try {
+                contentResolver.openInputStream(uri)?.use { readBounded(it, remaining) }
+            } catch (t: Throwable) {
+                null
+            }
+            if (bytes == null || bytes.isEmpty()) {
+                rejected++
+                continue
+            }
+            remaining -= bytes.size
+            val mime = contentResolver.getType(uri) ?: "application/octet-stream"
+            out.add(
+                DroppedFile(
+                    bytes = bytes,
+                    filename = encryptedAttachmentFilename(sharedDisplayName(uri, mime)),
+                    mime = encryptedAttachmentMime(mime),
+                )
+            )
+        }
+        return DroppedFiles(out, rejected)
+    }
+
+    /**
+     * Read at most [maxBytes] from [stream], returning null if the source is
+     * larger so an oversized file is rejected rather than silently truncated.
+     *
+     * Hand-rolled rather than `InputStream.readNBytes`, which Android only
+     * added in API 33 — on minSdk 26 that call compiles and then throws
+     * NoSuchMethodError on the device.
+     */
+    private fun readBounded(stream: java.io.InputStream, maxBytes: Long): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val read = stream.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) return null
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+
+    /** Prefer the provider's display name; fall back to a MIME-derived one. */
+    private fun sharedDisplayName(uri: android.net.Uri, mime: String): String {
+        val fromProvider = try {
+            contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+        } catch (t: Throwable) {
+            null
+        }
+        if (fromProvider != null) return fromProvider
+        val extension = android.webkit.MimeTypeMap.getSingleton()
+            .getExtensionFromMimeType(mime)
+            ?.let { ".$it" }
+            .orEmpty()
+        val stem = when {
+            mime.startsWith("image/") -> "photo"
+            mime.startsWith("video/") -> "video"
+            mime.startsWith("audio/") -> "audio"
+            else -> "attachment"
+        }
+        return "$stem$extension"
     }
 
     private fun handleNotificationIntent(intent: Intent?) {

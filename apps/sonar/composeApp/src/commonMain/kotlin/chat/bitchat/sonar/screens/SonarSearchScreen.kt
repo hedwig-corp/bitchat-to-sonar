@@ -18,7 +18,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -44,9 +43,6 @@ import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import kotlinx.coroutines.launch
 
-/** A `sinvite1` token followed by its hex payload, anywhere in the input. */
-private val INVITE_TOKEN_RE = Regex("sinvite1[0-9a-fA-F]{2,}")
-
 /** Close Search before [startChat] pushes its pending/existing chat screen. */
 internal fun startSecureChatFromSearch(
     closeSearch: () -> Unit,
@@ -66,9 +62,6 @@ internal fun startSecureChatFromSearch(
 fun SonarSearchScreen(state: SonarAppState) {
     val s = sonar
     var q by remember { mutableStateOf("") }
-    LaunchedEffect(state.sharedText) {
-        state.consumeSharedText()?.let { q = it }
-    }
     val query = q.trim()
     val ql = query.lowercase()
 
@@ -90,7 +83,7 @@ fun SonarSearchScreen(state: SonarAppState) {
     // Matches the bare token, the sonar:// scheme, and the https universal link;
     // the core normalizes whichever form before sending the join request. Require
     // a hex payload so ordinary text mentioning "sinvite1" doesn't offer to join.
-    val looksLikeInvite = INVITE_TOKEN_RE.containsMatchIn(query)
+    val looksLikeInvite = chat.bitchat.sonar.INVITE_TOKEN_IN_TEXT.containsMatchIn(query)
     val looksLikeNpub = !looksLikeInvite && ql.startsWith("npub1") && query.length > 8
     val looksLikeGeohash = !looksLikeInvite && ql.isNotEmpty() && ql.length in 2..9 &&
         ql.all { it in "0123456789bcdefghjkmnpqrstuvwxyz" } &&
