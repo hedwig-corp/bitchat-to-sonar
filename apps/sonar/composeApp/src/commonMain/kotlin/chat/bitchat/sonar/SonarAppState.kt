@@ -4692,8 +4692,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val missedAt = sonarDescriptorMissedAt[key]
         if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return
         if (!sonarDescriptorFetches.add(key)) return
+        // Capture the generation HERE, not inside the coroutine: a wipe between
+        // launch and start would otherwise let this fetch adopt the new
+        // account's generation and persist the old account's contact.
+        val generation = descriptorCacheGeneration
         scope.launch {
-            performDescriptorFetch(key)
+            performDescriptorFetch(key, generation)
         }
     }
 
@@ -4714,12 +4718,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             return sonarDescriptorsByNpubHex[key]
         }
         sonarDescriptorFetches.add(key)
-        performDescriptorFetch(key)
+        performDescriptorFetch(key, descriptorCacheGeneration)
         return sonarDescriptorsByNpubHex[key]
     }
 
-    private suspend fun performDescriptorFetch(key: String) {
-        val generation = descriptorCacheGeneration
+    private suspend fun performDescriptorFetch(key: String, generation: Int) {
         val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
         // The cache is durable now, so a fetch started under the previous
         // identity must not write (and persist) its contacts into the new

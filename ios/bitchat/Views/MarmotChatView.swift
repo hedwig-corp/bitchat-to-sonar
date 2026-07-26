@@ -2543,8 +2543,12 @@ final class MarmotChatModel: ObservableObject {
             return
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
+        // Capture the generation HERE, not inside the task: a wipe between
+        // scheduling and start would otherwise let this fetch adopt the new
+        // account's generation and persist the old account's contact.
+        let generation = descriptorCacheGeneration
         Task {
-            await performDescriptorFetch(npubToFetch)
+            await performDescriptorFetch(npubToFetch, generation: generation)
         }
     }
 
@@ -2570,7 +2574,7 @@ final class MarmotChatModel: ObservableObject {
             return sonarDescriptorsByNpub[npubToFetch]
         }
         descriptorFetches.insert(npubToFetch)
-        await performDescriptorFetch(npubToFetch)
+        await performDescriptorFetch(npubToFetch, generation: descriptorCacheGeneration)
         return sonarDescriptorsByNpub[npubToFetch]
     }
 
@@ -2594,8 +2598,7 @@ final class MarmotChatModel: ObservableObject {
         return (cached, false, true)
     }
 
-    private func performDescriptorFetch(_ npubToFetch: String) async {
-        let generation = descriptorCacheGeneration
+    private func performDescriptorFetch(_ npubToFetch: String, generation: Int) async {
         do {
             let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
             await MainActor.run {
