@@ -30,6 +30,11 @@ enum TransportConfig {
     static let bleDutyOnDuration: TimeInterval = 5.0
     static let bleDutyOffDuration: TimeInterval = 10.0
     static let bleAnnounceMinInterval: TimeInterval = 1.0
+    // Minimum spacing between announce-backs elicited by a Sonar 0x53 from an
+    // unknown peer. The 0.15s forced-announce throttle alone would let a
+    // stream of unique 0x53s elicit ~6 broadcasts/s; one per this window is
+    // enough because a single announce-back serves every queued sender.
+    static let bleSonarAnnounceBackCooldownSeconds: TimeInterval = 5.0
 
     // BLE discovery/quality thresholds
     static let bleDynamicRSSIThresholdDefault: Int = -90

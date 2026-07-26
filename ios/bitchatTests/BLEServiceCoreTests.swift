@@ -328,6 +328,60 @@ struct BLEServiceCoreTests {
         #expect(didAnnounceBack)
     }
 
+    // A stream of 0x53s from unknown peers must not elicit one forced
+    // announce each: the dedicated cooldown allows one announce-back per
+    // window (a single broadcast serves every queued sender), so a hostile
+    // flood cannot use us as an announce amplifier.
+    @Test
+    func sonarAnnounceBackIsRateLimitedByCooldown() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .normal
+
+        func signedSonarPacket(_ signer: NoiseEncryptionService) throws -> BitchatPacket {
+            let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+            let payload = try #require(SonarAnnouncePacket(
+                npub: Data((0..<32).map { UInt8($0) }),
+                bip353: nil,
+                capabilities: SonarCapability.marmotDM
+            ).encode(), "Failed to encode Sonar announce")
+            return try #require(signer.signPacket(BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: payload,
+                signature: nil,
+                ttl: 7
+            )), "Failed to sign Sonar packet")
+        }
+
+        let firstSigner = NoiseEncryptionService(keychain: MockKeychain())
+        let firstPacket = try signedSonarPacket(firstSigner)
+        let firstPeer = PeerID(publicKey: firstSigner.getStaticPublicKeyData())
+
+        ble._test_handlePacket(firstPacket, fromPeerID: firstPeer, preseedPeer: false)
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > Date.distantPast },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(didAnnounceBack)
+        let firstAnnounceAt = ble._test_lastAnnounceSentAt
+
+        // A second unknown sender inside the cooldown window must not elicit
+        // another forced announce.
+        let secondSigner = NoiseEncryptionService(keychain: MockKeychain())
+        let secondPacket = try signedSonarPacket(secondSigner)
+        let secondPeer = PeerID(publicKey: secondSigner.getStaticPublicKeyData())
+
+        ble._test_handlePacket(secondPacket, fromPeerID: secondPeer, preseedPeer: false)
+        let didAnnounceAgain = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > firstAnnounceAt },
+            timeout: 0.6
+        )
+        #expect(!didAnnounceAgain)
+        #expect(ble._test_lastAnnounceSentAt == firstAnnounceAt)
+    }
+
     @Test
     func restrictedDiscoveryReapply_prunesPeerAfterAllowlistChange() async throws {
         let ble = makeService()

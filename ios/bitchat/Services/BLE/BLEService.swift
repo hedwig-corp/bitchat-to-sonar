@@ -136,6 +136,9 @@ final class BLEService: NSObject {
     // Simple announce throttling
     private var lastAnnounceSent = Date.distantPast
     private let announceMinInterval: TimeInterval = TransportConfig.bleAnnounceMinInterval
+    // Announce-back cooldown for 0x53s from unknown peers. Only touched on
+    // messageQueue (handleSonarAnnounce runs there), so no extra locking.
+    private var lastSonarAnnounceBackSent = Date.distantPast
 
     // Sonar discovery (additive, see docs/SONAR-DISCOVERY.md):
     // injected provider for the local Sonar profile (Marmot npub + optional
@@ -2467,6 +2470,11 @@ extension BLEService {
     /// When the last announce was actually sent (post-throttle). Lets tests
     /// observe the announce-back scheduled by `handleSonarAnnounce` without a
     /// live radio: `sendAnnounce` stamps this before broadcasting.
+    /// Queue affinity: `lastAnnounceSent` is written on whatever queue calls
+    /// `sendAnnounce` — `messageQueue` for the announce-back path, `bleQueue`
+    /// for the maintenance timer — so this seam is race-free ONLY for
+    /// announce-back assertions. Do not reuse it for maintenance-cadence
+    /// assertions.
     var _test_lastAnnounceSentAt: Date {
         messageQueue.sync { lastAnnounceSent }
     }
@@ -4620,11 +4628,16 @@ extension BLEService {
             // includes .knownOnly: the "unknown" 0x53 sender may be a known
             // contact whose 0x01 we missed (Low Power Mode maps to .knownOnly,
             // and without the announce-back mutual discovery there waits on the
-            // periodic timer alone). The forced-announce min-interval throttle
-            // bounds attacker-elicited traffic; .off stays silent.
+            // periodic timer alone). A dedicated cooldown bounds
+            // attacker-elicited announce traffic — one announce-back per
+            // window serves every queued sender; .off stays silent.
             if discoveryMode != .off {
-                messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                    self?.sendAnnounce(forceSend: true)
+                let nowDate = Date()
+                if nowDate.timeIntervalSince(lastSonarAnnounceBackSent) >= TransportConfig.bleSonarAnnounceBackCooldownSeconds {
+                    lastSonarAnnounceBackSent = nowDate
+                    messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        self?.sendAnnounce(forceSend: true)
+                    }
                 }
             }
             return
