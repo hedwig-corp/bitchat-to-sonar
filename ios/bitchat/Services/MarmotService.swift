@@ -432,6 +432,27 @@ final class MarmotService: @unchecked Sendable {
             }
             service.setIdentity(identity)
             service.nodeLock.lock()
+            // A close/wipe already fenced this session. Checking `nodeClosing`
+            // (not just `sessionGeneration`) is required: the generation is
+            // bumped in the close's OWN `workQueue` hop, which is queued behind
+            // this one, so it still reads as current here. Installing anyway
+            // would publish an un-latched node to `SonarPushRegistration`,
+            // whose blocking `registerPushToken` holds the SQLCipher handle
+            // outside `nodeLifecycleGroup` and past the close (0xdead10cc).
+            //
+            // The check and the assignment MUST stay in this single `nodeLock`
+            // hold. Releasing between them lets `interruptNodeForSuspend()` run
+            // in the gap — it would set `nodeClosing` and latch only the OLD
+            // node, and this closure would then install the fresh one anyway.
+            // The close hop's `removedNode?.interruptForSuspend()` does catch
+            // that, but only after `setSonarNode` may already have handed the
+            // node to a registration thread the close never waits for, while
+            // `storeLock` has been released — so the SQLCipher handle can
+            // outlive the close and overlap NSE access to the same store.
+            guard !service.nodeClosing else {
+                service.nodeLock.unlock()
+                return false
+            }
             service.node = node
             service.relayConnected = RelayConnectionPolicy.latchAfterAttach(
                 startEpoch: attachEpoch,
@@ -493,6 +514,21 @@ final class MarmotService: @unchecked Sendable {
             }
             service.setIdentity(identity)
             service.nodeLock.lock()
+            // Same atomic fence as the relay install path: `connectLocal`
+            // checked `nodeClosing` before opening, but `SonarNode.connect`
+            // opens SQLCipher in between, and a close/wipe can fence during
+            // that window. Installing anyway hands the fresh node to
+            // `setSonarNode`, whose push registration retains the handle after
+            // the close releases `storeLock` — the NSE-overlap hazard, not just
+            // a background kill. Dropping `node` on the bail path closes the
+            // handle; the store lock hold has to be abandoned explicitly.
+            guard !service.nodeClosing else {
+                service.nodeLock.unlock()
+                #if os(iOS)
+                service.abandonStoreLockHold(storeLockHold)
+                #endif
+                throw ServiceError.cancelled
+            }
             service.node = node
             service.relayConnected = false
             #if os(iOS)
@@ -1366,6 +1402,33 @@ final class MarmotService: @unchecked Sendable {
         return (url.path, keyHex)
     }
 
+    /// Fence new node installs, then flip the live node's one-way suspend latch
+    /// so interruptible relay FFI parked on `workQueue` returns instead of
+    /// blocking the close hop. Safe from any thread; no-op when disconnected.
+    ///
+    /// The fence and the snapshot MUST happen under one `nodeLock` hold, and
+    /// the fence MUST be set here rather than in the caller's `workQueue` hop.
+    /// A relay connect that finished just before this runs has already enqueued
+    /// its install closure, and `workQueue` is FIFO — so that closure runs
+    /// *first*, before the close hop that bumps `sessionGeneration`. Without
+    /// the fence it installs a brand-new node this call never latched, hands it
+    /// to `SonarPushRegistration.setSonarNode`, and that kicks a blocking
+    /// `registerPushToken` on the global utility queue which holds a strong
+    /// `SonarNode` **outside** `nodeLifecycleGroup` — so the close cannot wait
+    /// for it and the SQLCipher handle outlives the close. That is the exact
+    /// 0xdead10cc shape this whole path exists to prevent.
+    ///
+    /// `nodeClosing` is cleared again by `closeNode(keepClosed: false)` and by
+    /// `wipeDatabase()`, so fencing early only widens the window in which new
+    /// leases and installs are refused — which is what a close wants anyway.
+    private func interruptNodeForSuspend() {
+        nodeLock.lock()
+        nodeClosing = true
+        let liveNode = node
+        nodeLock.unlock()
+        liveNode?.interruptForSuspend()
+    }
+
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
     /// Resolves wipe targets from fixed App Group + legacy roots — never via
@@ -1383,6 +1446,9 @@ final class MarmotService: @unchecked Sendable {
             }
         }
         #endif
+        // Same reason as `closeNode()`: the close hop below must not queue
+        // behind blocking relay FFI already parked on the serial `workQueue`.
+        interruptNodeForSuspend()
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)
@@ -1390,6 +1456,7 @@ final class MarmotService: @unchecked Sendable {
             #endif
             service.nodeLock.lock()
             service.nodeClosing = true
+            let removedNode = service.node
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1397,6 +1464,12 @@ final class MarmotService: @unchecked Sendable {
             service.storeLock = nil
             #endif
             service.nodeLock.unlock()
+            // Belt and braces for the node actually being dropped: the fence in
+            // `interruptNodeForSuspend()` should mean this is the same node we
+            // already latched, but any future install path that skips the fence
+            // would otherwise leave a live, un-latched node whose blocking FFI
+            // keeps the SQLCipher handle open past this close. Idempotent.
+            removedNode?.interruptForSuspend()
             service.setIdentity(nil)
             return ()
         }
@@ -1438,6 +1511,15 @@ final class MarmotService: @unchecked Sendable {
     /// caller must clear it (via another `closeNode(keepClosed: false)` path
     /// or by completing connect after clearing).
     func closeNode(keepClosed: Bool = false) async {
+        // Abort interruptible in-flight relay FFI (sync, push-token
+        // registration, descriptor/profile fetches) BEFORE the first hop onto
+        // the serial `workQueue`: that hop — the one that drops the node and
+        // releases the store lock — queues behind whatever blocking Rust is
+        // already parked there, and iOS grants only ~30s of background grace.
+        // An uninterrupted relay sync held the SQLCipher store past that
+        // deadline on TestFlight 1.12.2 (30) → RUNNINGBOARD 0xdead10cc
+        // (round 3). Cheap and thread-safe; the node is torn down right after.
+        interruptNodeForSuspend()
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)
@@ -1445,6 +1527,7 @@ final class MarmotService: @unchecked Sendable {
             #endif
             service.nodeLock.lock()
             service.nodeClosing = true
+            let removedNode = service.node
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1452,6 +1535,12 @@ final class MarmotService: @unchecked Sendable {
             service.storeLock = nil
             #endif
             service.nodeLock.unlock()
+            // Belt and braces for the node actually being dropped: the fence in
+            // `interruptNodeForSuspend()` should mean this is the same node we
+            // already latched, but any future install path that skips the fence
+            // would otherwise leave a live, un-latched node whose blocking FFI
+            // keeps the SQLCipher handle open past this close. Idempotent.
+            removedNode?.interruptForSuspend()
             return ()
         }
         await withCheckedContinuation { continuation in

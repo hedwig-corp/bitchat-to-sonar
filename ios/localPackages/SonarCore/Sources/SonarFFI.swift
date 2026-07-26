@@ -1561,6 +1561,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
+     * Suspendable: this is the idle-timeout path, so it is the call most
+     * likely to be parked on the host's serial work queue exactly when the app
+     * backgrounds — and it can await subscription setup plus a bounded repair
+     * fetch, which is long enough to push the store close past the ~30s
+     * suspension deadline (0xdead10cc). Re-runs on the next idle tick.
      */
     func ensureSubscriptions() throws
 
@@ -1624,6 +1629,19 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func installStickerPack(coordinate: String) throws
 
     /**
+     * Abort interruptible in-flight relay calls (`sync_once`, `sync_force`,
+     * `register_push_token`, descriptor/profile fetches) and make future ones
+     * fail fast with an "interrupted for suspend" error. The iOS host calls
+     * this right before closing the node for background suspension: the close
+     * queues on a serial dispatch queue BEHIND those blocking calls, and iOS
+     * only grants ~30s of background grace — an uninterrupted relay sync
+     * holds the SQLCipher store past that deadline and RunningBoard kills the
+     * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
+     * for this node's lifetime; reconnect constructs a fresh node.
+     */
+    func interruptForSuspend()
+
+    /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
     func leaveGroup(groupIdHex: String) throws
@@ -1680,6 +1698,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * relay-connect republish path, where the per-relay OK wait must not
      * delay the first message drain. Failures are logged in core and
      * self-heal on the next relay connect (replaceable event).
+     * Suspendable: runs automatically on relay connect. A KeyPackage is a
+     * replaceable event, so an aborted publish self-heals on the next connect.
      */
     func publishKeyPackageBackground() throws
 
@@ -1698,6 +1718,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
+     *
+     * Suspendable: hosts republish this automatically when payment/call
+     * capabilities settle, and it awaits relay acks for up to two replaceable
+     * events on the same serial work queue the store close needs. Replaceable
+     * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
@@ -1755,6 +1780,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
+     * Suspendable: runs automatically after relay connect and from the idle
+     * path, both on the host's serial work queue. Aborting only leaves entries
+     * in the durable outbox, which is precisely what it exists for — they
+     * republish on the next connect.
      */
     func retryOutbox() throws
 
@@ -1840,11 +1869,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
+     * Suspendable like `sync_once`.
      */
     func syncForce() throws
 
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
+     * Suspendable: `interrupt_for_suspend()` aborts it so a store close never
+     * queues behind a full relay sync (0xdead10cc round 3).
      */
     func syncOnce() throws
 
@@ -2289,6 +2321,11 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
+     * Suspendable: this is the idle-timeout path, so it is the call most
+     * likely to be parked on the host's serial work queue exactly when the app
+     * backgrounds — and it can await subscription setup plus a bounded repair
+     * fetch, which is long enough to push the store close past the ~30s
+     * suspension deadline (0xdead10cc). Re-runs on the next idle tick.
      */
 open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_ensure_subscriptions(
@@ -2447,6 +2484,24 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
 }
 
     /**
+     * Abort interruptible in-flight relay calls (`sync_once`, `sync_force`,
+     * `register_push_token`, descriptor/profile fetches) and make future ones
+     * fail fast with an "interrupted for suspend" error. The iOS host calls
+     * this right before closing the node for background suspension: the close
+     * queues on a serial dispatch queue BEHIND those blocking calls, and iOS
+     * only grants ~30s of background grace — an uninterrupted relay sync
+     * holds the SQLCipher store past that deadline and RunningBoard kills the
+     * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
+     * for this node's lifetime; reconnect constructs a fresh node.
+     */
+open func interruptForSuspend()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_interrupt_for_suspend(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
 open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -2571,6 +2626,8 @@ open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSon
      * relay-connect republish path, where the per-relay OK wait must not
      * delay the first message drain. Failures are logged in core and
      * self-heal on the next relay connect (replaceable event).
+     * Suspendable: runs automatically on relay connect. A KeyPackage is a
+     * replaceable event, so an aborted publish self-heals on the next connect.
      */
 open func publishKeyPackageBackground()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package_background(
@@ -2610,6 +2667,11 @@ open func publishProfileBackground(name: String, about: String?, picture: String
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
+     *
+     * Suspendable: hosts republish this automatically when payment/call
+     * capabilities settle, and it awaits relay acks for up to two replaceable
+     * events on the same serial work queue the store close needs. Replaceable
+     * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
 open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_sonar_descriptor(
@@ -2731,6 +2793,10 @@ open func retryMessage(messageIdHex: String)throws  -> String  {
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
+     * Suspendable: runs automatically after relay connect and from the idle
+     * path, both on the host's serial work queue. Aborting only leaves entries
+     * in the durable outbox, which is precisely what it exists for — they
+     * republish on the next connect.
      */
 open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_retry_outbox(
@@ -2941,6 +3007,7 @@ open func startGroup(members: [String], name: String)throws  -> String  {
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
+     * Suspendable like `sync_once`.
      */
 open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_sync_force(
@@ -2951,6 +3018,8 @@ open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
 
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
+     * Suspendable: `interrupt_for_suspend()` aborts it so a store close never
+     * queues behind a full relay sync (0xdead10cc round 3).
      */
 open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_sync_once(
@@ -8300,7 +8369,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56161) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_installed_packs() != 62453) {
@@ -8339,6 +8408,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 28091) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8369,7 +8441,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 41112) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 14586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
@@ -8378,7 +8450,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile_background() != 18973) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 27940) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {
@@ -8405,7 +8477,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 11322) {
@@ -8450,10 +8522,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group() != 41815) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 34432) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 53806) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 64518) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_state_snapshot_json() != 50844) {

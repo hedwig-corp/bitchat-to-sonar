@@ -647,10 +647,53 @@ pub fn sonar_render_notification(
 pub struct SonarNode {
     runtime: tokio::runtime::Runtime,
     client: SonarClient,
+    /// One-way suspend latch (`interrupt_for_suspend`). Long-blocking relay
+    /// methods select against it so an imminent iOS suspension can abort them
+    /// instead of holding the SQLCipher store past the background deadline
+    /// (RunningBoard 0xdead10cc). Reconnect builds a fresh node, so the latch
+    /// never needs resetting.
+    suspend_interrupt: tokio::sync::watch::Sender<bool>,
     /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
     /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
     #[cfg(feature = "calls-audio")]
     call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
+}
+
+/// Stable marker at the end of every suspend-aborted error message.
+///
+/// `SonarFfiError` is `#[uniffi(flat_error)]`, so only the rendered message
+/// crosses the FFI boundary — the Swift host tells a deliberate suspend abort
+/// apart from a real relay failure by matching this substring. Changing the
+/// text is a breaking change for `MarmotChatModel.isSuspendInterrupted` and
+/// `SonarPushRegistration.attemptRegistration` (see `docs/REGRESSIONS.md`,
+/// R-016); keep the two in sync.
+pub const SUSPEND_INTERRUPT_MARKER: &str = "interrupted for suspend";
+
+impl SonarNode {
+    /// `block_on`, but racing the suspend latch: when `interrupt_for_suspend()`
+    /// fires (or already fired), the future is dropped at its next await point
+    /// and the call returns an error instead of parking the host queue for the
+    /// remainder of an uncancellable relay wait. Only for relay-bound calls
+    /// whose partial progress is already crash-safe (sync's stage→persist→
+    /// commit has boot-time recovery; a dropped publish retries via outbox or
+    /// re-registration) — a process suspension today aborts them at an
+    /// arbitrary instant anyway, without the clean store close this enables.
+    fn block_on_suspendable<T>(
+        &self,
+        what: &str,
+        fut: impl std::future::Future<Output = Result<T, sonar_core::Error>>,
+    ) -> FfiResult<T> {
+        let mut interrupted = self.suspend_interrupt.subscribe();
+        self.runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = interrupted.wait_for(|suspending| *suspending) => Err(
+                    SonarFfiError::Core(format!("{what} {SUSPEND_INTERRUPT_MARKER}"))
+                ),
+                result = fut => result.map_err(Into::into),
+            }
+        })
+    }
 }
 
 #[uniffi::export]
@@ -695,9 +738,23 @@ impl SonarNode {
         Ok(Arc::new(Self {
             runtime,
             client,
+            suspend_interrupt: tokio::sync::watch::Sender::new(false),
             #[cfg(feature = "calls-audio")]
             call: Mutex::new(None),
         }))
+    }
+
+    /// Abort interruptible in-flight relay calls (`sync_once`, `sync_force`,
+    /// `register_push_token`, descriptor/profile fetches) and make future ones
+    /// fail fast with an "interrupted for suspend" error. The iOS host calls
+    /// this right before closing the node for background suspension: the close
+    /// queues on a serial dispatch queue BEHIND those blocking calls, and iOS
+    /// only grants ~30s of background grace — an uninterrupted relay sync
+    /// holds the SQLCipher store past that deadline and RunningBoard kills the
+    /// process with 0xdead10cc. Non-blocking and safe from any thread. One-way
+    /// for this node's lifetime; reconnect constructs a fresh node.
+    pub fn interrupt_for_suspend(&self) {
+        let _ = self.suspend_interrupt.send_replace(true);
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -712,9 +769,13 @@ impl SonarNode {
     /// relay-connect republish path, where the per-relay OK wait must not
     /// delay the first message drain. Failures are logged in core and
     /// self-heal on the next relay connect (replaceable event).
+    /// Suspendable: runs automatically on relay connect. A KeyPackage is a
+    /// replaceable event, so an aborted publish self-heals on the next connect.
     pub fn publish_key_package_background(&self) -> FfiResult<()> {
-        self.runtime
-            .block_on(self.client.publish_key_package_background())?;
+        self.block_on_suspendable(
+            "publish_key_package_background",
+            self.client.publish_key_package_background(),
+        )?;
         Ok(())
     }
 
@@ -754,7 +815,10 @@ impl SonarNode {
     /// not published one. Used to resolve a Marmot member's display name.
     pub fn fetch_profile(&self, npub: String) -> FfiResult<Option<ProfileInfo>> {
         let pubkey = PublicKey::parse(&npub).map_err(invalid("profile pubkey"))?;
-        let profile = self.runtime.block_on(self.client.fetch_profile(pubkey))?;
+        // Suspendable: per-member profile prefetches park the iOS serial work
+        // queue for FETCH_TIMEOUT each (0xdead10cc round 2 offender).
+        let profile =
+            self.block_on_suspendable("fetch_profile", self.client.fetch_profile(pubkey))?;
         Ok(profile.map(|p| ProfileInfo {
             name: p.name,
             display_name: p.display_name,
@@ -811,17 +875,22 @@ impl SonarNode {
 
     /// Publish this identity's public Sonar descriptor. `signaling` should list
     /// only routes this app build can actually use, in preference order.
+    ///
+    /// Suspendable: hosts republish this automatically when payment/call
+    /// capabilities settle, and it awaits relay acks for up to two replaceable
+    /// events on the same serial work queue the store close needs. Replaceable
+    /// ⇒ an aborted publish self-heals on the next capability change or connect.
     pub fn publish_sonar_descriptor(
         &self,
         calls_enabled: bool,
         signaling: Vec<String>,
         bolt12_offer: Option<String>,
     ) -> FfiResult<()> {
-        self.runtime.block_on(self.client.publish_sonar_descriptor(
-            calls_enabled,
-            signaling,
-            bolt12_offer,
-        ))?;
+        self.block_on_suspendable(
+            "publish_sonar_descriptor",
+            self.client
+                .publish_sonar_descriptor(calls_enabled, signaling, bolt12_offer),
+        )?;
         Ok(())
     }
 
@@ -829,9 +898,12 @@ impl SonarNode {
     /// peer is not confirmed Sonar-capable through this relay set.
     pub fn fetch_sonar_descriptor(&self, npub: String) -> FfiResult<Option<SonarDescriptorInfo>> {
         let pubkey = PublicKey::parse(&npub).map_err(invalid("descriptor pubkey"))?;
-        let descriptor = self
-            .runtime
-            .block_on(self.client.fetch_sonar_descriptor(pubkey))?;
+        // Suspendable: runs two FETCH_TIMEOUT fetches per member on the iOS
+        // serial work queue (0xdead10cc round 2 offender).
+        let descriptor = self.block_on_suspendable(
+            "fetch_sonar_descriptor",
+            self.client.fetch_sonar_descriptor(pubkey),
+        )?;
         Ok(descriptor.map(|d| SonarDescriptorInfo {
             schema: d.schema as u32,
             calls: d.calls,
@@ -1090,15 +1162,18 @@ impl SonarNode {
     }
 
     /// Poll the relays once: welcomes addressed to us, then group messages.
+    /// Suspendable: `interrupt_for_suspend()` aborts it so a store close never
+    /// queues behind a full relay sync (0xdead10cc round 3).
     pub fn sync_once(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.sync())?;
+        self.block_on_suspendable("sync", self.client.sync())?;
         Ok(())
     }
 
     /// Like `sync_once` but bypasses the live-subscription short-circuit.
     /// Use after a foreground resume to catch events missed while backgrounded.
+    /// Suspendable like `sync_once`.
     pub fn sync_force(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.sync_force())?;
+        self.block_on_suspendable("sync_force", self.client.sync_force())?;
         Ok(())
     }
 
@@ -1144,8 +1219,15 @@ impl SonarNode {
     /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
     /// after replacing a local-only node with a relay-backed node so sends created
     /// during relay connect are not stranded until app restart.
+    /// Suspendable: runs automatically after relay connect and from the idle
+    /// path, both on the host's serial work queue. Aborting only leaves entries
+    /// in the durable outbox, which is precisely what it exists for — they
+    /// republish on the next connect.
     pub fn retry_outbox(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.reload_outbox_and_retry());
+        self.block_on_suspendable("retry_outbox", async {
+            self.client.reload_outbox_and_retry().await;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1175,8 +1257,13 @@ impl SonarNode {
     /// after relay disconnects. Hosts call this on the idle timeout path
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
     /// so hosts must keep it off the local-first chat-open path.
+    /// Suspendable: this is the idle-timeout path, so it is the call most
+    /// likely to be parked on the host's serial work queue exactly when the app
+    /// backgrounds — and it can await subscription setup plus a bounded repair
+    /// fetch, which is long enough to push the store close past the ~30s
+    /// suspension deadline (0xdead10cc). Re-runs on the next idle tick.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.ensure_subscriptions())?;
+        self.block_on_suspendable("ensure_subscriptions", self.client.ensure_subscriptions())?;
         Ok(())
     }
 
@@ -1646,7 +1733,11 @@ impl SonarNode {
         token: Vec<u8>,
         server_npub: String,
     ) -> FfiResult<()> {
-        self.runtime.block_on(
+        // Suspendable: a blocking registration was the second store-lock
+        // holder in the 0xdead10cc round 2/3 crash logs; registration re-runs
+        // on the next launch/foreground, so aborting it is always safe.
+        self.block_on_suspendable(
+            "register_push_token",
             self.client
                 .register_push_token(&platform, &token, &server_npub),
         )?;
@@ -3195,6 +3286,116 @@ impl MeshLinkEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_test_node(relay_urls: Vec<String>) -> Arc<SonarNode> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("marmot.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        // Leak the tempdir guard so the store outlives this helper for the
+        // duration of the test process.
+        std::mem::forget(dir);
+        SonarNode::connect(
+            SonarIdentity::generate(),
+            relay_urls,
+            db_path,
+            "ab".repeat(32),
+        )
+        .expect("local node connects")
+    }
+
+    /// 0xdead10cc round 3 (TestFlight 1.12.2 build 30): the iOS store close
+    /// queues on a serial dispatch queue BEHIND blocking relay FFI, so an
+    /// interrupted node must fail relay calls fast instead of parking for the
+    /// full relay wait. Pins the fail-fast half of the contract.
+    #[test]
+    fn interrupted_node_fails_sync_fast_instead_of_parking() {
+        let node = local_test_node(vec![]);
+        node.interrupt_for_suspend();
+        let started = std::time::Instant::now();
+
+        // Every entry point the host can have parked on its serial work queue
+        // when the app backgrounds. `ensure_subscriptions` is the idle-timeout
+        // path and was missed by the first cut of this fix — it awaits
+        // subscription setup plus a bounded repair fetch, which is long enough
+        // on its own to push the store close past the suspension deadline.
+        let registration_npub = SonarIdentity::generate().npub();
+        let calls: Vec<(&str, Box<dyn Fn() -> FfiResult<()> + '_>)> = vec![
+            ("sync_once", Box::new(|| node.sync_once())),
+            ("sync_force", Box::new(|| node.sync_force())),
+            (
+                "ensure_subscriptions",
+                Box::new(|| node.ensure_subscriptions()),
+            ),
+            ("retry_outbox", Box::new(|| node.retry_outbox())),
+            (
+                "publish_key_package_background",
+                Box::new(|| node.publish_key_package_background()),
+            ),
+            (
+                "publish_sonar_descriptor",
+                Box::new(|| node.publish_sonar_descriptor(false, vec![], None)),
+            ),
+            (
+                "register_push_token",
+                Box::new(|| {
+                    node.register_push_token(
+                        "apns".into(),
+                        vec![0u8; 32],
+                        registration_npub.clone(),
+                    )
+                }),
+            ),
+        ];
+
+        for (name, call) in &calls {
+            let err = call()
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail when interrupted"));
+            assert!(
+                err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+                "{name}: unexpected error: {err}"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "interrupted relay calls must not park ({}s)",
+            started.elapsed().as_secs()
+        );
+    }
+
+    /// Pins the in-flight half: a call already parked inside
+    /// `block_on_suspendable` must return promptly when
+    /// `interrupt_for_suspend()` fires — not when its relay wait would have
+    /// timed out. The future never completes, so only the interrupt can end
+    /// this call.
+    #[test]
+    fn interrupt_aborts_in_flight_suspendable_wait() {
+        let node = local_test_node(vec![]);
+        let parked = {
+            let node = node.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = node.block_on_suspendable::<()>("test_wait", std::future::pending());
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        node.interrupt_for_suspend();
+        let (result, elapsed) = parked.join().expect("parked thread joins");
+        let err = result.expect_err("interrupted in-flight wait must fail");
+        assert!(
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "in-flight wait must abort on interrupt ({}s)",
+            elapsed.as_secs()
+        );
+    }
 
     #[test]
     fn mesh_announce_requires_sender_derived_from_noise_key() {
