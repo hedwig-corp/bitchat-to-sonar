@@ -10276,25 +10276,27 @@ class SonarAppState(private val scope: CoroutineScope) {
                 beat++
                 // ensureSubscriptions / sync are relay-connection upkeep — keep a
                 // wall-clock cadence (was every 4 s / every 60 s on the old tick).
-                if (SonarCore.isRelayConnected()) {
-                    runCatching { SonarCore.ensureSubscriptions() }
-                    if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
-                        runCatching { SonarCore.sync() }
-                    }
-                } else if (
-                    // Backgrounded on a platform that invalidates on background,
-                    // the down latch is [onProcessBackgrounded]'s own doing:
-                    // attaching here rebuilds (and closes) the node every beat
-                    // while the wake loop is still delivering over the live
-                    // sockets. The push wake and the foreground resume own that
-                    // rebuild instead. Desktop keeps reconnecting — its latch only
-                    // drops on a real failure and nothing else recovers it.
-                    RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+                when (
+                    RelayConnectionPolicy.heartbeatRelayAction(
+                        relayConnected = SonarCore.isRelayConnected(),
                         foreground = foreground,
                         invalidatesOnBackground = RelayConnectionPolicy.shouldInvalidateOnBackground(),
                     )
                 ) {
-                    startRelayConnection()
+                    HeartbeatRelayAction.SyncAndEnsureSubscriptions -> {
+                        runCatching { SonarCore.ensureSubscriptions() }
+                        if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {
+                            runCatching { SonarCore.sync() }
+                        }
+                    }
+                    HeartbeatRelayAction.Reconnect -> startRelayConnection()
+                    // Backgrounded on a platform that invalidates on background:
+                    // the down latch is [onProcessBackgrounded]'s own doing, and
+                    // attaching here would rebuild (and close) the node every beat
+                    // while the wake loop is still delivering over sockets the
+                    // Rust relay pool reconnects by itself. The push wake and the
+                    // foreground resume own that rebuild.
+                    HeartbeatRelayAction.Idle -> Unit
                 }
                 // Coarse presence beat (~every 60 s), profile TTL sweep (~30 min).
                 if (beat * effectiveHeartbeatMs() % PRESENCE_BEAT_MS < effectiveHeartbeatMs()) {

@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -50,15 +51,18 @@ class RelayConnectionPolicyTest {
     }
 
     @Test
-    fun backgrounded_heartbeat_does_not_rebuild_the_node_on_invalidating_platforms() {
-        // The heartbeat re-enters startRelayConnection() from scratch every beat,
-        // so shouldRetrySupersededAttach — which only guards the retry loop inside
-        // an already-running job — cannot hold it back. Ungated it reads the latch
-        // that onProcessBackgrounded() deliberately dropped as "reconnect now" and
-        // rebuilds the node every 60 s for as long as the app stays backgrounded,
-        // closing the node the live wake loop and conversation listener hold.
-        assertFalse(
-            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+    fun backgrounded_heartbeat_leaves_the_node_alone_on_invalidating_platforms() {
+        // THE regression this pins: the heartbeat re-enters startRelayConnection()
+        // from scratch every beat, so shouldRetrySupersededAttach — which guards
+        // the retry loop inside an already-running job — cannot hold it back.
+        // Ungated it read the latch that onProcessBackgrounded() deliberately
+        // dropped as "reconnect now" and rebuilt the node every 60 s for as long
+        // as the app stayed backgrounded, closing the node the live wake loop and
+        // conversation listener hold.
+        assertEquals(
+            HeartbeatRelayAction.Idle,
+            RelayConnectionPolicy.heartbeatRelayAction(
+                relayConnected = false,
                 foreground = false,
                 invalidatesOnBackground = true,
             ),
@@ -67,8 +71,10 @@ class RelayConnectionPolicyTest {
 
     @Test
     fun foreground_heartbeat_still_recovers_a_dead_connection() {
-        assertTrue(
-            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+        assertEquals(
+            HeartbeatRelayAction.Reconnect,
+            RelayConnectionPolicy.heartbeatRelayAction(
+                relayConnected = false,
                 foreground = true,
                 invalidatesOnBackground = true,
             ),
@@ -79,11 +85,30 @@ class RelayConnectionPolicyTest {
     fun unfocused_heartbeat_still_reconnects_where_background_never_invalidates() {
         // Desktop: focus loss reports foreground=false but keeps its node, so a
         // down latch is a genuine failure and nothing else recovers it.
-        assertTrue(
-            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+        assertEquals(
+            HeartbeatRelayAction.Reconnect,
+            RelayConnectionPolicy.heartbeatRelayAction(
+                relayConnected = false,
                 foreground = false,
                 invalidatesOnBackground = false,
             ),
         )
+    }
+
+    @Test
+    fun connected_heartbeat_runs_relay_upkeep_in_both_lifecycle_states() {
+        // The latched arm must not be collateral damage of gating the other two:
+        // a backgrounded process with a live latch still owes ensureSubscriptions
+        // and the periodic sync.
+        for (foreground in listOf(true, false)) {
+            assertEquals(
+                HeartbeatRelayAction.SyncAndEnsureSubscriptions,
+                RelayConnectionPolicy.heartbeatRelayAction(
+                    relayConnected = true,
+                    foreground = foreground,
+                    invalidatesOnBackground = true,
+                ),
+            )
+        }
     }
 }

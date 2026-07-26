@@ -62,7 +62,11 @@ object RelayConnectionPolicy {
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
 
     /**
-     * Whether the slow housekeeping heartbeat may start a relay attach.
+     * What the slow housekeeping heartbeat should do about the relay this beat.
+     *
+     * The whole three-way choice lives here rather than as a boolean the caller
+     * branches on, so [HeartbeatRelayAction.Idle] — the case that regressed — is
+     * an assertable value instead of an untested `else`.
      *
      * The heartbeat re-*enters* `startRelayConnection()` from scratch every beat,
      * so [shouldRetrySupersededAttach] — which only stops the retry loop *inside*
@@ -75,10 +79,16 @@ object RelayConnectionPolicy {
      * conversation listener, and in-flight sends are holding. On Android that is
      * exactly the state the user is in when they expect a notification.
      *
-     * A backgrounded process does not need this: its existing sockets keep
-     * feeding `waitForMarmotEvent` (the invalidate drops only the host latch, not
-     * the node), and a genuinely dead connection is rebuilt by the push wake or
-     * the next foreground resume — both of which #354 made responsible for it.
+     * A backgrounded process does not need that rebuild, and the reason is a
+     * layer below this one: `nostr-relay-pool` defaults to `reconnect: true` and
+     * the core builds its client with those defaults (`client.rs`
+     * `Client::new(identity.keys().clone())`), so **socket-level recovery is
+     * owned by the Rust relay pool**. Rebuilding an entire `SonarNode` — new
+     * SQLCipher handle, new relay pool, KeyPackage republish — to recover a
+     * websocket the pool already reconnects on its own is the sledgehammer this
+     * removes. The host latch is bookkeeping, not the transport. What genuinely
+     * needs a rebuilt node (a superseded attach, a suspended process) is driven
+     * by the push wake and the foreground resume, which #354 made responsible.
      *
      * Desktop must still reconnect while unfocused: `Main.kt` bridges every
      * `windowLostFocus` to `setForeground(false)`, and there is no push wake to
@@ -89,8 +99,27 @@ object RelayConnectionPolicy {
      * whole matrix is assertable from `commonTest`, which compiles into every KMP
      * test target and so cannot depend on one platform's actual.
      */
-    fun shouldReconnectOnHeartbeat(foreground: Boolean, invalidatesOnBackground: Boolean): Boolean =
-        foreground || !invalidatesOnBackground
+    fun heartbeatRelayAction(
+        relayConnected: Boolean,
+        foreground: Boolean,
+        invalidatesOnBackground: Boolean,
+    ): HeartbeatRelayAction = when {
+        relayConnected -> HeartbeatRelayAction.SyncAndEnsureSubscriptions
+        foreground || !invalidatesOnBackground -> HeartbeatRelayAction.Reconnect
+        else -> HeartbeatRelayAction.Idle
+    }
+}
+
+/** Outcome of [RelayConnectionPolicy.heartbeatRelayAction]. */
+enum class HeartbeatRelayAction {
+    /** Latch is up: run the periodic relay upkeep. */
+    SyncAndEnsureSubscriptions,
+
+    /** Latch is down and this process should rebuild now. */
+    Reconnect,
+
+    /** Latch is down because we backgrounded on purpose — leave the node alone. */
+    Idle,
 }
 
 /** Android/iOS-style process background: true. Desktop focus loss: false. */

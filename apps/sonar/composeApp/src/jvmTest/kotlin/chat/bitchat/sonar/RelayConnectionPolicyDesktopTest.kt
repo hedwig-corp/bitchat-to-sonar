@@ -1,8 +1,8 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
-import kotlin.test.assertTrue
 
 /**
  * Desktop-only half of the relay latch policy. Lives in jvmTest, not commonTest:
@@ -25,8 +25,10 @@ class RelayConnectionPolicyDesktopTest {
         // take over the reconnect. Feeding it the same platform value the
         // SonarAppState.poll() call site passes proves the pair composes right
         // here — the pure matrix lives in RelayConnectionPolicyTest.
-        assertTrue(
-            RelayConnectionPolicy.shouldReconnectOnHeartbeat(
+        assertEquals(
+            HeartbeatRelayAction.Reconnect,
+            RelayConnectionPolicy.heartbeatRelayAction(
+                relayConnected = false,
                 foreground = false,
                 invalidatesOnBackground = RelayConnectionPolicy.shouldInvalidateOnBackground(),
             ),
