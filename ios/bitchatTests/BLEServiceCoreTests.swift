@@ -272,22 +272,23 @@ struct BLEServiceCoreTests {
         #expect(capture.profile?.npub == npub)
     }
 
-    // The reachability retention window must survive at least two missed
-    // announce cycles at the worst-case connected cadence, plus a maintenance
-    // tick of slack. At 21s (old value) a relayed peer was mathematically
-    // guaranteed to be evicted between two dense-mode announces (30s ± 8s) and
-    // flapped in and out of the radar on a single lost packet in sparse mode.
-    // Same derivation as the Rust mesh engine's LINK_STALE_MS on Android.
+    // The reachability retention window must survive two LOST announces,
+    // which means lasting until the THIRD emission: announce emissions are
+    // spaced [interval, interval + maintenance tick] apart because the
+    // cadence is only evaluated once per tick. At 21s (original value) a
+    // relayed peer was evicted between two dense-mode announces; at 90s it
+    // still could not survive a second consecutive loss (3×43 = 129s).
     @Test
     func reachabilityRetentionToleratesTwoMissedAnnounceCycles() {
         let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
             + TransportConfig.bleConnectedAnnounceJitterDense
+            + TransportConfig.bleMaintenanceInterval
         let sparseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsSparse
             + TransportConfig.bleConnectedAnnounceJitterSparse
-        let slack = TransportConfig.bleMaintenanceInterval
+            + TransportConfig.bleMaintenanceInterval
 
-        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds >= 2 * denseWorstGap + slack)
-        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 2 * sparseWorstGap + slack)
+        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds >= 3 * denseWorstGap)
+        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 3 * sparseWorstGap)
     }
 
     // A Sonar 0x53 from a peer we have no verified 0x01 for must trigger an

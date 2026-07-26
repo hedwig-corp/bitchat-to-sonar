@@ -92,13 +92,16 @@ enum TransportConfig {
     // Lowered to make connected→reachable icon changes react faster when walking out of range
     static let blePeerInactivityTimeoutSeconds: TimeInterval = 8.0
     // How long to retain a peer as "reachable" (not directly connected) since lastSeen.
-    // Must cover at least two missed announce cycles at the worst-case connected
-    // cadence (dense: 30s base + 8s jitter, sparse: 15s + 4s) plus one maintenance
-    // tick, or a relayed peer is evicted between two announces and flaps in and
-    // out of the radar on a single lost packet. Same derivation as the Rust mesh
-    // engine's LINK_STALE_MS (core/sonar-core/src/mesh_engine.rs) used on Android.
-    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 90.0    // ≥ 2×(30+8) + 5
-    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 45.0  // ≥ 2×(15+4) + 5
+    // Announce emissions are spaced [interval, interval + maintenance tick]
+    // apart (the cadence is only evaluated once per 5s tick), so the worst
+    // gap is 30+8+5 = 43s dense and 15+4+5 = 24s sparse. Surviving TWO lost
+    // announces means lasting until the THIRD emission: ≥ 3×43 = 129s dense,
+    // ≥ 3×24 = 72s sparse. Anything shorter evicts a relayed peer while it is
+    // still announcing on schedule and it flaps in and out of the radar.
+    // Same failure-tolerance bar as the Rust mesh engine's LINK_STALE_MS
+    // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
+    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0   // ≥ 3×(30+8+5)
+    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 75.0  // ≥ 3×(15+4+5)
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0
