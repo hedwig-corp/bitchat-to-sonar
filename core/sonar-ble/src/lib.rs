@@ -244,6 +244,13 @@ async fn init_central() -> Option<btleplug::platform::Adapter> {
     adapters.into_iter().next()
 }
 
+/// True when this peripheral's advertisement actually carries the bitchat mesh
+/// service, either as an advertised service UUID or as a service-data key.
+fn advertises_bitchat(props: &btleplug::api::PeripheralProperties) -> bool {
+    props.services.contains(&BITCHAT_SERVICE)
+        || props.service_data.contains_key(&BITCHAT_SERVICE)
+}
+
 async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     let id = match &ev {
         CentralEvent::DeviceDiscovered(id)
@@ -256,10 +263,26 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     let props = p.properties().await.ok().flatten();
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
-    // The scan is filtered to the bitchat service, so every reported peripheral
-    // matched it — even when CoreBluetooth hands back an empty parsed services
-    // array (common). So treat all scan results as bitchat peers.
+    let advertises_bitchat = props.as_ref().map(advertises_bitchat).unwrap_or(false);
+    // CoreBluetooth enforces the ScanFilter, so every reported peripheral matched
+    // it — and it routinely hands back an EMPTY parsed services array, so we
+    // cannot re-check the UUID there and must trust the filter.
+    //
+    // BlueZ does not behave that way: btleplug's Linux backend raises
+    // DeviceDiscovered/DeviceUpdated for every device the daemon knows about,
+    // including already-paired peripherals that never advertised our service, so
+    // the filter is a hint rather than a guarantee. Trusting it there labelled a
+    // Logitech mouse as a bitchat mesh peer, which made MeshRadio.peers() report
+    // a phantom "nearby phone" on the radar. Re-check the advertisement instead.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     let bitchat = true;
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    let bitchat = advertises_bitchat;
+    if !bitchat {
+        dbg_log(&format!("ignoring non-bitchat device {id} name={name:?}"));
+        return;
+    }
+    let _ = advertises_bitchat;
     dbg_log(&format!("discovered BITCHAT peer {id} rssi={rssi}"));
     if let Ok(mut d) = DEVICES.lock() {
         d.insert(
@@ -457,4 +480,49 @@ async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     }
     let _ = peripheral.stop_advertising().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btleplug::api::PeripheralProperties;
+
+    fn props_with(services: Vec<Uuid>) -> PeripheralProperties {
+        PeripheralProperties {
+            services,
+            ..Default::default()
+        }
+    }
+
+    /// A device that advertises our service is a mesh peer.
+    #[test]
+    fn bitchat_service_uuid_matches() {
+        assert!(advertises_bitchat(&props_with(vec![BITCHAT_SERVICE])));
+    }
+
+    /// Regression: BlueZ raises discovery events for every device the daemon
+    /// knows about, not just ScanFilter matches, so an unrelated peripheral
+    /// (this was a Logitech MX Master 3) must NOT be reported as a mesh peer —
+    /// doing so put a phantom "nearby phone" on the desktop radar.
+    #[test]
+    fn unrelated_peripheral_is_not_a_mesh_peer() {
+        let hid = Uuid::from_u128(0x00001812_0000_1000_8000_00805f9b34fb);
+        let battery = Uuid::from_u128(0x0000180f_0000_1000_8000_00805f9b34fb);
+        assert!(!advertises_bitchat(&props_with(vec![hid, battery])));
+    }
+
+    /// An empty advertisement is not a match either (the CoreBluetooth
+    /// empty-services case is handled by trusting the filter, not by this fn).
+    #[test]
+    fn empty_advertisement_is_not_a_mesh_peer() {
+        assert!(!advertises_bitchat(&props_with(vec![])));
+    }
+
+    /// Some advertisers carry the service only as a service-data key.
+    #[test]
+    fn bitchat_service_data_matches() {
+        let mut props = props_with(vec![]);
+        props.service_data.insert(BITCHAT_SERVICE, vec![1, 2, 3]);
+        assert!(advertises_bitchat(&props));
+    }
 }
