@@ -287,6 +287,44 @@ struct SonarNSEDecoratePolicyTests {
         ))
     }
 
+    @Test("NSE mute lookup covers every key shape the store persists")
+    func nseMuteCandidatesMatchStoreNormalization() throws {
+        // Drift guard: the appex cannot compile the SwiftUI file SonarChatMuteStore
+        // lives in, so mutedLookupCandidates hand-copies normalizedCandidates.
+        // Nothing else pins the two together — add a shape to the store without
+        // adding it here and mutes silently stop working on the killed-app path.
+        let suiteName = "test.nse.mute.drift"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        // Clear before AND after: a crashed prior run would otherwise leave
+        // mutes behind and decide this test's verdict (matches freshMuteStore).
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let storeKey = "test.mutes.drift"
+        let store = SonarChatMuteStore(defaults: defaults, key: storeKey)
+
+        let gid = String(repeating: "ab", count: 32) // 64-hex group id
+        let npub = "npub1exampleexample"
+        let until = Date().addingTimeInterval(3600)
+        for raw in [gid, "marmot:" + gid, npub] {
+            store.mute(keys: [raw], until: until)
+        }
+
+        let lookedUp = Set(
+            SonarNSEDecoratePolicy.mutedLookupCandidates(groupIdHex: gid, senderNpub: npub)
+        )
+        for stored in store.mutedUntil.keys {
+            #expect(lookedUp.contains(stored), "NSE lookup misses stored mute key \(stored)")
+        }
+
+        // Round-trip the store's OWN persisted blob, so the implicit
+        // JSONEncoder/JSONDecoder date-strategy agreement is pinned too.
+        let blob = defaults.data(forKey: storeKey)
+        #expect(blob != nil)
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: npub, mutesJSON: blob, now: Date()
+        ))
+    }
+
     @Test("malformed trill lines are not treated as trills")
     func malformedTrillNotClassified() {
         #expect(SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|abc-123"))

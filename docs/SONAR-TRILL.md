@@ -64,9 +64,9 @@ App Group chat DB, drains, and classifies the decrypted content locally:
 `SonarNSEDecoratePolicy.render` produces the nudged-you banner (never the raw
 `⚡TRILL` line) and marks `isTrill`, which selects the distinct
 `sonar_trill.wav` sound. Muted chats are honored via an App Group mirror of
-the mute map. If hydrate fails (store busy, missing credentials, NSE time
-expiry) the generic placeholder banner and sound are delivered — never a raw
-line.
+the mute map (see the mute section for the one-launch caveat). If hydrate
+fails (store busy, missing credentials, NSE time expiry) the generic
+placeholder banner and sound are delivered — never a raw line.
 
 Honor the platform reduce-motion setting: skip the shake (keep sound/haptic)
 when reduced motion is enabled, mirroring the design's
@@ -101,7 +101,12 @@ Design: `MuteSheet` (sonar/components.jsx) with durations 1 hour, 8 hours,
 and from the DM/group screen. Muted rows show a bell-off icon in place of the
 unread dot. Mute state is **local to the install** (not synced across linked
 devices — tracked gap, Signal syncs it). On iOS the map is write-through
-mirrored into the App Group so the killed-app NSE path honors mutes too.
+mirrored into the App Group so the killed-app NSE path honors mutes too. The
+mirror is written whenever `SonarChatMuteStore` is constructed or mutated, so
+a mute made before updating to a build with the mirror reaches the extension
+only after the app has run once; until then the NSE fails open and the host
+removes the banner on the next wake. Android has no equivalent gap — it reads
+one core blob (`mute.byChat`) from the push service process.
 
 Mute suppresses notification/sound/haptic/shake for ALL message kinds in the
 chat, not only trills. Rows and unread badges still accrue.

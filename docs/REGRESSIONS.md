@@ -1085,6 +1085,48 @@ amount for a BOLT11 — that needs a wallet double — and the amountless refusa
 `SNScannedKind` at all: the Kotlin tests are the only coverage, so a Swift-side
 divergence would not be caught. Nothing here is exercised end-to-end against a
 real wallet.
+## R-022 — A muted chat must not alert on any delivery path
+
+**Invariant:** Per-chat mute suppresses banner, sound, and haptic on EVERY
+delivery path — foreground, background drain, and the killed-app notification
+extension — not only the paths that run inside the app process. Rows and unread
+badges still accrue.
+
+**Breaks as:** A muted chat rings on the lock screen while the app is killed.
+With a trill it rings the loud nudge bell, which is the abuse vector mute exists
+to close.
+
+**Why:** Mute shipped in #336 against the in-process paths only. iOS keeps the
+mute map in `.standard` UserDefaults, which the Notification Service Extension
+cannot read (separate container), so the NSE hydrate path decorated and sounded
+muted chats regardless. #443 mirrors the map into the App Group and gates the
+NSE decorate on it.
+
+**Call sites:**
+- iOS `SonarNotificationService/NotificationService.swift` (killed-app hydrate) → `SonarNSEDecoratePolicy.isMuted` over the App Group mirror written by `SonarChatMuteStore.mirrorToAppGroup`
+- iOS `SonarPushProcessor.swift` (drain + summary paths) and `NotificationService.sendLocalNotification` (central in-process gate)
+- Compose `SonarPushProcessingService.notifyUnreadConversations` → `decodeMuteMap(SonarCore.loadBlob("mute.byChat"))`
+
+**Guarded by:** `SonarNSEDecoratePolicyTests.nseMuteCheck`
+
+**Also guarded by:** `SonarNSEDecoratePolicyTests.nseMuteCandidatesMatchStoreNormalization`, `SonarTrillMessageTests.testMutedChatTrillIsRowOnly`, `SonarTrillMessageTests.testMuteKeyNormalizationBridgesIdShapes`, `SonarTrillTest.muteSuppressesUntilExpiryAndForeverNeverExpires`, `SonarTrillTest.muteMapRoundTripsThroughBlob`
+
+**Not guarded:** The NSE `apply()` call-site wiring. The cited tests pin
+`SonarNSEDecoratePolicy.isMuted` and the key-shape agreement, not the filter
+inside `hydrateMarmotAndDecorate`, so a call-site regression keeps them green —
+the exact failure mode R-001 warns about. Nothing pins the host's
+`removeDeliveredNSEOwnedBanners` backstop on the mute branches. Pre-existing
+mutes are not mirrored until `SonarChatMuteStore.shared` is first constructed,
+so an app updated but never launched fails open. Compose
+`notifyUnreadConversations` mute-skip has no test. iOS tests do not run in CI.
+
+**Rejected:** Suppressing in the NSE *before* hydrate using the push payload's
+group-id hint (`SonarNSEDecoratePolicy.hintGroupIdHex`) to avoid taking the
+store lock — the wake drain is not scoped to the hinted group, so an unmuted
+chat's message arriving in the same wake would be silenced along with the muted
+one. Moving the iOS mute map into the App Group outright, or onto the core blob
+store like Android: correct end state, but it migrates live mute state on a path
+where a miss means silent notification loss.
 
 ## R-022 — Restore recovers the account, or leaves it exactly as it was
 

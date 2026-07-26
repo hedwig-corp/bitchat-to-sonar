@@ -400,6 +400,15 @@ enum SonarPushProcessor {
             // caught by the summary path below (documented gap).
             if notif.groupName.isEmpty, !notif.senderNpub.isEmpty,
                SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
+                // The NSE suppresses muted chats itself, but it fails open when
+                // the App Group mute mirror is missing (app updated and never
+                // launched) or undecodable. The host is the backstop: drop the
+                // banner it already delivered instead of leaving a muted chat
+                // ringing on the lock screen.
+                await removeDeliveredNSEOwnedBanners(
+                    messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
+                    conversationId: notif.groupIdHex.isEmpty ? nil : "marmot:" + notif.groupIdHex
+                )
                 continue
             }
             // Receiver trill throttle: one alert per chat per window; excess
@@ -521,8 +530,15 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute: unread still accrues, no banner.
-            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) { continue }
+            // Per-chat mute: unread still accrues, no banner. Same NSE
+            // fail-open backstop as the drain path above.
+            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) {
+                await removeDeliveredNSEOwnedBanners(
+                    messageIdHex: nil,
+                    conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex
+                )
+                continue
+            }
             // Receiver trill throttle: excess trills stay row-only.
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
