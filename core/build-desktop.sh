@@ -107,7 +107,7 @@ BLE_LIB="$(echo "$LIB" | sed 's/sonar_ffi/sonar_ble/')"  # libsonar_ble.<ext>
 # deps (Linux needs libdbus-1-dev via libdbus-sys/pkg-config) or when you only
 # need the core bindings.
 #
-# Linux note: the bridge builds the central/scan role only — the peripheral
+# Linux note: the bridge builds the central/scan role only; the peripheral
 # (advertise + GATT server) role is CoreBluetooth-only, see run_peripheral in
 # sonar-ble/src/lib.rs and vendor/bluster/SONAR_PATCH.md.
 if [[ "${SONAR_SKIP_BLE:-0}" == "1" ]]; then

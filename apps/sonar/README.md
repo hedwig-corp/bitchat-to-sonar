@@ -24,8 +24,8 @@ composeApp/src/
 | Encrypted media (MIP-04)            |   ✅    |   ✅    |
 | Profiles / verify safety numbers    |   ✅    |   ✅    |
 | Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
-| BLE mesh — discovery (scan)         |   ✅    |   ✅ macOS (CoreBluetooth) + Linux (BlueZ) |
-| BLE mesh — advertise + GATT server  |   ✅    |   ✅ macOS only — ⚪️ not implemented on Linux/Windows |
+| BLE mesh: discovery (scan)         |   ✅    |   ✅ macOS (CoreBluetooth) + Linux (BlueZ) |
+| BLE mesh: advertise + GATT server  |   ✅    |   ✅ macOS only, ⚪️ not implemented on Linux/Windows |
 | BLE mesh — messaging (DMs/broadcast)|   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
 | Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
@@ -42,7 +42,7 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
   - **peripheral/advertise + GATT server** (`bluster`) — the desktop advertises
     the bitchat service and, when a phone subscribes, serves a signed **announce**
     built by the same `meshBuildAnnounce` Rust function the phones use, so the
-    phone shows the desktop as a named peer. **macOS only** — the notify /
+    phone shows the desktop as a named peer. **macOS only**. The notify /
     write-drain side channel this role is built on is a Sonar patch that exists
     solely in bluster's CoreBluetooth backend, so on Linux the advertise calls
     report unavailable and only the scan radar runs. Bringing it to BlueZ means
@@ -50,8 +50,8 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
 
   What this means on Linux in practice: a nearby phone with the mesh screen open
   **is** discovered, with live signal strength. But a peer's *name* comes from
-  the signed announce the phone writes over GATT — which needs the peripheral
-  role — so the radar shows an unnamed "nearby phone" and mesh DMs do not form.
+  the signed announce the phone writes over GATT, which needs the peripheral
+  role, so the radar shows an unnamed "nearby phone" and mesh DMs do not form.
   macOS gets named peers and DMs; Linux gets presence only.
 
   (`bluster` is vendored + patched; see
@@ -73,7 +73,7 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
 
 On Linux, install the BlueZ build deps first (the BLE bridge links `libdbus-sys`
 through pkg-config): `sudo apt-get install libdbus-1-dev pkg-config`. Without
-them, build with `SONAR_SKIP_BLE=1` to skip the bridge — the app then runs
+them, build with `SONAR_SKIP_BLE=1` to skip the bridge; the app then runs
 internet-only.
 
 ```bash

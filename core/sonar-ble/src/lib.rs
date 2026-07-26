@@ -20,7 +20,7 @@
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
-// The peripheral/advertise role is CoreBluetooth-only — see `run_peripheral`.
+// The peripheral/advertise role is CoreBluetooth-only; see `run_peripheral`.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -268,7 +268,7 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
     let name = props.as_ref().and_then(|pr| pr.local_name.clone());
     let rssi = props.as_ref().and_then(|pr| pr.rssi).unwrap_or(0);
     // CoreBluetooth enforces the ScanFilter, so every reported peripheral matched
-    // it — and it routinely hands back an EMPTY parsed services array, so we
+    // it, and it routinely hands back an EMPTY parsed services array, so we
     // cannot re-check the UUID there and must trust the filter.
     //
     // BlueZ does not behave that way: btleplug's Linux backend raises
@@ -511,7 +511,7 @@ mod tests {
 
     /// Regression: BlueZ raises discovery events for every device the daemon
     /// knows about, not just ScanFilter matches, so an unrelated peripheral
-    /// (this was a Logitech MX Master 3) must NOT be reported as a mesh peer —
+    /// (this was a Logitech MX Master 3) must NOT be reported as a mesh peer,
     /// doing so put a phantom "nearby phone" on the desktop radar.
     #[test]
     fn unrelated_peripheral_is_not_a_mesh_peer() {

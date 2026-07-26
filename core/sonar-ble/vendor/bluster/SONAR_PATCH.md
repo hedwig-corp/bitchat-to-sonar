@@ -1,6 +1,6 @@
 # Vendored + patched bluster 0.2.0
 
-Vendored from crates.io `bluster v0.2.0` (MIT licensed — see `LICENSE`). Three
+Vendored from crates.io `bluster v0.2.0` (MIT licensed, see `LICENSE`). Three
 patches, described below.
 
 ## 1. CoreBluetooth advertises service UUIDs as `NSString` (macOS)
@@ -17,14 +17,14 @@ services) to build the array from `CBUUID`s.
 
 `Peripheral::notify` and `Peripheral::take_writes` (and their
 `PeripheralManager` counterparts) are Sonar additions, marked `PATCH (Sonar)` at
-each site. They exist **only** in the CoreBluetooth backend — the BlueZ backend
+each site. They exist **only** in the CoreBluetooth backend; the BlueZ backend
 has no equivalent.
 
 This is why `sonar-ble`'s `run_peripheral` is CoreBluetooth-only: it drives the
 GATT server through this side channel rather than bluster's cross-platform
 `gatt::event` channel. Bringing the peripheral/advertise role to Linux means
 wiring `Event::NotifySubscribe` / `Event::Write` through the BlueZ backend's
-event receiver, which is a different mechanism — not a port of this patch.
+event receiver, which is a different mechanism, not a port of this patch.
 
 ## 3. Never-type fallback in the BlueZ backend (Linux)
 
@@ -32,7 +32,7 @@ event receiver, which is a different mechanism — not a port of this patch.
 `src/peripheral/bluez/advertisement.rs` (`register`, `unregister`) call
 `Proxy::method_call` and discard the reply, leaving the return type `R`
 unconstrained. That relied on never-type fallback resolving `R` to `()`, which
-`#[deny(dependency_on_unit_never_type_fallback)]` now rejects — the crate failed
+`#[deny(dependency_on_unit_never_type_fallback)]` now rejects, and the crate failed
 to build on stable rustc 1.96 with 8 errors, taking all of `core/build-desktop.sh`
 down with it on Linux.
 
