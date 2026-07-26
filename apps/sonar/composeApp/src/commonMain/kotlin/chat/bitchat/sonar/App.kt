@@ -1267,13 +1267,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     // when unrelated state (media decode, presence) invalidates the screen.
     val calls = run { state.callVersion; state.callRecords(screen.id) }
     val feed: List<Any> = remember(state.messages, calls) {
-        val visible = state.messages.filter {
-            val p = PayLine.decode(it.content)
-            // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines. The
-            // cheap ☎CALL prefix check avoids an FFI call for ordinary chat.
-            val isCall = it.content.trimStart().startsWith("☎CALL") &&
-                SonarCore.callParseControl(it.content) != null
-            (p == null || p is PayLine.Pay) && !isCall
+        // Hide ⚡PAY control lines (Claim/Done) and ☎CALL signaling lines.
+        // Core rows answer from their precomputed classification, which is also
+        // what decides whether they counted as unread — so the divider can
+        // never anchor on a row the transcript refuses to show. Only rows
+        // without one (mesh, optimistic echoes) pay the string decode, and the
+        // cheap ☎CALL prefix check keeps ordinary chat off the FFI path.
+        val visible = state.messages.filter { msg ->
+            isTranscriptVisibleRow(msg) { content ->
+                content.trimStart().startsWith("☎CALL") &&
+                    SonarCore.callParseControl(content) != null
+            }
         }
         (visible + calls).sortedBy { if (it is CallRecord) it.tsSecs else (it as SonarMsg).tsSecs }
     }

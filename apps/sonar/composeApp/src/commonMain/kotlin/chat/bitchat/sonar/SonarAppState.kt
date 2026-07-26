@@ -57,6 +57,13 @@ private const val PROFILE_REFRESH_TTL_SECS = 30 * 60L
 private const val BACKGROUND_TRANSCRIPT_SCAN_LIMIT = 100
 /** Two local pages of IDs cover overlap between incremental notification scans. */
 private const val NOTIFICATION_SEEN_MESSAGE_LIMIT = BACKGROUND_TRANSCRIPT_SCAN_LIMIT * 2
+/** Local re-read cadence for a transcript that opened blank on a conversation
+ *  known to have messages. Short first step so the common case (core finishing
+ *  its boot) repaints in well under a second; the budget bounds the whole thing
+ *  so a genuinely unreadable store cannot spin. */
+private const val BLANK_TRANSCRIPT_RETRY_START_MS = 100L
+private const val BLANK_TRANSCRIPT_RETRY_MAX_STEP_MS = 800L
+private const val BLANK_TRANSCRIPT_RETRY_BUDGET_MS = 8_000L
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
 private const val RELAY_RECONNECT_RETRY_MS = 10_000L
@@ -4770,6 +4777,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
                 runCatching { refreshChats() }
                 if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
+                if (messages.isEmpty()) scheduleBlankTranscriptRecovery(chat.id, generation)
             }
             return
         }
@@ -4791,6 +4799,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isCurrentTranscriptSession(chat.id, generation)) {
                 markTranscriptHydrated(chat.id)
             }
+            // Opened blank on a conversation we know has history: the store was
+            // not readable yet. Re-read it locally instead of leaving the chat
+            // black until an unrelated sync event repaints it.
+            if (visibleLocal.isEmpty()) scheduleBlankTranscriptRecovery(chat.id, generation)
             for (m in visibleLocal) if (!m.mine && m.senderNpub.isNotBlank()) ensureProfile(m.senderNpub)
             runCatching { refreshChats() }
         }
@@ -4847,6 +4859,9 @@ class SonarAppState(private val scope: CoroutineScope) {
             warmOpenTranscriptThumbs(visible)
             push(Screen.Chat(id, name, pay))
             if (isCurrentTranscriptSession(id, generation)) markTranscriptHydrated(id)
+            // Opened blank on a conversation we know has history: re-read local
+            // storage rather than leaving the chat black until the next sync.
+            if (visible.isEmpty()) scheduleBlankTranscriptRecovery(id, generation)
             // markGroupsRead already ran before the local page; refreshOpenDm
             // (reopen path / housekeeping) re-marks if folded groups appear later.
             refreshChats()
@@ -4934,6 +4949,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             scope.launch {
                 refreshOpenDm(peerId)
                 if (isCurrentTranscriptSession(chat.id, generation)) markTranscriptHydrated(chat.id)
+                if (messages.isEmpty()) scheduleBlankTranscriptRecovery(chat.id, generation)
             }
             return
         }
@@ -4963,6 +4979,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!isCurrentTranscriptSession(chat.id, generation)) return@launch
             setCurrentVisibleMessages(chat.id, local, processCalls = true)
             markTranscriptHydrated(chat.id)
+            if (messages.isEmpty()) scheduleBlankTranscriptRecovery(chat.id, generation)
         }
     }
 
@@ -8986,24 +9003,33 @@ class SonarAppState(private val scope: CoroutineScope) {
         generation: Long,
     ): List<SonarMsg> {
         val fetched = latestCursorPage(groupId)
+        val untrusted = transcriptReadIsUntrusted(fetched, started, localLatestTs(groupId))
         if (!isCurrentTranscriptSession(sessionChatId, generation)) {
             return when {
-                !started && fetched.isNullOrEmpty() ->
-                    chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
-                fetched == null -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
-                else -> visibleTranscriptPage(fetched)
+                untrusted -> chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
+                else -> visibleTranscriptPage(fetched.orEmpty())
             }
         }
 
         val current = transcriptWindows[groupId]
-        if (fetched == null || (!started && fetched.isEmpty())) {
-            if (current != null) return current.rows
+        if (untrusted) {
+            // Keep whatever is already painted; only fall through to the
+            // snapshot when there is nothing to keep.
+            if (current != null && current.rows.isNotEmpty()) return current.rows
             val fallback = chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(TRANSCRIPT_PAGE_SIZE)
-            transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+            // Never cache an empty window. A cached blank is indistinguishable
+            // from a real one at the `current != null` check above, so it would
+            // shadow the store on every later refresh and pin the chat black.
+            if (fallback.isNotEmpty()) {
+                transcriptWindows[groupId] = TranscriptGroupWindow(fallback, hasMore = false)
+            }
             return fallback
         }
+        // Trusted from here: `untrusted` already covered null and the ambiguous
+        // empty page, so an empty list now means the conversation really is empty.
+        val page = fetched.orEmpty()
 
-        val newest = visibleTranscriptPage(fetched)
+        val newest = visibleTranscriptPage(page)
         // Remember the freshly read page before any pinned/bounded filtering can
         // drop it: send-echo reconciliation must still see an outgoing row that
         // the render window refuses to admit.
@@ -9016,8 +9042,8 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         val hasMore = when {
             unboundedCount > TRANSCRIPT_RETAINED_ROWS -> true
-            current != null -> current.hasMore || fetched.size > TRANSCRIPT_PAGE_SIZE
-            else -> fetched.size > TRANSCRIPT_PAGE_SIZE
+            current != null -> current.hasMore || page.size > TRANSCRIPT_PAGE_SIZE
+            else -> page.size > TRANSCRIPT_PAGE_SIZE
         }
         transcriptWindows[groupId] = TranscriptGroupWindow(
             rows = merged,
@@ -9036,6 +9062,90 @@ class SonarAppState(private val scope: CoroutineScope) {
             return chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
         }
         return loaded ?: chatSnapshotMessagesByChat[groupId].orEmpty().takeLast(BACKGROUND_TRANSCRIPT_SCAN_LIMIT)
+    }
+
+    /** True when local metadata remembers messages for this conversation, even
+     *  if the encrypted store cannot be read right now. Survives a cold launch,
+     *  so it is the signal that a blank transcript is wrong rather than empty. */
+    private fun transcriptKnownNonEmpty(chatId: String): Boolean =
+        localLatestTs(chatId) > 0L || transcriptGroupIds(chatId).any { localLatestTs(it) > 0L }
+
+    /** Whether this conversation's transport legs are known yet. A mesh route
+     *  resolves its folded White Noise groups through `chats` / `npubRawFor`,
+     *  neither of which is populated on a cold launch; a plain Marmot chat id is
+     *  its own source, so it is always resolved. */
+    private fun transcriptSourcesResolved(chatId: String): Boolean =
+        !isMeshChat(chatId) || transcriptGroupIds(chatId).isNotEmpty()
+
+    /**
+     * The same local rows the open path would read for [chatId].
+     *
+     * A mesh conversation's id is a route id (`mesh:<peerId>`), not a Marmot
+     * group id, so it cannot be handed to [marmotMessagesPageForChat] — that
+     * would query a group that does not exist and answer "no messages" forever.
+     * Mirror `openDm`: merge the BLE window with the folded White Noise leg.
+     */
+    private suspend fun localTranscriptRowsForChat(
+        chatId: String,
+        generation: Long,
+    ): List<SonarMsg> {
+        if (!isMeshChat(chatId)) return marmotMessagesPageForChat(chatId, generation)
+        val peerId = canonicalMeshPeerId(meshPeerId(chatId))
+        val mesh = refreshMeshTranscriptWindow(peerId)
+        val wn = marmotMessagesForPeer(peerId, chatId, generation)
+        return refreshConversationRows(mesh + wn, chatId, generation)
+    }
+
+    /**
+     * Re-read local storage for a transcript that opened blank on a conversation
+     * we know has messages.
+     *
+     * The store can be briefly unreadable (core still booting after a cold
+     * launch, node being replaced), and the open path has no way to wait for it
+     * without holding the user on Home. Without this, the chat sits black until
+     * an unrelated sync event happens to repaint it — the reported "black screen,
+     * then the bubbles appear after a while".
+     *
+     * Bounded and local-only by construction: it re-reads the same local rows
+     * the open used ([localTranscriptRowsForChat], so mesh conversations resolve
+     * their own sources), never touches relay/sync, and stops at the first
+     * non-empty read, on session change, or after
+     * [BLANK_TRANSCRIPT_RETRY_BUDGET_MS].
+     */
+    private fun scheduleBlankTranscriptRecovery(chatId: String, generation: Long) {
+        val shouldRecover = shouldRecoverBlankTranscript(
+            knownNonEmpty = transcriptKnownNonEmpty(chatId),
+            coreStarted = started,
+            sourcesResolved = transcriptSourcesResolved(chatId),
+        )
+        if (!shouldRecover) return
+        scope.launch {
+            var waitedMs = 0L
+            var stepMs = BLANK_TRANSCRIPT_RETRY_START_MS
+            while (waitedMs < BLANK_TRANSCRIPT_RETRY_BUDGET_MS) {
+                delay(stepMs)
+                waitedMs += stepMs
+                stepMs = (stepMs * 2).coerceAtMost(BLANK_TRANSCRIPT_RETRY_MAX_STEP_MS)
+                if (!isCurrentTranscriptSession(chatId, generation)) return@launch
+                // Someone else (sync drain, send echo) already painted it.
+                if (messages.isNotEmpty()) return@launch
+                val local = withSendEchoes(
+                    chatId,
+                    mergePendingMediaUploads(chatId, localTranscriptRowsForChat(chatId, generation)),
+                )
+                val visible = visibleMessagesForChat(chatId, local)
+                if (visible.isEmpty()) {
+                    // Rows exist but the social filter hides all of them (blocked
+                    // contact). The store answered — retrying cannot change it.
+                    if (local.isNotEmpty()) return@launch
+                    continue
+                }
+                if (!isCurrentTranscriptSession(chatId, generation)) return@launch
+                publishOpenTranscript(chatId, visible)
+                markTranscriptHydrated(chatId)
+                return@launch
+            }
+        }
     }
 
     private suspend fun marmotMessagesPageForChat(

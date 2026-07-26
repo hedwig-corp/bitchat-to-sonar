@@ -223,6 +223,13 @@ impl ConversationIndex {
         Ok(false)
     }
 
+    /// Record a message in the conversation summary.
+    ///
+    /// [counts_unread] is **not** just `!mine`: a message only raises the
+    /// unread counter when hosts actually render it as a transcript row (see
+    /// `MessageClassification::is_transcript_visible`). Counting hidden
+    /// control lines drifts the unread divider back through real history and
+    /// leaves phantom badges on chats where nothing visible arrived.
     pub fn upsert_summary(
         &self,
         group_id_hex: &str,
@@ -231,6 +238,7 @@ impl ConversationIndex {
         sender: &str,
         at_secs: u64,
         mine: bool,
+        counts_unread: bool,
     ) -> Result<()> {
         self.db
             .execute(
@@ -244,7 +252,7 @@ impl ConversationIndex {
                     latest_at_secs = CASE WHEN ?5 >= latest_at_secs THEN ?5 ELSE latest_at_secs END,
                     latest_mine = CASE WHEN ?5 >= latest_at_secs THEN ?6 ELSE latest_mine END,
                     message_count = message_count + 1,
-                    unread_count = CASE WHEN ?6 = 0 THEN unread_count + 1 ELSE unread_count END,
+                    unread_count = CASE WHEN ?7 = 1 THEN unread_count + 1 ELSE unread_count END,
                     version = version + 1",
                 params![
                     group_id_hex,
@@ -253,7 +261,7 @@ impl ConversationIndex {
                     sender,
                     at_secs as i64,
                     mine as i32,
-                    if mine { 0i32 } else { 1i32 },
+                    if !mine && counts_unread { 1i32 } else { 0i32 },
                 ],
             )
             .map_err(|e| crate::Error::Storage(format!("index upsert: {e}")))?;
@@ -384,6 +392,8 @@ impl ConversationIndex {
                     &sender,
                     msg.created_at.as_secs(),
                     msg.mine,
+                    // Rebuild from storage resets unread below anyway.
+                    msg.classification.is_transcript_visible(),
                 )?;
                 self.db
                     .execute(
@@ -410,8 +420,8 @@ mod tests {
     fn repair_json_previews_rewrites_legacy_rows_once() {
         let idx = ConversationIndex::open_in_memory().unwrap();
         // Simulate a row written before the guard landed.
-        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false).unwrap();
-        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false).unwrap();
+        idx.upsert_summary("g1", "agent", "{\"alert\":\"cpu\",\"host\":\"ocean\"}", "npub1x", 10, false, true).unwrap();
+        idx.upsert_summary("g2", "human", "{ not json, just a brace", "npub1y", 20, false, true).unwrap();
         idx.repair_json_previews().unwrap();
         let summaries = idx.summaries_ordered().unwrap();
         let g1 = summaries.iter().find(|s| s.group_id_hex == "g1").unwrap();
@@ -452,9 +462,9 @@ mod tests {
     fn upsert_and_ordering() {
         let idx = ConversationIndex::open_in_memory().unwrap();
 
-        idx.upsert_summary("group_a", "Alice", "hello", "npub_alice", 100, false)
+        idx.upsert_summary("group_a", "Alice", "hello", "npub_alice", 100, false, true)
             .unwrap();
-        idx.upsert_summary("group_b", "Bob", "world", "npub_bob", 200, true)
+        idx.upsert_summary("group_b", "Bob", "world", "npub_bob", 200, true, true)
             .unwrap();
 
         let summaries = idx.summaries_ordered().unwrap();
@@ -472,9 +482,9 @@ mod tests {
     fn upsert_only_updates_when_newer() {
         let idx = ConversationIndex::open_in_memory().unwrap();
 
-        idx.upsert_summary("g1", "Chat", "newer msg", "sender_b", 200, false)
+        idx.upsert_summary("g1", "Chat", "newer msg", "sender_b", 200, false, true)
             .unwrap();
-        idx.upsert_summary("g1", "Chat", "older msg", "sender_a", 100, true)
+        idx.upsert_summary("g1", "Chat", "older msg", "sender_a", 100, true, true)
             .unwrap();
 
         let s = idx.summary("g1").unwrap().unwrap();
@@ -487,9 +497,9 @@ mod tests {
     fn mark_read_resets_unread() {
         let idx = ConversationIndex::open_in_memory().unwrap();
 
-        idx.upsert_summary("g1", "Chat", "msg1", "sender", 100, false)
+        idx.upsert_summary("g1", "Chat", "msg1", "sender", 100, false, true)
             .unwrap();
-        idx.upsert_summary("g1", "Chat", "msg2", "sender", 200, false)
+        idx.upsert_summary("g1", "Chat", "msg2", "sender", 200, false, true)
             .unwrap();
 
         let s = idx.summary("g1").unwrap().unwrap();
@@ -503,7 +513,7 @@ mod tests {
     #[test]
     fn remove_group_deletes_summary() {
         let idx = ConversationIndex::open_in_memory().unwrap();
-        idx.upsert_summary("g1", "Chat", "msg", "s", 100, true)
+        idx.upsert_summary("g1", "Chat", "msg", "s", 100, true, true)
             .unwrap();
         assert!(!idx.is_empty());
 
@@ -515,7 +525,7 @@ mod tests {
     #[test]
     fn ensure_group_does_not_overwrite() {
         let idx = ConversationIndex::open_in_memory().unwrap();
-        idx.upsert_summary("g1", "Chat", "msg", "s", 100, true)
+        idx.upsert_summary("g1", "Chat", "msg", "s", 100, true, true)
             .unwrap();
         idx.ensure_group("g1", "New Name").unwrap();
 
@@ -527,7 +537,7 @@ mod tests {
     #[test]
     fn update_group_name() {
         let idx = ConversationIndex::open_in_memory().unwrap();
-        idx.upsert_summary("g1", "Old", "msg", "s", 100, true)
+        idx.upsert_summary("g1", "Old", "msg", "s", 100, true, true)
             .unwrap();
         idx.update_group_name("g1", "New").unwrap();
 
@@ -539,11 +549,11 @@ mod tests {
     fn version_bumps_on_every_visible_mutation() {
         let idx = ConversationIndex::open_in_memory().unwrap();
 
-        idx.upsert_summary("g1", "Chat", "msg1", "peer", 100, false)
+        idx.upsert_summary("g1", "Chat", "msg1", "peer", 100, false, true)
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
-        idx.upsert_summary("g1", "Chat", "msg2", "peer", 200, false)
+        idx.upsert_summary("g1", "Chat", "msg2", "peer", 200, false, true)
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 2);
 
@@ -600,7 +610,7 @@ mod tests {
         assert_eq!(s.message_count, 3);
         assert_eq!(s.version, 0, "pre-migration rows start at version 0");
 
-        idx.upsert_summary("g1", "Chat", "new msg", "peer", 200, false)
+        idx.upsert_summary("g1", "Chat", "new msg", "peer", 200, false, true)
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
     }
@@ -637,7 +647,7 @@ mod tests {
         }
 
         let idx = ConversationIndex::open(&path, key).expect("open must not fail");
-        idx.upsert_summary("g1", "Chat", "msg", "peer", 100, false)
+        idx.upsert_summary("g1", "Chat", "msg", "peer", 100, false, true)
             .unwrap();
         assert_eq!(idx.summary("g1").unwrap().unwrap().version, 1);
 
@@ -650,13 +660,34 @@ mod tests {
     #[test]
     fn mine_messages_do_not_increment_unread() {
         let idx = ConversationIndex::open_in_memory().unwrap();
-        idx.upsert_summary("g1", "Chat", "msg1", "me", 100, true)
+        idx.upsert_summary("g1", "Chat", "msg1", "me", 100, true, true)
             .unwrap();
-        idx.upsert_summary("g1", "Chat", "msg2", "me", 200, true)
+        idx.upsert_summary("g1", "Chat", "msg2", "me", 200, true, true)
             .unwrap();
 
         let s = idx.summary("g1").unwrap().unwrap();
         assert_eq!(s.unread_count, 0);
         assert_eq!(s.message_count, 2);
+    }
+
+    #[test]
+    fn host_hidden_messages_do_not_increment_unread() {
+        let idx = ConversationIndex::open_in_memory().unwrap();
+        // One visible incoming message, then two incoming control lines that no
+        // host renders (☎CALL signaling / ⚡PAYDONE settlement).
+        idx.upsert_summary("g1", "Chat", "hey", "peer", 100, false, true)
+            .unwrap();
+        idx.upsert_summary("g1", "Chat", "☎CALL|1|END|x", "peer", 200, false, false)
+            .unwrap();
+        idx.upsert_summary("g1", "Chat", "⚡PAYDONE|2|abc", "peer", 300, false, false)
+            .unwrap();
+
+        let s = idx.summary("g1").unwrap().unwrap();
+        // One visible unread — not three. Counting the hidden rows drifts the
+        // unread divider two real messages back up the transcript.
+        assert_eq!(s.unread_count, 1);
+        // They are still messages: count, ordering and preview are untouched.
+        assert_eq!(s.message_count, 3);
+        assert_eq!(s.latest_at_secs, 300);
     }
 }

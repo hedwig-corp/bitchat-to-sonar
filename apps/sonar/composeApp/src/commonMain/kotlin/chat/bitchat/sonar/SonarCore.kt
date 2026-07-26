@@ -46,7 +46,27 @@ data class SonarMsg(
     val uploadProgress: Float? = null,
     /// Sticker reference if this message is a sticker send.
     val stickerRef: SonarStickerRef? = null,
+    /// Content classification computed once in core. Null for locally-built
+    /// rows (mesh, optimistic echoes) that never went through the core mapper —
+    /// those still fall back to string decoding.
+    val classification: SonarMsgClass? = null,
 )
+
+/**
+ * Transcript-level classification of a message, mirrored from core
+ * (`MessageClassification` in Rust, `MessageClassInfo` over FFI).
+ *
+ * Core owns this decision so the host never re-parses `content` on the render
+ * path, and so "hidden control line" means exactly the same thing to the
+ * transcript and to the unread counter. [PayDone] and [CallControl] are
+ * protocol control lines the transcript does not render.
+ */
+sealed interface SonarMsgClass {
+    data object Text : SonarMsgClass
+    data class PayReceipt(val paymentId: String, val amountSats: Long) : SonarMsgClass
+    data class PayDone(val paymentId: String, val preimageHex: String?) : SonarMsgClass
+    data object CallControl : SonarMsgClass
+}
 
 /** Account-level direct NIP-17 DM decoded from a `bitchat1:` embedded packet. */
 data class SonarDirectDm(

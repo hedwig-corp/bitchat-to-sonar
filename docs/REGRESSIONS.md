@@ -664,6 +664,168 @@ in-flight sync uninterruptible) -> this fix.
 
 ---
 
+## R-017 — Unread accounting counts only rows the transcript renders
+
+**Invariant:** `conversation_summary.unread_count` increments only for incoming
+messages a host actually paints as a transcript row. Any event hidden from the
+transcript (⚡PAYDONE settlements, ☎CALL signaling, non-kind-9 application
+rumors) must not raise it. Corollary: **exactly one** decoder decides "hidden
+control line" — core's `MessageClassification` — and every host reads that
+verdict rather than re-parsing `content`. Two decoders means two answers, and
+the counter and the transcript then disagree on edge inputs.
+
+**Breaks as:** "opening a chat lands in the middle of the conversation and I
+have to scroll down". Also phantom unread badges on chats where nothing visible
+arrived (a missed call alone marks the chat unread).
+
+**Why:** Both hosts place the Signal-style unread divider by walking
+`unread_count` **visible** incoming rows back from the tail
+(`TranscriptDisplayPolicy.firstUnreadTranscriptIndex`,
+`SNMsgList.resolveUnreadAnchor`). Counting an invisible event has no row to
+consume, so the walk overshoots by one real message per hidden event — and when
+the budget exceeds the visible incoming rows in the loaded window, the open
+lands on the oldest one in it. Core already classifies exactly what hosts hide
+(`MessageClassification::PayDone` / `CallControl`); only the unread counter
+ignored it.
+
+The counter alone is not enough, because the hosts held a *second* decoder.
+iOS already switched on the core classification (`SonarAppStore.payMapping`),
+but Compose re-parsed the raw string in the `ChatScreen` feed filter, and the
+two disagree on edge inputs: core trims leading whitespace before classifying
+and validates the payment id, `PayLine.decode` does neither. So
+`" ⚡PAYDONE|1|abc"` rendered but did not count (divider one row short) and
+`"⚡PAYDONE|1|hello world"` counted but did not render (the original bug,
+intact). Compose now reads `SonarMsg.classification` and falls back to the
+string decode only for locally-built rows that have no core classification.
+
+**Call sites:** `client.rs::upsert_index_for_message` (the `counts_unread`
+argument of `ConversationIndex::upsert_summary`) and
+`marmot.rs::process_group_message` (kind-9 gate) in shared core; Compose
+`TranscriptDisplayPolicy.isTranscriptVisibleRow` (fed by `SonarCore.toCommon`
+on both Android and JVM), consumed by the `ChatScreen` feed filter; iOS
+`SonarAppStore.payMapping` (already classification-driven, unchanged).
+
+**Guarded by:** `client.rs::hidden_control_lines_do_not_count_as_unread_at_the_index_call_site`
+
+**Also guarded by:** `conversation_index.rs::host_hidden_messages_do_not_increment_unread`, `marmot.rs::only_host_rendered_classes_are_transcript_visible`, `conversation_index.rs::mine_messages_do_not_increment_unread`, `TranscriptDisplayPolicyTest.coreClassificationWinsOverTheLocalStringDecode`, `TranscriptDisplayPolicyTest.coreClassificationDecidesVisibilityForCoreRows`, `TranscriptDisplayPolicyTest.rowsWithoutCoreClassificationKeepTheStringDecode`
+
+**Enforced by the compiler:** `counts_unread` has **no default** on
+`upsert_summary`; a new call site cannot silently fall back to counting
+everything.
+
+**Not guarded:** the host walk itself against a real core count (needs a
+constructible `SonarAppState` / `SonarAppStore` — see Unguarded), and the
+residual case where a legitimately large unread budget exceeds the loaded
+window, which still anchors on the oldest visible incoming row. Existing
+inflated counts on installed devices self-heal on the next chat open, since
+`mark_read` zeroes the counter; nothing tests that migration. The Kotlin tests
+pin the pure policy function, not that `ChatScreen` passes the real rows
+through it, and the two `MessageInfo.toCommon` mappers (androidMain / jvmMain)
+are duplicated by hand — a classification dropped from one of them is a
+compile-clean regression on that platform only.
+
+**Platform gap:** the fallback path still runs two decoders for rows with no
+core classification (mesh, optimistic echoes). Those never reach the
+conversation index, so they cannot drift the counter — but a mesh ⚡PAYDONE and
+a Marmot one are still judged by different code. Desktop is additionally
+blind to ☎CALL there: `SonarCore.jvm.kt::callParseControl` returns `null`
+unconditionally, so only the classification path hides call control on JVM
+(pre-existing, now partly fixed for core rows).
+
+**History:** #303 introduced the unread-anchored open; the counter it consumes
+had been "every non-mine message" since the conversation index landed, so the
+disagreement shipped with the feature and surfaces only in chats carrying
+calls/payments. Layout-side mid-history opens are R-009 — a different mechanism
+with the same symptom, which is why both need reading before touching open
+behaviour.
+
+**Rejected:**
+- *Filtering control lines host-side before counting.* The hosts do not have the
+  hidden rows to subtract — they were never fetched into the window — and it
+  would have to be written twice, the exact shape of the cross-platform drift
+  this ledger tracks.
+- *Teaching `PayLine.decode` to trim and validate ids like core does.* Closes
+  today's two divergent inputs by duplicating the validation rules in Kotlin, so
+  the next change to either decoder re-opens the gap. Reading the classification
+  deletes the second decoder for core rows instead.
+- *Also suppressing `latest_content` / `latest_at_secs` for control lines.* A
+  call or settlement is a real conversation event; keeping chat-list recency
+  intact is deliberate, and changing ordering is a separate product call.
+- *Dropping non-kind-9 rumors at the index instead of at `process_incoming`.*
+  They would still ring a notification for a row no host can render.
+
+## R-018 — An unreadable local store must never paint as an empty conversation
+
+**Invariant:** A local transcript read that returns nothing is only painted when
+the store was actually readable. "Core is not readable yet" and "this
+conversation has no messages" must not reach the UI as the same answer, and an
+empty window must never be cached as a conversation's contents.
+
+**Breaks as:** Opening a chat shows a black transcript — header, verified
+banner and composer, no rows — and the messages appear seconds later when an
+unrelated sync event repaints. Typing works throughout, which is what makes it
+read as a rendering bug rather than a loading one.
+
+**Why:** `SonarCore.messagesCursorPage` / `messagesPage` answered `emptyList()`
+when `node` was null (still booting after a cold launch, or being replaced),
+which is indistinguishable from a genuinely empty conversation. The transcript
+committed that as the page, and `refreshTranscriptGroupWindow` then *cached* the
+empty window — after which `current != null` short-circuited every later refresh
+and the chat stayed blank until something else published rows. The `!started`
+fallback did not cover it, because `started` is true well before every read path
+has a node.
+
+**Call sites:** Compose `SonarCore.android.kt` / `SonarCore.jvm.kt`
+(`messagesPage` / `messagesCursorPage` now `requireNode()`);
+`TranscriptDisplayPolicy.transcriptReadIsUntrusted` consumed by
+`SonarAppState.refreshTranscriptGroupWindow`;
+`SonarAppState.scheduleBlankTranscriptRecovery` wired into `openChat`, `openDm`
+and `restoreTranscriptSession`. iOS: not implemented — see platform gap.
+
+**Guarded by:** `TranscriptDisplayPolicyTest.emptyReadIsUntrustedWhenLocalMetadataKnowsMessages`
+
+**Also guarded by:** `TranscriptDisplayPolicyTest.blankRecoveryRunsWhenEmptinessCannotBeProven`, `TranscriptDisplayPolicyTest.blankRecoverySkipsAConversationProvenEmpty`
+
+**Coverage (honest):** the cited tests pin the pure trust decision (including
+that a genuinely empty conversation stays paintable, or a new chat would hold a
+stale window forever) and the recovery gate. They do **not** pin that
+`refreshTranscriptGroupWindow` consults the first, that the empty window is no
+longer cached, that the read APIs throw instead of returning empty, that mesh
+recovery resolves through `localTranscriptRowsForChat`, or the retry loop itself
+— all of which need a constructible `SonarAppState` (see Unguarded). The
+recovery budget (8 s, 100 ms → 800 ms backoff) is a judgement call, not a
+measured one.
+
+**Two ways the recovery can miss, both deliberate:** its read must resolve the
+conversation's real sources (a mesh route id is not a Marmot group id — hand it
+to a group-page read and every retry answers "no messages"), and its gate must
+not treat "we cannot tell yet" as "genuinely empty" (the mesh snapshot is keyed
+by group id, so a cold-launch mesh route knows of no history until `chats` /
+`npubRawFor` resolve). Both were live in the first cut of this fix.
+
+**Platform gap:** iOS is untouched and has the same class of hole — the
+cold-launch first-open hydrate can show blank there too (noted while landing
+#303). The Apple read path needs the same "unreadable ≠ empty" distinction; not
+implemented here because this fix is Compose/Android-side, and the report was an
+Android device.
+
+**History:** Reported with screenshots: chat open on a black transcript, rows
+appearing "after a while". Distinct from R-017 (which mis-*places* the divider
+on a populated transcript) and from R-009 (which mis-*scrolls* one) — all three
+surface to the user as "the chat opened wrong", which is why the first two fixes
+did not touch this path.
+
+**Rejected:**
+- *Waiting for a readable store before `push`.* Keeps the user on Home with a
+  dead tap; the Signal-Comparable Performance Rule wants the chat open
+  immediately, painting whatever local state exists.
+- *Letting the next sync/poll repaint it.* That is exactly today's behaviour and
+  what produced the reported delay — it ties first paint to a network-driven
+  event.
+- *Returning `emptyList()` but flagging a boolean alongside it.* Every caller
+  would have to remember to check the flag; throwing routes through the
+  `runCatching { … }.getOrNull()` both call sites already have.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
