@@ -9071,6 +9071,25 @@ class SonarAppState(private val scope: CoroutineScope) {
         localLatestTs(chatId) > 0L || transcriptGroupIds(chatId).any { localLatestTs(it) > 0L }
 
     /**
+     * The same local rows the open path would read for [chatId].
+     *
+     * A mesh conversation's id is a route id (`mesh:<peerId>`), not a Marmot
+     * group id, so it cannot be handed to [marmotMessagesPageForChat] — that
+     * would query a group that does not exist and answer "no messages" forever.
+     * Mirror `openDm`: merge the BLE window with the folded White Noise leg.
+     */
+    private suspend fun localTranscriptRowsForChat(
+        chatId: String,
+        generation: Long,
+    ): List<SonarMsg> {
+        if (!isMeshChat(chatId)) return marmotMessagesPageForChat(chatId, generation)
+        val peerId = canonicalMeshPeerId(meshPeerId(chatId))
+        val mesh = refreshMeshTranscriptWindow(peerId)
+        val wn = marmotMessagesForPeer(peerId, chatId, generation)
+        return refreshConversationRows(mesh + wn, chatId, generation)
+    }
+
+    /**
      * Re-read local storage for a transcript that opened blank on a conversation
      * we know has messages.
      *
@@ -9080,9 +9099,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      * an unrelated sync event happens to repaint it — the reported "black screen,
      * then the bubbles appear after a while".
      *
-     * Bounded and local-only by construction: it re-reads the same local page
-     * the open used, never touches relay/sync, and stops at the first non-empty
-     * read, on session change, or after [BLANK_TRANSCRIPT_RETRY_BUDGET_MS].
+     * Bounded and local-only by construction: it re-reads the same local rows
+     * the open used ([localTranscriptRowsForChat], so mesh conversations resolve
+     * their own sources), never touches relay/sync, and stops at the first
+     * non-empty read, on session change, or after
+     * [BLANK_TRANSCRIPT_RETRY_BUDGET_MS].
      */
     private fun scheduleBlankTranscriptRecovery(chatId: String, generation: Long) {
         if (!transcriptKnownNonEmpty(chatId)) return
@@ -9098,7 +9119,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (messages.isNotEmpty()) return@launch
                 val local = withSendEchoes(
                     chatId,
-                    mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, generation)),
+                    mergePendingMediaUploads(chatId, localTranscriptRowsForChat(chatId, generation)),
                 )
                 val visible = visibleMessagesForChat(chatId, local)
                 if (visible.isEmpty()) continue

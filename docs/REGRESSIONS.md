@@ -754,7 +754,7 @@ behaviour.
 - *Dropping non-kind-9 rumors at the index instead of at `process_incoming`.*
   They would still ring a notification for a row no host can render.
 
-## R-015 — An unreadable local store must never paint as an empty conversation
+## R-018 — An unreadable local store must never paint as an empty conversation
 
 **Invariant:** A local transcript read that returns nothing is only painted when
 the store was actually readable. "Core is not readable yet" and "this
@@ -799,7 +799,7 @@ implemented here because this fix is Compose/Android-side, and the report was an
 Android device.
 
 **History:** Reported with screenshots: chat open on a black transcript, rows
-appearing "after a while". Distinct from R-014 (which mis-*places* the divider
+appearing "after a while". Distinct from R-017 (which mis-*places* the divider
 on a populated transcript) and from R-009 (which mis-*scrolls* one) — all three
 surface to the user as "the chat opened wrong", which is why the first two fixes
 did not touch this path.
