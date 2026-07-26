@@ -84,10 +84,21 @@ report:
    hides the payment affordance on every cold start until a relay round-trip
    lands. Persist them and hydrate at init so payments paint from local state
    first (Signal-Comparable Performance Rule). Compose:
-   `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both are
-   account-scoped: wipe/identity replacement clears them, and a fetch started
-   under the previous identity is dropped by a generation guard rather than
-   persisted into the new account.
+   `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both cap
+   the persisted set at 1024, keeping the freshest by published-at with the npub
+   as tiebreak, so the blob stays bounded and re-encodes byte-identically.
+3. **Clear on identity death, not on "erase all chats".** Descriptors belong to
+   the *account*, so only a panic wipe or an identity replacement may drop them
+   (iOS `clearAccountContactDescriptors`, called from `wipeDatabase` and
+   `prepareForIdentityReplacement` — deliberately NOT from
+   `eraseChatsKeepIdentity`; Compose clears in `wipe()` / `restoreAccount()`,
+   deliberately NOT in `eraseAllChats()`). Erasing chats keeps the identity, so
+   wiping the cache there would strip the payment affordance from every pure
+   White Noise contact until a relay fetch succeeds — re-creating invariant 1's
+   bug through a different door. A fetch started under the previous identity is
+   dropped by a generation guard, captured at schedule time rather than at fetch
+   start, so a wipe landing mid-flight cannot persist the old account's contacts
+   into the new one.
 
 ## Chat UX
 

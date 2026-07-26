@@ -4100,6 +4100,7 @@ final class MarmotChatModel: ObservableObject {
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
         clearIdentityScopedState()
+        clearAccountContactDescriptors()
         do {
             try await service.wipeDatabase()
         } catch {
@@ -4117,6 +4118,7 @@ final class MarmotChatModel: ObservableObject {
         stopPolling()
         invalidateGapRecovery()
         clearIdentityScopedState()
+        clearAccountContactDescriptors()
         try await wipeDatabase()
     }
 
@@ -4152,13 +4154,6 @@ final class MarmotChatModel: ObservableObject {
         profilesByNpub = [:]
         profileFetches = []
         profileFetchedAt = [:]
-        // Descriptors are account-scoped contact metadata (peer BOLT12 offers) —
-        // they must not survive an identity wipe/replacement.
-        sonarDescriptorsByNpub = [:]
-        sonarDescriptorMissesByNpub = [:]
-        sonarDescriptorFetchedAtByNpub = [:]
-        descriptorFetches = []
-        descriptorCacheGeneration &+= 1
         // Invalidate any in-flight syncForce slot so a post-wipe wake cannot
         // join the previous identity's FETCH_TIMEOUT park.
         gapRecoveryGeneration &+= 1
@@ -4171,8 +4166,24 @@ final class MarmotChatModel: ObservableObject {
         refreshTask = nil
         clearStickerCaches()
         SNMarmotProfileCache.clear(from: defaults)
-        SNMarmotDescriptorCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
+    }
+
+    /// Drop every peer descriptor (their BOLT12 offers and call routes) plus the
+    /// durable cache.
+    ///
+    /// Identity-replacement ONLY. `eraseChatsKeepIdentity()` must not call this:
+    /// the account survives that flow, so wiping descriptors would strip a pure
+    /// White Noise contact's payment affordance until a relay fetch succeeds.
+    /// Compose `eraseAllChats()` retains `sonarDescriptorsByNpubHex` for the
+    /// same reason.
+    private func clearAccountContactDescriptors() {
+        sonarDescriptorsByNpub = [:]
+        sonarDescriptorMissesByNpub = [:]
+        sonarDescriptorFetchedAtByNpub = [:]
+        descriptorFetches = []
+        descriptorCacheGeneration &+= 1
+        SNMarmotDescriptorCache.clear(from: defaults)
     }
 
     /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the

@@ -85,6 +85,28 @@ struct MarmotDescriptorCacheTests {
         #expect(loaded["npub1vincent"]?.supportsDirectPayments == true)
     }
 
+    /// Identity replacement must drop the previous account's peer descriptors —
+    /// they are that account's contacts, and the cache is durable now.
+    ///
+    /// Uses `prepareForIdentityReplacement`'s injected wipe closure, the seam
+    /// the model already exposes for exactly this kind of ordering test.
+    @MainActor
+    @Test
+    func identityReplacementDropsPeerDescriptorsAndTheirCache() async throws {
+        let suiteName = "MarmotDescriptorCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let model = MarmotChatModel(defaults: defaults)
+        model.sonarDescriptorsByNpub = ["npub1vincent": descriptor()]
+        SNMarmotDescriptorCache.save(model.sonarDescriptorsByNpub, to: defaults)
+
+        try await model.prepareForIdentityReplacement(wipeDatabase: {})
+
+        #expect(model.sonarDescriptorsByNpub.isEmpty)
+        #expect(SNMarmotDescriptorCache.load(from: defaults).isEmpty)
+    }
+
     @Test
     func clearRemovesEveryPersistedDescriptor() {
         let suiteName = "MarmotDescriptorCacheTests-\(UUID().uuidString)"
