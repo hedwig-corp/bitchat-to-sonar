@@ -98,6 +98,45 @@ enum SonarNSEDecoratePolicy {
     /// userInfo marker: still the privacy placeholder (host may wipe).
     static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
 
+    /// App Group mirror key for the per-chat mute map (written by
+    /// `SonarChatMuteStore` as write-through; JSON-encoded `[String: Date]`).
+    static let mutesUserDefaultsKey = "sonar.chat.mutes.v1"
+
+    /// Mirror of `SonarChatMuteStore.normalizedCandidates` — the store lives
+    /// in a SwiftUI file the appex does not compile, so the key shapes must
+    /// match (raw key, `marmot:` prefix stripped/added, 16-hex short form).
+    static func mutedLookupCandidates(groupIdHex: String, senderNpub: String) -> [String] {
+        var keys: [String] = []
+        for raw in [groupIdHex, senderNpub] where !raw.isEmpty {
+            keys.append(raw)
+            if raw.hasPrefix("marmot:") {
+                keys.append(String(raw.dropFirst("marmot:".count)))
+            } else if raw.count == 64, raw.allSatisfy(\.isHexDigit) {
+                keys.append(String(raw.prefix(16)))
+                keys.append("marmot:" + raw)
+            }
+        }
+        return keys
+    }
+
+    /// Pure per-chat mute check over the App Group mirror. Expired entries
+    /// read as unmuted (lazy removal stays the store's job). Missing or
+    /// undecodable mirror data reads as unmuted — mute must fail open, never
+    /// suppress a wanted banner.
+    static func isMuted(
+        groupIdHex: String,
+        senderNpub: String,
+        mutesJSON: Data?,
+        now: Date
+    ) -> Bool {
+        guard let mutesJSON,
+              let map = try? JSONDecoder().decode([String: Date].self, from: mutesJSON) else {
+            return false
+        }
+        return mutedLookupCandidates(groupIdHex: groupIdHex, senderNpub: senderNpub)
+            .contains { key in (map[key] ?? .distantPast) > now }
+    }
+
     /// Pure `⚡TRILL|1|<id>` check mirroring core `parse_trill_line` —
     /// version-locked, no trailing fields, hex-or-dash id (1-64 chars).
     static func isTrillLine(_ content: String) -> Bool {

@@ -5,6 +5,7 @@
 // Pins NSE decorate privacy + expire invariants (production readiness for #381).
 //
 
+import Foundation
 import Testing
 @testable import Sonar
 
@@ -250,6 +251,40 @@ struct SonarNSEDecoratePolicyTests {
             prefs: .init(showNames: true, showPreview: true)
         )
         #expect(!plain.isTrill)
+    }
+
+    @Test("NSE mute check reads the App Group mirror shapes and honors expiry")
+    func nseMuteCheck() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let gid = String(repeating: "ab", count: 32) // 64-hex group id
+        let active = now.addingTimeInterval(3600)
+        // marmot:-prefixed store key matches a bare 64-hex group id.
+        let byGroup = try JSONEncoder().encode(["marmot:" + gid: active])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: "npub1x", mutesJSON: byGroup, now: now
+        ))
+        // 16-hex short-form store key matches too.
+        let byShortForm = try JSONEncoder().encode([String(gid.prefix(16)): active])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: "", mutesJSON: byShortForm, now: now
+        ))
+        // Sender-keyed mutes (DM drain rows carry no group) match by npub.
+        let bySender = try JSONEncoder().encode(["npub1x": active])
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: "", senderNpub: "npub1x", mutesJSON: bySender, now: now
+        ))
+        // Expired reads as unmuted.
+        let expired = try JSONEncoder().encode(["marmot:" + gid: now.addingTimeInterval(-1)])
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: "", mutesJSON: expired, now: now
+        ))
+        // Missing or undecodable mirror fails open (unmuted).
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: "", mutesJSON: nil, now: now
+        ))
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: "", mutesJSON: Data("junk".utf8), now: now
+        ))
     }
 
     @Test("malformed trill lines are not treated as trills")

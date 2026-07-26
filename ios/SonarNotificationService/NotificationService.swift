@@ -171,9 +171,30 @@ class NotificationService: SDKNotificationService {
                     finish(with: content)
                     return
                 }
+                // Per-chat mute (App Group mirror of SonarChatMuteStore):
+                // muted rows stay row-only — no banner, no sound — matching
+                // the silence table in docs/SONAR-TRILL.md.
+                let mutesJSON = UserDefaults(suiteName: Self.appGroupId)?
+                    .data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
+                let unmuted = notifications.filter {
+                    !SonarNSEDecoratePolicy.isMuted(
+                        groupIdHex: $0.groupIdHex,
+                        senderNpub: $0.senderNpub,
+                        mutesJSON: mutesJSON,
+                        now: Date()
+                    )
+                }
+                if unmuted.isEmpty {
+                    os_log("NSE: all drained notifications muted — suppressing banner",
+                           log: Self.log, type: .info)
+                    Self.recordDiagnostic("suppressed:muted count=\(notifications.count)")
+                    Self.suppressTransponderNotification(content)
+                    finish(with: content)
+                    return
+                }
                 let prefs = Self.notificationPrefs()
                 // Drain is oldest-first (sync queue + live append). Banner the tip.
-                let ordered = Array(notifications.reversed())
+                let ordered = Array(unmuted.reversed())
                 let primary = ordered[0]
                 Self.apply(
                     notification: primary,

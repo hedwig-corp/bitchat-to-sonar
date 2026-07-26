@@ -155,6 +155,7 @@ final class SonarTrillThrottle {
 final class SonarChatMuteStore: ObservableObject {
     static let shared = SonarChatMuteStore()
     static let defaultsKey = "sonar.chat.mutes.v1"
+    static let appGroupId = "group.sh.hedwig.sonar"
 
     @Published private(set) var mutedUntil: [String: Date]
 
@@ -170,6 +171,9 @@ final class SonarChatMuteStore: ObservableObject {
         } else {
             mutedUntil = [:]
         }
+        // Mirror on init so mutes recorded before the mirror existed become
+        // visible to the NSE without waiting for the next mute/unmute.
+        mirrorToAppGroup()
     }
 
     /// Equivalent lookup keys for one raw conversation key, so the check
@@ -249,11 +253,32 @@ final class SonarChatMuteStore: ObservableObject {
     func wipe() {
         mutedUntil = [:]
         defaults.removeObject(forKey: key)
+        if mirrorsToAppGroup {
+            UserDefaults(suiteName: SonarChatMuteStore.appGroupId)?
+                .removeObject(forKey: key)
+        }
     }
 
     private func persist() {
         if let data = try? JSONEncoder().encode(mutedUntil) {
             defaults.set(data, forKey: key)
+        }
+        mirrorToAppGroup()
+    }
+
+    /// Only the real store mirrors — test instances with injected defaults
+    /// must never write into the shared container.
+    private var mirrorsToAppGroup: Bool { defaults === UserDefaults.standard }
+
+    /// Write-through mirror for the NSE. `.standard` stays the source of
+    /// truth (no migration risk); the App Group copy is read-only for the
+    /// appex so a muted chat's killed-app push can be silenced
+    /// (SonarNSEDecoratePolicy.isMuted).
+    private func mirrorToAppGroup() {
+        guard mirrorsToAppGroup,
+              let shared = UserDefaults(suiteName: SonarChatMuteStore.appGroupId) else { return }
+        if let data = try? JSONEncoder().encode(mutedUntil) {
+            shared.set(data, forKey: key)
         }
     }
 }
