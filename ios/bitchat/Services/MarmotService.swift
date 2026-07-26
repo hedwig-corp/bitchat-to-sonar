@@ -514,6 +514,21 @@ final class MarmotService: @unchecked Sendable {
             }
             service.setIdentity(identity)
             service.nodeLock.lock()
+            // Same atomic fence as the relay install path: `connectLocal`
+            // checked `nodeClosing` before opening, but `SonarNode.connect`
+            // opens SQLCipher in between, and a close/wipe can fence during
+            // that window. Installing anyway hands the fresh node to
+            // `setSonarNode`, whose push registration retains the handle after
+            // the close releases `storeLock` — the NSE-overlap hazard, not just
+            // a background kill. Dropping `node` on the bail path closes the
+            // handle; the store lock hold has to be abandoned explicitly.
+            guard !service.nodeClosing else {
+                service.nodeLock.unlock()
+                #if os(iOS)
+                service.abandonStoreLockHold(storeLockHold)
+                #endif
+                throw ServiceError.cancelled
+            }
             service.node = node
             service.relayConnected = false
             #if os(iOS)

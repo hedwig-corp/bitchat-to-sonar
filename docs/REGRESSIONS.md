@@ -551,6 +551,15 @@ SQLCipher handle outlives the close. The install closure in `connect` therefore
 checks `nodeClosing` (not just `sessionGeneration`), and the close hop also
 interrupts the node it actually removes as defence in depth.
 
+**Both install paths need the fence, not just the relay one.** `connect()`
+(relay) and `connectLocal()` (local-only, Signal-style first paint) each assign
+`service.node` and each hand it to `SonarPushRegistration.setSonarNode`.
+`connectLocal` checked `nodeClosing` only *before* opening, and `SonarNode.connect`
+opens SQLCipher in between — wide enough for a close to fence. Fixing only the
+relay path left the same hazard reachable through local connect. There are
+exactly two `service.node =` install sites and exactly two `setSonarNode` calls;
+if a third appears it needs the same treatment.
+
 **The fence check and the node assignment must be one `nodeLock` hold.** The
 first attempt at this checked `nodeClosing`, released the lock, then reacquired
 it to assign — and `interruptNodeForSuspend()` fits in that gap: it sets
