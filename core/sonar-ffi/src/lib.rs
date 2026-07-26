@@ -769,9 +769,13 @@ impl SonarNode {
     /// relay-connect republish path, where the per-relay OK wait must not
     /// delay the first message drain. Failures are logged in core and
     /// self-heal on the next relay connect (replaceable event).
+    /// Suspendable: runs automatically on relay connect. A KeyPackage is a
+    /// replaceable event, so an aborted publish self-heals on the next connect.
     pub fn publish_key_package_background(&self) -> FfiResult<()> {
-        self.runtime
-            .block_on(self.client.publish_key_package_background())?;
+        self.block_on_suspendable(
+            "publish_key_package_background",
+            self.client.publish_key_package_background(),
+        )?;
         Ok(())
     }
 
@@ -1210,8 +1214,15 @@ impl SonarNode {
     /// Reload the durable outbox sidecar and retry pending sends. Hosts call this
     /// after replacing a local-only node with a relay-backed node so sends created
     /// during relay connect are not stranded until app restart.
+    /// Suspendable: runs automatically after relay connect and from the idle
+    /// path, both on the host's serial work queue. Aborting only leaves entries
+    /// in the durable outbox, which is precisely what it exists for — they
+    /// republish on the next connect.
     pub fn retry_outbox(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.reload_outbox_and_retry());
+        self.block_on_suspendable("retry_outbox", async {
+            self.client.reload_outbox_and_retry().await;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -1241,8 +1252,13 @@ impl SonarNode {
     /// after relay disconnects. Hosts call this on the idle timeout path
     /// instead of `sync_once()`. It may run one bounded per-chat repair fetch,
     /// so hosts must keep it off the local-first chat-open path.
+    /// Suspendable: this is the idle-timeout path, so it is the call most
+    /// likely to be parked on the host's serial work queue exactly when the app
+    /// backgrounds — and it can await subscription setup plus a bounded repair
+    /// fetch, which is long enough to push the store close past the ~30s
+    /// suspension deadline (0xdead10cc). Re-runs on the next idle tick.
     pub fn ensure_subscriptions(&self) -> FfiResult<()> {
-        self.runtime.block_on(self.client.ensure_subscriptions())?;
+        self.block_on_suspendable("ensure_subscriptions", self.client.ensure_subscriptions())?;
         Ok(())
     }
 
@@ -3294,22 +3310,46 @@ mod tests {
         let node = local_test_node(vec![]);
         node.interrupt_for_suspend();
         let started = std::time::Instant::now();
-        let err = node.sync_once().expect_err("interrupted sync must fail");
-        assert!(
-            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
-            "unexpected error: {err}"
-        );
-        let err = node
-            .register_push_token(
-                "apns".into(),
-                vec![0u8; 32],
-                SonarIdentity::generate().npub(),
-            )
-            .expect_err("interrupted registration must fail");
-        assert!(
-            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
-            "unexpected error: {err}"
-        );
+
+        // Every entry point the host can have parked on its serial work queue
+        // when the app backgrounds. `ensure_subscriptions` is the idle-timeout
+        // path and was missed by the first cut of this fix — it awaits
+        // subscription setup plus a bounded repair fetch, which is long enough
+        // on its own to push the store close past the suspension deadline.
+        let registration_npub = SonarIdentity::generate().npub();
+        let calls: Vec<(&str, Box<dyn Fn() -> FfiResult<()> + '_>)> = vec![
+            ("sync_once", Box::new(|| node.sync_once())),
+            ("sync_force", Box::new(|| node.sync_force())),
+            (
+                "ensure_subscriptions",
+                Box::new(|| node.ensure_subscriptions()),
+            ),
+            ("retry_outbox", Box::new(|| node.retry_outbox())),
+            (
+                "publish_key_package_background",
+                Box::new(|| node.publish_key_package_background()),
+            ),
+            (
+                "register_push_token",
+                Box::new(|| {
+                    node.register_push_token(
+                        "apns".into(),
+                        vec![0u8; 32],
+                        registration_npub.clone(),
+                    )
+                }),
+            ),
+        ];
+
+        for (name, call) in &calls {
+            let err = call()
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail when interrupted"));
+            assert!(
+                err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+                "{name}: unexpected error: {err}"
+            );
+        }
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "interrupted relay calls must not park ({}s)",

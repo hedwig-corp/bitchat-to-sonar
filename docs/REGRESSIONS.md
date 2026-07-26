@@ -481,12 +481,25 @@ of #312.
 
 ## R-016 — A suspend-interrupted node aborts blocking relay FFI instead of parking
 
-**Invariant:** After `SonarNode.interrupt_for_suspend()`, the interruptible
-relay calls (`sync_once`, `sync_force`, `register_push_token`,
-`fetch_profile`, `fetch_sonar_descriptor`) return an "interrupted for suspend"
-error promptly — both when the latch was already set and when the call is
-already parked mid-wait — instead of blocking for the remainder of their relay
-timeouts.
+**Invariant:** After `SonarNode.interrupt_for_suspend()`, every relay call that
+the host can have parked on its serial work queue returns an "interrupted for
+suspend" error promptly — both when the latch was already set and when the call
+is already parked mid-wait — instead of blocking for the remainder of its relay
+timeouts. And a close must **fence** node installation before it latches, so a
+connect that finished a moment earlier cannot install an un-latched node behind
+it.
+
+**Which calls, and why that boundary:** suspendable = runs automatically
+(no user waiting on it) and self-heals on the next connect — `sync_once`,
+`sync_force`, `ensure_subscriptions`, `retry_outbox`,
+`publish_key_package_background`, `register_push_token`, `fetch_profile`,
+`fetch_sonar_descriptor`. Deliberately **not** suspendable: user-initiated MLS
+mutations (`send_text`, invite accept/decline, group create/leave, `start_dm`).
+Those have a user waiting on the result, and aborting them would surface as
+lost work rather than as a deferred retry. `ensure_subscriptions` is the one
+that matters most in practice and was missed by the first cut of this fix — it
+is the *idle-timeout* path, so it is the call most likely to be in flight when
+the app backgrounds with nobody touching the screen.
 
 **Breaks as:** `RUNNINGBOARD 0xdead10cc` TestFlight crashes: iOS suspends the
 process while the SQLCipher store in the App Group container is still open,
@@ -524,9 +537,24 @@ no-await-under-`mls_write` invariant is ever broken, this entry breaks with it.
 The status quo it replaces is a `SIGKILL` at an arbitrary instruction, which is
 strictly worse than a drop at an await point.
 
+**The fence is part of the invariant, not a detail.** `interruptNodeForSuspend()`
+sets `nodeClosing` and snapshots the node under **one** `nodeLock` hold, and it
+must do so *before* the caller's `workQueue` hop — not inside it. `workQueue` is
+FIFO, so a relay connect that already enqueued its install closure runs *first*,
+ahead of the close hop that bumps `sessionGeneration`; the install's generation
+check therefore still passes. Installing there publishes a brand-new,
+un-latched node to `SonarPushRegistration.setSonarNode`, which kicks a blocking
+`registerPushToken` on the global utility queue holding a strong `SonarNode`
+**outside** `nodeLifecycleGroup` — so the close cannot wait for it, and the
+SQLCipher handle outlives the close. The install closure in `connect` therefore
+checks `nodeClosing` (not just `sessionGeneration`), and the close hop also
+interrupts the node it actually removes as defence in depth. Found by review on
+PR #449, not by a test — there is no seam to drive that FIFO race.
+
 **Call sites:** iOS `MarmotService.swift::closeNode(keepClosed:)` and
-`MarmotService.swift::wipeDatabase()` (both via `interruptNodeForSuspend()`);
-core `sonar-ffi/src/lib.rs::block_on_suspendable`. Compose: not applicable —
+`MarmotService.swift::wipeDatabase()` (both via `interruptNodeForSuspend()`),
+plus the `nodeClosing` guard in the `connect` install closure; core
+`sonar-ffi/src/lib.rs::block_on_suspendable`. Compose: not applicable —
 Android has no RunningBoard shared-container file-lock kill; nothing calls
 `interruptForSuspend` there (the binding exists but is inert).
 
@@ -550,9 +578,11 @@ assert against it rather than a duplicated literal.
 **Guarded by:** `lib.rs::interrupted_node_fails_sync_fast_instead_of_parking`, `lib.rs::interrupt_aborts_in_flight_suspendable_wait`
 
 **Not guarded:** the Swift half — that `closeNode()` actually fires the
-interrupt before its queue hop — is unpinned (iOS tests do not run in CI, and
-`MarmotService`'s node/queue internals are private). Verification remains a
-TestFlight build surviving backgrounding mid-sync. Nothing mechanically
+interrupt before its queue hop, and that the install closure honours the fence —
+is unpinned (iOS tests do not run in CI, and `MarmotService`'s node/queue
+internals are private). The install/close FIFO race in particular has no test
+seam at all: it needs two `workQueue` hops interleaved at a specific point.
+Verification remains a TestFlight build surviving backgrounding mid-sync. Nothing mechanically
 enforces the no-await-under-`mls_write` invariant the drop-safety argument
 above depends on; it is a comment and a code shape, so a future `await` added
 inside that lock would silently invalidate this entry.

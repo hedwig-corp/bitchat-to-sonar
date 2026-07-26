@@ -1561,6 +1561,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
+     * Suspendable: this is the idle-timeout path, so it is the call most
+     * likely to be parked on the host's serial work queue exactly when the app
+     * backgrounds — and it can await subscription setup plus a bounded repair
+     * fetch, which is long enough to push the store close past the ~30s
+     * suspension deadline (0xdead10cc). Re-runs on the next idle tick.
      */
     func ensureSubscriptions() throws
 
@@ -1693,6 +1698,8 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * relay-connect republish path, where the per-relay OK wait must not
      * delay the first message drain. Failures are logged in core and
      * self-heal on the next relay connect (replaceable event).
+     * Suspendable: runs automatically on relay connect. A KeyPackage is a
+     * replaceable event, so an aborted publish self-heals on the next connect.
      */
     func publishKeyPackageBackground() throws
 
@@ -1768,6 +1775,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
+     * Suspendable: runs automatically after relay connect and from the idle
+     * path, both on the host's serial work queue. Aborting only leaves entries
+     * in the durable outbox, which is precisely what it exists for — they
+     * republish on the next connect.
      */
     func retryOutbox() throws
 
@@ -2305,6 +2316,11 @@ open func drainPendingMarmot()throws  -> [DrainNotificationInfo]  {
      * after relay disconnects. Hosts call this on the idle timeout path
      * instead of `sync_once()`. It may run one bounded per-chat repair fetch,
      * so hosts must keep it off the local-first chat-open path.
+     * Suspendable: this is the idle-timeout path, so it is the call most
+     * likely to be parked on the host's serial work queue exactly when the app
+     * backgrounds — and it can await subscription setup plus a bounded repair
+     * fetch, which is long enough to push the store close past the ~30s
+     * suspension deadline (0xdead10cc). Re-runs on the next idle tick.
      */
 open func ensureSubscriptions()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_ensure_subscriptions(
@@ -2605,6 +2621,8 @@ open func publishKeyPackage()throws   {try rustCallWithError(FfiConverterTypeSon
      * relay-connect republish path, where the per-relay OK wait must not
      * delay the first message drain. Failures are logged in core and
      * self-heal on the next relay connect (replaceable event).
+     * Suspendable: runs automatically on relay connect. A KeyPackage is a
+     * replaceable event, so an aborted publish self-heals on the next connect.
      */
 open func publishKeyPackageBackground()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_key_package_background(
@@ -2765,6 +2783,10 @@ open func retryMessage(messageIdHex: String)throws  -> String  {
      * Reload the durable outbox sidecar and retry pending sends. Hosts call this
      * after replacing a local-only node with a relay-backed node so sends created
      * during relay connect are not stranded until app restart.
+     * Suspendable: runs automatically after relay connect and from the idle
+     * path, both on the host's serial work queue. Aborting only leaves entries
+     * in the durable outbox, which is precisely what it exists for — they
+     * republish on the next connect.
      */
 open func retryOutbox()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_retry_outbox(
@@ -8337,7 +8359,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_drain_pending_marmot() != 2299) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 49920) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_ensure_subscriptions() != 56161) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_fetch_installed_packs() != 62453) {
@@ -8409,7 +8431,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package() != 48211) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 41112) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_key_package_background() != 14586) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile() != 42572) {
@@ -8445,7 +8467,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_message() != 18819) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 58495) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_retry_outbox() != 21048) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_send_direct_dm() != 11322) {
