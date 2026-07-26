@@ -399,3 +399,33 @@ private fun isGraphemeExtension(codePoint: Int): Boolean =
         codePoint in 0x1F3FB..0x1F3FF ||
         codePoint in 0xE0100..0xE01EF ||
         codePoint == 0x20E3
+
+/**
+ * Whether a row belongs in the rendered transcript.
+ *
+ * Core rows carry a [SonarMsgClass] computed once in core; that decision is
+ * authoritative, because the same classification decides whether the message
+ * counts toward `unread_count`. Re-deriving visibility from the raw string here
+ * let the two disagree — e.g. core trims leading whitespace before classifying
+ * and validates the payment id, while [PayLine.decode] does neither — and every
+ * disagreement either drops a visible row from the unread budget or leaves a
+ * hidden one inside it, drifting the unread divider off the right message.
+ *
+ * Locally-built rows (mesh, optimistic echoes) have no core classification, so
+ * they keep the string decode. [isCallControl] is injected because parsing a
+ * ☎CALL line is an FFI call the pure policy layer must not make itself.
+ */
+internal fun isTranscriptVisibleRow(
+    msg: SonarMsg,
+    isCallControl: (String) -> Boolean,
+): Boolean {
+    msg.classification?.let { klass ->
+        return when (klass) {
+            is SonarMsgClass.PayDone, is SonarMsgClass.CallControl -> false
+            is SonarMsgClass.Text, is SonarMsgClass.PayReceipt -> true
+        }
+    }
+    val pay = PayLine.decode(msg.content)
+    if (pay != null && pay !is PayLine.Pay) return false
+    return !isCallControl(msg.content)
+}

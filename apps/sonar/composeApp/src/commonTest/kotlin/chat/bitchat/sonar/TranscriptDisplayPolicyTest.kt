@@ -643,4 +643,85 @@ class TranscriptDisplayPolicyTest {
         val rows = listOf(message("a", 1, mine = true), message("b", 2, mine = true))
         assertEquals(-1, firstUnreadTranscriptIndex(rows, 2))
     }
+
+    private fun coreRow(content: String, klass: SonarMsgClass) = SonarMsg(
+        id = "m-${content.hashCode()}",
+        senderNpub = "npub",
+        content = content,
+        mine = false,
+        tsSecs = 1L,
+        viaInternet = true,
+        classification = klass,
+    )
+
+    private val noCallControl: (String) -> Boolean = { false }
+
+    @Test
+    fun coreClassificationDecidesVisibilityForCoreRows() {
+        assertTrue(isTranscriptVisibleRow(coreRow("hey", SonarMsgClass.Text), noCallControl))
+        assertTrue(
+            isTranscriptVisibleRow(
+                coreRow("⚡PAY|1|abc-123|21", SonarMsgClass.PayReceipt("abc-123", 21L)),
+                noCallControl,
+            )
+        )
+        assertFalse(
+            isTranscriptVisibleRow(
+                coreRow("⚡PAYDONE|1|abc-123", SonarMsgClass.PayDone("abc-123", null)),
+                noCallControl,
+            )
+        )
+        assertFalse(
+            isTranscriptVisibleRow(
+                coreRow("☎CALL|1|END|c3a1|declined", SonarMsgClass.CallControl),
+                noCallControl,
+            )
+        )
+    }
+
+    @Test
+    fun coreClassificationWinsOverTheLocalStringDecode() {
+        // Core validates the payment id, PayLine.decode does not: this row is
+        // plain text to core, so it must render AND stay in the unread budget.
+        val invalidId = "⚡PAYDONE|1|hello world"
+        assertFalse(PayLine.decode(invalidId) is PayLine.Pay, "local decode hides this row")
+        assertTrue(
+            isTranscriptVisibleRow(coreRow(invalidId, SonarMsgClass.Text), noCallControl),
+            "core says text — hiding it would keep the phantom-unread bug",
+        )
+
+        // Core trims leading whitespace before classifying, the local decode
+        // does not: core hides this one, so it must not render either.
+        val leadingSpace = " ⚡PAYDONE|1|abc-123"
+        assertEquals(null, PayLine.decode(leadingSpace), "local decode shows this row")
+        assertFalse(
+            isTranscriptVisibleRow(
+                coreRow(leadingSpace, SonarMsgClass.PayDone("abc-123", null)),
+                noCallControl,
+            ),
+            "core hides it, so it is not in the unread budget either",
+        )
+    }
+
+    @Test
+    fun rowsWithoutCoreClassificationKeepTheStringDecode() {
+        val meshEcho = SonarMsg(
+            id = "echo-1",
+            senderNpub = "npub",
+            content = "⚡PAYDONE|2|abc-123",
+            mine = true,
+            tsSecs = 1L,
+        )
+        assertFalse(isTranscriptVisibleRow(meshEcho, noCallControl))
+
+        val meshText = SonarMsg(
+            id = "echo-2",
+            senderNpub = "npub",
+            content = "hey",
+            mine = true,
+            tsSecs = 1L,
+        )
+        assertTrue(isTranscriptVisibleRow(meshText, noCallControl))
+        assertFalse(isTranscriptVisibleRow(meshText) { it == "hey" }, "injected call-control gate applies")
+    }
 }

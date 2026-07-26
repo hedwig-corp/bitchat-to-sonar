@@ -506,7 +506,24 @@ actual object SonarCore {
         stickerRef = stickerRef?.let {
             SonarStickerRef(it.packCoordinate, it.shortcode, it.plaintextSha256)
         },
+        classification = classification.toCommon(),
     )
+
+    /** Core-computed classification; the host must not re-derive it from text. */
+    private fun uniffi.sonar_ffi.MessageClassInfo.toCommon(): SonarMsgClass = when (this) {
+        is uniffi.sonar_ffi.MessageClassInfo.Text -> SonarMsgClass.Text
+        is uniffi.sonar_ffi.MessageClassInfo.PayReceipt ->
+            // `amountSats` is a core u64 and the UI uses Long: above Long.MAX
+            // `toULong().toLong()` wraps to a negative amount instead of
+            // failing. Degrade to plain text on overflow, matching iOS
+            // (`Int64(exactly:)` guard) and the string decoder it replaces.
+            amountSats.toLong().takeIf { it >= 0L }
+                ?.let { SonarMsgClass.PayReceipt(paymentId, it) }
+                ?: SonarMsgClass.Text
+        is uniffi.sonar_ffi.MessageClassInfo.PayDone ->
+            SonarMsgClass.PayDone(paymentId, preimageHex)
+        is uniffi.sonar_ffi.MessageClassInfo.CallControl -> SonarMsgClass.CallControl
+    }
 
     private fun uniffi.sonar_ffi.StickerPackInfo.toCommon(): SonarStickerPack = SonarStickerPack(
         packCoordinate = packCoordinate,
