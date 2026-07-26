@@ -479,6 +479,26 @@ of #312.
 - *Fixing only decode.* Encode returning nil aborts a send the user asked for,
   for a field that carries no user content.
 
+## R-016 — A backgrounded process must not rebuild the relay node on a timer
+
+**Invariant:** On a platform that drops the relay latch when the process really backgrounds, the slow housekeeping heartbeat must not start a relay attach while backgrounded. Only the push wake and the foreground resume may rebuild the node.
+
+**Breaks as:** No notifications on Android for *both* mesh DMs and Marmot messages while the app is backgrounded but alive — the periodic rebuild closes the node the live wake loop, the conversation listener, and in-flight sends are holding, every 60 s, forever.
+
+**Why:** Two correct-looking decisions fight. `onProcessBackgrounded()` drops the latch so the *next wake* rebuilds instead of syncing against suspended sockets (#354); `poll()`'s heartbeat reads any down latch as "reconnect now". `shouldRetrySupersededAttach(foreground)` cannot arbitrate: it guards the retry loop *inside* an already-running relay job, while the heartbeat enters a **fresh** job each beat. Socket recovery is not the host's job in the first place — `nostr-relay-pool` defaults to `reconnect: true` and the core takes those defaults, so the latch is bookkeeping and rebuilding a whole `SonarNode` to fix a websocket is a sledgehammer.
+
+**Call sites:** Compose `SonarAppState.poll()` → `RelayConnectionPolicy.heartbeatRelayAction`. iOS does not apply: it has no periodic reconnect heartbeat — `ensureConnected` is called from action paths and `refreshAfterForeground`, never a background timer.
+
+**Guarded by:** `RelayConnectionPolicyTest.backgrounded_heartbeat_leaves_the_node_alone_on_invalidating_platforms`
+
+**Also guarded by:** `RelayConnectionPolicyTest.foreground_heartbeat_still_recovers_a_dead_connection`, `RelayConnectionPolicyTest.unfocused_heartbeat_still_reconnects_where_background_never_invalidates`, `RelayConnectionPolicyTest.connected_heartbeat_runs_relay_upkeep_in_both_lifecycle_states`, `RelayConnectionPolicyDesktopTest.desktop_heartbeat_reconnects_while_unfocused`
+
+**Not guarded:** the `poll()` dispatch itself. The tests pin the decision and the desktop composition; nothing constructs `SonarAppState`, so a `when` arm rewired to call `startRelayConnection()` from the `Idle` branch would keep every test green. Returning the decision as a three-valued enum rather than a boolean is what shrinks that hole — `Idle` is now a value a test can name — but it does not close it. Also unpinned: `ensureMarmotGroupForOutbox`, a second background attach path that is demand-driven rather than periodic and was deliberately left outside the policy.
+
+**Rejected:** *Gating on `foreground` alone.* Strands Compose Desktop, which reports `foreground=false` on every `windowLostFocus` (`Main.kt`) and has no push wake to take over the reconnect. *Reading `shouldInvalidateOnBackground()` inside the policy function.* Makes it impure, so its matrix cannot be asserted from `commonTest`, which compiles into every KMP test target — this was shipped first and `jvmTest` failed on it. *Reverting #354's background invalidate.* Brings back the original "backgrounded Sonar syncs against dead sockets" bug; the two decisions needed reconciling, not one removing the other.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
 /**
@@ -14,5 +15,23 @@ class RelayConnectionPolicyDesktopTest {
         // Main.kt bridges every windowLostFocus to setForeground(false); alt-tab
         // must not rebuild a healthy node.
         assertFalse(RelayConnectionPolicy.shouldInvalidateOnBackground())
+    }
+
+    @Test
+    fun desktop_heartbeat_reconnects_while_unfocused() {
+        // Pins the wiring, not just the rule: gating the heartbeat attach on
+        // `foreground` alone would strand desktop, because Main.kt reports
+        // foreground=false on every windowLostFocus and there is no push wake to
+        // take over the reconnect. Feeding it the same platform value the
+        // SonarAppState.poll() call site passes proves the pair composes right
+        // here — the pure matrix lives in RelayConnectionPolicyTest.
+        assertEquals(
+            HeartbeatRelayAction.Reconnect,
+            RelayConnectionPolicy.heartbeatRelayAction(
+                relayConnected = false,
+                foreground = false,
+                invalidatesOnBackground = RelayConnectionPolicy.shouldInvalidateOnBackground(),
+            ),
+        )
     }
 }
