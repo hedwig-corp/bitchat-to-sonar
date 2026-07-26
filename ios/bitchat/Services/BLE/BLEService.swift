@@ -4628,10 +4628,14 @@ extension BLEService {
             // includes .knownOnly: the "unknown" 0x53 sender may be a known
             // contact whose 0x01 we missed (Low Power Mode maps to .knownOnly,
             // and without the announce-back mutual discovery there waits on the
-            // periodic timer alone). A dedicated cooldown bounds
+            // periodic timer alone). shouldAcceptPeer folds the discovery
+            // policy: .normal accepts everyone, .knownOnly only allowlisted
+            // contacts — a stranger in restricted mode cannot elicit signed
+            // mesh-wide broadcasts while battery saving is active — and .off
+            // stays silent. A dedicated cooldown additionally bounds
             // attacker-elicited announce traffic — one announce-back per
-            // window serves every queued sender; .off stays silent.
-            if discoveryMode != .off {
+            // window serves every queued sender.
+            if shouldAcceptPeer(peerID, noisePublicKey: nil) {
                 let nowDate = Date()
                 if nowDate.timeIntervalSince(lastSonarAnnounceBackSent) >= TransportConfig.bleSonarAnnounceBackCooldownSeconds {
                     lastSonarAnnounceBackSent = nowDate

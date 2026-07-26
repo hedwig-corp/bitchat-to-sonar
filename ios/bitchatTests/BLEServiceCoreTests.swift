@@ -302,6 +302,10 @@ struct BLEServiceCoreTests {
 
         let signer = NoiseEncryptionService(keychain: MockKeychain())
         let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+        // The sender is a KNOWN contact whose 0x01 we missed — the exact case
+        // the announce-back exists for. Strangers are covered by the
+        // ...announceBackRequiresKnownContact test below.
+        ble.knownPeerProvider = { candidate, _ in candidate == peerID }
         let npub = Data((0..<32).map { UInt8($0) })
         let sonarPayload = try #require(SonarAnnouncePacket(
             npub: npub,
@@ -326,6 +330,43 @@ struct BLEServiceCoreTests {
             timeout: TestConstants.shortTimeout
         )
         #expect(didAnnounceBack)
+    }
+
+    // In .knownOnly a STRANGER's 0x53 must not elicit an announce-back: any
+    // nearby sender could otherwise provoke signed mesh-wide broadcasts
+    // precisely while battery saving is active (Codex P1 on PR #444). The
+    // allowlist gate (shouldAcceptPeer) decides, not the cooldown.
+    @Test
+    func sonarAnnounceBackInKnownOnlyRequiresKnownContact() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .knownOnly
+        ble.knownPeerProvider = { _, _ in false }
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: Data((0..<32).map { UInt8($0) }),
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > Date.distantPast },
+            timeout: 0.6
+        )
+        #expect(!didAnnounceBack)
+        #expect(ble._test_lastAnnounceSentAt == Date.distantPast)
     }
 
     // A stream of 0x53s from unknown peers must not elicit one forced
