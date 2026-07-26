@@ -549,8 +549,18 @@ un-latched node to `SonarPushRegistration.setSonarNode`, which kicks a blocking
 **outside** `nodeLifecycleGroup` — so the close cannot wait for it, and the
 SQLCipher handle outlives the close. The install closure in `connect` therefore
 checks `nodeClosing` (not just `sessionGeneration`), and the close hop also
-interrupts the node it actually removes as defence in depth. Found by review on
-PR #449, not by a test — there is no seam to drive that FIFO race.
+interrupts the node it actually removes as defence in depth.
+
+**The fence check and the node assignment must be one `nodeLock` hold.** The
+first attempt at this checked `nodeClosing`, released the lock, then reacquired
+it to assign — and `interruptNodeForSuspend()` fits in that gap: it sets
+`nodeClosing` and latches only the *old* node, after which the closure installs
+the fresh one regardless. The close hop's `removedNode?.interruptForSuspend()`
+does eventually catch it, but only after `setSonarNode` may already have handed
+the node to a registration thread the close never waits for, and `storeLock` has
+already been released — so the handle can outlive the close and overlap NSE
+access to the same store. Both hazards were found by review on PR #449, not by
+a test; there is no seam to drive either race.
 
 **Call sites:** iOS `MarmotService.swift::closeNode(keepClosed:)` and
 `MarmotService.swift::wipeDatabase()` (both via `interruptNodeForSuspend()`),

@@ -430,6 +430,7 @@ final class MarmotService: @unchecked Sendable {
             else {
                 return false
             }
+            service.setIdentity(identity)
             service.nodeLock.lock()
             // A close/wipe already fenced this session. Checking `nodeClosing`
             // (not just `sessionGeneration`) is required: the generation is
@@ -438,13 +439,20 @@ final class MarmotService: @unchecked Sendable {
             // would publish an un-latched node to `SonarPushRegistration`,
             // whose blocking `registerPushToken` holds the SQLCipher handle
             // outside `nodeLifecycleGroup` and past the close (0xdead10cc).
+            //
+            // The check and the assignment MUST stay in this single `nodeLock`
+            // hold. Releasing between them lets `interruptNodeForSuspend()` run
+            // in the gap — it would set `nodeClosing` and latch only the OLD
+            // node, and this closure would then install the fresh one anyway.
+            // The close hop's `removedNode?.interruptForSuspend()` does catch
+            // that, but only after `setSonarNode` may already have handed the
+            // node to a registration thread the close never waits for, while
+            // `storeLock` has been released — so the SQLCipher handle can
+            // outlive the close and overlap NSE access to the same store.
             guard !service.nodeClosing else {
                 service.nodeLock.unlock()
                 return false
             }
-            service.nodeLock.unlock()
-            service.setIdentity(identity)
-            service.nodeLock.lock()
             service.node = node
             service.relayConnected = RelayConnectionPolicy.latchAfterAttach(
                 startEpoch: attachEpoch,
