@@ -291,6 +291,27 @@ struct BLEServiceCoreTests {
         #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 3 * sparseWorstGap)
     }
 
+    // The radar retention window must never leak into DM transport selection.
+    // `MessageRouter` is built as `[meshService, nostrTransport]` and takes the
+    // first transport whose `isPeerReachable` is true, so a radar-sized window
+    // in `BLEService.isPeerReachable` hands DMs to a stale mesh route — which
+    // is marked `.sent` with no receipt timeout (#312) and never falls back to
+    // Nostr. Widening radar retention must not widen routing.
+    @Test
+    func dmRoutingWindowStaysTighterThanRadarRetention() {
+        #expect(TransportConfig.bleRoutingReachabilitySeconds
+                < TransportConfig.bleReachabilityRetentionUnverifiedSeconds)
+        #expect(TransportConfig.bleRoutingReachabilitySeconds
+                < TransportConfig.bleReachabilityRetentionVerifiedSeconds)
+
+        // At or below one worst-case announce gap: beyond that the peer has
+        // already missed an announce and Nostr is the better transport.
+        let sparseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsSparse
+            + TransportConfig.bleConnectedAnnounceJitterSparse
+            + TransportConfig.bleMaintenanceInterval
+        #expect(TransportConfig.bleRoutingReachabilitySeconds <= sparseWorstGap)
+    }
+
     // A Sonar 0x53 from a peer we have no verified 0x01 for must trigger an
     // announce-back in .knownOnly too, not just .normal: Low Power Mode maps to
     // .knownOnly, and the "unknown" sender there may be a known contact whose

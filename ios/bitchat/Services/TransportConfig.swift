@@ -102,6 +102,16 @@ enum TransportConfig {
     // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
     static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0   // ≥ 3×(30+8+5)
     static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 75.0  // ≥ 3×(15+4+5)
+    // Window for DM TRANSPORT SELECTION, deliberately much tighter than the
+    // radar windows above. `MessageRouter` is built as
+    // `[meshService, nostrTransport]` and picks the first transport whose
+    // `isPeerReachable` is true, so a wide window here hands DMs to a stale
+    // mesh route — and a mesh send is marked `.sent` with no receipt timeout
+    // (#312), so it never falls back to Nostr. Keep it at or below ONE
+    // worst-case announce gap: past that the peer has already missed an
+    // announce and Nostr is the better transport. Android draws the same
+    // split — generous radar grace, routing gated on live link state.
+    static let bleRoutingReachabilitySeconds: TimeInterval = 21.0
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0

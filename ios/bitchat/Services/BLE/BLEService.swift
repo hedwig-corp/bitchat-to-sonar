@@ -839,10 +839,11 @@ final class BLEService: NSObject {
             guard let info = peers[routingID] else { return false }
             if info.isConnected { return true }
             guard meshAttached else { return false }
-            // Apply reachability retention window
-            let isVerified = info.isVerifiedNickname
-            let retention: TimeInterval = isVerified ? TransportConfig.bleReachabilityRetentionVerifiedSeconds : TransportConfig.bleReachabilityRetentionUnverifiedSeconds
-            return Date().timeIntervalSince(info.lastSeen) <= retention
+            // Routing window, NOT the radar retention window. This method
+            // feeds `MessageRouter.reachableTransport`, so it decides whether
+            // a DM goes over the mesh or falls back to Nostr. The radar's
+            // longer grace lives in `UnifiedPeerService.buildPeerFromMesh`.
+            return Date().timeIntervalSince(info.lastSeen) <= TransportConfig.bleRoutingReachabilitySeconds
         }
     }
 
