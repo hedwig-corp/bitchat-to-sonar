@@ -875,17 +875,22 @@ impl SonarNode {
 
     /// Publish this identity's public Sonar descriptor. `signaling` should list
     /// only routes this app build can actually use, in preference order.
+    ///
+    /// Suspendable: hosts republish this automatically when payment/call
+    /// capabilities settle, and it awaits relay acks for up to two replaceable
+    /// events on the same serial work queue the store close needs. Replaceable
+    /// ⇒ an aborted publish self-heals on the next capability change or connect.
     pub fn publish_sonar_descriptor(
         &self,
         calls_enabled: bool,
         signaling: Vec<String>,
         bolt12_offer: Option<String>,
     ) -> FfiResult<()> {
-        self.runtime.block_on(self.client.publish_sonar_descriptor(
-            calls_enabled,
-            signaling,
-            bolt12_offer,
-        ))?;
+        self.block_on_suspendable(
+            "publish_sonar_descriptor",
+            self.client
+                .publish_sonar_descriptor(calls_enabled, signaling, bolt12_offer),
+        )?;
         Ok(())
     }
 
@@ -3328,6 +3333,10 @@ mod tests {
             (
                 "publish_key_package_background",
                 Box::new(|| node.publish_key_package_background()),
+            ),
+            (
+                "publish_sonar_descriptor",
+                Box::new(|| node.publish_sonar_descriptor(false, vec![], None)),
             ),
             (
                 "register_push_token",

@@ -492,7 +492,8 @@ it.
 **Which calls, and why that boundary:** suspendable = runs automatically
 (no user waiting on it) and self-heals on the next connect — `sync_once`,
 `sync_force`, `ensure_subscriptions`, `retry_outbox`,
-`publish_key_package_background`, `register_push_token`, `fetch_profile`,
+`publish_key_package_background`, `publish_sonar_descriptor`,
+`register_push_token`, `fetch_profile`,
 `fetch_sonar_descriptor`. Deliberately **not** suspendable: user-initiated MLS
 mutations (`send_text`, invite accept/decline, group create/leave, `start_dm`).
 Those have a user waiting on the result, and aborting them would surface as
@@ -557,6 +558,21 @@ plus the `nodeClosing` guard in the `connect` install closure; core
 `sonar-ffi/src/lib.rs::block_on_suspendable`. Compose: not applicable —
 Android has no RunningBoard shared-container file-lock kill; nothing calls
 `interruptForSuspend` there (the binding exists but is inert).
+
+**Making a call suspendable is only half the change — its error path must be
+audited too.** Every `catch` that previously only ever saw a real relay failure
+now also sees a deliberate abort, and the polling loop showed why that matters:
+its idle `ensureSubscriptions()` handler set `errorText`, dropped
+`relayConnected`, and armed `scheduleRelayConnect(delaySeconds: 2)`. Because
+`closeNode()` clears `nodeClosing` when it completes, that timer would **reopen
+the SQLCipher store about two seconds later while the app was still
+backgrounded** — reintroducing the very kill this entry exists to prevent, and
+doing it *more* often than before, since the call now fails fast where it used
+to block. (`closeStoreAfterBackgroundWake()` already cancels `relayConnectTask`
+for exactly this reason; the scenePhase `suspendStoreForBackground()` path does
+not.) The handler now treats the marker as terminal and simply stops the loop —
+foreground resume restarts polling via `performConnect`. Before making any
+further call suspendable, read its callers' error paths first.
 
 **The abort must not read as a failure.** A suspend abort is a deliberate
 control-flow signal, not a relay error, and two host paths originally treated it

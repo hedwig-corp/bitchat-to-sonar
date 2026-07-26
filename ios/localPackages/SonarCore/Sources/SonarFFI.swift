@@ -1718,6 +1718,11 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
+     *
+     * Suspendable: hosts republish this automatically when payment/call
+     * capabilities settle, and it awaits relay acks for up to two replaceable
+     * events on the same serial work queue the store close needs. Replaceable
+     * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
     func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?) throws
 
@@ -2662,6 +2667,11 @@ open func publishProfileBackground(name: String, about: String?, picture: String
     /**
      * Publish this identity's public Sonar descriptor. `signaling` should list
      * only routes this app build can actually use, in preference order.
+     *
+     * Suspendable: hosts republish this automatically when payment/call
+     * capabilities settle, and it awaits relay acks for up to two replaceable
+     * events on the same serial work queue the store close needs. Replaceable
+     * ⇒ an aborted publish self-heals on the next capability change or connect.
      */
 open func publishSonarDescriptor(callsEnabled: Bool, signaling: [String], bolt12Offer: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_publish_sonar_descriptor(
@@ -8440,7 +8450,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_profile_background() != 18973) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 7979) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_publish_sonar_descriptor() != 27940) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_recent_message_pages() != 17660) {

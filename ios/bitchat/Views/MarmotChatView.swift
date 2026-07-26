@@ -3807,6 +3807,21 @@ final class MarmotChatModel: ObservableObject {
                     do {
                         try await self.service.ensureSubscriptions()
                     } catch {
+                        // A suspend abort is not a lost subscription — the node
+                        // is being closed for background suspension. Falling
+                        // into the reconnect path below would arm
+                        // scheduleRelayConnect(2s), and because closeNode()
+                        // clears `nodeClosing` when it finishes, that task can
+                        // REOPEN the SQLCipher store while the app is still
+                        // backgrounded — the exact 0xdead10cc kill this close
+                        // exists to prevent (the same hazard
+                        // closeStoreAfterBackgroundWake() cancels relayConnectTask
+                        // for). Just stop the loop; the foreground resume
+                        // restarts polling through performConnect.
+                        if Self.isSuspendInterrupted(error) {
+                            self.syncTask = nil
+                            return
+                        }
                         self.relayConnected = false
                         self.errorText = Self.describe(error)
                         SecureLogger.warning("⚠️ Marmot relay subscription lost: \(self.errorText ?? "unknown error")", category: .session)
