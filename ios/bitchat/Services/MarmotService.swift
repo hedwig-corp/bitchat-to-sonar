@@ -1366,6 +1366,16 @@ final class MarmotService: @unchecked Sendable {
         return (url.path, keyHex)
     }
 
+    /// Snapshot the live node race-free and flip its one-way suspend latch so
+    /// interruptible relay FFI parked on `workQueue` returns instead of
+    /// blocking the close hop. Safe from any thread; no-op when disconnected.
+    private func interruptNodeForSuspend() {
+        nodeLock.lock()
+        let liveNode = node
+        nodeLock.unlock()
+        liveNode?.interruptForSuspend()
+    }
+
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
     /// SQLite sidecars), and forget the Keychain DB key. Idempotent.
     /// Resolves wipe targets from fixed App Group + legacy roots — never via
@@ -1383,6 +1393,9 @@ final class MarmotService: @unchecked Sendable {
             }
         }
         #endif
+        // Same reason as `closeNode()`: the close hop below must not queue
+        // behind blocking relay FFI already parked on the serial `workQueue`.
+        interruptNodeForSuspend()
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)
@@ -1438,6 +1451,15 @@ final class MarmotService: @unchecked Sendable {
     /// caller must clear it (via another `closeNode(keepClosed: false)` path
     /// or by completing connect after clearing).
     func closeNode(keepClosed: Bool = false) async {
+        // Abort interruptible in-flight relay FFI (sync, push-token
+        // registration, descriptor/profile fetches) BEFORE the first hop onto
+        // the serial `workQueue`: that hop — the one that drops the node and
+        // releases the store lock — queues behind whatever blocking Rust is
+        // already parked there, and iOS grants only ~30s of background grace.
+        // An uninterrupted relay sync held the SQLCipher store past that
+        // deadline on TestFlight 1.12.2 (30) → RUNNINGBOARD 0xdead10cc
+        // (round 3). Cheap and thread-safe; the node is torn down right after.
+        interruptNodeForSuspend()
         await runNonThrowing { service in
             service.sessionGeneration = service.sessionGeneration &+ 1
             #if os(iOS)

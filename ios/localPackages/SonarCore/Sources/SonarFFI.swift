@@ -1624,6 +1624,19 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     func installStickerPack(coordinate: String) throws
 
     /**
+     * Abort interruptible in-flight relay calls (`sync_once`, `sync_force`,
+     * `register_push_token`, descriptor/profile fetches) and make future ones
+     * fail fast with an "interrupted for suspend" error. The iOS host calls
+     * this right before closing the node for background suspension: the close
+     * queues on a serial dispatch queue BEHIND those blocking calls, and iOS
+     * only grants ~30s of background grace — an uninterrupted relay sync
+     * holds the SQLCipher store past that deadline and RunningBoard kills the
+     * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
+     * for this node's lifetime; reconnect constructs a fresh node.
+     */
+    func interruptForSuspend()
+
+    /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
     func leaveGroup(groupIdHex: String) throws
@@ -1840,11 +1853,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
+     * Suspendable like `sync_once`.
      */
     func syncForce() throws
 
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
+     * Suspendable: `interrupt_for_suspend()` aborts it so a store close never
+     * queues behind a full relay sync (0xdead10cc round 3).
      */
     func syncOnce() throws
 
@@ -2447,6 +2463,24 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
 }
 
     /**
+     * Abort interruptible in-flight relay calls (`sync_once`, `sync_force`,
+     * `register_push_token`, descriptor/profile fetches) and make future ones
+     * fail fast with an "interrupted for suspend" error. The iOS host calls
+     * this right before closing the node for background suspension: the close
+     * queues on a serial dispatch queue BEHIND those blocking calls, and iOS
+     * only grants ~30s of background grace — an uninterrupted relay sync
+     * holds the SQLCipher store past that deadline and RunningBoard kills the
+     * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
+     * for this node's lifetime; reconnect constructs a fresh node.
+     */
+open func interruptForSuspend()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarnode_interrupt_for_suspend(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+    /**
      * Leave a group and delete its local state after the leave proposal is sent.
      */
 open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -2941,6 +2975,7 @@ open func startGroup(members: [String], name: String)throws  -> String  {
     /**
      * Like `sync_once` but bypasses the live-subscription short-circuit.
      * Use after a foreground resume to catch events missed while backgrounded.
+     * Suspendable like `sync_once`.
      */
 open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_sync_force(
@@ -2951,6 +2986,8 @@ open func syncForce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiErr
 
     /**
      * Poll the relays once: welcomes addressed to us, then group messages.
+     * Suspendable: `interrupt_for_suspend()` aborts it so a store close never
+     * queues behind a full relay sync (0xdead10cc round 3).
      */
 open func syncOnce()throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_sync_once(
@@ -8339,6 +8376,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 28091) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8450,10 +8490,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_start_group() != 41815) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 34432) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_force() != 53806) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 45718) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_once() != 64518) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_sync_state_snapshot_json() != 50844) {

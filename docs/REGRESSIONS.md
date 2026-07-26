@@ -479,6 +479,96 @@ of #312.
 - *Fixing only decode.* Encode returning nil aborts a send the user asked for,
   for a field that carries no user content.
 
+## R-016 — A suspend-interrupted node aborts blocking relay FFI instead of parking
+
+**Invariant:** After `SonarNode.interrupt_for_suspend()`, the interruptible
+relay calls (`sync_once`, `sync_force`, `register_push_token`,
+`fetch_profile`, `fetch_sonar_descriptor`) return an "interrupted for suspend"
+error promptly — both when the latch was already set and when the call is
+already parked mid-wait — instead of blocking for the remainder of their relay
+timeouts.
+
+**Breaks as:** `RUNNINGBOARD 0xdead10cc` TestFlight crashes: iOS suspends the
+process while the SQLCipher store in the App Group container is still open,
+because `MarmotService.closeNode()`'s first hop — the one that drops the node
+and releases the store lock — is a `workQueue.async` on a **serial** queue and
+queues behind whatever uncancellable blocking Rust is already parked there.
+Round 1 (#446) closed the store after background wakes; round 2 (#448) stopped
+*new* prefetch work from flooding the queue; round 3 (1.12.2 build 30, killed
+85s after launch) proved neither helps when a full `SonarClient::sync` is
+*already in flight* at suspension — the ~30s background-task grace expires
+before the sync returns.
+
+**Why:** `block_on` at the FFI boundary cannot observe Swift cancellation, and
+iOS gives no way to extend the deadline. The only seam that works is dropping
+the future at its next await point: each interruptible method now races its
+future against a one-way `tokio::sync::watch` latch
+(`SonarNode::block_on_suspendable`), and `closeNode()` /`wipeDatabase()` flip
+the latch race-free (snapshot under `nodeLock`) BEFORE the first serial-queue
+hop.
+
+**Why dropping `sync` cannot tear MLS or DB state** — this is the load-bearing
+safety argument, and it rests on an invariant the code already enforces
+rather than on new care taken here. A dropped future stops at an **await
+point**, meaning every synchronous span between awaits has already run to
+completion. In `MarmotEngine::process_incoming` (`core/sonar-core/src/marmot.rs`)
+the only await is the gift-wrap unwrap, which is pure crypto and touches no
+store; the MLS mutation and its SQLCipher writes run **synchronously** under
+`mls_write()`, guarded by the standing rule stated at that call site: *the lock
+must never span an await*. `process_group_message` is a plain `fn` for the same
+reason. So an interrupt can land only *between* events or *before* any state
+mutation — never mid-commit. Per-event progress is already durable
+(`mark_sync_event_processed`), unfinished events are re-fetched from the
+watermark, and a dropped publish re-runs via outbox/re-registration. If that
+no-await-under-`mls_write` invariant is ever broken, this entry breaks with it.
+The status quo it replaces is a `SIGKILL` at an arbitrary instruction, which is
+strictly worse than a drop at an await point.
+
+**Call sites:** iOS `MarmotService.swift::closeNode(keepClosed:)` and
+`MarmotService.swift::wipeDatabase()` (both via `interruptNodeForSuspend()`);
+core `sonar-ffi/src/lib.rs::block_on_suspendable`. Compose: not applicable —
+Android has no RunningBoard shared-container file-lock kill; nothing calls
+`interruptForSuspend` there (the binding exists but is inert).
+
+**Guarded by:** `lib.rs::interrupted_node_fails_sync_fast_instead_of_parking`, `lib.rs::interrupt_aborts_in_flight_suspendable_wait`
+
+**Not guarded:** the Swift half — that `closeNode()` actually fires the
+interrupt before its queue hop — is unpinned (iOS tests do not run in CI, and
+`MarmotService`'s node/queue internals are private). Verification remains a
+TestFlight build surviving backgrounding mid-sync. Nothing mechanically
+enforces the no-await-under-`mls_write` invariant the drop-safety argument
+above depends on; it is a comment and a code shape, so a future `await` added
+inside that lock would silently invalidate this entry.
+
+**Residual, not fixed here — the lease wait.** The interrupt unblocks the
+*serial-queue* half of the close. `closeNode()` then waits on
+`nodeLifecycleGroup`, which covers leases taken on `mediaQueue` / `sendQueue` /
+`readQueue` too, and a Blossom media upload can hold one for minutes — far past
+both the iOS wake window and the `beginBackgroundTask` grace that
+`closeStoreAfterBackgroundWake()` relies on. That path is *not* implicated in
+any of the three crash logs (rounds 1-3 are all sync / push-registration), and
+making media suspendable means abandoning a user's in-progress send, so it is
+deliberately left alone. Follow-up: decide whether media should be suspendable
+(it has durable staging + resume, so it is recoverable) or whether the close
+should stop waiting on the media lane at all.
+
+**History:** #446 (round 1: close after background wakes) -> #448 (round 2:
+stop flooding the queue, bound the close wait) -> build 30 crash (round 3:
+in-flight sync uninterruptible) -> this fix.
+
+**Rejected:**
+- *Releasing the flock/`storeLock` ahead of the node.* Reverted in #448 review:
+  the NSE opens its own `SonarNode` the instant it wins the flock, and two
+  processes committing against one MLS store can fork group state. See the
+  round-2 notes below.
+- *Bounding `sync` with a shorter internal timeout.* Suspension can arrive 1s
+  after a sync starts; no fixed budget closes the race, it only shrinks it.
+- *Swift-side `withTimeout` around the FFI.* A task group awaits its children
+  before rethrowing, so it cannot bound work that ignores cancellation — the
+  same reason documented on `closeStoreWithDeadline` in round 2.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -513,7 +603,7 @@ its coverage is worse than an honest hole, because it stops people looking.
 
   The core half IS pinned (`sticker_ref_prefetch_claims_are_cross_batch_and_released`, `cancel_on_wiped_session_abandons_inflight_fetch_after_wipe`).
 
-- **A background wake must close the Marmot store before iOS suspends the process (0xdead10cc, round 2).** #446 added `closeStoreAfterBackgroundWake()` but the close could not win the race, and 1.12.1 build 29 crashed with the same `RUNNINGBOARD 0xdead10cc` 31s after a background launch. Three things had to be true together, and each is a separate hazard worth keeping:
+- **A background wake must close the Marmot store before iOS suspends the process (0xdead10cc, round 2).** #446 added `closeStoreAfterBackgroundWake()` but the close could not win the race, and 1.12.1 build 29 crashed with the same `RUNNINGBOARD 0xdead10cc` 31s after a background launch. Round 3 (build 30) hit the remaining hole — an *in-flight* sync the close cannot preempt — now covered by R-016; the hazards below are still real and separately load-bearing. Three things had to be true together, and each is a separate hazard worth keeping:
   - **Nothing may flood `MarmotService.workQueue` during a background wake.** That queue is *serial*, and `fetch_sonar_descriptor` parks in uncancellable Rust for two `FETCH_TIMEOUT` fetches (`core/sonar-core/src/client.rs`, 10s each). `loadLocalSummaries(resolveMembers: true)` kicks one `ensureProfile` + `ensureSonarDescriptor` per group member and `SonarPushProcessor` calls it three times per wake, so a handful of contacts queues minutes of blocking work ahead of `closeNode()`'s own `workQueue.async` hop. Both prefetches are now gated on `MarmotChatModel.canPrefetchFromRelays` (`applicationState != .background`). The gate sits *before* the in-flight dedup inserts, so a skipped wake does not leave a poisoned `profileFetches` / `descriptorFetches` entry that suppresses the next foreground fetch.
   - **The flock must NOT be released ahead of the node, and the close must not be abandoned bare.** Releasing `storeLock` early to beat the queue was tried and reverted during review: the NSE opens its own `SonarNode` on the same store the instant it wins the flock (`NotificationService.collectMarmotNotificationsAfterWake`) and drains MLS events, so two processes would commit against one store and could fork group state. `NotificationService` states the contract directly — never unlock under an open handle. That trades a background kill for a corrupted MLS store, which is worse. What actually makes an early return safe is a `UIApplication` background task held across `closeNode()` (same pattern as `suspendStoreForBackground()`), so the wake can report its fetch result on time while iOS keeps the process alive until the store is genuinely shut.
   - **No blocking FFI may hold a `SonarNode` across a retry sleep.** `SonarPushRegistration.registerTransponderIfReady` captured the node and slept 2s then 4s between attempts, outside the lease system — so the Rust node, its SQLCipher handle, and that handle's locks on the shared store outlived `closeNode()`'s `clearSonarNode()` entirely. The node is now re-read per attempt inside `attemptRegistration`, which returns `.nodeGone` and stops when the session was closed.
