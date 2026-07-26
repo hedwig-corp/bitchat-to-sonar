@@ -653,6 +653,13 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // Drop the App Group flock FIRST, synchronously. `closeNode()` releases
+        // it too, but only after its `workQueue.async` hop reaches the front of
+        // the SERIAL work queue — behind any blocking relay FFI already parked
+        // there (up to 20s for one descriptor fetch). Suspending while that lock
+        // is held on a shared-container file is the 0xdead10cc kill, so it must
+        // not depend on the queue draining in time.
+        service.releaseStoreLockNow()
         await service.closeNode()
         #endif
     }
@@ -2323,10 +2330,38 @@ final class MarmotChatModel: ObservableObject {
         ensureProfile(key)
     }
 
+    /// Fire-and-forget relay enrichment must not start while the app is
+    /// backgrounded.
+    ///
+    /// `ensureProfile` / `ensureSonarDescriptor` both dispatch onto
+    /// `MarmotService`'s SERIAL work queue and park inside uncancellable blocking
+    /// FFI — `FETCH_TIMEOUT` is 10s, and a descriptor fetch runs two of them.
+    /// `loadLocalSummaries(resolveMembers: true)` kicks one pair per group
+    /// member, and a push wake calls it three times, so a handful of contacts
+    /// queues minutes of blocking work. `closeStoreAfterBackgroundWake()` ->
+    /// `closeNode()` hops onto that same serial queue, so it lands behind all of
+    /// it and the process suspends still holding the App Group flock and the
+    /// SQLCipher locks — the RunningBoard 0xdead10cc kill.
+    ///
+    /// Nothing renders while backgrounded, so these are pure waste there. Both
+    /// callers re-run on the next foreground pass: `ensureProfile` via
+    /// `refreshStaleProfiles()`, `ensureSonarDescriptor` via its TTL /
+    /// miss-retry windows. The push-notification title path is unaffected —
+    /// `resolveSenderName(npub:)` awaits `service.fetchProfile` directly instead
+    /// of going through `ensureProfile`.
+    private var canPrefetchFromRelays: Bool {
+        #if os(iOS)
+        return UIApplication.shared.applicationState != .background
+        #else
+        return true
+        #endif
+    }
+
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
     /// raw npub in the chat list, header, and avatar. Retries (via the periodic
     /// `refresh()`) until the peer has published a profile.
     func ensureProfile(_ npubToFetch: String) {
+        guard canPrefetchFromRelays else { return }
         let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
         let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
         guard !key.isEmpty, key != ownKey else { return }
@@ -2385,6 +2420,9 @@ final class MarmotChatModel: ObservableObject {
     /// Positive results are periodically refreshed so protocol upgrades or
     /// capability changes are noticed during long-running sessions.
     func ensureSonarDescriptor(_ npubToFetch: String) {
+        // See `canPrefetchFromRelays`: a background wake must not flood the
+        // serial work queue that `closeNode()` has to get through.
+        guard canPrefetchFromRelays else { return }
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
         if sonarDescriptorsByNpub[npubToFetch] != nil,
            let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],

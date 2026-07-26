@@ -178,7 +178,27 @@ enum SonarPushProcessor {
                 // Gate on .background only: .active/.inactive means the user can
                 // see the app and the foreground path owns the node.
                 guard UIApplication.shared.applicationState == .background else { break }
-                await marmot.closeStoreAfterBackgroundWake()
+                // Bound the close to what is left of the wake window. `closeNode()`
+                // hops onto MarmotService's SERIAL work queue and waits for every
+                // outstanding node lease, so a blocking relay FFI already parked
+                // there (a descriptor fetch runs two 10s fetches) can hold it well
+                // past the ~30s iOS gives us. Awaiting that bare means the fetch
+                // completion handler never fires and we get suspended mid-close —
+                // exactly the 0xdead10cc kill this exists to prevent.
+                // `closeStoreAfterBackgroundWake()` drops the App Group flock
+                // synchronously before the await, so timing out here still leaves
+                // the shared-container lock released.
+                let closeBudget = max(
+                    Self.marmotWakeCloseMinSeconds,
+                    Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
+                )
+                do {
+                    try await withTimeout(seconds: closeBudget) {
+                        await marmot.closeStoreAfterBackgroundWake()
+                    }
+                } catch {
+                    log.warning("Marmot store close exceeded the wake window: \(error)")
+                }
                 if UIApplication.shared.applicationState != .background {
                     // The user foregrounded WHILE closeNode() awaited — the
                     // scene-phase resume raced our close and could have failed
@@ -223,6 +243,11 @@ enum SonarPushProcessor {
     /// Below this much remaining window a coalesced rerun cannot pay even a
     /// shrunk sync — skip it; the push syncs on the next wake/foreground.
     private static let marmotWakeRerunMinSeconds: Double = 8
+    /// Floor for the store-close budget. Even when the sync already burned the
+    /// whole window, give the close a moment to land before returning — the
+    /// flock is already released synchronously, so this only covers dropping
+    /// the node itself.
+    private static let marmotWakeCloseMinSeconds: Double = 3
 
     @MainActor
     private static func runMarmotWakeup(
