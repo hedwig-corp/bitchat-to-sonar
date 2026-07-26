@@ -1432,45 +1432,6 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Release ONLY the App Group flock, synchronously, without waiting for the
-    /// serial work queue.
-    ///
-    /// `closeNode()`'s first hop is `workQueue.async`, so it queues behind any
-    /// blocking FFI already on that serial queue — a descriptor fetch parks up
-    /// to 2 x `FETCH_TIMEOUT` (20s) inside uncancellable Rust. A background wake
-    /// cannot wait that long: iOS suspends at the end of the ~30s window and
-    /// RunningBoard kills the process for holding a lock on a shared-container
-    /// file (0xdead10cc). Dropping the flock up front bounds that exposure even
-    /// when the full close lands late.
-    ///
-    /// `MarmotStoreLock.release()` is idempotent and internally synchronized, so
-    /// the regular `closeNode()` path may release the same lock again. `storeLock`
-    /// is `nodeLock`-protected at every site (see `installStoreLockHold`).
-    ///
-    /// **Deliberate trade, and it breaks a documented invariant.** `MarmotStoreLock`'s
-    /// header says the main app holds the lock "while SonarNode is open"; after this
-    /// call that is false. The NSE's `tryAcquireExclusive()` can now succeed while our
-    /// Rust node still has the store open and may still be writing through a parked
-    /// FFI call. SQLite does its own locking so this is not corruption, but on a
-    /// background wake we prefer a concurrent NSE hydrate over a RunningBoard kill.
-    /// The window already existed — in-flight leases keep the node alive past
-    /// `closeNode()`'s `node = nil` — this widens it and makes it likely.
-    ///
-    /// **Deliberately does NOT set `nodeClosing`.** A foreground reconnect racing the
-    /// wake close can therefore see `storeLock == nil`, acquire a fresh lock via
-    /// `prepareStoreLockForConnectSync()`, and have the trailing `closeNode()` release
-    /// it out from under the reconnect. Fencing here would be worse: a fence stranded
-    /// by a close that never lands would block reconnect for the life of the process.
-    func releaseStoreLockNow() {
-        #if os(iOS)
-        nodeLock.lock()
-        let lock = storeLock
-        storeLock = nil
-        nodeLock.unlock()
-        lock?.release()
-        #endif
-    }
-
     /// Drop the live `SonarNode` so DB files can be read/replaced. Does not
     /// delete files or the Keychain DB key. When `keepClosed` is true, leaves
     /// `nodeClosing` set so reconnect cannot race the following FFI work;

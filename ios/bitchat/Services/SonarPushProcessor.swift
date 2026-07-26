@@ -202,18 +202,19 @@ enum SonarPushProcessor {
                 // completion handler never fires and we get suspended mid-close —
                 // exactly the 0xdead10cc kill this exists to prevent.
                 //
-                // The floor deliberately overshoots `marmotWakeWindowSeconds`'s 2s
-                // margin when the sync already burned the window: a 1s budget would
-                // guarantee the close never lands, and dropping the node matters
-                // more than the margin. The flock is already released synchronously
-                // by `closeStoreAfterBackgroundWake()`, so an overrun here costs a
-                // late node teardown, not a held shared-container lock.
+                // Never wait past the window: `closeStoreAfterBackgroundWake()`
+                // holds a UIApplication background task across the close, so
+                // abandoning the wait does NOT leave us suspending with the store
+                // open — iOS keeps the process alive until the close lands. A
+                // budget of 0 is therefore fine and correct when the sync already
+                // burned the window; the close still completes, we just report
+                // the fetch result on time instead of overrunning it.
                 let closeBudget = max(
-                    Self.marmotWakeCloseMinSeconds,
+                    0,
                     Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
                 )
                 if await closeStoreWithDeadline(marmot: marmot, seconds: closeBudget) == false {
-                    log.warning("Marmot store close did not land in \(Int(closeBudget))s — flock already released, node teardown continues in background")
+                    log.warning("Marmot store close did not land in \(Int(closeBudget))s — continuing under a background task")
                 }
                 if UIApplication.shared.applicationState != .background {
                     // The user foregrounded WHILE closeNode() awaited — the
@@ -259,11 +260,6 @@ enum SonarPushProcessor {
     /// Below this much remaining window a coalesced rerun cannot pay even a
     /// shrunk sync — skip it; the push syncs on the next wake/foreground.
     private static let marmotWakeRerunMinSeconds: Double = 8
-    /// Floor for the store-close budget. Even when the sync already burned the
-    /// whole window, give the close a moment to land before returning — the
-    /// flock is already released synchronously, so this only covers dropping
-    /// the node itself.
-    private static let marmotWakeCloseMinSeconds: Double = 3
 
     @MainActor
     private static func runMarmotWakeup(
@@ -775,9 +771,10 @@ enum SonarPushProcessor {
     /// `ensureRelayConnected()` poll loops; the close has no such seam. Abandoning the
     /// wait is the only thing that actually bounds it.
     ///
-    /// Returning early is safe because `closeStoreAfterBackgroundWake()` releases the
-    /// App Group flock synchronously before its first await, so the shared-container
-    /// lock is gone even when the node teardown lands late.
+    /// Returning early is safe because `closeStoreAfterBackgroundWake()` holds a
+    /// `UIApplication` background task across the close, so iOS keeps the process
+    /// alive until the store is actually shut instead of suspending us with it open.
+    /// The flock is NOT dropped ahead of the node — see that method for why.
     ///
     /// Returns true when the close completed inside the budget.
     @MainActor
@@ -789,6 +786,13 @@ enum SonarPushProcessor {
         Task.detached(priority: .userInitiated) {
             await marmot.closeStoreAfterBackgroundWake()
             latch.complete()
+            // The caller may already have given up on the deadline and moved past
+            // its own foreground recheck, which would then have run while the node
+            // was still open (seeing it connected, doing nothing) — leaving the
+            // foregrounded app disconnected once this close finally lands. Recheck
+            // here, after the close is real. Idempotent: it gates on
+            // `applicationState` and `isConnected()`.
+            await marmot.reconnectIfForegroundAfterWakeClose()
         }
         let start = Date()
         while Date().timeIntervalSince(start) < seconds {

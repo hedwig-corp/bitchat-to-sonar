@@ -586,6 +586,28 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Box + lock so an expiration handler and a closeNode completion cannot both
+    /// end the same `UIBackgroundTaskIdentifier` (value-type capture race). Shared
+    /// by `suspendStoreForBackground()` and `closeStoreAfterBackgroundWake()`.
+    #if os(iOS)
+    final class SNBackgroundTaskBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var id = UIBackgroundTaskIdentifier.invalid
+        func set(_ newId: UIBackgroundTaskIdentifier) {
+            lock.lock(); id = newId; lock.unlock()
+        }
+        func endOnce() {
+            lock.lock()
+            let current = id
+            id = .invalid
+            lock.unlock()
+            if current != .invalid {
+                UIApplication.shared.endBackgroundTask(current)
+            }
+        }
+    }
+    #endif
+
     /// Drop the live Marmot node + App Group store lock before suspension so the
     /// NSE can acquire exclusive hydrate on Transponder push. Tor/Nostr are already
     /// dormant in background; keeping the flock would leave banners stuck on the
@@ -595,25 +617,7 @@ final class MarmotChatModel: ObservableObject {
     /// a fire-and-forget Task alone often loses the race with Transponder NSE.
     func suspendStoreForBackground() {
         #if os(iOS)
-        // Box + lock so the expiration handler and closeNode completion cannot
-        // both end the same UIBackgroundTaskIdentifier (value-type capture race).
-        final class BgTaskBox: @unchecked Sendable {
-            private let lock = NSLock()
-            private var id = UIBackgroundTaskIdentifier.invalid
-            func set(_ newId: UIBackgroundTaskIdentifier) {
-                lock.lock(); id = newId; lock.unlock()
-            }
-            func endOnce() {
-                lock.lock()
-                let current = id
-                id = .invalid
-                lock.unlock()
-                if current != .invalid {
-                    UIApplication.shared.endBackgroundTask(current)
-                }
-            }
-        }
-        let box = BgTaskBox()
+        let box = SNBackgroundTaskBox()
         box.set(
             UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
                 box.endOnce()
@@ -653,14 +657,28 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
-        // Drop the App Group flock FIRST, synchronously. `closeNode()` releases
-        // it too, but only after its `workQueue.async` hop reaches the front of
-        // the SERIAL work queue — behind any blocking relay FFI already parked
-        // there (up to 20s for one descriptor fetch). Suspending while that lock
-        // is held on a shared-container file is the 0xdead10cc kill, so it must
-        // not depend on the queue draining in time.
-        service.releaseStoreLockNow()
+        // Hold a background task across the close, exactly like
+        // `suspendStoreForBackground()`. The push wake abandons its wait on this
+        // call once its deadline expires so it can return the fetch completion
+        // handler on time; without this, that early return would let iOS suspend
+        // the process with the SQLCipher store still open and the flock held —
+        // the 0xdead10cc kill. With it, iOS keeps us alive until the close lands.
+        //
+        // The flock is deliberately NOT released ahead of `closeNode()`. The NSE
+        // opens its own `SonarNode` on this same store the moment it wins the
+        // flock (`NotificationService.collectMarmotNotificationsAfterWake`), and
+        // that path drains MLS events — two processes committing against one
+        // store can fork group state. `NotificationService` states the contract
+        // directly: never unlock under an open handle. Releasing early would
+        // trade a background kill for a corrupted MLS store, which is worse.
+        let box = SNBackgroundTaskBox()
+        box.set(
+            UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.wakeClose") {
+                box.endOnce()
+            }
+        )
         await service.closeNode()
+        box.endOnce()
         #endif
     }
 
