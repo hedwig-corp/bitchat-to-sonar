@@ -586,6 +586,28 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Box + lock so an expiration handler and a closeNode completion cannot both
+    /// end the same `UIBackgroundTaskIdentifier` (value-type capture race). Shared
+    /// by `suspendStoreForBackground()` and `closeStoreAfterBackgroundWake()`.
+    #if os(iOS)
+    final class SNBackgroundTaskBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var id = UIBackgroundTaskIdentifier.invalid
+        func set(_ newId: UIBackgroundTaskIdentifier) {
+            lock.lock(); id = newId; lock.unlock()
+        }
+        func endOnce() {
+            lock.lock()
+            let current = id
+            id = .invalid
+            lock.unlock()
+            if current != .invalid {
+                UIApplication.shared.endBackgroundTask(current)
+            }
+        }
+    }
+    #endif
+
     /// Drop the live Marmot node + App Group store lock before suspension so the
     /// NSE can acquire exclusive hydrate on Transponder push. Tor/Nostr are already
     /// dormant in background; keeping the flock would leave banners stuck on the
@@ -595,25 +617,7 @@ final class MarmotChatModel: ObservableObject {
     /// a fire-and-forget Task alone often loses the race with Transponder NSE.
     func suspendStoreForBackground() {
         #if os(iOS)
-        // Box + lock so the expiration handler and closeNode completion cannot
-        // both end the same UIBackgroundTaskIdentifier (value-type capture race).
-        final class BgTaskBox: @unchecked Sendable {
-            private let lock = NSLock()
-            private var id = UIBackgroundTaskIdentifier.invalid
-            func set(_ newId: UIBackgroundTaskIdentifier) {
-                lock.lock(); id = newId; lock.unlock()
-            }
-            func endOnce() {
-                lock.lock()
-                let current = id
-                id = .invalid
-                lock.unlock()
-                if current != .invalid {
-                    UIApplication.shared.endBackgroundTask(current)
-                }
-            }
-        }
-        let box = BgTaskBox()
+        let box = SNBackgroundTaskBox()
         box.set(
             UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
                 box.endOnce()
@@ -653,7 +657,28 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // Hold a background task across the close, exactly like
+        // `suspendStoreForBackground()`. The push wake abandons its wait on this
+        // call once its deadline expires so it can return the fetch completion
+        // handler on time; without this, that early return would let iOS suspend
+        // the process with the SQLCipher store still open and the flock held —
+        // the 0xdead10cc kill. With it, iOS keeps us alive until the close lands.
+        //
+        // The flock is deliberately NOT released ahead of `closeNode()`. The NSE
+        // opens its own `SonarNode` on this same store the moment it wins the
+        // flock (`NotificationService.collectMarmotNotificationsAfterWake`), and
+        // that path drains MLS events — two processes committing against one
+        // store can fork group state. `NotificationService` states the contract
+        // directly: never unlock under an open handle. Releasing early would
+        // trade a background kill for a corrupted MLS store, which is worse.
+        let box = SNBackgroundTaskBox()
+        box.set(
+            UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.wakeClose") {
+                box.endOnce()
+            }
+        )
         await service.closeNode()
+        box.endOnce()
         #endif
     }
 
@@ -2323,10 +2348,44 @@ final class MarmotChatModel: ObservableObject {
         ensureProfile(key)
     }
 
+    /// Fire-and-forget relay enrichment must not start while the app is
+    /// backgrounded.
+    ///
+    /// `ensureProfile` / `ensureSonarDescriptor` both dispatch onto
+    /// `MarmotService`'s SERIAL work queue and park inside uncancellable blocking
+    /// FFI — `FETCH_TIMEOUT` is 10s, and a descriptor fetch runs two of them.
+    /// `loadLocalSummaries(resolveMembers: true)` kicks one pair per group
+    /// member, and a push wake calls it three times, so a handful of contacts
+    /// queues minutes of blocking work. `closeStoreAfterBackgroundWake()` ->
+    /// `closeNode()` hops onto that same serial queue, so it lands behind all of
+    /// it and the process suspends still holding the App Group flock and the
+    /// SQLCipher locks — the RunningBoard 0xdead10cc kill.
+    ///
+    /// Nothing renders while backgrounded, so these are pure waste there.
+    ///
+    /// This self-heals because the guard sits BEFORE the `profileFetches` /
+    /// `descriptorFetches` in-flight inserts: a skipped npub leaves no marker, so the
+    /// next foreground `loadLocalSummaries(resolveMembers: true)` simply calls it again
+    /// and it proceeds. Do not move the guard below those inserts — that would leave a
+    /// permanent in-flight marker for an npub that was never fetched and suppress it
+    /// forever. Note `refreshStaleProfiles()` does NOT cover this: it only clears
+    /// entries whose `profileFetchedAt` is older than the TTL, and a skipped npub has
+    /// no `profileFetchedAt` entry at all. The push-notification title path is unaffected —
+    /// `resolveSenderName(npub:)` awaits `service.fetchProfile` directly instead
+    /// of going through `ensureProfile`.
+    private var canPrefetchFromRelays: Bool {
+        #if os(iOS)
+        return UIApplication.shared.applicationState != .background
+        #else
+        return true
+        #endif
+    }
+
     /// Fetch + cache a peer's kind-0 profile, so their name/avatar replaces the
     /// raw npub in the chat list, header, and avatar. Retries (via the periodic
     /// `refresh()`) until the peer has published a profile.
     func ensureProfile(_ npubToFetch: String) {
+        guard canPrefetchFromRelays else { return }
         let key = SNMarmotProfileCache.canonicalKey(npubToFetch)
         let ownKey = npub.map(SNMarmotProfileCache.canonicalKey)
         guard !key.isEmpty, key != ownKey else { return }
@@ -2385,6 +2444,9 @@ final class MarmotChatModel: ObservableObject {
     /// Positive results are periodically refreshed so protocol upgrades or
     /// capability changes are noticed during long-running sessions.
     func ensureSonarDescriptor(_ npubToFetch: String) {
+        // See `canPrefetchFromRelays`: a background wake must not flood the
+        // serial work queue that `closeNode()` has to get through.
+        guard canPrefetchFromRelays else { return }
         guard !npubToFetch.isEmpty, npubToFetch != npub else { return }
         if sonarDescriptorsByNpub[npubToFetch] != nil,
            let fetchedAt = sonarDescriptorFetchedAtByNpub[npubToFetch],

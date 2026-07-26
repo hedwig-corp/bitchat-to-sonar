@@ -184,28 +184,57 @@ final class SonarPushRegistration: @unchecked Sendable {
 
     private func registerTransponderIfReady(token: Data) {
         guard !transponderNpub.isEmpty else { return }
-        guard let node = sonarNode else {
+        guard sonarNode != nil else {
             Self.log.info("Transponder: SonarNode not ready, will retry after setSonarNode")
             return
         }
         let npub = self.transponderNpub
+        // `shared` singleton — no `[weak self]`; there is no lifetime concern here
+        // and implying one costs the reader a moment.
         DispatchQueue.global(qos: .utility).async {
             var backoff: UInt32 = 2
             for attempt in 1...Self.maxRetries {
-                do {
-                    try node.registerPushToken(
-                        platform: "apns",
-                        token: token,
-                        serverNpub: npub
-                    )
+                // Re-read the node per attempt rather than capturing it, and keep
+                // the strong reference confined to `attemptRegistration` so it is
+                // released before the retry `sleep`. Holding a `SonarNode` across
+                // those sleeps keeps the Rust node — and therefore the SQLCipher
+                // handle and its locks on the shared App Group store — alive long
+                // after `closeNode()` ran `clearSonarNode()`. On a background wake
+                // that outlives the ~30s window and RunningBoard kills the process
+                // with 0xdead10cc.
+                switch self.attemptRegistration(token: token, npub: npub) {
+                case .registered:
                     Self.log.info("Transponder: MIP-05 push token registered")
                     return
-                } catch {
+                case .nodeGone:
+                    // Session was closed (background-wake close, or a wipe).
+                    // The next `setSonarNode()` re-registers.
+                    Self.log.info("Transponder: SonarNode released, deferring registration")
+                    return
+                case .failed(let error):
                     Self.log.warning("Transponder registration attempt \(attempt)/\(Self.maxRetries) failed: \(error)")
                     if attempt < Self.maxRetries { sleep(backoff) }
                     backoff *= 2
                 }
             }
+        }
+    }
+
+    private enum RegistrationAttempt {
+        case registered
+        case nodeGone
+        case failed(Error)
+    }
+
+    /// One registration attempt. The `SonarNode` reference lives and dies inside
+    /// this call so no retry sleep straddles it.
+    private func attemptRegistration(token: Data, npub: String) -> RegistrationAttempt {
+        guard let node = queue.sync(execute: { self.sonarNode }) else { return .nodeGone }
+        do {
+            try node.registerPushToken(platform: "apns", token: token, serverNpub: npub)
+            return .registered
+        } catch {
+            return .failed(error)
         }
     }
 
