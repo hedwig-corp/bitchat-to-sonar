@@ -272,6 +272,62 @@ struct BLEServiceCoreTests {
         #expect(capture.profile?.npub == npub)
     }
 
+    // The reachability retention window must survive at least two missed
+    // announce cycles at the worst-case connected cadence, plus a maintenance
+    // tick of slack. At 21s (old value) a relayed peer was mathematically
+    // guaranteed to be evicted between two dense-mode announces (30s ± 8s) and
+    // flapped in and out of the radar on a single lost packet in sparse mode.
+    // Same derivation as the Rust mesh engine's LINK_STALE_MS on Android.
+    @Test
+    func reachabilityRetentionToleratesTwoMissedAnnounceCycles() {
+        let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
+            + TransportConfig.bleConnectedAnnounceJitterDense
+        let sparseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsSparse
+            + TransportConfig.bleConnectedAnnounceJitterSparse
+        let slack = TransportConfig.bleMaintenanceInterval
+
+        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds >= 2 * denseWorstGap + slack)
+        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 2 * sparseWorstGap + slack)
+    }
+
+    // A Sonar 0x53 from a peer we have no verified 0x01 for must trigger an
+    // announce-back in .knownOnly too, not just .normal: Low Power Mode maps to
+    // .knownOnly, and the "unknown" sender there may be a known contact whose
+    // announce we missed. Without the announce-back, mutual discovery under
+    // Low Power Mode waits on the periodic announce timer alone.
+    @Test
+    func sonarAnnounceFromUnknownPeerInKnownOnly_triggersAnnounceBack() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .knownOnly
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+        let npub = Data((0..<32).map { UInt8($0) })
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: npub,
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        let before = ble._test_lastAnnounceSentAt
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > before },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(didAnnounceBack)
+    }
+
     @Test
     func restrictedDiscoveryReapply_prunesPeerAfterAllowlistChange() async throws {
         let ble = makeService()

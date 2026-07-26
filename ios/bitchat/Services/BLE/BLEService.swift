@@ -2463,6 +2463,13 @@ extension BLEService {
     func _test_handleCentralState(_ state: CBManagerState) {
         bleQueue.sync { handleCentralState(state, central: nil) }
     }
+
+    /// When the last announce was actually sent (post-throttle). Lets tests
+    /// observe the announce-back scheduled by `handleSonarAnnounce` without a
+    /// live radio: `sendAnnounce` stamps this before broadcasting.
+    var _test_lastAnnounceSentAt: Date {
+        messageQueue.sync { lastAnnounceSent }
+    }
 }
 #endif
 
@@ -4609,10 +4616,13 @@ extension BLEService {
         guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
             queuePendingSonarAnnounce(packet, from: peerID)
             SecureLogger.debug("Queued Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
-            // Only announce back in normal discovery mode — in restricted mode
-            // (.knownOnly/.off), don't respond to unknown peers to avoid
-            // unbounded forced announcements from attacker-controlled traffic.
-            if discoveryMode == .normal {
+            // Announce back so the sender can verify us and re-announce. This
+            // includes .knownOnly: the "unknown" 0x53 sender may be a known
+            // contact whose 0x01 we missed (Low Power Mode maps to .knownOnly,
+            // and without the announce-back mutual discovery there waits on the
+            // periodic timer alone). The forced-announce min-interval throttle
+            // bounds attacker-elicited traffic; .off stays silent.
+            if discoveryMode != .off {
                 messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
                     self?.sendAnnounce(forceSend: true)
                 }

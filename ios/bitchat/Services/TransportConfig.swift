@@ -86,9 +86,14 @@ enum TransportConfig {
     // How long without seeing traffic before we sanity-check the direct link
     // Lowered to make connected→reachable icon changes react faster when walking out of range
     static let blePeerInactivityTimeoutSeconds: TimeInterval = 8.0
-    // How long to retain a peer as "reachable" (not directly connected) since lastSeen
-    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 21.0    // 21s for verified/favorites
-    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 21.0  // 21s for unknown/unverified
+    // How long to retain a peer as "reachable" (not directly connected) since lastSeen.
+    // Must cover at least two missed announce cycles at the worst-case connected
+    // cadence (dense: 30s base + 8s jitter, sparse: 15s + 4s) plus one maintenance
+    // tick, or a relayed peer is evicted between two announces and flaps in and
+    // out of the radar on a single lost packet. Same derivation as the Rust mesh
+    // engine's LINK_STALE_MS (core/sonar-core/src/mesh_engine.rs) used on Android.
+    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 90.0    // ≥ 2×(30+8) + 5
+    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 45.0  // ≥ 2×(15+4) + 5
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0
