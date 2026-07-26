@@ -183,7 +183,11 @@ enum SNMarmotDescriptorCache {
     ) -> [String: MarmotService.SonarDescriptor] {
         guard descriptors.count > entryLimit else { return descriptors }
         let kept = descriptors
-            .sorted { $0.value.publishedAt > $1.value.publishedAt }
+            .sorted {
+                $0.value.publishedAt == $1.value.publishedAt
+                    ? $0.key < $1.key
+                    : $0.value.publishedAt > $1.value.publishedAt
+            }
             .prefix(entryLimit)
         return Dictionary(uniqueKeysWithValues: kept.map { ($0.key, $0.value) })
     }

@@ -83,11 +83,49 @@ class SonarDescriptorCacheTest {
         assertEquals(emptyMap(), decodeSonarDescriptorCache(""))
     }
 
+    /** `eraseAllChats()` clears chats and links but not the descriptor map, so
+     *  without a cap a long-lived identity grows the blob forever — and it is
+     *  decoded synchronously on the cold-start path. iOS caps at the same limit. */
+    @Test
+    fun keepsOnlyTheFreshestDescriptorsWhenOverTheCap() {
+        val overCap = SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT + 50
+        val cache = (0 until overCap).associate { i ->
+            i.toString(16).padStart(64, '0') to descriptor(publishedAtSecs = i.toLong())
+        }
+
+        val decoded = decodeSonarDescriptorCache(encodeSonarDescriptorCache(cache))
+
+        assertEquals(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT, decoded.size)
+        // The 50 oldest are dropped, the newest are kept.
+        assertEquals(null, decoded[0.toString(16).padStart(64, '0')])
+        assertEquals(
+            (overCap - 1).toLong(),
+            decoded[(overCap - 1).toString(16).padStart(64, '0')]?.publishedAtSecs,
+        )
+    }
+
+    /** Ties on publishedAtSecs break on the key, so the persisted blob does not
+     *  churn between runs for an unchanged cache. */
+    @Test
+    fun pruningIsDeterministicWhenTimestampsTie() {
+        val overCap = SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT + 10
+        val cache = (0 until overCap).associate { i ->
+            i.toString(16).padStart(64, '0') to descriptor(publishedAtSecs = 7L)
+        }
+
+        val first = encodeSonarDescriptorCache(cache)
+        val second = encodeSonarDescriptorCache(cache.entries.reversed().associate { it.key to it.value })
+
+        assertEquals(first, second)
+        assertEquals(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT, decodeSonarDescriptorCache(first).size)
+    }
+
     private fun descriptor(
         bolt12Offer: String? = "lno1qcp4256ypq",
         paymentReceipts: List<String> = listOf("sonar.payment.receipt.v1"),
         callIdentity: String = "iroh-hkdf-sonar-call-iroh-v1",
         media: List<String> = listOf("voice", "video"),
+        publishedAtSecs: Long = 1_753_000_000L,
     ) = SonarDescriptor(
         schema = 2,
         calls = true,
@@ -97,6 +135,6 @@ class SonarDescriptorCacheTest {
         callIdentity = callIdentity,
         bolt12Offer = bolt12Offer,
         paymentReceipts = paymentReceipts,
-        publishedAtSecs = 1_753_000_000L,
+        publishedAtSecs = publishedAtSecs,
     )
 }

@@ -334,15 +334,30 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
         }
     }
 
+/** Cap on the persisted descriptor set. Descriptors are bounded by how many
+ *  contacts exist, but `eraseAllChats()` does not clear the in-memory map, so a
+ *  long-lived identity would otherwise grow the blob without limit — and it is
+ *  decoded synchronously at startup. Mirrors iOS
+ *  `SNMarmotDescriptorCache.entryLimit`. */
+internal const val SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT = 1024
+
 /** Encode the resolved-descriptor cache (npub hex → descriptor) for durable
  *  storage. Every string rides through [hexEnc] so an offer or capability token
- *  can never corrupt the tab/newline framing. */
+ *  can never corrupt the tab/newline framing. Over the cap, the freshest
+ *  descriptors win. */
 internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
     descriptors.entries
         .mapNotNull { (key, descriptor) ->
             val npubHex = normalizedDescriptorCacheKey(key) ?: return@mapNotNull null
             npubHex to descriptor
         }
+        // Newest first so the cap keeps the freshest descriptors, with the key
+        // as tiebreak so the pruned set (and the blob) is deterministic.
+        .sortedWith(
+            compareByDescending<Pair<String, SonarDescriptor>> { it.second.publishedAtSecs }
+                .thenBy { it.first }
+        )
+        .take(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT)
         .sortedBy { it.first }
         .joinToString("\n") { (npubHex, d) ->
             listOf(
