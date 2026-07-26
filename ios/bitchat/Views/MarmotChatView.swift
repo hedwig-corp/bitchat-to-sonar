@@ -1108,6 +1108,27 @@ final class MarmotChatModel: ObservableObject {
         return detail.localizedCaseInsensitiveContains("already in flight")
     }
 
+    /// Core aborted this call because the node is being closed for background
+    /// suspension (R-016), not because the relay failed. Must never reach
+    /// `errorText`: the app is on its way to the background, the sync watermark
+    /// was not advanced, and the next foreground resume or push wake re-runs it.
+    /// Matches the message because `SonarFfiError` is a flat error — the marker
+    /// is `SUSPEND_INTERRUPT_MARKER` in `core/sonar-ffi/src/lib.rs`.
+    private static func isSuspendInterrupted(_ error: Error) -> Bool {
+        let detail: String
+        if let service = error as? MarmotService.ServiceError {
+            switch service {
+            case .core(let message), .invalidInput(let message):
+                detail = message
+            default:
+                return false
+            }
+        } else {
+            detail = error.localizedDescription
+        }
+        return detail.localizedCaseInsensitiveContains("interrupted for suspend")
+    }
+
     private func connectRelaysIfNeeded() {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
@@ -1578,7 +1599,10 @@ final class MarmotChatModel: ObservableObject {
                 try await service.syncOnce()
                 self.errorText = nil
             } catch {
-                self.errorText = Self.describe(error)
+                // A suspend abort is not a relay failure — leave the banner alone.
+                if !Self.isSuspendInterrupted(error) {
+                    self.errorText = Self.describe(error)
+                }
             }
             let notifications = (try? await service.drainPending()) ?? []
             if !notifications.isEmpty {
@@ -2159,7 +2183,10 @@ final class MarmotChatModel: ObservableObject {
                 self.errorText = nil
             } catch {
                 if Task.isCancelled { return [DrainNotificationInfo]() }
-                self.errorText = Self.describe(error)
+                // A suspend abort is not a relay failure — leave the banner alone.
+                if !Self.isSuspendInterrupted(error) {
+                    self.errorText = Self.describe(error)
+                }
             }
             if Task.isCancelled { return [DrainNotificationInfo]() }
             let notifications = (try? await self.service.drainPending()) ?? [DrainNotificationInfo]()

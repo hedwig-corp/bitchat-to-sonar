@@ -530,6 +530,23 @@ core `sonar-ffi/src/lib.rs::block_on_suspendable`. Compose: not applicable —
 Android has no RunningBoard shared-container file-lock kill; nothing calls
 `interruptForSuspend` there (the binding exists but is inert).
 
+**The abort must not read as a failure.** A suspend abort is a deliberate
+control-flow signal, not a relay error, and two host paths originally treated it
+as one — both are regressions this entry now owns:
+`MarmotChatModel.refreshWhenConnected` / the `ensureGapRecovery` task wrote it
+to `errorText`, showing the user a literal "sync interrupted for suspend"
+banner on the next foreground; and `SonarPushRegistration.attemptRegistration`
+classified it `.failed`, burning all three attempts with 2s+4s backoff sleeps
+against a node whose latch is one-way and can never succeed. Both now classify
+it terminal: `MarmotChatModel.isSuspendInterrupted` suppresses the banner, and
+`RegistrationAttempt.suspended` defers to the next `setSonarNode()`. Because
+`SonarFfiError` is `#[uniffi(flat_error)]` only the rendered message crosses the
+boundary, so both match the substring named by `SUSPEND_INTERRUPT_MARKER`
+(`core/sonar-ffi/src/lib.rs`) — the same message-matching pattern already used
+by `isMediaUploadInFlight`. **Renaming that marker silently breaks both hosts**;
+the constant exists so the Rust side has one source of truth and the tests
+assert against it rather than a duplicated literal.
+
 **Guarded by:** `lib.rs::interrupted_node_fails_sync_fast_instead_of_parking`, `lib.rs::interrupt_aborts_in_flight_suspendable_wait`
 
 **Not guarded:** the Swift half — that `closeNode()` actually fires the

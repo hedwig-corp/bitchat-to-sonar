@@ -659,6 +659,16 @@ pub struct SonarNode {
     call: Mutex<Option<Arc<sonar_core::call::engine::CallEngine>>>,
 }
 
+/// Stable marker at the end of every suspend-aborted error message.
+///
+/// `SonarFfiError` is `#[uniffi(flat_error)]`, so only the rendered message
+/// crosses the FFI boundary — the Swift host tells a deliberate suspend abort
+/// apart from a real relay failure by matching this substring. Changing the
+/// text is a breaking change for `MarmotChatModel.isSuspendInterrupted` and
+/// `SonarPushRegistration.attemptRegistration` (see `docs/REGRESSIONS.md`,
+/// R-016); keep the two in sync.
+pub const SUSPEND_INTERRUPT_MARKER: &str = "interrupted for suspend";
+
 impl SonarNode {
     /// `block_on`, but racing the suspend latch: when `interrupt_for_suspend()`
     /// fires (or already fired), the future is dropped at its next await point
@@ -678,7 +688,7 @@ impl SonarNode {
             tokio::select! {
                 biased;
                 _ = interrupted.wait_for(|suspending| *suspending) => Err(
-                    SonarFfiError::Core(format!("{what} interrupted for suspend"))
+                    SonarFfiError::Core(format!("{what} {SUSPEND_INTERRUPT_MARKER}"))
                 ),
                 result = fut => result.map_err(Into::into),
             }
@@ -3286,7 +3296,7 @@ mod tests {
         let started = std::time::Instant::now();
         let err = node.sync_once().expect_err("interrupted sync must fail");
         assert!(
-            err.to_string().contains("interrupted for suspend"),
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
             "unexpected error: {err}"
         );
         let err = node
@@ -3297,7 +3307,7 @@ mod tests {
             )
             .expect_err("interrupted registration must fail");
         assert!(
-            err.to_string().contains("interrupted for suspend"),
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
             "unexpected error: {err}"
         );
         assert!(
@@ -3328,7 +3338,7 @@ mod tests {
         let (result, elapsed) = parked.join().expect("parked thread joins");
         let err = result.expect_err("interrupted in-flight wait must fail");
         assert!(
-            err.to_string().contains("interrupted for suspend"),
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
             "unexpected error: {err}"
         );
         assert!(

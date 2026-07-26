@@ -211,6 +211,12 @@ final class SonarPushRegistration: @unchecked Sendable {
                     // The next `setSonarNode()` re-registers.
                     Self.log.info("Transponder: SonarNode released, deferring registration")
                     return
+                case .suspended:
+                    // Node is closing for suspension; the latch is one-way, so
+                    // retrying only burns the budget. The next `setSonarNode()`
+                    // after reconnect re-registers.
+                    Self.log.info("Transponder: node suspending, deferring registration")
+                    return
                 case .failed(let error):
                     Self.log.warning("Transponder registration attempt \(attempt)/\(Self.maxRetries) failed: \(error)")
                     if attempt < Self.maxRetries { sleep(backoff) }
@@ -223,6 +229,11 @@ final class SonarPushRegistration: @unchecked Sendable {
     private enum RegistrationAttempt {
         case registered
         case nodeGone
+        /// Core aborted the call because the node is closing for background
+        /// suspension (R-016). Terminal like `nodeGone`, not retryable: the
+        /// latch is one-way for that node's lifetime, so every retry would fail
+        /// the same way while burning the attempt budget and its backoff sleeps.
+        case suspended
         case failed(Error)
     }
 
@@ -234,6 +245,11 @@ final class SonarPushRegistration: @unchecked Sendable {
             try node.registerPushToken(platform: "apns", token: token, serverNpub: npub)
             return .registered
         } catch {
+            // Matches `SUSPEND_INTERRUPT_MARKER` in core/sonar-ffi/src/lib.rs.
+            // `SonarFfiError` is a flat error, so the message is all we get.
+            if "\(error)".localizedCaseInsensitiveContains("interrupted for suspend") {
+                return .suspended
+            }
             return .failed(error)
         }
     }
