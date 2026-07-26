@@ -9061,16 +9061,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      * Text goes first so a link with attachments reads as a caption above its
      * files, matching the order a composer send produces.
      */
-    fun sendPendingShare(chat: SonarChat) {
+    fun sendPendingShare(chatId: String, open: () -> Unit) {
         val content = pendingShare ?: return
         pendingShare = null
         // Leave the picker before opening the chat so Back from the chat lands
         // on Home rather than re-showing the resolved share.
         back()
-        openChat(chat)
-        content.text?.takeIf { it.isNotBlank() }?.let { send(chat.id, it) }
+        open()
+        content.text?.takeIf { it.isNotBlank() }?.let { send(chatId, it) }
         if (content.files.files.isNotEmpty()) {
-            sendDroppedAttachments(chat.id, content.files)
+            sendDroppedAttachments(chatId, content.files)
         } else if (content.files.rejectedCount > 0) {
             toast = "Some files couldn't be attached."
         }

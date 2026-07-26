@@ -372,21 +372,25 @@ class MainActivity : ComponentActivity() {
                     ?: emptyList()
         }
 
-        // Consume the payload from the in-process Intent. This covers onNewIntent
-        // re-delivery of the same Intent and same-process activity recreation
-        // (rotation), which would otherwise re-offer a share the user already
-        // sent. removeExtra mutates only this in-process Intent, not the task's
-        // stored root intent, so a share re-offered after a cold start (process
-        // death + task restore) is a known remaining gap. Same pattern as
-        // handleNotificationIntent.
-        intent.removeExtra(Intent.EXTRA_TEXT)
-        intent.removeExtra(Intent.EXTRA_STREAM)
+        // Consume the payload from the in-process Intent only once the copy has
+        // been handed off to SonarLifecycle. Consuming after the hand-off is
+        // what makes a cancelled copy retryable: a configuration change can
+        // destroy the activity (cancelling the lifecycleScope read) before the
+        // extras are cleared, and the recreated activity re-reads the same
+        // Intent and retries — whereas clearing up front would lose the share
+        // with nothing to resend. This still covers onNewIntent re-delivery of
+        // the same Intent and same-process recreation. removeExtra mutates only
+        // this in-process Intent, not the task's stored root intent, so a share
+        // re-offered after a cold start (process death + task restore) is a
+        // known remaining gap. Same pattern as handleNotificationIntent.
 
         // Pure text share: there is no content:// I/O to do, so submit
         // synchronously and avoid adding any latency before the picker opens.
         if (uris.isEmpty()) {
             if (text == null) return
             SonarLifecycle.submitSharedContent(SharedContent(text, DroppedFiles(emptyList(), 0)))
+            intent.removeExtra(Intent.EXTRA_TEXT)
+            intent.removeExtra(Intent.EXTRA_STREAM)
             return
         }
 
@@ -401,10 +405,16 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             val files = withContext(Dispatchers.IO) { readSharedFiles(uris) }
             if (text == null && files.files.isEmpty()) {
-                if (files.rejectedCount > 0) SonarLifecycle.submitSharedContent(SharedContent(null, files))
+                if (files.rejectedCount > 0) {
+                    SonarLifecycle.submitSharedContent(SharedContent(null, files))
+                    intent.removeExtra(Intent.EXTRA_TEXT)
+                    intent.removeExtra(Intent.EXTRA_STREAM)
+                }
                 return@launch
             }
             SonarLifecycle.submitSharedContent(SharedContent(text, files))
+            intent.removeExtra(Intent.EXTRA_TEXT)
+            intent.removeExtra(Intent.EXTRA_STREAM)
         }
     }
 

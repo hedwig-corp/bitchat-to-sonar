@@ -1000,6 +1000,11 @@ final class SonarAppStore: ObservableObject {
     /// Drives the "Send to…" picker — see `SonarShareIntake`.
     @Published var pendingShare: SNPendingShare?
 
+    /// Payload ids currently being sent. `ingestPendingShares` must skip these:
+    /// the staged manifest stays on disk until the async send finishes, and a
+    /// rescan in that window would re-offer the same text and files.
+    var inFlightSharePayloadIDs: Set<String> = []
+
     /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
     /// Survives leaving a chat and returning within the same process; cleared on send.
     /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate

@@ -52,6 +52,7 @@ extension SonarAppStore {
 
         let groupID = Self.shareAppGroupID
         let payloads = SonarShareInbox.pendingPayloads(appGroupID: groupID)
+            .filter { !inFlightSharePayloadIDs.contains($0.id) }
         guard let payload = payloads.first else {
             ingestLegacySharedContent()
             return
@@ -143,6 +144,7 @@ extension SonarAppStore {
 
         let groupID = Self.shareAppGroupID
         let payloadID = share.payload.id
+        inFlightSharePayloadIDs.insert(payloadID)
         let text = share.text?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fileURLs = share.fileURLs
         let droppedCount = share.payload.droppedCount
@@ -155,6 +157,7 @@ extension SonarAppStore {
         }
 
         guard !fileURLs.isEmpty else {
+            inFlightSharePayloadIDs.remove(payloadID)
             SonarShareInbox.discard(payloadID, appGroupID: groupID)
             if droppedCount > 0 {
                 showToast("\(droppedCount) file\(droppedCount == 1 ? "" : "s") couldn't be attached")
@@ -175,6 +178,7 @@ extension SonarAppStore {
                 // different recipient would fail identically, so drop the
                 // staged copies rather than leaking them until the 24h prune.
                 SonarShareInbox.discard(payloadID, appGroupID: groupID)
+                inFlightSharePayloadIDs.remove(payloadID)
                 return
             }
 
@@ -200,10 +204,12 @@ extension SonarAppStore {
                 showToast("This contact must be online to receive files")
                 // Transient failure — keep the staged files and restore the
                 // picker so the user can retry instead of losing the payload.
+                inFlightSharePayloadIDs.remove(payloadID)
                 pendingShare = filesOnlyRetry
                 return
             case .failed:
                 showToast("Couldn't set up a secure file transfer")
+                inFlightSharePayloadIDs.remove(payloadID)
                 pendingShare = filesOnlyRetry
                 return
             }
@@ -222,6 +228,7 @@ extension SonarAppStore {
             // At least one send was attempted, so the staged copies are now dead
             // weight — discard only after the loop, never on a route failure.
             SonarShareInbox.discard(payloadID, appGroupID: groupID)
+            inFlightSharePayloadIDs.remove(payloadID)
             // `droppedCount` covers what the extension could not stage at all,
             // so a partly-delivered multi-file share never looks complete.
             let offered = result.attachments.count + result.rejectedCount + droppedCount

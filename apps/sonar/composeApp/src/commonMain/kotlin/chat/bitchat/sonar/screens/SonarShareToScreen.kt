@@ -29,8 +29,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.HomeMessageRow
 import chat.bitchat.sonar.SonarAppState
-import chat.bitchat.sonar.SonarChat
+import chat.bitchat.sonar.mergeHomeMessageRows
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
@@ -63,9 +64,18 @@ fun SonarShareToScreen(state: SonarAppState) {
 
     var q by remember { mutableStateOf("") }
     val ql = q.trim().lowercase()
-    val chats: List<SonarChat> = remember(state.visibleChats, ql) {
-        if (ql.isEmpty()) state.visibleChats
-        else state.visibleChats.filter { it.name.lowercase().contains(ql) }
+    val rows: List<HomeMessageRow> = remember(state.meshDmRows, state.visibleChats, ql) {
+        val merged = mergeHomeMessageRows(state.meshDmRows, state.visibleChats) { chatId ->
+            state.marmotRow(chatId).tsSecs
+        }
+        if (ql.isEmpty()) merged
+        else merged.filter { row ->
+            val name = when (row) {
+                is HomeMessageRow.Mesh -> row.row.name
+                is HomeMessageRow.Marmot -> row.chat.name
+            }
+            name.lowercase().contains(ql)
+        }
     }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
@@ -128,7 +138,7 @@ fun SonarShareToScreen(state: SonarAppState) {
         }
 
         LazyColumn(Modifier.fillMaxSize()) {
-            if (chats.isEmpty()) {
+            if (rows.isEmpty()) {
                 item {
                     Text(
                         if (ql.isEmpty()) "No chats yet. Start a chat first, then share into it."
@@ -139,18 +149,44 @@ fun SonarShareToScreen(state: SonarAppState) {
                 }
             } else {
                 item { SNSectionLabel("Messages") }
-                items(chats, key = { "share:" + it.id }) { chat ->
+                items(rows, key = { it.listKey }) { homeRow ->
+                    val name = when (homeRow) {
+                        is HomeMessageRow.Mesh -> homeRow.row.name
+                        is HomeMessageRow.Marmot -> homeRow.chat.name
+                    }
                     Row(
                         Modifier.fillMaxWidth()
-                            .clickable { state.sendPendingShare(chat) }
+                            .clickable {
+                                when (homeRow) {
+                                    is HomeMessageRow.Mesh ->
+                                        state.sendPendingShare(homeRow.listKey) {
+                                            state.openDm(homeRow.row.peerId, homeRow.row.name)
+                                        }
+                                    is HomeMessageRow.Marmot ->
+                                        state.sendPendingShare(homeRow.chat.id) {
+                                            state.openChat(homeRow.chat)
+                                        }
+                                }
+                            }
                             .padding(horizontal = 16.dp, vertical = 9.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        SonarAvatar(chat.name, 44.dp, presence = false)
+                        // Mesh rows carry the in-range dot like Home does: an
+                        // out-of-range BLE peer cannot take an attachment, so
+                        // the user should see that before picking it.
+                        SonarAvatar(
+                            name,
+                            44.dp,
+                            presence = homeRow is HomeMessageRow.Mesh &&
+                                state.dmInRange(homeRow.row.peerId),
+                        )
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
-                            Text(chat.name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Secure chat", color = s.text3, fontSize = 12.5.sp)
+                            Text(name, color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                if (homeRow is HomeMessageRow.Mesh) "Bluetooth" else "Secure chat",
+                                color = s.text3, fontSize = 12.5.sp
+                            )
                         }
                     }
                 }

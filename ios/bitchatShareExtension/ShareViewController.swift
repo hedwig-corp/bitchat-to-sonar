@@ -257,7 +257,13 @@ final class ShareViewController: UIViewController {
             group.enter()
             provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, _ in
                 defer { group.leave() }
-                guard let url else { return }
+                guard let url else {
+                    // No temp representation vended. Count it, or a multi-file
+                    // share silently omits this attachment and still reports
+                    // complete success.
+                    queue.sync { staged.unreadableCount += 1 }
+                    return
+                }
                 // loadFileRepresentation's URL is valid only inside this
                 // callback, so copy synchronously before returning.
                 queue.sync {

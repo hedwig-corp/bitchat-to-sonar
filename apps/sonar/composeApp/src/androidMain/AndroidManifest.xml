@@ -75,9 +75,13 @@
                     android:pathPrefix="/join" />
             </intent-filter>
             <!-- Share sheet target. text/plain carries links and text; the
-                 wildcard types carry photos, videos and documents, which land
-                 in EXTRA_STREAM and are read through the ContentResolver in
-                 MainActivity.handleShareIntent. -->
+                 explicit image/video/audio/application types cover the common
+                 cases, and the "*/*" wildcard is what matches iOS's arbitrary
+                 `public.data` acceptance so a provider sharing text/csv,
+                 text/calendar, font/*, etc. still offers Sonar. The explicit
+                 entries stay to document intent. Whatever the provider vends,
+                 readSharedFiles normalizes an unknown MIME through
+                 encryptedAttachmentMime. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
@@ -87,6 +91,7 @@
                 <data android:mimeType="video/*" />
                 <data android:mimeType="audio/*" />
                 <data android:mimeType="application/*" />
+                <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
 
