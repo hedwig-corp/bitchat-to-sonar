@@ -2343,10 +2343,16 @@ final class MarmotChatModel: ObservableObject {
     /// it and the process suspends still holding the App Group flock and the
     /// SQLCipher locks — the RunningBoard 0xdead10cc kill.
     ///
-    /// Nothing renders while backgrounded, so these are pure waste there. Both
-    /// callers re-run on the next foreground pass: `ensureProfile` via
-    /// `refreshStaleProfiles()`, `ensureSonarDescriptor` via its TTL /
-    /// miss-retry windows. The push-notification title path is unaffected —
+    /// Nothing renders while backgrounded, so these are pure waste there.
+    ///
+    /// This self-heals because the guard sits BEFORE the `profileFetches` /
+    /// `descriptorFetches` in-flight inserts: a skipped npub leaves no marker, so the
+    /// next foreground `loadLocalSummaries(resolveMembers: true)` simply calls it again
+    /// and it proceeds. Do not move the guard below those inserts — that would leave a
+    /// permanent in-flight marker for an npub that was never fetched and suppress it
+    /// forever. Note `refreshStaleProfiles()` does NOT cover this: it only clears
+    /// entries whose `profileFetchedAt` is older than the TTL, and a skipped npub has
+    /// no `profileFetchedAt` entry at all. The push-notification title path is unaffected —
     /// `resolveSenderName(npub:)` awaits `service.fetchProfile` directly instead
     /// of going through `ensureProfile`.
     private var canPrefetchFromRelays: Bool {

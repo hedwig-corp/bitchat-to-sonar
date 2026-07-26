@@ -189,10 +189,11 @@ final class SonarPushRegistration: @unchecked Sendable {
             return
         }
         let npub = self.transponderNpub
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        // `shared` singleton — no `[weak self]`; there is no lifetime concern here
+        // and implying one costs the reader a moment.
+        DispatchQueue.global(qos: .utility).async {
             var backoff: UInt32 = 2
             for attempt in 1...Self.maxRetries {
-                guard let self else { return }
                 // Re-read the node per attempt rather than capturing it, and keep
                 // the strong reference confined to `attemptRegistration` so it is
                 // released before the retry `sleep`. Holding a `SonarNode` across

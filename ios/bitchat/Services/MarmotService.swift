@@ -1446,6 +1446,21 @@ final class MarmotService: @unchecked Sendable {
     /// `MarmotStoreLock.release()` is idempotent and internally synchronized, so
     /// the regular `closeNode()` path may release the same lock again. `storeLock`
     /// is `nodeLock`-protected at every site (see `installStoreLockHold`).
+    ///
+    /// **Deliberate trade, and it breaks a documented invariant.** `MarmotStoreLock`'s
+    /// header says the main app holds the lock "while SonarNode is open"; after this
+    /// call that is false. The NSE's `tryAcquireExclusive()` can now succeed while our
+    /// Rust node still has the store open and may still be writing through a parked
+    /// FFI call. SQLite does its own locking so this is not corruption, but on a
+    /// background wake we prefer a concurrent NSE hydrate over a RunningBoard kill.
+    /// The window already existed — in-flight leases keep the node alive past
+    /// `closeNode()`'s `node = nil` — this widens it and makes it likely.
+    ///
+    /// **Deliberately does NOT set `nodeClosing`.** A foreground reconnect racing the
+    /// wake close can therefore see `storeLock == nil`, acquire a fresh lock via
+    /// `prepareStoreLockForConnectSync()`, and have the trailing `closeNode()` release
+    /// it out from under the reconnect. Fencing here would be worse: a fence stranded
+    /// by a close that never lands would block reconnect for the life of the process.
     func releaseStoreLockNow() {
         #if os(iOS)
         nodeLock.lock()

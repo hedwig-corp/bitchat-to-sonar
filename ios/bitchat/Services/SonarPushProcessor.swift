@@ -27,6 +27,22 @@ import SonarCore
 
 private struct SonarPushTimeoutError: Error {}
 
+/// Thread-safe completion latch for `closeStoreWithDeadline`.
+private final class SonarWakeCloseLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+    func complete() {
+        lock.lock()
+        done = true
+        lock.unlock()
+    }
+    var isComplete: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return done
+    }
+}
+
 enum SonarPushProcessor {
 
     /// userInfo key set by the NSE on Transponder placeholders. Cleanup must
@@ -185,19 +201,19 @@ enum SonarPushProcessor {
                 // past the ~30s iOS gives us. Awaiting that bare means the fetch
                 // completion handler never fires and we get suspended mid-close —
                 // exactly the 0xdead10cc kill this exists to prevent.
-                // `closeStoreAfterBackgroundWake()` drops the App Group flock
-                // synchronously before the await, so timing out here still leaves
-                // the shared-container lock released.
+                //
+                // The floor deliberately overshoots `marmotWakeWindowSeconds`'s 2s
+                // margin when the sync already burned the window: a 1s budget would
+                // guarantee the close never lands, and dropping the node matters
+                // more than the margin. The flock is already released synchronously
+                // by `closeStoreAfterBackgroundWake()`, so an overrun here costs a
+                // late node teardown, not a held shared-container lock.
                 let closeBudget = max(
                     Self.marmotWakeCloseMinSeconds,
                     Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
                 )
-                do {
-                    try await withTimeout(seconds: closeBudget) {
-                        await marmot.closeStoreAfterBackgroundWake()
-                    }
-                } catch {
-                    log.warning("Marmot store close exceeded the wake window: \(error)")
+                if await closeStoreWithDeadline(marmot: marmot, seconds: closeBudget) == false {
+                    log.warning("Marmot store close did not land in \(Int(closeBudget))s — flock already released, node teardown continues in background")
                 }
                 if UIApplication.shared.applicationState != .background {
                     // The user foregrounded WHILE closeNode() awaited — the
@@ -746,6 +762,40 @@ enum SonarPushProcessor {
                 continuation.resume()
             }
         }
+    }
+
+    /// Wait up to `seconds` for the store close, then give up WITHOUT waiting for it.
+    ///
+    /// Deliberately not `withTimeout`: that is built on `withThrowingTaskGroup`, and
+    /// a task group awaits its child tasks before returning or rethrowing. Cancellation
+    /// is cooperative, and `closeNode()` parks in `withCheckedContinuation` behind a
+    /// serial queue inside uncancellable Rust — so a group-based deadline expires and
+    /// then blocks for the full close anyway. #446 made the *sync* deadline land by
+    /// adding `Task.isCancelled` checks to the `ensureConnected()` /
+    /// `ensureRelayConnected()` poll loops; the close has no such seam. Abandoning the
+    /// wait is the only thing that actually bounds it.
+    ///
+    /// Returning early is safe because `closeStoreAfterBackgroundWake()` releases the
+    /// App Group flock synchronously before its first await, so the shared-container
+    /// lock is gone even when the node teardown lands late.
+    ///
+    /// Returns true when the close completed inside the budget.
+    @MainActor
+    private static func closeStoreWithDeadline(
+        marmot: MarmotChatModel,
+        seconds: TimeInterval
+    ) async -> Bool {
+        let latch = SonarWakeCloseLatch()
+        Task.detached(priority: .userInitiated) {
+            await marmot.closeStoreAfterBackgroundWake()
+            latch.complete()
+        }
+        let start = Date()
+        while Date().timeIntervalSince(start) < seconds {
+            if latch.isComplete { return true }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return latch.isComplete
     }
 
     private static func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {
