@@ -570,9 +570,22 @@ backgrounded** — reintroducing the very kill this entry exists to prevent, and
 doing it *more* often than before, since the call now fails fast where it used
 to block. (`closeStoreAfterBackgroundWake()` already cancels `relayConnectTask`
 for exactly this reason; the scenePhase `suspendStoreForBackground()` path does
-not.) The handler now treats the marker as terminal and simply stops the loop —
-foreground resume restarts polling via `performConnect`. Before making any
-further call suspendable, read its callers' error paths first.
+not.) Before making any further call suspendable, read its callers' error paths
+first.
+
+There are **three** such handlers, and they were found one at a time across
+three review rounds — if a fourth suspendable call is ever added, audit for a
+fourth handler rather than assuming these are all of them:
+  - the polling loop's *idle* branch (the one described above);
+  - the polling loop's *live* branch, where `try?` silently swallowed the
+    marker — harmless-looking, except the loop then iterated once more and that
+    iteration's `notConnected` fell into the idle catch and armed the reconnect
+    anyway, so the bug arrived by a longer route;
+  - `performRelayConnect`'s generic catch, because `connect()` *ends* with a
+    (suspendable) `retryOutbox()`, so a background transition mid-connect
+    surfaces the marker there and it would schedule its own retry.
+All three now return without arming a reconnect; foreground resume restarts
+polling via `performConnect`.
 
 **The abort must not read as a failure.** A suspend abort is a deliberate
 control-flow signal, not a relay error, and two host paths originally treated it

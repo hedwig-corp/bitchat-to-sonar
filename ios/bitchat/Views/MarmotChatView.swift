@@ -1200,6 +1200,12 @@ final class MarmotChatModel: ObservableObject {
                 return
             } catch {
                 self.relayConnected = false
+                // Same terminal rule as the polling loop: `connect()` finishes
+                // with a (suspendable) `retryOutbox()`, so a background
+                // transition mid-connect surfaces the marker here. Retrying
+                // would reopen the SQLCipher store after `closeNode()` clears
+                // `nodeClosing`, while still backgrounded.
+                if Self.isSuspendInterrupted(error) { return }
                 let desc = Self.describe(error)
                 SecureLogger.warning("⚠️ Marmot relay connect failed: \(desc)", category: .session)
                 self.errorText = desc
@@ -3794,7 +3800,19 @@ final class MarmotChatModel: ObservableObject {
                     // Steady live traffic keeps woke true; core throttles this
                     // pass, so most ticks are a cheap no-op. Do not retry the
                     // outbox here: that can republish in-flight Pending rows.
-                    try? await self.service.ensureSubscriptions()
+                    // `try?` elsewhere is fine, but a suspend abort must stop
+                    // the loop here too: swallowing it lets the loop iterate
+                    // once more, and that iteration's `notConnected` (the node
+                    // is gone by then) falls into the idle catch below and arms
+                    // a reconnect that reopens the store while backgrounded.
+                    do {
+                        try await self.service.ensureSubscriptions()
+                    } catch {
+                        if Self.isSuspendInterrupted(error) {
+                            self.syncTask = nil
+                            return
+                        }
+                    }
                 } else {
                     #if DEBUG
                     // SONAR_BENCH: first wait cycle resolved with no buffered events
