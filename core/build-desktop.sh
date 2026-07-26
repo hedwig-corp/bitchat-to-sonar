@@ -103,9 +103,13 @@ cargo run -p "$CRATE" --features cli --bin uniffi-bindgen -- generate \
 #     SEPARATE cargo workspace (its BLE deps stay out of sonar-ffi / CI). ---------
 BLE_LIB="$(echo "$LIB" | sed 's/sonar_ffi/sonar_ble/')"  # libsonar_ble.<ext>
 # SONAR_SKIP_BLE=1 skips the bridge build; BLE is optional at runtime (the app
-# runs internet-only without the dylib). CI uses this: the Linux peripheral dep
-# (bluster) does not compile on current stable Rust, and CI only needs the core
-# bindings + tests, not a radio.
+# runs internet-only without the dylib). Useful on a host without the BlueZ build
+# deps (Linux needs libdbus-1-dev via libdbus-sys/pkg-config) or when you only
+# need the core bindings.
+#
+# Linux note: the bridge builds the central/scan role only — the peripheral
+# (advertise + GATT server) role is CoreBluetooth-only, see run_peripheral in
+# sonar-ble/src/lib.rs and vendor/bluster/SONAR_PATCH.md.
 if [[ "${SONAR_SKIP_BLE:-0}" == "1" ]]; then
   echo "Skipping sonar-ble (SONAR_SKIP_BLE=1) — desktop BLE will be unavailable."
 else

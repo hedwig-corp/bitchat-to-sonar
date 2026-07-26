@@ -107,7 +107,7 @@ impl Advertisement {
         // Register with DBus
         let proxy = self.connection.get_bluez_proxy(&self.adapter);
         proxy
-            .method_call(
+            .method_call::<(), _, _, _>(
                 LE_ADVERTISING_MANAGER_IFACE,
                 "RegisterAdvertisement",
                 (
@@ -123,7 +123,7 @@ impl Advertisement {
     pub async fn unregister(self: &Self) -> Result<(), Error> {
         let proxy = self.connection.get_bluez_proxy(&self.adapter);
 
-        let method_call = proxy.method_call(
+        let method_call = proxy.method_call::<(), _, _, _>(
             LE_ADVERTISING_MANAGER_IFACE,
             "UnregisterAdvertisement",
             (&self.object_path,),

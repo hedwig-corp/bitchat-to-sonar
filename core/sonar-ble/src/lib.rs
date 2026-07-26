@@ -20,22 +20,32 @@
 
 use btleplug::api::{Central, CentralEvent, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::Manager;
+// The peripheral/advertise role is CoreBluetooth-only — see `run_peripheral`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::characteristic::{Characteristic, Properties, Read, Secure, Write};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::event::{Event, Response};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::gatt::service::Service;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use bluster::Peripheral;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+use std::collections::HashSet;
 use std::ffi::{c_char, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use uuid08::Uuid as Uuid08; // bluster's UUID version
 
 /// bitchat mesh GATT service + characteristic — must match the iOS/Android apps.
 const BITCHAT_SERVICE_U128: u128 = 0xF47B5E2D_4A9E_4C5A_9B3F_8E1D2C3A4B5C;
+// Only the peripheral role serves this characteristic (CoreBluetooth-only today).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const BITCHAT_CHAR_U128: u128 = 0xA1B2C3D4_E5F6_4A5B_8C9D_0E1F2A3B4C5D;
 const BITCHAT_SERVICE: Uuid = Uuid::from_u128(BITCHAT_SERVICE_U128);
 
@@ -329,6 +339,20 @@ pub unsafe extern "C" fn sonar_ble_notify(ptr: *const u8, len: usize) {
     }
 }
 
+/// Peripheral role is CoreBluetooth-only for now. The notify/write-drain side
+/// channel `run_peripheral` relies on (`Peripheral::notify`/`take_writes`) is a
+/// Sonar patch that exists solely in bluster's CoreBluetooth backend; the BlueZ
+/// backend carries no equivalent, and its cross-platform `gatt::event` channel
+/// is a different mechanism that has to be wired separately. Keeping the full
+/// C ABI on every target (the JVM `BleLib` binds all of it via JNA) and failing
+/// here means Linux gets the central/scan radar with advertising reported
+/// unavailable, rather than the whole crate failing to build.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
+    Err("peripheral/advertise role is not implemented for this platform".into())
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 async fn run_peripheral() -> Result<(), Box<dyn std::error::Error>> {
     let svc = Uuid08::from_u128(BITCHAT_SERVICE_U128);
     let chr = Uuid08::from_u128(BITCHAT_CHAR_U128);

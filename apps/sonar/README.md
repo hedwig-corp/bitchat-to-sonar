@@ -24,7 +24,8 @@ composeApp/src/
 | Encrypted media (MIP-04)            |   ✅    |   ✅    |
 | Profiles / verify safety numbers    |   ✅    |   ✅    |
 | Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
-| BLE mesh — discovery (both ways)    |   ✅    |   ✅ scan + advertise (CoreBluetooth/BlueZ) |
+| BLE mesh — discovery (scan)         |   ✅    |   ✅ macOS (CoreBluetooth) + Linux (BlueZ) |
+| BLE mesh — advertise + GATT server  |   ✅    |   ✅ macOS only — ⚪️ not implemented on Linux/Windows |
 | BLE mesh — messaging (DMs/broadcast)|   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
 | Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
@@ -35,17 +36,20 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
 - **BLE mesh** was never a hardware or Compose limitation — it's a JVM-library
   gap (no pure-JVM BLE library). The desktop drives Bluetooth through a small
   native bridge, **`core/sonar-ble`**, loaded over JNA exactly like the Rust core,
-  in **both roles**:
+  in two roles:
   - **central/scan** (`btleplug` → CoreBluetooth/BlueZ) — the radar shows nearby
-    bitchat-mesh phones;
+    bitchat-mesh phones. Works on **macOS and Linux**;
   - **peripheral/advertise + GATT server** (`bluster`) — the desktop advertises
     the bitchat service and, when a phone subscribes, serves a signed **announce**
     built by the same `meshBuildAnnounce` Rust function the phones use, so the
-    phone shows the desktop as a named peer.
+    phone shows the desktop as a named peer. **macOS only** — the notify /
+    write-drain side channel this role is built on is a Sonar patch that exists
+    solely in bluster's CoreBluetooth backend, so on Linux the advertise calls
+    report unavailable and only the scan radar runs. Bringing it to BlueZ means
+    wiring bluster's cross-platform `gatt::event` channel, tracked separately.
 
-  (`bluster` is vendored + patched — upstream advertises macOS service UUIDs as
-  `NSString` instead of `CBUUID`, which CoreBluetooth rejects with "invalid
-  parameters"; see `core/sonar-ble/vendor/bluster/SONAR_PATCH.md`.) Still to come:
+  (`bluster` is vendored + patched; see
+  `core/sonar-ble/vendor/bluster/SONAR_PATCH.md`.) Still to come:
   the **Noise-over-GATT message transport** (encrypted DMs/broadcast over the
   link) — at which point the desktop joins the mesh fully.
   - **macOS permission**: BLE needs the Bluetooth grant. The packaged `.app`
@@ -60,6 +64,11 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
   LDK/CLN/LND bridge).
 
 ## Build & run — Desktop
+
+On Linux, install the BlueZ build deps first (the BLE bridge links `libdbus-sys`
+through pkg-config): `sudo apt-get install libdbus-1-dev pkg-config`. Without
+them, build with `SONAR_SKIP_BLE=1` to skip the bridge — the app then runs
+internet-only.
 
 ```bash
 # 1. Build the Rust core + BLE bridge for the host (one time, or after a change).
@@ -81,7 +90,9 @@ open /Applications/Sonar.app
 ```
 
 Desktop data (identity, encrypted Marmot DB, transcripts, prefs) lives under the
-OS app-data dir, e.g. `~/Library/Application Support/Sonar` on macOS.
+OS app-data dir: `~/Library/Application Support/Sonar` on macOS,
+`$XDG_DATA_HOME/Sonar` (default `~/.local/share/Sonar`) on Linux, and
+`%APPDATA%\Sonar` on Windows.
 
 ### Seeing mesh peers on the radar
 

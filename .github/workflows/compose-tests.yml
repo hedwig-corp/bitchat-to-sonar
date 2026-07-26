@@ -46,8 +46,12 @@ jobs:
       # needs a display even though it asserts on plain strings. xvfb gives the
       # job a virtual one. (The Compose UI tests themselves render via skiko in
       # software and pass headless; this is only for the AWT dependency.)
-      - name: Install xvfb (virtual display for AWT)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb
+      # libdbus-1-dev: the desktop BLE bridge (core/sonar-ble) links libdbus-sys
+      # for the BlueZ backend. Installing it lets this job build the bridge for
+      # real, so a Linux BLE build break is caught here instead of on a
+      # developer's machine.
+      - name: Install xvfb (virtual display for AWT) + BlueZ build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xvfb libdbus-1-dev pkg-config
 
       - name: Update Rust toolchain
         run: rustup update stable && rustup default stable
@@ -77,10 +81,10 @@ jobs:
             packages/transcript-engine-policy/golden/inset-follow.json \
             ios/localPackages/TranscriptEngine/Tests/Resources/inset-follow.json
 
-      - name: Run JVM unit tests (builds desktop Rust core + UniFFI bindings)
-        # SONAR_SKIP_BLE: the sonar-ble Linux peripheral dep (bluster) does not
-        # compile on current stable Rust; BLE is optional at runtime and the
-        # tests don't need a radio.
+      - name: Run JVM unit tests (builds desktop Rust core + BLE bridge + UniFFI bindings)
+        # The BLE bridge is built for real here (no SONAR_SKIP_BLE) so the Linux
+        # sonar-ble/bluster build stays green; the peripheral role is
+        # CoreBluetooth-only, so this covers the central/scan build path.
         # Also compile/test extracted transcript-engine modules so package-only
         # PRs cannot skip the new policy/host check surfaces.
         run: >
@@ -91,8 +95,6 @@ jobs:
           :composeApp:jvmTest
           --console=plain
         working-directory: apps/sonar
-        env:
-          SONAR_SKIP_BLE: '1'
 
   transcript-engine-spm:
     name: TranscriptEngine SPM tests
