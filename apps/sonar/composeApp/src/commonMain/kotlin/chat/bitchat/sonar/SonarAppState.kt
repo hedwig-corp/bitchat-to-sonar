@@ -933,6 +933,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             endTranscriptSession()
             relayConnectJob?.cancel(); relayConnectJob = null
             resetStartupFlags()
+            refreshRelayOnline()
             val marmotDeliveryGeneration = cancelPendingMarmotPeerDeliveryJobs { MeshRadio.stop() }
             try {
             cancelPendingMarmotSetups()
@@ -1063,6 +1064,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 resumePendingMarmotPeerDelivery(marmotDeliveryGeneration)
             }
             resetStartupFlags()
+            refreshRelayOnline()
             localCoreReady = true
             homeMessagesHydrated = true
             // The node is recreated → re-bind the iroh call endpoint on next use.
@@ -3465,6 +3467,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 housekeepingJob = null
                 marmotWakeJob = null
                 resetStartupFlags()
+                refreshRelayOnline()
                 toJoin.forEach { it.cancel() }
                 toJoin.forEach { job ->
                     runCatching { withTimeoutOrNull(3_000) { job.join() } }
@@ -3585,6 +3588,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 housekeepingJob = null
                 marmotWakeJob = null
                 resetStartupFlags()
+                refreshRelayOnline()
                 toJoin.forEach { it.cancel() }
                 toJoin.forEach { job ->
                     runCatching { withTimeoutOrNull(3_000) { job.join() } }
@@ -4350,11 +4354,24 @@ class SonarAppState(private val scope: CoroutineScope) {
                             // listener, the wake loop or the invite drain until relays
                             // finally came up.
                             completeLocalStartup()
+                            // "connecting…" is a claim that this is about to work.
+                            // After the first failure it is not: the job retries
+                            // for as long as relays are down, and while the flag
+                            // stays up the chip can never reach its offline copy
+                            // ("N nearby on Bluetooth") — the one useful thing it
+                            // has to say in exactly this state.
+                            if (consecutiveFailures == 1) relayConnecting = false
                             refreshRelayOnline()
-                            delay(RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures))
+                            delay(
+                                RelayConnectionPolicy.connectRetryDelayMs(
+                                    consecutiveFailures,
+                                    foreground,
+                                ),
+                            )
                             continue
                         }
                         consecutiveFailures = 0
+                        relayConnecting = true
                         npub = result.getOrThrow()
                         SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                     }
@@ -4451,9 +4468,6 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun resetStartupFlags() {
         relayStartupCompleted = false
         localStartupCompleted = false
-        // A teardown/wipe replaces or closes the node, so the chip must not keep
-        // claiming internet from the previous session's latch.
-        refreshRelayOnline()
     }
 
     /**
@@ -4579,6 +4593,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (started || connecting) return
         connecting = true
         resetStartupFlags()
+        refreshRelayOnline()
         homeMessagesHydrated = false
         localCoreReady = false
         Notifier.ensureChannel()

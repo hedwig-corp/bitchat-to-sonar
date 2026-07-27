@@ -1087,12 +1087,21 @@ its coverage is worse than an honest hole, because it stops people looking.
   and on the heartbeat), matching iOS `SonarAppStore.online`, which is already
   gated on `marmot.relayConnected`; the failure path logs via `sonarLog` like
   iOS does. **Pinned:** only the retry schedule
-  (`RelayConnectionPolicyTest.first_connect_failure_retries_fast` /
-  `sustained_connect_failure_backs_off`). **Not pinned:** that no UI surface
-  reads `started` for internet state again, and that the failure path stays
-  toast-free — both need a constructed `SonarAppState` (same root cause as the
-  gaps above). A fifth surface hand-reading `started` is exactly the original
-  bug and nothing would catch it.
+  (`RelayConnectionPolicyTest.first_connect_failure_retries_fast_in_foreground`
+  / `sustained_connect_failure_backs_off` /
+  `backgrounded_attach_never_uses_the_fast_retries`). **Not pinned:** that no UI
+  surface reads `started` for internet state again, that the failure path stays
+  toast-free, and that `relayConnecting` is cleared on the first failure — all
+  three need a constructed `SonarAppState` (same root cause as the gaps above).
+  A fifth surface hand-reading `started` is exactly the original bug and nothing
+  would catch it. **The `relayConnecting` half is the sharper hole:** self-review
+  caught that leaving the flag up for the whole outage made
+  `StatusChipPill`'s `else -> "$meshCount nearby on Bluetooth"` branch
+  unreachable — the chip's offline copy, dead in exactly the state it exists
+  for. That bug lives in the interaction between a Compose flag and a `when`
+  branch order, which no test reachable today could see. If the chip's branch
+  order is ever rearranged, re-check that a sustained outage can still fall
+  through to the mesh count.
 - **A failed relay attach must still run the local half of startup.**
   `startRelayConnection()` `continue`d on failure *before* `completeLocalStartup()`,
   despite that function's own contract ("runs on every attach outcome … must not

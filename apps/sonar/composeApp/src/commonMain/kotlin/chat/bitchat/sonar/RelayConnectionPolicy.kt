@@ -76,13 +76,20 @@ object RelayConnectionPolicy {
      * The core gives the quorum a fixed 5 s window (`RELAY_CONNECT_TIMEOUT` in
      * `client.rs`), which a radio waking from doze, a Wi-Fi/LTE handover, or a
      * captive-portal hop routinely misses. Because [shouldInvalidateOnBackground]
-     * makes every ordinary resume re-run the attach, the common failure here is
-     * a network that is a second away from usable — not an outage. Retry fast at
-     * first so a resume heals in about a second, then settle into the slow
-     * interval once the failures look sustained (the heartbeat re-triggers the
-     * job at that cadence anyway).
+     * makes every ordinary resume re-run the attach, the common failure in the
+     * foreground is a network that is a second away from usable — not an outage.
+     * Retry fast at first so a resume heals in about a second, then settle into
+     * the slow interval once the failures look sustained (the heartbeat
+     * re-triggers the job at that cadence anyway).
+     *
+     * Backgrounded, skip the fast head entirely, for the same reason
+     * [shouldRetrySupersededAttach] refuses to loop there: every retry is a full
+     * `SonarNode.connect` — SQLCipher open, restore reconcile, relay dial — and
+     * rebuilding that against sockets the OS is suspending buys nothing. The
+     * push wake and the next foreground resume start a fresh job anyway.
      */
-    fun connectRetryDelayMs(consecutiveFailures: Int): Long = when {
+    fun connectRetryDelayMs(consecutiveFailures: Int, foreground: Boolean): Long = when {
+        !foreground -> RELAY_RETRY_SLOW_MS
         consecutiveFailures <= 1 -> RELAY_RETRY_FAST_MS
         consecutiveFailures == 2 -> RELAY_RETRY_MEDIUM_MS
         else -> RELAY_RETRY_SLOW_MS
