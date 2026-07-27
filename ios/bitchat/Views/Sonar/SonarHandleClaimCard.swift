@@ -129,10 +129,15 @@ struct SonarHandleClaimCard: View {
                 .strokeBorder(handleFocused ? SonarTheme.accent : Color.clear, lineWidth: 1.5)
         )
         .contentShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
-        .onTapGesture {
-            guard !claiming else { return }
+        // `simultaneousGesture` + the already-focused guard keep this handler
+        // out of the TextField's way: it only ever fires to grant first focus,
+        // so once the field is focused every tap belongs to the field itself
+        // (caret placement, selection). A plain `onTapGesture` would instead
+        // take priority over the field's own recognizers across the whole pill.
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !claiming, !handleFocused else { return }
             handleFocused = true
-        }
+        })
         .accessibilityLabel("Username")
 
         if !trimmedDraft.isEmpty {
@@ -170,6 +175,7 @@ struct SonarHandleClaimCard: View {
                 .foregroundColor(claimDisabled ? SonarTheme.text3 : SonarTheme.onAccent)
                 .padding(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                 .background(Capsule().fill(claimDisabled ? SonarTheme.surface2 : SonarTheme.accentFill))
+                .overlay(Capsule().strokeBorder(claimDisabled ? SonarTheme.hairline : Color.clear, lineWidth: 1))
                 .contentShape(Capsule())
             }
             .buttonStyle(.plain)

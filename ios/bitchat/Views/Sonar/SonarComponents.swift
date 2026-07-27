@@ -4532,6 +4532,13 @@ struct SNPrimaryButton: View {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(fill)
                 )
+                // Disabled shares `surface2` with the text-input pills, so
+                // without a stroke it reads as a third empty field on sheets
+                // that stack both (New group, Add people).
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(disabled ? SonarTheme.hairline : Color.clear, lineWidth: 1)
+                )
         }
         .buttonStyle(SNScaleStyle(scale: 0.98))
         .disabled(disabled)

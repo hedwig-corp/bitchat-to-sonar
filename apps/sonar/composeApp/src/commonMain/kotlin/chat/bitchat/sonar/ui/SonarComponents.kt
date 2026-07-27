@@ -2,6 +2,7 @@ package chat.bitchat.sonar.ui
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.clickable
@@ -126,6 +127,13 @@ fun SNPrimaryButton(
             .height(52.dp)
             .clip(RoundedCornerShape(15.dp))
             .background(if (disabled) s.surface2 else fill)
+            // Disabled shares `surface2` with the text-input pills, so without
+            // a stroke it reads as a third empty field on screens stacking both.
+            .border(
+                width = 1.dp,
+                color = if (disabled) s.hairline else Color.Transparent,
+                shape = RoundedCornerShape(15.dp),
+            )
             .clickable(enabled = !disabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
