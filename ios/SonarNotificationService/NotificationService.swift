@@ -191,6 +191,18 @@ class NotificationService: SDKNotificationService {
                     os_log("NSE: all drained notifications muted — suppressing banner",
                            log: Self.log, type: .info)
                     Self.recordDiagnostic("suppressed:muted count=\(notifications.count)")
+                    // An NSE cannot drop a notification, only blank it, so a
+                    // contentless row still lands in Notification Center.
+                    // Stamp the conversation id the host's mute branches pass
+                    // to removeDeliveredNSEOwnedBanners — a suppressed
+                    // placeholder never ran apply(), so without this it matches
+                    // nothing and the blank row sticks until the user swipes it.
+                    var mutedInfo = content.userInfo
+                    if let gid = notifications.first?.groupIdHex, !gid.isEmpty {
+                        mutedInfo[Self.conversationIdKey] =
+                            Self.marmotConversationPrefix + gid
+                    }
+                    content.userInfo = mutedInfo
                     Self.suppressTransponderNotification(content)
                     finish(with: content)
                     return

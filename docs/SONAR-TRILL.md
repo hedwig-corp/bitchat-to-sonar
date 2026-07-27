@@ -93,10 +93,16 @@ than the chat's notification level already allows.**
 | State | Behaviour |
 |---|---|
 | Blocked peer | Dropped at ingest. No row, no alert. |
-| Muted chat | Row + unread badge only. No shake/bell/haptic/notification. |
+| Muted chat | Row + unread badge only. No shake/bell/haptic/notification. [^nse-mute] |
 | OS DND / silent | Row + notification; the OS decides presentation. |
 | Foreground | Row + shake + bell + haptic. |
 | Background/killed | Row + notification with trill sound. |
+
+[^nse-mute]: On killed-app iOS the extension cannot drop a notification, only
+blank it — a contentless, `.passive` entry is still delivered. The NSE stamps
+the conversation id on that row so the host's mute branches remove it on the
+next wake via `removeDeliveredNSEOwnedBanners`. The same blank-row shape exists
+on the notifications-disabled path, which does not yet get that cleanup.
 
 ## Abuse guards
 
