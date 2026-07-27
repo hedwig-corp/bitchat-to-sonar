@@ -91,17 +91,26 @@ enum TransportConfig {
     // How long without seeing traffic before we sanity-check the direct link
     // Lowered to make connected→reachable icon changes react faster when walking out of range
     static let blePeerInactivityTimeoutSeconds: TimeInterval = 8.0
-    // How long to retain a peer as "reachable" (not directly connected) since lastSeen.
-    // Announce emissions are spaced [interval, interval + maintenance tick]
-    // apart (the cadence is only evaluated once per 5s tick), so the worst
-    // gap is 30+8+5 = 43s dense and 15+4+5 = 24s sparse. Surviving TWO lost
-    // announces means lasting until the THIRD emission: ≥ 3×43 = 129s dense,
-    // ≥ 3×24 = 72s sparse. Anything shorter evicts a relayed peer while it is
-    // still announcing on schedule and it flaps in and out of the radar.
+    // How long to retain a peer as "reachable" (not directly connected) since
+    // lastSeen. Announce emissions are spaced [interval, interval + maintenance
+    // tick] apart (the cadence is only evaluated once per 5s tick), so the
+    // worst gap is 30+8+5 = 43s. Surviving TWO lost announces means lasting
+    // until the THIRD emission: >= 3x43 = 129s. Anything shorter evicts a peer
+    // while it is still announcing on schedule and it flaps in and out of the
+    // radar.
+    //
+    // BOTH trust classes are sized for the DENSE gap deliberately. The cadence
+    // is picked from `connectedCount` in `performMaintenance` (topology) while
+    // the window below is picked from identity trust in
+    // `UnifiedPeerService.buildPeerFromMesh` — independent properties, so an
+    // unverified peer can perfectly well be announcing at 30+-8s. Sizing the
+    // unverified window for the sparse cadence made it flap after ONE loss.
+    // The two constants stay separate so the policy knob survives, but neither
+    // may drop below the dense bar.
     // Same failure-tolerance bar as the Rust mesh engine's LINK_STALE_MS
     // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
-    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0   // ≥ 3×(30+8+5)
-    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 75.0  // ≥ 3×(15+4+5)
+    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0    // >= 3x(30+8+5)
+    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 130.0  // >= 3x(30+8+5)
     // Window for DM TRANSPORT SELECTION, deliberately much tighter than the
     // radar windows above. `MessageRouter` is built as
     // `[meshService, nostrTransport]` and picks the first transport whose

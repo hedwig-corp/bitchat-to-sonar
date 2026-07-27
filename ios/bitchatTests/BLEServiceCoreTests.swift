@@ -283,12 +283,13 @@ struct BLEServiceCoreTests {
         let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
             + TransportConfig.bleConnectedAnnounceJitterDense
             + TransportConfig.bleMaintenanceInterval
-        let sparseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsSparse
-            + TransportConfig.bleConnectedAnnounceJitterSparse
-            + TransportConfig.bleMaintenanceInterval
 
+        // BOTH trust classes are held to the DENSE bar: the cadence comes from
+        // topology (`connectedCount`) and the window from identity trust, so an
+        // unverified peer can be announcing at 30+-8s. Holding the unverified
+        // window to the sparse gap let it flap after a single lost announce.
         #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds >= 3 * denseWorstGap)
-        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 3 * sparseWorstGap)
+        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 3 * denseWorstGap)
     }
 
     // The radar retention window must never leak into DM transport selection.
