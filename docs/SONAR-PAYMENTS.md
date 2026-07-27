@@ -112,6 +112,43 @@ report:
    start, so a wipe landing mid-flight cannot persist the old account's contacts
    into the new one.
 
+## Entry points
+
+There are two ways to start a payment:
+
+1. **From inside a chat** — the "+" composer action. Pays that conversation's
+   peer and posts the ⚡PAY receipt bubbles into the transcript.
+2. **From the new-chat sheet** — *Start a chat → Send a payment*, which opens
+   the standalone send-payment picker
+   (`SonarSendPaymentScreen.kt` / `SonarSendPaymentScreen.swift`, reproducing
+   the design's `SendPaymentScreen` in
+   `design/handoff/project/sonar/pay.jsx`). It offers two recipient kinds:
+   - **A contact** from "People you can pay" — every conversation whose peer
+     already published a BOLT12 offer. The payment is routed through
+     `sendPay(chatId)`, so it is identical to paying from inside the chat and
+     the peer still gets the in-chat receipt. The list is built **cache-only**:
+     it never fetches a descriptor, so opening the picker cannot block on the
+     relay. A contact whose descriptor has not arrived yet is simply not
+     listed.
+   - **Anyone else** — a BOLT12 offer (`lno1…`), a BOLT11 invoice
+     (`lnbc…`/`lntb…`), or a Lightning address (`name@domain`) typed into the
+     field. The wallet resolves the destination
+     (`payDestination` / `payDestinationDetached`). There is no conversation to
+     post a receipt into, so only the wallet activity row is written, with
+     `peerKey = "wallet"`.
+
+   An `npub` is deliberately **not** an external destination: it is a Sonar
+   identity, not something the wallet can pay. Such a person shows up under
+   "People you can pay" once their descriptor arrives.
+
+**Tracked gap (both platforms):** the design's "Scan a QR code" row is not
+implemented. Sonar has no camera decoder on Android/desktop (zxing is bundled
+for *encoding* invite QRs only), and shipping it on iOS alone would break the
+Cross-Platform Feature Rule. Follow-up: add a shared scanner (CameraX + a
+decoder on Android, the existing `AVCaptureMetadataOutput` path from
+`VerificationViews.swift` on iOS), then restore the row in both screens.
+Pasting the code into the field covers the same destinations meanwhile.
+
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,

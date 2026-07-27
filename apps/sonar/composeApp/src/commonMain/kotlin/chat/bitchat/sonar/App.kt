@@ -360,6 +360,7 @@ internal fun SonarScreenHost(state: SonarAppState) {
         is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
         is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
         is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
+        is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
     }
 }
 
@@ -4470,7 +4471,7 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
             ) {
                 if (findUsername) {
-                    Text("New discussion", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text("Find by username", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "Type a username — just vincenzo for @${state.handleDomain}, a full name@domain, or paste a key.",
@@ -4590,9 +4591,12 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                 ActionRow(SNIconName.Rings, "People nearby", "Open the radar to see everyone in range") {
                     onClose(); state.push(Screen.Nearby)
                 }
-                ActionRow(SNIconName.Key, "New discussion", "Username, name@domain, or paste a key — reaches anywhere") {
+                ActionRow(SNIconName.Key, "Find by username", "Username, name@domain, or paste a key — reaches anywhere") {
                     findUsername = true; groupEntry = false
                     findDraft = ""; findNpub = null; findMiss = false
+                }
+                ActionRow(SNIconName.Coin, "Send a payment", "Pay a contact, Lightning address or Bolt12 offer") {
+                    onClose(); state.push(Screen.SendPayment)
                 }
                 ActionRow(SNIconName.People, "New group", "Invite contacts or paste keys") {
                     groupEntry = true; findUsername = false

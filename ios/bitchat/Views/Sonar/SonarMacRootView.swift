@@ -183,7 +183,9 @@ struct SonarMacRootView: View {
         case .profile:
             selection = .profile
             store.path.removeAll()
-        case .contactProfile, .groupInfo, .walletActivity:
+        case .contactProfile, .groupInfo, .walletActivity, .sendPayment:
+            // Pushed detail screens: they live on store.path, so the sidebar
+            // selection stays where it is.
             break
         case .call:
             break
@@ -506,6 +508,8 @@ private struct SonarMacMainPane: View {
             SonarGroupInfoScreen(peerId: id)
         case .walletActivity:
             SonarWalletActivityScreen()
+        case .sendPayment:
+            SonarSendPaymentScreen()
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
         case .contactProfile(let id, let name):
@@ -1729,6 +1733,7 @@ private struct MacRadarPeerRow: View {
 private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     case profile
     case findUsername
+    case sendPayment
     case newGroup
     case settings
     case nearby
@@ -1739,6 +1744,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return .key
         case .findUsername: return .key
+        case .sendPayment: return .coin
         case .newGroup: return .people
         case .settings: return .list
         case .nearby: return .rings
@@ -1748,7 +1754,8 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .profile: return "Profile"
-        case .findUsername: return "New discussion"
+        case .findUsername: return "Find by username"
+        case .sendPayment: return "Send a payment"
         case .newGroup: return "New group"
         case .settings: return "Settings"
         case .nearby: return "People Nearby"
@@ -1759,6 +1766,7 @@ private enum MacPaletteCommand: String, CaseIterable, Identifiable {
         switch self {
         case .profile: return "Name, username, key sharing, and payment address"
         case .findUsername: return "Username, name@domain, or paste a key — reaches anywhere"
+        case .sendPayment: return "Pay a contact, Lightning address or Bolt12 offer"
         case .newGroup: return "Invite contacts or paste keys"
         case .settings: return "Appearance, network, wallet, and privacy"
         case .nearby: return "Open Sonar discovery"
@@ -2064,6 +2072,11 @@ private struct MacCommandPalette: View {
                 findUsernameEntry = true
                 groupEntry = false
             }
+        case .sendPayment:
+            findUsernameEntry = false
+            groupEntry = false
+            isPresented = false
+            store.push(.sendPayment)
         case .newGroup:
             if groupNameDraft.isEmpty, !trimmedQuery.hasPrefix("npub") {
                 groupNameDraft = trimmedQuery

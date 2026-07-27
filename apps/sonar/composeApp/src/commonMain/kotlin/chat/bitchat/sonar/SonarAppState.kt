@@ -346,6 +346,8 @@ sealed interface Screen {
     data class ContactProfile(val chatId: String, val name: String) : Screen
     data class GroupInfo(val chatId: String) : Screen
     data object WalletActivity : Screen
+    /** Standalone send-payment picker (new-chat sheet → "Send a payment"). */
+    data object SendPayment : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
@@ -353,6 +355,19 @@ data class MeshDmRow(val peerId: String, val name: String, val preview: String, 
 
 /** A local contact that can be invited into a Marmot group. */
 data class GroupContact(val id: String, val title: String, val subtitle: String, val npub: String)
+
+/**
+ * A contact we already hold a BOLT12 offer for, so the send-payment picker can
+ * pay them without opening the chat first (pay.jsx `SendPaymentScreen`, the
+ * "People you can pay" list). [chatId] is the conversation the payment belongs
+ * to — paying through it keeps the in-chat ⚡PAY receipt.
+ */
+data class PayableContact(
+    val chatId: String,
+    val name: String,
+    val subtitle: String,
+    val nearby: Boolean,
+)
 
 internal fun messagePreview(content: String, stickerRef: SonarStickerRef? = null, media: List<SonarMedia> = emptyList()): String {
     media.firstOrNull()?.let {
@@ -2932,6 +2947,107 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (!receiptOk) {
                     toast = "Payment sent but receipt delivery failed"
                 }
+            } else {
+                PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
+                toast = failureMessage ?: "Payment failed"
+            }
+        }
+        return null
+    }
+
+    /**
+     * Fire-and-forget wrappers for the send-payment picker, which pops itself
+     * as soon as the amount is confirmed. The screen's `rememberCoroutineScope`
+     * dies with the screen, so launching there and popping in the same frame
+     * would cancel the payment mid-flight (the descriptor fetch inside
+     * [sendPay] suspends). These run on the app scope instead, and surface the
+     * outcome through [toast] / the Wallet activity screen.
+     */
+    fun sendPayDetached(chatId: String, sats: Long) {
+        scope.launch { sendPay(chatId, sats)?.let { toast = it } }
+    }
+
+    fun payDestinationDetached(destination: String, sats: Long, displayName: String) {
+        scope.launch { payDestination(destination, sats, displayName)?.let { toast = it } }
+    }
+
+    /**
+     * Contacts the send-payment picker can pay right now: every direct
+     * conversation (mesh DM or 1:1 Marmot chat) whose peer publishes a BOLT12
+     * offer. Mirrors the design's "People you can pay" list, which is
+     * explicitly filtered to people who publish a payment address.
+     *
+     * Deliberately read-only and cache-only — it never fetches a descriptor, so
+     * opening the picker cannot block on the relay (Signal-Comparable
+     * Performance Rule). A contact whose descriptor has not arrived yet simply
+     * is not listed; typing their address in the field still works.
+     */
+    fun payableContacts(): List<PayableContact> {
+        val seen = HashSet<String>()
+        val out = ArrayList<PayableContact>()
+        fun add(chatId: String) {
+            if (!seen.add(chatId)) return
+            if (isContactBlocked(chatId)) return
+            if (directPaymentOffer(chatId).isNullOrBlank()) return
+            val nearby = isMeshChat(chatId) && hasLiveMeshRoute(meshPeerId(chatId))
+            out += PayableContact(
+                chatId = chatId,
+                name = callPeerName(chatId),
+                subtitle = if (nearby) "Nearby · Bluetooth" else "Over Lightning",
+                nearby = nearby,
+            )
+        }
+        meshPeers.forEach { add("mesh:" + meshPeerId(it.id)) }
+        meshDmRows.forEach { add("mesh:" + it.peerId) }
+        chats.filter { isDirectMarmotChat(it) }.forEach { add(it.id) }
+        return out.sortedWith(compareByDescending<PayableContact> { it.nearby }.thenBy { it.name.lowercase() })
+    }
+
+    /**
+     * Pay an arbitrary Lightning destination typed into the send-payment picker
+     * — a BOLT12 offer, a BOLT11 invoice, or a `name@domain` Lightning address.
+     * Breez resolves the destination, so this only records the wallet-side
+     * activity: there is no conversation to post a ⚡PAY receipt into.
+     *
+     * Returns a message to surface to the user, or null when the send was
+     * accepted (the outcome then lands on the Wallet activity screen).
+     */
+    suspend fun payDestination(destination: String, sats: Long, displayName: String): String? {
+        val dest = destination.trim()
+        if (sats <= 0 || dest.isEmpty()) return null
+        if (!walletAvailable || walletState !is WalletState.Ready) {
+            return "Set up the wallet first."
+        }
+        val payId = randomPayId()
+        PaymentActivityStore.recordPending(
+            SonarPaymentActivity(
+                id = payId,
+                kind = SonarPaymentActivity.Kind.SonarDirect,
+                // No conversation backs this one — "wallet" is the documented
+                // peerKey for payments that do not belong to a chat.
+                peerKey = "wallet",
+                peerName = displayName.ifBlank { shortNpubLabel(dest) },
+                direction = SonarPaymentActivity.Direction.Outgoing,
+                sats = sats,
+                via = "internet",
+                createdAtSecs = SonarClock.nowSecs(),
+                destinationHash = paymentDestinationHash(dest),
+                status = SonarPaymentActivity.Status.Pending,
+            )
+        )
+        scope.launch {
+            var failureMessage: String? = null
+            val result = runCatching { WalletBridge.send(dest, sats, "Sonar payment $payId") }
+                .getOrElse {
+                    failureMessage = "Payment failed: ${it.message}"
+                    SendResult(false)
+                }
+            walletState = WalletBridge.state()
+            if (result.ok) {
+                PaymentActivityStore.markPaid(
+                    payId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
             } else {
                 PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
                 toast = failureMessage ?: "Payment failed"

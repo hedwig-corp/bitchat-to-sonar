@@ -94,7 +94,7 @@ struct SonarHomeScreen: View {
         .snSheet(isPresented: $searchSheet, title: "Search") {
             SNSearchSheetContent(onClose: { searchSheet = false })
         }
-        .snSheet(isPresented: $composeSheet, title: findUsername ? "New discussion" : "Start a chat") {
+        .snSheet(isPresented: $composeSheet, title: findUsername ? "Find by username" : "Start a chat") {
             if findUsername {
                 findUsernameContent
             } else {
@@ -399,12 +399,16 @@ struct SonarHomeScreen: View {
                     composeSheet = false
                     store.push(.nearby)
                 }
-                SNActionRow(icon: .key, label: "New discussion", desc: "Username, name@domain, or paste a key — reaches anywhere") {
+                SNActionRow(icon: .key, label: "Find by username", desc: "Username, name@domain, or paste a key — reaches anywhere") {
                     findUsername = true
                     groupEntry = false
                     findDraft = ""
                     findNpub = nil
                     findMiss = false
+                }
+                SNActionRow(icon: .coin, label: "Send a payment", desc: "Pay a contact, Lightning address or Bolt12 offer") {
+                    composeSheet = false
+                    store.push(.sendPayment)
                 }
                 SNActionRow(icon: .people, label: "New group", desc: "Invite contacts or paste keys") {
                     groupEntry = true

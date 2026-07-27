@@ -160,6 +160,8 @@ enum SonarRoute: Hashable {
     case contactProfile(String, String)
     case groupInfo(String)
     case walletActivity
+    /// Standalone send-payment picker (new-chat sheet → "Send a payment").
+    case sendPayment
 }
 
 // MARK: - View models consumed by the screens
@@ -602,6 +604,17 @@ struct SNDMRow: Identifiable {
     var marmotGroupId: String? = nil
     /// Muted chat: the row shows a bell-slash instead of the unread dot.
     var muted: Bool = false
+}
+
+/// A contact we already hold a BOLT12 offer for, so the send-payment picker can
+/// pay them without opening the chat first (pay.jsx `SendPaymentScreen`, the
+/// "People you can pay" list). `id` is the conversation the payment belongs to —
+/// paying through it keeps the in-chat ⚡PAY receipt.
+struct SNPayableContact: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let subtitle: String
+    let nearby: Bool
 }
 
 /// Stable home ordering shared by the live list and the regression smoke
@@ -7537,6 +7550,85 @@ final class SonarAppStore: ObservableObject {
             return true
         }
         return callDescriptor(id)?.supportsMarmotCallSignaling == true
+    }
+
+    /// Cache-only BOLT12 lookup. Unlike `directPaymentOffer` this never calls
+    /// `ensureSonarDescriptor`, so building the picker list cannot kick a relay
+    /// fetch off the render path (Signal-Comparable Performance Rule).
+    private func cachedPaymentOffer(_ id: String) -> String? {
+        guard let npub = callNpub(id),
+              let descriptor = marmot.sonarDescriptorsByNpub[npub],
+              descriptor.supportsDirectPayments,
+              let offer = descriptor.bolt12Offer?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !offer.isEmpty
+        else { return nil }
+        return offer
+    }
+
+    /// Contacts the send-payment picker can pay right now: every conversation
+    /// whose peer already published a BOLT12 offer. Mirrors the design's
+    /// "People you can pay" list, which is explicitly filtered to people who
+    /// publish a payment address. A contact whose descriptor has not arrived
+    /// yet simply is not listed; typing their address still works.
+    var payableContacts: [SNPayableContact] {
+        var seen = Set<String>()
+        var out: [SNPayableContact] = []
+        for row in dmRows {
+            guard seen.insert(row.id).inserted else { continue }
+            guard !isContactBlocked(row.id, npub: callNpub(row.id) ?? "") else { continue }
+            guard cachedPaymentOffer(row.id) != nil else { continue }
+            let nearby = dmTransport(row.id) == .mesh
+            out.append(SNPayableContact(
+                id: row.id,
+                name: row.title,
+                subtitle: nearby ? "Nearby · Bluetooth" : "Over Lightning",
+                nearby: nearby
+            ))
+        }
+        return out.sorted {
+            if $0.nearby != $1.nearby { return $0.nearby }
+            return $0.name.lowercased() < $1.name.lowercased()
+        }
+    }
+
+    /// Pays an arbitrary Lightning destination typed into the send-payment
+    /// picker — a BOLT12 offer, a BOLT11 invoice, or a `name@domain` Lightning
+    /// address. The wallet resolves the destination, so this only records the
+    /// wallet-side activity: there is no conversation to post a ⚡PAY receipt
+    /// into. Returns a user-facing message, or nil when the payment settled.
+    @discardableResult
+    func payDestination(_ destination: String, sats: Int64, displayName: String) async -> String? {
+        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sats > 0, !dest.isEmpty else { return nil }
+        guard case .ready = walletState else { return "Set up the wallet first." }
+        let activityId = UUID().uuidString.lowercased()
+        paymentActivityLedger.recordPending(SonarPaymentActivity(
+            id: activityId,
+            kind: .sonarDirect,
+            // No conversation backs this one — "wallet" is the documented
+            // peerKey for payments that do not belong to a chat.
+            peerKey: "wallet",
+            peerName: displayName.isEmpty ? dest : displayName,
+            direction: .outgoing,
+            sats: sats,
+            via: SNVia.internet.rawValue,
+            createdAt: Date(),
+            destinationHash: Self.sha256Hex(dest),
+            status: .pending
+        ))
+        do {
+            let payment = try await wallet.send(
+                destination: dest,
+                amountSats: sats,
+                note: "Sonar payment \(activityId)"
+            )
+            paymentActivityLedger.markPaid(activityId, payment: payment)
+            return nil
+        } catch {
+            paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
+            SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
+            return "Payment failed: \(error.localizedDescription)"
+        }
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
