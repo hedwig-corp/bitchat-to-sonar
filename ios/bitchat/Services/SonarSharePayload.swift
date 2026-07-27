@@ -274,15 +274,24 @@ enum SonarShareInbox {
 /// producing a duplicate attachment, or a spurious "couldn't be attached"
 /// when the coercion fails. So the generic `public.data` fallback is only
 /// honoured for providers that are neither text nor a non-file URL.
+///
+/// `hasSuggestedName` rescues genuine documents (CSV, JSON, source, calendar)
+/// that conform to `UTType.text` and so trip the `isText` guard: a provider
+/// that carries a filename is a document to stage, not the plain text/link body
+/// `loadURLOrText` already consumed.
 func snShouldStageAsFile(
     isConcreteFileType: Bool,
     isText: Bool,
     isNonFileURL: Bool,
-    isData: Bool
+    isData: Bool,
+    hasSuggestedName: Bool
 ) -> Bool {
-    // Images, movies, audio, PDFs and file URLs are always content to stage,
-    // even though they conform to public.data too.
     if isConcreteFileType { return true }
+    // A text-conforming provider that carries a filename is a DOCUMENT (csv,
+    // json, source, calendar), not the plain text/link body `loadURLOrText`
+    // already consumed. Staging it is what keeps parity with Android's
+    // wildcard file handling.
+    if isText && hasSuggestedName { return true }
     if isText || isNonFileURL { return false }
     return isData
 }

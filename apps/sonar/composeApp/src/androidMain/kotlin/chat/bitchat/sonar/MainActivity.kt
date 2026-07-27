@@ -389,7 +389,14 @@ class MainActivity : ComponentActivity() {
         val action = intent?.action
         if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
 
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+        // Some senders put a SpannedString (or other CharSequence) in
+        // EXTRA_TEXT; getStringExtra returns null for those, so a text-only
+        // share from such an app opens Sonar with no picker and no error.
+        // getCharSequenceExtra also returns plain Strings (String IS a
+        // CharSequence), so this strictly widens what is accepted.
+        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)
+            ?.toString()
+            ?.takeIf { it.isNotBlank() }
         val uris: List<android.net.Uri> = when (action) {
             Intent.ACTION_SEND ->
                 listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, android.net.Uri::class.java))
@@ -413,6 +420,12 @@ class MainActivity : ComponentActivity() {
         if (isRestore && SonarCore.loadBlob(CONSUMED_SHARE_BLOB_KEY) == signature) {
             return
         }
+
+        // The text of this share already went out, but its files did not
+        // resolve. Re-offer the files alone rather than the whole payload.
+        val textAlreadySent =
+            isRestore && SonarCore.loadBlob(CONSUMED_SHARE_TEXT_BLOB_KEY) == signature
+        val effectiveText = if (textAlreadySent) null else text
 
         // Consume the payload from the in-process Intent only once the copy has
         // been handed off to SonarLifecycle. Consuming after the hand-off is
@@ -438,9 +451,9 @@ class MainActivity : ComponentActivity() {
         // Pure text share: there is no content:// I/O to do, so submit
         // synchronously and avoid adding any latency before the picker opens.
         if (uris.isEmpty()) {
-            if (text == null) return
+            if (effectiveText == null) return
             SonarLifecycle.submitSharedContent(
-                SharedContent(text, DroppedFiles(emptyList(), 0), consumedMarker = signature)
+                SharedContent(effectiveText, DroppedFiles(emptyList(), 0), consumedMarker = signature)
             )
             consume()
             return
@@ -456,14 +469,14 @@ class MainActivity : ComponentActivity() {
         // and mutates the navigation stack.
         lifecycleScope.launch {
             val files = withContext(Dispatchers.IO) { readSharedFiles(uris) }
-            if (text == null && files.files.isEmpty()) {
+            if (effectiveText == null && files.files.isEmpty()) {
                 if (files.rejectedCount > 0) {
                     SonarLifecycle.submitSharedContent(SharedContent(null, files, consumedMarker = signature))
                     consume()
                 }
                 return@launch
             }
-            SonarLifecycle.submitSharedContent(SharedContent(text, files, consumedMarker = signature))
+            SonarLifecycle.submitSharedContent(SharedContent(effectiveText, files, consumedMarker = signature))
             consume()
         }
     }

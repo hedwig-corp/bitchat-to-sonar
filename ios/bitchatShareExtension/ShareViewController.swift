@@ -221,7 +221,8 @@ final class ShareViewController: UIViewController {
                     || provider.hasItemConformingToTypeIdentifier(UTType.text.identifier),
                 isNonFileURL: provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
                     && !isFileURL,
-                isData: provider.hasItemConformingToTypeIdentifier(UTType.data.identifier)
+                isData: provider.hasItemConformingToTypeIdentifier(UTType.data.identifier),
+                hasSuggestedName: provider.suggestedName?.isEmpty == false
             )
         }
         guard !fileProviders.isEmpty else {

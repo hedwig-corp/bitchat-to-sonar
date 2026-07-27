@@ -56,6 +56,14 @@ internal data class SharedContent(
  */
 internal const val CONSUMED_SHARE_BLOB_KEY = "share.lastConsumedSignature"
 
+/**
+ * Blob key holding the fingerprint of the share whose TEXT has already been
+ * sent. Distinct from [CONSUMED_SHARE_BLOB_KEY]: a share can have its text
+ * delivered while its files are still pending a retry, and a restore in that
+ * window must re-offer the files WITHOUT re-offering the text.
+ */
+internal const val CONSUMED_SHARE_TEXT_BLOB_KEY = "share.lastConsumedTextSignature"
+
 /** A `sinvite1` token followed by its hex payload, anywhere in the input. */
 internal val INVITE_TOKEN_IN_TEXT = Regex("sinvite1[0-9a-fA-F]{2,}")
 

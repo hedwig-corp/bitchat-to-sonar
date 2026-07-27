@@ -165,19 +165,33 @@ extension SonarAppStore {
             // manifest outlives this process; if we die between the send and the
             // attachment work finishing, relaunch re-ingests the manifest, and
             // with the text still in it the user would send it a second time.
-            // Rewriting first makes the crash window offer files only.
+            // Rewriting first makes the crash window offer files only. The send
+            // is gated on the rewrite succeeding: if the App Group is full or
+            // unwritable the durable manifest would still contain the text, so
+            // sending now would let a later process death re-ingest it and
+            // deliver it twice.
             if !fileURLs.isEmpty {
-                try? SonarShareInbox.commit(
-                    SonarSharePayload(
-                        version: share.payload.version,
-                        id: payloadID,
-                        createdAt: share.payload.createdAt,
-                        text: nil,
-                        items: share.payload.items,
-                        droppedCount: droppedCount
-                    ),
-                    appGroupID: groupID
-                )
+                do {
+                    try SonarShareInbox.commit(
+                        SonarSharePayload(
+                            version: share.payload.version,
+                            id: payloadID,
+                            createdAt: share.payload.createdAt,
+                            text: nil,
+                            items: share.payload.items,
+                            droppedCount: droppedCount
+                        ),
+                        appGroupID: groupID
+                    )
+                } catch {
+                    // Nothing was sent, so the whole original share is still
+                    // pending — restore it and bail rather than risking a double
+                    // text send on a later re-ingest.
+                    showToast("Couldn't prepare the share — try again")
+                    inFlightSharePayloadIDs.remove(payloadID)
+                    pendingShare = share
+                    return
+                }
             }
             sendDm(conversationID, text)
         }

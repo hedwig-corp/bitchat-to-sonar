@@ -87,17 +87,50 @@ struct SonarSharePayloadTests {
             isConcreteFileType: false,
             isText: false,
             isNonFileURL: true,
-            isData: true
+            isData: true,
+            hasSuggestedName: false
         ))
     }
 
     @Test
     func plainTextShareIsNotAlsoStagedAsAFile() {
+        // A plain text share has no filename — it is the message body, not a
+        // document, so it must not also be staged as a file.
         #expect(!snShouldStageAsFile(
             isConcreteFileType: false,
             isText: true,
             isNonFileURL: false,
-            isData: true
+            isData: true,
+            hasSuggestedName: false
+        ))
+    }
+
+    @Test
+    func textDocumentWithFilenameIsStaged() {
+        // A CSV/JSON/.swift/.ics document conforms to UTType.text, so without
+        // the suggested-name rescue the isText guard would drop it and only the
+        // message body would survive — losing the file and its filename. A
+        // provider that carries a filename is a document, so it is staged to
+        // match Android's wildcard file handling.
+        #expect(snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: true,
+            isNonFileURL: false,
+            isData: true,
+            hasSuggestedName: true
+        ))
+    }
+
+    @Test
+    func linkShareIsNotStagedEvenWithASuggestedName() {
+        // A non-file URL keeps being rejected even when it carries a suggested
+        // name — a shared web link is not a document.
+        #expect(!snShouldStageAsFile(
+            isConcreteFileType: false,
+            isText: false,
+            isNonFileURL: true,
+            isData: true,
+            hasSuggestedName: true
         ))
     }
 
@@ -109,14 +142,16 @@ struct SonarSharePayloadTests {
             isConcreteFileType: true,
             isText: false,
             isNonFileURL: false,
-            isData: true
+            isData: true,
+            hasSuggestedName: false
         ))
         // A file URL is content even though it is also a URL.
         #expect(snShouldStageAsFile(
             isConcreteFileType: true,
             isText: false,
             isNonFileURL: false,
-            isData: false
+            isData: false,
+            hasSuggestedName: false
         ))
     }
 
@@ -128,7 +163,8 @@ struct SonarSharePayloadTests {
             isConcreteFileType: false,
             isText: false,
             isNonFileURL: false,
-            isData: true
+            isData: true,
+            hasSuggestedName: false
         ))
     }
 
@@ -138,7 +174,8 @@ struct SonarSharePayloadTests {
             isConcreteFileType: false,
             isText: false,
             isNonFileURL: false,
-            isData: false
+            isData: false,
+            hasSuggestedName: false
         ))
     }
 
