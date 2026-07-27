@@ -4782,7 +4782,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     // any deferred write that encoded before the wipe is dropped rather than
     // committed.
     private val contactCacheWriteMutex = Mutex()
-    private var contactCacheWriteGeneration = 0
+    /** Per-blob-key, NOT global. `eraseAllChats()` clears the profile cache but
+     *  deliberately retains descriptors, so a global counter would let the
+     *  profile write invalidate an in-flight descriptor write — and since the
+     *  retained map is never re-persisted, that descriptor would silently
+     *  vanish on the next restart. */
+    private val contactCacheWriteGenerations = mutableMapOf<String, Int>()
     /** Per-key schedule order. Encodes run concurrently and finish out of
      *  order, so the mutex alone would serialize commits by *encode-completion*
      *  order and let an older snapshot overwrite a newer one — losing the newest
@@ -4793,13 +4798,13 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Snapshot now on the caller's thread, encode + write on IO. Use for the
      *  per-fetch paths, never for wipe/teardown. */
     private fun scheduleContactCacheWrite(key: String, encode: () -> String) {
-        val generation = contactCacheWriteGeneration
+        val generation = contactCacheWriteGenerations[key] ?: 0
         val seq = (contactCacheScheduledSeq[key] ?: 0) + 1
         contactCacheScheduledSeq[key] = seq
         scope.launch(Dispatchers.IO) {
             val encoded = encode()
             contactCacheWriteMutex.withLock {
-                if (generation != contactCacheWriteGeneration) return@withLock
+                if (generation != (contactCacheWriteGenerations[key] ?: 0)) return@withLock
                 // A newer snapshot already landed — this one is stale.
                 if (seq <= (contactCacheCommittedSeq[key] ?: 0)) return@withLock
                 contactCacheCommittedSeq[key] = seq
@@ -4813,10 +4818,12 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  account. */
     private suspend fun writeContactCacheNow(key: String, encoded: String) {
         contactCacheWriteMutex.withLock {
-            // Invalidates every deferred write queued so far, for every key.
-            contactCacheWriteGeneration++
-            contactCacheCommittedSeq.clear()
-            contactCacheScheduledSeq.clear()
+            // Invalidates deferred writes for THIS key only — a teardown that
+            // clears one cache must not discard an in-flight write for a cache
+            // it deliberately retains.
+            contactCacheWriteGenerations[key] = (contactCacheWriteGenerations[key] ?: 0) + 1
+            contactCacheCommittedSeq.remove(key)
+            contactCacheScheduledSeq.remove(key)
             withContext(Dispatchers.IO) { SonarCore.saveBlob(key, encoded) }
         }
     }

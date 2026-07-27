@@ -538,10 +538,17 @@ final class MarmotChatModel: ObservableObject {
     /// Bumped on identity teardown so a descriptor fetch started under the old
     /// account cannot land — and persist — after the wipe.
     private var descriptorCacheGeneration = 0
-    /// Bumped by every teardown that clears a contact cache. A deferred write
+    /// Bumped by a teardown that clears a contact cache, so a deferred write
     /// that encoded before the clear is dropped instead of resurrecting erased
     /// contact data (an Account Key Durability-class failure).
-    private var contactCacheWriteGeneration = 0
+    ///
+    /// Per-cache, NOT shared: `eraseChatsKeepIdentity()` runs
+    /// `clearIdentityScopedState()` (profiles) but deliberately retains
+    /// descriptors, so one counter would let the profile clear discard an
+    /// in-flight descriptor write — and the retained map is never re-persisted,
+    /// so that descriptor would vanish on the next restart.
+    private var profileCacheWriteGeneration = 0
+    private var descriptorCacheWriteGeneration = 0
     /// Per-cache schedule order. Detached encodes finish out of order, so
     /// without this an older snapshot could commit after a newer one and lose
     /// the freshest profile / BOLT12 offer from disk until the next fetch.
@@ -2662,7 +2669,7 @@ final class MarmotChatModel: ObservableObject {
     // These schedule the encode off the actor and commit on it. The commit
     // itself is cheap — `defaults.set` is in-memory, the OS flushes later — and
     // doing it back on the actor is what makes the ordering safe: a teardown
-    // that bumps `contactCacheWriteGeneration` is serialized against the commit
+    // that bumps the cache's write generation is serialized against the commit
     // hop, so a write encoded before a wipe can never land after it.
     //
     // Teardown paths must NOT use these. They call `.clear(from:)` directly,
@@ -2671,14 +2678,14 @@ final class MarmotChatModel: ObservableObject {
     private func scheduleProfileCacheWrite() {
         let snapshot = profilesByNpub
         let defaults = self.defaults
-        let generation = contactCacheWriteGeneration
+        let generation = profileCacheWriteGeneration
         profileCacheScheduledSeq &+= 1
         let seq = profileCacheScheduledSeq
         Task.detached(priority: .utility) { [weak self] in
             guard let payload = SNMarmotProfileCache.encoded(snapshot) else { return }
             guard let self else { return }
             await MainActor.run {
-                guard generation == self.contactCacheWriteGeneration else { return }
+                guard generation == self.profileCacheWriteGeneration else { return }
                 // A newer snapshot already landed — this one is stale.
                 guard seq > self.profileCacheCommittedSeq else { return }
                 self.profileCacheCommittedSeq = seq
@@ -2690,14 +2697,14 @@ final class MarmotChatModel: ObservableObject {
     private func scheduleDescriptorCacheWrite() {
         let snapshot = sonarDescriptorsByNpub
         let defaults = self.defaults
-        let generation = contactCacheWriteGeneration
+        let generation = descriptorCacheWriteGeneration
         descriptorCacheScheduledSeq &+= 1
         let seq = descriptorCacheScheduledSeq
         Task.detached(priority: .utility) { [weak self] in
             guard let data = SNMarmotDescriptorCache.encoded(snapshot) else { return }
             guard let self else { return }
             await MainActor.run {
-                guard generation == self.contactCacheWriteGeneration else { return }
+                guard generation == self.descriptorCacheWriteGeneration else { return }
                 // A newer snapshot already landed — this one is stale.
                 guard seq > self.descriptorCacheCommittedSeq else { return }
                 self.descriptorCacheCommittedSeq = seq
@@ -4305,11 +4312,11 @@ final class MarmotChatModel: ObservableObject {
         refreshTask?.cancel()
         refreshTask = nil
         clearStickerCaches()
-        // Invalidate every deferred contact-cache write queued so far, so none
-        // of them can commit after these clears.
-        contactCacheWriteGeneration &+= 1
+        // Profiles only: this runs from eraseChatsKeepIdentity() too, which
+        // retains descriptors. Invalidating theirs here would drop an in-flight
+        // descriptor write that nothing re-persists.
+        profileCacheWriteGeneration &+= 1
         profileCacheScheduledSeq = 0; profileCacheCommittedSeq = 0
-        descriptorCacheScheduledSeq = 0; descriptorCacheCommittedSeq = 0
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -4328,7 +4335,7 @@ final class MarmotChatModel: ObservableObject {
         sonarDescriptorFetchedAtByNpub = [:]
         descriptorFetches = []
         descriptorCacheGeneration &+= 1
-        contactCacheWriteGeneration &+= 1
+        descriptorCacheWriteGeneration &+= 1
         descriptorCacheScheduledSeq = 0; descriptorCacheCommittedSeq = 0
         SNMarmotDescriptorCache.clear(from: defaults)
     }
