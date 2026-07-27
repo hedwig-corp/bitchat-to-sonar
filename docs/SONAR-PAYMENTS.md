@@ -155,6 +155,11 @@ Money still appears inside the chat. A direct send pays the receiver's wallet,
 then posts gold payment receipt bubbles using the encrypted chat transport.
 There is no "tap to claim" step for these bubbles.
 
+The **Wallet → Activity** screen is a log only: balance card, then the
+transaction list. It carries no Send/Receive buttons — paying always starts
+from the new-chat sheet or from inside a chat (this matches the design's
+`WalletScreen`).
+
 The wallet sheet also lists direct payment activity, newest first, including:
 
 - Sonar direct sends to Nostr/Sonar peers.

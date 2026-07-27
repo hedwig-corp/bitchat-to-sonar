@@ -1,8 +1,6 @@
 package chat.bitchat.sonar.screens
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -25,7 +23,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
-import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
@@ -101,57 +98,17 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
                 )
             }
 
-            // ── Quick actions ──
-            Row(
-                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                // Send button
-                Box(
-                    Modifier.weight(1f).height(48.dp)
-                        .clip(RoundedCornerShape(999.dp)).background(s.goldFill)
-                        .clickable { state.toast = "Open a chat to send or receive bitcoin" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SNIcon(SNIconName.Bolt, 18.dp, s.onGold)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "Send",
-                            color = s.onGold,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                }
-                // Receive button
-                Box(
-                    Modifier.weight(1f).height(48.dp)
-                        .clip(RoundedCornerShape(999.dp)).background(s.surface)
-                        .clickable { state.toast = "Open a chat to send or receive bitcoin" },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        SNIcon(SNIconName.Coin, 18.dp, s.text)
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            "Receive",
-                            color = s.text,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Bold,
-                        )
-                    }
-                }
-            }
-
             // ── Activity section ──
+            // Design (`design/handoff/project/sonar/settings.jsx` WalletScreen):
+            // balance, then the transaction log. No send/receive actions live
+            // here — paying starts from the new-chat sheet or inside a chat.
             SNSectionLabel("Activity")
 
             if (entries.isEmpty()) {
                 SNEmptyState(
                     icon = SNIconName.Activity,
-                    title = "No activity yet",
-                    desc = "Send or receive bitcoin in any chat to see your transaction history here.",
+                    title = "No transactions yet",
+                    desc = "Payments you send and receive show up here.",
                 )
             } else {
                 Column(Modifier.fillMaxWidth()) {
@@ -162,8 +119,6 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
             }
         }
     }
-
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 @Composable

@@ -2,9 +2,10 @@
 // SonarWalletActivityScreen.swift
 // bitchat
 //
-// Wallet activity screen: gold-themed balance card, send/receive quick
-// actions, transaction history from SonarPaymentActivityLedger. Ported from
-// the Compose Multiplatform SonarWalletActivityScreen.
+// Wallet activity screen: gold-themed balance card plus the transaction log
+// from SonarPaymentActivityLedger. It is a log only — sending starts from the
+// new-chat sheet or inside a chat. Ported from the Compose Multiplatform
+// SonarWalletActivityScreen.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -14,8 +15,6 @@ import SwiftUI
 
 struct SonarWalletActivityScreen: View {
     @EnvironmentObject private var store: SonarAppStore
-
-    @State private var toast: String?
 
     private var balanceSats: Int64 { store.balanceSats ?? 0 }
     private var entries: [SonarPaymentActivity] { store.paymentActivities }
@@ -61,48 +60,18 @@ struct SonarWalletActivityScreen: View {
                     )
                     .padding(EdgeInsets(top: 10, leading: 14, bottom: 4, trailing: 14))
 
-                    // ── Quick actions ──
-                    HStack(spacing: 8) {
-                        Button {
-                            showToast("Open a chat to send or receive bitcoin")
-                        } label: {
-                            HStack(spacing: 6) {
-                                SNIcon(name: .bolt, size: 18)
-                                Text("Send")
-                                    .font(SonarTheme.uiFont(size: 15, weight: .bold))
-                            }
-                            .foregroundColor(SonarTheme.onGold)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 48)
-                            .background(Capsule().fill(SonarTheme.goldFill))
-                        }
-                        .buttonStyle(SNScaleStyle(scale: 0.97))
-
-                        Button {
-                            showToast("Open a chat to send or receive bitcoin")
-                        } label: {
-                            HStack(spacing: 6) {
-                                SNIcon(name: .coin, size: 18)
-                                Text("Receive")
-                                    .font(SonarTheme.uiFont(size: 15, weight: .bold))
-                            }
-                            .foregroundColor(SonarTheme.text)
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 48)
-                            .background(Capsule().fill(SonarTheme.surface))
-                        }
-                        .buttonStyle(SNScaleStyle(scale: 0.97))
-                    }
-                    .padding(EdgeInsets(top: 4, leading: 14, bottom: 0, trailing: 14))
-
                     // ── Activity ──
+                    // Design (`design/handoff/project/sonar/settings.jsx`
+                    // WalletScreen): balance, then the transaction log. No
+                    // send/receive actions live here — paying starts from the
+                    // new-chat sheet or inside a chat.
                     SNSectionLabel("Activity")
 
                     if entries.isEmpty {
                         SNEmptyState(
                             icon: .bolt, iconSize: 24,
-                            title: "No activity yet",
-                            desc: "Send or receive bitcoin in any chat to see your transaction history here."
+                            title: "No transactions yet",
+                            desc: "Payments you send and receive show up here."
                         )
                         .frame(height: 200)
                     } else {
@@ -118,34 +87,6 @@ struct SonarWalletActivityScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
-        .overlay(alignment: .bottom) { toastView }
-        .animation(.easeOut(duration: 0.2), value: toast)
-    }
-
-    @ViewBuilder
-    private var toastView: some View {
-        if let toast {
-            Text(verbatim: toast)
-                .font(SonarTheme.uiFont(size: 13.5, weight: .medium))
-                .foregroundColor(SonarTheme.text)
-                .multilineTextAlignment(.center)
-                .padding(EdgeInsets(top: 11, leading: 16, bottom: 11, trailing: 16))
-                .background(
-                    RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .fill(SonarTheme.surface2)
-                        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 6)
-                )
-                .padding(.horizontal, 24)
-                .padding(.bottom, 88)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-    }
-
-    private func showToast(_ text: String) {
-        toast = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
-            if toast == text { toast = nil }
-        }
     }
 
     private func activityRow(_ entry: SonarPaymentActivity) -> some View {
