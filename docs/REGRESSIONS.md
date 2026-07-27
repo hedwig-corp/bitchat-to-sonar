@@ -1042,18 +1042,21 @@ BIP-21 URI pays the rail inside it (`lno` > `lightning` > address), a BOLT11
 carries its own amount and is never handed one of ours, and a decimal BTC
 `amount` is converted digit-by-digit rather than through a `Double`.
 
-**Breaks as:** Silently paying the wrong thing, or nothing at all. Two observed
-shapes: `bitcoin:bc1q…?lno=lno1…` was labelled "Bitcoin address · On-chain" and
-the whole URI — query string included — was handed to the wallet, so the BOLT12
-offer sitting in `lno=` was never paid; and `lnbc21u1…` parsed as **2 BTC**
-instead of 2,100 sats because the amount was read up to the *first* `1` rather
-than the bech32 separator, which is the last one.
+**Breaks as:** Silently paying the wrong thing, or nothing at all.
+`bitcoin:bc1q…?lno=lno1…` was labelled "Bitcoin address · On-chain" and the whole
+URI — query string included — was handed to the wallet, so the BOLT12 offer in
+`lno=` was never paid and the send failed with
+`AmountMissing: "Expected invoice with an amount"`.
 
-**Why:** Both look like string handling and are really money handling. The
-BOLT11 separator rule is not obvious unless you know bech32 excludes `1` from
-the data charset, and BIP-21's good rails hide in the query string behind an
-on-chain address that parses fine on its own — so a naive prefix check finds
-"an address" and stops looking.
+**Why:** This looks like string handling and is really money handling, and each
+rule is invisible unless you already know it. The BOLT11 amount ends at the
+*last* `1`, not the first, because bech32 excludes `1` from the data charset —
+read it the obvious way and `lnbc21u1…` becomes 2 BTC instead of 2,100 sats.
+BIP-21 hides the good rails in the query string behind an on-chain address that
+parses fine on its own, so a prefix check finds "an address" and stops looking.
+And Breez takes a BOLT11's amount from the invoice: passing our own risks
+`"Receiver amount and invoice amount do not match"`, and an amountless invoice
+cannot be paid at all no matter what we pass.
 
 **Call sites:** Compose `wallet/PaymentDestination.kt::bolt11AmountSats`,
 `screens/SonarScanQrSheet.kt::scannedKind`,
@@ -1066,15 +1069,22 @@ on-chain address that parses fine on its own — so a naive prefix check finds
 `Bip21ScanTest.unifiedUriPrefersTheBolt12Offer`,
 `Bip21ScanTest.btcToSatsIsExactAndRefusesWhatItCannotRepresent`
 
-**History:** the separator bug was caught by its own new test before it ever
-shipped; the BIP-21 bug was reported from a failing payment on device and
-confirmed against the wallet's `AmountMissing` error.
+**History:** #491.
 
-**Not guarded:** no test asserts that the wallet is called with a *nil* amount
-for a BOLT11 — that path needs a wallet double, and the amountless refusal is
-enforced in `payDestination` on both platforms without a test. iOS has no unit
-test for `SNScannedKind` at all; the Kotlin tests are the only coverage, so a
-Swift-side divergence would not be caught.
+**Rejected:** Passing our own parsed amount alongside a BOLT11 that already
+carries one — it reads as harmless belt-and-braces and is the opposite, because
+any disagreement with the invoice (the parser rounds `p`-denominated amounts up)
+becomes `"Receiver amount and invoice amount do not match"`. Also rejected:
+offering the keypad for an amountless invoice, which looks like a courtesy but
+is a control that always fails, since the SDK refuses the payment regardless of
+the amount supplied.
+
+**Not guarded:** No test asserts the wallet is actually called with a *nil*
+amount for a BOLT11 — that needs a wallet double — and the amountless refusal in
+`payDestination` has no test on either platform. iOS has no unit test for
+`SNScannedKind` at all: the Kotlin tests are the only coverage, so a Swift-side
+divergence would not be caught. Nothing here is exercised end-to-end against a
+real wallet.
 
 ## Unguarded
 
