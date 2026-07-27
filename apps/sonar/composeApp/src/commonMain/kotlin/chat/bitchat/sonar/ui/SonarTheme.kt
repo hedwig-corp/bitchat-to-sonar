@@ -126,6 +126,17 @@ val SonarDark = SonarPalette(
     goldDeep = Color(0xFFF5C56B),
 )
 
+// ── Disabled filled controls ──
+// `onAccent` / `onNet` are near-black inks meant to sit on a BRIGHT fill, so
+// fading an accent fill makes the label vanish in dark mode. Disabled filled
+// controls use a neutral chip instead. The stroke matters: without it the chip
+// is indistinguishable from a `surface2` text input on screens that stack both.
+// Keep these in lockstep with `SonarTheme.disabledFill` / `.onDisabled` /
+// `.disabledStroke` on Apple.
+val SonarPalette.disabledFill: Color get() = surface2
+val SonarPalette.onDisabled: Color get() = text3
+val SonarPalette.disabledStroke: Color get() = hairline
+
 val LocalSonar = staticCompositionLocalOf { SonarDark }
 
 /** Convenience accessor used across the Sonar UI. */

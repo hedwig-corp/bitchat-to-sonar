@@ -70,6 +70,17 @@ enum SonarTheme {
         dark: Color(sonarHex: 0xFFFFFF, opacity: 0.07)
     )
 
+    // ── Disabled filled controls ──
+    // `onAccent` / `onNet` are near-black inks meant to sit on a BRIGHT fill,
+    // so fading an accent fill makes the label vanish in dark mode. Disabled
+    // filled controls use a neutral chip instead. The stroke matters: without
+    // it the chip is indistinguishable from a `surface2` text input on screens
+    // that stack both. Keep these in lockstep with `SonarPalette.disabledFill`
+    // / `.onDisabled` / `.disabledStroke` on Compose.
+    static let disabledFill = surface2
+    static let onDisabled = text3
+    static let disabledStroke = hairline
+
     // ── Accent (cyan · Bluetooth mesh transport) ──
     static let accent = Color(light: Color(sonarHex: 0x0891B2), dark: Color(sonarHex: 0x22D3EE))
     static let accentDeep = Color(light: Color(sonarHex: 0x0E7490), dark: Color(sonarHex: 0x67E2F4))

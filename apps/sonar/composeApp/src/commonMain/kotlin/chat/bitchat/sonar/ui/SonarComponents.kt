@@ -126,12 +126,12 @@ fun SNPrimaryButton(
             .fillMaxWidth()
             .height(52.dp)
             .clip(RoundedCornerShape(15.dp))
-            .background(if (disabled) s.surface2 else fill)
-            // Disabled shares `surface2` with the text-input pills, so without
-            // a stroke it reads as a third empty field on screens stacking both.
+            .background(if (disabled) s.disabledFill else fill)
+            // Disabled uses the shared neutral-chip tokens — see
+            // `SonarPalette.disabledFill` for why a faded accent fill fails here.
             .border(
                 width = 1.dp,
-                color = if (disabled) s.hairline else Color.Transparent,
+                color = if (disabled) s.disabledStroke else Color.Transparent,
                 shape = RoundedCornerShape(15.dp),
             )
             .clickable(enabled = !disabled, onClick = onClick),
@@ -139,7 +139,7 @@ fun SNPrimaryButton(
     ) {
         Text(
             label,
-            color = if (disabled) s.text3 else on,
+            color = if (disabled) s.onDisabled else on,
             fontSize = 16.5.sp,
             fontWeight = FontWeight.Bold
         )

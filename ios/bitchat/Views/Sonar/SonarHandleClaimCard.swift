@@ -168,14 +168,12 @@ struct SonarHandleClaimCard: View {
                         : (isExternalDraft ? "Save address" : "Claim"))
                         .font(SonarTheme.uiFont(size: 13.5, weight: .bold))
                 }
-                // Disabled = neutral chip (surface2 + text3), the same contract
-                // as Compose `SNPrimaryButton`. Fading the accent fill instead
-                // left dark `onAccent` text on a dark faded capsule, which read
-                // as an unreadable blob in dark mode.
-                .foregroundColor(claimDisabled ? SonarTheme.text3 : SonarTheme.onAccent)
+                // Same disabled contract as `SNPrimaryButton`, via the shared
+                // tokens — see `SonarTheme.disabledFill`.
+                .foregroundColor(claimDisabled ? SonarTheme.onDisabled : SonarTheme.onAccent)
                 .padding(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                .background(Capsule().fill(claimDisabled ? SonarTheme.surface2 : SonarTheme.accentFill))
-                .overlay(Capsule().strokeBorder(claimDisabled ? SonarTheme.hairline : Color.clear, lineWidth: 1))
+                .background(Capsule().fill(claimDisabled ? SonarTheme.disabledFill : SonarTheme.accentFill))
+                .overlay(Capsule().strokeBorder(claimDisabled ? SonarTheme.disabledStroke : Color.clear, lineWidth: 1))
                 .contentShape(Capsule())
             }
             .buttonStyle(.plain)

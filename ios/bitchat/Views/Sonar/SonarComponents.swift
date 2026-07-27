@@ -4505,18 +4505,16 @@ struct SNPrimaryButton: View {
     var disabled: Bool = false
     let action: () -> Void
 
-    // Disabled = neutral chip (surface2 + text3), matching Compose
-    // `SNPrimaryButton`. Fading the whole button instead made the label
-    // vanish in dark mode, where `onAccent` is a near-black ink meant to sit
-    // on a bright fill — at 0.4 opacity it read as an inert dark blob.
+    // Disabled uses the shared neutral-chip tokens — see `SonarTheme.disabledFill`
+    // for why a faded accent fill does not work here.
     private var fill: Color {
-        if disabled { return SonarTheme.surface2 }
+        if disabled { return SonarTheme.disabledFill }
         if danger { return SonarTheme.danger }
         return net ? SonarTheme.netFill : SonarTheme.accentFill
     }
 
     private var foreground: Color {
-        if disabled { return SonarTheme.text3 }
+        if disabled { return SonarTheme.onDisabled }
         if danger { return Color(sonarHex: 0xFFF6F6) }
         return net ? SonarTheme.onNet : SonarTheme.onAccent
     }
@@ -4532,12 +4530,9 @@ struct SNPrimaryButton: View {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(fill)
                 )
-                // Disabled shares `surface2` with the text-input pills, so
-                // without a stroke it reads as a third empty field on sheets
-                // that stack both (New group, Add people).
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(disabled ? SonarTheme.hairline : Color.clear, lineWidth: 1)
+                        .strokeBorder(disabled ? SonarTheme.disabledStroke : Color.clear, lineWidth: 1)
                 )
         }
         .buttonStyle(SNScaleStyle(scale: 0.98))
