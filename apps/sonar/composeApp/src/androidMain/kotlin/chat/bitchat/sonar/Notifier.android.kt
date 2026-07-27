@@ -131,6 +131,9 @@ actual object Notifier {
         }
     }
 
+    actual fun pushTransportStatus(): String? =
+        chat.bitchat.sonar.push.SonarPushRegistration.diagnosticsStatus()
+
     actual fun notify(
         id: Int,
         title: String,

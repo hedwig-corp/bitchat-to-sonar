@@ -2,9 +2,6 @@ package chat.bitchat.sonar.push
 
 import android.content.Intent
 import android.util.Log
-import chat.bitchat.sonar.Notifier
-import chat.bitchat.sonar.SonarNotificationKind
-import chat.bitchat.sonar.SonarNotificationRouter
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -62,26 +59,9 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
 
     private fun handleMarmotWakeup() {
         Log.d(TAG, "Transponder push — starting Marmot sync")
-        val intent = Intent(this, SonarPushProcessingService::class.java).apply {
-            putExtra(SonarPushProcessingService.EXTRA_PUSH_TYPE, SonarPushProcessingService.TYPE_MARMOT)
-        }
-        try {
-            startForegroundService(intent)
-        } catch (e: Exception) {
-            // ForegroundServiceStartNotAllowedException: background-start
-            // restriction or the Android 15 dataSync 6h/day budget. We are
-            // still inside the high-priority FCM execution window, so surface
-            // a generic notification instead of dropping the wake silently.
-            Log.w(TAG, "Push service start rejected, showing generic notification", e)
-            val prefs = SonarPushPrefs.notificationPrefs(this)
-            Notifier.ensureChannel()
-            SonarNotificationRouter.build(
-                idKey = "marmot-push",
-                kind = SonarNotificationKind.Message,
-                unreadCount = 1,
-                prefs = prefs.copy(showPreview = false),
-            )?.let { Notifier.notify(it.id, it.title, it.body) }
-        }
+        // Shared with SonarUnifiedPushService so the drain path and its
+        // foreground-service fallback can never diverge between transports.
+        SonarPushWake.startMarmotSync(this)
     }
 
     private fun handleBreezWakeup(data: Map<String, String>) {

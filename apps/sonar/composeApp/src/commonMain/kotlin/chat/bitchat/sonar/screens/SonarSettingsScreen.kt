@@ -771,6 +771,14 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
             "$connected/$total relays connected · Last sync: $sync"
         } ?: if (loaded) "Relay not connected yet" else "Loading…"
         Text(summary, color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp)
+        // Push transport (Android only; null hides the row on desktop).
+        // Live status matters on GrapheneOS: FCM with sandboxed Play,
+        // UnifiedPush when degoogled, or an explicit "none" so a missing
+        // background-delivery path is never silent.
+        Notifier.pushTransportStatus()?.let { pushStatus ->
+            Spacer(Modifier.height(6.dp))
+            Text("Push transport: $pushStatus", color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp)
+        }
         Spacer(Modifier.height(12.dp))
         SNSettingsRow(
             icon = SNIconName.Search, label = "Verbose logs",

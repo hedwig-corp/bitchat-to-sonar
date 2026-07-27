@@ -1637,8 +1637,9 @@ impl SonarNode {
     /// Encrypt a device push token to the transponder and cache/share it with
     /// peers. Sender-side wakeups publish kind-446 requests later.
     ///
-    /// `platform`: `"apns"` or `"fcm"`.
-    /// `token`: raw device token bytes (APNS) or UTF-8 FCM token string.
+    /// `platform`: `"apns"`, `"fcm"` or `"unifiedpush"`.
+    /// `token`: raw device token bytes (APNS), UTF-8 FCM token string, or the
+    /// UTF-8 UnifiedPush endpoint URL (the transponder POSTs the wake to it).
     /// `server_npub`: the transponder's npub (bech32 or hex).
     pub fn register_push_token(
         &self,

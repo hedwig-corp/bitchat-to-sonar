@@ -66,6 +66,17 @@ for t in "${RUST_TARGETS[@]}"; do rustup target add "$t" >/dev/null 2>&1 || true
 unset OPENSSL_DIR OPENSSL_LIB_DIR OPENSSL_INCLUDE_DIR OPENSSL_NO_VENDOR \
       OPENSSL_STATIC LIBSQLITE3_SYS_USE_PKG_CONFIG 2>/dev/null || true
 
+# --- 16 KB page-size alignment -------------------------------------------------
+# GrapheneOS (and Android 15+ on Pixel) runs a 16 KB-page kernel; every LOAD
+# segment in a bundled .so must be aligned to 0x4000 or the app aborts at dlopen.
+# NDK r27+ defaults to 16 KB alignment, but the NDK discovery above picks
+# whatever is newest on the host, so pass the flag explicitly to make the
+# artifact deterministic across machines. This must be a RUSTFLAGS link-arg,
+# not a Cargo profile setting — profiles cannot carry linker args (the same
+# reason the size opts live in [profile.release] but LTO flags do not; see
+# core/Cargo.toml). Verify with scripts/check-so-alignment.sh after a build.
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-z,max-page-size=16384"
+
 # Only wipe the generated artifacts — KOTLIN_DIR is the androidMain source root
 # and also holds hand-written Kotlin (MainActivity, actuals), so scope the
 # delete to the generated uniffi package.

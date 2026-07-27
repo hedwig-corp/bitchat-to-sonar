@@ -9,6 +9,14 @@ jna = "5.14.0"
 breez-sdk-liquid = "0.12.4"
 firebase-bom = "33.7.0"
 google-services = "4.4.2"
+# Degoogled push (GrapheneOS without sandboxed Play): distributor-based
+# endpoint delivery. Maven Central artifact — google() is content-filtered.
+# Pinned to the last release built with Kotlin 2.2.x: 3.2.0+ ship Kotlin 2.3.0
+# metadata, which this repo's Kotlin 2.1.0 compiler rejects. Bump alongside
+# the repo-wide Kotlin upgrade.
+unifiedpush-connector = "3.1.2"
+# GoogleApiAvailability for the push-transport probe (FCM vs UnifiedPush).
+play-services-base = "18.5.0"
 android-minSdk = "26"
 android-targetSdk = "35"
 android-compileSdk = "35"
@@ -36,6 +44,8 @@ jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
 breez-sdk-liquid = { module = "technology.breez.liquid:breez-sdk-liquid-kmp", version.ref = "breez-sdk-liquid" }
 firebase-bom = { module = "com.google.firebase:firebase-bom", version.ref = "firebase-bom" }
 firebase-messaging = { module = "com.google.firebase:firebase-messaging" }
+unifiedpush-connector = { module = "org.unifiedpush.android:connector", version.ref = "unifiedpush-connector" }
+play-services-base = { module = "com.google.android.gms:play-services-base", version.ref = "play-services-base" }
 androidx-benchmark-macro-junit4 = { module = "androidx.benchmark:benchmark-macro-junit4", version.ref = "androidx-benchmark" }
 androidx-profileinstaller = { module = "androidx.profileinstaller:profileinstaller", version.ref = "androidx-profileinstaller" }
 androidx-test-uiautomator = { module = "androidx.test.uiautomator:uiautomator", version.ref = "androidx-uiautomator" }
