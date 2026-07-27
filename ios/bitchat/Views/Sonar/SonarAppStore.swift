@@ -2132,6 +2132,11 @@ final class SonarAppStore: ObservableObject {
             onboarded = true
             defaults.set(true, forKey: Keys.onboarded)
             path = []
+            // A share that arrived through the extension before onboarding is
+            // still staged and waiting: ingestPendingShares bails out while
+            // there is no identity to send from. Finishing onboarding is the
+            // signal that releases it without forcing the user to relaunch.
+            ingestPendingShares()
         }
     }
 
@@ -2220,6 +2225,9 @@ final class SonarAppStore: ObservableObject {
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
+        // A staged share can also be waiting if the extension opened a fresh
+        // install that then went through the restore flow — release it now.
+        ingestPendingShares()
         switch backupOutcome {
         case .restored:
             showToast(String(localized: "Account restored — chats recovered from backup"))

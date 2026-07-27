@@ -39,6 +39,7 @@ class MainActivity : ComponentActivity() {
         const val DEBUG_MESH_TIMEOUT_MS = 45_000L
         const val DEBUG_MESH_RETRY_MS = 1_000L
         const val DEBUG_MESH_TAG = "SonarBleDebug"
+        const val CONSUMED_SHARE_BLOB_KEY = "share.lastConsumedSignature"
     }
 
     @Volatile
@@ -171,7 +172,10 @@ class MainActivity : ComponentActivity() {
             )
         }
         handleInviteIntent(intent)
-        handleShareIntent(intent)
+        // A non-null savedInstanceState means this activity is being restored,
+        // not freshly launched by a share — that is the only case where the
+        // task's original ACTION_SEND intent can be redelivered.
+        handleShareIntent(intent, isRestore = savedInstanceState != null)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
         maybeDebugMeshSend(intent)
@@ -230,7 +234,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleInviteIntent(intent)
-        handleShareIntent(intent)
+        handleShareIntent(intent, isRestore = false)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
         maybeDebugMeshSend(intent)
@@ -349,6 +353,20 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Stable fingerprint of a share payload: the text plus the URI list.
+     *
+     * Used to recognise the task's root ACTION_SEND intent being redelivered
+     * after process death — `removeExtra` only mutates the in-process copy, so
+     * without this a share the user already sent is offered again.
+     */
+    private fun shareSignature(text: String?, uris: List<android.net.Uri>): String =
+        buildString {
+            append(text.orEmpty())
+            append(' ')
+            uris.forEach { append(it.toString()).append(' ') }
+        }.hashCode().toString()
+
+    /**
      * System share sheet hand-off. Text and links arrive in EXTRA_TEXT; photos,
      * videos and documents arrive as content:// URIs in EXTRA_STREAM.
      *
@@ -358,8 +376,17 @@ class MainActivity : ComponentActivity() {
      * not to the calling thread, so the (potentially network-backed, up to 25 MiB)
      * reads run on [Dispatchers.IO] instead of blocking the main thread; a pure
      * text share with no URIs is still submitted synchronously to add no latency.
+     *
+     * [isRestore] is true only when the activity is being recreated from saved
+     * state (`savedInstanceState != null`), which is the sole case where Android
+     * can redeliver the task's original root ACTION_SEND intent — `removeExtra`
+     * cannot clear that, since it mutates only the in-process copy. Gating the
+     * persisted-signature check on a restore rather than on every cold start
+     * matters: a user deliberately re-sharing the same link in a fresh launch
+     * must still reach the picker, and keying suppression on content alone
+     * would silently swallow it.
      */
-    private fun handleShareIntent(intent: Intent?) {
+    private fun handleShareIntent(intent: Intent?, isRestore: Boolean) {
         val action = intent?.action
         if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
 
@@ -372,25 +399,44 @@ class MainActivity : ComponentActivity() {
                     ?: emptyList()
         }
 
+        // Persisted dedupe for the process-death + task-restore case. A share
+        // handed off to SonarLifecycle is fingerprinted and recorded, so when
+        // Android restores the task with the original root ACTION_SEND intent
+        // we recognise it and skip — otherwise a share the user already
+        // resolved is offered again and can be sent twice.
+        //
+        // Deliberately gated on [isRestore], not on "cold start": a fresh
+        // launch always carries a genuinely new share, even when its content is
+        // byte-identical to the last one (sharing the same link to a second
+        // person is ordinary). Suppressing on content alone would make that a
+        // silent no-op.
+        val signature = shareSignature(text, uris)
+        if (isRestore && SonarCore.loadBlob(CONSUMED_SHARE_BLOB_KEY) == signature) {
+            return
+        }
+
         // Consume the payload from the in-process Intent only once the copy has
         // been handed off to SonarLifecycle. Consuming after the hand-off is
         // what makes a cancelled copy retryable: a configuration change can
         // destroy the activity (cancelling the lifecycleScope read) before the
         // extras are cleared, and the recreated activity re-reads the same
         // Intent and retries — whereas clearing up front would lose the share
-        // with nothing to resend. This still covers onNewIntent re-delivery of
-        // the same Intent and same-process recreation. removeExtra mutates only
-        // this in-process Intent, not the task's stored root intent, so a share
-        // re-offered after a cold start (process death + task restore) is a
-        // known remaining gap. Same pattern as handleNotificationIntent.
+        // with nothing to resend. This covers onNewIntent re-delivery of the
+        // same Intent and same-process recreation; the persisted-signature
+        // guard above closes the process-death + task-restore case. Same
+        // pattern as handleNotificationIntent.
+        fun consume() {
+            intent.removeExtra(Intent.EXTRA_TEXT)
+            intent.removeExtra(Intent.EXTRA_STREAM)
+            SonarCore.saveBlob(CONSUMED_SHARE_BLOB_KEY, signature)
+        }
 
         // Pure text share: there is no content:// I/O to do, so submit
         // synchronously and avoid adding any latency before the picker opens.
         if (uris.isEmpty()) {
             if (text == null) return
             SonarLifecycle.submitSharedContent(SharedContent(text, DroppedFiles(emptyList(), 0)))
-            intent.removeExtra(Intent.EXTRA_TEXT)
-            intent.removeExtra(Intent.EXTRA_STREAM)
+            consume()
             return
         }
 
@@ -407,14 +453,12 @@ class MainActivity : ComponentActivity() {
             if (text == null && files.files.isEmpty()) {
                 if (files.rejectedCount > 0) {
                     SonarLifecycle.submitSharedContent(SharedContent(null, files))
-                    intent.removeExtra(Intent.EXTRA_TEXT)
-                    intent.removeExtra(Intent.EXTRA_STREAM)
+                    consume()
                 }
                 return@launch
             }
             SonarLifecycle.submitSharedContent(SharedContent(text, files))
-            intent.removeExtra(Intent.EXTRA_TEXT)
-            intent.removeExtra(Intent.EXTRA_STREAM)
+            consume()
         }
     }
 

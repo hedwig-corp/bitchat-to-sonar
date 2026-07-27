@@ -148,7 +148,15 @@ extension SonarAppStore {
         let text = share.text?.trimmingCharacters(in: .whitespacesAndNewlines)
         let fileURLs = share.fileURLs
         let droppedCount = share.payload.droppedCount
-        let limit = shareAttachmentLimitBytes(for: conversationID)
+        // The read budget is the ceiling of what ANY route can carry — not what
+        // the mesh alone supports. `sendAttachment` chooses mesh vs the encrypted
+        // White Noise route and already falls back to White Noise for payloads
+        // that exceed the mesh file-packet limit. Capping the read here with the
+        // lower mesh limit would reject an oversized photo before that fallback
+        // could run: a large share to a mesh-reachable peer that ALSO has an
+        // internet route would be silently dropped instead of sent. Android reads
+        // with the internet ceiling for the same reason.
+        let limit = SonarShareInbox.maxStagedBytes
 
         openDM(conversationID)
 
@@ -240,11 +248,4 @@ extension SonarAppStore {
         }
     }
 
-    /// Mesh routes cap far lower than internet ones; mirror the DM composer so
-    /// a share cannot stage past what the chosen transport will carry.
-    private func shareAttachmentLimitBytes(for conversationID: String) -> Int {
-        dmTransport(conversationID) == .mesh
-            ? FileTransferLimits.maxPayloadBytes
-            : SonarShareInbox.maxStagedBytes
-    }
 }
