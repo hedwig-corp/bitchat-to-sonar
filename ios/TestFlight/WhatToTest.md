@@ -1,9 +1,11 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.3 (31)** · Apple hotfix on **v0.1-alpha.12** (+ #446, #448, #449)
+Build: **Sonar 1.12.4 (32)** · Apple hotfix on **v0.1-alpha.12** (+ #441–#461 stack)
 
-Hotfix over 1.12.2: abort in-flight relay sync so the store close can finish
-before iOS suspends the process (`0xdead10cc` round 3). Opening a chat should
+Hotfix over 1.12.3: chat open/unread divider (#441), bitcoin payment option
+(#442), nearby peer flapping (#444), share-sheet recipient pick (#447), keep
+backgrounded Marmot store closed (#459), username claim UI (#460), and calm the
+relay-connect banner when chat already works (#461). Opening a chat should
 still paint from local storage first; missed messages catch up in the
 background; payments and notifications should stay stable when the phone is
 locked or the app is killed.
