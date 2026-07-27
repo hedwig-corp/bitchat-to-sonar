@@ -3,6 +3,7 @@ package chat.bitchat.sonar.wallet
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.ConcurrencyLock
 import chat.bitchat.sonar.PayEntry
 import chat.bitchat.sonar.PayStatus
 import chat.bitchat.sonar.SonarClock
@@ -294,6 +295,13 @@ object PaymentActivityStore {
 
     private var ledger: SonarPaymentActivityLedger? = null
 
+    /** Guards the lazy [ledger] init + every mutate/persist. The Android Breez
+     *  event listener records incoming receives from an SDK callback thread
+     *  ([recordIncomingWalletPayment]) concurrently with the app's main scope
+     *  and the push-service settlement path, so the underlying LinkedHashMap
+     *  must not be touched by two threads at once. */
+    private val lock = ConcurrencyLock()
+
     /** Bumped whenever the ledger changes, so activity UI recomposes. */
     var version by mutableStateOf(0)
         private set
@@ -301,16 +309,23 @@ object PaymentActivityStore {
     private fun ledger(): SonarPaymentActivityLedger =
         ledger ?: SonarPaymentActivityLedger(SonarCore.loadBlob(BLOB_KEY)).also { ledger = it }
 
-    fun sorted(): List<SonarPaymentActivity> = ledger().sorted()
+    fun sorted(): List<SonarPaymentActivity> = lock.withLock { ledger().sorted() }
 
-    fun activities(peerKey: String): List<SonarPaymentActivity> = ledger().activities(peerKey)
+    fun activities(peerKey: String): List<SonarPaymentActivity> =
+        lock.withLock { ledger().activities(peerKey) }
 
-    fun get(id: String): SonarPaymentActivity? = ledger().get(id)
+    fun get(id: String): SonarPaymentActivity? = lock.withLock { ledger().get(id) }
 
     fun recordPending(activity: SonarPaymentActivity): Boolean {
-        if (!ledger().recordPending(activity)) return false
-        persist(); version++
-        return true
+        val inserted = lock.withLock {
+            if (!ledger().recordPending(activity)) return@withLock false
+            persist(); true
+        }
+        // Bump the Compose version OUTSIDE the lock: writing snapshot state under
+        // [lock] (from the Breez SDK callback thread) would establish a
+        // lock → snapshot-lock ordering; keeping it out avoids that fragility.
+        if (inserted) version++
+        return inserted
     }
 
     /** Record a settled INCOMING external wallet payment. Called at the event
@@ -347,21 +362,29 @@ object PaymentActivityStore {
         feesSats: Long?,
         settledAtSecs: Long = SonarClock.nowSecs(),
     ): Boolean {
-        if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return false
-        persist(); version++
-        return true
+        val changed = lock.withLock {
+            if (!ledger().markPaid(id, walletPaymentId, feesSats, settledAtSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
     }
 
     fun markFailed(id: String, message: String, nowSecs: Long = SonarClock.nowSecs()): Boolean {
-        if (!ledger().markFailed(id, message, nowSecs)) return false
-        persist(); version++
-        return true
+        val changed = lock.withLock {
+            if (!ledger().markFailed(id, message, nowSecs)) return@withLock false
+            persist(); true
+        }
+        if (changed) version++
+        return changed
     }
 
     /** Emergency wipe: forget every payment (iOS `wipe()`). */
     fun wipe() {
-        ledger = SonarPaymentActivityLedger()
-        SonarCore.saveBlob(BLOB_KEY, "")
+        lock.withLock {
+            ledger = SonarPaymentActivityLedger()
+            SonarCore.saveBlob(BLOB_KEY, "")
+        }
         version++
     }
 

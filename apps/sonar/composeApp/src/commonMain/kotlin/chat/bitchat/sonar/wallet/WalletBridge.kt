@@ -37,6 +37,15 @@ data class WalletPaymentEvent(
     val feesSats: Long?,
     val timestampSecs: Long,
     val preimage: String? = null,
+    /**
+     * True only for a fully COMPLETE payment. A swap receive is reported while
+     * still PENDING (lockup seen, claim in flight) so a headless wake can stop
+     * waiting early — but a pending receive must not produce a user-visible
+     * "received" banner or a permanent `Paid` ledger row, because the swap can
+     * still fail or the lockup be reorged and the notify-once ring would block
+     * any later correction.
+     */
+    val settled: Boolean = true,
 )
 
 /**

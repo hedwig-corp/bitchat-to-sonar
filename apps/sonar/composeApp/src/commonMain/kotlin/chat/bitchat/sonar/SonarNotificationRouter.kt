@@ -108,6 +108,29 @@ object SonarNotificationRouter {
         )
     }
 
+    /**
+     * Direct wallet receive (external Lightning sender — no chat line, so no
+     * content for the core classifier). Rendered locally: title never names a
+     * sender (there is none), body carries the amount only when
+     * [SonarNotificationPrefs.showPaymentAmount] allows.
+     */
+    fun buildWalletReceive(
+        idKey: String,
+        sats: Long,
+        prefs: SonarNotificationPrefs = SonarNotificationPrefs(),
+    ): SonarNotification? {
+        if (!prefs.enabled) return null
+        val body =
+            if (prefs.showPaymentAmount) "${formatSats(sats)} received."
+            else "Open Sonar to view the payment."
+        return SonarNotification(
+            id = idKey.hashCode(),
+            title = "Payment received",
+            body = body,
+            kind = SonarNotificationKind.Payment,
+        )
+    }
+
     private fun classifyContentLocal(
         content: String,
         isCallControl: (String) -> Boolean,

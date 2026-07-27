@@ -270,6 +270,15 @@ object SonarPushRegistration {
         }
     }
 
+    /** Host that Breez NDS callback URLs must point at. An invoice_request
+     *  reply is only ever POSTed to the same NDS the webhook was registered
+     *  with — pinning the host closes off a forged push redirecting the reply
+     *  (including `https://user@evil/` userinfo tricks, since callers compare
+     *  the PARSED host). */
+    internal fun expectedNdsHost(): String =
+        runCatching { Uri.parse(ndsUrl.trim()).host }.getOrNull()
+            ?.takeUnless { it.isBlank() } ?: DEFAULT_NDS_HOST
+
     internal fun normalizedNdsUrl(rawValue: String?): String {
         val raw = rawValue?.trim().orEmpty()
         if (raw.isEmpty() || raw == "https:" || raw == "http:") return "https://$DEFAULT_NDS_HOST"
