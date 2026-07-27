@@ -37,7 +37,6 @@ import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
 import chat.bitchat.sonar.wallet.WalletState
-import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
@@ -59,8 +58,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  * Short-lived foreground service that processes push wakeups.
  *
  * Marmot pushes (transponder): sync messages → render user-visible notification.
- * Breez pushes (NDS): stay alive until the SDK settles the incoming payment,
- * then post one "Payment received" notification (nothing settled → silent).
+ * Breez pushes (NDS): answer a BOLT12 `invoice_request` first — a payer is
+ * blocked on it — then stay alive until an incoming receive arrives. A claimed
+ * (PENDING) receive ends the wake, but only a COMPLETE one posts "Payment
+ * received" and writes the ledger; nothing arriving stays silent.
  */
 class SonarPushProcessingService : Service() {
 
@@ -92,10 +93,18 @@ class SonarPushProcessingService : Service() {
      *  `stopSelf` with a stale id is a no-op and would strand the service. */
     @Volatile private var lastStartId = 0
 
-    /** Reply URL of an invoice_request we have accepted but not yet answered.
-     *  Set once the URL passes the pin, cleared as soon as any reply is POSTed,
-     *  so [stopWakeWork] can send a bail-out error for exactly the window where
-     *  a payer is blocked on us. */
+    /**
+     * Reply URL of an invoice_request we have accepted but not yet answered.
+     * Set once the URL passes the pin, cleared as soon as any reply is POSTed,
+     * so [stopWakeWork] can send a bail-out error for exactly the window where
+     * a payer is blocked on us.
+     *
+     * Single-slot on purpose, and best-effort: two overlapping invoice_request
+     * wakes are last-writer-wins, so the earlier one loses its bail-out. Not
+     * worth a collection — the NDS sends one request at a time per device, and
+     * the fallback is the pre-existing behaviour (the payer waits out the 60s
+     * window) rather than anything worse.
+     */
     @Volatile private var pendingReplyUrl: String? = null
 
     override fun onCreate() {
@@ -532,7 +541,7 @@ class SonarPushProcessingService : Service() {
             // dedup is [NotifiedPaymentIds], not this floor.
             val wakeFloorSecs =
                 System.currentTimeMillis() / 1000 - BREEZ_SETTLE_LOOKBACK_SECS
-            val settled = AtomicInteger(0)
+            val arrivals = AtomicInteger(0)
             // Per-wake dedup, separate from the cross-wake notified ring — see
             // handleSettledReceive.
             val seenThisWake = HashSet<String>()
@@ -545,7 +554,7 @@ class SonarPushProcessingService : Service() {
                         if (ev.incoming &&
                             handleSettledReceive(ev, prefs, seenThisWake, liveEvent = true)
                         ) {
-                            settled.incrementAndGet()
+                            arrivals.incrementAndGet()
                         }
                     }
                 }
@@ -600,21 +609,21 @@ class SonarPushProcessingService : Service() {
 
                 // Await a claimed receive: the first one ends this wake (each new
                 // payment gets its own push, so we don't need to drain many).
-                while (settled.get() == 0 &&
+                while (arrivals.get() == 0 &&
                     SystemClock.elapsedRealtime() < deadline
                 ) {
                     for (ev in WalletBridge.recentIncomingReceives(wakeFloorSecs)) {
                         if (handleSettledReceive(ev, prefs, seenThisWake, liveEvent = false)) {
-                            settled.incrementAndGet()
+                            arrivals.incrementAndGet()
                         }
                     }
-                    if (settled.get() > 0) break
+                    if (arrivals.get() > 0) break
                     delay(BREEZ_SETTLE_POLL_MS)
                 }
                 events.cancel()
             }
-            if (settled.get() > 0) WalletBridge.refreshBalance()
-            Log.d(TAG, "Breez wakeup done (type=$notificationType settled=${settled.get()})")
+            if (arrivals.get() > 0) WalletBridge.refreshBalance()
+            Log.d(TAG, "Breez wakeup done (type=$notificationType arrivals=${arrivals.get()})")
         } catch (e: Exception) {
             Log.w(TAG, "Breez wakeup failed (silent)", e)
         }

@@ -307,7 +307,12 @@ actual object WalletBridge {
         // "Payment received" banner for a payment the user watched land.
         // A headless wake has appVisible=false, so this never steals the claim
         // from the push service.
-        if (ev.incoming && SonarLifecycle.appVisible) claimNotifiedPaymentId(ev.paymentId)
+        // `settled` guard matters even though PaymentSucceeded should always be
+        // COMPLETE: claiming for a payment that has not actually arrived would
+        // suppress the real banner when it does.
+        if (ev.incoming && ev.settled && SonarLifecycle.appVisible) {
+            claimNotifiedPaymentId(ev.paymentId)
+        }
         payments.tryEmit(ev)
     }
 
