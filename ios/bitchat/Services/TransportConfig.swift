@@ -191,6 +191,12 @@ enum TransportConfig {
     static let messageDedupMaxAgeSeconds: TimeInterval = 300
     static let messageDedupMaxCount: Int = 1000
 
+    // Consecutive Noise decrypt failures tolerated before an established session
+    // is treated as desynchronized and torn down. Anything lower than 2 lets a
+    // single forged packet under a claimed sender ID evict a working session.
+    static let noiseDecryptFailuresBeforeSessionReset: Int = 3
+    static let noiseDecryptFailureTrackingCap: Int = 512
+
     // Verification QR
     static let verificationQRMaxAgeSeconds: TimeInterval = 5 * 60
 

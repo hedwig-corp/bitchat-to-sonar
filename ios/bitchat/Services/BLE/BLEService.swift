@@ -87,6 +87,8 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
+    /// Consecutive Noise decrypt failures per peer (see `noteDecryptFailed`).
+    private var consecutiveDecryptFailures: [PeerID: Int] = [:]
     /// False while the radio is unusable (`.poweredOff` / `.unauthorized` / `.resetting`).
     ///
     /// Announces are processed on `messageQueue`, so one received a few ms before
@@ -1670,6 +1672,15 @@ final class BLEService: NSObject {
     /// signing key bound by a verified announce. The persisted identity cache
     /// keeps delayed or relayed leaves verifiable after the live registry entry
     /// has aged out.
+    ///
+    /// This is only as strong as the signing-key pin behind it, and that pin is
+    /// trust-on-first-use: `handleAnnounce` checks the announced signing key
+    /// against the live `peers` registry, so on a node where the entry is
+    /// missing (fresh start, sender out of range) an announce carrying the
+    /// sender's public noise key with an attacker signing key still verifies
+    /// against itself and rebinds the pin. Closing that is a change to the
+    /// announce path, not this one; until then a leave proves possession of
+    /// whatever key is currently pinned, not of the original identity.
     ///
     /// Returns whether the leave was accepted, so the caller can withhold the
     /// relay: an unverifiable leave must not be amplified across the mesh.
@@ -4924,8 +4935,9 @@ extension BLEService {
         
         do {
             let decrypted = try noiseService.decrypt(packet.payload, from: peerID)
+            noteDecryptSucceeded(for: peerID)
             guard decrypted.count > 0 else { return }
-            
+
             // First byte indicates the payload type
             let payloadType = decrypted[0]
             let payloadData = decrypted.dropFirst()
@@ -4966,12 +4978,47 @@ extension BLEService {
             if !noiseService.hasSession(with: peerID) {
                 initiateNoiseHandshake(with: peerID)
             }
+        } catch NoiseSecurityError.rateLimitExceeded {
+            // Being rate limited says nothing about session health. Clearing here
+            // handed an attacker a session-teardown primitive: flood packets under
+            // a victim's claimed sender ID and the victim's session is discarded.
+            SecureLogger.warning("🚫 Rate limited decrypt from \(peerID.id.prefix(8))…; keeping the established session", category: .security)
         } catch {
-            // Decryption failed - clear the corrupted session and re-initiate handshake
-            // This handles cases where session state got out of sync (nonce mismatch, etc.)
-            SecureLogger.error("❌ Failed to decrypt message from \(peerID): \(error) - clearing session and re-initiating handshake")
+            // Decryption failed. Anyone can emit a packet under any claimed sender
+            // ID, so a single AEAD failure is not evidence that our session is out
+            // of sync, and tearing it down on one packet is the same denial of
+            // service this file now refuses on the handshake path. Only a run of
+            // consecutive failures indicates real desync (nonce mismatch, peer
+            // restart), and any successful decrypt resets the run.
+            let failures = noteDecryptFailed(for: peerID)
+            guard failures >= TransportConfig.noiseDecryptFailuresBeforeSessionReset else {
+                SecureLogger.warning("❌ Failed to decrypt message from \(peerID.id.prefix(8))… (\(failures)/\(TransportConfig.noiseDecryptFailuresBeforeSessionReset)): \(error)", category: .security)
+                return
+            }
+            SecureLogger.error("❌ \(failures) consecutive decrypt failures from \(peerID) - clearing session and re-initiating handshake")
+            noteDecryptSucceeded(for: peerID)
             noiseService.clearSession(for: peerID)
             initiateNoiseHandshake(with: peerID)
+        }
+    }
+
+    /// Consecutive Noise decrypt failures per peer, so that one forged packet
+    /// cannot evict a working session. Reset on any successful decrypt and when
+    /// the session is torn down.
+    private func noteDecryptFailed(for peerID: PeerID) -> Int {
+        collectionsQueue.sync(flags: .barrier) {
+            let next = (consecutiveDecryptFailures[peerID] ?? 0) + 1
+            if consecutiveDecryptFailures.count >= TransportConfig.noiseDecryptFailureTrackingCap {
+                consecutiveDecryptFailures.removeAll()
+            }
+            consecutiveDecryptFailures[peerID] = next
+            return next
+        }
+    }
+
+    private func noteDecryptSucceeded(for peerID: PeerID) {
+        collectionsQueue.sync(flags: .barrier) {
+            _ = consecutiveDecryptFailures.removeValue(forKey: peerID)
         }
     }
 

@@ -1778,7 +1778,12 @@ impl Engine {
             return;
         };
         let Some(fp) = Self::authenticated_fingerprint(&hs, &l.bind) else {
+            // Drop the contradicted identity with the handshake. Leaving it in
+            // place would let the link keep counting as the victim for
+            // `bind_allowed` (allowlist fan-out) and keep announcing itself as
+            // that peer, even though nothing here ever authenticated.
             l.noise = None;
+            l.bind = PeerBinding::default();
             return;
         };
         match hs.into_session() {
@@ -1803,6 +1808,7 @@ impl Engine {
         // in flight. A later announce may only agree with it, never move it.
         let Some(fp) = Self::authenticated_fingerprint(&hs, &s.bind) else {
             s.noise = None;
+            s.bind = PeerBinding::default();
             return;
         };
         match hs.into_session() {
@@ -2183,6 +2189,14 @@ mod tests {
         assert!(
             a.send_text_now(&victim_fp, "mid", "secret", now).is_none(),
             "a DM to the victim must not leave over the attacker's session"
+        );
+        // The contradicted binding must be dropped, not merely left unusable:
+        // `bind_allowed` consults the fingerprint without requiring a session,
+        // so a lingering one would still buy allowlist fan-out as the victim.
+        assert_eq!(
+            a.links.get(&link).and_then(|l| l.bind.fingerprint.clone()),
+            None,
+            "a rejected link must stop claiming the victim's fingerprint"
         );
     }
 
