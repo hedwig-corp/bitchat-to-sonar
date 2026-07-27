@@ -46,8 +46,16 @@ actual object MeshRadio {
         if (discoveryMode == BleDiscoveryMode.KnownOnly && knownPeerIds.isEmpty()) return
         BleBridge.start()            // central: filtered scan
         refreshAnnounce()
-        BleBridge.startAdvertising() // peripheral: advertise + GATT server
-        MeshLink.start()             // protocol engine: handshake + DMs
+        if (BleBridge.advertisingSupported) {
+            BleBridge.startAdvertising() // peripheral: advertise + GATT server
+            MeshLink.start()             // protocol engine: handshake + DMs
+        } else {
+            // Linux/Windows: scan-only. Without the peripheral role a phone can
+            // never subscribe, so it never writes its announce, so MeshLink has
+            // nothing to pump and no Noise session can form. Starting it would
+            // just spin a thread that never sees a packet.
+            sonarLog("MeshRadio", "BLE peripheral role unavailable on this platform: scan-only, phones cannot discover this desktop")
+        }
     }
 
     actual fun stop() {

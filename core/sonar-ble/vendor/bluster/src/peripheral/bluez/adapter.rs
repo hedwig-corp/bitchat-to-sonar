@@ -50,7 +50,7 @@ impl Adapter {
     pub async fn powered(self: &Self, on: bool) -> Result<(), Error> {
         let proxy = self.connection.get_bluez_proxy(&self.object_path);
         proxy
-            .method_call(
+            .method_call::<(), _, _, _>(
                 DBUS_PROPERTIES_IFACE,
                 "Set",
                 (
@@ -82,7 +82,7 @@ impl Adapter {
     pub async fn set_alias(self: &Self, alias: &str) -> Result<(), Error> {
         let proxy = self.connection.get_bluez_proxy(&self.object_path);
         proxy
-            .method_call(
+            .method_call::<(), _, _, _>(
                 DBUS_PROPERTIES_IFACE,
                 "Set",
                 (

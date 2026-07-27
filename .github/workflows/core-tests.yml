@@ -29,5 +29,15 @@ jobs:
         run: cargo test --workspace
         working-directory: core
 
+      # sonar-ble is a DETACHED workspace (its BLE deps stay out of the
+      # sonar-ffi build and `cargo test --workspace` above), so it needs its own
+      # invocation or it is never compiled by CI at all. Running it here on
+      # macOS covers the CoreBluetooth peripheral path, which is cfg'd out on
+      # Linux and would otherwise ship unbuilt; compose-tests covers the Linux
+      # (BlueZ) central path.
+      - name: Build + test the desktop BLE bridge (CoreBluetooth path)
+        run: cargo test
+        working-directory: core/sonar-ble
+
       - name: Test relay smoke classification
         run: scripts/smoke/test-relay-smoke-classifier.sh
