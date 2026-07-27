@@ -46,7 +46,15 @@ enum RelayConnectionPolicy {
     /// (`ensureRelayConnected`) legitimately needs relays while backgrounded and
     /// owns its own bounded close afterwards, and the foreground resume is not
     /// backgrounded by definition.
-    static func mayAutoReconnect(appBackgrounded: Bool) -> Bool { !appBackgrounded }
+    ///
+    /// Takes `foreground` rather than `backgrounded` to match the Compose
+    /// sibling `RelayConnectionPolicy.shouldRetrySupersededAttach(foreground:)`,
+    /// which reached the same rule independently — "once genuinely backgrounded,
+    /// do not retry — looping would rebuild sockets the OS is suspending". The
+    /// two are not interchangeable (Kotlin's is scoped to a superseded in-flight
+    /// attach, this to any timer-driven reconnect), so they stay separate; they
+    /// read in the same direction so the mirror stays diffable.
+    static func shouldAutoReconnect(foreground: Bool) -> Bool { foreground }
 
     /// Whether a push wake should drop the relay latch.
     ///

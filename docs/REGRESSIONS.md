@@ -935,7 +935,7 @@ stay callable while backgrounded: `SonarPushProcessor`'s wake reaches it through
 `ensureRelayConnected()` and needs relays with the app in `.background`, and it
 owns a bounded close afterwards. Every caller of `scheduleRelayConnect`, by
 contrast, is a retry firing on a timer with nobody waiting on it. So
-`scheduleRelayConnect` consults `RelayConnectionPolicy.mayAutoReconnect` when
+`scheduleRelayConnect` consults `RelayConnectionPolicy.shouldAutoReconnect` when
 the timer **fires**, not when it is armed — the delay routinely straddles the
 foreground→background transition, and a schedule-time check would miss exactly
 the case that crashes.
@@ -977,11 +977,16 @@ call must survive backgrounding.
 **Call sites:** iOS `MarmotChatView.swift::scheduleRelayConnect` (the gate),
 `MarmotChatView.swift::suspendStoreForBackground` (the quiesce), and
 `SonarAppStore.swift::finalizeCall` (the call-loop cancel); policy in
-`RelayConnectionPolicy.swift::mayAutoReconnect`. Compose: not applicable — the
-same reason as R-016, Android has no RunningBoard file-lock kill. Android's
-equivalent loops cost battery and wakelock time rather than the process — the
-analogous background-rebuild churn there was #440, which is a performance bug,
-not a kill.
+`RelayConnectionPolicy.swift::shouldAutoReconnect`. Compose: the *crash* does not
+apply — Android has no RunningBoard file-lock kill, same reason as R-016 — but the
+*rule* does, and Android got there first. `RelayConnectionPolicy.kt` already carries
+`shouldRetrySupersededAttach(foreground:)` with the same reasoning ("looping would
+rebuild sockets the OS is suspending"), and #440 fixed Android's analogous
+background-rebuild churn as a battery/wakelock bug rather than a kill. The two
+predicates stay separate — Kotlin's covers a superseded in-flight attach, iOS's any
+timer-driven reconnect — but share polarity and cross-reference each other, so the
+mirror stays diffable. An earlier draft of this entry claimed Compose was simply not
+applicable; that was an overclaim from a grep that missed the Kotlin file.
 
 **Guarded by:** `RelayConnectionPolicyTests.backgroundedAppMustNotSelfHealRelayConnection`, `RelayConnectionPolicyTests.foregroundAppStillSelfHealsRelayConnection`
 

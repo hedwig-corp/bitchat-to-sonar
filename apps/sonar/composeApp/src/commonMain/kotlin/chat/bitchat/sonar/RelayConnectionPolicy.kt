@@ -58,6 +58,14 @@ object RelayConnectionPolicy {
      * backgrounded, do not retry — looping would rebuild sockets the OS is
      * suspending, and both the push wake and the next foreground resume start a
      * fresh job.
+     *
+     * iOS reached the same rule separately, for a harsher reason: there a
+     * timer-driven reconnect reopens the SQLCipher store after the suspend hook
+     * closed it, and RunningBoard kills the process (0xdead10cc, `R-020`). Its
+     * gate is `RelayConnectionPolicy.shouldAutoReconnect(foreground:)`, kept as a
+     * separate member because it covers any timer-driven reconnect rather than a
+     * superseded in-flight attach. Same polarity on purpose — if you change one,
+     * read the other.
      */
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
 }

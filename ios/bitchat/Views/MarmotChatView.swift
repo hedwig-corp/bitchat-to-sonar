@@ -1165,8 +1165,8 @@ final class MarmotChatModel: ObservableObject {
             // safe: the foreground resume reconnects via `refreshAfterForeground`
             // and a push wake attaches relays through `ensureRelayConnected()`,
             // which calls `connectRelaysIfNeeded()` directly and is not gated.
-            guard RelayConnectionPolicy.mayAutoReconnect(
-                appBackgrounded: UIApplication.shared.applicationState == .background
+            guard RelayConnectionPolicy.shouldAutoReconnect(
+                foreground: UIApplication.shared.applicationState != .background
             ) else {
                 self?.relayConnectTask = nil
                 return
@@ -4115,9 +4115,7 @@ final class MarmotChatModel: ObservableObject {
                         // pass and start a SECOND concurrent loop. Checked
                         // BEFORE `isSuspendInterrupted`: on the suspend path
                         // both are true at once, and that branch clears the slot.
-                        if Task.isCancelled {
-                            return
-                        }
+                        if Task.isCancelled { return }
                         // A suspend abort is not a lost subscription — the node
                         // is being closed for background suspension. Falling
                         // into the reconnect path below would arm
