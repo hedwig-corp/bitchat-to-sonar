@@ -1175,7 +1175,17 @@ final class MarmotChatModel: ObservableObject {
             // serial queue the close is trying to drain. Spraying 40 of those
             // into a close window would push against 0xdead10cc, which is
             // precisely the thing this whole path exists to avoid.
-            if !busy, Date().timeIntervalSince(lastKick) >= 1 {
+            //
+            // `canPrefetchFromRelays` is a FIRE-TIME gate, same pattern as
+            // `scheduleRelayConnect`: callers check foreground only at entry,
+            // and this await routinely straddles a background transition. A
+            // re-kick landing after that transition would reopen the SQLCipher
+            // store via `connectLocal` with the scenePhase suspend hook
+            // already spent — nothing would close it again (the R-020 kill).
+            // The push wake runs backgrounded and keeps its pre-existing
+            // single-kick behavior; the resume race this loop heals is
+            // foreground by definition.
+            if !busy, canPrefetchFromRelays, Date().timeIntervalSince(lastKick) >= 1 {
                 lastKick = Date()
                 connectIfNeeded()
             }
@@ -2735,15 +2745,21 @@ final class MarmotChatModel: ObservableObject {
         // not error — `fetch_events_from` just has no relays to ask — so it
         // returns a clean miss and lands us back on the same false "no offer".
         //
-        // Deliberately short. This is a tap-blocking path with no spinner, and
-        // the timeouts only ever elapse in the state that used to be permanent,
-        // so a bounded wait strictly improves it; a 10s default twice over
-        // would trade a wrong answer for a frozen button.
+        // Deliberately bounded. This is a tap-blocking path with no spinner,
+        // and the timeouts only ever elapse in the state that used to be
+        // permanent, so a bounded wait strictly improves it; a 10s default
+        // twice over would trade a wrong answer for a frozen button. The two
+        // bounds are asymmetric on purpose: the node open is local-only and
+        // fast (3s is generous), while the relay attach must cover core's
+        // fixed 5s quorum window (`RELAY_CONNECT_TIMEOUT`) — a 3s bound there
+        // expires mid-attach on a radio waking from doze, the fetch proceeds
+        // relay-less, and the clean miss stamps the 60s cooldown that
+        // suppresses the background `ensureSonarDescriptor` path.
         if !service.isConnected(), canPrefetchFromRelays {
             _ = await ensureConnected(timeoutSeconds: 3)
         }
         if !service.isRelayConnected(), canPrefetchFromRelays {
-            _ = await ensureRelayConnected(timeoutSeconds: 3)
+            _ = await ensureRelayConnected(timeoutSeconds: 6)
         }
         descriptorFetches.insert(npubToFetch)
         await performDescriptorFetch(npubToFetch, generation: descriptorCacheGeneration)
