@@ -921,12 +921,17 @@ actual object SonarCore {
 
     actual suspend fun backupAccountToBlossom(requireNoLiveUiSession: Boolean): String =
         withContext(Dispatchers.IO) {
+            // Symmetric with the restore path: a backup that silently fails to
+            // upload is indistinguishable from one that was never taken, and
+            // the user only learns which when they try to restore.
+            sonarLog("Backup", "upload: sealing and uploading account backup")
             try {
                 val sealed = sealAccountBackup(requireNoLiveUiSession)
                 val status = uploadSealedAccountBackup(sealed)
                 runCatching { recordBackupSuccess() }
                 status
             } catch (t: Throwable) {
+                sonarLog("Backup", "upload FAILED: ${t.message}")
                 runCatching { recordBackupFailure(t.message ?: "backup failed") }
                 throw t
             }
@@ -956,6 +961,7 @@ actual object SonarCore {
         val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
             ?: error("no identity to back up")
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        sonarLog("Backup", "upload OK: ${info.size} bytes -> ${info.url}")
         "uploaded ${info.size} bytes"
     }
 

@@ -34,9 +34,20 @@ const HKDF_INFO: &[u8] = b"sonar-account-backup-v1";
 const NONCE_LEN: usize = 12;
 /// Distinct MIME so the BUD-03 listing can pick account backups among media.
 pub const ACCOUNT_BACKUP_MIME: &str = "application/vnd.sonar.account-backup-v1";
-/// Same fallback host as media uploads (`client::DEFAULT_BLOSSOM_SERVER`).
-/// Duplicated here to avoid a client ↔ account_backup import cycle.
-const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
+/// Same fallback host as media uploads — referenced, not copied. The previous
+/// hand-copied duplicate silently drifted when #360 moved media to Hedwig
+/// Blossom, leaving account backups (recovery data) on a third-party public
+/// host while media went to our own.
+use crate::client::DEFAULT_BLOSSOM_SERVER;
+
+/// Hosts that older builds uploaded account backups to, tried on restore after
+/// the current default yields nothing.
+///
+/// Media does not need this — a message carries the blob's absolute URL, so
+/// `fetch_media` reaches any prior host directly. A backup has no stored URL:
+/// restore finds it by LISTING one host, so moving the default would otherwise
+/// orphan every backup already sitting on the old one.
+const LEGACY_BACKUP_BLOSSOM_SERVERS: &[&str] = &["https://nostr.download"];
 /// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
 /// guards memory against a malicious Blossom response.
 const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
@@ -867,10 +878,44 @@ async fn list_account_backup_blobs(keys: &Keys, base: &Url) -> Result<Vec<BlobDe
         .map_err(|e| Error::Blossom(format!("blossom list decode: {e}")))
 }
 
+/// Hosts to search on restore: the caller's server, or — when it defaulted —
+/// the current default followed by [`LEGACY_BACKUP_BLOSSOM_SERVERS`].
+///
+/// An explicit server is honoured verbatim: a caller pointing at their own
+/// Blossom does not want us reaching out to a public one behind their back.
+fn backup_search_hosts(server_url: &str) -> Result<Vec<Url>> {
+    let base = blossom_base(server_url)?;
+    if !server_url.is_empty() {
+        return Ok(vec![base]);
+    }
+    let mut hosts = vec![base];
+    for legacy in LEGACY_BACKUP_BLOSSOM_SERVERS {
+        let legacy = blossom_base(legacy)?;
+        if !hosts.contains(&legacy) {
+            hosts.push(legacy);
+        }
+    }
+    Ok(hosts)
+}
+
 /// List this pubkey's blobs and download the newest account-backup MIME.
 pub async fn download_latest_sealed_backup(keys: &Keys, server_url: &str) -> Result<Vec<u8>> {
-    let base = blossom_base(server_url)?;
-    download_latest_sealed_backup_at(keys, &base).await
+    download_latest_sealed_backup_from(keys, &backup_search_hosts(server_url)?).await
+}
+
+/// Try each host in order. Only a genuinely absent backup advances to the next
+/// one — a transport or decode failure is reported as-is rather than being
+/// retried elsewhere and surfacing as the misleading "no backup" outcome.
+async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Result<Vec<u8>> {
+    let mut last_missing = Error::AccountBackupMissing;
+    for base in bases {
+        match download_latest_sealed_backup_at(keys, base).await {
+            Ok(data) => return Ok(data),
+            Err(e) if is_missing_backup_error(&e) => last_missing = e,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_missing)
 }
 
 /// Same, against an already-validated base. Split out so tests can drive the
@@ -1098,6 +1143,55 @@ mod tests {
             expiration > Timestamp::now().as_u64(),
             "expired authorizations are refused",
         );
+    }
+
+    /// Moving the default host must not orphan a backup already uploaded to the
+    /// old one: unlike media, a backup carries no stored URL, so restore can
+    /// only find it by listing.
+    #[tokio::test]
+    async fn restore_falls_back_to_a_legacy_host() {
+        let keys = Keys::generate();
+        let sealed = b"backup-on-the-old-host".to_vec();
+        let (current, _a) = spawn_mock_blossom_list(Keys::generate().public_key(), b"x".to_vec());
+        let (legacy, _b) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
+        let got = download_latest_sealed_backup_from(&keys, &[current, legacy])
+            .await
+            .expect("must search the legacy host too");
+        assert_eq!(got, sealed);
+    }
+
+    /// A real error on the first host must not be retried onto the next and
+    /// end up reported as "no backup" — that is how a transient outage would
+    /// tell a user their chats are gone.
+    #[tokio::test]
+    async fn a_transport_error_does_not_become_a_missing_backup() {
+        let keys = Keys::generate();
+        let dead = Url::parse("http://127.0.0.1:1/").expect("closed port");
+        let (legacy, _b) = spawn_mock_blossom_list(keys.public_key(), b"sealed".to_vec());
+        let err = download_latest_sealed_backup_from(&keys, &[dead, legacy])
+            .await
+            .expect_err("the first host failed for real");
+        assert!(
+            !is_missing_backup_error(&err),
+            "a transport failure must stay a failure, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn default_search_hosts_start_at_the_media_host_then_legacy() {
+        let hosts = backup_search_hosts("").unwrap();
+        assert_eq!(
+            hosts.first().map(Url::as_str),
+            Some(format!("{DEFAULT_BLOSSOM_SERVER}/").as_str()),
+            "backups must target the same host as media",
+        );
+        assert!(
+            hosts.len() > 1 && hosts.iter().any(|h| h.as_str().contains("nostr.download")),
+            "the previous default must stay searchable: {hosts:?}",
+        );
+        // An explicit server is honoured alone, no public-host fallback.
+        let explicit = backup_search_hosts("https://blossom.example").unwrap();
+        assert_eq!(explicit.len(), 1);
     }
 
     #[test]
