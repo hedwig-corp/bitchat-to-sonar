@@ -4103,6 +4103,17 @@ final class MarmotChatModel: ObservableObject {
                     do {
                         try await self.service.ensureSubscriptions()
                     } catch {
+                        // Cancellation is checked FIRST, before any error
+                        // classification: on the suspend path the task is
+                        // already cancelled AND the error carries the suspend
+                        // marker, so a classification-first order would clear
+                        // `syncTask` — possibly a NEWER task a fast foreground
+                        // resume already installed. `Task` is a struct, so
+                        // there is no identity check to make "only clear my own
+                        // slot" work (see `stopPolling()`'s note on
+                        // `mediaResumeTask`). Returning without touching shared
+                        // state is the only safe move for a cancelled loop.
+                        if Task.isCancelled { return }
                         if Self.isSuspendInterrupted(error) {
                             self.syncTask = nil
                             return
@@ -4120,6 +4131,18 @@ final class MarmotChatModel: ObservableObject {
                     do {
                         try await self.service.ensureSubscriptions()
                     } catch {
+                        // A cancelled loop is a deliberate stop (the background
+                        // suspend hook cancels `syncTask` before closing the
+                        // node), so it must not surface an error, arm a
+                        // reconnect, or clear the slot — a foreground resume may
+                        // already have installed a newer task there, and nilling
+                        // it lets `startPolling()`'s `guard syncTask == nil`
+                        // pass and start a SECOND concurrent loop. Checked
+                        // BEFORE `isSuspendInterrupted`: on the suspend path
+                        // both are true at once, and that branch clears the slot.
+                        if Task.isCancelled || Self.isDeliberatelyStopped(error) {
+                            return
+                        }
                         // A suspend abort is not a lost subscription — the node
                         // is being closed for background suspension. Falling
                         // into the reconnect path below would arm
@@ -4133,16 +4156,6 @@ final class MarmotChatModel: ObservableObject {
                         // restarts polling through performConnect.
                         if Self.isSuspendInterrupted(error) {
                             self.syncTask = nil
-                            return
-                        }
-                        // A cancelled loop is a deliberate stop (the background
-                        // suspend hook cancels `syncTask` before closing the
-                        // node), so it must not surface an error, arm a
-                        // reconnect, or clear the slot — a foreground resume may
-                        // already have installed a newer task there, and nilling
-                        // it lets `startPolling()`'s `guard syncTask == nil`
-                        // pass and start a SECOND concurrent loop.
-                        if Task.isCancelled || Self.isDeliberatelyStopped(error) {
                             return
                         }
                         self.relayConnected = false
