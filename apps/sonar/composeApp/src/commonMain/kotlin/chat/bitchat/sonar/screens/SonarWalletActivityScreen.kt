@@ -16,6 +16,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -52,7 +55,11 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
 
     val balanceSats = state.walletBalanceSats()
     // Chat receipts + direct wallet activity, deduped, newest first.
-    val entries = state.walletActivity()
+    //
+    // `walletActivity()` merges two ledgers, dedupes and sorts. Off the render
+    // path via derivedStateOf: it recomputes only when the ledgers it reads
+    // actually change, instead of on every recomposition of this screen.
+    val entries by remember(state) { derivedStateOf { state.walletActivity() } }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Wallet", hairline = false, onBack = { state.back() })
