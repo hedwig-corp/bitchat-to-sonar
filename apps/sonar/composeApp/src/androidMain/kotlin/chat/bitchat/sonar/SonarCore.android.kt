@@ -929,7 +929,17 @@ actual object SonarCore {
                 val dbKeyHex = loadOrCreateDbKey()
                 // UniFFI close — nulling `node` alone leaves SQLCipher open.
                 closeNode()
-                val info = uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
+                // Symmetric with the restore path: a backup that silently fails
+                // to upload is indistinguishable from one that was never taken,
+                // and the user only learns which when they try to restore.
+                sonarLog("Backup", "upload: sealing and uploading account backup")
+                val info = try {
+                    uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
+                } catch (t: Throwable) {
+                    sonarLog("Backup", "upload FAILED: ${t.message}")
+                    throw t
+                }
+                sonarLog("Backup", "upload OK: ${info.size} bytes -> ${info.url}")
                 "uploaded ${info.size} bytes"
             }
         }
