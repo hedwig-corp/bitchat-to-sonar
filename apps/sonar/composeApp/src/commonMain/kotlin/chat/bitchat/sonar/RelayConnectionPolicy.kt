@@ -95,6 +95,16 @@ object RelayConnectionPolicy {
      * Passed rather than read inside so the schedule stays a pure function: a
      * `commonTest` assertion about the backgrounded branch compiles into the JVM
      * target, where the platform actual is `false`.
+     *
+     * **This deliberately does NOT share polarity with
+     * [shouldRetrySupersededAttach] / iOS `shouldAutoReconnect`, and must not be
+     * "made consistent" with them.** Those decide *whether* to reconnect at all,
+     * which on iOS is what reopens a closed SQLCipher store and gets the process
+     * killed (`R-020`) — so they gate on bare `!foreground`, the conservative
+     * answer. This one only scales a delay inside a loop that is already running
+     * and already committed to retrying, so the extra precision costs nothing
+     * and buys desktop its fast head back. Widening those two the same way is a
+     * separate change that has to keep the iOS gate intact.
      */
     fun connectRetryDelayMs(
         consecutiveFailures: Int,
