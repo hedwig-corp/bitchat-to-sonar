@@ -66,6 +66,25 @@ object RelayConnectionPolicy {
      * separate member because it covers any timer-driven reconnect rather than a
      * superseded in-flight attach. Same polarity on purpose — if you change one,
      * read the other.
+     *
+     * **Do not "fix" `foreground` here the way [connectRetryDelayMs] does.** It
+     * looks like the same conflation of "not frontmost" with "sockets are
+     * suspended", and on desktop it looks like alt-tab strands a superseded
+     * attach until the heartbeat. It does not: on desktop this branch is
+     * unreachable. `relayEpoch` only advances in `invalidateRelayConnection()`,
+     * whose two callers are `SonarAppState.onProcessBackgrounded()` — gated on
+     * [shouldInvalidateOnBackground], `false` on JVM, and never wired anyway
+     * since `SonarDesktopRoot` installs only `onForeground` — and Android's
+     * `SonarPushProcessingService`. With the epoch frozen, [latchAfterAttach]
+     * always returns `true`, so a desktop attach is never superseded and this
+     * function is never asked. Relaxing it would therefore change nothing on
+     * desktop while loosening the gate that keeps iOS alive.
+     *
+     * That unreachability is emergent, not enforced: it is two independent facts
+     * (`false` on JVM, hook not installed) rather than one assertion. Adding any
+     * desktop push or process-lifecycle path that invalidates the latch makes
+     * this branch live, and this note wrong — re-derive it then rather than
+     * trusting it.
      */
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
 

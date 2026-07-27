@@ -1016,6 +1016,24 @@ close) -> this fix.
   push wake, which must attach relays precisely while backgrounded.
 - *Checking the app state when `scheduleRelayConnect` is armed.* The delay
   spans the transition; the crash case arms in the foreground and fires after.
+- *Relaxing the Compose `shouldRetrySupersededAttach(foreground)` gate the way
+  #461 relaxed its sibling `connectRetryDelayMs`.* Proposed twice off the same
+  plausible reading — `foreground` is window focus on desktop
+  (`Main.kt` `WindowFocusListener`), `platformShouldInvalidateRelayOnBackground()`
+  is `false` there, so alt-tab appears to strand a superseded attach until the
+  30 s heartbeat. **The premise is wrong: on desktop that branch is
+  unreachable.** `relayEpoch` advances only in `invalidateRelayConnection()`,
+  whose only callers are `SonarAppState.onProcessBackgrounded()` (gated on
+  `shouldInvalidateOnBackground()`, and `SonarDesktopRoot` installs only
+  `onForeground`, so it is never even reached) and Android's
+  `SonarPushProcessingService`. Epoch frozen ⇒ `latchAfterAttach` always `true`
+  ⇒ no desktop attach is ever superseded. The change would have bought nothing
+  and loosened the gate this entry exists to keep tight. `connectRetryDelayMs`
+  was a legitimate case because it only scales a delay inside a loop already
+  committed to retrying; this one decides *whether* to reconnect. Note the
+  unreachability is emergent — two independent facts, not one assertion — so a
+  desktop push or process-lifecycle path would make the branch live and this
+  rejection stale.
 
 ## Unguarded
 
