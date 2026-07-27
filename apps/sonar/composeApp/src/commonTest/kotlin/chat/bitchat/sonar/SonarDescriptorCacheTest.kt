@@ -166,6 +166,56 @@ class SonarDescriptorCacheTest {
         )
     }
 
+    /** The bug: evicting by the peer's publish time meant a contact who
+     *  published their descriptor long ago was dropped the instant we fetched
+     *  them — so the fetch achieved nothing, they stayed unpayable, and every
+     *  chat open refetched the same descriptor. */
+    @Test
+    fun theJustFetchedDescriptorSurvivesEvenWithTheOldestPublishTime() {
+        val staleKey = "f".repeat(64)
+        val full = (0 until SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT).associate { i ->
+            i.toString(16).padStart(64, '0') to descriptor(publishedAtSecs = 9_000L + i)
+        }
+        // Published years before everything already cached.
+        val incoming = full + (staleKey to descriptor(publishedAtSecs = 1L))
+
+        val bounded = boundedSonarDescriptorCache(
+            incoming,
+            lastFetchedAtSecs = mapOf(staleKey to 5_000_000L),
+            keep = staleKey,
+        )
+
+        assertEquals(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT, bounded.size)
+        assertTrue(staleKey in bounded, "the descriptor we just fetched must not be evicted")
+    }
+
+    /** Local fetch recency wins over the peer's publish time. */
+    @Test
+    fun evictionPrefersLocallyRecentEntriesOverRecentlyPublishedOnes() {
+        val recentlyUsed = "a".repeat(63) + "1"
+        val neverUsed = "b".repeat(63) + "2"
+        // Filler fills every slot but one, and is locally more recent than both
+        // candidates — so exactly one of the two below gets the last slot.
+        val fillerKeys = (0 until SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT - 1)
+            .map { it.toString(16).padStart(64, '0') }
+        val filler = fillerKeys.associateWith { descriptor(publishedAtSecs = 500L) }
+        val cache = filler +
+            // Old publish time, but we touched it a moment ago.
+            (recentlyUsed to descriptor(publishedAtSecs = 1L)) +
+            // Freshly published, never fetched locally.
+            (neverUsed to descriptor(publishedAtSecs = 9_999_999L))
+
+        val bounded = boundedSonarDescriptorCache(
+            cache,
+            lastFetchedAtSecs = fillerKeys.associateWith { 9_000_000L } +
+                (recentlyUsed to 8_000_000L),
+        )
+
+        assertEquals(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT, bounded.size)
+        assertTrue(recentlyUsed in bounded)
+        assertFalse(neverUsed in bounded)
+    }
+
     @Test
     fun boundingIsIdentityBelowTheCap() {
         val under = (0 until 10).associate { i ->

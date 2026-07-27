@@ -4739,9 +4739,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             return
         }
         if (descriptor != null) {
-            sonarDescriptorsByNpubHex =
-                boundedSonarDescriptorCache(sonarDescriptorsByNpubHex + (key to descriptor))
+            // Stamp the fetch time BEFORE pruning so this key counts as the most
+            // recently used, and pin it via `keep` — otherwise a peer whose
+            // descriptor was published long ago is evicted the moment we cache
+            // them and stays unpayable however often we refetch.
             sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
+            sonarDescriptorsByNpubHex = boundedSonarDescriptorCache(
+                sonarDescriptorsByNpubHex + (key to descriptor),
+                lastFetchedAtSecs = sonarDescriptorFetchedAt,
+                keep = key,
+            )
             sonarDescriptorMissedAt.remove(key)
             persistSonarDescriptorCache()
         } else {

@@ -85,8 +85,13 @@ report:
    lands. Persist them and hydrate at init so payments paint from local state
    first (Signal-Comparable Performance Rule). Compose:
    `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both cap
-   the persisted set at 1024, keeping the freshest by published-at with the npub
-   as tiebreak, so the blob stays bounded and re-encodes byte-identically.
+   the set at 1024 and evict by **local fetch recency**, pinning the key just
+   fetched. Evicting by the peer's `published_at` looks equivalent and is not:
+   a contact who published their descriptor long ago would be dropped the
+   instant we cached them, so the fetch achieves nothing, they stay unpayable,
+   and every chat open refetches the same event. Published-at survives only as
+   the tiebreak that orders entries hydrated from disk, which have no local
+   fetch time yet.
    The per-fetch write does its encode **off** the UI thread (Compose
    `scheduleContactCacheWrite`, iOS `scheduleDescriptorCacheWrite`) — a
    relay-startup sweep resolves N contacts, and encoding the whole map N times

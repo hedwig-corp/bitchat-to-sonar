@@ -341,13 +341,18 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
  *  `SNMarmotDescriptorCache.entryLimit`. */
 internal const val SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT = 1024
 
-/** Encode the resolved-descriptor cache (npub hex → descriptor) for durable
- *  storage. Every string rides through [hexEnc] so an offer or capability token
- *  can never corrupt the tab/newline framing. Over the cap, the freshest
- *  descriptors win. */
-/** Prune a descriptor cache to [SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT], keeping the
- *  freshest by `publishedAtSecs` with the npub key as tiebreak so the result is
- *  deterministic.
+/** Prune a descriptor cache to [SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT].
+ *
+ *  Eviction is by **local fetch recency** ([lastFetchedAtSecs]), not by the
+ *  peer's `publishedAtSecs`. Publication time is a property of their data, not
+ *  of how useful the entry is to us: a peer who published their descriptor a
+ *  year ago and whom we just fetched would otherwise be evicted the instant we
+ *  cached them, leaving them permanently unpayable and refetched on every chat
+ *  open. [keep] pins the just-fetched key for the same reason.
+ *
+ *  `publishedAtSecs` remains the tiebreak, which is what orders entries
+ *  hydrated from disk (they have no local fetch time yet), and the npub key
+ *  breaks the remaining ties so the result is deterministic.
  *
  *  Apply this to the LIVE map, not only to the encoder's output: capping only
  *  what gets serialized leaves the in-memory map growing without bound, and the
@@ -355,17 +360,25 @@ internal const val SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT = 1024
  *  ever-larger map on the render path. */
 internal fun boundedSonarDescriptorCache(
     descriptors: Map<String, SonarDescriptor>,
+    lastFetchedAtSecs: Map<String, Long> = emptyMap(),
+    keep: String? = null,
 ): Map<String, SonarDescriptor> {
     if (descriptors.size <= SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT) return descriptors
     return descriptors.entries
         .sortedWith(
-            compareByDescending<Map.Entry<String, SonarDescriptor>> { it.value.publishedAtSecs }
+            compareByDescending<Map.Entry<String, SonarDescriptor>> { it.key == keep }
+                .thenByDescending { lastFetchedAtSecs[it.key] ?: 0L }
+                .thenByDescending { it.value.publishedAtSecs }
                 .thenBy { it.key }
         )
         .take(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT)
         .associate { it.key to it.value }
 }
 
+/** Encode the resolved-descriptor cache (npub hex → descriptor) for durable
+ *  storage. Every string rides through [hexEnc] so an offer or capability token
+ *  can never corrupt the tab/newline framing. Callers pass an already-bounded
+ *  map; the extra bound here is belt-and-braces for direct callers. */
 internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
     boundedSonarDescriptorCache(
         descriptors.entries

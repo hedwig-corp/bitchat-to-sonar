@@ -211,18 +211,40 @@ enum SNMarmotDescriptorCache {
         defaults.removeObject(forKey: defaultsKey)
     }
 
-    /// Keep the freshest descriptors when over the cap (newest `publishedAt`).
-    /// Applied to the LIVE model map as well as to `save`, so the in-memory
-    /// dictionary cannot grow without bound and make every fetch re-encode more.
+    /// Prune to `entryLimit`. Applied to the LIVE model map as well as to
+    /// `save`, so the in-memory dictionary cannot grow without bound and make
+    /// every fetch re-encode more.
+    ///
+    /// Eviction is by **local fetch recency** (`lastFetchedAt`), not by the
+    /// peer's `publishedAt`. Publication time says nothing about how useful the
+    /// entry is to us: a peer who published a year ago and whom we just fetched
+    /// would otherwise be evicted the instant we cached them, leaving them
+    /// permanently unpayable and refetched on every chat open. `keep` pins the
+    /// just-fetched key for the same reason. `publishedAt` stays the tiebreak —
+    /// it is what orders entries hydrated from disk, which have no local fetch
+    /// time yet — and the npub key breaks the rest so the result is stable.
     static func capped(
-        _ descriptors: [String: MarmotService.SonarDescriptor]
+        _ descriptors: [String: MarmotService.SonarDescriptor],
+        lastFetchedAt: [String: Date] = [:],
+        keep: String? = nil
     ) -> [String: MarmotService.SonarDescriptor] {
         guard descriptors.count > entryLimit else { return descriptors }
+        func rank(_ e: (key: String, value: MarmotService.SonarDescriptor))
+            -> (Bool, TimeInterval, TimeInterval, String) {
+            (
+                e.key == keep,
+                lastFetchedAt[e.key]?.timeIntervalSince1970 ?? 0,
+                e.value.publishedAt.timeIntervalSince1970,
+                e.key
+            )
+        }
         let kept = descriptors
             .sorted {
-                $0.value.publishedAt == $1.value.publishedAt
-                    ? $0.key < $1.key
-                    : $0.value.publishedAt > $1.value.publishedAt
+                let l = rank($0), r = rank($1)
+                if l.0 != r.0 { return l.0 }
+                if l.1 != r.1 { return l.1 > r.1 }
+                if l.2 != r.2 { return l.2 > r.2 }
+                return l.3 < r.3
             }
             .prefix(entryLimit)
         return Dictionary(uniqueKeysWithValues: kept.map { ($0.key, $0.value) })
@@ -2721,7 +2743,15 @@ final class MarmotChatModel: ObservableObject {
                     self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
                 }
                 self.sonarDescriptorsByNpub[npubToFetch] = outcome.descriptor
-                self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.capped(self.sonarDescriptorsByNpub)
+                // `keep` + the fetch-time map stamped above: without them a
+                // peer whose descriptor was published long ago is evicted the
+                // moment we cache them and stays unpayable however often we
+                // refetch.
+                self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.capped(
+                    self.sonarDescriptorsByNpub,
+                    lastFetchedAt: self.sonarDescriptorFetchedAtByNpub,
+                    keep: npubToFetch
+                )
                 if outcome.missed {
                     self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
                 } else {
