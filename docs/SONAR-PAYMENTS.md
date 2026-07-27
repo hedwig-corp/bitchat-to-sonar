@@ -87,6 +87,13 @@ report:
    `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both cap
    the persisted set at 1024, keeping the freshest by published-at with the npub
    as tiebreak, so the blob stays bounded and re-encodes byte-identically.
+   The per-fetch write does its encode **off** the UI thread (Compose
+   `scheduleContactCacheWrite`, iOS `scheduleDescriptorCacheWrite`) — a
+   relay-startup sweep resolves N contacts, and encoding the whole map N times
+   on the render path is a Signal-Comparable Performance Rule violation. Only
+   wipe/teardown writes synchronously, because it must observe the blob cleared
+   before the account is replaced; it also invalidates any deferred write still
+   in flight so an erased contact cannot be resurrected.
 3. **Clear on identity death, not on "erase all chats".** Descriptors belong to
    the *account*, so only a panic wipe or an identity replacement may drop them
    (iOS `clearAccountContactDescriptors`, called from `wipeDatabase` and
