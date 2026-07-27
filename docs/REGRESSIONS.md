@@ -1204,6 +1204,32 @@ actually consults the predicate before wiping — that needs a constructible
 check entirely would still pass every test here. R-001 regressed exactly this
 way: a missing argument at a call site while every helper-level test stayed
 green.
+## R-024 — A Noise session belongs to the identity its handshake authenticated
+
+**Invariant:** A completed Noise handshake may only be filed under an identity that the authenticated remote static key derives. Validating a replacement must never cost the established session it is trying to replace.
+
+**Breaks as:** An attacker is authenticated as someone else. On iOS the victim's peer ID is mapped to the attacker's fingerprint and announced to every `onPeerAuthenticatedHandlers` subscriber; in Rust `sendable_route` hands the victim's DMs to the attacker's session and `handle_encrypted` attributes the attacker's traffic to the victim. Separately, one unauthenticated packet claiming a peer's ID tore that peer's working session down.
+
+**Why:** Noise XX authenticates the remote static key, but nothing else in the packet does. iOS took the peer ID straight from the packet header. The Rust engine took the fingerprint from an announce, which is a self-contained signed packet that anyone who overhears it can replay verbatim on their own link. So in both cases a genuine handshake with the attacker's own key was filed under a name the attacker chose.
+
+**Call sites:** iOS `NoiseSessionManager.swift::authenticatedRemoteKey(_:matches:)` (called from `handleIncomingHandshake`); Rust `mesh_engine.rs::authenticated_fingerprint` (called from `finish_noise_client` / `finish_noise_server`), plus the `direct` demotion in `handle_announce`
+
+**Guarded by:** `mesh_engine.rs::replayed_announce_cannot_bind_an_attacker_link_to_the_victim_route`, `mesh_engine.rs::late_replayed_announce_cannot_move_an_authenticated_link`
+
+**Also guarded by:** `NoiseSessionBindingTests.handshakeAuthenticatedByAnotherKeyCannotClaimAPeerID`, `NoiseSessionBindingTests.forgedReplacementHandshakeLeavesTheEstablishedSessionIntact`, `NoiseSessionBindingTests.unauthenticatedHandshakeMessageAloneCannotTearDownASession`, `NoiseSessionBindingTests.genuineRehandshakeStillReplacesTheEstablishedSession`
+
+**Not guarded:** the Swift citations above are weaker than the Rust ones by construction — **no workflow runs iOS tests** (see the CI note under `## Unguarded`), so `check-regression-ledger.sh` proves those four tests *exist* and nothing proves they still *pass*. The two Rust tests are the machine-checked half: both were verified failing without the fix and both run in CI on every PR. Mutation testing on macOS during review of #462 confirmed the Swift four are not one over-broad test written four times — forcing `authenticatedRemoteKey` to `return true` fails exactly the two that pin the binding and leaves the two that pin candidate isolation passing.
+
+Also not guarded: the fail-open default. `authenticatedRemoteKey` still returns `true` for a peer ID that is neither 16-hex nor 64-hex (#464). That branch is unreachable from the wire — `BinaryProtocol.decodeCore` reads a fixed 8-byte sender field, so a wire ID is always 16-hex — but it is a fail-open last line inside an authentication check, and only in-app callers keep it honest. Rust recovery after a peer rotates its identity on a surviving link is likewise unpinned (#483).
+
+**This is a mirror pair.** Drift is the failure mode: a change to one platform that is not made to the other silently reopens the hole on that platform. See the Cross-Platform Feature Rule.
+
+**History:** ported from an upstream bitchat fix in #462, which also extended the invariant to the Rust mesh engine that Android and desktop run.
+
+**Rejected:**
+- *Tearing down the established session when a replacement handshake arrives.* That is the original behaviour and it is the denial of service: any unauthenticated peer destroys a working session with one forged message. The candidate slot exists so validation costs nothing until it succeeds.
+- *Resetting the Rust link's Noise session when an announce names a different fingerprint.* This looks like the natural recovery path for a rotated identity, but announces are replayable, so it hands an attacker the same one-packet teardown by replaying any victim's announce onto a healthy link. The link is demoted to non-direct instead, which keeps the peer visible in the radar as relayed while refusing to move the route.
+- *Dropping only `noise` and leaving `bind` on a rejected Rust handshake.* `bind_allowed` consults `bind.fingerprint` without requiring an established session, so the attacker's link would keep counting as the victim for allowlist fan-out and keep announcing as that peer. The whole binding is cleared.
 
 ## Unguarded
 
@@ -1306,4 +1332,3 @@ its coverage is worse than an honest hole, because it stops people looking.
   listener, no Marmot wake loop, no BLE discovery-policy update and no invite
   drain until relays finally came up — the local-first rule inverted by control
   flow rather than by design. Unpinned for the same reason as above.
-- **Noise sessions must stay bound to the peer ID that claimed them, on both platforms.** `NoiseSessionManager.handleIncomingHandshake` (iOS) and `finish_noise_client`/`finish_noise_server` (`core/sonar-core/src/mesh_engine.rs`) both used to file a completed Noise session under an identity the handshake never authenticated: iOS took the peer ID straight from the packet header, and the Rust engine took the fingerprint from an announce, which is a self-contained signed packet anyone who overhears it can replay. Either way an attacker completes a valid XX handshake with its own static key and is authenticated as someone else — on iOS `handleSessionEstablished` then maps the victim's ID to the attacker's fingerprint and fires `onPeerAuthenticatedHandlers`; in Rust `sendable_route` hands the victim's DMs to the attacker's session. Fixed in PR #462 by requiring the authenticated remote static key to derive the claimed identity before establishment, holding responder rehandshakes in an isolated candidate slot so a forged replacement cannot evict a working session, and clearing a contradicted link binding outright so it stops counting as the victim for allowlist fan-out. **The Rust half is pinned** by `replayed_announce_cannot_bind_an_attacker_link_to_the_victim_route` and `late_replayed_announce_cannot_move_an_authenticated_link`, both verified failing without the fix and both running in CI. **The Swift half is not**: `NoiseSessionBindingTests` exists and covers the same four properties, but no workflow runs iOS tests (see the CI note above), so it guards this only for whoever runs it on macOS. This is a mirror pair and drift is the failure mode — a change to one side that is not made to the other reopens the hole on that platform silently. **Also unguarded:** the binding check still returns `true` for peer IDs that are neither 16-hex nor 64-hex (issue #464). That branch is unreachable from the wire, because `BinaryProtocol.decodeCore` reads a fixed 8-byte sender field, but it is a fail-open default inside an authentication check and only in-app callers keep it honest.

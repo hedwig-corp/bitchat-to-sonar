@@ -192,8 +192,16 @@ enum TransportConfig {
     static let messageDedupMaxCount: Int = 1000
 
     // Consecutive Noise decrypt failures tolerated before an established session
-    // is treated as desynchronized and torn down. Anything lower than 2 lets a
-    // single forged packet under a claimed sender ID evict a working session.
+    // is treated as desynchronized and torn down.
+    //
+    // No value here defeats a determined flooder — their packets arrive
+    // consecutively, so they reach any small threshold. What actually removes
+    // the teardown primitive is that `rateLimitExceeded` no longer counts as a
+    // failure at all, so flooding hits the rate limiter instead of the session.
+    // This threshold buys something narrower: a single stray packet (one probe,
+    // a late duplicate, a corrupted frame) must not cost a working session,
+    // while a genuinely desynchronized one still recovers within a few packets.
+    // 3 is that margin; 1 is the bug this replaced.
     static let noiseDecryptFailuresBeforeSessionReset: Int = 3
     static let noiseDecryptFailureTrackingCap: Int = 512
 

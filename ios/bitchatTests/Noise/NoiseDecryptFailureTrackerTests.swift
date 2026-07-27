@@ -18,20 +18,26 @@ struct NoiseDecryptFailureTrackerTests {
     private let peer = PeerID(str: "aabbccddeeff0011")
     private let other = PeerID(str: "1100ffeeddccbbaa")
 
-    @Test func singleFailureDoesNotResetTheSession() {
+    @Test
+
+    func singleFailureDoesNotResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
         #expect(tracker.failureCount(for: peer) == 1)
     }
 
-    @Test func failuresBelowThresholdDoNotResetTheSession() {
+    @Test
+
+    func failuresBelowThresholdDoNotResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
         #expect(tracker.recordFailure(for: peer) == false)
         #expect(tracker.failureCount(for: peer) == 2)
     }
 
-    @Test func thresholdConsecutiveFailuresResetTheSession() {
+    @Test
+
+    func thresholdConsecutiveFailuresResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
         #expect(tracker.recordFailure(for: peer) == false)
@@ -42,7 +48,8 @@ struct NoiseDecryptFailureTrackerTests {
 
     /// The "consecutive" part is what stops an attacker accumulating failures
     /// across a peer's healthy traffic until the session dies.
-    @Test func successClearsTheRun() {
+    @Test
+    func successClearsTheRun() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         _ = tracker.recordFailure(for: peer)
         _ = tracker.recordFailure(for: peer)
@@ -51,7 +58,9 @@ struct NoiseDecryptFailureTrackerTests {
         #expect(tracker.recordFailure(for: peer) == false)
     }
 
-    @Test func failuresAreTrackedPerPeer() {
+    @Test
+
+    func failuresAreTrackedPerPeer() {
         var tracker = NoiseDecryptFailureTracker(threshold: 2, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
         // A different peer's failure must not push the first peer over.
@@ -61,7 +70,8 @@ struct NoiseDecryptFailureTrackerTests {
     }
 
     /// A flood of unknown sender IDs must not grow the map without bound.
-    @Test func trackingIsBounded() {
+    @Test
+    func trackingIsBounded() {
         var tracker = NoiseDecryptFailureTracker(threshold: 5, trackingCap: 4)
         for index in 0..<12 {
             _ = tracker.recordFailure(for: PeerID(str: String(format: "%016x", index)))

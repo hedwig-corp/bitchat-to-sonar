@@ -64,7 +64,9 @@ struct NoiseSessionBindingTests {
         return message3
     }
 
-    @Test func handshakeAuthenticatedByAnotherKeyCannotClaimAPeerID() throws {
+    @Test
+
+    func handshakeAuthenticatedByAnotherKeyCannotClaimAPeerID() throws {
         let alice = manager(aliceKey)
         let mallory = manager(malloryKey)
 
@@ -76,7 +78,9 @@ struct NoiseSessionBindingTests {
         #expect(alice.getSession(for: bobPeerID)?.isEstablished() != true)
     }
 
-    @Test func forgedReplacementHandshakeLeavesTheEstablishedSessionIntact() throws {
+    @Test
+
+    func forgedReplacementHandshakeLeavesTheEstablishedSessionIntact() throws {
         let alice = manager(aliceKey)
         let bob = manager(bobKey)
         try establishSession(alice: alice, bob: bob)
@@ -97,7 +101,8 @@ struct NoiseSessionBindingTests {
     /// The denial-of-service half: before this fix an established session was
     /// evicted the instant any handshake byte arrived, so one unauthenticated
     /// message was enough to tear down a working session.
-    @Test func unauthenticatedHandshakeMessageAloneCannotTearDownASession() throws {
+    @Test
+    func unauthenticatedHandshakeMessageAloneCannotTearDownASession() throws {
         let alice = manager(aliceKey)
         let bob = manager(bobKey)
         try establishSession(alice: alice, bob: bob)
@@ -115,7 +120,8 @@ struct NoiseSessionBindingTests {
     /// The isolation must not strand a genuine peer: a real rehandshake still
     /// has to be promoted over the old session, or a restarted peer can never
     /// reconnect.
-    @Test func genuineRehandshakeStillReplacesTheEstablishedSession() throws {
+    @Test
+    func genuineRehandshakeStillReplacesTheEstablishedSession() throws {
         let alice = manager(aliceKey)
         let bob = manager(bobKey)
         try establishSession(alice: alice, bob: bob)

@@ -38,7 +38,14 @@ struct NoiseDecryptFailureTracker {
     /// threshold and the session should be reset, clearing the run so the next
     /// attempt starts fresh.
     mutating func recordFailure(for peerID: PeerID) -> Bool {
-        // Bound the map: a flood of unknown sender IDs must not grow it forever.
+        // The map is already bounded by the number of peers we hold an
+        // established session with: `NoiseEncryptionService.decrypt` throws
+        // `sessionNotEstablished` for an unknown sender before ever reaching a
+        // session, and that lands in a different catch. So this cap is a
+        // backstop against a session-table explosion, not a defence against a
+        // sender-ID flood, and it can only fire with `trackingCap` concurrent
+        // established sessions — where clearing every peer's run at once is the
+        // fail-safe direction (nobody is evicted) rather than the risky one.
         if counts[peerID] == nil && counts.count >= trackingCap {
             counts.removeAll()
         }
