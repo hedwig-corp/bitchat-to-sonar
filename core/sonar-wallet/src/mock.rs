@@ -4,10 +4,17 @@ use std::sync::{Arc, Mutex};
 use crate::destination::{classify_destination, resolve_send_amount};
 use crate::error::{Result, WalletError};
 use crate::listeners::ListenerRegistry;
+#[cfg(test)]
+use crate::traits::prepare_and_send;
 use crate::traits::{WalletBackend, WalletEventListener};
 use crate::types::{
-    Balance, Destination, ExchangeRate, Payment, PaymentStatus, WalletCapabilities, WalletEvent,
+    Balance, Destination, ExchangeRate, Payment, PaymentStatus, PreparedSend, PreparedSendToken,
+    ReceiveMethod, ReceiveRequest, WalletCapabilities, WalletEvent,
 };
+
+/// Flat fee the mock charges, so tests exercise the fee path rather than
+/// assuming it is always zero.
+const MOCK_FEE_SATS: u64 = 1;
 
 /// Deterministic in-memory backend: proves the trait is implementable without
 /// any network or storage, and gives hosts/tests a real `dyn WalletBackend`
@@ -83,12 +90,13 @@ impl MockWallet {
 impl WalletBackend for MockWallet {
     fn capabilities(&self) -> WalletCapabilities {
         WalletCapabilities {
-            node_lifecycle: false,
-            webhook: false,
             fiat_rates: true,
+            lnurl_send: true,
             bolt11_send: true,
             bolt12_send: true,
             bolt12_receive: true,
+            bolt11_receive: true,
+            ..Default::default()
         }
     }
 
@@ -115,9 +123,23 @@ impl WalletBackend for MockWallet {
         Ok(*self.balance.lock().expect("balance lock"))
     }
 
-    fn receive_offer(&self) -> Result<String> {
+    fn sync_wallet(&self) -> Result<()> {
         self.ensure_connected()?;
-        Ok("lno1mockoffermockoffermockoffer".to_string())
+        self.listeners.dispatch(&WalletEvent::Synced);
+        Ok(())
+    }
+
+    fn receive(&self, request: &ReceiveRequest) -> Result<String> {
+        self.ensure_connected()?;
+        match request.method {
+            ReceiveMethod::Bolt12Offer => Ok("lno1mockoffermockoffermockoffer".to_string()),
+            ReceiveMethod::Bolt11Invoice => {
+                let amount = request.amount_sats.ok_or_else(|| {
+                    WalletError::InvalidInput("a BOLT11 invoice needs an amount".into())
+                })?;
+                Ok(format!("lnbc{amount}n1mockinvoice"))
+            }
+        }
     }
 
     fn parse_destination(&self, input: &str) -> Result<Destination> {
@@ -128,28 +150,49 @@ impl WalletBackend for MockWallet {
         Ok(destination)
     }
 
-    fn send(
+    fn prepare_send(
         &self,
         destination: &Destination,
         amount_sats: Option<u64>,
-        note: &str,
-    ) -> Result<Payment> {
+    ) -> Result<PreparedSend> {
         self.ensure_connected()?;
+        if !destination.kind.is_supported_by(&self.capabilities()) {
+            return Err(WalletError::Unsupported(format!(
+                "sending to a {}",
+                destination.kind.label()
+            )));
+        }
         // Same resolution rules every backend uses.
-        let amount = resolve_send_amount(amount_sats, destination.amount_sats)?
-            .or(destination.amount_sats)
-            .expect("resolve_send_amount rejects the no-amount-anywhere case");
+        let amount = match resolve_send_amount(amount_sats, destination.amount_sats)? {
+            Some(explicit) => explicit,
+            None => destination.amount_sats.ok_or_else(|| {
+                WalletError::InvalidDestination("destination carries no amount".into())
+            })?,
+        };
+        Ok(PreparedSend {
+            destination: destination.clone(),
+            amount_sats: amount,
+            fees_sats: Some(MOCK_FEE_SATS),
+            token: PreparedSendToken::None,
+        })
+    }
+
+    fn send(&self, prepared: &PreparedSend, note: &str) -> Result<Payment> {
+        self.ensure_connected()?;
+        let amount = prepared.amount_sats;
+        let fees = prepared.fees_sats.unwrap_or(0);
         {
             let mut balance = self.balance.lock().expect("balance lock");
-            if balance.confirmed_sats < amount {
+            let debit = amount.saturating_add(fees);
+            if balance.confirmed_sats < debit {
                 return Err(WalletError::InsufficientFunds);
             }
-            balance.confirmed_sats -= amount;
+            balance.confirmed_sats -= debit;
         }
         let payment = Payment {
             id: format!("mock-out-{}", self.now()),
             amount_sats: amount,
-            fees_sats: Some(0),
+            fees_sats: Some(fees),
             incoming: false,
             timestamp_secs: self.now(),
             status: PaymentStatus::Complete,
@@ -194,6 +237,13 @@ impl WalletBackend for MockWallet {
     }
 
     fn wipe_local_storage(&self) -> Result<()> {
+        // Same precondition the real backends enforce, so hosts cannot depend
+        // on the mock being more permissive than what ships.
+        if self.is_connected() {
+            return Err(WalletError::Backend(
+                "disconnect before wiping local storage".into(),
+            ));
+        }
         // Local state only: the transcript of payments. Funds ("on chain")
         // and the seed survive a wipe by design.
         self.payments.lock().expect("payments lock").clear();
@@ -258,12 +308,28 @@ mod tests {
         let recorder = Arc::new(Recorder(StdMutex::new(Vec::new())));
         w.add_event_listener(recorder.clone());
         let dest = w.parse_destination("lno1qcp4256ypq").unwrap();
-        let payment = w.send(&dest, Some(2_500), "coffee").unwrap();
+        let payment = prepare_and_send(&w, &dest, Some(2_500), "coffee").unwrap();
         assert!(!payment.incoming);
         assert_eq!(payment.amount_sats, 2_500);
         assert_eq!(payment.note.as_deref(), Some("coffee"));
-        assert_eq!(w.balance().unwrap().confirmed_sats, 7_500);
+        // Amount plus the quoted fee leaves the balance.
+        assert_eq!(
+            w.balance().unwrap().confirmed_sats,
+            10_000 - 2_500 - MOCK_FEE_SATS
+        );
         assert_eq!(*recorder.0.lock().unwrap(), vec!["sent"]);
+    }
+
+    #[test]
+    fn prepare_quotes_the_fee_before_any_money_moves() {
+        let w = wallet();
+        let dest = w.parse_destination("lno1qcp4256ypq").unwrap();
+        let prepared = w.prepare_send(&dest, Some(2_500)).unwrap();
+        assert_eq!(prepared.amount_sats, 2_500);
+        assert_eq!(prepared.fees_sats, Some(MOCK_FEE_SATS));
+        // Preparing alone must not move funds — that is the whole point of
+        // the split.
+        assert_eq!(w.balance().unwrap().confirmed_sats, 10_000);
     }
 
     #[test]
@@ -271,14 +337,37 @@ mod tests {
         let w = wallet();
         let dest = w.parse_destination("lno1qcp4256ypq").unwrap();
         assert!(matches!(
-            w.send(&dest, None, ""),
+            w.prepare_send(&dest, None),
             Err(WalletError::InvalidDestination(_))
         ));
         assert!(matches!(
-            w.send(&dest, Some(1_000_000), ""),
+            prepare_and_send(&w, &dest, Some(1_000_000), ""),
             Err(WalletError::InsufficientFunds)
         ));
         assert_eq!(w.balance().unwrap().confirmed_sats, 10_000);
+    }
+
+    #[test]
+    fn receive_supports_offers_and_amount_bearing_invoices() {
+        let w = wallet();
+        assert!(w.receive_offer().unwrap().starts_with("lno1"));
+        let invoice = w
+            .receive(&ReceiveRequest {
+                method: ReceiveMethod::Bolt11Invoice,
+                amount_sats: Some(1_000),
+                description: None,
+            })
+            .unwrap();
+        assert!(invoice.starts_with("lnbc"));
+        // A BOLT11 invoice with no amount is not a thing we can mint.
+        assert!(matches!(
+            w.receive(&ReceiveRequest {
+                method: ReceiveMethod::Bolt11Invoice,
+                amount_sats: None,
+                description: None,
+            }),
+            Err(WalletError::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -286,29 +375,105 @@ mod tests {
         let w = wallet();
         w.simulate_receive(500);
         let dest = w.parse_destination("user@host.tld").unwrap();
-        w.send(&dest, Some(100), "").unwrap();
+        prepare_and_send(&w, &dest, Some(100), "").unwrap();
         let recent = w.list_recent_payments(10).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(!recent[0].incoming, "newest (the send) first");
         assert!(recent[1].incoming);
         let balance = w.balance().unwrap();
+        // Wiping is only allowed once disconnected.
+        assert!(matches!(
+            w.wipe_local_storage(),
+            Err(WalletError::Backend(_))
+        ));
+        w.disconnect().unwrap();
         w.wipe_local_storage().unwrap();
+        w.connect().unwrap();
         assert!(w.list_recent_payments(10).unwrap().is_empty());
         assert_eq!(w.balance().unwrap(), balance);
     }
 
     #[test]
+    fn send_refuses_destination_kinds_the_backend_lacks() {
+        struct NoLnurl(MockWallet);
+        impl WalletBackend for NoLnurl {
+            fn capabilities(&self) -> WalletCapabilities {
+                WalletCapabilities {
+                    lnurl_send: false,
+                    ..self.0.capabilities()
+                }
+            }
+            fn connect(&self) -> Result<()> {
+                self.0.connect()
+            }
+            fn disconnect(&self) -> Result<()> {
+                self.0.disconnect()
+            }
+            fn is_connected(&self) -> bool {
+                self.0.is_connected()
+            }
+            fn balance(&self) -> Result<Balance> {
+                self.0.balance()
+            }
+            fn receive(&self, request: &ReceiveRequest) -> Result<String> {
+                self.0.receive(request)
+            }
+            fn parse_destination(&self, input: &str) -> Result<Destination> {
+                self.0.parse_destination(input)
+            }
+            fn prepare_send(
+                &self,
+                destination: &Destination,
+                amount_sats: Option<u64>,
+            ) -> Result<PreparedSend> {
+                if !destination.kind.is_supported_by(&self.capabilities()) {
+                    return Err(WalletError::Unsupported(format!(
+                        "sending to a {}",
+                        destination.kind.label()
+                    )));
+                }
+                self.0.prepare_send(destination, amount_sats)
+            }
+            fn send(&self, prepared: &PreparedSend, note: &str) -> Result<Payment> {
+                self.0.send(prepared, note)
+            }
+            fn list_recent_payments(&self, limit: u32) -> Result<Vec<Payment>> {
+                self.0.list_recent_payments(limit)
+            }
+            fn add_event_listener(&self, listener: Arc<dyn WalletEventListener>) -> u64 {
+                self.0.add_event_listener(listener)
+            }
+            fn remove_event_listener(&self, id: u64) {
+                self.0.remove_event_listener(id)
+            }
+            fn wipe_local_storage(&self) -> Result<()> {
+                self.0.wipe_local_storage()
+            }
+        }
+        let w = NoLnurl(MockWallet::new(10_000));
+        w.connect().unwrap();
+        let address = w.parse_destination("conor@sonar.hedwig.sh").unwrap();
+        let err = prepare_and_send(&w, &address, Some(100), "").unwrap_err();
+        assert!(
+            matches!(err, WalletError::Unsupported(ref m) if m.contains("Lightning address")),
+            "unexpected error: {err}"
+        );
+        // A kind it does support still goes through.
+        let offer = w.parse_destination("lno1qcp4256ypq").unwrap();
+        assert!(prepare_and_send(&w, &offer, Some(100), "").is_ok());
+    }
+
+    #[test]
     fn minimal_backend_reports_unsupported_for_gated_methods() {
+        // A backend written against only the required methods. Adding a
+        // capability field must not break this — hence `..Default::default()`.
         struct Minimal;
         impl WalletBackend for Minimal {
             fn capabilities(&self) -> WalletCapabilities {
                 WalletCapabilities {
-                    node_lifecycle: false,
-                    webhook: false,
-                    fiat_rates: false,
-                    bolt11_send: false,
                     bolt12_send: true,
                     bolt12_receive: true,
+                    ..Default::default()
                 }
             }
             fn connect(&self) -> crate::Result<()> {
@@ -323,18 +488,20 @@ mod tests {
             fn balance(&self) -> crate::Result<Balance> {
                 Ok(Balance::default())
             }
-            fn receive_offer(&self) -> crate::Result<String> {
-                Ok(String::new())
+            fn receive(&self, _request: &ReceiveRequest) -> crate::Result<String> {
+                Ok("lno1minimal".into())
             }
             fn parse_destination(&self, input: &str) -> crate::Result<Destination> {
                 Ok(classify_destination(input))
             }
-            fn send(
+            fn prepare_send(
                 &self,
                 _destination: &Destination,
                 _amount_sats: Option<u64>,
-                _note: &str,
-            ) -> crate::Result<Payment> {
+            ) -> crate::Result<PreparedSend> {
+                Err(WalletError::Backend("not implemented".into()))
+            }
+            fn send(&self, _prepared: &PreparedSend, _note: &str) -> crate::Result<Payment> {
                 Err(WalletError::Backend("not implemented".into()))
             }
             fn list_recent_payments(&self, _limit: u32) -> crate::Result<Vec<Payment>> {
@@ -349,17 +516,18 @@ mod tests {
             }
         }
         let backend: Arc<dyn WalletBackend> = Arc::new(Minimal);
-        assert!(matches!(
-            backend.fetch_fiat_rates(),
-            Err(WalletError::Unsupported("fiat rates"))
-        ));
-        assert!(matches!(
+        for result in [
+            backend.fetch_fiat_rates().map(|_| ()),
             backend.register_webhook("https://nds.example"),
-            Err(WalletError::Unsupported("webhook"))
-        ));
-        assert!(matches!(
             backend.unregister_webhook(),
-            Err(WalletError::Unsupported("webhook"))
-        ));
+            backend.sync_wallet(),
+        ] {
+            assert!(
+                matches!(result, Err(WalletError::Unsupported(_))),
+                "expected Unsupported, got {result:?}"
+            );
+        }
+        // The provided receive_offer() delegates to the required receive().
+        assert_eq!(backend.receive_offer().unwrap(), "lno1minimal");
     }
 }

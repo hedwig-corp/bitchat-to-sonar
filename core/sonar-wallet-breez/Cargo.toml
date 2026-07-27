@@ -20,7 +20,9 @@ path = "src/bin/sonar-wallet-cli.rs"
 
 [dependencies]
 sonar-wallet = { path = "../sonar-wallet" }
-breez-sdk-liquid = { git = "https://github.com/breez/breez-sdk-liquid", tag = "0.12.4" }
+# Pinned by rev, not tag: this crate signs payments, and a git tag can be
+# moved upstream. `e11d88c` is what tag 0.12.4 pointed at when this landed.
+breez-sdk-liquid = { git = "https://github.com/breez/breez-sdk-liquid", rev = "e11d88c73abf1bf00b3c909e0a238c0abebb5d6a" }
 async-trait = "0.1"
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hex = "0.4"

@@ -17,7 +17,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 use sonar_wallet::{
     entropy_hex, nsec_to_secret, wallet_entropy, Network, Payment, WalletBackend, WalletConfig,
-    WalletError, WalletEvent, WalletEventListener,
+    WalletError, WalletEvent, WalletEventListener, Zeroizing,
 };
 use sonar_wallet_breez::BreezWallet;
 
@@ -27,15 +27,12 @@ use sonar_wallet_breez::BreezWallet;
     about = "Sonar wallet interface (Breez backend)"
 )]
 struct Cli {
-    /// Account key: `nsec1…` or 64-char hex. Falls back to $SONAR_NSEC.
-    #[arg(long, global = true)]
-    nsec: Option<String>,
-    /// Breez API key. Falls back to $BREEZ_API_KEY.
-    #[arg(long, global = true)]
-    api_key: Option<String>,
     /// Working directory for the wallet database.
     #[arg(long, global = true, default_value = "~/.sonar-wallet")]
     dir: String,
+    /// Use testnet instead of mainnet.
+    #[arg(long, global = true)]
+    testnet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -52,8 +49,12 @@ enum Command {
     Offer,
     /// Classify/parse a destination.
     Parse(ParseArgs),
+    /// Price a send without paying it.
+    Quote(SendArgs),
     /// Pay a destination.
     Send(SendArgs),
+    /// Force a sync with the network.
+    Sync,
     /// List recent payments.
     History(HistoryArgs),
     /// Fetch fiat exchange rates.
@@ -73,6 +74,9 @@ struct SendArgs {
     /// Amount in sats. Required for amountless destinations (BOLT12 offers).
     #[arg(long)]
     amount_sats: Option<u64>,
+    /// Abort if the quoted fee exceeds this.
+    #[arg(long)]
+    max_fee_sats: Option<u64>,
     #[arg(long, default_value = "")]
     note: String,
 }
@@ -138,28 +142,42 @@ fn main() -> Result<(), WalletError> {
         .init();
 
     let cli = Cli::parse();
-    // Secrets are read from the environment by hand rather than via clap's
-    // `env` feature, which would echo values into --help output.
-    let nsec = cli
-        .nsec
-        .clone()
-        .or_else(|| std::env::var("SONAR_NSEC").ok())
-        .ok_or_else(|| WalletError::InvalidInput("missing --nsec (or $SONAR_NSEC)".into()))?;
-    let api_key = cli
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("BREEZ_API_KEY").ok());
-    let secret = nsec_to_secret(&nsec)?;
+    // Secrets come from the environment only. Never accept them as arguments:
+    // argv is visible to every local user via `ps` and lands in shell history
+    // and CI logs.
+    let nsec = Zeroizing::new(std::env::var("SONAR_NSEC").map_err(|_| {
+        WalletError::InvalidInput("set $SONAR_NSEC to an nsec1… or 64-char hex key".into())
+    })?);
+    let api_key = std::env::var("BREEZ_API_KEY").ok();
+    let secret = Zeroizing::new(nsec_to_secret(&nsec)?);
 
     if matches!(cli.command, Command::Derive) {
-        println!("{}", json!({ "entropy_hex": entropy_hex(&secret) }));
+        // The entropy IS the wallet — printing it to stdout would put
+        // funds-controlling material into terminal scrollback and CI logs, so
+        // show a fingerprint unless the operator explicitly asks otherwise.
+        let full = entropy_hex(&secret);
+        if std::env::var("SONAR_WALLET_UNSAFE_DUMP_SEED").as_deref() == Ok("1") {
+            println!("{}", json!({ "entropy_hex": full }));
+        } else {
+            println!(
+                "{}",
+                json!({
+                    "entropy_prefix": &full[..8],
+                    "note": "set SONAR_WALLET_UNSAFE_DUMP_SEED=1 to print the full seed",
+                })
+            );
+        }
         return Ok(());
     }
 
     let working_dir = expand_home(&cli.dir);
     let wallet = BreezWallet::new(WalletConfig {
-        seed: wallet_entropy(&secret).to_vec(),
-        network: Network::Mainnet,
+        seed: Zeroizing::new(wallet_entropy(&secret).to_vec()),
+        network: if cli.testnet {
+            Network::Testnet
+        } else {
+            Network::Mainnet
+        },
         api_key,
         working_dir,
     })?;
@@ -218,8 +236,41 @@ fn run(wallet: &BreezWallet, command: &Command) -> Result<(), WalletError> {
         }
         Command::Send(args) => {
             let destination = wallet.parse_destination(&args.destination)?;
-            let payment = wallet.send(&destination, args.amount_sats, &args.note)?;
+            let prepared = wallet.prepare_send(&destination, args.amount_sats)?;
+            // Show the quote before moving money, and let the caller cap it.
+            println!(
+                "{}",
+                json!({
+                    "quote": {
+                        "amount_sats": prepared.amount_sats,
+                        "fees_sats": prepared.fees_sats,
+                    }
+                })
+            );
+            if let (Some(max), Some(fees)) = (args.max_fee_sats, prepared.fees_sats) {
+                if fees > max {
+                    return Err(WalletError::Backend(format!(
+                        "quoted fee {fees} sats exceeds --max-fee-sats {max}"
+                    )));
+                }
+            }
+            let payment = wallet.send(&prepared, &args.note)?;
             println!("{}", payment_json(&payment));
+        }
+        Command::Quote(args) => {
+            let destination = wallet.parse_destination(&args.destination)?;
+            let prepared = wallet.prepare_send(&destination, args.amount_sats)?;
+            println!(
+                "{}",
+                json!({
+                    "amount_sats": prepared.amount_sats,
+                    "fees_sats": prepared.fees_sats,
+                })
+            );
+        }
+        Command::Sync => {
+            wallet.sync_wallet()?;
+            println!("{}", json!({ "synced": true }));
         }
         Command::History(args) => {
             for payment in wallet.list_recent_payments(args.limit)? {
@@ -236,10 +287,13 @@ fn run(wallet: &BreezWallet, command: &Command) -> Result<(), WalletError> {
         }
         Command::Listen => {
             wallet.add_event_listener(Arc::new(StderrListener));
-            tracing::info!("listening for wallet events; Ctrl-C to stop");
-            loop {
-                std::thread::park();
-            }
+            // Blocking on stdin rather than parking forever: Ctrl-C would kill
+            // the process before the caller's `disconnect()` runs and leave the
+            // wallet database locked, which is a poor look for the binary whose
+            // job is to prove the lifecycle.
+            tracing::info!("listening for wallet events; press Enter to stop");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
         }
     }
     Ok(())

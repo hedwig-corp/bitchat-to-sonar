@@ -12,3 +12,4 @@ hex.workspace = true
 hkdf = "0.12"
 sha2 = "0.10"
 thiserror.workspace = true
+zeroize = { version = "1", features = ["alloc"] }

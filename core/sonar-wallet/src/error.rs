@@ -12,7 +12,7 @@ pub enum WalletError {
     #[error("wallet is not connected")]
     NotConnected,
     #[error("unsupported by this wallet backend: {0}")]
-    Unsupported(&'static str),
+    Unsupported(String),
     #[error("invalid destination: {0}")]
     InvalidDestination(String),
     #[error("insufficient funds")]

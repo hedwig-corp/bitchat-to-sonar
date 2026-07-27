@@ -664,7 +664,7 @@ dependencies = [
 [[package]]
 name = "breez-sdk-liquid"
 version = "0.12.4"
-source = "git+https://github.com/breez/breez-sdk-liquid?tag=0.12.4#e11d88c73abf1bf00b3c909e0a238c0abebb5d6a"
+source = "git+https://github.com/breez/breez-sdk-liquid?rev=e11d88c73abf1bf00b3c909e0a238c0abebb5d6a#e11d88c73abf1bf00b3c909e0a238c0abebb5d6a"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4478,6 +4478,7 @@ dependencies = [
  "hkdf",
  "sha2 0.10.9",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]

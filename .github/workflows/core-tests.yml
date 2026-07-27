@@ -67,5 +67,7 @@ jobs:
           workspaces: core/sonar-wallet-breez
 
       - name: Run wallet island tests
-        run: cargo test
+        # --locked: the money-path dependency tree is pinned in the committed
+        # lockfile; fail loudly on drift instead of silently re-resolving.
+        run: cargo test --locked
         working-directory: core/sonar-wallet-breez

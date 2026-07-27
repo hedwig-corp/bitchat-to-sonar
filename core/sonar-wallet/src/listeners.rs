@@ -8,6 +8,10 @@ use crate::types::WalletEvent;
 /// Shared listener registry for backends: id allocation, removal, and
 /// snapshot-before-dispatch so a listener can remove itself (or others) from
 /// inside a callback without deadlocking.
+///
+/// A poisoned lock is recovered rather than propagated: the registry holds no
+/// invariant a panicking listener can corrupt, and this type will sit behind
+/// an FFI boundary where a panic becomes a process abort.
 #[derive(Default)]
 pub struct ListenerRegistry {
     next_id: AtomicU64,
@@ -23,7 +27,7 @@ impl ListenerRegistry {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.listeners
             .lock()
-            .expect("listener lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(id, listener);
         id
     }
@@ -31,7 +35,7 @@ impl ListenerRegistry {
     pub fn remove(&self, id: u64) {
         self.listeners
             .lock()
-            .expect("listener lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
     }
 
@@ -39,7 +43,7 @@ impl ListenerRegistry {
         let snapshot: Vec<Arc<dyn WalletEventListener>> = self
             .listeners
             .lock()
-            .expect("listener lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect();

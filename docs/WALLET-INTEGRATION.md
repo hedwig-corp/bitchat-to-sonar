@@ -6,8 +6,8 @@
 > `core/sonar-wallet-breez`. The per-platform Breez integrations described
 > below are what ships today; they are scheduled for replacement by that
 > interface over a staged PR train (desktop → Android → iOS app → iOS
-> notification extension). Plan:
-> [`docs/plans/2026-07-27-sonar-wallet-interface-crate.md`](plans/2026-07-27-sonar-wallet-interface-crate.md).
+> notification extension). Background and the decisions behind it:
+> [`docs/brainstorms/2026-07-26-wallet-interface-bolt12.md`](brainstorms/2026-07-26-wallet-interface-bolt12.md).
 >
 > Two constraints that will not go away, and that any wallet work must respect:
 >
