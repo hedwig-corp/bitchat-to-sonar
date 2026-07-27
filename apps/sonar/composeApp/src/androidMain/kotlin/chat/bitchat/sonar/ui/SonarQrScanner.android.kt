@@ -36,6 +36,7 @@ import com.google.zxing.common.HybridBinarizer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * CameraX preview + zxing decode. The decoder runs on a single background
@@ -81,6 +82,10 @@ actual fun SonarQrScanner(
     // One payload only: the sheet tears the scanner down on the first hit, but
     // frames already in flight would otherwise fire onCode again.
     val delivered = remember { AtomicBoolean(false) }
+    // Held so teardown can unbind without blocking: `ProcessCameraProvider
+    // .getInstance(ctx).get()` waits on a ListenableFuture, and onDispose runs
+    // on the main thread.
+    val boundProvider = remember { AtomicReference<ProcessCameraProvider?>(null) }
     DisposableEffect(Unit) { onDispose { executor.shutdown() } }
 
     AndroidView(
@@ -113,6 +118,7 @@ actual fun SonarQrScanner(
                     .also { it.setAnalyzer(executor, QrAnalyzer { code ->
                         if (delivered.compareAndSet(false, true)) currentOnCode(code)
                     }) }
+                boundProvider.set(provider)
                 runCatching {
                     provider.unbindAll()
                     provider.bindToLifecycle(
@@ -128,7 +134,9 @@ actual fun SonarQrScanner(
 
     DisposableEffect(lifecycleOwner) {
         onDispose {
-            runCatching { ProcessCameraProvider.getInstance(context).get().unbindAll() }
+            // Never block the main thread here — use the provider we already
+            // resolved rather than awaiting the future again.
+            runCatching { boundProvider.getAndSet(null)?.unbindAll() }
         }
     }
 }

@@ -1035,6 +1035,47 @@ close) -> this fix.
   desktop push or process-lifecycle path would make the branch live and this
   rejection stale.
 
+## R-021 — A payment destination pays what the payload says, not what we guessed
+
+**Invariant:** Every payable payload is resolved before the wallet sees it — a
+BIP-21 URI pays the rail inside it (`lno` > `lightning` > address), a BOLT11
+carries its own amount and is never handed one of ours, and a decimal BTC
+`amount` is converted digit-by-digit rather than through a `Double`.
+
+**Breaks as:** Silently paying the wrong thing, or nothing at all. Two observed
+shapes: `bitcoin:bc1q…?lno=lno1…` was labelled "Bitcoin address · On-chain" and
+the whole URI — query string included — was handed to the wallet, so the BOLT12
+offer sitting in `lno=` was never paid; and `lnbc21u1…` parsed as **2 BTC**
+instead of 2,100 sats because the amount was read up to the *first* `1` rather
+than the bech32 separator, which is the last one.
+
+**Why:** Both look like string handling and are really money handling. The
+BOLT11 separator rule is not obvious unless you know bech32 excludes `1` from
+the data charset, and BIP-21's good rails hide in the query string behind an
+on-chain address that parses fine on its own — so a naive prefix check finds
+"an address" and stops looking.
+
+**Call sites:** Compose `wallet/PaymentDestination.kt::bolt11AmountSats`,
+`screens/SonarScanQrSheet.kt::scannedKind`,
+`SonarAppState.kt::payDestination`; iOS
+`SonarScanQrSheet.swift::SNScannedKind`,
+`SonarAppStore.swift::payDestination`
+
+**Guarded by:** `Bolt11AmountTest.everyMultiplierScalesCorrectly`,
+`Bolt11AmountTest.microBtcInvoiceIsTwentyOneHundredSats`,
+`Bip21ScanTest.unifiedUriPrefersTheBolt12Offer`,
+`Bip21ScanTest.btcToSatsIsExactAndRefusesWhatItCannotRepresent`
+
+**History:** the separator bug was caught by its own new test before it ever
+shipped; the BIP-21 bug was reported from a failing payment on device and
+confirmed against the wallet's `AmountMissing` error.
+
+**Not guarded:** no test asserts that the wallet is called with a *nil* amount
+for a BOLT11 — that path needs a wallet double, and the amountless refusal is
+enforced in `payDestination` on both platforms without a test. iOS has no unit
+test for `SNScannedKind` at all; the Kotlin tests are the only coverage, so a
+Swift-side divergence would not be caught.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

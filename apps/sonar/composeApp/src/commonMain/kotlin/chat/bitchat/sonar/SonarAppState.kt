@@ -3042,7 +3042,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Offers and addresses are the opposite — they need the amount from us.
         val lower = dest.lowercase()
         val isBolt11 = lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
-        if (isBolt11 && chat.bitchat.sonar.screens.bolt11AmountSats(lower) == null) {
+        if (isBolt11 && chat.bitchat.sonar.wallet.bolt11AmountSats(lower) == null) {
             return "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
         }
         val amountForWallet = if (isBolt11) 0L else sats

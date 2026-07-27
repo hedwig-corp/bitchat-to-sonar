@@ -45,6 +45,7 @@ import chat.bitchat.sonar.ui.SNNavHeader
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonarQrScanSupported
+import chat.bitchat.sonar.wallet.bolt11AmountSats
 import chat.bitchat.sonar.ui.sonar
 
 /**

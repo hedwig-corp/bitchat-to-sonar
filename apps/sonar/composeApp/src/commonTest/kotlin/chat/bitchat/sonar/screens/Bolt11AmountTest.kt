@@ -1,5 +1,6 @@
 package chat.bitchat.sonar.screens
 
+import chat.bitchat.sonar.wallet.bolt11AmountSats
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
