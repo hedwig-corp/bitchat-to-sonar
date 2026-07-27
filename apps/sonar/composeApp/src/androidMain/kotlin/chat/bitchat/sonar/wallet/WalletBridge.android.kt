@@ -187,16 +187,18 @@ actual object WalletBridge {
             recoverPendingCleanupLocked()
             val existing = sdk
             if (existing != null) {
-                // Bound the probe like connectLocked bounds connect(): getInfo()
-                // is a blocking native call, and a half-dead websocket could hang
-                // it for the SDK's internal timeout while we hold `lock`. A plain
-                // runCatching can't preempt that; a child-coroutine await can.
-                val liveProbe = coroutineScope {
-                    val work = async(Dispatchers.IO) { runCatching { existing.getInfo() }.isSuccess }
-                    (runCatching { withTimeoutOrNull(CONNECTION_PROBE_TIMEOUT_MS) { work.await() } }
-                        .getOrNull() ?: false)
-                        .also { if (!it) work.cancel() }
-                }
+                // Bound the probe: getInfo() is a blocking native call, and a
+                // half-dead websocket could hang it for the SDK's internal
+                // timeout while we hold `lock`. It runs on walletScope, NOT as a
+                // child of this coroutine — `coroutineScope` awaits its children,
+                // so a child would hold `lock` for the full native call anyway
+                // and the timeout would buy nothing (cancelling a blocking UniFFI
+                // call is cooperative, i.e. a no-op here). Awaiting an orphan is
+                // what actually releases `lock` on time; the abandoned probe
+                // finishes and its result is discarded.
+                val probe = walletScope.async { runCatching { existing.getInfo() }.isSuccess }
+                val liveProbe = withTimeoutOrNull(CONNECTION_PROBE_TIMEOUT_MS) { probe.await() }
+                    ?: false.also { probe.cancel() }
                 if (liveProbe) return@withLock true
                 // Stale/hung handle — disconnect it inline (can't call shutdown();
                 // it re-locks). Bump the epoch so any in-flight refreshBalance
