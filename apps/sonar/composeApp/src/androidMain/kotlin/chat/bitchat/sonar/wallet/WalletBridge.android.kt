@@ -75,12 +75,24 @@ actual object WalletBridge {
     @Volatile private var refreshPending = false
 
     /** Upper bound on the [ensureLiveConnection] liveness probe so a hung
-     *  native `getInfo()` can't hold [lock] indefinitely. */
-    private const val CONNECTION_PROBE_TIMEOUT_MS = 10_000L
+     *  native `getInfo()` can't hold [lock] indefinitely. Public because the
+     *  push service derives its own outer bound from it — see
+     *  `SonarPushProcessingService.WALLET_SETUP_TIMEOUT_MS`. */
+    const val CONNECTION_PROBE_TIMEOUT_MS = 10_000L
 
     /** Backstop on the [createBolt12Invoice] native call. The push service's own
      *  answer-window bound is usually tighter; this only catches a wedged SDK. */
     private const val CREATE_INVOICE_TIMEOUT_MS = 20_000L
+
+    /**
+     * Bound on the blocking `connect()` in [connectLocked]. Named rather than
+     * inline so the relationship to the caller's bound is checkable: the worst
+     * case through [ensureLiveConnection] is [CONNECTION_PROBE_TIMEOUT_MS] +
+     * this, and `SonarPushProcessingService.WALLET_SETUP_TIMEOUT_MS` must be at
+     * least that sum or our own outer bound abandons a connect the SDK would
+     * have completed.
+     */
+    const val CONNECT_TIMEOUT_MS = 20_000L
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -140,7 +152,7 @@ actual object WalletBridge {
                     if (!handedOff) runCatching { node?.disconnect() }
                 }
             }
-            runCatching { withTimeoutOrNull(20_000) { work.await() } }
+            runCatching { withTimeoutOrNull(CONNECT_TIMEOUT_MS) { work.await() } }
                 .also { if (it.getOrNull() == null) work.cancel() }
         }
         current = when {

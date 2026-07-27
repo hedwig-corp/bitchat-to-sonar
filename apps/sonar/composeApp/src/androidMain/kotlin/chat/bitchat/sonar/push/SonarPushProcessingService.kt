@@ -861,7 +861,23 @@ class SonarPushProcessingService : Service() {
         private const val BREEZ_SETTLE_BUDGET_MS = 45_000L
         // Outer bound on connect(); the SDK's own connect timeout is ~20s, so
         // 20s here avoids abandoning a connect the SDK would have completed.
-        private const val WALLET_SETUP_TIMEOUT_MS = 20_000L
+        /**
+         * Outer bound on [WalletBridge.ensureLiveConnection].
+         *
+         * Must be >= its inner worst case, or we abandon a connect the SDK
+         * would have completed and the payer gets an error for a wallet that
+         * was about to be fine. That worst case is the liveness probe
+         * (`CONNECTION_PROBE_TIMEOUT_MS`, 10s) followed by a full connect
+         * (`WalletBridge.CONNECT_TIMEOUT_MS`, 20s) = 30s, which only occurs for
+         * a backgrounded reused-but-stale handle; a cold wake has no handle to
+         * probe and pays connect alone. Derived from those constants rather
+         * than hardcoded so the relationship cannot silently drift.
+         *
+         * Still leaves headroom inside BREEZ_SETTLE_BUDGET_MS (45s) and, more
+         * importantly, inside the NDS's 60s server window.
+         */
+        private val WALLET_SETUP_TIMEOUT_MS =
+            WalletBridge.CONNECTION_PROBE_TIMEOUT_MS + WalletBridge.CONNECT_TIMEOUT_MS
         private const val BREEZ_SETTLE_POLL_MS = 2_500L
         // Poll floor: generous enough for connect()-latency, swap-claim time and
         // realistic clock skew vs the swap server, while excluding genuinely old
