@@ -27,7 +27,7 @@ const FORMAT_VERSION: u32 = 1;
 const HKDF_SALT: &[u8] = b"sonar-backup";
 const HKDF_INFO: &[u8] = b"sonar-account-backup-v1";
 const NONCE_LEN: usize = 12;
-/// Distinct MIME so `list_blobs` can pick account backups among media.
+/// Distinct MIME so the BUD-03 listing can pick account backups among media.
 pub const ACCOUNT_BACKUP_MIME: &str = "application/vnd.sonar.account-backup-v1";
 /// Same fallback host as media uploads (`client::DEFAULT_BLOSSOM_SERVER`).
 /// Duplicated here to avoid a client ↔ account_backup import cycle.
@@ -464,15 +464,81 @@ pub async fn upload_sealed_backup(
     })
 }
 
+/// BUD-03 list endpoint for `pubkey`: `{base}/list/{pubkey_hex}`.
+///
+/// Built segment-wise on purpose. `nostr-blossom` (0.44.0 and 0.45.0-alpha.6)
+/// does `base.join("list")?.join(&pubkey.to_hex())?`, and `Url::join` is RFC
+/// 3986 relative resolution: joining a bare segment onto a path that does not
+/// end in `/` REPLACES the last segment. So upstream requests `{base}/{pubkey}`
+/// — the BUD-01 blob-fetch route — which 404s for a pubkey, and every account
+/// backup restore fails with a transport error instead of finding the blob.
+fn backup_list_url(base: &Url, pubkey: &PublicKey) -> Result<Url> {
+    let mut url = base.clone();
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| Error::Blossom(format!("blossom base cannot be a base: {base}")))?;
+        // A base with a trailing slash parses as a final empty segment, which
+        // would otherwise render as `//list/`.
+        segments.pop_if_empty();
+        segments.push("list");
+        segments.push(&pubkey.to_hex());
+    }
+    Ok(url)
+}
+
+/// BUD-03 `GET /list/<pubkey>` with a signed kind-24242 authorization.
+///
+/// Hand-rolled rather than `BlossomClient::list_blobs` — see [`backup_list_url`]
+/// for why that path cannot reach the endpoint. The auth event mirrors what the
+/// crate builds for every other verb, so servers see nothing unusual.
+async fn list_account_backup_blobs(keys: &Keys, base: &Url) -> Result<Vec<BlobDescriptor>> {
+    let url = backup_list_url(base, &keys.public_key())?;
+    let authorization = BlossomAuthorization::new(
+        "Blossom list authorization".to_string(),
+        Timestamp::now() + std::time::Duration::from_secs(300),
+        BlossomAuthorizationVerb::List,
+        BlossomAuthorizationScope::ServerUrl(base.clone()),
+    );
+    let auth_event = EventBuilder::blossom_auth(authorization)
+        .sign(keys)
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom list auth: {e}")))?;
+    let header = {
+        use base64::Engine as _;
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(auth_event.as_json())
+        )
+    };
+    let response = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, header)
+        .send()
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom list: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Blossom(format!("blossom list http {status}")));
+    }
+    response
+        .json::<Vec<BlobDescriptor>>()
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom list decode: {e}")))
+}
+
 /// List this pubkey's blobs and download the newest account-backup MIME.
 pub async fn download_latest_sealed_backup(keys: &Keys, server_url: &str) -> Result<Vec<u8>> {
     let base = blossom_base(server_url)?;
-    let client = BlossomClient::new(base);
-    let pubkey = keys.public_key();
-    let mut blobs = client
-        .list_blobs(&pubkey, None, None, None, Some(keys))
-        .await
-        .map_err(|e| Error::Blossom(e.to_string()))?;
+    download_latest_sealed_backup_at(keys, &base).await
+}
+
+/// Same, against an already-validated base. Split out so tests can drive the
+/// real list → download → verify path against a loopback mock without
+/// loosening the https requirement in [`blossom_base`].
+async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec<u8>> {
+    let client = BlossomClient::new(base.clone());
+    let mut blobs = list_account_backup_blobs(keys, base).await?;
     blobs.retain(|b| b.mime_type.as_deref() == Some(ACCOUNT_BACKUP_MIME));
     if blobs.is_empty() {
         return Err(Error::AccountBackupMissing);
@@ -565,6 +631,150 @@ pub fn message_indicates_missing_backup(message: &str) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// The whole point of [`backup_list_url`]: `Url::join` would drop `list`.
+    #[test]
+    fn list_url_keeps_the_list_segment() {
+        let keys = Keys::generate();
+        let pubkey = keys.public_key();
+        for base in ["https://nostr.download", "https://nostr.download/"] {
+            let base = Url::parse(base).unwrap();
+            let built = backup_list_url(&base, &pubkey).unwrap();
+            assert_eq!(
+                built.as_str(),
+                format!("https://nostr.download/list/{}", pubkey.to_hex()),
+                "base {base} must resolve to the BUD-03 list route",
+            );
+            // Pin the upstream behaviour this function exists to avoid, so a
+            // future `Url::join` rewrite of the helper fails loudly here.
+            let upstream = base.join("list").unwrap().join(&pubkey.to_hex()).unwrap();
+            assert_ne!(
+                upstream, built,
+                "join-based construction must not be mistaken for correct",
+            );
+        }
+    }
+
+    /// End-to-end over a loopback Blossom that answers BUD-03 `/list/<pubkey>`
+    /// and 404s the BUD-01 `/<pubkey>` blob route, exactly like nostr.download.
+    /// Before the [`backup_list_url`] fix this failed with `blossom list http
+    /// 404` — which `is_missing_account_backup_error` does NOT classify as
+    /// missing, so hosts reported "chat backup restore failed" and no restore
+    /// could ever succeed.
+    #[tokio::test]
+    async fn download_finds_the_backup_through_the_list_route() {
+        let keys = Keys::generate();
+        let sealed = b"sealed-account-backup-bytes".to_vec();
+        let base = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
+        let got = download_latest_sealed_backup_at(&keys, &base)
+            .await
+            .expect("restore must find the uploaded backup");
+        assert_eq!(got, sealed);
+    }
+
+    /// A server with no account backup for this pubkey must surface the typed
+    /// missing error, not a transport error — that is the difference between
+    /// "chats start empty" and "restore failed" in the host UI.
+    #[tokio::test]
+    async fn empty_list_is_a_missing_backup_not_a_failure() {
+        let keys = Keys::generate();
+        let base = spawn_mock_blossom_list(Keys::generate().public_key(), b"other".to_vec());
+        let err = download_latest_sealed_backup_at(&keys, &base)
+            .await
+            .expect_err("no backup for this pubkey");
+        assert!(
+            matches!(err, Error::AccountBackupMissing),
+            "expected AccountBackupMissing, got {err:?}",
+        );
+        assert!(is_missing_backup_error(&err));
+    }
+
+    /// Minimal BUD-01/03 server: `GET /list/<owner>` lists one account-backup
+    /// descriptor, `GET /<sha>` serves it, everything else 404s — including the
+    /// `/<pubkey>` route the upstream client's URL join would hit.
+    fn spawn_mock_blossom_list(owner: PublicKey, blob: Vec<u8>) -> Url {
+        use sha2::Digest;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock blossom");
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let base_for_thread = base.clone();
+        std::thread::spawn(move || {
+            let sha = hex::encode(sha2::Sha256::digest(&blob));
+            let list_path = format!("/list/{}", owner.to_hex());
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                if path == list_path {
+                    let json = format!(
+                        "[{{\"url\":\"{base_for_thread}/{sha}\",\"sha256\":\"{sha}\",\
+                         \"size\":{},\"type\":\"{ACCOUNT_BACKUP_MIME}\",\"uploaded\":7}}]",
+                        blob.len()
+                    );
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{json}",
+                            json.len()
+                        )
+                        .as_bytes(),
+                    );
+                } else if path.trim_start_matches('/') == sha {
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n",
+                            blob.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.write_all(&blob);
+                } else if path.starts_with("/list/") {
+                    // Another pubkey's listing: valid request, nothing stored.
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 2\r\nConnection: close\r\n\r\n[]",
+                    );
+                } else {
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                let _ = stream.flush();
+            }
+        });
+        Url::parse(&base).expect("mock base url")
+    }
+
+    /// A base with a path prefix (some servers mount Blossom under a subpath)
+    /// must keep that prefix rather than have it replaced.
+    #[test]
+    fn list_url_preserves_a_base_path_prefix() {
+        let keys = Keys::generate();
+        let base = Url::parse("https://example.test/blossom/").unwrap();
+        let built = backup_list_url(&base, &keys.public_key()).unwrap();
+        assert_eq!(
+            built.as_str(),
+            format!(
+                "https://example.test/blossom/list/{}",
+                keys.public_key().to_hex()
+            ),
+        );
+    }
 
     #[test]
     fn seal_open_roundtrip() {
