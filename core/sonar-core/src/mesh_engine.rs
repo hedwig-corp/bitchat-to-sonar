@@ -279,6 +279,10 @@ pub struct Engine {
     identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
+    /// Fingerprints that proved they run Sonar by sending a *verified* 0x53
+    /// Sonar announce. Only these peers may receive the optional file-transfer
+    /// TLVs Sonar adds on top of bitchat's format — see `send_file`.
+    sonar_peers: HashSet<String>,
     seen_broadcasts: HashSet<String>,
     seen_files: HashSet<String>,
     reassembler: mesh::fragment::Reassembler,
@@ -335,6 +339,7 @@ impl Engine {
             identity_refused: 0,
             identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
+            sonar_peers: HashSet::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
             reassembler: mesh::fragment::Reassembler::new(),
@@ -781,11 +786,23 @@ impl Engine {
         let route = self.sendable_route(fingerprint)?;
         let peer_id_hex = self.route_peer_id(&route)?;
         let peer_id = parse_id8(&peer_id_hex)?;
+        // The message-id TLV is a SONAR-ONLY extension and must never reach a
+        // stock bitchat peer: bitchat-android's decoder rejects the whole
+        // packet on the first tag it does not know
+        // (`TLVType.from(...) ?: return null`), so a single extra TLV turns
+        // every image / voice note / file Sonar sends into silence on the
+        // other side. Only peers that proved they run Sonar with a verified
+        // 0x53 announce get the extension; everyone else gets bytes that are
+        // byte-for-byte stock bitchat, at the cost of a delivery receipt.
+        let message_id = self
+            .sonar_peers
+            .contains(fingerprint)
+            .then(|| message_id.to_string());
         let payload = mesh::file_packet::FilePacket {
             file_name: Some(file_name.to_string()),
             file_size: Some(content.len() as u64),
             mime_type: Some(mime_type.to_string()),
-            message_id: Some(message_id.to_string()),
+            message_id,
             content: content.to_vec(),
         }
         .encode()?;
@@ -950,6 +967,7 @@ impl Engine {
         self.identity_lru.clear();
         self.identity_refused = 0;
         self.pending_sonar.clear();
+        self.sonar_peers.clear();
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();
@@ -2043,6 +2061,12 @@ impl Engine {
         if !self.fp_allowed(&fp) {
             return;
         }
+        // A verified 0x53 is the only proof that the peer speaks Sonar, and so
+        // the only licence to put Sonar's optional file TLV on the wire for it.
+        if self.sonar_peers.len() >= MAX_PENDING_SONAR {
+            self.sonar_peers.clear();
+        }
+        self.sonar_peers.insert(fp.clone());
         out.events.push(AppEvent::SonarPayload {
             fingerprint: fp,
             payload: packet.payload.clone(),
@@ -2240,6 +2264,155 @@ mod tests {
         );
     }
 
+    /// Exchange verified 0x53 Sonar announces both ways, which is what tells
+    /// each engine the other side is Sonar and not stock bitchat.
+    fn exchange_sonar_announces(
+        a: &mut Engine,
+        link: &LinkId,
+        b: &mut Engine,
+        b_conn: &str,
+        now: u64,
+    ) {
+        for command in a.set_sonar_payload(Some(b"sonar-a".to_vec()), now).commands {
+            if let Command::WriteLink { bytes, .. } = command {
+                b.on_server_rx(b_conn, &bytes, now);
+            }
+        }
+        for command in b.set_sonar_payload(Some(b"sonar-b".to_vec()), now).commands {
+            if let Command::NotifyConn { bytes, .. } = command {
+                a.on_client_rx(&link.conn, link.instance, &bytes, now);
+            }
+        }
+    }
+
+    /// bitchat-android's `BitchatFilePacket.decode`, transcribed: it resolves
+    /// every tag through a 4-value enum and bails on the first miss
+    /// (`TLVType.from(data[off].toUByte()) ?: return null`), so ANY extra TLV
+    /// costs the whole transfer. This is the decoder Sonar's media has to
+    /// survive, and the reason `send_file` gates its extension.
+    fn decode_like_bitchat_android(data: &[u8]) -> Option<(String, Vec<u8>)> {
+        let mut off = 0usize;
+        let mut name: Option<String> = None;
+        let mut content: Option<Vec<u8>> = None;
+        while off + 3 <= data.len() {
+            let tag = data[off];
+            if !matches!(tag, 0x01..=0x04) {
+                return None; // unknown tag ⇒ the media is dropped on the floor
+            }
+            off += 1;
+            let len = if tag == 0x04 {
+                if off + 4 > data.len() {
+                    return None;
+                }
+                let v = u32::from_be_bytes(data[off..off + 4].try_into().ok()?) as usize;
+                off += 4;
+                v
+            } else {
+                if off + 2 > data.len() {
+                    return None;
+                }
+                let v = u16::from_be_bytes(data[off..off + 2].try_into().ok()?) as usize;
+                off += 2;
+                v
+            };
+            if off + len > data.len() {
+                return None;
+            }
+            let value = &data[off..off + len];
+            off += len;
+            match tag {
+                0x01 => name = String::from_utf8(value.to_vec()).ok(),
+                0x02 if len != 4 => return None,
+                0x04 => content = Some(value.to_vec()),
+                _ => {}
+            }
+        }
+        Some((name?, content?))
+    }
+
+    /// Extract the file-transfer TLV payload from the single unfragmented
+    /// write `send_file` produces for a small payload.
+    fn sent_file_payload(out: &Output) -> Vec<u8> {
+        // `send_file` prepends discovery traffic for the route, so pick the
+        // file packet out rather than trusting command order. A small payload
+        // must arrive whole: a FRAGMENT here would mean this assertion is
+        // inspecting a header instead of the TLV.
+        out.commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::WriteLink { bytes, .. } | Command::NotifyConn { bytes, .. } => {
+                    mesh::Packet::decode(bytes)
+                }
+                _ => None,
+            })
+            .find(|p| p.type_ == msg_type::FILE_TRANSFER)
+            .expect("an unfragmented file write")
+            .payload
+    }
+
+    /// The regression: Sonar's optional message-id TLV reached stock bitchat
+    /// peers, and bitchat-android rejects a file packet outright on the first
+    /// unknown tag — so every image, voice note and file a Sonar user sent to
+    /// an Android bitchat user silently never appeared.
+    #[test]
+    fn media_to_a_stock_bitchat_peer_carries_no_unknown_tlv() {
+        let mut a = engine(1, "sonar");
+        let mut b = engine(9, "stock-bitchat");
+        let _link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+
+        let media = vec![0x42; 64];
+        let send = a
+            .send_file(&fp_of(&b), "media-mid", &media, "photo.jpg", "image/jpeg", 3_000)
+            .expect("media route");
+
+        let payload = sent_file_payload(&send);
+        let (name, content) =
+            decode_like_bitchat_android(&payload).expect("stock bitchat must decode Sonar's media");
+        assert_eq!(name, "photo.jpg");
+        assert_eq!(content, media);
+        assert_eq!(
+            mesh::file_packet::FilePacket::decode(&payload)
+                .expect("self-decode")
+                .message_id,
+            None,
+            "the Sonar-only message id must not be on the wire for a stock peer",
+        );
+    }
+
+    /// The extension is not removed, only gated: a peer that proved it runs
+    /// Sonar with a verified 0x53 still gets the id that earns a receipt.
+    #[test]
+    fn media_to_a_sonar_peer_still_carries_the_message_id() {
+        let mut a = engine(1, "sonar-a");
+        let mut b = engine(9, "sonar-b");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        exchange_sonar_announces(&mut a, &link, &mut b, "droid", 2_000);
+
+        let send = a
+            .send_file(
+                &fp_of(&b),
+                "media-mid",
+                &[0x42; 64],
+                "photo.jpg",
+                "image/jpeg",
+                3_000,
+            )
+            .expect("media route");
+        let payload = sent_file_payload(&send);
+        assert_eq!(
+            mesh::file_packet::FilePacket::decode(&payload)
+                .expect("self-decode")
+                .message_id
+                .as_deref(),
+            Some("media-mid"),
+        );
+        assert!(
+            decode_like_bitchat_android(&payload).is_none(),
+            "this is exactly the packet bitchat-android drops — it may only be \
+             addressed to a peer known to speak Sonar",
+        );
+    }
+
     #[test]
     fn announce_binds_and_starts_handshake_then_dm_round_trip() {
         let mut a = engine(1, "pixel");
@@ -2356,6 +2529,10 @@ mod tests {
         let mut a = engine(1, "pixel");
         let mut b = engine(9, "iphone");
         let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        // Media receipts ride a Sonar-only TLV that is withheld from peers
+        // which have not identified themselves as Sonar, so this round trip
+        // only exists once both sides have exchanged a verified 0x53.
+        exchange_sonar_announces(&mut a, &link, &mut b, "droid", 1_500);
 
         let text_ack = b
             .send_delivery_ack(&fp_of(&a), "text-mid", 2_000)

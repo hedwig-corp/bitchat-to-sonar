@@ -176,7 +176,15 @@ final class BLEService: NSObject {
     // the peer's signing key.
     private var pendingSonarAnnounces: [PeerID: BitchatPacket] = [:]
     private let pendingSonarAnnounceCap = 128
-    
+
+    // Peers that proved they run Sonar by sending a *verified* 0x53. Only these
+    // may receive the optional TLVs Sonar adds on top of bitchat's file packet
+    // — see `sendFilePrivate`. Never cleared with the pending queues above: a
+    // BLE reset does not make a Sonar peer stop being one, and the set
+    // self-heals from the next announce burst anyway.
+    private var sonarCapablePeers: Set<PeerID> = []
+    private let sonarCapablePeerCap = 256
+
     // Application state tracking (thread-safe)
     #if os(iOS)
     private var isAppActive: Bool = true  // Assume active initially
@@ -979,6 +987,10 @@ final class BLEService: NSObject {
     }
 
     func sendFileBroadcast(_ filePacket: BitchatFilePacket, transferId: String) {
+        // A broadcast reaches every client on the mesh, including stock bitchat
+        // ones that drop a file packet carrying any TLV they do not know, and
+        // broadcasts are never acked anyway (`ackMessageID` is private-only).
+        let filePacket = Self.wireFilePacket(filePacket, sonarCapableRecipient: false)
         messageQueue.async { [weak self] in
             guard let self = self else { return }
             guard let payload = filePacket.encode() else {
@@ -1017,6 +1029,17 @@ final class BLEService: NSObject {
             SecureLogger.error("❌ No live route for private file transfer: \(peerID)", category: .session)
             return false
         }
+        // The message-id TLV is a SONAR-ONLY extension and must never reach a
+        // stock bitchat peer: bitchat-android's decoder resolves every tag
+        // through a four-value enum and returns null on the first miss, so one
+        // extra TLV turns every image, voice note and file Sonar sends into
+        // silence on the other side. Peers proven to run Sonar by a verified
+        // 0x53 keep the id (and the delivery receipt it earns); everyone else
+        // gets bytes that are byte-for-byte stock bitchat.
+        let filePacket = Self.wireFilePacket(
+            filePacket,
+            sonarCapableRecipient: isSonarCapable(targetRoute)
+        )
         messageQueue.async { [weak self] in
             guard let self = self else { return }
             guard let payload = filePacket.encode() else {
@@ -4748,6 +4771,15 @@ extension BLEService {
             return
         }
 
+        // A verified 0x53 is the only proof the peer speaks Sonar, and so the
+        // only licence to put Sonar's optional file TLV on the wire for it.
+        collectionsQueue.sync(flags: .barrier) {
+            if sonarCapablePeers.count >= sonarCapablePeerCap {
+                sonarCapablePeers.removeAll()
+            }
+            sonarCapablePeers.insert(peerID)
+        }
+
         NotificationCenter.default.post(
             name: .sonarPeerProfileUpdated,
             object: nil,
@@ -4756,6 +4788,31 @@ extension BLEService {
                 SonarDiscoveryUserInfoKey.profile: announce
             ]
         )
+    }
+
+    /// Whether `peerID` has proven, with a verified 0x53 Sonar announce, that it
+    /// can decode the optional TLVs Sonar adds to bitchat's file packet.
+    func isSonarCapable(_ peerID: PeerID) -> Bool {
+        collectionsQueue.sync { sonarCapablePeers.contains(peerID) }
+    }
+
+    /// Strips Sonar-only TLVs from a file packet unless the recipient is known
+    /// to speak Sonar.
+    ///
+    /// bitchat-android's `BitchatFilePacket.decode` resolves every tag through
+    /// a four-value enum and returns null on the first miss, so a packet with
+    /// one unknown TLV is not "partially understood" — it is dropped whole.
+    /// Anything that can reach a non-Sonar client must go through here.
+    static func wireFilePacket(
+        _ filePacket: BitchatFilePacket,
+        sonarCapableRecipient: Bool
+    ) -> BitchatFilePacket {
+        guard sonarCapableRecipient else {
+            var stripped = filePacket
+            stripped.messageID = nil
+            return stripped
+        }
+        return filePacket
     }
 
     private func queuePendingSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {

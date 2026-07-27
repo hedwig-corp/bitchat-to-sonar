@@ -465,9 +465,11 @@ the pair asymmetric, which is worse than either behaviour alone.
 
 **Guarded by:** `mesh.rs::malformed_optional_message_id_degrades_instead_of_dropping_the_file`, `BitchatFilePacketTests.testUnusableMessageIDCostsTheReceiptNotTheTransfer`, `BitchatFilePacketTests.testMalformedMessageIDTLVStillDecodesTheFile`
 
-**Not guarded:** cross-implementation behaviour against stock bitchat, which does
-not know tag `0x05` at all — that path relies on unknown tags being skipped, and
-nothing here exercises a real stock decoder. iOS tests also do not run in CI.
+**Not guarded:** iOS tests do not run in CI. The cross-implementation hole this
+entry admitted — "stock bitchat does not know tag `0x05` at all; that path relies
+on unknown tags being skipped, and nothing here exercises a real stock decoder" —
+turned out to be a live bug, because bitchat-**android** does not skip them. It
+is now R-021.
 
 **History:** Introduced with the receipt feature: both sides rejected the packet
 on a bad id, so an optional extension could destroy the media. Found in review
@@ -1687,6 +1689,66 @@ lookup itself, and the focus gate on `SNComposer.liveDraft`.
   gate does not cost anything on the normal path: a posted-click harness showed
   the composer keeps focus and first responder through the click (4/4), so the
   editor is still the one consulted.
+
+## R-022 — A Sonar-only TLV must never ride a packet a stock bitchat peer will parse
+
+**Invariant:** Anything Sonar adds on top of bitchat's wire format goes out only
+to peers that have **proven** they run Sonar (a verified `0x53` Sonar announce).
+The default for an unidentified peer is bytes that are byte-for-byte stock
+bitchat, even when that costs a Sonar feature.
+
+**Breaks as:** a Sonar user sends a photo (or voice note, or file) to a bitchat
+**Android** user over BLE and nothing arrives — no row, no error, no log, on
+either side. Both apps look healthy; text in the same chat keeps working.
+
+**Why the tolerant reading is wrong:** bitchat's *Swift* decoder skips unknown
+TLVs (`case nil: continue`), and Sonar generalised that into "stock bitchat
+decoders skip unknown TLVs". bitchat-**android**'s does the opposite —
+`val t = TLVType.from(data[off].toUByte()) ?: return null` — so one unknown tag
+drops the entire file packet, media included. Upstream knows this and says so in
+`PrivateMediaMessageIdentity`'s own doc comment ("Android clients reject unknown
+file tags"), which is why upstream derives its media receipt id from fields
+already on the wire instead of adding a TLV. Two decoders written from the same
+spec disagreed, and the tolerant one was the one Sonar read.
+
+**Call sites:** `mesh_engine.rs::Engine::send_file` (Compose/Android/desktop, via
+the core) and `BLEService.sendFilePrivate` / `sendFileBroadcast` →
+`BLEService.wireFilePacket` (iOS). Capability is recorded where the `0x53` is
+*verified*: `mesh_engine.rs::handle_sonar` and `BLEService.handleSonarAnnounce`.
+Broadcasts never carry the extension on either platform — they reach every client
+on the mesh and are never acked anyway.
+
+**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `BLEServiceCoreTests.fileTransferToNonSonarPeer_carriesNoUnknownTLV`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`
+
+The Rust pair pins the real call site: it drives two engines through
+`Engine::send_file` and runs bitchat-android's decoder, transcribed, over the
+bytes that actually go out.
+
+**Not guarded:** the iOS *wiring* — `wireFilePacket` and `isSonarCapable` are each
+pinned, but nothing exercises `sendFilePrivate` end-to-end, which needs a live BLE
+route. iOS tests also do not run in CI. Nothing runs against a real bitchat-android
+build; the strict decoders in both test suites are transcriptions, so an upstream
+change to bitchat-android's TLV handling will not show up here.
+
+**History:** Introduced with the media delivery receipt in #312 on the stated
+premise that unknown tags are skipped. R-015 (same TLV) named this exact hole in
+its "Not guarded" section and it went unclosed until it was reported in the field
+as "sending images between bitchat and Sonar is broken".
+
+**Rejected:**
+- *Dropping the `0x05` TLV entirely.* Costs every mesh media delivery receipt,
+  including Sonar↔Sonar, to fix a bitchat-only problem.
+- *Deriving the receipt id from the filename, as upstream's
+  `PrivateMediaMessageIdentity` does.* The better long-term answer — it needs no
+  extension at all and would earn receipts from stock bitchat-iOS too — but it
+  requires entropy-bearing filenames on both Sonar platforms
+  (`img_<ts>_<UUID>.jpg`; Sonar sends `img_<ts>.jpg` on iOS and picker names on
+  Compose), and gives no receipt for generic files, which Sonar supports today.
+  Tracked as a follow-up rather than folded into a field-broken hotfix.
+- *Gating on the relay-discovered Sonar profile (`capabilities` from an npub)
+  instead of the mesh `0x53`.* Not available synchronously at send time on the
+  BLE path, and absent for a mesh-only peer — it would fail open, which is the
+  failure this entry exists to prevent.
 
 ## Unguarded
 
