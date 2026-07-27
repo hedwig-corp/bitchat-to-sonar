@@ -22,26 +22,22 @@ function bcNow() {
 }
 
 function bcFreshState() {
-  const groupMsgs = BC_DATA.groupMsgs || {};
   return {
     v: 3,
     onboarded: false,
     nick: '',
     network: 'online',
     balance: 182400,
-    txns: (BC_DATA.txns || []).slice(),
+    txns: BC_DATA.txns.slice(),
     verified: {},
     muted: {},
     read: {},
     stack: [{ s: 'home' }],
     nav: '',
     prefs: { appLock: false, readReceipts: true, preview: true, names: true, notifs: true, icon: 'default', requests: 1, btcMode: false, currency: 'EUR' },
-    chMsgs: { centro: (BC_DATA.chMsgs || []).slice(), city: [] },
-    dmMsgs: { maya: (BC_DATA.dmMsgs || []).slice(), sofia: (BC_DATA.dmMsgsSofia || []).slice() },
-    groupMsgs: {
-      lake: (groupMsgs.lake || []).slice(),
-      trip: (groupMsgs.trip || []).slice(),
-    },
+    chMsgs: { centro: BC_DATA.chMsgs.slice(), city: [] },
+    dmMsgs: { maya: BC_DATA.dmMsgs.slice(), sofia: BC_DATA.dmMsgsSofia.slice() },
+    groupMsgs: { lake: BC_DATA.groupMsgs.lake.slice(), trip: BC_DATA.groupMsgs.trip.slice() },
   };
 }
 
@@ -183,6 +179,16 @@ function SonarApp() {
     setTimeout(() => setPayState(peerId, key, 'paid'), 1400);
     setTimeout(() => setPayState(peerId, key, 'confirmed'), 3200);
   };
+  // External/directory payment from the Send-payment picker (contact, username or Bolt12)
+  const payExternal = (target, sats) => {
+    const key = 'tx' + Date.now();
+    const via = target && target.inRange ? 'mesh' : 'internet';
+    const time = bcNow();
+    setApp((a) => pushTxn({ ...a, balance: Math.max(0, (a.balance || 0) - sats) },
+      { key, dir: 'out', who: (target && target.name) || 'recipient', amount: sats, via, state: 'pending', time }));
+    setTimeout(() => setApp((a) => ({ ...a, txns: (a.txns || []).map((t) => t.key === key ? { ...t, state: 'confirmed' } : t) })), 1800);
+  };
+
   const claimPay = () => {};
 
   // Media rides the same rails as messages (Bluetooth in range, internet otherwise)
@@ -304,6 +310,10 @@ function SonarApp() {
     screen = <WalletScreen key={screenKey} app={app} nav={app.nav} pop={pop} />;
   } else if (top.s === 'donate') {
     screen = <DonateScreen key={screenKey} app={app} nav={app.nav} pop={pop} onBecomeSupporter={() => setPref('supporter', true)} />;
+  } else if (top.s === 'backup') {
+    screen = <BackupScreen key={screenKey} app={app} nav={app.nav} pop={pop} onPref={setPref} />;
+  } else if (top.s === 'pay') {
+    screen = <SendPaymentScreen key={screenKey} app={app} nav={app.nav} pop={pop} onPaid={(target, sats) => { payExternal(target, sats); pop(); }} />;
   } else if (top.s === 'peer') {
     screen = <PeerProfileScreen key={screenKey} app={app} nav={app.nav} pop={pop} push={push} peerId={top.id} onVerify={(pid) => setApp((a) => ({ ...a, verified: { ...a.verified, [pid]: true } }))} />;
   }

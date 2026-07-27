@@ -15,7 +15,7 @@ const BC_ICONS = {
   shield: <path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z" />,
   shieldCheck: <><path d="M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z" /><path d="M8.8 12.1l2.3 2.3 4.3-4.6" /></>,
   x: <path d="M6.5 6.5l11 11M17.5 6.5l-11 11" />,
-  smile: <><circle cx="12" cy="12" r="8.2" /><circle cx="9.1" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><circle cx="14.9" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><path d="M8.7 14.2a4.5 4.5 0 0 0 6.6 0" /></>,
+  smile: <><circle cx="12" cy="12" r="8.2" data-comment-anchor="2decdc16a3-circle-18-12" /><circle cx="9.1" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><circle cx="14.9" cy="10.2" r="1.1" fill="currentColor" stroke="none" /><path d="M8.7 14.2a4.5 4.5 0 0 0 6.6 0" /></>,
   navArrow: <path d="M20.4 3.6 3.8 10.2l6.6 3.4 3.4 6.6z" />,
   dice: <><rect x="4.2" y="4.2" width="15.6" height="15.6" rx="4" /><circle cx="8.8" cy="8.8" r="1.2" fill="currentColor" stroke="none" /><circle cx="15.2" cy="8.8" r="1.2" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="8.8" cy="15.2" r="1.2" fill="currentColor" stroke="none" /><circle cx="15.2" cy="15.2" r="1.2" fill="currentColor" stroke="none" /></>,
   slash: <path d="M14.5 4.5l-5 15" />,
@@ -30,6 +30,8 @@ const BC_ICONS = {
   list: <><path d="M9 6.5h11M9 12h11M9 17.5h11" /><circle cx="4.6" cy="6.5" r="1.2" fill="currentColor" stroke="none" /><circle cx="4.6" cy="12" r="1.2" fill="currentColor" stroke="none" /><circle cx="4.6" cy="17.5" r="1.2" fill="currentColor" stroke="none" /></>,
   moon: <path d="M19 13.8A7.6 7.6 0 1 1 10.2 5 6.1 6.1 0 0 0 19 13.8z" />,
   bell: <><path d="M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z" /><path d="M10 18.8a2.1 2.1 0 0 0 4 0" /></>,
+  bellOff: <><path d="M8.7 4.7A5.5 5.5 0 0 1 17.5 9.5c0 2.3.5 3.8 1.1 4.9M4.8 15.2c.9-1.1 1.7-2.7 1.7-5.7 0-.6.1-1.2.3-1.7" /><path d="M10 18.8a2.1 2.1 0 0 0 4 0" /><path d="M4.5 4.5l15 15" /></>,
+  clock: <><circle cx="12" cy="12" r="8.2" /><path d="M12 7.6V12l3.2 2.4" /></>,
   trash: <><path d="M5 7h14M10 7V5.6A1.6 1.6 0 0 1 11.6 4h.8A1.6 1.6 0 0 1 14 5.6V7" /><path d="M7 7l.8 12a1.8 1.8 0 0 0 1.8 1.7h4.8a1.8 1.8 0 0 0 1.8-1.7L17 7" /></>,
   info: <><circle cx="12" cy="12" r="8.2" /><path d="M12 11.2v5" /><circle cx="12" cy="8" r="1.1" fill="currentColor" stroke="none" /></>,
   compose: <><path d="M12 5.2H7.2A2.4 2.4 0 0 0 4.8 7.6v9a2.4 2.4 0 0 0 2.4 2.4h9a2.4 2.4 0 0 0 2.4-2.4V12" /><path d="M17.7 4.5l1.8 1.8-6.6 6.6-2.5.7.7-2.5z" /></>,
@@ -42,6 +44,15 @@ const BC_ICONS = {
   play: <path d="M7.5 5.5v13l11-6.5z" fill="currentColor" stroke="none" />,
   doc: <><path d="M6.5 3.5h7l5 5v12a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1v-16a1 1 0 0 1 1-1z" /><path d="M13.5 3.5V8.5h5" /></>,
   download: <><path d="M12 4v11M7.5 10.5 12 15l4.5-4.5" /><path d="M5 19.5h14" /></>,
+  clock: <><circle cx="12" cy="12" r="8.2" /><path d="M12 7.5V12l3 2" /></>,
+  leaf: <><path d="M5 19c0-7 5-12 14-12 0 9-5 14-12 14-1.5 0-2-1-2-2z" /><path d="M8 17c3-4 6-6 9-7" /></>,
+  cup: <><path d="M5 8h11v5a5 5 0 0 1-10 0z" /><path d="M16 9h2.2a1.8 1.8 0 0 1 0 3.6H16" /><path d="M6 20.5h9" /></>,
+  ball: <><circle cx="12" cy="12" r="8.2" /><path d="M12 3.8c-2.7 2.5-4.1 5.2-4.1 8.2s1.4 5.7 4.1 8.2c2.7-2.5 4.1-5.2 4.1-8.2S14.7 6.3 12 3.8zM3.8 12h16.4" /></>,
+  car: <><path d="M5 16.5v-3l1.6-4.2a2 2 0 0 1 1.9-1.3h7a2 2 0 0 1 1.9 1.3L19 13.5v3" /><path d="M4.5 16.5h15" /><circle cx="8" cy="16.8" r="1.4" fill="currentColor" stroke="none" /><circle cx="16" cy="16.8" r="1.4" fill="currentColor" stroke="none" /></>,
+  bulb: <><path d="M12 3.5a6 6 0 0 0-3.4 11c.5.4.9 1 1 1.6h4.8c.1-.6.5-1.2 1-1.6A6 6 0 0 0 12 3.5z" /><path d="M9.5 19.5h5M10.5 21.5h3" /></>,
+  grid: <><rect x="4.5" y="4.5" width="6" height="6" rx="1.4" /><rect x="13.5" y="4.5" width="6" height="6" rx="1.4" /><rect x="4.5" y="13.5" width="6" height="6" rx="1.4" /><rect x="13.5" y="13.5" width="6" height="6" rx="1.4" /></>,
+  flag: <><path d="M6 21V4M6 5h11l-2 3.5L17 12H6" /></>,
+  keyboard: <><rect x="3.5" y="6.5" width="17" height="11" rx="2.5" /><path d="M7 10h.01M11 10h.01M15 10h.01M9 13h6" /></>,
   phone: <path d="M6.5 4.5c-1 0-2 .9-2 2 0 7 6 13 13 13 1.1 0 2-1 2-2v-2.6c0-.5-.4-.9-.9-1l-3-.6c-.4-.1-.9.1-1.1.5l-1 1.6a11 11 0 0 1-5-5l1.6-1c.4-.2.6-.7.5-1.1l-.6-3c-.1-.5-.5-.9-1-.9z" />,
   phoneDown: <><path d="M3.5 13.5c4.7-4 12.3-4 17 0l-2.2 2.6c-.4.5-1.1.5-1.6.2l-1.9-1.2a1.1 1.1 0 0 1-.5-1.2l.3-1.4a11 11 0 0 0-5.7 0l.3 1.4c.1.5-.1 1-.5 1.2l-1.9 1.2c-.5.3-1.2.3-1.6-.2z" /></>,
   micOff: <><path d="M9.2 5.4a2.8 2.8 0 0 1 5.6.8v4M14.8 12.8a2.8 2.8 0 0 1-5.6-1.2V9.2M5.8 11.5a6.2 6.2 0 0 0 9.5 5.3M18.2 11.5a6.2 6.2 0 0 1-.4 2.2M12 17.7V20.4M9 20.6h6" /><path d="M4.5 4.5l15 15" /></>,
@@ -50,9 +61,14 @@ const BC_ICONS = {
   cameraFlip: <><rect x="3.5" y="6.5" width="17" height="13" rx="3" /><path d="M8.5 13a3.5 3.5 0 0 1 6-2.4M15.5 13a3.5 3.5 0 0 1-6 2.4" /><path d="M14.2 8.2 14.6 10.4 12.4 10.2M9.8 17.8 9.4 15.6 11.6 15.8" /><path d="M8 6.5l1-2h6l1 2" /></>,
   copy: <><rect x="8.5" y="8.5" width="11" height="11" rx="2.6" /><path d="M15.5 8.5V6a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2.5" /></>,
   share: <><circle cx="6.5" cy="12" r="2.4" /><circle cx="17" cy="6" r="2.4" /><circle cx="17" cy="18" r="2.4" /><path d="M8.6 10.9 14.9 7.1M8.6 13.1l6.3 3.8" /></>,
+  link: <><path d="M10.2 13.8a4 4 0 0 1 0-3.6l1.2-.9M13.8 10.2a4 4 0 0 1 0 3.6l-1.2.9" /><path d="M9 16.2 6.5 18a3.2 3.2 0 0 1-1-4.4l2.2-3.4a3.2 3.2 0 0 1 4.4-1" /><path d="M15 7.8l2.5-1.8a3.2 3.2 0 0 1 1 4.4l-2.2 3.4a3.2 3.2 0 0 1-4.4 1" /></>,
+  qr: <><rect x="4" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5" /><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5" /><path d="M14 14h2.5v2.5M17 14v6h-3M20 17v3h-3" /></>,
+  heart: <path d="M12 20.3 4.6 13a4.6 4.6 0 0 1 6.5-6.5l.9.9.9-.9A4.6 4.6 0 0 1 19.4 13z" fill="currentColor" stroke="none" />,
+  nudge: <><path d="M12 4a5.5 5.5 0 0 1 5.5 5.5c0 3 .8 4.6 1.7 5.7H4.8c.9-1.1 1.7-2.7 1.7-5.7A5.5 5.5 0 0 1 12 4z" /><path d="M10 18.8a2.1 2.1 0 0 0 4 0" /><path d="M20 5.5c1 .8 1.6 2 1.6 3.4M4 5.5C3 6.3 2.4 7.5 2.4 8.9" /></>,
   eye: <><path d="M2.5 12s3.5-6.5 9.5-6.5S21.5 12 21.5 12s-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" /><circle cx="12" cy="12" r="2.8" /></>,
   eyeOff: <><path d="M4.5 5 19.5 19" /><path d="M9.5 5.7A9 9 0 0 1 12 5.5c6 0 9.5 6.5 9.5 6.5a16 16 0 0 1-2.9 3.6M6.4 7.6A16 16 0 0 0 2.5 12s3.5 6.5 9.5 6.5a8.8 8.8 0 0 0 3.1-.55" /><path d="M9.8 10.2a2.8 2.8 0 0 0 3.9 4" /></>,
   importKey: <><circle cx="8" cy="12" r="3.2" /><path d="M11.2 12h9M16.5 12v3M20.2 12v2.4" /><path d="M14 5.5 11 8.5M14 5.5l-3-3M11 8.5l-2.4-2.4" /></>,
+  backup: <><path d="M7.5 18.5A4.5 4.5 0 0 1 6.8 9.6 6 6 0 0 1 18.5 10a4 4 0 0 1 .3 8.5" /><path d="M12 11v6.5M9.3 14.7 12 17.4l2.7-2.7" /></>
 };
 
 function BCIcon({ name, size = 20, weight = 1.8, style, className }) {
@@ -61,9 +77,9 @@ function BCIcon({ name, size = 20, weight = 1.8, style, className }) {
       width={size} height={size} viewBox="0 0 24 24"
       fill="none" stroke="currentColor" strokeWidth={weight}
       strokeLinecap="round" strokeLinejoin="round"
-      style={style} className={className} aria-hidden="true"
-    >{BC_ICONS[name] || null}</svg>
-  );
+      style={style} className={className} aria-hidden="true">
+      {BC_ICONS[name] || null}</svg>);
+
 }
 
 Object.assign(window, { BCIcon });

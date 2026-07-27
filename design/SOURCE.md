@@ -3,7 +3,46 @@
 The complete design handoff bundle lives in `design/handoff/`. It is **vendored**
 (checked in) so agents read it from disk instead of re-fetching every time.
 
-- **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design)
+- **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design) — **dead (404)**; refresh through the `DesignSync` MCP tool against the project id below instead.
+- **Send-payment refresh (2026-07-27)** — Claude Design project
+  `c6936a45-1fde-470e-9d0b-56b04428e60b`
+  ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Prototype.html)):
+  ADDS a **standalone send-payment flow** reachable from the new-chat sheet —
+  `Start a chat → “Send a payment” → SendPaymentScreen → PaySheet`. Changes
+  vendored here:
+  - `project/sonar/pay.jsx` — new `SendPaymentScreen` (recipient picker: search
+    field, “Scan a QR code” row, a “Pay ‘…’” external row that appears when the
+    query looks like `@user` / `name@domain` / `lno1…` / `npub1…`, and a
+    “People you can pay” list filtered to peers whose `caps` include
+    `payments`), new `ScanQrSheet` (viewfinder + three sample codes: Lightning
+    invoice with a **fixed** amount, on-chain address, Bolt12 offer), new
+    `PayDetailSheet` (plain summary + mono proof block), new `WalletActivity`
+    log. `PaySheet` gained a `fixed` prop (skips chips + keypad when the code
+    carries an amount). `PayBubble` moved from **sealed/claim ecash** to a
+    **direct BOLT12 payment**: `pending → paid → confirmed | failed`, incoming
+    is `received` and lands straight in the wallet — there is no claim step
+    anymore.
+  - `project/sonar/screens.jsx` — `StartChatSheet` takes `onPay`; its rows are
+    now *People nearby · Find by username · **Send a payment** · New group*
+    ("New discussion" was renamed "Find by username").
+  - `project/sonar/app.jsx` — `pay` and `backup` routes, `payExternal()`.
+  - `project/sonar/data.js` — peers gained `npub` / `bip353` / `caps` /
+    `media` / `met` / `supporter`; new `txns` seed list.
+  - `project/sonar/icons.jsx` — `qr`, `backup`, `heart`, `nudge`, `link`,
+    `leaf`, `cup`, `ball`, `car`, `bulb`, `grid`, `flag`, `keyboard`, `bellOff`.
+  - `project/sonar/settings.jsx` — `BackupScreen` + `BackupSetupSheet` (Signal
+    style encrypted backup with a 12-word recovery key) and the Data & storage
+    “Chat backup” row.
+  - `project/sonar/theme.css` — `.sp-*` (send-payment picker), `.scan-*`
+    (scan to pay), `.bk-*` (backup).
+  Not re-vendored because they matched byte-for-byte: `Sonar Prototype.html`,
+  `sonar/components.jsx`. Out of scope for this refresh: the newer
+  `Sonar Stickers.html`, `Sonar Design System.html` and `Fight Chat Control.html`
+  pages that also live in the project.
+  One divergence from the remote source: the remote `pay.jsx` puts a JS escape
+  sequence (backslash-u-2026) in JSX *text* position for the pending label, and
+  JSX text does not process escapes — React would render those six characters
+  verbatim instead of an ellipsis. The vendored copy uses the real `…`.
 - **Blog refresh (2026-07-14)** — Claude Design project
   `c6936a45-1fde-470e-9d0b-56b04428e60b`
   ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Blog.html)):

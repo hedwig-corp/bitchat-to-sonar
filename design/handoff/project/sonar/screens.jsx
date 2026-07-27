@@ -192,7 +192,7 @@ function normalizeHandle(raw) {
   return { kind: 'address', name: m[1], domain: m[2], address: full, native: m[2] === SONAR_HOME };
 }
 
-function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure }) {
+function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure, onPay }) {
   const [find, setFind] = React.useState(false);
   const [val, setVal] = React.useState('');
   const [state, setState] = React.useState('idle'); // idle · resolving · found · notfound
@@ -219,7 +219,7 @@ function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure }) {
 
   if (find) {
     return (
-      <Sheet onClose={onClose} title="New discussion">
+      <Sheet onClose={onClose} title="Find someone">
         <p className="bc-verifycopy" style={{ paddingTop: 2 }}>
           Type a Sonar username — just <b>vincenzo</b> for a @{SONAR_HOME} account, or a full address like <b>vincenzo@stacker.news</b> for another provider. You can also paste a raw npub.
         </p>
@@ -279,8 +279,9 @@ function StartChatSheet({ onClose, onDM, onRadar, onNewGroup, onSecure }) {
       ))}
       <div style={{ height: 1, background: 'var(--hairline)', margin: '6px 12px' }}></div>
       <ActionRow icon="people" label="People nearby" desc="Open the radar to see everyone in range" onClick={onRadar} />
-      <ActionRow icon="key" label="New discussion" desc={'Username, name@domain, or paste a key — reaches anywhere'} onClick={() => setFind(true)} />
-      <ActionRow icon="plus" label="New group" desc="Invite contacts or paste keys" onClick={onNewGroup} />
+      <ActionRow icon="key" label="Find by username" desc={'e.g. vincenzo · or name@domain · reaches anywhere'} onClick={() => setFind(true)} />
+      <ActionRow icon="coin" label="Send a payment" desc="Pay a contact, username or Bolt12 offer" onClick={onPay} />
+      <ActionRow icon="plus" label="New group" desc="Private, encrypted, with people you choose" onClick={onNewGroup} />
     </Sheet>
   );
 }
@@ -395,6 +396,7 @@ function HomeScreen({ app, t, nav, push, toggleNetwork, onWipe, onMute, onUnmute
           onRadar={() => { setStartChat(false); push('nearby'); }}
           onNewGroup={() => { setStartChat(false); push('newgroup'); }}
           onSecure={() => { setStartChat(false); push('dm', { id: 'sofia' }); }}
+          onPay={() => { setStartChat(false); push('pay'); }}
         />
       )}
       {muteTarget && (
