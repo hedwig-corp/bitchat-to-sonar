@@ -395,9 +395,14 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute. The drain payload carries no group id, so a
-            // muted DM is matched by sender npub; muted GROUPS are only
-            // caught by the summary path below (documented gap).
+            // Per-chat mute, DM fast path only: a DM row has no meaningful
+            // group name, so match it by sender npub and skip the name
+            // resolution below. Muted GROUPS are not handled here — they are
+            // stopped by the central gate in
+            // NotificationService.sendLocalNotification, which reads the
+            // marmot:<groupId> conversation id this loop puts in userInfo.
+            // (Drained rows DO carry a group id; core sets group_id_hex on
+            // every DrainNotification.)
             if notif.groupName.isEmpty, !notif.senderNpub.isEmpty,
                SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
                 // The NSE suppresses muted chats itself, but it fails open when
