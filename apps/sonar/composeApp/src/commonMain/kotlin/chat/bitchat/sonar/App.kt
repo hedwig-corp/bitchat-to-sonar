@@ -91,6 +91,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.InlineTextContent
@@ -693,10 +694,14 @@ private fun geoShort(level: GeoLevel): String = when (level) {
  *  hairline under the row inset to the text column (hidden on the last row). */
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
-private fun ConvRow(
+internal fun ConvRow(
     avatar: @Composable () -> Unit,
     title: String,
     sub: String,
+    /** Glyph rendered before the sub text (design `.bc-signal`). */
+    subLeading: (@Composable () -> Unit)? = null,
+    /** `.bc-rowsub` is 14; a nested `.bc-signal` renders at 13.5. */
+    subFontSize: TextUnit = 14.sp,
     time: String? = null,
     lock: Boolean = false,
     verified: Boolean = false,
@@ -730,8 +735,9 @@ private fun ConvRow(
                 // bc-rowsub: 14 text2, single line, ellipsized (npubs must never wrap).
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
+                    if (subLeading != null) { subLeading(); Spacer(Modifier.width(6.dp)) }
                     Text(
-                        sub, color = s.text2, fontSize = 14.sp,
+                        sub, color = s.text2, fontSize = subFontSize,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false)
                     )

@@ -32,8 +32,20 @@ struct SonarSendPaymentScreen: View {
     @State private var scanning = false
     @State private var toast: String?
 
+    /// Snapshot of the payable contacts, taken when the screen appears.
+    ///
+    /// `store.payableContacts` walks `dmRows`, which is a full scan of every
+    /// private chat, mutual favourite and npub fold. As a computed property it
+    /// re-ran on every SwiftUI `body` evaluation — and this view read it twice
+    /// per body, so a single keystroke in the field cost two complete chat
+    /// scans. That is what made the list feel slow and jumpy.
+    ///
+    /// The list only changes when peers or chats do, not while someone types,
+    /// so it is snapshotted once per appearance and the search filters the
+    /// snapshot.
+    @State private var contacts: [SNPayableContact] = []
+
     private var trimmed: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
-    private var contacts: [SNPayableContact] { store.payableContacts }
     private var listed: [SNPayableContact] {
         trimmed.isEmpty
             ? contacts
@@ -168,59 +180,55 @@ struct SonarSendPaymentScreen: View {
                             .frame(maxWidth: .infinity)
                             .padding(EdgeInsets(top: 24, leading: 20, bottom: 24, trailing: 20))
                     } else {
+                        // The design uses the shared ConvRow (`.bc-row`): 16/11
+                        // padding, 16.5/650 title, a `.bc-signal` sub, a hairline
+                        // from x=72 suppressed on the last row — and nothing on
+                        // the right. Hand-rolling this row is what made the list
+                        // look wrong; reuse the component instead.
                         VStack(spacing: 0) {
-                            ForEach(listed) { contact in
-                                Button {
-                                    contactTarget = contact
-                                } label: {
-                                    HStack(spacing: 12) {
+                            ForEach(Array(listed.enumerated()), id: \.element.id) { index, contact in
+                                SNConvRow(
+                                    title: contact.name,
+                                    divider: index < listed.count - 1,
+                                    action: { contactTarget = contact },
+                                    avatar: {
                                         SonarAvatar(name: contact.name, size: 44, presence: contact.nearby)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text(verbatim: contact.name)
-                                                .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                                                .foregroundColor(SonarTheme.text)
-                                            // .bc-signal — a BLE dot when
-                                            // nearby, otherwise a bolt glyph in
-                                            // front of the payment address.
-                                            HStack(spacing: 6) {
-                                                if contact.nearby {
-                                                    Circle()
-                                                        .fill(SonarTheme.accent)
-                                                        .frame(width: 8, height: 8)
-                                                } else {
-                                                    SNIcon(name: .bolt, size: 12, weight: 2.2)
-                                                        .foregroundColor(SonarTheme.net)
-                                                }
-                                                Text(verbatim: contact.subtitle)
-                                                    .font(SonarTheme.uiFont(size: 13))
-                                                    .foregroundColor(SonarTheme.text2)
-                                                    .lineLimit(1)
+                                    },
+                                    sub: {
+                                        HStack(spacing: 6) {
+                                            if contact.nearby {
+                                                Circle()
+                                                    .fill(SonarTheme.accent)
+                                                    .frame(width: 8, height: 8)
+                                            } else {
+                                                SNIcon(name: .bolt, size: 12, weight: 2.2)
+                                                    .foregroundColor(SonarTheme.net)
                                             }
+                                            Text(verbatim: contact.subtitle)
+                                                .font(SonarTheme.uiFont(size: 13.5))
+                                                .foregroundColor(SonarTheme.text2)
+                                                .lineLimit(1)
                                         }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        SNIcon(name: .chevron, size: 15, weight: 2.2)
-                                            .foregroundColor(SonarTheme.text3)
                                     }
-                                    .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))
-                                }
-                                .buttonStyle(SNScaleStyle(scale: 0.99))
+                                )
                             }
                         }
                     }
 
                     Text("Only people who publish a payment address appear here. "
                          + "Payments settle directly to their wallet — no claim step.")
-                        .font(SonarTheme.uiFont(size: 12.5))
-                        .lineSpacing(12.5 * 0.3)
+                        .font(SonarTheme.uiFont(size: 12))
+                        .lineSpacing(12 * 0.4)
                         .foregroundColor(SonarTheme.text3)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(EdgeInsets(top: 10, leading: 18, bottom: 0, trailing: 18))
+                        .padding(EdgeInsets(top: 12, leading: 24, bottom: 4, trailing: 24))
 
                     Color.clear.frame(height: 40)
                 }
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .task { contacts = store.payableContacts }
         .snSheet(
             isPresented: Binding(
                 get: { contactTarget != nil },

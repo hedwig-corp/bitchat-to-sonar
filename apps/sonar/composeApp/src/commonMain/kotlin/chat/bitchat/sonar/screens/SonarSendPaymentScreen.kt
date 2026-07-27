@@ -19,6 +19,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.PayableContact
+import chat.bitchat.sonar.ConvRow
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
@@ -74,9 +76,21 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     var scanning by remember { mutableStateOf(false) }
 
     val trimmed = query.trim()
-    val contacts = state.payableContacts()
-    val listed = if (trimmed.isEmpty()) contacts
-    else contacts.filter { it.name.contains(trimmed, ignoreCase = true) }
+    // `payableContacts()` walks every mesh peer, mesh DM row and direct Marmot
+    // chat, resolving a BOLT12 offer and a display name for each. Calling it
+    // straight from the composable body re-ran that whole scan on every
+    // recomposition — including once per keystroke in the field below, which
+    // is what made this list feel sluggish.
+    //
+    // derivedStateOf keeps the scan off the typing path: `query` is not read
+    // inside it, so typing never invalidates it, and it only recomputes when
+    // the peer/chat state it actually reads changes — and only notifies when
+    // the resulting list differs.
+    val contacts by remember(state) { derivedStateOf { state.payableContacts() } }
+    val listed = remember(contacts, trimmed) {
+        if (trimmed.isEmpty()) contacts
+        else contacts.filter { it.name.contains(trimmed, ignoreCase = true) }
+    }
 
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Send payment", hairline = false, onBack = { state.back() })
@@ -188,33 +202,27 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
                 )
             } else {
-                listed.forEach { contact ->
-                    Row(
-                        Modifier.fillMaxWidth().clickable { contactTarget = contact }
-                            .padding(horizontal = 14.dp, vertical = 9.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        SonarAvatar(contact.name, 44.dp, presence = contact.nearby)
-                        Spacer(Modifier.width(12.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                contact.name,
-                                color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
-                            )
-                            // .bc-signal — a BLE dot when nearby, otherwise a
-                            // bolt glyph in front of the payment address.
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (contact.nearby) {
-                                    Box(Modifier.size(8.dp).clip(CircleShape).background(s.accent))
-                                } else {
-                                    SNIcon(SNIconName.Bolt, 12.dp, s.net, weight = 2.2f)
-                                }
-                                Spacer(Modifier.width(6.dp))
-                                Text(contact.subtitle, color = s.text2, fontSize = 13.sp, maxLines = 1)
+                // The design uses the shared ConvRow (`.bc-row`): 16/11
+                // padding, 16.5/650 title, a `.bc-signal` sub, a hairline from
+                // x=72 that is suppressed on the last row — and nothing on the
+                // right. Hand-rolling this row is what made the list look
+                // wrong; reuse the component instead.
+                listed.forEachIndexed { i, contact ->
+                    ConvRow(
+                        avatar = { SonarAvatar(contact.name, 44.dp, presence = contact.nearby) },
+                        title = contact.name,
+                        sub = contact.subtitle,
+                        subFontSize = 13.5.sp,
+                        subLeading = {
+                            if (contact.nearby) {
+                                Box(Modifier.size(8.dp).clip(CircleShape).background(s.accent))
+                            } else {
+                                SNIcon(SNIconName.Bolt, 12.dp, s.net, weight = 2.2f)
                             }
-                        }
-                        SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
-                    }
+                        },
+                        divider = i < listed.lastIndex,
+                        onClick = { contactTarget = contact },
+                    )
                 }
             }
 
@@ -222,8 +230,8 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
             Text(
                 "Only people who publish a payment address appear here. " +
                     "Payments settle directly to their wallet — no claim step.",
-                color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
-                modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp),
+                color = s.text3, fontSize = 12.sp, lineHeight = 17.sp,
+                modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 4.dp),
             )
         }
     }
