@@ -11,4 +11,7 @@ enum NoiseSessionError: Error, Equatable {
     case notEstablished
     case sessionNotFound
     case alreadyEstablished
+    /// The handshake authenticated a static key that does not derive the peer
+    /// ID the packet claimed to come from.
+    case peerIdentityMismatch
 }
