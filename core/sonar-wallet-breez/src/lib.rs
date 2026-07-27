@@ -665,11 +665,17 @@ fn map_payment(p: &Payment) -> Option<sonar_wallet::Payment> {
 /// so keying on it would give the same payment two different ids across its
 /// lifetime and show the user duplicate rows.
 fn stable_id(p: &Payment) -> Option<String> {
-    extract_details(p)
-        .payment_hash
-        .or_else(|| p.tx_id.clone())
-        .or_else(|| p.destination.clone())
-        .filter(|id| !id.is_empty())
+    // Each candidate is emptiness-checked in turn: filtering only at the end
+    // lets a present-but-empty field (breez writes `Some("")` for an
+    // unconfirmed tx_id) shadow a perfectly good destination.
+    [
+        extract_details(p).payment_hash,
+        p.tx_id.clone(),
+        p.destination.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|id| !id.is_empty())
 }
 
 fn payment_with_id(p: &Payment, id: String) -> sonar_wallet::Payment {
@@ -746,6 +752,183 @@ mod tests {
             api_key: None,
             working_dir: PathBuf::from("/tmp/sonar-wallet-breez-test"),
         }
+    }
+
+    fn lightning_details(payment_hash: Option<&str>) -> PaymentDetails {
+        PaymentDetails::Lightning {
+            swap_id: "swap-1".into(),
+            description: "invoice description".into(),
+            liquid_expiration_blockheight: 0,
+            preimage: Some("beef".into()),
+            invoice: None,
+            payment_hash: payment_hash.map(str::to_string),
+            destination_pubkey: None,
+            lnurl_info: None,
+            payer_note: None,
+            claim_tx_id: None,
+            refund_tx_id: None,
+            refund_tx_amount_sat: None,
+            bip353_address: None,
+            bolt12_offer: None,
+            settled_at: None,
+        }
+    }
+
+    fn payment(
+        payment_type: PaymentType,
+        status: PaymentState,
+        amount_sat: u64,
+        fees_sat: u64,
+        details: PaymentDetails,
+    ) -> Payment {
+        Payment {
+            destination: None,
+            tx_id: None,
+            unblinding_data: None,
+            timestamp: 1_700_000_000,
+            amount_sat,
+            fees_sat,
+            swapper_fees_sat: None,
+            payment_type,
+            status,
+            details,
+        }
+    }
+
+    #[test]
+    fn pending_send_amount_excludes_fees_so_it_does_not_change_on_settle() {
+        // Breez reports a fee-INCLUSIVE payer amount while a send is pending
+        // and a fee-EXCLUSIVE receiver amount once it lands. Both must map to
+        // the same net figure, or the number moves under the user between
+        // "Sending" and "Sent".
+        let pending = payment(
+            PaymentType::Send,
+            PaymentState::Pending,
+            1_100,
+            100,
+            lightning_details(Some("hash-1")),
+        );
+        let settled = payment(
+            PaymentType::Send,
+            PaymentState::Complete,
+            1_000,
+            100,
+            lightning_details(Some("hash-1")),
+        );
+        assert_eq!(net_amount_sats(&pending), 1_000);
+        assert_eq!(net_amount_sats(&settled), 1_000);
+
+        // Receives are already net in both states.
+        let received = payment(
+            PaymentType::Receive,
+            PaymentState::Pending,
+            500,
+            10,
+            lightning_details(Some("hash-2")),
+        );
+        assert_eq!(net_amount_sats(&received), 500);
+    }
+
+    #[test]
+    fn payment_id_is_stable_across_pending_and_settled() {
+        // tx_id is absent while the swap is pending and present once
+        // confirmed; keying on it would give one payment two ids and show the
+        // user duplicate rows.
+        let pending = payment(
+            PaymentType::Send,
+            PaymentState::Pending,
+            1_000,
+            0,
+            lightning_details(Some("hash-1")),
+        );
+        let mut settled = payment(
+            PaymentType::Send,
+            PaymentState::Complete,
+            1_000,
+            0,
+            lightning_details(Some("hash-1")),
+        );
+        settled.tx_id = Some("tx-abc".into());
+        assert_eq!(stable_id(&pending), stable_id(&settled));
+        assert_eq!(stable_id(&pending).as_deref(), Some("hash-1"));
+    }
+
+    #[test]
+    fn unidentifiable_payments_are_skipped_not_given_an_empty_id() {
+        // Two different payments with no stable identity must not both map to
+        // "" — hosts dedupe by id, so the second would vanish from the ledger.
+        let mut anonymous = payment(
+            PaymentType::Receive,
+            PaymentState::Complete,
+            10,
+            0,
+            lightning_details(None),
+        );
+        anonymous.destination = None;
+        assert!(stable_id(&anonymous).is_none());
+        assert!(map_payment(&anonymous).is_none());
+
+        // An empty string is not an identity either.
+        anonymous.tx_id = Some(String::new());
+        assert!(map_payment(&anonymous).is_none());
+
+        // With a destination it becomes identifiable.
+        anonymous.destination = Some("lno1xyz".into());
+        assert_eq!(map_payment(&anonymous).unwrap().id, "lno1xyz");
+    }
+
+    #[test]
+    fn payer_note_wins_over_the_invoice_description() {
+        // Our own receives carry the constant "Sonar" description; the note
+        // the sender attached is the interesting one.
+        let mut details = lightning_details(Some("hash-1"));
+        if let PaymentDetails::Lightning {
+            ref mut payer_note, ..
+        } = details
+        {
+            *payer_note = Some("pizza money".into());
+        }
+        let p = payment(
+            PaymentType::Receive,
+            PaymentState::Complete,
+            100,
+            0,
+            details,
+        );
+        assert_eq!(
+            map_payment(&p).unwrap().note.as_deref(),
+            Some("pizza money")
+        );
+
+        // Falls back to the description when there is no note.
+        let plain = payment(
+            PaymentType::Receive,
+            PaymentState::Complete,
+            100,
+            0,
+            lightning_details(Some("hash-2")),
+        );
+        assert_eq!(
+            map_payment(&plain).unwrap().note.as_deref(),
+            Some("invoice description")
+        );
+    }
+
+    #[test]
+    fn mapped_payment_reports_fees_separately_from_the_amount() {
+        let p = payment(
+            PaymentType::Send,
+            PaymentState::Complete,
+            1_000,
+            25,
+            lightning_details(Some("hash-1")),
+        );
+        let mapped = map_payment(&p).unwrap();
+        assert_eq!(mapped.amount_sats, 1_000);
+        assert_eq!(mapped.fees_sats, Some(25));
+        assert!(!mapped.incoming);
+        assert_eq!(mapped.status, PaymentStatus::Complete);
+        assert_eq!(mapped.preimage.as_deref(), Some("beef"));
     }
 
     #[test]
