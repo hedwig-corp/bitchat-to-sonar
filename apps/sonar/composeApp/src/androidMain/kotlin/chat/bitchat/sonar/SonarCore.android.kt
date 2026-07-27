@@ -955,8 +955,10 @@ actual object SonarCore {
         val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
         closeNode()
         return try {
+            sonarLog("Backup", "restore: fetching account backup from Blossom")
             val dbKeyHex = uniffi.sonar_ffi.restoreAccountFromBlossom(identity.nsec(), dbPath, null)
             require(dbKeyHex.matches(Regex("^[0-9a-fA-F]{64}$"))) { "restored db key malformed" }
+            sonarLog("Backup", "restore: backup staged, committing")
             try {
                 AndroidSecrets.put("dbKeyHex", dbKeyHex, durable = true)
                 uniffi.sonar_ffi.commitAccountRestore(dbPath)
@@ -974,8 +976,13 @@ actual object SonarCore {
             // Identity restore still proceeds with a fresh empty DB.
             val msg = e.message.orEmpty()
             if (uniffi.sonar_ffi.isMissingAccountBackupError(msg)) {
+                sonarLog("Backup", "restore: no backup on server for this account")
                 AccountBackupRestoreOutcome.Missing
             } else {
+                // Without this the host shows "chat backup restore failed" and
+                // the reason — HTTP status, decrypt failure, malformed key —
+                // is discarded, leaving a data-recovery path undebuggable.
+                sonarLog("Backup", "restore FAILED: $msg")
                 AccountBackupRestoreOutcome.Failed
             }
         }

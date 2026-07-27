@@ -487,20 +487,32 @@ fn backup_list_url(base: &Url, pubkey: &PublicKey) -> Result<Url> {
     Ok(url)
 }
 
+/// Server scope for a BUD-01 authorization, without the trailing slash.
+///
+/// `Url::parse("https://nostr.download")` normalizes to `https://nostr.download/`,
+/// and servers compare this tag as a plain string: nostr.download answers
+/// `401` with `x-reason: Server not in authorization token scope` for the
+/// slashed form and `200` for the bare one. BUD-01's own examples are bare, so
+/// trim rather than hope the server is lenient.
+fn blossom_server_scope(base: &Url) -> String {
+    base.as_str().trim_end_matches('/').to_string()
+}
+
 /// BUD-03 `GET /list/<pubkey>` with a signed kind-24242 authorization.
 ///
 /// Hand-rolled rather than `BlossomClient::list_blobs` — see [`backup_list_url`]
-/// for why that path cannot reach the endpoint. The auth event mirrors what the
-/// crate builds for every other verb, so servers see nothing unusual.
+/// for why that path cannot reach the endpoint, and [`blossom_server_scope`] for
+/// why the crate's `ServerUrl` scope is rejected once it does.
 async fn list_account_backup_blobs(keys: &Keys, base: &Url) -> Result<Vec<BlobDescriptor>> {
     let url = backup_list_url(base, &keys.public_key())?;
-    let authorization = BlossomAuthorization::new(
-        "Blossom list authorization".to_string(),
-        Timestamp::now() + std::time::Duration::from_secs(300),
-        BlossomAuthorizationVerb::List,
-        BlossomAuthorizationScope::ServerUrl(base.clone()),
-    );
-    let auth_event = EventBuilder::blossom_auth(authorization)
+    let expiration = Timestamp::now() + std::time::Duration::from_secs(300);
+    let auth_event = EventBuilder::new(Kind::BlossomAuth, "Blossom list authorization")
+        .tags([
+            Tag::parse(["server", &blossom_server_scope(base)])
+                .map_err(|e| Error::Blossom(format!("blossom server tag: {e}")))?,
+            Tag::expiration(expiration),
+            Tag::hashtag("list"),
+        ])
         .sign(keys)
         .await
         .map_err(|e| Error::Blossom(format!("blossom list auth: {e}")))?;
@@ -665,11 +677,76 @@ mod tests {
     async fn download_finds_the_backup_through_the_list_route() {
         let keys = Keys::generate();
         let sealed = b"sealed-account-backup-bytes".to_vec();
-        let base = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
         let got = download_latest_sealed_backup_at(&keys, &base)
             .await
             .expect("restore must find the uploaded backup");
         assert_eq!(got, sealed);
+    }
+
+    /// The authorization a real server actually accepts.
+    ///
+    /// nostr.download rejects a `server` scope carrying `Url`'s normalized
+    /// trailing slash with `401 / x-reason: Server not in authorization token
+    /// scope`, which reached users as "chat backup restore failed" even after
+    /// the list route was correct. Verified against the live server with a
+    /// throwaway key: bare scope 200, slashed scope 401.
+    #[tokio::test]
+    async fn list_request_sends_an_accepted_authorization() {
+        use base64::Engine as _;
+
+        let keys = Keys::generate();
+        let (base, seen) = spawn_mock_blossom_list(keys.public_key(), b"blob".to_vec());
+        let _ = download_latest_sealed_backup_at(&keys, &base).await;
+
+        let header = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("list must send Authorization");
+        let encoded = header
+            .strip_prefix("Nostr ")
+            .expect("BUD-01 header is `Nostr <base64>`");
+        let json = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64 auth payload");
+        let event = Event::from_json(String::from_utf8(json).expect("utf8 auth event"))
+            .expect("auth event parses");
+
+        assert_eq!(event.kind, Kind::BlossomAuth, "BUD-01 uses kind 24242");
+        assert!(event.verify().is_ok(), "auth event must be signed");
+        assert_eq!(event.pubkey, keys.public_key());
+
+        let tag = |name: &str| {
+            event
+                .tags
+                .iter()
+                .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
+                .map(|t| t.as_slice()[1].clone())
+        };
+        assert_eq!(tag("t").as_deref(), Some("list"), "verb tag");
+        let server = tag("server").expect("server scope tag");
+        assert!(
+            !server.ends_with('/'),
+            "a trailing slash is rejected as out-of-scope: {server}",
+        );
+        assert_eq!(server, base.as_str().trim_end_matches('/'));
+        let expiration: u64 = tag("expiration")
+            .expect("expiration tag")
+            .parse()
+            .expect("numeric expiration");
+        assert!(
+            expiration > Timestamp::now().as_u64(),
+            "expired authorizations are refused",
+        );
+    }
+
+    #[test]
+    fn server_scope_drops_url_normalized_trailing_slash() {
+        for raw in ["https://nostr.download", "https://nostr.download/"] {
+            let base = Url::parse(raw).unwrap();
+            assert_eq!(blossom_server_scope(&base), "https://nostr.download");
+        }
     }
 
     /// A server with no account backup for this pubkey must surface the typed
@@ -678,7 +755,8 @@ mod tests {
     #[tokio::test]
     async fn empty_list_is_a_missing_backup_not_a_failure() {
         let keys = Keys::generate();
-        let base = spawn_mock_blossom_list(Keys::generate().public_key(), b"other".to_vec());
+        let (base, _seen) =
+            spawn_mock_blossom_list(Keys::generate().public_key(), b"other".to_vec());
         let err = download_latest_sealed_backup_at(&keys, &base)
             .await
             .expect_err("no backup for this pubkey");
@@ -689,10 +767,14 @@ mod tests {
         assert!(is_missing_backup_error(&err));
     }
 
+    /// `Authorization` header a mock saw on its list route. Per-server, not
+    /// global: these tests run in parallel and each spawns its own mock.
+    type SeenAuthorization = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
     /// Minimal BUD-01/03 server: `GET /list/<owner>` lists one account-backup
     /// descriptor, `GET /<sha>` serves it, everything else 404s — including the
     /// `/<pubkey>` route the upstream client's URL join would hit.
-    fn spawn_mock_blossom_list(owner: PublicKey, blob: Vec<u8>) -> Url {
+    fn spawn_mock_blossom_list(owner: PublicKey, blob: Vec<u8>) -> (Url, SeenAuthorization) {
         use sha2::Digest;
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -701,6 +783,8 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let base = format!("http://127.0.0.1:{port}");
         let base_for_thread = base.clone();
+        let seen: SeenAuthorization = Default::default();
+        let seen_for_thread = seen.clone();
         std::thread::spawn(move || {
             let sha = hex::encode(sha2::Sha256::digest(&blob));
             let list_path = format!("/list/{}", owner.to_hex());
@@ -719,6 +803,14 @@ mod tests {
                     .nth(1)
                     .unwrap_or("")
                     .to_string();
+                if path.starts_with("/list/") {
+                    let authorization = head.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    });
+                    *seen_for_thread.lock().unwrap() = authorization;
+                }
                 if path == list_path {
                     let json = format!(
                         "[{{\"url\":\"{base_for_thread}/{sha}\",\"sha256\":\"{sha}\",\
@@ -757,7 +849,7 @@ mod tests {
                 let _ = stream.flush();
             }
         });
-        Url::parse(&base).expect("mock base url")
+        (Url::parse(&base).expect("mock base url"), seen)
     }
 
     /// A base with a path prefix (some servers mount Blossom under a subpath)
