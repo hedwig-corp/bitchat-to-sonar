@@ -14,6 +14,59 @@ internal data class DroppedFiles(
     val rejectedCount: Int,
 )
 
+/**
+ * One "share into Sonar" gesture from the system share sheet: optional
+ * text/link plus already-read file bytes.
+ *
+ * The bytes are eager rather than lazy because Android scopes the
+ * `content://` read grant to the delivering intent — by the time the user
+ * picks a recipient the permission can already be gone.
+ */
+internal data class SharedContent(
+    val text: String?,
+    val files: DroppedFiles,
+    /**
+     * Fingerprint of the delivering intent, recorded durably only once the user
+     * resolves this share (sends or cancels).
+     *
+     * Deliberately NOT recorded at hand-off: a process killed while the picker
+     * is still open would then have the restored intent suppressed while
+     * `pendingShare` — memory-only — died with the process, silently losing a
+     * share the user never resolved. Marking at resolution means an unresolved
+     * share is correctly re-offered.
+     */
+    val consumedMarker: String? = null,
+) {
+    val isEmpty: Boolean
+        get() = text.isNullOrBlank() && files.files.isEmpty()
+
+    /** One-line description for the picker's preview strip. */
+    val summary: String
+        get() = when {
+            !text.isNullOrBlank() -> text
+            files.files.size == 1 -> files.files[0].filename
+            else -> "${files.files.size} files"
+        }
+}
+
+/**
+ * Blob key holding the fingerprint of the last share the user actually
+ * resolved. Read on Android when a task is restored, to tell a redelivered root
+ * ACTION_SEND intent from a genuinely new share.
+ */
+internal const val CONSUMED_SHARE_BLOB_KEY = "share.lastConsumedSignature"
+
+/**
+ * Blob key holding the fingerprint of the share whose TEXT has already been
+ * sent. Distinct from [CONSUMED_SHARE_BLOB_KEY]: a share can have its text
+ * delivered while its files are still pending a retry, and a restore in that
+ * window must re-offer the files WITHOUT re-offering the text.
+ */
+internal const val CONSUMED_SHARE_TEXT_BLOB_KEY = "share.lastConsumedTextSignature"
+
+/** A `sinvite1` token followed by its hex payload, anywhere in the input. */
+internal val INVITE_TOKEN_IN_TEXT = Regex("sinvite1[0-9a-fA-F]{2,}")
+
 internal const val MAX_INTERNET_ATTACHMENT_BYTES = 25L * 1024L * 1024L
 internal const val MAX_MESH_ATTACHMENT_BYTES = 1L * 1024L * 1024L
 internal const val MAX_DROPPED_FILES = MAX_ALBUM_PHOTOS

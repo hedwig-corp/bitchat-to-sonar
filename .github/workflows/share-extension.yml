@@ -1,0 +1,38 @@
+name: Share extension resources
+
+# The iOS share extension shipped without its string catalog: the target had a
+# Sources build phase and nothing else, so `String(localized:)` rendered raw
+# keys on screen ("share.status.shared_link").
+#
+# iOS is not built in CI, so an Xcode-level guard would never run. This parses
+# the project file instead — pure shell + python3, seconds, any runner.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ios/bitchat.xcodeproj/project.pbxproj'
+      - 'ios/bitchatShareExtension/**'
+      - 'scripts/check-share-extension-resources.sh'
+      - '.github/workflows/share-extension.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'ios/bitchat.xcodeproj/project.pbxproj'
+      - 'ios/bitchatShareExtension/**'
+      - 'scripts/check-share-extension-resources.sh'
+      - '.github/workflows/share-extension.yml'
+
+jobs:
+  check:
+    name: Share extension ships its strings
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check the extension bundles its string catalog
+        run: ./scripts/check-share-extension-resources.sh

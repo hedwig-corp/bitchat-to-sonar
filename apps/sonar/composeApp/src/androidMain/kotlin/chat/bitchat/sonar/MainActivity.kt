@@ -18,6 +18,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.IntentCompat
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
@@ -166,7 +171,10 @@ class MainActivity : ComponentActivity() {
             )
         }
         handleInviteIntent(intent)
-        handleShareIntent(intent)
+        // A non-null savedInstanceState means this activity is being restored,
+        // not freshly launched by a share — that is the only case where the
+        // task's original ACTION_SEND intent can be redelivered.
+        handleShareIntent(intent, isRestore = savedInstanceState != null)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
         maybeDebugMeshSend(intent)
@@ -225,7 +233,7 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleInviteIntent(intent)
-        handleShareIntent(intent)
+        handleShareIntent(intent, isRestore = false)
         handleNotificationIntent(intent)
         maybeDebugNotificationSound(intent)
         maybeDebugMeshSend(intent)
@@ -343,10 +351,219 @@ class MainActivity : ComponentActivity() {
         SonarLifecycle.submitInviteLink(candidate)
     }
 
-    private fun handleShareIntent(intent: Intent?) {
-        if (intent?.action != Intent.ACTION_SEND) return
-        val text = intent.getStringExtra(Intent.EXTRA_TEXT) ?: return
-        SonarLifecycle.submitSharedText(text)
+    /**
+     * Stable fingerprint of a share payload: the text plus the URI list.
+     *
+     * Used to recognise the task's root ACTION_SEND intent being redelivered
+     * after process death — `removeExtra` only mutates the in-process copy, so
+     * without this a share the user already sent is offered again.
+     */
+    private fun shareSignature(text: String?, uris: List<android.net.Uri>): String =
+        buildString {
+            append(text.orEmpty())
+            append(' ')
+            uris.forEach { append(it.toString()).append(' ') }
+        }.hashCode().toString()
+
+    /**
+     * System share sheet hand-off. Text and links arrive in EXTRA_TEXT; photos,
+     * videos and documents arrive as content:// URIs in EXTRA_STREAM.
+     *
+     * The URI read grant is scoped to this intent, so the bytes are pulled here
+     * rather than lazily from the picker screen — by the time the user chooses
+     * a recipient the permission may be gone. The grant is tied to the Activity,
+     * not to the calling thread, so the (potentially network-backed, up to 25 MiB)
+     * reads run on [Dispatchers.IO] instead of blocking the main thread; a pure
+     * text share with no URIs is still submitted synchronously to add no latency.
+     *
+     * [isRestore] is true only when the activity is being recreated from saved
+     * state (`savedInstanceState != null`), which is the sole case where Android
+     * can redeliver the task's original root ACTION_SEND intent — `removeExtra`
+     * cannot clear that, since it mutates only the in-process copy. Gating the
+     * persisted-signature check on a restore rather than on every cold start
+     * matters: a user deliberately re-sharing the same link in a fresh launch
+     * must still reach the picker, and keying suppression on content alone
+     * would silently swallow it.
+     */
+    private fun handleShareIntent(intent: Intent?, isRestore: Boolean) {
+        val action = intent?.action
+        if (action != Intent.ACTION_SEND && action != Intent.ACTION_SEND_MULTIPLE) return
+
+        // Some senders put a SpannedString (or other CharSequence) in
+        // EXTRA_TEXT; getStringExtra returns null for those, so a text-only
+        // share from such an app opens Sonar with no picker and no error.
+        // getCharSequenceExtra also returns plain Strings (String IS a
+        // CharSequence), so this strictly widens what is accepted.
+        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)
+            ?.toString()
+            ?.takeIf { it.isNotBlank() }
+        val uris: List<android.net.Uri> = when (action) {
+            Intent.ACTION_SEND ->
+                listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, android.net.Uri::class.java))
+            else ->
+                IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, android.net.Uri::class.java)
+                    ?: emptyList()
+        }
+
+        // Persisted dedupe for the process-death + task-restore case. A share
+        // handed off to SonarLifecycle is fingerprinted and recorded, so when
+        // Android restores the task with the original root ACTION_SEND intent
+        // we recognise it and skip — otherwise a share the user already
+        // resolved is offered again and can be sent twice.
+        //
+        // Deliberately gated on [isRestore], not on "cold start": a fresh
+        // launch always carries a genuinely new share, even when its content is
+        // byte-identical to the last one (sharing the same link to a second
+        // person is ordinary). Suppressing on content alone would make that a
+        // silent no-op.
+        val signature = shareSignature(text, uris)
+        if (isRestore && SonarCore.loadBlob(CONSUMED_SHARE_BLOB_KEY) == signature) {
+            return
+        }
+
+        // The text of this share already went out, but its files did not
+        // resolve. Re-offer the files alone rather than the whole payload.
+        val textAlreadySent =
+            isRestore && SonarCore.loadBlob(CONSUMED_SHARE_TEXT_BLOB_KEY) == signature
+        val effectiveText = if (textAlreadySent) null else text
+
+        // Consume the payload from the in-process Intent only once the copy has
+        // been handed off to SonarLifecycle. Consuming after the hand-off is
+        // what makes a cancelled copy retryable: a configuration change can
+        // destroy the activity (cancelling the lifecycleScope read) before the
+        // extras are cleared, and the recreated activity re-reads the same
+        // Intent and retries — whereas clearing up front would lose the share
+        // with nothing to resend. This covers onNewIntent re-delivery of the
+        // same Intent and same-process recreation; the persisted-signature
+        // guard above closes the process-death + task-restore case. Same
+        // pattern as handleNotificationIntent.
+        // Clears only the in-process extras. The DURABLE marker is written by
+        // SonarAppState when the user actually resolves the share (sends or
+        // cancels) — writing it here would suppress the restored intent after a
+        // process death that happened while the picker was still open, and
+        // `pendingShare` does not survive that death, so the share would be
+        // lost rather than re-offered.
+        fun consume() {
+            intent.removeExtra(Intent.EXTRA_TEXT)
+            intent.removeExtra(Intent.EXTRA_STREAM)
+        }
+
+        // Pure text share: there is no content:// I/O to do, so submit
+        // synchronously and avoid adding any latency before the picker opens.
+        if (uris.isEmpty()) {
+            if (effectiveText == null) return
+            SonarLifecycle.submitSharedContent(
+                SharedContent(effectiveText, DroppedFiles(emptyList(), 0), consumedMarker = signature)
+            )
+            consume()
+            return
+        }
+
+        // The content:// URIs can be backed by remote providers (Google Photos,
+        // Drive) and total up to 25 MiB, so read them off the main thread to
+        // avoid an ANR. The URI read grant is scoped to this Activity, not to
+        // the calling thread, so resolving the bytes on Dispatchers.IO stays
+        // within the grant.
+        // Only the read goes to IO. The submit stays on the main dispatcher
+        // because it lands in `handleSharedContent`, which writes Compose state
+        // and mutates the navigation stack.
+        lifecycleScope.launch {
+            val files = withContext(Dispatchers.IO) { readSharedFiles(uris) }
+            if (effectiveText == null && files.files.isEmpty()) {
+                if (files.rejectedCount > 0) {
+                    SonarLifecycle.submitSharedContent(SharedContent(null, files, consumedMarker = signature))
+                    consume()
+                }
+                return@launch
+            }
+            SonarLifecycle.submitSharedContent(SharedContent(effectiveText, files, consumedMarker = signature))
+            consume()
+        }
+    }
+
+    /**
+     * Copy shared content:// URIs into memory, bounded by the largest cap any
+     * send route accepts. The chosen chat's real transport cap is enforced
+     * again at send time.
+     */
+    private fun readSharedFiles(uris: List<android.net.Uri>): DroppedFiles {
+        if (uris.isEmpty()) return DroppedFiles(emptyList(), 0)
+        val out = ArrayList<DroppedFile>()
+        var rejected = maxOf(0, uris.size - MAX_DROPPED_FILES)
+        var remaining = MAX_INTERNET_ATTACHMENT_BYTES
+
+        for (uri in uris.take(MAX_DROPPED_FILES)) {
+            val bytes = try {
+                contentResolver.openInputStream(uri)?.use { readBounded(it, remaining) }
+            } catch (t: Throwable) {
+                null
+            }
+            if (bytes == null || bytes.isEmpty()) {
+                rejected++
+                continue
+            }
+            remaining -= bytes.size
+            val mime = contentResolver.getType(uri) ?: "application/octet-stream"
+            out.add(
+                DroppedFile(
+                    bytes = bytes,
+                    filename = encryptedAttachmentFilename(sharedDisplayName(uri, mime)),
+                    mime = encryptedAttachmentMime(mime),
+                )
+            )
+        }
+        return DroppedFiles(out, rejected)
+    }
+
+    /**
+     * Read at most [maxBytes] from [stream], returning null if the source is
+     * larger so an oversized file is rejected rather than silently truncated.
+     *
+     * Hand-rolled rather than `InputStream.readNBytes`, which Android only
+     * added in API 33 — on minSdk 26 that call compiles and then throws
+     * NoSuchMethodError on the device.
+     */
+    private fun readBounded(stream: java.io.InputStream, maxBytes: Long): ByteArray? {
+        val out = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (true) {
+            val read = stream.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) return null
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+
+    /** Prefer the provider's display name; fall back to a MIME-derived one. */
+    private fun sharedDisplayName(uri: android.net.Uri, mime: String): String {
+        val fromProvider = try {
+            contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0)?.takeIf { it.isNotBlank() } else null
+            }
+        } catch (t: Throwable) {
+            null
+        }
+        if (fromProvider != null) return fromProvider
+        val extension = android.webkit.MimeTypeMap.getSingleton()
+            .getExtensionFromMimeType(mime)
+            ?.let { ".$it" }
+            .orEmpty()
+        val stem = when {
+            mime.startsWith("image/") -> "photo"
+            mime.startsWith("video/") -> "video"
+            mime.startsWith("audio/") -> "audio"
+            else -> "attachment"
+        }
+        return "$stem$extension"
     }
 
     private fun handleNotificationIntent(intent: Intent?) {

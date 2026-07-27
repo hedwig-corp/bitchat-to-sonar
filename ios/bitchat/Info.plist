@@ -2,6 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Same build-time value the share extension reads, so both processes
+	     agree on the container even when a dev build overrides the group id.
+	     Deriving it from the bundle id instead drifts the moment
+	     PRODUCT_BUNDLE_IDENTIFIER and APP_GROUP_ID are set independently. -->
+	<key>AppGroupID</key>
+	<string>$(APP_GROUP_ID)</string>
 	<key>BREEZ_API_KEY</key>
 	<string>$(BREEZ_API_KEY)</string>
 	<key>TRANSPONDER_NPUB</key>

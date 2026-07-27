@@ -107,6 +107,27 @@ struct SonarRootView: View {
             }
         }
         #endif
+        // Presented at the root so a share hand-off reaches the picker from any
+        // screen — the extension opens the app wherever the user left it.
+        .snSheet(
+            isPresented: Binding(
+                get: { store.pendingShare != nil },
+                set: { showing in
+                    if !showing { store.cancelPendingShare() }
+                }
+            ),
+            title: "Send to…"
+        ) {
+            if let share = store.pendingShare {
+                SNShareSheetContent(share: share) {
+                    // `sendPendingShare` already cleared it; this only covers
+                    // a close that did not send.
+                    store.pendingShare = nil
+                    store.rescanPendingSharesAfterDismiss()
+                }
+                .environmentObject(store)
+            }
+        }
     }
 
     private struct SonarLocalLaunchSurface: View {

@@ -996,6 +996,15 @@ final class SonarAppStore: ObservableObject {
     @Published var pendingMediaPreviews: [PendingMediaPreview] = []
     private var mediaPreviewGeneration: UInt64 = 0
 
+    /// Content handed over by the iOS share extension, awaiting a recipient.
+    /// Drives the "Send to…" picker — see `SonarShareIntake`.
+    @Published var pendingShare: SNPendingShare?
+
+    /// Payload ids currently being sent. `ingestPendingShares` must skip these:
+    /// the staged manifest stays on disk until the async send finishes, and a
+    /// rescan in that window would re-offer the same text and files.
+    var inFlightSharePayloadIDs: Set<String> = []
+
     /// In-memory composer drafts keyed by chat id (DM peer/group, channel id).
     /// Survives leaving a chat and returning within the same process; cleared on send.
     /// Intentionally NOT `@Published`: publishing on every keystroke would invalidate
@@ -2123,6 +2132,11 @@ final class SonarAppStore: ObservableObject {
             onboarded = true
             defaults.set(true, forKey: Keys.onboarded)
             path = []
+            // A share that arrived through the extension before onboarding is
+            // still staged and waiting: ingestPendingShares bails out while
+            // there is no identity to send from. Finishing onboarding is the
+            // signal that releases it without forcing the user to relaunch.
+            ingestPendingShares()
         }
     }
 
@@ -2211,6 +2225,9 @@ final class SonarAppStore: ObservableObject {
         onboarded = true
         defaults.set(true, forKey: Keys.onboarded)
         path = []
+        // A staged share can also be waiting if the extension opened a fresh
+        // install that then went through the restore flow — release it now.
+        ingestPendingShares()
         switch backupOutcome {
         case .restored:
             showToast(String(localized: "Account restored — chats recovered from backup"))

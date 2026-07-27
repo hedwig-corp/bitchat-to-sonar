@@ -333,6 +333,8 @@ sealed interface Screen {
     data object Profile : Screen
     data object Nearby : Screen
     data object Search : Screen
+    /** Recipient picker for content arriving from the system share sheet. */
+    data object ShareTo : Screen
     // id "mesh:<peerId>" = a BLE-mesh DM (Noise link); otherwise a Marmot group.
     // pay=true auto-opens the payment sheet (radar "Send sats").
     data class Chat(val id: String, val name: String, val pay: Boolean = false) : Screen
@@ -6744,7 +6746,12 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Import results arrive after platform file IO. Queue the first selected
      * attachment behind the pre-existing direct-chat setup, then send using the
      * resolved group id rather than the transient pending chat id. */
-    internal fun sendDroppedAttachments(chatId: String, dropped: DroppedFiles) {
+    internal fun sendDroppedAttachments(
+        chatId: String,
+        dropped: DroppedFiles,
+        onRouteReady: (() -> Unit)? = null,
+        onRouteFailure: (() -> Unit)? = null,
+    ) {
         if (dropped.files.isEmpty()) {
             toast = "Couldn't attach that file."
             return
@@ -6755,15 +6762,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                     dropped.files.forEach { file ->
                         sendAttachment(route.chatId, file.bytes, file.filename, file.mime)
                     }
+                    // The files are dispatched — the share is genuinely resolved.
+                    onRouteReady?.invoke()
                     if (dropped.rejectedCount > 0) {
                         toast = "Some files couldn't be attached."
                     }
                 }
                 AttachmentRoutePreparation.Unavailable -> {
                     toast = "This contact must be online to receive files."
+                    onRouteFailure?.invoke()
                 }
                 AttachmentRoutePreparation.Failed -> {
                     toast = "Couldn't set up a secure file transfer."
+                    onRouteFailure?.invoke()
                 }
             }
         }
@@ -9013,18 +9024,150 @@ class SonarAppState(private val scope: CoroutineScope) {
         queued.forEach { requestJoinViaLink(it) }
     }
 
-    var sharedText: String? by mutableStateOf(null)
+    /** Content from the system share sheet awaiting a recipient. */
+    internal var pendingShare: SharedContent? by mutableStateOf(null)
         private set
 
-    fun handleSharedText(text: String) {
-        sharedText = text
-        push(Screen.Search)
+    /**
+     * Shares that arrived while another was still being resolved. iOS keeps
+     * these as committed payloads in its App Group inbox and takes them
+     * oldest-first; this is the in-memory equivalent, so a second ACTION_SEND
+     * cannot destroy the first.
+     */
+    private val queuedShares = ArrayDeque<SharedContent>()
+
+    /**
+     * Route content shared into Sonar to the recipient picker.
+     *
+     * This used to drop the shared text into the Search *query field*, which
+     * looked like a search for the link rather than a way to send it, and had
+     * no path at all for files.
+     */
+    internal fun handleSharedContent(content: SharedContent) {
+        // A Sonar invite link shared back into Sonar means "join", not "send".
+        val token = content.text?.let { INVITE_TOKEN_IN_TEXT.find(it)?.value }
+        if (token != null && content.files.files.isEmpty()) {
+            requestJoinViaLink(token)
+            return
+        }
+        if (content.isEmpty) {
+            toast = if (content.files.rejectedCount > 0) {
+                "Couldn't attach that file."
+            } else {
+                "Nothing to share."
+            }
+            return
+        }
+        if (pendingShare != null) {
+            // A picker is already up — queue behind it rather than replacing it.
+            queuedShares.addLast(content)
+            return
+        }
+        pendingShare = content
+        // Never stack two ShareTo pickers: a second share arriving while one is
+        // already up would leave a stale ShareTo behind after sendPendingShare's
+        // single back(). Drop any existing ShareTo entries before pushing.
+        if (stack.any { it is Screen.ShareTo }) {
+            stack = stack.filterNot { it is Screen.ShareTo }
+        }
+        push(Screen.ShareTo)
     }
 
-    fun consumeSharedText(): String? {
-        val text = sharedText
-        sharedText = null
-        return text
+    fun cancelPendingShare() {
+        markShareResolved(pendingShare)
+        pendingShare = null
+        promoteQueuedShare()
+    }
+
+    /**
+     * Record durably that the user resolved this share, so a task restored
+     * after process death recognises the redelivered intent instead of
+     * offering it again.
+     *
+     * Written at RESOLUTION, never at hand-off: a process killed while the
+     * picker was still open must re-offer the share, because `pendingShare`
+     * itself does not survive that death.
+     */
+    private fun markShareResolved(content: SharedContent?) {
+        content?.consumedMarker?.let { SonarCore.saveBlob(CONSUMED_SHARE_BLOB_KEY, it) }
+    }
+
+    /** Record that this share's TEXT is spoken for, while its files may not be. */
+    private fun markShareTextSent(content: SharedContent) {
+        content.consumedMarker?.let { SonarCore.saveBlob(CONSUMED_SHARE_TEXT_BLOB_KEY, it) }
+    }
+
+    /** Promote the next queued share, if any, once the current one resolves. */
+    private fun promoteQueuedShare() {
+        if (pendingShare != null) return
+        val next = queuedShares.removeFirstOrNull() ?: return
+        pendingShare = next
+        if (screen !is Screen.ShareTo) push(Screen.ShareTo)
+    }
+
+    /**
+     * Send the pending share into [chatId], then open that chat.
+     *
+     * Text goes first so a link with attachments reads as a caption above its
+     * files, matching the order a composer send produces.
+     */
+    fun sendPendingShare(chatId: String, open: () -> Unit) {
+        val content = pendingShare ?: return
+        pendingShare = null
+        // Picking a recipient makes the TEXT unrepeatable: a process death
+        // mid-send must not let the restored intent re-deliver text that
+        // already went out. The share as a whole is only "resolved" once its
+        // files finish too — see markShareResolved below — because a route
+        // failure must still re-offer the files for retry.
+        markShareTextSent(content)
+        // Leave the picker before opening the chat so Back from the chat lands
+        // on Home rather than re-showing the resolved share.
+        back()
+        open()
+        content.text?.takeIf { it.isNotBlank() }?.let { send(chatId, it) }
+        if (content.files.files.isNotEmpty()) {
+            sendDroppedAttachments(
+                chatId,
+                content.files,
+                onRouteReady = { markShareResolved(content) },
+            ) {
+                // Transient route failure (out-of-range mesh peer, failed
+                // secure-chat setup). Keep the files and reopen the picker so
+                // the user can retry — the picker deliberately lists
+                // out-of-range rows, so this is reachable by design. Apple does
+                // the same in `SonarShareIntake.sendPendingShare`.
+                //
+                // Text is dropped from the retry: it was already sent above,
+                // and re-offering it would deliver it twice. The share is left
+                // NOT marked resolved so a process death here still re-offers
+                // the files.
+                //
+                // This callback is async and fires AFTER promoteQueuedShare()
+                // below has possibly installed the next queued share, so it must
+                // never assign `pendingShare` blind — doing so would destroy that
+                // share, which is the very bug the queue exists to prevent. The
+                // retry goes to the HEAD of the queue because it is older than
+                // whatever was promoted.
+                val retry = content.copy(text = null)
+                if (pendingShare != null) {
+                    queuedShares.addFirst(retry)
+                } else {
+                    pendingShare = retry
+                    if (screen !is Screen.ShareTo) push(Screen.ShareTo)
+                }
+            }
+        } else {
+            // No files pending — the share is fully resolved.
+            markShareResolved(content)
+            if (content.files.rejectedCount > 0) {
+                toast = "Some files couldn't be attached."
+            }
+        }
+        // Promote the next queued share once this one has been dispatched.
+        // sendDroppedAttachments is async; its route-failure callback assigns
+        // pendingShare itself, and this runs before that callback, so the
+        // guard here keeps them from fighting over the slot.
+        promoteQueuedShare()
     }
 
     fun acceptGroupInvite(inviteId: String) {

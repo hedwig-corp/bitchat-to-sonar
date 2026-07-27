@@ -26,12 +26,23 @@
 	<dict>
 		<key>NSExtensionAttributes</key>
 		<dict>
+			<!-- Counts must stay <= SonarShareInbox.maxStagedItems (10); the
+			     extension drops anything beyond that budget. -->
 			<key>NSExtensionActivationRule</key>
 			<dict>
+				<key>NSExtensionActivationSupportsAttachmentsWithMaxCount</key>
+				<integer>10</integer>
+				<key>NSExtensionActivationSupportsFileWithMaxCount</key>
+				<integer>10</integer>
 				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
-				<integer>1</integer>
+				<integer>10</integer>
+				<key>NSExtensionActivationSupportsMovieWithMaxCount</key>
+				<integer>10</integer>
 				<key>NSExtensionActivationSupportsText</key>
 				<true/>
+				<!-- No SupportsWebPage: that rule requires an
+				     NSExtensionJavaScriptPreprocessingFile, and SupportsWebURL
+				     already covers sharing a link out of Safari. -->
 				<key>NSExtensionActivationSupportsWebURLWithMaxCount</key>
 				<integer>1</integer>
 			</dict>
