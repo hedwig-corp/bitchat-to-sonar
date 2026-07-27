@@ -1339,6 +1339,18 @@ impl Engine {
         }
     }
 
+    /// The fingerprint this route proved through a completed Noise handshake.
+    /// `None` while the handshake is still in flight, where the binding rests
+    /// on the announce alone.
+    fn origin_authenticated_fingerprint(&self, origin: &Origin) -> Option<String> {
+        let (noise, bind) = match origin {
+            Origin::Client(id) => self.links.get(id).map(|l| (&l.noise, &l.bind))?,
+            Origin::Server(conn) => self.server_conns.get(conn).map(|s| (&s.noise, &s.bind))?,
+        };
+        noise.as_ref().filter(|n| n.established())?;
+        bind.fingerprint.clone()
+    }
+
     fn handle_announce(
         &mut self,
         origin: Origin,
@@ -1364,9 +1376,21 @@ impl Engine {
         let _ = raw;
         // Only a full-TTL announce may bind the physical neighbour; a relayed
         // one still belongs in the radar but must never own link routing.
-        let direct = packet.ttl == DEFAULT_TTL;
+        let mut direct = packet.ttl == DEFAULT_TTL;
         let noise_pub_hex = hex::encode(&announce.noise_public_key);
         let fp = Self::fingerprint_of(&noise_pub_hex);
+        // An established Noise session has already pinned this link to an
+        // authenticated static key. Announces are replayable by any listener,
+        // so one naming a different identity is not evidence about who is on
+        // the other end of this link: keep it in the radar as relayed, but
+        // never let it move the route off the authenticated peer.
+        if direct
+            && self
+                .origin_authenticated_fingerprint(&origin)
+                .is_some_and(|bound| !bound.eq_ignore_ascii_case(&fp))
+        {
+            direct = false;
+        }
         let signing_hex = hex::encode(&announce.signing_public_key);
         let sender_key = sender_hex.to_lowercase();
         match self.signing_key_by_peer.get(&sender_key) {
@@ -1724,6 +1748,28 @@ impl Engine {
         }
     }
 
+    /// The fingerprint a completed handshake is allowed to own, or `None` when
+    /// the peer's static key is missing or contradicts the bound identity.
+    ///
+    /// Noise XX authenticates the remote static key, but nothing else on this
+    /// link does. `bind.fingerprint` comes from an announce, and an announce is
+    /// a self-contained signed packet that anyone who overheard it can replay
+    /// verbatim. Without this check an attacker replays a victim's announce on
+    /// its own link, completes the handshake with its own key, and takes over
+    /// the victim's route: `sendable_route` would hand the victim's DMs to the
+    /// attacker's session, and `handle_encrypted` would attribute the
+    /// attacker's traffic to the victim.
+    fn authenticated_fingerprint(hs: &NoiseHandshake, bind: &PeerBinding) -> Option<String> {
+        let fp = Self::fingerprint_of(&hex::encode(hs.remote_static()?));
+        if fp.is_empty() {
+            return None;
+        }
+        match bind.fingerprint.as_deref() {
+            Some(bound) if !bound.eq_ignore_ascii_case(&fp) => None,
+            _ => Some(fp),
+        }
+    }
+
     fn finish_noise_client(&mut self, id: &LinkId, out: &mut Output) {
         let Some(l) = self.links.get_mut(id) else {
             return;
@@ -1731,15 +1777,14 @@ impl Engine {
         let Some(NoiseState::Handshake { hs, .. }) = l.noise.take() else {
             return;
         };
+        let Some(fp) = Self::authenticated_fingerprint(&hs, &l.bind) else {
+            l.noise = None;
+            return;
+        };
         match hs.into_session() {
             Ok(session) => {
                 l.noise = Some(NoiseState::Session(session));
-                let fp = l
-                    .bind
-                    .fingerprint
-                    .clone()
-                    .or_else(|| l.bind.peer_id_hex.clone())
-                    .unwrap_or_else(|| id.conn.clone());
+                l.bind.fingerprint = Some(fp.clone());
                 self.link_established(&fp, out);
             }
             Err(_) => l.noise = None,
@@ -1753,17 +1798,17 @@ impl Engine {
         let Some(NoiseState::Handshake { hs, .. }) = s.noise.take() else {
             return;
         };
+        // The responder authenticates the initiator's static key here, so the
+        // fingerprint is derived from that key even when the announce is still
+        // in flight. A later announce may only agree with it, never move it.
+        let Some(fp) = Self::authenticated_fingerprint(&hs, &s.bind) else {
+            s.noise = None;
+            return;
+        };
         match hs.into_session() {
             Ok(session) => {
-                // The responder authenticates the initiator's static key here;
-                // bind the fingerprint even if the announce is still in flight.
                 s.noise = Some(NoiseState::Session(session));
-                let fp = s
-                    .bind
-                    .fingerprint
-                    .clone()
-                    .or_else(|| s.bind.peer_id_hex.clone())
-                    .unwrap_or_else(|| conn.to_string());
+                s.bind.fingerprint = Some(fp.clone());
                 self.link_established(&fp, out);
             }
             Err(_) => s.noise = None,
@@ -2092,6 +2137,93 @@ mod tests {
 
     fn fp_of(e: &Engine) -> String {
         Engine::fingerprint_of(&e.noise_public_hex)
+    }
+
+    /// An announce is a self-contained signed packet, so anyone who overhears
+    /// one can replay it verbatim on their own link. Completing Noise with the
+    /// attacker's own static key must not then hand it the victim's route.
+    #[test]
+    fn replayed_announce_cannot_bind_an_attacker_link_to_the_victim_route() {
+        let mut a = engine(1, "pixel");
+        let mut attacker = engine(7, "attacker");
+        let victim = engine(9, "victim");
+        let victim_fp = fp_of(&victim);
+        let now = 1_000;
+        let (conn, instance) = ("84:2F", 34);
+
+        a.on_dial_request(conn, now);
+        a.on_client_connected(conn, now);
+        attacker.on_server_connected("droid", now);
+        a.on_instances_discovered(conn, &[instance], now);
+        let sub = a.on_subscribe_result(conn, instance, true, now);
+        let link = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+
+        // The attacker replays the victim's genuine, signature-valid announce,
+        // then answers the handshake with its own key.
+        let stolen = victim.announce_bytes(now).expect("victim announce");
+        let mut first = Output::default();
+        first.merge(sub);
+        first.merge(a.on_client_rx(conn, instance, &stolen, now));
+        let (a_events, _) = pump(&mut a, &link, &mut attacker, "droid", first, now);
+
+        assert!(
+            !a_events.iter().any(|e| matches!(
+                e,
+                AppEvent::LinkEstablished { fingerprint } if *fingerprint == victim_fp
+            )),
+            "no link may establish under the victim's fingerprint, got {a_events:?}"
+        );
+        assert!(
+            !a.has_link(&victim_fp),
+            "the attacker's link must not become the victim's route"
+        );
+        assert!(
+            a.send_text_now(&victim_fp, "mid", "secret", now).is_none(),
+            "a DM to the victim must not leave over the attacker's session"
+        );
+    }
+
+    /// The same binding in the other arrival order: the handshake authenticates
+    /// first, and a replayed announce arrives afterwards. The authenticated key
+    /// owns the link, so the late announce may not move it.
+    #[test]
+    fn late_replayed_announce_cannot_move_an_authenticated_link() {
+        let mut attacker = engine(7, "attacker");
+        let mut a = engine(1, "pixel");
+        let victim = engine(9, "victim");
+        let (victim_fp, attacker_fp) = (fp_of(&victim), fp_of(&attacker));
+        let now = 1_000;
+
+        // `a` is the peripheral; the attacker establishes under its own key.
+        establish(&mut attacker, &mut a, "84:2F", 34, now);
+        assert!(
+            a.has_link(&attacker_fp),
+            "the attacker's own link is legitimate and must still work"
+        );
+
+        let stolen = victim.announce_bytes(now).expect("victim announce");
+        let out = a.on_server_rx("droid", &stolen, now + 1);
+
+        assert!(
+            !a.has_link(&victim_fp),
+            "a replayed announce must not repoint the victim's route at this link"
+        );
+        assert!(
+            a.has_link(&attacker_fp),
+            "the authenticated binding must survive the replay"
+        );
+        assert!(
+            out.events.iter().any(|e| matches!(
+                e,
+                AppEvent::PeerAnnounced { fingerprint, direct, .. }
+                    if *fingerprint == victim_fp && !*direct
+            )),
+            "the victim stays in the radar as relayed, not as this link's neighbour, got {:?}",
+            out.events
+        );
     }
 
     #[test]
