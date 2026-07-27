@@ -87,8 +87,8 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
-    /// Consecutive Noise decrypt failures per peer (see `noteDecryptFailed`).
-    private var consecutiveDecryptFailures: [PeerID: Int] = [:]
+    /// Consecutive Noise decrypt failures per peer. Guarded by `collectionsQueue`.
+    private var decryptFailures = NoiseDecryptFailureTracker()
     /// False while the radio is unusable (`.poweredOff` / `.unauthorized` / `.resetting`).
     ///
     /// Announces are processed on `messageQueue`, so one received a few ms before
@@ -4990,35 +4990,27 @@ extension BLEService {
             // service this file now refuses on the handshake path. Only a run of
             // consecutive failures indicates real desync (nonce mismatch, peer
             // restart), and any successful decrypt resets the run.
-            let failures = noteDecryptFailed(for: peerID)
-            guard failures >= TransportConfig.noiseDecryptFailuresBeforeSessionReset else {
-                SecureLogger.warning("❌ Failed to decrypt message from \(peerID.id.prefix(8))… (\(failures)/\(TransportConfig.noiseDecryptFailuresBeforeSessionReset)): \(error)", category: .security)
+            guard noteDecryptFailed(for: peerID) else {
+                SecureLogger.warning("❌ Failed to decrypt message from \(peerID.id.prefix(8))…; keeping the session: \(error)", category: .security)
                 return
             }
-            SecureLogger.error("❌ \(failures) consecutive decrypt failures from \(peerID) - clearing session and re-initiating handshake")
-            noteDecryptSucceeded(for: peerID)
+            SecureLogger.error("❌ \(TransportConfig.noiseDecryptFailuresBeforeSessionReset) consecutive decrypt failures from \(peerID) - clearing session and re-initiating handshake")
             noiseService.clearSession(for: peerID)
             initiateNoiseHandshake(with: peerID)
         }
     }
 
-    /// Consecutive Noise decrypt failures per peer, so that one forged packet
-    /// cannot evict a working session. Reset on any successful decrypt and when
-    /// the session is torn down.
-    private func noteDecryptFailed(for peerID: PeerID) -> Int {
+    /// Records a decrypt failure, returning whether the run has reached the
+    /// threshold at which the session is treated as desynchronized.
+    private func noteDecryptFailed(for peerID: PeerID) -> Bool {
         collectionsQueue.sync(flags: .barrier) {
-            let next = (consecutiveDecryptFailures[peerID] ?? 0) + 1
-            if consecutiveDecryptFailures.count >= TransportConfig.noiseDecryptFailureTrackingCap {
-                consecutiveDecryptFailures.removeAll()
-            }
-            consecutiveDecryptFailures[peerID] = next
-            return next
+            decryptFailures.recordFailure(for: peerID)
         }
     }
 
     private func noteDecryptSucceeded(for peerID: PeerID) {
         collectionsQueue.sync(flags: .barrier) {
-            _ = consecutiveDecryptFailures.removeValue(forKey: peerID)
+            decryptFailures.recordSuccess(for: peerID)
         }
     }
 
