@@ -79,10 +79,29 @@ enum SNMarmotProfileCache {
     }
 
     static func save(_ profiles: [String: MarmotService.Profile], to defaults: UserDefaults) {
+        guard let payload = encoded(profiles) else { return }
+        commit(payload, to: defaults)
+    }
+
+    /// The expensive half: normalize + JSON-encode the whole map. `nonisolated`
+    /// and pure so callers can run it off the main actor and commit the result
+    /// later — see `MarmotChatModel.scheduleProfileCacheWrite`.
+    nonisolated static func encoded(
+        _ profiles: [String: MarmotService.Profile]
+    ) -> (data: Data, normalized: [String: MarmotService.Profile])? {
         let normalizedProfiles = normalized(profiles)
-        guard let data = try? JSONEncoder().encode(normalizedProfiles) else { return }
-        defaults.set(data, forKey: defaultsKey)
-        syncSharedProfileNames(normalizedProfiles)
+        guard let data = try? JSONEncoder().encode(normalizedProfiles) else { return nil }
+        return (data, normalizedProfiles)
+    }
+
+    /// The cheap half: hand the encoded bytes to UserDefaults (in-memory, the
+    /// disk flush is the OS's problem) and mirror the App Group name map.
+    static func commit(
+        _ payload: (data: Data, normalized: [String: MarmotService.Profile]),
+        to defaults: UserDefaults
+    ) {
+        defaults.set(payload.data, forKey: defaultsKey)
+        syncSharedProfileNames(payload.normalized)
     }
 
     static func clear(from defaults: UserDefaults) {
@@ -138,6 +157,97 @@ enum SNMarmotProfileCache {
         guard let data = Data(hexString: trimmed), data.count == 32,
               let encoded = try? Bech32.encode(hrp: "npub", data: data) else { return nil }
         return encoded
+    }
+}
+
+/// Durable cache of resolved public Sonar descriptors, keyed by npub.
+///
+/// The descriptor carries the peer's BOLT12 offer, which is what unlocks
+/// "Send money" in a chat. Holding it only in memory meant every cold start
+/// hid the payment affordance until a relay round-trip landed (and hid it for
+/// a further 60 s whenever that first fetch missed). Persisting it lets the
+/// payment row paint from local state first — the same local-first shape the
+/// profile cache already uses.
+enum SNMarmotDescriptorCache {
+    static let defaultsKey = "marmot.sonarDescriptorsByNpub.v1"
+    /// Descriptors are small and bounded by how many contacts exist, but cap
+    /// the persisted set so a long-lived install cannot grow it without limit.
+    private static let entryLimit = 1_024
+
+    static func load(from defaults: UserDefaults) -> [String: MarmotService.SonarDescriptor] {
+        guard let data = defaults.data(forKey: defaultsKey),
+              let descriptors = try? JSONDecoder().decode(
+                  [String: MarmotService.SonarDescriptor].self, from: data
+              )
+        else { return [:] }
+        // A blob written before the cap existed can be over the limit; bound it
+        // here so the live map starts bounded without needing a write.
+        return capped(descriptors)
+    }
+
+    static func save(
+        _ descriptors: [String: MarmotService.SonarDescriptor],
+        to defaults: UserDefaults
+    ) {
+        guard let data = encoded(descriptors) else { return }
+        commit(data, to: defaults)
+    }
+
+    /// The expensive half: cap + JSON-encode the whole map. `nonisolated` and
+    /// pure so callers can run it off the main actor and commit the result
+    /// later — see `MarmotChatModel.scheduleDescriptorCacheWrite`.
+    nonisolated static func encoded(
+        _ descriptors: [String: MarmotService.SonarDescriptor]
+    ) -> Data? {
+        try? JSONEncoder().encode(capped(descriptors))
+    }
+
+    /// The cheap half: hand the encoded bytes to UserDefaults.
+    static func commit(_ data: Data, to defaults: UserDefaults) {
+        defaults.set(data, forKey: defaultsKey)
+    }
+
+    static func clear(from defaults: UserDefaults) {
+        defaults.removeObject(forKey: defaultsKey)
+    }
+
+    /// Prune to `entryLimit`. Applied to the LIVE model map as well as to
+    /// `save`, so the in-memory dictionary cannot grow without bound and make
+    /// every fetch re-encode more.
+    ///
+    /// Eviction is by **local fetch recency** (`lastFetchedAt`), not by the
+    /// peer's `publishedAt`. Publication time says nothing about how useful the
+    /// entry is to us: a peer who published a year ago and whom we just fetched
+    /// would otherwise be evicted the instant we cached them, leaving them
+    /// permanently unpayable and refetched on every chat open. `keep` pins the
+    /// just-fetched key for the same reason. `publishedAt` stays the tiebreak —
+    /// it is what orders entries hydrated from disk, which have no local fetch
+    /// time yet — and the npub key breaks the rest so the result is stable.
+    static func capped(
+        _ descriptors: [String: MarmotService.SonarDescriptor],
+        lastFetchedAt: [String: Date] = [:],
+        keep: String? = nil
+    ) -> [String: MarmotService.SonarDescriptor] {
+        guard descriptors.count > entryLimit else { return descriptors }
+        func rank(_ e: (key: String, value: MarmotService.SonarDescriptor))
+            -> (Bool, TimeInterval, TimeInterval, String) {
+            (
+                e.key == keep,
+                lastFetchedAt[e.key]?.timeIntervalSince1970 ?? 0,
+                e.value.publishedAt.timeIntervalSince1970,
+                e.key
+            )
+        }
+        let kept = descriptors
+            .sorted {
+                let l = rank($0), r = rank($1)
+                if l.0 != r.0 { return l.0 }
+                if l.1 != r.1 { return l.1 > r.1 }
+                if l.2 != r.2 { return l.2 > r.2 }
+                return l.3 < r.3
+            }
+            .prefix(entryLimit)
+        return Dictionary(uniqueKeysWithValues: kept.map { ($0.key, $0.value) })
     }
 }
 
@@ -425,6 +535,27 @@ final class MarmotChatModel: ObservableObject {
     /// Last successful relay lookup time per npub. A successful nil response is
     /// tracked via `sonarDescriptorMissesByNpub`.
     private var sonarDescriptorFetchedAtByNpub: [String: Date] = [:]
+    /// Bumped on identity teardown so a descriptor fetch started under the old
+    /// account cannot land — and persist — after the wipe.
+    private var descriptorCacheGeneration = 0
+    /// Bumped by a teardown that clears a contact cache, so a deferred write
+    /// that encoded before the clear is dropped instead of resurrecting erased
+    /// contact data (an Account Key Durability-class failure).
+    ///
+    /// Per-cache, NOT shared: `eraseChatsKeepIdentity()` runs
+    /// `clearIdentityScopedState()` (profiles) but deliberately retains
+    /// descriptors, so one counter would let the profile clear discard an
+    /// in-flight descriptor write — and the retained map is never re-persisted,
+    /// so that descriptor would vanish on the next restart.
+    private var profileCacheWriteGeneration = 0
+    private var descriptorCacheWriteGeneration = 0
+    /// Per-cache schedule order. Detached encodes finish out of order, so
+    /// without this an older snapshot could commit after a newer one and lose
+    /// the freshest profile / BOLT12 offer from disk until the next fetch.
+    private var profileCacheScheduledSeq = 0
+    private var profileCacheCommittedSeq = 0
+    private var descriptorCacheScheduledSeq = 0
+    private var descriptorCacheCommittedSeq = 0
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -558,6 +689,7 @@ final class MarmotChatModel: ObservableObject {
         self.keychain = keychain
         self.defaults = defaults
         self.profilesByNpub = SNMarmotProfileCache.load(from: defaults)
+        self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.load(from: defaults)
         let cached = SNMarmotChatSnapshotCache.load(from: defaults)
         self.groups = cached.0
         self.messagesByGroup = cached.1
@@ -2307,7 +2439,7 @@ final class MarmotChatModel: ObservableObject {
         await MainActor.run {
             profilesByNpub[key] = profile
             profileFetchedAt[key] = Date()
-            SNMarmotProfileCache.save(profilesByNpub, to: defaults)
+            scheduleProfileCacheWrite()
             onOwnProfileFetched?(profile)
         }
         let claimed = await service.claimedHandle()
@@ -2433,7 +2565,7 @@ final class MarmotChatModel: ObservableObject {
                     if key != npubToFetch {
                         self.profilesByNpub.removeValue(forKey: npubToFetch)
                     }
-                    SNMarmotProfileCache.save(self.profilesByNpub, to: self.defaults)
+                    self.scheduleProfileCacheWrite()
                 } else {
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
@@ -2491,8 +2623,12 @@ final class MarmotChatModel: ObservableObject {
             return
         }
         guard descriptorFetches.insert(npubToFetch).inserted else { return }
+        // Capture the generation HERE, not inside the task: a wipe between
+        // scheduling and start would otherwise let this fetch adopt the new
+        // account's generation and persist the old account's contact.
+        let generation = descriptorCacheGeneration
         Task {
-            await performDescriptorFetch(npubToFetch)
+            await performDescriptorFetch(npubToFetch, generation: generation)
         }
     }
 
@@ -2518,22 +2654,123 @@ final class MarmotChatModel: ObservableObject {
             return sonarDescriptorsByNpub[npubToFetch]
         }
         descriptorFetches.insert(npubToFetch)
-        await performDescriptorFetch(npubToFetch)
+        await performDescriptorFetch(npubToFetch, generation: descriptorCacheGeneration)
         return sonarDescriptorsByNpub[npubToFetch]
     }
 
-    private func performDescriptorFetch(_ npubToFetch: String) async {
+    // ── Contact-cache persistence (profiles + Sonar descriptors) ──
+    //
+    // Both caches re-encode their WHOLE map on every successful fetch, and both
+    // `save` calls used to run inside `MainActor.run`. A boot / foreground sweep
+    // (`refreshDescriptors(forKnownNpubs:)`, `refreshChatMemberProfiles`)
+    // resolves N contacts, so that was N full-map JSON encodes on the main
+    // actor while the user may be scrolling or sending.
+    //
+    // These schedule the encode off the actor and commit on it. The commit
+    // itself is cheap — `defaults.set` is in-memory, the OS flushes later — and
+    // doing it back on the actor is what makes the ordering safe: a teardown
+    // that bumps the cache's write generation is serialized against the commit
+    // hop, so a write encoded before a wipe can never land after it.
+    //
+    // Teardown paths must NOT use these. They call `.clear(from:)` directly,
+    // which is synchronous, and bump the generation.
+
+    private func scheduleProfileCacheWrite() {
+        let snapshot = profilesByNpub
+        let defaults = self.defaults
+        let generation = profileCacheWriteGeneration
+        profileCacheScheduledSeq &+= 1
+        let seq = profileCacheScheduledSeq
+        Task.detached(priority: .utility) { [weak self] in
+            guard let payload = SNMarmotProfileCache.encoded(snapshot) else { return }
+            guard let self else { return }
+            await MainActor.run {
+                guard generation == self.profileCacheWriteGeneration else { return }
+                // A newer snapshot already landed — this one is stale.
+                guard seq > self.profileCacheCommittedSeq else { return }
+                self.profileCacheCommittedSeq = seq
+                SNMarmotProfileCache.commit(payload, to: defaults)
+            }
+        }
+    }
+
+    private func scheduleDescriptorCacheWrite() {
+        let snapshot = sonarDescriptorsByNpub
+        let defaults = self.defaults
+        let generation = descriptorCacheWriteGeneration
+        descriptorCacheScheduledSeq &+= 1
+        let seq = descriptorCacheScheduledSeq
+        Task.detached(priority: .utility) { [weak self] in
+            guard let data = SNMarmotDescriptorCache.encoded(snapshot) else { return }
+            guard let self else { return }
+            await MainActor.run {
+                guard generation == self.descriptorCacheWriteGeneration else { return }
+                // A newer snapshot already landed — this one is stale.
+                guard seq > self.descriptorCacheCommittedSeq else { return }
+                self.descriptorCacheCommittedSeq = seq
+                SNMarmotDescriptorCache.commit(data, to: defaults)
+            }
+        }
+    }
+
+    /// Apply a completed descriptor fetch to the cache.
+    ///
+    /// A relay MISS (`fetched == nil`) is a transient answer, not proof the peer
+    /// has no descriptor: relays reconnecting after background, the 10 s core
+    /// `FETCH_TIMEOUT` expiring, or a relay that simply does not hold the event
+    /// all produce it. Evicting on a miss silently drops the peer's BOLT12
+    /// offer, so a chat that was payable a moment ago loses "Send money" from
+    /// the "+" sheet until some later fetch happens to succeed — the intermittent
+    /// "bitcoin payment is not showing" report. Keep the last resolved
+    /// descriptor and stamp only the miss, so the 60 s miss cooldown (not the
+    /// 15 min success TTL) drives the retry. Mirrors Compose
+    /// `SonarAppState.performDescriptorFetch`.
+    nonisolated static func descriptorCacheAfterFetch(
+        cached: MarmotService.SonarDescriptor?,
+        fetched: MarmotService.SonarDescriptor?
+    ) -> (descriptor: MarmotService.SonarDescriptor?, stampFetchedAt: Bool, missed: Bool) {
+        if let fetched { return (fetched, true, false) }
+        return (cached, false, true)
+    }
+
+    private func performDescriptorFetch(_ npubToFetch: String, generation: Int) async {
         do {
             let descriptor = try await service.fetchSonarDescriptor(npub: npubToFetch)
             await MainActor.run {
                 self.descriptorFetches.remove(npubToFetch)
-                self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
-                if let descriptor {
-                    self.sonarDescriptorsByNpub[npubToFetch] = descriptor
-                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
-                } else {
-                    self.sonarDescriptorsByNpub.removeValue(forKey: npubToFetch)
+                // The cache is durable now, so a fetch started under the previous
+                // identity must not write (and persist) its contacts into the new
+                // account after a wipe/restore.
+                guard generation == self.descriptorCacheGeneration else { return }
+                let outcome = Self.descriptorCacheAfterFetch(
+                    cached: self.sonarDescriptorsByNpub[npubToFetch],
+                    fetched: descriptor
+                )
+                if outcome.stampFetchedAt {
+                    self.sonarDescriptorFetchedAtByNpub[npubToFetch] = Date()
+                }
+                self.sonarDescriptorsByNpub[npubToFetch] = outcome.descriptor
+                // `keep` + the fetch-time map stamped above: without them a
+                // peer whose descriptor was published long ago is evicted the
+                // moment we cache them and stays unpayable however often we
+                // refetch.
+                self.sonarDescriptorsByNpub = SNMarmotDescriptorCache.capped(
+                    self.sonarDescriptorsByNpub,
+                    lastFetchedAt: self.sonarDescriptorFetchedAtByNpub,
+                    keep: npubToFetch
+                )
+                if outcome.missed {
                     self.sonarDescriptorMissesByNpub[npubToFetch] = Date()
+                } else {
+                    self.sonarDescriptorMissesByNpub[npubToFetch] = nil
+                }
+                // A miss leaves the cache byte-identical, so skip the encode.
+                // `save` runs a full JSON encode of the whole dictionary on the
+                // MainActor; a boot/foreground refresh sweep would otherwise do
+                // that once per missed contact for no state change. Compose's
+                // miss branch does not persist either.
+                if !outcome.missed {
+                    self.scheduleDescriptorCacheWrite()
                 }
             }
         } catch {
@@ -4010,6 +4247,7 @@ final class MarmotChatModel: ObservableObject {
         conversationRefreshTask = nil
         pendingConversationRefreshGroups = []
         clearIdentityScopedState()
+        clearAccountContactDescriptors()
         do {
             try await service.wipeDatabase()
         } catch {
@@ -4027,6 +4265,7 @@ final class MarmotChatModel: ObservableObject {
         stopPolling()
         invalidateGapRecovery()
         clearIdentityScopedState()
+        clearAccountContactDescriptors()
         try await wipeDatabase()
     }
 
@@ -4073,8 +4312,32 @@ final class MarmotChatModel: ObservableObject {
         refreshTask?.cancel()
         refreshTask = nil
         clearStickerCaches()
+        // Profiles only: this runs from eraseChatsKeepIdentity() too, which
+        // retains descriptors. Invalidating theirs here would drop an in-flight
+        // descriptor write that nothing re-persists.
+        profileCacheWriteGeneration &+= 1
+        profileCacheScheduledSeq = 0; profileCacheCommittedSeq = 0
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
+    }
+
+    /// Drop every peer descriptor (their BOLT12 offers and call routes) plus the
+    /// durable cache.
+    ///
+    /// Identity-replacement ONLY. `eraseChatsKeepIdentity()` must not call this:
+    /// the account survives that flow, so wiping descriptors would strip a pure
+    /// White Noise contact's payment affordance until a relay fetch succeeds.
+    /// Compose `eraseAllChats()` retains `sonarDescriptorsByNpubHex` for the
+    /// same reason.
+    private func clearAccountContactDescriptors() {
+        sonarDescriptorsByNpub = [:]
+        sonarDescriptorMissesByNpub = [:]
+        sonarDescriptorFetchedAtByNpub = [:]
+        descriptorFetches = []
+        descriptorCacheGeneration &+= 1
+        descriptorCacheWriteGeneration &+= 1
+        descriptorCacheScheduledSeq = 0; descriptorCacheCommittedSeq = 0
+        SNMarmotDescriptorCache.clear(from: defaults)
     }
 
     /// Erase every White Noise / Marmot chat but KEEP the identity: wipe the

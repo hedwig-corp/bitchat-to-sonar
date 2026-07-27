@@ -863,12 +863,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity. */
-    var sonarDescriptorsByNpubHex by mutableStateOf<Map<String, SonarDescriptor>>(emptyMap())
+    /** Public Sonar descriptors by raw npub hex, used for out-of-BLE call parity
+     *  and for the BOLT12 offer that unlocks "Send bitcoin". Hydrated from the
+     *  persisted cache so a cold start paints the payment affordance from local
+     *  state instead of waiting on a relay round-trip. */
+    var sonarDescriptorsByNpubHex by mutableStateOf(
+        boundedSonarDescriptorCache(
+            decodeSonarDescriptorCache(SonarCore.loadBlob(SONAR_DESCRIPTOR_CACHE_BLOB_KEY))
+        )
+    )
         private set
     private val sonarDescriptorFetches = mutableSetOf<String>()
     private val sonarDescriptorFetchedAt = mutableMapOf<String, Long>()
     private val sonarDescriptorMissedAt = mutableMapOf<String, Long>()
+    /** Bumped on identity teardown so a descriptor fetch started under the old
+     *  account cannot land — and persist — after the wipe. */
+    private var descriptorCacheGeneration = 0
     private var stack by mutableStateOf<List<Screen>>(listOf(Screen.Home))
     val screen: Screen get() = stack.last()
 
@@ -930,7 +940,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
-            sonarDescriptorsByNpubHex = emptyMap()
+            // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
+            // suspends, and an in-flight fetch resuming in that window would
+            // otherwise still pass performDescriptorFetch's generation guard and
+            // repopulate the map we just cleared.
+            sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
             needsSonarDescriptorPublish = false
@@ -1007,7 +1021,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotGroups = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
-            profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
+            profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCacheNow()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
@@ -2805,6 +2819,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 ?.takeIf { isDirectMarmotChat(it) }
                 ?.let { otherMembers(it).singleOrNull() }
                 ?.let { canonicalNpubHex(it) }
+            // NOTE: a pending chat (XChat-Style Chat Startup Rule) is deliberately
+            // NOT payable even though we know the peer's npub: the ⚡PAY receipt
+            // lines need a real Marmot group, so paying here would settle on
+            // Lightning with no in-chat receipt. Tracked follow-up: queue the
+            // receipt through pendingDirectMarmotSends, then allow it.
         }
 
     private fun directPaymentOffer(chatId: String): String? {
@@ -3451,14 +3470,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
-                sonarDescriptorsByNpubHex = emptyMap()
+                // Generation first — see wipe(): the write below suspends.
+                sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
                 publishedSonarDescriptor = false
                 publishedSonarDescriptorBolt12Offer = null
                 publishingSonarDescriptor = false
                 needsSonarDescriptorPublish = false
                 rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
-                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCache()
+                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
                 socialState = SonarSocialState(); persistSocialState()
                 bip353 = ""; SonarCore.saveBlob("bip353", "")
                 coreClaimedHandle = null
@@ -4679,8 +4699,12 @@ class SonarAppState(private val scope: CoroutineScope) {
         val missedAt = sonarDescriptorMissedAt[key]
         if (missedAt != null && now - missedAt < SONAR_DESCRIPTOR_MISS_TTL_SECS) return
         if (!sonarDescriptorFetches.add(key)) return
+        // Capture the generation HERE, not inside the coroutine: a wipe between
+        // launch and start would otherwise let this fetch adopt the new
+        // account's generation and persist the old account's contact.
+        val generation = descriptorCacheGeneration
         scope.launch {
-            performDescriptorFetch(key)
+            performDescriptorFetch(key, generation)
         }
     }
 
@@ -4701,20 +4725,121 @@ class SonarAppState(private val scope: CoroutineScope) {
             return sonarDescriptorsByNpubHex[key]
         }
         sonarDescriptorFetches.add(key)
-        performDescriptorFetch(key)
+        performDescriptorFetch(key, descriptorCacheGeneration)
         return sonarDescriptorsByNpubHex[key]
     }
 
-    private suspend fun performDescriptorFetch(key: String) {
+    private suspend fun performDescriptorFetch(key: String, generation: Int) {
         val descriptor = runCatching { SonarCore.fetchSonarDescriptor(key) }.getOrNull()
+        // The cache is durable now, so a fetch started under the previous
+        // identity must not write (and persist) its contacts into the new
+        // account after a wipe/restore.
+        if (generation != descriptorCacheGeneration) {
+            sonarDescriptorFetches.remove(key)
+            return
+        }
         if (descriptor != null) {
-            sonarDescriptorsByNpubHex = sonarDescriptorsByNpubHex + (key to descriptor)
+            // Stamp the fetch time BEFORE pruning so this key counts as the most
+            // recently used, and pin it via `keep` — otherwise a peer whose
+            // descriptor was published long ago is evicted the moment we cache
+            // them and stays unpayable however often we refetch.
             sonarDescriptorFetchedAt[key] = SonarClock.nowSecs()
+            sonarDescriptorsByNpubHex = boundedSonarDescriptorCache(
+                sonarDescriptorsByNpubHex + (key to descriptor),
+                lastFetchedAtSecs = sonarDescriptorFetchedAt,
+                keep = key,
+            )
             sonarDescriptorMissedAt.remove(key)
+            persistSonarDescriptorCache()
         } else {
+            // A miss is transient (relay reconnecting, FETCH_TIMEOUT, a relay
+            // that just doesn't hold the event) — never evict an already
+            // resolved descriptor, or the peer's BOLT12 offer disappears and a
+            // payable chat silently loses "Send bitcoin".
             sonarDescriptorMissedAt[key] = SonarClock.nowSecs()
         }
         sonarDescriptorFetches.remove(key)
+    }
+
+    // ── Contact-cache persistence (profiles + Sonar descriptors) ──
+    //
+    // Both caches re-encode their WHOLE map on every successful fetch, and this
+    // state's scope is a `rememberCoroutineScope()` (App.kt) — i.e. Main. A
+    // relay-startup sweep (`refreshKnownContactDescriptors` /
+    // `refreshChatMemberProfiles`) resolves N contacts, so the naive form did N
+    // full-map encodes on the render path. On desktop it is worse than it looks:
+    // `SonarCore.saveBlob` → `DesktopEnv.putString` writes the properties file
+    // synchronously, so the write itself blocks too.
+    //
+    // So the per-fetch path snapshots the (immutable) map on Main and does the
+    // encode AND the write on IO. Wipe/teardown must NOT use that path: it has
+    // to observe the blob cleared before the account is replaced, so it writes
+    // through [writeContactCacheNow], which is awaited.
+    //
+    // The mutex + generation are what keep a deferred write from landing after a
+    // wipe and resurrecting erased contact data (an Account Key Durability-class
+    // failure). Every synchronous write bumps the generation under the lock, so
+    // any deferred write that encoded before the wipe is dropped rather than
+    // committed.
+    private val contactCacheWriteMutex = Mutex()
+    /** Per-blob-key, NOT global. `eraseAllChats()` clears the profile cache but
+     *  deliberately retains descriptors, so a global counter would let the
+     *  profile write invalidate an in-flight descriptor write — and since the
+     *  retained map is never re-persisted, that descriptor would silently
+     *  vanish on the next restart. */
+    private val contactCacheWriteGenerations = mutableMapOf<String, Int>()
+    /** Per-key schedule order. Encodes run concurrently and finish out of
+     *  order, so the mutex alone would serialize commits by *encode-completion*
+     *  order and let an older snapshot overwrite a newer one — losing the newest
+     *  profile or BOLT12 offer from disk until the next fetch. */
+    private val contactCacheScheduledSeq = mutableMapOf<String, Int>()
+    private val contactCacheCommittedSeq = mutableMapOf<String, Int>()
+
+    /** Snapshot now on the caller's thread, encode + write on IO. Use for the
+     *  per-fetch paths, never for wipe/teardown. */
+    private fun scheduleContactCacheWrite(key: String, encode: () -> String) {
+        val generation = contactCacheWriteGenerations[key] ?: 0
+        val seq = (contactCacheScheduledSeq[key] ?: 0) + 1
+        contactCacheScheduledSeq[key] = seq
+        scope.launch(Dispatchers.IO) {
+            val encoded = encode()
+            contactCacheWriteMutex.withLock {
+                if (generation != (contactCacheWriteGenerations[key] ?: 0)) return@withLock
+                // A newer snapshot already landed — this one is stale.
+                if (seq <= (contactCacheCommittedSeq[key] ?: 0)) return@withLock
+                contactCacheCommittedSeq[key] = seq
+                SonarCore.saveBlob(key, encoded)
+            }
+        }
+    }
+
+    /** Write immediately and invalidate every deferred write queued so far.
+     *  Wipe/teardown only — callers must await this before replacing the
+     *  account. */
+    private suspend fun writeContactCacheNow(key: String, encoded: String) {
+        contactCacheWriteMutex.withLock {
+            // Invalidates deferred writes for THIS key only — a teardown that
+            // clears one cache must not discard an in-flight write for a cache
+            // it deliberately retains.
+            contactCacheWriteGenerations[key] = (contactCacheWriteGenerations[key] ?: 0) + 1
+            contactCacheCommittedSeq.remove(key)
+            contactCacheScheduledSeq.remove(key)
+            withContext(Dispatchers.IO) { SonarCore.saveBlob(key, encoded) }
+        }
+    }
+
+    private fun persistSonarDescriptorCache() {
+        val snapshot = sonarDescriptorsByNpubHex
+        scheduleContactCacheWrite(SONAR_DESCRIPTOR_CACHE_BLOB_KEY) {
+            encodeSonarDescriptorCache(snapshot)
+        }
+    }
+
+    private suspend fun persistSonarDescriptorCacheNow() {
+        writeContactCacheNow(
+            SONAR_DESCRIPTOR_CACHE_BLOB_KEY,
+            encodeSonarDescriptorCache(sonarDescriptorsByNpubHex),
+        )
     }
 
     private fun refreshKnownContactDescriptors(clearMisses: Boolean = false) {
@@ -4727,9 +4852,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistProfileCache() {
+        val snapshot = profilesByNpub
+        scheduleContactCacheWrite(PROFILE_CACHE_BLOB_KEY) {
+            val encoded = encodeProfileCache(snapshot)
+            sonarLog("SonarProfile", "persist cache: ${snapshot.size} profiles → ${encoded.length} chars")
+            encoded
+        }
+    }
+
+    private suspend fun persistProfileCacheNow() {
         val encoded = encodeProfileCache(profilesByNpub)
-        sonarLog("SonarProfile", "persist cache: ${profilesByNpub.size} profiles → ${encoded.length} chars")
-        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encoded)
+        sonarLog("SonarProfile", "persist cache (sync): ${profilesByNpub.size} profiles → ${encoded.length} chars")
+        writeContactCacheNow(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {

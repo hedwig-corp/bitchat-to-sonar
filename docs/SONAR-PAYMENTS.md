@@ -62,6 +62,56 @@ Direct sends require a valid BOLT12 offer from the peer's Sonar metadata. BLE
 payment capability bits may show the affordance while the descriptor is being
 fetched, but sending refuses until the concrete offer is available.
 
+### Descriptor cache durability (why "Send bitcoin" must not flicker)
+
+A resolved descriptor is the *only* payment route for a pure White Noise
+contact — a peer met over BLE also carries the `CAP_PAY` bit in their persisted
+profile, but an npub-only contact does not. Two invariants follow, and both
+have already caused an intermittent "the bitcoin payment option is not showing"
+report:
+
+1. **A relay miss must never evict a resolved descriptor.** `fetch_sonar_descriptor`
+   returns `Ok(None)` for an ordinary empty result — relays reconnecting after
+   background, the 10 s `FETCH_TIMEOUT` expiring, a relay that simply does not
+   hold the event. Treating that as "this peer has no offer" drops a known-good
+   BOLT12 offer and silently removes the payment row from a chat that was
+   payable a moment ago. Keep the last resolved descriptor and stamp only the
+   miss, so the short miss cooldown (not the long success TTL) drives the retry.
+   Compose: `SonarAppState.performDescriptorFetch`. iOS:
+   `MarmotChatModel.performDescriptorFetch` /
+   `MarmotChatModel.descriptorCacheAfterFetch`.
+2. **The cache is durable, not per-process.** Holding descriptors only in memory
+   hides the payment affordance on every cold start until a relay round-trip
+   lands. Persist them and hydrate at init so payments paint from local state
+   first (Signal-Comparable Performance Rule). Compose:
+   `SONAR_DESCRIPTOR_CACHE_BLOB_KEY`. iOS: `SNMarmotDescriptorCache`. Both cap
+   the set at 1024 and evict by **local fetch recency**, pinning the key just
+   fetched. Evicting by the peer's `published_at` looks equivalent and is not:
+   a contact who published their descriptor long ago would be dropped the
+   instant we cached them, so the fetch achieves nothing, they stay unpayable,
+   and every chat open refetches the same event. Published-at survives only as
+   the tiebreak that orders entries hydrated from disk, which have no local
+   fetch time yet.
+   The per-fetch write does its encode **off** the UI thread (Compose
+   `scheduleContactCacheWrite`, iOS `scheduleDescriptorCacheWrite`) — a
+   relay-startup sweep resolves N contacts, and encoding the whole map N times
+   on the render path is a Signal-Comparable Performance Rule violation. Only
+   wipe/teardown writes synchronously, because it must observe the blob cleared
+   before the account is replaced; it also invalidates any deferred write still
+   in flight so an erased contact cannot be resurrected.
+3. **Clear on identity death, not on "erase all chats".** Descriptors belong to
+   the *account*, so only a panic wipe or an identity replacement may drop them
+   (iOS `clearAccountContactDescriptors`, called from `wipeDatabase` and
+   `prepareForIdentityReplacement` — deliberately NOT from
+   `eraseChatsKeepIdentity`; Compose clears in `wipe()` / `restoreAccount()`,
+   deliberately NOT in `eraseAllChats()`). Erasing chats keeps the identity, so
+   wiping the cache there would strip the payment affordance from every pure
+   White Noise contact until a relay fetch succeeds — re-creating invariant 1's
+   bug through a different door. A fetch started under the previous identity is
+   dropped by a generation guard, captured at schedule time rather than at fetch
+   start, so a wipe landing mid-flight cannot persist the old account's contacts
+   into the new one.
+
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,

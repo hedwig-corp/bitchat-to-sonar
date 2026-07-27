@@ -215,6 +215,10 @@ data class SonarDescriptor(
 
 internal const val PROFILE_CACHE_BLOB_KEY = "profiles.byNpub.v1"
 internal const val CHAT_SNAPSHOT_BLOB_KEY = "chats.snapshot.v1"
+/** Resolved Sonar descriptors, keyed by npub hex. Persisted so the payment /
+ *  call affordances paint from local state on cold start instead of waiting on
+ *  a relay round-trip (Signal-Comparable Performance Rule). */
+internal const val SONAR_DESCRIPTOR_CACHE_BLOB_KEY = "sonar.descriptors.v2"
 
 internal fun canonicalProfileKey(value: String): String {
     val clean = value.trim()
@@ -329,6 +333,129 @@ internal fun decodeChatSnapshotLatest(blob: String): Map<String, Long> =
             put(id, latest)
         }
     }
+
+/** Cap on the persisted descriptor set. Descriptors are bounded by how many
+ *  contacts exist, but `eraseAllChats()` does not clear the in-memory map, so a
+ *  long-lived identity would otherwise grow the blob without limit — and it is
+ *  decoded synchronously at startup. Mirrors iOS
+ *  `SNMarmotDescriptorCache.entryLimit`. */
+internal const val SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT = 1024
+
+/** Prune a descriptor cache to [SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT].
+ *
+ *  Eviction is by **local fetch recency** ([lastFetchedAtSecs]), not by the
+ *  peer's `publishedAtSecs`. Publication time is a property of their data, not
+ *  of how useful the entry is to us: a peer who published their descriptor a
+ *  year ago and whom we just fetched would otherwise be evicted the instant we
+ *  cached them, leaving them permanently unpayable and refetched on every chat
+ *  open. [keep] pins the just-fetched key for the same reason.
+ *
+ *  `publishedAtSecs` remains the tiebreak, which is what orders entries
+ *  hydrated from disk (they have no local fetch time yet), and the npub key
+ *  breaks the remaining ties so the result is deterministic.
+ *
+ *  Apply this to the LIVE map, not only to the encoder's output: capping only
+ *  what gets serialized leaves the in-memory map growing without bound, and the
+ *  encode runs on the Main dispatcher, so every fetch would re-encode an
+ *  ever-larger map on the render path. */
+internal fun boundedSonarDescriptorCache(
+    descriptors: Map<String, SonarDescriptor>,
+    lastFetchedAtSecs: Map<String, Long> = emptyMap(),
+    keep: String? = null,
+): Map<String, SonarDescriptor> {
+    if (descriptors.size <= SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT) return descriptors
+    return descriptors.entries
+        .sortedWith(
+            compareByDescending<Map.Entry<String, SonarDescriptor>> { it.key == keep }
+                .thenByDescending { lastFetchedAtSecs[it.key] ?: 0L }
+                .thenByDescending { it.value.publishedAtSecs }
+                .thenBy { it.key }
+        )
+        .take(SONAR_DESCRIPTOR_CACHE_ENTRY_LIMIT)
+        .associate { it.key to it.value }
+}
+
+/** Encode the resolved-descriptor cache (npub hex → descriptor) for durable
+ *  storage. Every string rides through [hexEnc] so an offer or capability token
+ *  can never corrupt the tab/newline framing. Callers pass an already-bounded
+ *  map; the extra bound here is belt-and-braces for direct callers. */
+internal fun encodeSonarDescriptorCache(descriptors: Map<String, SonarDescriptor>): String =
+    boundedSonarDescriptorCache(
+        descriptors.entries
+            .mapNotNull { (key, descriptor) ->
+                val npubHex = normalizedDescriptorCacheKey(key) ?: return@mapNotNull null
+                npubHex to descriptor
+            }
+            .toMap()
+    )
+        .entries
+        .sortedBy { it.key }
+        .joinToString("\n") { (npubHex, d) ->
+            listOf(
+                npubHex,
+                d.schema.toString(),
+                if (d.calls) "1" else "0",
+                encodeDescriptorList(d.media),
+                encodeDescriptorList(d.signaling),
+                encodeDescriptorList(d.transports),
+                hexEnc(d.callIdentity),
+                profileField(d.bolt12Offer),
+                encodeDescriptorList(d.paymentReceipts),
+                d.publishedAtSecs.toString(),
+            ).joinToString("\t")
+        }
+
+internal fun decodeSonarDescriptorCache(blob: String): Map<String, SonarDescriptor> =
+    blob.lineSequence()
+        .mapNotNull { line ->
+            if (line.isBlank()) return@mapNotNull null
+            val parts = line.split("\t")
+            if (parts.size != 10) return@mapNotNull null
+            val npubHex = normalizedDescriptorCacheKey(parts[0]) ?: return@mapNotNull null
+            val schema = parts[1].toIntOrNull() ?: return@mapNotNull null
+            val calls = when (parts[2]) {
+                "1" -> true
+                "0" -> false
+                else -> return@mapNotNull null
+            }
+            val media = decodeDescriptorList(parts[3]) ?: return@mapNotNull null
+            val signaling = decodeDescriptorList(parts[4]) ?: return@mapNotNull null
+            val transports = decodeDescriptorList(parts[5]) ?: return@mapNotNull null
+            val callIdentity = hexDec(parts[6]) ?: return@mapNotNull null
+            val bolt12Offer = profileFieldValue(parts[7]) ?: return@mapNotNull null
+            val receipts = decodeDescriptorList(parts[8]) ?: return@mapNotNull null
+            val publishedAtSecs = parts[9].toLongOrNull() ?: return@mapNotNull null
+            npubHex to SonarDescriptor(
+                schema = schema,
+                calls = calls,
+                media = media,
+                signaling = signaling,
+                transports = transports,
+                callIdentity = callIdentity,
+                bolt12Offer = bolt12Offer.value,
+                paymentReceipts = receipts,
+                publishedAtSecs = publishedAtSecs,
+            )
+        }
+        .toMap()
+
+/** Descriptors are cached under the 32-byte pubkey as lowercase hex — the key
+ *  `paymentNpubHex` / `callDescriptorNpubHex` look up with. */
+private fun normalizedDescriptorCacheKey(value: String): String? =
+    value.trim().lowercase()
+        .takeIf { it.length == 64 && it.all { c -> c in '0'..'9' || c in 'a'..'f' } }
+
+/** Hex-encode each element separately and join the HEX with ",". Hex output is
+ *  `[0-9a-f]` only, so the separator can never occur inside an encoded element
+ *  and a list round-trips element-for-element even when a value contains a
+ *  comma. Joining before encoding would silently split such a value in two. */
+private fun encodeDescriptorList(values: List<String>): String =
+    values.joinToString(",") { hexEnc(it) }
+
+private fun decodeDescriptorList(token: String): List<String>? {
+    if (token.isEmpty()) return emptyList()
+    return token.split(",").map { hexDec(it) ?: return null }
+}
 
 private fun profileField(value: String?): String =
     value?.let { "1" + hexEnc(it) } ?: "0"
