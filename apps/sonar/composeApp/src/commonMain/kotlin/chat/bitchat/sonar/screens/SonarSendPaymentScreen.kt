@@ -154,7 +154,7 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
                         .clip(RoundedCornerShape(14.dp)).background(s.netSoft)
-                        .clickable { externalTarget = trimmed }
+                        .clickable { externalTarget = external.destination; fixedSats = external.fixedSats }
                         .padding(horizontal = 14.dp, vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -263,7 +263,14 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
 }
 
 /** How an external destination is labelled in the "Pay …" row. */
-internal data class ExternalDestination(val icon: SNIconName, val subtitle: String)
+internal data class ExternalDestination(
+    val icon: SNIconName,
+    val subtitle: String,
+    /** What to hand the wallet — for a BIP-21 URI this is the extracted rail. */
+    val destination: String,
+    /** Amount the payload fixes, if any. */
+    val fixedSats: Long? = null,
+)
 
 /**
  * Classify what the user typed. Anything Breez can resolve counts: a BOLT12
@@ -274,13 +281,24 @@ internal data class ExternalDestination(val icon: SNIconName, val subtitle: Stri
 internal fun payableDestination(input: String): ExternalDestination? {
     val v = input.lowercase()
     return when {
-        v.startsWith("lno1") -> ExternalDestination(SNIconName.Bolt, "Bolt12 offer · over Lightning")
+        // A pasted BIP-21 / lightning URI resolves exactly like a scanned one,
+        // so the offer inside `?lno=` is paid rather than the URI itself.
+        v.startsWith("bitcoin:") || v.startsWith("lightning:") -> {
+            val k = scannedKind(input)
+            k.destination.takeIf { it.isNotBlank() }
+                ?.let { ExternalDestination(k.icon, k.sub, it, k.fixedSats) }
+        }
+        v.startsWith("lno1") ->
+            ExternalDestination(SNIconName.Bolt, "Bolt12 offer · over Lightning", input.trim().lowercase())
         v.startsWith("lnbc") || v.startsWith("lntb") || v.startsWith("lnbcrt") ->
-            ExternalDestination(SNIconName.Bolt, "Lightning invoice")
+            ExternalDestination(
+                SNIconName.Bolt, "Lightning invoice", input.trim().lowercase(),
+                bolt11AmountSats(input.trim().lowercase()),
+            )
         // A Lightning address needs a user and a dotted host: "a@b.c".
         v.count { it == '@' } == 1 && v.substringBefore('@').isNotEmpty() &&
             v.substringAfter('@').let { it.contains('.') && !it.startsWith('.') && !it.endsWith('.') } ->
-            ExternalDestination(SNIconName.Globe, "Lightning address · over the internet")
+            ExternalDestination(SNIconName.Globe, "Lightning address · over the internet", input.trim())
         else -> null
     }
 }

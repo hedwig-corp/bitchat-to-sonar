@@ -135,7 +135,7 @@ fun SonarScanQrSheet(
                         if (kind.fixedSats != null) "Continue · ${chat.bitchat.sonar.payFmt(kind.fixedSats)} sats"
                         else "Enter amount",
                         net = true,
-                    ) { onDetect(code, kind.fixedSats) }
+                    ) { onDetect(kind.destination, kind.fixedSats) }
                     Spacer(Modifier.height(6.dp))
                     SNGhostButton("Scan again") { found = null }
                 }
@@ -198,20 +198,83 @@ private fun ScanSweep(accent: Color) {
     )
 }
 
-/** What a decoded payload is, for the "found" card. */
+/**
+ * What a scanned/typed payload resolves to: the string the wallet should
+ * actually be handed, plus how to label it and any amount it fixes.
+ */
 internal data class ScannedKind(
     val icon: SNIconName,
     val name: String,
     val sub: String,
     val fixedSats: Long?,
+    /** What to pay. NOT the raw payload — see [scannedKind]. */
+    val destination: String,
 )
 
+/**
+ * Resolve a scanned or pasted payment payload.
+ *
+ * The important case is the **BIP-21 unified URI**, which is what modern
+ * wallets put in a QR code:
+ *
+ *     bitcoin:BC1Q…?amount=0.0001&lno=lno1…&lightning=lnbc…
+ *
+ * The on-chain address is the fallback; the good rails ride in the query
+ * string. Handing that whole URI to the wallet — query string and all — is how
+ * this used to fail: the BOLT12 offer sitting in `lno=` was never looked at,
+ * the code was labelled a plain on-chain address, and the send went nowhere.
+ *
+ * Preference order is best-rail-first: `lno` (reusable BOLT12 offer) →
+ * `lightning` (BOLT11 invoice) → the bare on-chain address.
+ */
 internal fun scannedKind(raw: String): ScannedKind {
     val v = raw.trim()
-    val lower = v.lowercase().removePrefix("lightning:").removePrefix("bitcoin:")
+    val lowerAll = v.lowercase()
+
+    // ── BIP-21 unified URI ──
+    if (lowerAll.startsWith("bitcoin:")) {
+        val body = v.substring("bitcoin:".length)
+        val address = body.substringBefore('?')
+        val params = parseUriParams(body.substringAfter('?', ""))
+        val uriSats = btcToSats(params["amount"])
+
+        // BOLT12 offer — the best rail a unified QR can carry.
+        val offer = params["lno"] ?: params["b12"]
+        if (!offer.isNullOrBlank()) {
+            return ScannedKind(
+                SNIconName.Bolt, "Bolt12 offer", "Reusable · over Lightning",
+                uriSats, offer.trim().lowercase(),
+            )
+        }
+        // BOLT11 invoice — its own amount wins over the URI's.
+        val invoice = params["lightning"]
+        if (!invoice.isNullOrBlank()) {
+            val clean = invoice.trim().lowercase()
+            val sats = bolt11AmountSats(clean) ?: uriSats
+            return ScannedKind(
+                SNIconName.Bolt, "Lightning invoice",
+                if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested" else "No amount · you choose",
+                sats, clean,
+            )
+        }
+        // On-chain only. Bech32 is case-insensitive, base58 is NOT — never
+        // lowercase a base58 address or it stops being the same address.
+        val clean = if (looksBech32(address)) address.lowercase() else address
+        return ScannedKind(
+            SNIconName.Coin, "Bitcoin address", "On-chain",
+            uriSats, clean,
+        )
+    }
+
+    // ── bare payloads, optionally scheme-prefixed ──
+    val bare = when {
+        lowerAll.startsWith("lightning:") -> v.substring("lightning:".length).trim()
+        else -> v
+    }
+    val lower = bare.lowercase()
     return when {
         lower.startsWith("lno1") -> ScannedKind(
-            SNIconName.Bolt, "Bolt12 offer", "Reusable · over Lightning", null
+            SNIconName.Bolt, "Bolt12 offer", "Reusable · over Lightning", null, lower
         )
         lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt") -> {
             val sats = bolt11AmountSats(lower)
@@ -219,12 +282,69 @@ internal fun scannedKind(raw: String): ScannedKind {
                 SNIconName.Bolt,
                 "Lightning invoice",
                 if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested" else "No amount · you choose",
-                sats,
+                sats, lower,
             )
         }
-        '@' in lower -> ScannedKind(SNIconName.Globe, v, "Lightning address", null)
-        else -> ScannedKind(SNIconName.Coin, "Bitcoin address", "On-chain", null)
+        '@' in bare -> ScannedKind(SNIconName.Globe, bare, "Lightning address", null, bare)
+        else -> ScannedKind(SNIconName.Coin, "Bitcoin address", "On-chain", null, bare)
     }
+}
+
+private fun looksBech32(address: String): Boolean {
+    val a = address.lowercase()
+    return a.startsWith("bc1") || a.startsWith("tb1") || a.startsWith("bcrt1")
+}
+
+/** `k=v&k=v` → map, keys lower-cased, values percent-decoded. */
+internal fun parseUriParams(query: String): Map<String, String> {
+    if (query.isBlank()) return emptyMap()
+    val out = LinkedHashMap<String, String>()
+    for (pair in query.split('&')) {
+        if (pair.isBlank()) continue
+        val key = pair.substringBefore('=').lowercase()
+        val value = pair.substringAfter('=', "")
+        if (key.isNotEmpty() && key !in out) out[key] = percentDecode(value)
+    }
+    return out
+}
+
+private fun percentDecode(value: String): String {
+    if ('%' !in value && '+' !in value) return value
+    val sb = StringBuilder(value.length)
+    var i = 0
+    while (i < value.length) {
+        val c = value[i]
+        when {
+            c == '+' -> { sb.append(' '); i++ }
+            c == '%' && i + 2 < value.length -> {
+                val hex = value.substring(i + 1, i + 3).toIntOrNull(16)
+                if (hex != null) { sb.append(hex.toChar()); i += 3 } else { sb.append(c); i++ }
+            }
+            else -> { sb.append(c); i++ }
+        }
+    }
+    return sb.toString()
+}
+
+/**
+ * BIP-21 `amount` is decimal **BTC**. Parsed digit-by-digit rather than through
+ * a Double: `0.1 + 0.2` arithmetic has no place anywhere near an amount a user
+ * is about to send.
+ */
+internal fun btcToSats(amount: String?): Long? {
+    val raw = amount?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+    if (!raw.all { it.isDigit() || it == '.' }) return null
+    if (raw.count { it == '.' } > 1) return null
+    val whole = raw.substringBefore('.').ifEmpty { "0" }
+    val fractionRaw = raw.substringAfter('.', "")
+    // More than 8 decimals cannot be expressed in sats; refuse rather than
+    // silently truncate someone's amount.
+    if (fractionRaw.length > 8) return null
+    val fraction = fractionRaw.padEnd(8, '0')
+    val wholeSats = whole.toLongOrNull()?.times(100_000_000L) ?: return null
+    val fracSats = fraction.toLongOrNull() ?: return null
+    val total = wholeSats + fracSats
+    return total.takeIf { it > 0 }
 }
 
 /**

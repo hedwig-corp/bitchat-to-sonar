@@ -120,7 +120,8 @@ struct SonarSendPaymentScreen: View {
                     // ── External destination ──
                     if let external = SNExternalDestination(input: trimmed) {
                         Button {
-                            externalTarget = trimmed
+                            externalTarget = external.destination
+                            fixedSats = external.fixedSats
                         } label: {
                             HStack(spacing: 12) {
                                 RoundedRectangle(cornerRadius: 11, style: .continuous)
@@ -315,18 +316,38 @@ struct SonarSendPaymentScreen: View {
 struct SNExternalDestination {
     let icon: SNIconName
     let subtitle: String
+    /// What to hand the wallet — for a BIP-21 URI this is the extracted rail.
+    let destination: String
+    /// Amount the payload fixes, if any.
+    let fixedSats: Int64?
 
     init?(input: String) {
-        let v = input.lowercased()
-        if v.hasPrefix("lno1") {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        let v = trimmed.lowercased()
+        // A pasted BIP-21 / lightning URI resolves exactly like a scanned one,
+        // so the offer inside `?lno=` is paid rather than the URI itself.
+        if v.hasPrefix("bitcoin:") || v.hasPrefix("lightning:") {
+            let kind = SNScannedKind(trimmed)
+            guard !kind.destination.isEmpty else { return nil }
+            self.icon = kind.icon
+            self.subtitle = kind.sub
+            self.destination = kind.destination
+            self.fixedSats = kind.fixedSats
+        } else if v.hasPrefix("lno1") {
             self.icon = .bolt
             self.subtitle = "Bolt12 offer · over Lightning"
+            self.destination = v
+            self.fixedSats = nil
         } else if v.hasPrefix("lnbc") || v.hasPrefix("lntb") || v.hasPrefix("lnbcrt") {
             self.icon = .bolt
             self.subtitle = "Lightning invoice"
+            self.destination = v
+            self.fixedSats = SNScannedKind.bolt11AmountSats(v)
         } else if Self.looksLikeLightningAddress(v) {
             self.icon = .globe
             self.subtitle = "Lightning address · over the internet"
+            self.destination = trimmed
+            self.fixedSats = nil
         } else {
             return nil
         }
