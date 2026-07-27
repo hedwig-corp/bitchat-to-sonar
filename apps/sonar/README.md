@@ -26,7 +26,7 @@ composeApp/src/
 | Location channels ("Around you")    |   ✅ GPS | ⚪️ opt-in IP geolocation (Settings) |
 | BLE mesh: discovery (scan)         |   ✅    |   ✅ macOS (CoreBluetooth) + Linux (BlueZ) |
 | BLE mesh: advertise + GATT server  |   ✅    |   ✅ macOS only, ⚪️ not implemented on Linux (Windows: crate does not build) |
-| BLE mesh — messaging (DMs/broadcast)|   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
+| BLE mesh: messaging (DMs/broadcast) |   ✅    |   ⚪️ next stage (Noise-over-GATT transport) |
 | Unify nearby payments (BLE)         |   ✅    |   ⚪️ not yet (same bridge, later) |
 | Lightning wallet (⚡PAY)            |   ✅ (Breez) | ⚪️ unavailable (no desktop Breez build yet) |
 
@@ -113,7 +113,9 @@ The desktop discovers nearby bitchat-mesh phones over BLE. Two conditions:
 
 Then click **Sonar** in the sidebar → the phone appears as a node on the radar
 (and the sidebar shows "N people in range"). Set `SONAR_BLE_DEBUG=1` to trace the
-scan to `/tmp/sonar-ble.log`.
+scan to `$XDG_STATE_HOME/sonar/sonar-ble.log` (default `~/.local/state/sonar/`
+on Linux, `~/Library/Logs/sonar/` on macOS). Device addresses and names are
+never written there.
 
 ## Build & run — Android
 

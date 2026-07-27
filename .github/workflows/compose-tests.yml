@@ -89,8 +89,11 @@ jobs:
       # predicate it tests is dead code on CoreBluetooth. Running these only in
       # the macOS core-tests job would leave the Linux behavior unguarded on
       # Linux, so run them here too.
+      # --release so these artifacts are shared with the build-desktop.sh
+      # invocation in the JVM step below, instead of building btleplug + bluster
+      # + dbus + tokio twice in one job.
       - name: Test the desktop BLE bridge (BlueZ path)
-        run: cargo test
+        run: cargo test --release
         working-directory: core/sonar-ble
 
       - name: Run JVM unit tests (builds desktop Rust core + BLE bridge + UniFFI bindings)

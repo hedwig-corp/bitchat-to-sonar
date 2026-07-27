@@ -365,12 +365,23 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
         // the map grow for the life of the session. BLE addresses rotate for
         // privacy, so a single nearby radio produces a new key every few minutes.
         let now = Instant::now();
+        let key = id.to_string();
         d.retain(|_, s| now.duration_since(s.at) < PEER_TTL);
         // Hard cap as well: the bitchat service UUID is public and unauthenticated,
-        // so anyone can mint fresh entries faster than the TTL expires them. Drop
-        // the oldest rather than refusing the newest, so a flood cannot pin the map
-        // to stale devices and hide a real phone.
-        if d.len() >= MAX_TRACKED_DEVICES && !d.contains_key(&id.to_string()) {
+        // so anyone can mint fresh entries faster than the TTL expires them.
+        //
+        // Eviction is LRU by last-seen. Be clear about what that does and does not
+        // buy: under a flood the attacker's entries are the NEWEST by construction,
+        // while a real phone holds the oldest `at` (it only refreshes each
+        // RESCAN_EVERY, because duplicate adverts are coalesced), so LRU evicts the
+        // genuine peer FIRST. It bounds memory; it does not keep a real phone on the
+        // radar during a flood. Refusing the newest instead would be worse (an
+        // attacker could then freeze the map), and the blast radius is cosmetic
+        // today because MeshRadio.peers() collapses every scan hit into one
+        // "nearby phone" node, so only the reported RSSI is affected. Keeping a
+        // real peer discoverable under flood needs authentication, not an eviction
+        // policy.
+        if d.len() >= MAX_TRACKED_DEVICES && !d.contains_key(&key) {
             if let Some(oldest) = d
                 .iter()
                 .min_by_key(|(_, s)| s.at)
@@ -379,10 +390,7 @@ async fn handle_event(central: &btleplug::platform::Adapter, ev: CentralEvent) {
                 d.remove(&oldest);
             }
         }
-        d.insert(
-            id.to_string(),
-            Seen { name, rssi, at: Instant::now() },
-        );
+        d.insert(key, Seen { name, rssi, at: now });
     }
 }
 

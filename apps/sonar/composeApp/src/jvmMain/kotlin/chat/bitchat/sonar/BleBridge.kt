@@ -42,8 +42,9 @@ object BleBridge {
      * server). False on Linux/Windows, where only the scan radar works, so callers
      * must not treat [available] as "phones can discover this desktop".
      */
-    val advertisingSupported: Boolean
-        get() = runCatching { lib?.sonar_ble_advertising_supported() == true }.getOrDefault(false)
+    val advertisingSupported: Boolean by lazy {
+        runCatching { lib?.sonar_ble_advertising_supported() == true }.getOrDefault(false)
+    }
 
     private fun load(): BleLib? = runCatching {
         val mapped = System.mapLibraryName("sonar_ble") // libsonar_ble.dylib / .so / sonar_ble.dll
