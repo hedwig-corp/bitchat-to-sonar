@@ -305,12 +305,19 @@ struct BLEServiceCoreTests {
         #expect(TransportConfig.bleRoutingReachabilitySeconds
                 < TransportConfig.bleReachabilityRetentionVerifiedSeconds)
 
-        // At or below one worst-case announce gap: beyond that the peer has
-        // already missed an announce and Nostr is the better transport.
-        let sparseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsSparse
-            + TransportConfig.bleConnectedAnnounceJitterSparse
+        // ...but never tighter than ONE worst-case announce gap. `ChatViewModel`
+        // gates sending on this same `isPeerReachable`, so a shorter window
+        // marks a healthily-announcing peer unreachable for part of every cycle
+        // and a mesh-only contact's DM is marked `.failed` ("recipient
+        // unreachable") while the radar still shows them.
+        let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
+            + TransportConfig.bleConnectedAnnounceJitterDense
             + TransportConfig.bleMaintenanceInterval
-        #expect(TransportConfig.bleRoutingReachabilitySeconds <= sparseWorstGap)
+        #expect(TransportConfig.bleRoutingReachabilitySeconds >= denseWorstGap)
+
+        // Routing gives up after ONE missed announce, the radar after two.
+        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds
+                >= 2 * TransportConfig.bleRoutingReachabilitySeconds)
     }
 
     // A Sonar 0x53 from a peer we have no verified 0x01 for must trigger an

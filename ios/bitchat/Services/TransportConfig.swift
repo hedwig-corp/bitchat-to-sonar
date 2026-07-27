@@ -111,16 +111,21 @@ enum TransportConfig {
     // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
     static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0    // >= 3x(30+8+5)
     static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 130.0  // >= 3x(30+8+5)
-    // Window for DM TRANSPORT SELECTION, deliberately much tighter than the
-    // radar windows above. `MessageRouter` is built as
+    // Window for DM TRANSPORT SELECTION, tighter than the radar windows above
+    // but NOT tighter than one announce cycle. `MessageRouter` is built as
     // `[meshService, nostrTransport]` and picks the first transport whose
-    // `isPeerReachable` is true, so a wide window here hands DMs to a stale
-    // mesh route — and a mesh send is marked `.sent` with no receipt timeout
-    // (#312), so it never falls back to Nostr. Keep it at or below ONE
-    // worst-case announce gap: past that the peer has already missed an
-    // announce and Nostr is the better transport. Android draws the same
-    // split — generous radar grace, routing gated on live link state.
-    static let bleRoutingReachabilitySeconds: TimeInterval = 21.0
+    // `isPeerReachable` is true, so a wide window hands DMs to a stale mesh
+    // route — a mesh send is marked `.sent` with no receipt timeout (#312) and
+    // never falls back to Nostr.
+    //
+    // The floor matters just as much as the ceiling: `ChatViewModel` gates
+    // sending on this same `isPeerReachable`, so a value below the worst-case
+    // announce gap (30+8+5 = 43s dense) marks a peer that is announcing
+    // perfectly healthily as unreachable for part of every cycle — and a
+    // mesh-only contact's DM is then marked `.failed` ("recipient
+    // unreachable") while the radar still shows them. So: one worst-case gap,
+    // give up after ONE missed announce, where the radar gives up after two.
+    static let bleRoutingReachabilitySeconds: TimeInterval = 45.0  // >= 1x(30+8+5)
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0
