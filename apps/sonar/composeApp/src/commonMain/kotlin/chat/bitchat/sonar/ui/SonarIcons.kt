@@ -44,6 +44,8 @@ enum class SNIconName {
     Drive, Data, ArrowOut,
     // Muted-chat glyph: the Bell with a strike-through (design bellOff).
     BellOff,
+    // Wallet activity: incoming payment (design icons.jsx `download`).
+    Download,
 }
 
 private sealed interface Shape {
@@ -72,6 +74,8 @@ private val ICONS: Map<SNIconName, List<Shape>> = mapOf(
     SNIconName.Check to listOf(Shape.P("M5 12.8l4.3 4.3L19 7.4")),
     // design icons.jsx `send` — the composer send arrow.
     SNIconName.Send to listOf(Shape.P("M12 18.5v-13M6.5 11 12 5.5 17.5 11")),
+    // design icons.jsx `download`: the incoming-payment glyph on the wallet row.
+    SNIconName.Download to listOf(Shape.P("M12 4v11M7.5 10.5 12 15l4.5-4.5"), Shape.P("M5 19.5h14")),
     SNIconName.Shield to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z")),
     SNIconName.ShieldCheck to listOf(Shape.P("M12 3.4l7 2.7v5.2c0 4.4-2.9 7.4-7 9-4.1-1.6-7-4.6-7-9V6.1z"), Shape.P("M8.8 12.1l2.3 2.3 4.3-4.6")),
     SNIconName.X to listOf(Shape.P("M6.5 6.5l11 11M17.5 6.5l-11 11")),

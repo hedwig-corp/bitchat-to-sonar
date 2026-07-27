@@ -141,24 +141,25 @@ There are two ways to start a payment:
    identity, not something the wallet can pay. Such a person shows up under
    "People you can pay" once their descriptor arrives.
 
-**Tracked gap (both platforms):** the design's "Scan a QR code" row is not
-implemented. Sonar has no camera decoder on Android/desktop (zxing is bundled
-for *encoding* invite QRs only), and shipping it on iOS alone would break the
-Cross-Platform Feature Rule. Follow-up: add a shared scanner (CameraX + a
-decoder on Android, the existing `AVCaptureMetadataOutput` path from
-`VerificationViews.swift` on iOS), then restore the row in both screens.
-Pasting the code into the field covers the same destinations meanwhile.
-
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,
 then posts gold payment receipt bubbles using the encrypted chat transport.
 There is no "tap to claim" step for these bubbles.
 
-The **Wallet → Activity** screen is a log only: balance card, then the
-transaction list. It carries no Send/Receive buttons — paying always starts
-from the new-chat sheet or from inside a chat (this matches the design's
-`WalletScreen`).
+The **Wallet → Activity** screen is a log only, reproducing the design's
+`WalletScreen` + `WalletActivity`: the centered balance block, then the
+transaction list — no Send/Receive buttons, because paying always starts from
+the new-chat sheet or from inside a chat. Each row is
+`send`/`download` glyph on indigo/green · "To <who>" / "From <who>" ·
+"<status> · <rail> · <time>" · a signed amount that greys out and strikes
+through when the payment failed.
+
+One data gap feeds that row: Compose's `PayEntry` does not persist a peer key,
+so a chat ⚡PAY receipt with no matching wallet-activity row has no name to
+show and falls back to the design's own "unknown". Direct wallet activity
+always carries `peerName`. iOS renders from the activity ledger only, so it is
+unaffected.
 
 The wallet sheet also lists direct payment activity, newest first, including:
 

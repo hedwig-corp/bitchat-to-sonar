@@ -30,6 +30,8 @@ enum SNIconName: String {
     case link
     // Contact profile favorite toggle (Compose SNIconName.Heart, verbatim path).
     case heart
+    // Wallet activity: incoming payment (design icons.jsx `download`).
+    case download
 }
 
 private enum SNIconElement {
@@ -44,6 +46,8 @@ private let snIconTable: [SNIconName: [SNIconElement]] = [
     .lock: [.rect(5.5, 10.5, 13, 9.5, 2.6), .path("M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5")],
     .plus: [.path("M12 5.5v13M5.5 12h13")],
     .send: [.path("M12 18.5v-13M6.5 11 12 5.5 17.5 11")],
+    // design icons.jsx `download`: the incoming-payment glyph on the wallet row.
+    .download: [.path("M12 4v11M7.5 10.5 12 15l4.5-4.5"), .path("M5 19.5h14")],
     .search: [.circle(11, 11, 5.6, filled: false), .path("M15.4 15.4 20 20")],
     .pin: [
         .path("M12 20.8s-6.3-5.3-6.3-10.2a6.3 6.3 0 0 1 12.6 0c0 4.9-6.3 10.2-6.3 10.2z"),

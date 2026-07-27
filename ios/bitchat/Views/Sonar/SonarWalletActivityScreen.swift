@@ -2,10 +2,11 @@
 // SonarWalletActivityScreen.swift
 // bitchat
 //
-// Wallet activity screen: gold-themed balance card plus the transaction log
-// from SonarPaymentActivityLedger. It is a log only — sending starts from the
-// new-chat sheet or inside a chat. Ported from the Compose Multiplatform
-// SonarWalletActivityScreen.
+// Wallet — 1:1 with the design's `WalletScreen` + `WalletActivity`
+// (design/handoff/project/sonar/settings.jsx and pay.jsx): the balance block,
+// then the transaction log. It is a log only; there are no send/receive actions
+// here — paying starts from the new-chat sheet or inside a chat. Mirrors the
+// Compose Multiplatform SonarWalletActivityScreen.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -27,57 +28,38 @@ struct SonarWalletActivityScreen: View {
 
             ScrollView {
                 VStack(spacing: 0) {
-                    // ── Balance card ──
-                    VStack(spacing: 0) {
-                        SNIcon(name: .coin, size: 32)
-                            .foregroundColor(SonarTheme.goldDeep)
-                        HStack(alignment: .bottom, spacing: 6) {
-                            Text(verbatim: sonarFormatSats(balanceSats))
-                                .font(SonarTheme.uiFont(size: 36, weight: .heavy))
-                                .foregroundColor(SonarTheme.text)
-                            Text("sats")
-                                .font(SonarTheme.uiFont(size: 15, weight: .bold))
-                                .foregroundColor(SonarTheme.text3)
-                                .padding(.bottom, 5)
-                        }
-                        .padding(.top, 10)
-                        if let fiat = store.fiatText(balanceSats) {
-                            Text(verbatim: fiat)
-                                .font(SonarTheme.uiFont(size: 14))
-                                .foregroundColor(SonarTheme.text2)
-                                .padding(.top, 4)
-                        }
-                        Text("Lightning wallet")
-                            .font(SonarTheme.uiFont(size: 12))
+                    // ── .wallet-balance: centered, 14px top / 6px bottom, 3px gap ──
+                    VStack(spacing: 3) {
+                        // .wallet-balnum: 34/800, -0.02em. `money()` is the
+                        // design's walletStr — sats or fiat, per the user's
+                        // display preference.
+                        Text(verbatim: store.money(balanceSats))
+                            .font(SonarTheme.uiFont(size: 34, weight: .heavy))
+                            .kerning(34 * -0.02)
+                            .foregroundColor(SonarTheme.text)
+                        // .wallet-ballabel: 12.5px, text3
+                        Text("Balance · pays directly, no claim step")
+                            .font(SonarTheme.uiFont(size: 12.5))
                             .foregroundColor(SonarTheme.text3)
-                            .padding(.top, 6)
                     }
                     .frame(maxWidth: .infinity)
-                    .padding(20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 20, style: .continuous)
-                            .fill(SonarTheme.goldSoft)
-                    )
-                    .padding(EdgeInsets(top: 10, leading: 14, bottom: 4, trailing: 14))
+                    .padding(.top, 14)
+                    .padding(.bottom, 6)
 
-                    // ── Activity ──
-                    // Design (`design/handoff/project/sonar/settings.jsx`
-                    // WalletScreen): balance, then the transaction log. No
-                    // send/receive actions live here — paying starts from the
-                    // new-chat sheet or inside a chat.
                     SNSectionLabel("Activity")
 
                     if entries.isEmpty {
-                        SNEmptyState(
-                            icon: .bolt, iconSize: 24,
-                            title: "No transactions yet",
-                            desc: "Payments you send and receive show up here."
-                        )
-                        .frame(height: 200)
+                        // .wallet-empty: centered text3, 14px, 30px/20px padding
+                        Text("No transactions yet.")
+                            .font(SonarTheme.uiFont(size: 14))
+                            .foregroundColor(SonarTheme.text3)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                            .padding(EdgeInsets(top: 30, leading: 20, bottom: 30, trailing: 20))
                     } else {
                         VStack(spacing: 0) {
-                            ForEach(entries) { entry in
-                                activityRow(entry)
+                            ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
+                                activityRow(entry, divider: index < entries.count - 1)
                             }
                         }
                     }
@@ -89,65 +71,75 @@ struct SonarWalletActivityScreen: View {
         .background(SonarTheme.bg.ignoresSafeArea())
     }
 
-    private func activityRow(_ entry: SonarPaymentActivity) -> some View {
+    /// .wallet-txrow — icon bubble, "To/From <who>", "<status> · <rail> · <time>",
+    /// signed amount.
+    private func activityRow(_ entry: SonarPaymentActivity, divider: Bool) -> some View {
         let sent = entry.direction == .outgoing
-        let icon: SNIconName = sent ? .bolt : .coin
+        let failed = entry.status == .failed
 
+        // Design pay.jsx WalletActivity: send glyph out, download glyph in.
+        let icon: SNIconName = sent ? .send : .download
+        // .wallet-txicon.out = net-soft/net-deep, .in = green-soft/green-deep
+        let tileBg = sent ? SonarTheme.netSoft : SonarTheme.greenSoft
+        let tileFg = sent ? SonarTheme.netDeep : SonarTheme.greenDeep
+
+        // Design status words. The app has no separate "confirmed" state — a
+        // settled outgoing payment is "Sent", a settled incoming one "Received".
         let statusLabel: String = {
             switch entry.status {
-            case .paid: return "Completed"
             case .pending: return "Pending"
             case .failed: return "Failed"
+            case .paid: return sent ? "Sent" : "Received"
             }
         }()
+        let rail = entry.via == SNVia.mesh.rawValue ? "Bluetooth" : "Lightning"
+        // Same label the chat list uses: today → HH:MM, this week → weekday,
+        // older → date. Matches the design's `tx.time` ("18:06" / "Mon").
+        let time = SonarAppStore.listTime(entry.settledAt ?? entry.createdAt)
+        let meta = time.isEmpty
+            ? "\(statusLabel) · \(rail)"
+            : "\(statusLabel) · \(rail) · \(time)"
 
-        let statusColor: Color = {
-            switch entry.status {
-            case .paid: return SonarTheme.green
-            case .pending: return SonarTheme.goldDeep
-            case .failed: return SonarTheme.danger
-            }
-        }()
+        return VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Circle()
+                    .fill(tileBg)
+                    .frame(width: 36, height: 36)
+                    .overlay(
+                        SNIcon(name: icon, size: 16, weight: 2.2)
+                            .foregroundColor(tileFg)
+                    )
 
-        let amountPrefix = sent ? "" : "+"
-        let amountColor = sent ? SonarTheme.text : SonarTheme.green
-        let fiat = store.fiatText(entry.sats)
-
-        return HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 11, style: .continuous)
-                .fill(SonarTheme.goldSoft)
-                .frame(width: 38, height: 38)
-                .overlay(
-                    SNIcon(name: icon, size: 18)
-                        .foregroundColor(SonarTheme.goldDeep)
-                )
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: sent ? "Sent" : "Received")
-                    .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
-                    .foregroundColor(SonarTheme.text)
-                HStack(spacing: 0) {
-                    Text(verbatim: statusLabel)
+                VStack(alignment: .leading, spacing: 1) {
+                    // .wallet-txwho: 15.5/650
+                    Text(verbatim: (sent ? "To " : "From ") + entry.peerName)
+                        .font(SonarTheme.uiFont(size: 15.5, weight: .semibold))
+                        .foregroundColor(SonarTheme.text)
+                        .lineLimit(1)
+                    // .wallet-txmeta: 12.5px, text2 — not status-colored in the design.
+                    Text(verbatim: meta)
                         .font(SonarTheme.uiFont(size: 12.5))
-                        .foregroundColor(statusColor)
-                    Text(verbatim: " · Lightning")
-                        .font(SonarTheme.uiFont(size: 12.5))
-                        .foregroundColor(SonarTheme.text3)
+                        .foregroundColor(SonarTheme.text2)
+                        .lineLimit(1)
                 }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            VStack(alignment: .trailing, spacing: 2) {
-                Text(verbatim: "\(amountPrefix)\(sonarFormatSats(entry.sats)) sats")
-                    .font(SonarTheme.uiFont(size: 16, weight: .semibold))
-                    .foregroundColor(amountColor)
-                if let fiat {
-                    Text(verbatim: fiat)
-                        .font(SonarTheme.uiFont(size: 12))
-                        .foregroundColor(SonarTheme.text3)
-                }
+                // .wallet-txamt: 15/700; .in green-deep; .failed text3 + strikethrough
+                Text(verbatim: (sent ? "−" : "+") + store.money(entry.sats))
+                    .font(SonarTheme.uiFont(size: 15, weight: .bold))
+                    .monospacedDigit()
+                    .strikethrough(failed)
+                    .foregroundColor(failed ? SonarTheme.text3 : (sent ? SonarTheme.text : SonarTheme.greenDeep))
+            }
+            .padding(EdgeInsets(top: 11, leading: 18, bottom: 11, trailing: 18))
+
+            // .wallet-txrow::after — hairline inset to 64px, hidden on the last row
+            if divider {
+                SonarTheme.hairline
+                    .frame(height: 1)
+                    .padding(.leading, 64)
+                    .padding(.trailing, 18)
             }
         }
-        .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))
     }
 }

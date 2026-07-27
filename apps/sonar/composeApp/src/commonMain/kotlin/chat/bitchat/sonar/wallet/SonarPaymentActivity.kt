@@ -226,8 +226,9 @@ class SonarPaymentActivityLedger(blob: String = "") {
 /**
  * One row of the merged wallet Activity list: either a chat ⚡PAY receipt
  * ([PayEntry]) or a direct wallet payment ([SonarPaymentActivity]) projected
- * into the shape the iOS `SonarWalletActivityScreen` row renders (Sent/Received
- * title, Completed/Pending/Failed status, amount).
+ * into the shape the design's `WalletActivity` row renders — "To <who>" /
+ * "From <who>", "<status> · <rail> · <time>", and a signed amount
+ * (design/handoff/project/sonar/pay.jsx).
  */
 data class WalletActivityItem(
     val id: String,
@@ -236,6 +237,16 @@ data class WalletActivityItem(
     val status: SonarPaymentActivity.Status,
     /** Sort key, newest first. 0 for legacy receipts persisted without a time. */
     val sortSecs: Long,
+    /**
+     * Counterparty name for the "To …" / "From …" title. Null for chat ⚡PAY
+     * receipts: [PayEntry] does not persist a peer key, so a receipt-only row
+     * (an incoming chat payment, or a legacy row) has no name to show and the
+     * UI falls back to the design's own "unknown". Direct wallet activity
+     * always carries one.
+     */
+    val who: String? = null,
+    /** "mesh" | "internet"; null when the source row does not record a rail. */
+    val via: String? = null,
 )
 
 /**
@@ -262,6 +273,8 @@ fun mergeWalletActivity(
             sats = a.sats,
             status = a.status,
             sortSecs = a.displaySecs,
+            who = a.peerName,
+            via = a.via,
         )
     }
     for (r in receipts.asReversed()) {
