@@ -70,6 +70,26 @@ class SonarPushProcessingService : Service() {
      *  foreground service the process can be killed mid-answer or ANR. */
     @Volatile private var fgsReady = false
 
+    /**
+     * Wakes currently running on [scope].
+     *
+     * A per-wake `stopSelf(startId)` is wrong here: Android's contract is "stop
+     * the service if [startId] is the most recent start id", NOT "release my own
+     * reference". So whichever wake finishes FIRST stops the service for
+     * everyone, and `onDestroy` → `scope.cancel()` kills the rest mid-flight.
+     * Observed on device: a Marmot sync (later push, higher id) completed and
+     * 24ms later the in-flight Breez settle wake died with
+     * JobCancellationException — on the money path, that is an unanswered
+     * invoice_request and a payer timeout. The 45s Breez budget makes a Marmot
+     * push landing inside that window routine, not rare.
+     */
+    private val inFlightWakes = AtomicInteger(0)
+
+    /** Newest delivered start id. The last wake to finish stops the service with
+     *  THIS id, not its own, so a start delivered meanwhile is not discarded —
+     *  `stopSelf` with a stale id is a no-op and would strand the service. */
+    @Volatile private var lastStartId = 0
+
     override fun onCreate() {
         super.onCreate()
         Notifier.ensureChannel()
@@ -152,16 +172,25 @@ class SonarPushProcessingService : Service() {
         val type = intent?.getStringExtra(EXTRA_PUSH_TYPE)
         Log.d(TAG, "Processing push type=$type")
 
+        lastStartId = startId
+        inFlightWakes.incrementAndGet()
         scope.launch {
-            when (type) {
-                TYPE_MARMOT -> processMarmotWakeup()
-                TYPE_BREEZ -> processBreezWakeup(
-                    intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
-                    intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: "",
-                )
-                else -> Log.w(TAG, "Unknown push type: $type")
+            try {
+                when (type) {
+                    TYPE_MARMOT -> processMarmotWakeup()
+                    TYPE_BREEZ -> processBreezWakeup(
+                        intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
+                        intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: "",
+                    )
+                    else -> Log.w(TAG, "Unknown push type: $type")
+                }
+            } finally {
+                // Stop only when nothing is left running — see [inFlightWakes].
+                // `finally` (not the happy path) so a cancelled or throwing wake
+                // still releases its slot; stopSelf does not suspend, so it runs
+                // even from a cancelled coroutine.
+                if (inFlightWakes.decrementAndGet() == 0) stopSelf(lastStartId)
             }
-            stopSelf(startId)
         }
 
         return START_NOT_STICKY
@@ -555,7 +584,8 @@ class SonarPushProcessingService : Service() {
             return
         }
         val answered = withTimeoutOrNull(remainingMs) {
-            val body = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest).fold(
+            val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
+            val body = invoice.fold(
                 onSuccess = { JsonLite.encodeObject("invoice", it) },
                 onFailure = {
                     // Keep the detailed SDK message local; the reply is relayed
@@ -565,9 +595,14 @@ class SonarPushProcessingService : Service() {
                     JsonLite.encodeObject("error", "failed to create invoice")
                 },
             )
-            postReply(req.replyUrl, body)
+            postReply(req.replyUrl, body) to invoice.isSuccess
         }
-        Log.d(TAG, "invoice_request answered (posted=${answered ?: false})")
+        // `posted` is only the HTTP 2xx — BOTH an invoice and an {"error": ...}
+        // reply post successfully, so log the outcome separately. Without this
+        // the one line you actually grep in the field cannot tell "we answered
+        // the payer" from "we politely told the payer we failed".
+        Log.d(TAG, "invoice_request answered (posted=${answered?.first ?: false} " +
+            "invoice=${answered?.second ?: false})")
     }
 
     /** POST [body] as JSON to [url]; true on 2xx. Bounded timeouts — the whole
@@ -645,6 +680,10 @@ class SonarPushProcessingService : Service() {
     }
 
     override fun onDestroy() {
+        // Close the gate before cancelling, same ordering as stopWakeWork: a
+        // wake launched onto an already-cancelled scope never runs its body, so
+        // its `finally` never releases the [inFlightWakes] slot it took.
+        fgsReady = false
         scope.cancel()
         super.onDestroy()
     }
