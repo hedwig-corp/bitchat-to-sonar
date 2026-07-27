@@ -186,6 +186,14 @@ actual object WalletBridge {
             // seed.
             recoverPendingCleanupLocked()
             val existing = sdk
+            // Mirror of RelayConnectionPolicy.shouldInvalidateOnPushWake: a push
+            // landing while the UI is up reaches a node the user may have an
+            // in-flight send on, and the probe can time out simply because that
+            // node is busy or the radio just thawed. Tearing it down then tells
+            // the user their payment failed while its swap state is ambiguous.
+            // A visible app is already driving its own connection health, so
+            // trust the existing handle and skip probe+reconnect entirely.
+            if (existing != null && SonarLifecycle.appVisible) return@withLock true
             if (existing != null) {
                 // Bound the probe: getInfo() is a blocking native call, and a
                 // half-dead websocket could hang it for the SDK's internal
@@ -278,6 +286,10 @@ actual object WalletBridge {
             feesSats = p.feesSat.toLong(),
             timestampSecs = p.timestamp.toLong(),
             preimage = lightning?.preimage,
+            // Only COMPLETE is money that has actually arrived. recentIncoming-
+            // Receives also returns PENDING so a wake can stop waiting once the
+            // claim is in flight; that state must not notify or write `Paid`.
+            settled = p.status == PaymentState.COMPLETE,
         )
     }
 
@@ -343,9 +355,15 @@ actual object WalletBridge {
      * so the payer can pay it. The exact call iOS's `InvoiceRequestTask` makes
      * in the NSE (`liquidSDK.createBolt12Invoice`); on Android the push service
      * calls this headlessly and POSTs the result to the NDS reply URL itself,
-     * because the KMP bindings ship no notification plugin. Held under [lock]
-     * for the same reason as [recentIncomingReceives] — the handle must not be
-     * torn down while the (multi-second) native call is in flight.
+     * because the KMP bindings ship no notification plugin.
+     *
+     * [lock] is held while we WAIT on the call, so a concurrent shutdown or
+     * reconnect cannot swap the handle out between reading `sdk` and using it.
+     * It deliberately does NOT cover the whole native call: on timeout we
+     * release the lock and abandon the work, so an orphaned call can still be
+     * in flight against `node` while [ensureLiveConnection] disconnects it.
+     * That is an errored call, not a use-after-free — `disconnect()` on the Rust
+     * side is a graceful shutdown-signal plus task-join, never a free.
      *
      * The native call runs on [walletScope], NOT as a child of this coroutine.
      * The caller wraps this in `withTimeoutOrNull`, and a blocking UniFFI call
@@ -409,7 +427,15 @@ actual object WalletBridge {
 
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {
-            val node = sdk ?: return@withContext SendResult(false)
+            // Capture the handle under [lock] so a concurrent Breez wake cannot
+            // swap it between this read and the calls below. The lock is NOT
+            // held for the whole send: a send is multi-second network work, and
+            // holding it would block a concurrent wake's invoice_request answer
+            // — trading a send hazard for a payer timeout. The real protection
+            // against a mid-send teardown is the appVisible guard in
+            // [ensureLiveConnection]: a user-initiated send implies a visible
+            // UI, and that path no longer probes or reconnects at all.
+            val node = lock.withLock { sdk } ?: return@withContext SendResult(false)
             if (amountSats < 0) return@withContext SendResult(false)
             try {
                 val amount: PayAmount? =

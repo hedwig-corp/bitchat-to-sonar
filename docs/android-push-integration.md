@@ -79,7 +79,7 @@ Add the FCM service and `FOREGROUND_SERVICE` permission to
 ```xml
 <!-- Inside <manifest>, alongside existing permissions: -->
 <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+<!-- shortService needs no type-specific permission (unlike dataSync). -->
 <uses-permission android:name="android.permission.WAKE_LOCK" />
 
 <!-- Inside <application>: -->
@@ -97,7 +97,7 @@ Add the FCM service and `FOREGROUND_SERVICE` permission to
 <service
     android:name=".SonarPushProcessingService"
     android:exported="false"
-    android:foregroundServiceType="dataSync" />
+    android:foregroundServiceType="shortService" />
 ```
 
 ## 3. FCM Token Collection and Registration
@@ -316,7 +316,7 @@ class SonarPushProcessingService : Service() {
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(FOREGROUND_ID, notification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE)
         } else {
             startForeground(FOREGROUND_ID, notification)
         }

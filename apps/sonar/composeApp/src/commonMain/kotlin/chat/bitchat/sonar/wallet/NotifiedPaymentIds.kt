@@ -61,6 +61,19 @@ private val notifiedIdsLock = ConcurrencyLock()
  * Guarded because the Breez SDK callback thread and the push service's wake
  * coroutines both run this load → mark → persist round-trip.
  */
+/**
+ * Whether [paymentId] already produced a notification, WITHOUT claiming it.
+ *
+ * Needed for the PENDING case: a receive whose claim is still in flight ends
+ * the wake but must not claim the notify slot (it may never complete). Reading
+ * the ring lets the wake tell "pending arrival of something new" from "pending
+ * re-report of a payment an earlier wake already announced", so a stale pending
+ * row cannot keep ending every wake for the rest of the lookback window.
+ */
+fun wasPaymentNotified(paymentId: String): Boolean = notifiedIdsLock.withLock {
+    NotifiedPaymentIds(SonarCore.loadBlob(NOTIFIED_PAYMENT_IDS_BLOB)).contains(paymentId)
+}
+
 fun claimNotifiedPaymentId(paymentId: String): Boolean = notifiedIdsLock.withLock {
     val ring = NotifiedPaymentIds(SonarCore.loadBlob(NOTIFIED_PAYMENT_IDS_BLOB))
     if (!ring.markNotified(paymentId)) return@withLock false

@@ -39,9 +39,14 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         }
 
         // Starting a background FGS is only legal under the high-priority FCM
-        // allowlist; a downgraded push would throw ForegroundServiceStart-
-        // NotAllowedException. When not high AND we're backgrounded, skip the
-        // FGS start (it can't legally run) and surface why.
+        // allowlist; a downgraded push throws ForegroundServiceStartNotAllowed-
+        // Exception, which the handlers below catch and log.
+        //
+        // Deliberately NOT used as a guard: this is diagnostic only. We still
+        // attempt the start on a NORMAL-priority push because the app may be
+        // visible (also exempt), and a wrong skip loses a real wake — worse
+        // than a caught exception. Do not turn this into a branch without
+        // also checking visibility.
         val highPriority = message.priority == RemoteMessage.PRIORITY_HIGH
 
         when {

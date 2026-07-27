@@ -30,7 +30,9 @@ import chat.bitchat.sonar.resolvePushSenderName
 import chat.bitchat.sonar.shortNpubLabel
 import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
+import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.wallet.claimNotifiedPaymentId
+import chat.bitchat.sonar.wallet.wasPaymentNotified
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
@@ -90,6 +92,12 @@ class SonarPushProcessingService : Service() {
      *  `stopSelf` with a stale id is a no-op and would strand the service. */
     @Volatile private var lastStartId = 0
 
+    /** Reply URL of an invoice_request we have accepted but not yet answered.
+     *  Set once the URL passes the pin, cleared as soon as any reply is POSTed,
+     *  so [stopWakeWork] can send a bail-out error for exactly the window where
+     *  a payer is blocked on us. */
+    @Volatile private var pendingReplyUrl: String? = null
+
     override fun onCreate() {
         super.onCreate()
         Notifier.ensureChannel()
@@ -101,33 +109,48 @@ class SonarPushProcessingService : Service() {
                 )
             }
         }
+        fgsReady = enterForeground()
+        if (!fgsReady) {
+            // e.g. the background-start allowlist expired before we reached
+            // startForeground. Nothing can run without the FGS; stop cleanly
+            // rather than risk a crash loop.
+            Log.w(TAG, "startForeground(shortService) refused; stopping")
+            stopSelf()
+        }
+    }
+
+    /**
+     * Enter — or RE-enter — the foreground as a SHORT_SERVICE.
+     *
+     * SHORT_SERVICE (API 34+), not DATA_SYNC: a push-triggered settlement/sync
+     * wake is exactly the "short critical task" shortService exists for, and —
+     * unlike dataSync — it is NOT subject to Android 15's ~6h/24h cumulative
+     * dataSync cap (observed force-stopping a sibling app on-device with
+     * ForegroundServiceStartNotAllowedException). It needs only
+     * FOREGROUND_SERVICE, no type permission.
+     *
+     * Called again per delivery from [onStartCommand]: the shortService clock
+     * starts at the FIRST `startForeground()` an instance makes and does not
+     * restart per delivery, so calling it again is how the ~3-minute window is
+     * extended. Returns false instead of throwing so the caller can decide
+     * whether that is fatal (first arm) or merely not-extended (re-arm).
+     */
+    private fun enterForeground(): Boolean = try {
         val notification = Notification.Builder(this, SYNC_CHANNEL)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentTitle("Sonar")
             .setContentText("Syncing...")
             .build()
-        // SHORT_SERVICE (API 34+), not DATA_SYNC: a push-triggered settlement/
-        // sync wake is exactly the "short critical task" shortService exists for,
-        // and — unlike dataSync — it is NOT subject to Android 15's ~6h/24h
-        // cumulative dataSync cap (which was observed force-stopping a sibling
-        // app on-device with ForegroundServiceStartNotAllowedException). It needs
-        // only FOREGROUND_SERVICE (no type permission). onTimeout() below is the
-        // required backstop for its ~3-minute ceiling.
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                startForeground(FOREGROUND_ID, notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE)
-            } else {
-                startForeground(FOREGROUND_ID, notification)
-            }
-            fgsReady = true
-        } catch (t: Throwable) {
-            // e.g. the background-start allowlist expired before we reached
-            // startForeground. Nothing can run without the FGS; stop cleanly
-            // rather than risk a crash loop.
-            Log.w(TAG, "startForeground(shortService) refused; stopping", t)
-            stopSelf()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(FOREGROUND_ID, notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE)
+        } else {
+            startForeground(FOREGROUND_ID, notification)
         }
+        true
+    } catch (t: Throwable) {
+        Log.w(TAG, "startForeground(shortService) refused: ${t.message}")
+        false
     }
 
     /** API 34 short-service timeout backstop → stop before the ANR. */
@@ -155,6 +178,15 @@ class SonarPushProcessingService : Service() {
      */
     private fun stopWakeWork() {
         fgsReady = false
+        // A payer may be blocked on an invoice_request we accepted and are
+        // about to abandon. Tell them now: a fast {"error": ...} beats the NDS
+        // holding its 60s window for a reply that is never coming. Sent from
+        // bailoutScope because [scope] is cancelled on the next line.
+        pendingReplyUrl?.let { url ->
+            pendingReplyUrl = null
+            Log.w(TAG, "wake cancelled with an unanswered invoice_request; sending error reply")
+            bailoutScope.launch { postNdsReply(url, JsonLite.encodeObject("error", "wake cancelled")) }
+        }
         scope.cancel()
         stopSelf()
     }
@@ -171,6 +203,20 @@ class SonarPushProcessingService : Service() {
         }
         val type = intent?.getStringExtra(EXTRA_PUSH_TYPE)
         Log.d(TAG, "Processing push type=$type")
+
+        // Re-arm the shortService window. Its timeout runs from the FIRST
+        // startForeground() this instance made and is NOT restarted per
+        // delivery, so on a reused instance a later push inherits whatever is
+        // left of the original ~3 minutes: a burst of chat wakes can leave an
+        // invoice_request with seconds before onTimeout cancels it mid-answer,
+        // which is the payer-timeout bug this service exists to remove. A
+        // high-priority FCM delivery is an exemption, so the extension is
+        // available on exactly the path that needs it.
+        // Best effort: a refused extension still leaves the FGS armed by
+        // onCreate, so run the work rather than drop a payment wake.
+        if (!enterForeground()) {
+            Log.w(TAG, "shortService window not re-armed; running on the original one")
+        }
 
         lastStartId = startId
         inFlightWakes.incrementAndGet()
@@ -462,8 +508,21 @@ class SonarPushProcessingService : Service() {
         try {
             val prefs = notificationPrefs()
             if (payload.isNotBlank()) {
-                // Swap id / payment hash for correlating against Boltz-side logs.
-                Log.d(TAG, "Breez payload: ${payload.take(200)}")
+                // NEVER log the raw payload in release. `reply_url` is a one-shot
+                // bearer capability — whoever POSTs an invoice to
+                // /api/v1/response/{reqId} first decides where that payment goes
+                // — and the payload also carries the payer's signing pubkey and
+                // any payer_note. Logcat is app-private, but ADB, bug reports and
+                // device-admin log collectors all read it, and this build has
+                // isMinifyEnabled=false so there is no R8 Log stripping to lean
+                // on. Release keeps only what is useful for debugging the pin.
+                if (BuildConfig.DEBUG) {
+                    Log.d(TAG, "Breez payload: ${payload.take(200)}")
+                } else {
+                    val host = InvoiceRequestPayload.parse(payload)
+                        ?.let { runCatching { URL(it.replyUrl).host }.getOrNull() }
+                    Log.d(TAG, "Breez payload received (replyHost=${host ?: "<none>"})")
+                }
             }
             val deadline = SystemClock.elapsedRealtime() + BREEZ_SETTLE_BUDGET_MS
             // A generous floor: covers connect() latency, swap-claim time, and
@@ -507,23 +566,37 @@ class SonarPushProcessingService : Service() {
                 } ?: false
                 if (!live || WalletBridge.state() !is WalletState.Ready) {
                     // No usable SDK — nothing can settle; don't burn the budget.
+                    // But a payer blocked on an invoice_request must not be left
+                    // to the NDS's 60s timeout just because our wallet is cold
+                    // or flaky: that is the original bug wearing a new hat. Send
+                    // a fast error instead. The pin means this can only ever be
+                    // aimed at the real NDS.
                     Log.w(TAG, "Breez wakeup: wallet not ready, giving up")
+                    if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
+                        replyInvoiceRequestError(payload, "wallet unavailable")
+                    }
                     events.cancel()
                     return@coroutineScope
                 }
-                WalletBridge.refreshBalance()
 
                 // BOLT12 invoice_request: the payer is blocked until we produce
                 // the invoice and POST it to the NDS reply URL (60s server
                 // window) — the step iOS's NSE does via InvoiceRequestTask and
                 // Android must do itself (no notification plugin in the KMP
-                // bindings). Answer FIRST, then await the resulting payment.
+                // bindings). This is the ONLY work here with a hard external
+                // deadline, so it runs before anything else; refreshBalance()
+                // in particular is unbounded and would happily eat the window.
                 // (breez/notify's lnurlpay_* callback types are intentionally
                 // unhandled: Sonar publishes no LNURL-pay endpoint, only BOLT12
                 // offers — extend here if LNURL receive ever ships.)
                 if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
                     answerInvoiceRequest(payload, deadline)
                 }
+
+                // Redundant on the connect path (connectLocked already did a
+                // getInfo) but needed for a reused live handle. Sequenced after
+                // the answer precisely because it is unbounded.
+                WalletBridge.refreshBalance()
 
                 // Await a claimed receive: the first one ends this wake (each new
                 // payment gets its own push, so we don't need to drain many).
@@ -559,20 +632,11 @@ class SonarPushProcessingService : Service() {
             Log.w(TAG, "invoice_request: unparseable payload")
             return
         }
-        // The reply URL is server-injected by OUR NDS; pin it there. Comparing
-        // the PARSED host (https, no userinfo) rejects both plain-http and
-        // `https://user@evil/` tricks — a forged push must not redirect the
-        // invoice elsewhere. The path is pinned too: breez/notify always injects
-        // {NOTIFY_EXTERNAL_URL}/api/v1/response/{reqId}, so nothing else on that
-        // host is a legitimate target for a produced invoice.
-        val replyUrl = runCatching { URL(req.replyUrl) }.getOrNull()
-            ?.takeIf { it.protocol == "https" && it.userInfo == null }
-        val replyHost = replyUrl?.host
-        if (replyHost == null ||
-            !replyHost.equals(SonarPushRegistration.expectedNdsHost(), ignoreCase = true) ||
-            replyUrl.path?.startsWith(NDS_RESPONSE_PATH_PREFIX) != true
-        ) {
-            Log.w(TAG, "invoice_request: refusing reply URL (host/scheme/path mismatch)")
+        // The reply URL is server-injected by OUR NDS; pin it there so a forged
+        // push cannot redirect a freshly signed invoice. Pure and pinned by
+        // NdsReplyUrlTest — see isAcceptableNdsReplyUrl for the axes checked.
+        if (!isAcceptableNdsReplyUrl(req.replyUrl, SonarPushRegistration.expectedNdsHost())) {
+            Log.w(TAG, "invoice_request: refusing reply URL (scheme/host/port/path)")
             return
         }
         // The NDS blocks its caller ~60s from the webhook; past our own wake
@@ -580,9 +644,13 @@ class SonarPushProcessingService : Service() {
         // bother producing (and leaking wall-clock on) a stale invoice.
         val remainingMs = deadlineElapsedMs - SystemClock.elapsedRealtime()
         if (remainingMs < 2_000) {
-            Log.w(TAG, "invoice_request: answer window already spent, skipping")
+            Log.w(TAG, "invoice_request: answer window already spent, sending error")
+            postNdsReply(req.replyUrl, JsonLite.encodeObject("error", "answer window expired"))
             return
         }
+        // From here a payer is blocked on us, so a cancelled wake owes them an
+        // error reply — see stopWakeWork. Cleared on every exit path below.
+        pendingReplyUrl = req.replyUrl
         val answered = withTimeoutOrNull(remainingMs) {
             val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
             val body = invoice.fold(
@@ -595,7 +663,14 @@ class SonarPushProcessingService : Service() {
                     JsonLite.encodeObject("error", "failed to create invoice")
                 },
             )
-            postReply(req.replyUrl, body) to invoice.isSuccess
+            postNdsReply(req.replyUrl, body) to invoice.isSuccess
+        }
+        pendingReplyUrl = null
+        if (answered == null) {
+            // Our own bound tripped before the SDK produced anything. Still owe
+            // the payer an answer rather than the NDS's 60s expiry.
+            Log.w(TAG, "invoice_request: timed out producing the invoice, sending error")
+            postNdsReply(req.replyUrl, JsonLite.encodeObject("error", "timed out"))
         }
         // `posted` is only the HTTP 2xx — BOTH an invoice and an {"error": ...}
         // reply post successfully, so log the outcome separately. Without this
@@ -605,32 +680,20 @@ class SonarPushProcessingService : Service() {
             "invoice=${answered?.second ?: false})")
     }
 
-    /** POST [body] as JSON to [url]; true on 2xx. Bounded timeouts — the whole
-     *  answer must beat the NDS's 60s callback window. */
-    private suspend fun postReply(url: String, body: String): Boolean =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                try {
-                    conn.requestMethod = "POST"
-                    // The host pin validates only this URL; don't let a 3xx from
-                    // the (compromised/open-redirecting) host bounce the POST past
-                    // the pin to another origin.
-                    conn.instanceFollowRedirects = false
-                    conn.connectTimeout = 10_000
-                    conn.readTimeout = 10_000
-                    conn.doOutput = true
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.outputStream.use { it.write(body.encodeToByteArray()) }
-                    conn.responseCode in 200..299
-                } finally {
-                    conn.disconnect()
-                }
-            }.getOrElse {
-                Log.w(TAG, "invoice_request reply POST failed", it)
-                false
-            }
+    /**
+     * Tell a blocked payer we cannot answer, instead of letting the NDS's 60s
+     * window expire. Same pin as the success path — a forged push can never
+     * aim even an error reply anywhere but the real NDS.
+     */
+    private suspend fun replyInvoiceRequestError(payload: String, reason: String) {
+        val req = InvoiceRequestPayload.parse(payload) ?: return
+        if (!isAcceptableNdsReplyUrl(req.replyUrl, SonarPushRegistration.expectedNdsHost())) {
+            Log.w(TAG, "invoice_request: refusing reply URL for error reply")
+            return
         }
+        val posted = postNdsReply(req.replyUrl, JsonLite.encodeObject("error", reason))
+        Log.d(TAG, "invoice_request error reply sent (reason=$reason posted=$posted)")
+    }
 
     /**
      * Handle an incoming wallet payment observed during this wake. Returns true
@@ -664,10 +727,21 @@ class SonarPushProcessingService : Service() {
         seenThisWake: MutableSet<String>,
         liveEvent: Boolean,
     ): Boolean {
+        val firstThisWake = seenThisWake.add(ev.paymentId)
+        if (!ev.settled) {
+            // PENDING: lockup seen, claim in flight. Funds are arriving, so this
+            // still ends the wake (that is why recentIncomingReceives asks for
+            // PENDING at all) — but it must NOT notify or write a permanent
+            // `Paid` row: the swap can still fail or the lockup be reorged, and
+            // claiming the notify slot now would block the eventual correction
+            // AND suppress the real "received" banner when it completes.
+            // Exclude one we already announced, or a stale pending row would
+            // end every wake for the rest of the lookback window.
+            return firstThisWake && !wasPaymentNotified(ev.paymentId)
+        }
         // Ledger capture (idempotent) — normally already recorded at the event
         // source; this covers poll-fallback payments the listener never saw.
         PaymentActivityStore.recordIncomingWalletPayment(ev)
-        val firstThisWake = seenThisWake.add(ev.paymentId)
         val claimed = claimNotifiedPaymentId(ev.paymentId)
         if (claimed) {
             SonarNotificationRouter.buildWalletReceive(
@@ -706,6 +780,17 @@ class SonarPushProcessingService : Service() {
         /** Guards the single-flight wake state below. Process-wide, because
          *  overlapping FCM deliveries each get their own service start and
          *  coroutine. */
+        /**
+         * Scope for the bail-out error reply only.
+         *
+         * Deliberately process-scoped rather than per-instance: [stopWakeWork]
+         * cancels the wake [scope] and then stops the service, so a reply
+         * launched on either would be cancelled or die with onDestroy before
+         * the POST completes — and the whole point is that the payer hears
+         * something instead of waiting out the NDS's 60s window.
+         */
+        private val bailoutScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
         private val marmotWakeLock = Mutex()
 
         /** The wake currently reconnecting + draining. Later deliveries join it
