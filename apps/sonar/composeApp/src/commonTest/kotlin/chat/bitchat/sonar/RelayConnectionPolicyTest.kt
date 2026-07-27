@@ -86,18 +86,30 @@ class RelayConnectionPolicyTest {
 
     @Test
     fun backgrounded_attach_never_uses_the_fast_retries() {
-        // Every retry is a full SonarNode.connect. Backgrounded, that rebuilds
-        // sockets the OS is suspending — the same reason
-        // shouldRetrySupersededAttach refuses to loop there. The fast head is a
-        // foreground affordance ("the user just came back"), so it must not
-        // survive a background transition.
+        // Every retry is a full SonarNode.connect. Where backgrounding really
+        // suspends sockets (mobile), that rebuild buys nothing — the same
+        // reason shouldRetrySupersededAttach refuses to loop there. The fast
+        // head is a foreground affordance ("the user just came back"), so it
+        // must not survive a real background transition.
+        //
+        // backgroundSuspendsSockets is passed explicitly: the default reads the
+        // platform actual, and this file compiles into the JVM target where it
+        // is false. See RelayConnectionPolicyDesktopTest for that half.
         assertEquals(
             10_000L,
-            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 1, foreground = false),
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 1,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ),
         )
         assertEquals(
             10_000L,
-            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 2, foreground = false),
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 2,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ),
         )
     }
 
@@ -106,10 +118,18 @@ class RelayConnectionPolicyTest {
         // Defensive: a caller that has not incremented yet must still back off,
         // never busy-loop rebuilding sockets.
         assertTrue(
-            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 0, foreground = true) > 0L,
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 0,
+                foreground = true,
+                backgroundSuspendsSockets = true,
+            ) > 0L,
         )
         assertTrue(
-            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 0, foreground = false) > 0L,
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 0,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ) > 0L,
         )
     }
 }

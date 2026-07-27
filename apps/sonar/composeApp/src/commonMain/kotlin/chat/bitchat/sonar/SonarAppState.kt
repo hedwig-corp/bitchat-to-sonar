@@ -4325,7 +4325,8 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun startRelayConnection() {
         if (!started || relayConnectJob?.isActive == true) return
         relayConnecting = true
-        relayConnectJob = scope.launch {
+        lateinit var job: Job
+        job = scope.launch {
             var consecutiveFailures = 0
             try {
                 while (isActive && started) {
@@ -4371,6 +4372,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                             continue
                         }
                         consecutiveFailures = 0
+                        // Re-arm for the superseded case below: the attach
+                        // succeeded but an invalidate may have left the latch
+                        // down, and looping there we genuinely ARE still
+                        // connecting. On a clean attach this is cleared by the
+                        // `finally` a few lines later, so it costs nothing.
                         relayConnecting = true
                         npub = result.getOrThrow()
                         SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
@@ -4403,10 +4409,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                     return@launch
                 }
             } finally {
-                relayConnecting = false
-                refreshRelayOnline()
+                // A cancel() flips isActive false BEFORE this runs, so
+                // startRelayConnection() can already have launched a
+                // replacement. Only the current owner may clear the flag —
+                // same ownership shape as marmotWakeOwnerGeneration.
+                if (relayConnectJob === job) {
+                    relayConnecting = false
+                    refreshRelayOnline()
+                }
             }
         }
+        relayConnectJob = job
     }
 
     /** Republish the relay latch into UI state. The chip and the Connections

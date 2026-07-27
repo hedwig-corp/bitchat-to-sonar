@@ -82,14 +82,26 @@ object RelayConnectionPolicy {
      * the slow interval once the failures look sustained (the heartbeat
      * re-triggers the job at that cadence anyway).
      *
-     * Backgrounded, skip the fast head entirely, for the same reason
-     * [shouldRetrySupersededAttach] refuses to loop there: every retry is a full
-     * `SonarNode.connect` — SQLCipher open, restore reconcile, relay dial — and
-     * rebuilding that against sockets the OS is suspending buys nothing. The
-     * push wake and the next foreground resume start a fresh job anyway.
+     * Skip the fast head only where leaving the foreground actually suspends the
+     * sockets, which is what [backgroundSuspendsSockets] means — not merely
+     * "not frontmost". Every retry is a full `SonarNode.connect` (SQLCipher
+     * open, restore reconcile, relay dial), and rebuilding that against sockets
+     * the OS is tearing down buys nothing; the push wake and the next resume
+     * start a fresh job anyway. On desktop `foreground` is window focus
+     * (`Main.kt` bridges `WindowFocusListener`), and alt-tab suspends nothing —
+     * so an unfocused desktop window keeps the fast head, exactly as
+     * [shouldInvalidateOnBackground] keeps its healthy node.
+     *
+     * Passed rather than read inside so the schedule stays a pure function: a
+     * `commonTest` assertion about the backgrounded branch compiles into the JVM
+     * target, where the platform actual is `false`.
      */
-    fun connectRetryDelayMs(consecutiveFailures: Int, foreground: Boolean): Long = when {
-        !foreground -> RELAY_RETRY_SLOW_MS
+    fun connectRetryDelayMs(
+        consecutiveFailures: Int,
+        foreground: Boolean,
+        backgroundSuspendsSockets: Boolean = shouldInvalidateOnBackground(),
+    ): Long = when {
+        !foreground && backgroundSuspendsSockets -> RELAY_RETRY_SLOW_MS
         consecutiveFailures <= 1 -> RELAY_RETRY_FAST_MS
         consecutiveFailures == 2 -> RELAY_RETRY_MEDIUM_MS
         else -> RELAY_RETRY_SLOW_MS

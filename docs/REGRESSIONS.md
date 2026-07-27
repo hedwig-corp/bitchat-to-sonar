@@ -1089,7 +1089,12 @@ its coverage is worse than an honest hole, because it stops people looking.
   iOS does. **Pinned:** only the retry schedule
   (`RelayConnectionPolicyTest.first_connect_failure_retries_fast_in_foreground`
   / `sustained_connect_failure_backs_off` /
-  `backgrounded_attach_never_uses_the_fast_retries`). **Not pinned:** that no UI
+  `backgrounded_attach_never_uses_the_fast_retries`, plus
+  `RelayConnectionPolicyDesktopTest.unfocused_desktop_window_keeps_the_fast_retries`
+  for the half that cannot live in `commonTest` — the schedule takes
+  `backgroundSuspendsSockets` rather than reading the platform actual precisely
+  so both halves stay assertable, since alt-tab on desktop suspends nothing and
+  must not be slowed to the mobile backoff). **Not pinned:** that no UI
   surface reads `started` for internet state again, that the failure path stays
   toast-free, and that `relayConnecting` is cleared on the first failure — all
   three need a constructed `SonarAppState` (same root cause as the gaps above).
