@@ -179,6 +179,38 @@ internal fun meshSweepResumedFromGap(
     gapMs: Long,
 ): Boolean = lastSweepMs != 0L && nowMs - lastSweepMs >= gapMs
 
+/** Adapter power states we care about, normalized off the platform constants. */
+internal enum class BleAdapterState { On, Off, Transitioning }
+
+/** What the radio must do in response to an adapter power transition. */
+internal enum class BleAdapterAction(val logValue: String) {
+    Restart("adapter_on"),
+    Teardown("adapter_off"),
+    Ignore("transitioning"),
+}
+
+/**
+ * Map an adapter power transition onto a radio action.
+ *
+ * Turning Bluetooth off (airplane mode does exactly this) destroys the scan and
+ * the advertiser, but the OS tells the app nothing: `scanning` stays true, so
+ * `MeshRadio.start()` early-returns forever, and the cached `BluetoothLeScanner`
+ * is invalidated by the power cycle so the watchdog's restarts fail silently.
+ * The radio then looks alive while being deaf until the process is killed. So an
+ * OFF must run the full `stop()` teardown (which clears `scanning`) and a
+ * following ON must re-run `start()` to re-acquire scanner and advertiser.
+ *
+ * Apple gets this for free: `centralManagerDidUpdateState` fires on every
+ * transition and `.poweredOn` re-runs `startScanning()` (see R-006).
+ * Intermediate states are ignored — acting on them would tear down a radio that
+ * is about to come back, or start one before the stack is ready.
+ */
+internal fun bleAdapterAction(state: BleAdapterState): BleAdapterAction = when (state) {
+    BleAdapterState.On -> BleAdapterAction.Restart
+    BleAdapterState.Off -> BleAdapterAction.Teardown
+    BleAdapterState.Transitioning -> BleAdapterAction.Ignore
+}
+
 /**
  * Decide whether Android's BLE scan needs recovery without confusing repeated
  * advertisements from a connected peer with scanner starvation.

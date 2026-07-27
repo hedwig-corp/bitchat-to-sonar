@@ -1,7 +1,11 @@
 package chat.bitchat.sonar
 
 import android.Manifest
+import android.bluetooth.BluetoothAdapter
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -60,6 +64,31 @@ class MainActivity : ComponentActivity() {
             // Whatever the user granted, (re)try starting the mesh radio.
             startMeshRadio()
         }
+
+    /**
+     * Airplane mode (and any manual Bluetooth toggle) powers the adapter down
+     * without telling the app: the scan and advertiser die, `scanning` stays
+     * true so `MeshRadio.start()` early-returns forever, and the cached
+     * `BluetoothLeScanner` is invalidated by the power cycle so the watchdog's
+     * restarts fail silently. Without this receiver the radio looks alive but is
+     * deaf until the process is killed. Apple gets the equivalent for free from
+     * `centralManagerDidUpdateState` (R-006).
+     */
+    private val adapterStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            val state = when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_ON -> BleAdapterState.On
+                BluetoothAdapter.STATE_OFF -> BleAdapterState.Off
+                else -> BleAdapterState.Transitioning
+            }
+            when (bleAdapterAction(state)) {
+                BleAdapterAction.Restart -> startMeshRadio()
+                BleAdapterAction.Teardown -> MeshRadio.stop()
+                BleAdapterAction.Ignore -> Unit
+            }
+        }
+    }
 
     private fun startMeshRadio() {
         MeshRadio.setMeshNickname(SonarCore.nickname())
@@ -125,6 +154,10 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         deferFirstDrawUntilLocalStateReady()
+        registerReceiver(
+            adapterStateReceiver,
+            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+        )
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         setContent {
             App(
@@ -378,6 +411,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         debugMeshGeneration++
         debugHandler.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(adapterStateReceiver) }
         MeshRadio.stop()
         super.onDestroy()
     }
