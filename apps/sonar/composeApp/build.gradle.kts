@@ -219,6 +219,13 @@ kotlin {
             implementation("net.java.dev.jna:jna:5.14.0@aar")
             // QR encoding for shareable group invite links.
             implementation("com.google.zxing:core:3.5.3")
+            // UnifiedPush distributor connector: background wakeups on
+            // degoogled devices (GrapheneOS without sandboxed Play). FCM stays
+            // the preferred transport when Play Services is available.
+            implementation(libs.unifiedpush.connector)
+            // GoogleApiAvailability probe for the FCM-vs-UnifiedPush decision
+            // (firebase-messaging only exposes basement transitively).
+            implementation(libs.play.services.base)
         }
         androidInstrumentedTest.dependencies {
             implementation(libs.androidx.test.runner)

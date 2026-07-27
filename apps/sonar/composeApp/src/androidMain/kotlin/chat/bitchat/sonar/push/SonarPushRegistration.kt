@@ -9,8 +9,11 @@ import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletState
+import com.google.android.gms.common.ConnectionResult
+import com.google.android.gms.common.GoogleApiAvailability
 import com.google.firebase.messaging.FirebaseMessaging
 import java.security.MessageDigest
+import org.unifiedpush.android.connector.UnifiedPush
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -19,9 +22,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 
 /**
- * Registers the device's FCM token with both notification servers:
+ * Registers the device's push credential with both notification servers:
  *   1. Transponder — MIP-05 encrypted token shares (chat/call wakeups)
  *   2. Breez NDS — webhook URL (wallet wakeups, silent only)
+ *
+ * Transport selection (GrapheneOS-aware, see docs/GRAPHENEOS.md):
+ *   - Play Services available (incl. sandboxed Play) → FCM, exactly as before.
+ *   - No Play but a UnifiedPush distributor installed → the distributor
+ *     endpoint URL is registered as the MIP-05 token (`platform =
+ *     "unifiedpush"`). Chat wakeups work once the deployed transponder
+ *     understands that platform; Breez wallet wakeups stay FCM-only (gap).
+ *   - Neither → explicit NONE state surfaced in Settings → Diagnostics,
+ *     never a silent logcat-only failure.
  */
 object SonarPushRegistration {
 
@@ -56,7 +68,12 @@ object SonarPushRegistration {
         }
 
     @Volatile private var cachedFcmToken: String? = null
+    @Volatile private var cachedUnifiedPushEndpoint: String? = null
     @Volatile private var cachedOffer: String? = null
+
+    /** Last transport decision + progress, for Settings → Diagnostics. */
+    @Volatile private var transportState: PushTransport = PushTransport.NONE
+    @Volatile private var registrationDetail: String = "not started"
     @Volatile private var completedSessionWebhookMarker: String? = null
     @Volatile private var inFlightWebhookMarker: String? = null
     @Volatile private var inFlightWebhookStartedAtMs: Long = 0L
@@ -65,6 +82,7 @@ object SonarPushRegistration {
     fun ensureRegistered() {
         if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
             Log.d(TAG, "Push not registered: disabled by user preference")
+            registrationDetail = "disabled in settings"
             return
         }
         // NEVER register (or start the core) before an account exists.
@@ -76,20 +94,139 @@ object SonarPushRegistration {
         // nothing to register for until onboarding has produced a key.
         if (!SonarCore.hasIdentity()) {
             Log.d(TAG, "Push not registered: no account yet (pre-onboarding)")
+            registrationDetail = "waiting for onboarding"
             return
         }
         if (transponderNpub.isBlank() && ndsUrl.isBlank()) {
             Log.d(TAG, "Push not configured (no TRANSPONDER_NPUB or NDS_URL)")
+            registrationDetail = "not configured"
             return
         }
+        val ctx = AppContextHolder.ctx
+        // Transport probing does GMS + PackageManager binder work and
+        // ensureRegistered runs from SonarApp.onCreate — keep the probe off
+        // the cold-start main thread (Performance Analysis Rule). The
+        // distributor probe is short-circuited when Play Services answers:
+        // FCM wins regardless, so don't pay queryIntentServices for it.
+        scope.launch {
+            val playServices = isPlayServicesAvailable()
+            val transport = PushTransportPolicy.choose(
+                playServicesAvailable = playServices,
+                distributorAvailable = !playServices && hasUnifiedPushDistributor(),
+            )
+            transportState = transport
+            when (transport) {
+                PushTransport.FCM -> registerViaFcm()
+                PushTransport.UNIFIED_PUSH -> registerViaUnifiedPush(ctx)
+                PushTransport.NONE -> {
+                    // Honest degrade: no Play Services, no distributor. Surfaced in
+                    // Settings → Diagnostics — do not pretend pushes will arrive.
+                    registrationDetail = "no Play Services and no UnifiedPush distributor"
+                    Log.w(TAG, "No push transport available (degoogled device without a distributor)")
+                }
+            }
+        }
+    }
+
+    private fun registerViaFcm() {
+        registrationDetail = "collecting FCM token"
         FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
             Log.d(TAG, "FCM token collected")
             cachedFcmToken = token
-            registerTransponder(token)
+            registerTransponder(platform = "fcm", token = token)
             retryBreezWebhookIfNeeded()
         }.addOnFailureListener { e ->
+            registrationDetail = "FCM token collection failed"
             Log.w(TAG, "FCM token collection failed", e)
         }
+    }
+
+    /**
+     * Degoogled path. Reuses the distributor the user already acked, else the
+     * saved choice, else auto-picks when exactly one is installed. With several
+     * distributors and no prior choice we take the first deterministically —
+     * an in-app picker (UnifiedPush.tryUseDefaultDistributor needs an Activity)
+     * is a tracked follow-up. The endpoint arrives asynchronously at
+     * [SonarUnifiedPushService.onNewEndpoint] → [onUnifiedPushEndpoint].
+     */
+    private fun registerViaUnifiedPush(ctx: Context) {
+        val distributor = UnifiedPush.getAckDistributor(ctx)
+            ?: UnifiedPush.getSavedDistributor(ctx)
+            ?: UnifiedPush.getDistributors(ctx).firstOrNull()?.also {
+                UnifiedPush.saveDistributor(ctx, it)
+            }
+        if (distributor == null) {
+            // Race: distributor uninstalled between the probe and here.
+            transportState = PushTransport.NONE
+            registrationDetail = "no UnifiedPush distributor"
+            return
+        }
+        registrationDetail = "awaiting endpoint from $distributor"
+        Log.d(TAG, "UnifiedPush: registering with distributor")
+        UnifiedPush.register(ctx)
+    }
+
+    private fun isPlayServicesAvailable(): Boolean = runCatching {
+        GoogleApiAvailability.getInstance()
+            .isGooglePlayServicesAvailable(AppContextHolder.ctx) == ConnectionResult.SUCCESS
+    }.getOrDefault(false)
+
+    private fun hasUnifiedPushDistributor(): Boolean = runCatching {
+        val ctx = AppContextHolder.ctx
+        UnifiedPush.getAckDistributor(ctx) != null ||
+            UnifiedPush.getDistributors(ctx).isNotEmpty()
+    }.getOrDefault(false)
+
+    /** Called from [SonarUnifiedPushService] when the distributor issues an endpoint. */
+    fun onUnifiedPushEndpoint(endpoint: String) {
+        if (!SonarPushPrefs.effectivePushEnabled(AppContextHolder.ctx)) {
+            Log.d(TAG, "UnifiedPush endpoint received while push disabled")
+            cachedUnifiedPushEndpoint = null
+            // A late endpoint for a user who disabled push must not stay live
+            // on the distributor's server — revoke it, don't just drop it.
+            runCatching { UnifiedPush.unregister(AppContextHolder.ctx) }
+            return
+        }
+        if (endpoint == cachedUnifiedPushEndpoint && transportState == PushTransport.UNIFIED_PUSH) {
+            // Same endpoint re-delivered (every UnifiedPush.register() call
+            // re-fires onNewEndpoint). Re-registering would fan a kind-447
+            // token share out to every member of every group — skip it.
+            Log.d(TAG, "UnifiedPush endpoint unchanged; skipping re-registration")
+            return
+        }
+        cachedUnifiedPushEndpoint = endpoint
+        transportState = PushTransport.UNIFIED_PUSH
+        registrationDetail = "endpoint received, registering"
+        registerTransponder(platform = "unifiedpush", token = endpoint)
+        // Breez NDS only speaks FCM; wallet wakeups are a documented gap here.
+    }
+
+    fun onUnifiedPushRegistrationFailed(reason: String) {
+        registrationDetail = "UnifiedPush registration failed: $reason"
+    }
+
+    fun onUnifiedPushUnregistered() {
+        cachedUnifiedPushEndpoint = null
+        if (transportState == PushTransport.UNIFIED_PUSH) {
+            registrationDetail = "distributor unregistered"
+        }
+    }
+
+    /** Distributor reachable but temporarily unable to deliver (connector callback). */
+    fun onUnifiedPushTempUnavailable() {
+        if (transportState == PushTransport.UNIFIED_PUSH) {
+            registrationDetail = "distributor temporarily unavailable"
+        }
+    }
+
+    /** One-line status for Settings → Diagnostics (English, like the rest of the sheet). */
+    fun diagnosticsStatus(): String {
+        val transport = when (transportState) {
+            PushTransport.FCM -> "FCM"
+            PushTransport.UNIFIED_PUSH -> "UnifiedPush"
+            PushTransport.NONE -> "none"
+        }
+        return "$transport — $registrationDetail"
     }
 
     fun onTokenRefresh(token: String) {
@@ -100,7 +237,7 @@ object SonarPushRegistration {
         }
         Log.d(TAG, "FCM token refreshed")
         cachedFcmToken = token
-        registerTransponder(token)
+        registerTransponder(platform = "fcm", token = token)
         retryBreezWebhookIfNeeded()
     }
 
@@ -134,7 +271,7 @@ object SonarPushRegistration {
         registerBreezWebhook(token, offer)
     }
 
-    private fun registerTransponder(fcmToken: String) {
+    private fun registerTransponder(platform: String, token: String) {
         if (transponderNpub.isBlank()) return
         // Guard the SonarCore.start() below: never mint an identity from a push
         // callback (token-refresh / background wakeup) before onboarding.
@@ -149,11 +286,17 @@ object SonarPushRegistration {
                     SonarCore.start()
                     SonarCore.connectRelays()
                     SonarCore.registerPushToken(
-                        platform = "fcm",
-                        token = fcmToken.toByteArray(Charsets.UTF_8),
+                        platform = platform,
+                        token = token.toByteArray(Charsets.UTF_8),
                         serverNpub = transponderNpub,
                     )
-                    Log.d(TAG, "Transponder: MIP-05 push token registered")
+                    registrationDetail = when (platform) {
+                        "fcm" -> "registered"
+                        // Chat wakeups flow once the deployed transponder
+                        // understands platform 0x03 (docs/GRAPHENEOS.md).
+                        else -> "registered (awaiting server-side unifiedpush support)"
+                    }
+                    Log.d(TAG, "Transponder: MIP-05 push token registered ($platform)")
                     return@launch
                 } catch (e: Exception) {
                     Log.w(TAG, "Transponder registration attempt $attempt/$MAX_RETRIES failed", e)
@@ -161,6 +304,7 @@ object SonarPushRegistration {
                     backoff *= 2
                 }
             }
+            registrationDetail = "transponder registration failed"
         }
     }
 
@@ -234,7 +378,13 @@ object SonarPushRegistration {
         scope.launch {
             try { WalletBridge.unregisterWebhook() } catch (_: Exception) {}
         }
+        // Unconditional: the endpoint cache is in-process only, so gating on
+        // it leaks a live distributor subscription across process restarts.
+        // UnifiedPush.unregister() is a no-op when no distributor is saved.
+        runCatching { UnifiedPush.unregister(AppContextHolder.ctx) }
         cachedFcmToken = null
+        cachedUnifiedPushEndpoint = null
+        registrationDetail = "unregistered"
         cachedOffer = null
         synchronized(webhookLock) {
             completedSessionWebhookMarker = null

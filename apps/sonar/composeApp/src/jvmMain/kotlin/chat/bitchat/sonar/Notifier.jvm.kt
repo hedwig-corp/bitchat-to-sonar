@@ -75,6 +75,8 @@ actual object Notifier {
 
     actual fun setPushEnabled(enabled: Boolean) { /* no push on desktop */ }
 
+    actual fun pushTransportStatus(): String? = null // no remote push on desktop; hides the row
+
     actual fun notify(
         id: Int,
         title: String,

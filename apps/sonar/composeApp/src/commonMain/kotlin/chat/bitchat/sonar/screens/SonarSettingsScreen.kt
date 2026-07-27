@@ -27,6 +27,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -771,6 +772,20 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
             "$connected/$total relays connected · Last sync: $sync"
         } ?: if (loaded) "Relay not connected yet" else "Loading…"
         Text(summary, color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp)
+        // Push transport (Android only; null hides the row on desktop).
+        // The status lives in plain @Volatile fields, not snapshot state, so
+        // poll while the sheet is open — registration transitions (endpoint
+        // arrival, transponder ack) land seconds after composition.
+        val pushStatus by produceState(Notifier.pushTransportStatus()) {
+            while (true) {
+                delay(1_000)
+                value = Notifier.pushTransportStatus()
+            }
+        }
+        pushStatus?.let { status ->
+            Spacer(Modifier.height(6.dp))
+            Text("Push transport: $status", color = s.text2, fontSize = 13.5.sp, lineHeight = 18.sp)
+        }
         Spacer(Modifier.height(12.dp))
         SNSettingsRow(
             icon = SNIconName.Search, label = "Verbose logs",

@@ -36,4 +36,8 @@ expect object Notifier {
     suspend fun prepareForAccountReplacement()
     /** Re-register or unregister push tokens when the user toggles push in settings. */
     fun setPushEnabled(enabled: Boolean)
+    /** One-line push transport status for Settings → Diagnostics
+     *  ("FCM — registered", "UnifiedPush — …", "none — …"), or null on
+     *  platforms without remote push (desktop) to hide the row. */
+    fun pushTransportStatus(): String?
 }

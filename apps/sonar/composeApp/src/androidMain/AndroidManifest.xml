@@ -90,6 +90,17 @@
             </intent-filter>
         </service>
 
+        <!-- UnifiedPush wakeup handler for degoogled devices (GrapheneOS
+             without sandboxed Play). The distributor binds this service and
+             delivers endpoints + wake messages; must NOT be exported. -->
+        <service
+            android:name=".push.SonarUnifiedPushService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+            </intent-filter>
+        </service>
+
         <!-- Foreground service for processing push wakeups when the app is killed. -->
         <service
             android:name=".push.SonarPushProcessingService"

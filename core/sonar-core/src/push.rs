@@ -27,6 +27,11 @@ const HKDF_INFO: &[u8] = b"mip05-token-encryption";
 const TOKEN_PLAINTEXT_SIZE: usize = 1024;
 const PLATFORM_APNS: u8 = 0x01;
 const PLATFORM_FCM: u8 = 0x02;
+/// UnifiedPush: the "token" is the distributor-issued HTTPS endpoint URL the
+/// transponder POSTs the wake to (degoogled Android / GrapheneOS without
+/// sandboxed Play). Endpoint URLs are well under the `TOKEN_PLAINTEXT_SIZE - 3`
+/// ceiling, so they ride the same MIP-05 blob as apns/fcm tokens.
+const PLATFORM_UNIFIEDPUSH: u8 = 0x03;
 pub(crate) const PUSH_TOKEN_CACHE_FILE_SUFFIX: &str = ".sonar-push-tokens.json";
 const PUSH_TOKEN_CACHE_VERSION: u32 = 1;
 pub(crate) const KIND_NOTIFICATION_REQUEST: u16 = 446;
@@ -54,8 +59,9 @@ pub(crate) fn platform_byte(platform: &str) -> crate::Result<u8> {
     match platform {
         "apns" => Ok(PLATFORM_APNS),
         "fcm" => Ok(PLATFORM_FCM),
+        "unifiedpush" => Ok(PLATFORM_UNIFIEDPUSH),
         _ => Err(crate::Error::InvalidInput(format!(
-            "unknown platform: {platform} (expected \"apns\" or \"fcm\")"
+            "unknown platform: {platform} (expected \"apns\", \"fcm\" or \"unifiedpush\")"
         ))),
     }
 }
@@ -302,6 +308,40 @@ mod tests {
         // cap (a full cache must never pin a stale / rotated token).
         assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES, true));
         assert!(should_cache_push_token(1, MAX_PUSH_TOKEN_CACHE_ENTRIES + 1, true));
+    }
+
+    #[test]
+    fn platform_byte_accepts_known_platforms_only() {
+        // Wire-format bytes are protocol constants shared with the transponder:
+        // renumbering any of them breaks every registered device.
+        assert_eq!(platform_byte("apns").unwrap(), 0x01);
+        assert_eq!(platform_byte("fcm").unwrap(), 0x02);
+        assert_eq!(platform_byte("unifiedpush").unwrap(), 0x03);
+        assert!(platform_byte("").is_err());
+        assert!(platform_byte("gcm").is_err());
+        // Case-sensitive on purpose — hosts pass lowercase literals.
+        assert!(platform_byte("FCM").is_err());
+        assert!(platform_byte("UnifiedPush").is_err());
+    }
+
+    #[test]
+    fn encrypt_token_fits_unifiedpush_endpoint_urls() {
+        let server = Keys::generate().public_key();
+        // A realistic distributor endpoint URL rides the same blob as apns/fcm
+        // tokens: fixed-size plaintext, so length is not observable either.
+        let endpoint =
+            "https://ntfy.sh/upSoNaRdEviCeAbCdEfGhIjKlMnOpQrStUvWxYz0123456789?up=1";
+        let blob = encrypt_token(PLATFORM_UNIFIEDPUSH, endpoint.as_bytes(), &server)
+            .expect("endpoint encrypts");
+        // 32B ephemeral X-only key + 12B nonce + ciphertext(1024 + 16B tag).
+        assert_eq!(blob.len(), 32 + 12 + TOKEN_PLAINTEXT_SIZE + 16);
+
+        // Ceiling pinned on both sides: largest accepted is SIZE - 3, first
+        // rejected is SIZE - 2 — an off-by-one tightening fails here.
+        let max_ok = vec![b'a'; TOKEN_PLAINTEXT_SIZE - 3];
+        assert!(encrypt_token(PLATFORM_UNIFIEDPUSH, &max_ok, &server).is_ok());
+        let oversized = vec![b'a'; TOKEN_PLAINTEXT_SIZE - 2];
+        assert!(encrypt_token(PLATFORM_UNIFIEDPUSH, &oversized, &server).is_err());
     }
 
     #[test]
