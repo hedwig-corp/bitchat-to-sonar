@@ -24,6 +24,17 @@ struct MeshLinkSenderPolicy {
     static func isSelfEcho(senderIsSelf: Bool, ttl: UInt8) -> Bool {
         senderIsSelf && ttl > 0
     }
+
+    /// A signed identity packet still carrying full TTL — it came straight off a
+    /// live link and cannot be a stored/gossip replay, so its freshness must be
+    /// judged by our own receive time rather than by the clock the sender
+    /// stamped it with. The complement of `allowsRelayedIdentityPacket`:
+    /// relayed copies (ttl < max) stay subject to the staleness checks, because
+    /// that is the path a replayed announce actually travels.
+    static func isDirectIdentityPacket(type: UInt8, ttl: UInt8, maxTTL: UInt8) -> Bool {
+        guard ttl == maxTTL else { return false }
+        return type == MessageType.announce.rawValue || type == SonarAnnouncePacket.packetType
+    }
 }
 
 // RelayController centralizes flood control policy for relays.

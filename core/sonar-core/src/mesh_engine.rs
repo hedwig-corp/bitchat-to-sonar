@@ -2406,6 +2406,43 @@ mod tests {
         assert!(out.events.is_empty(), "own announce must not surface");
     }
 
+    // A peer whose wall clock is badly wrong must still be discoverable. The
+    // engine judges freshness by the driver-supplied monotonic `now_ms` and
+    // never by the wall clock stamped into the packet, so a device months out
+    // of date is still announced normally. Apple used to reject these on a
+    // +/-120s skew gate and a 900s announce-age gate, which made a Pixel whose
+    // clock had drifted 153 days permanently invisible to every Apple peer
+    // while it still saw them - silent, and one-way. Apple now exempts the
+    // direct full-TTL identity packet (MeshLinkSenderPolicy.isDirectIdentityPacket);
+    // this pins the matching Android behaviour so the two cannot drift apart
+    // again without a red test.
+    #[test]
+    fn announce_from_peer_with_skewed_wall_clock_is_still_accepted() {
+        let mut a = engine(1, "pixel");
+        let mut far = engine(9, "wrong-clock-phone");
+
+        let now = 1_000_000;
+        // 153 days in the past, the real skew measured on the test device.
+        let skewed_wall = 1_000u64;
+        far.set_wall_clock(now, skewed_wall);
+        a.set_wall_clock(now, now + 153 * 24 * 60 * 60 * 1000);
+
+        a.on_dial_request("relay", now);
+        a.on_client_connected("relay", now);
+        a.on_instances_discovered("relay", &[7], now);
+        a.on_subscribe_result("relay", 7, true, now);
+
+        let skewed_announce = far.announce_bytes(now).expect("announce bytes");
+        let out = a.on_client_rx("relay", 7, &skewed_announce, now);
+
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, AppEvent::PeerAnnounced { .. })),
+            "an announce from a peer with a badly skewed clock must still surface the peer"
+        );
+    }
+
     #[test]
     fn relayed_announce_lists_but_does_not_bind_or_handshake() {
         let mut a = engine(1, "pixel");
