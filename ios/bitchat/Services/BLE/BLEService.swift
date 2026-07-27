@@ -1094,20 +1094,14 @@ final class BLEService: NSObject {
             }
         }
 
-        // A signed identity packet that arrived at full TTL came straight off a
-        // live link, so it cannot be a gossip-sync replay however wrong the
-        // sender's clock is — and a peer's clock must never decide whether we
-        // can see them. Presence freshness comes from OUR receive time
-        // (`updatePeerLastSeen`), not from the timestamp the sender claims.
-        // Relayed copies keep the check: that is where stale-replay actually
-        // matters. Android's engine (core/sonar-core/src/mesh_engine.rs) has
-        // never rejected on skew, so this also removes a silent one-way
-        // invisibility: a clock-skewed phone saw everyone while being
-        // undiscoverable to every Apple peer.
-        if MeshLinkSenderPolicy.isDirectIdentityPacket(type: packet.type, ttl: packet.ttl, maxTTL: messageTTL) {
-            skipTimestampCheck = true
-        }
-
+        // NOTE: do not exempt "direct" (full-TTL) identity packets from this
+        // check. TTL travels inside the signed packet, so it proves nothing
+        // about freshness — an attacker can replay a captured full-TTL announce
+        // verbatim on a new connection and, with this window gone, bind their
+        // link to the replayed identity. This window is what forces a replay to
+        // happen within 120s of capture. Making a clock-skewed peer visible
+        // needs freshness evidence that is NOT carried in the replayable packet
+        // (a challenge/nonce); see the follow-up rather than widening this.
         if !skipTimestampCheck {
             let maxSkew: UInt64 = 120_000
             let packetTime = packet.timestamp
@@ -4433,19 +4427,14 @@ extension BLEService {
         }
 
         // Reject stale announces to prevent ghost peers from appearing.
-        // Same 15-minute window as gossip sync (900 seconds) — and scoped to
-        // the gossip/relay path for the same reason: a full-TTL announce came
-        // straight off a live link, so it is fresh by construction no matter
-        // what clock the sender stamped it with. Judging it by the sender's
-        // clock made a phone with a wrong date permanently invisible here
-        // while it still saw us, since Android's engine never rejects on time.
+        // Use same 15-minute window as gossip sync (900 seconds).
+        // This applies to full-TTL announces too: TTL is inside the signed
+        // packet, so a captured announce replays with its TTL intact and would
+        // otherwise resurrect the peer and bind the replayer's link to it.
         let maxAnnounceAgeSeconds: TimeInterval = 900
         let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let ageThresholdMs = UInt64(maxAnnounceAgeSeconds * 1000)
-        let isDirectAnnounce = MeshLinkSenderPolicy.isDirectIdentityPacket(
-            type: packet.type, ttl: packet.ttl, maxTTL: messageTTL
-        )
-        if !isDirectAnnounce, nowMs >= ageThresholdMs {
+        if nowMs >= ageThresholdMs {
             let cutoffMs = nowMs - ageThresholdMs
             if packet.timestamp < cutoffMs {
                 SecureLogger.debug("⏰ Ignoring stale announce from \(peerID.id.prefix(8))… (age: \(Double(nowMs - packet.timestamp) / 1000.0)s)", category: .session)
@@ -4638,18 +4627,11 @@ extension BLEService {
         // Ignore our own announces echoed back by the mesh
         if peerID == myPeerID { return }
 
-        // Reject stale Sonar announces (same 15-minute window as announces),
-        // and exempt the direct full-TTL copy for the same reason: the 0x53
-        // rides alongside the 0x01, so gating it on the sender's clock would
-        // strip the Sonar capabilities off a peer whose announce we just
-        // accepted, leaving them stuck as a plain bitchat row.
+        // Reject stale Sonar announces (same 15-minute window as announces)
         let maxAnnounceAgeSeconds: TimeInterval = 900
         let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let ageThresholdMs = UInt64(maxAnnounceAgeSeconds * 1000)
-        let isDirectSonarAnnounce = MeshLinkSenderPolicy.isDirectIdentityPacket(
-            type: packet.type, ttl: packet.ttl, maxTTL: messageTTL
-        )
-        if !isDirectSonarAnnounce, nowMs >= ageThresholdMs, packet.timestamp < nowMs - ageThresholdMs {
+        if nowMs >= ageThresholdMs, packet.timestamp < nowMs - ageThresholdMs {
             return
         }
 

@@ -2406,16 +2406,19 @@ mod tests {
         assert!(out.events.is_empty(), "own announce must not surface");
     }
 
-    // A peer whose wall clock is badly wrong must still be discoverable. The
-    // engine judges freshness by the driver-supplied monotonic `now_ms` and
-    // never by the wall clock stamped into the packet, so a device months out
-    // of date is still announced normally. Apple used to reject these on a
-    // +/-120s skew gate and a 900s announce-age gate, which made a Pixel whose
-    // clock had drifted 153 days permanently invisible to every Apple peer
-    // while it still saw them - silent, and one-way. Apple now exempts the
-    // direct full-TTL identity packet (MeshLinkSenderPolicy.isDirectIdentityPacket);
-    // this pins the matching Android behaviour so the two cannot drift apart
-    // again without a red test.
+    // Documents a KNOWN GAP, not a guarantee we are happy with. The engine
+    // judges freshness by the driver-supplied monotonic `now_ms` and never by
+    // the wall clock in the packet, so a peer months out of date is announced
+    // normally - which is why a Pixel whose clock had drifted 153 days was
+    // visible to Android while being silently invisible to every Apple peer
+    // (Apple enforces a +/-120s skew gate and a 900s announce-age gate).
+    //
+    // The flip side is that this engine accepts a replayed captured announce
+    // indefinitely: nothing here binds acceptance to freshness evidence that an
+    // attacker cannot replay. Apple's windows at least force a replay to happen
+    // within 120s of capture. Closing this properly needs a challenge/nonce on
+    // both platforms; until then this test pins current behaviour so a change
+    // is deliberate rather than accidental.
     #[test]
     fn announce_from_peer_with_skewed_wall_clock_is_still_accepted() {
         let mut a = engine(1, "pixel");
