@@ -454,7 +454,9 @@ class SonarPushProcessingService : Service() {
                 // connect() can't slip past the collector.
                 val events = launch {
                     WalletBridge.paymentEvents.collect { ev ->
-                        if (ev.incoming && handleSettledReceive(ev, prefs, seenThisWake)) {
+                        if (ev.incoming &&
+                            handleSettledReceive(ev, prefs, seenThisWake, liveEvent = true)
+                        ) {
                             settled.incrementAndGet()
                         }
                     }
@@ -500,7 +502,9 @@ class SonarPushProcessingService : Service() {
                     SystemClock.elapsedRealtime() < deadline
                 ) {
                     for (ev in WalletBridge.recentIncomingReceives(wakeFloorSecs)) {
-                        if (handleSettledReceive(ev, prefs, seenThisWake)) settled.incrementAndGet()
+                        if (handleSettledReceive(ev, prefs, seenThisWake, liveEvent = false)) {
+                            settled.incrementAndGet()
+                        }
                     }
                     if (settled.get() > 0) break
                     delay(BREEZ_SETTLE_POLL_MS)
@@ -594,16 +598,26 @@ class SonarPushProcessingService : Service() {
         }
 
     /**
-     * Handle a settled incoming wallet payment observed during this wake.
+     * Handle an incoming wallet payment observed during this wake. Returns true
+     * when this observation should end the settle loop — and that is a
+     * path-dependent question, NOT the same one as "should we post a banner":
      *
-     * Returns true the FIRST time this wake sees [ev] — that is the signal the
-     * settle loop uses to stop waiting, and it is deliberately NOT the same
-     * question as "should we post a banner". The persisted ring can already own
-     * the payment (an earlier wake, an SDK event replay, or the foreground
-     * listener claiming a receive the user watched land in the UI); in that case
-     * the wake must still end, we just don't post a second banner. Conflating
-     * the two made an already-claimed payment invisible to the loop, which then
-     * burned its whole budget polling.
+     * - [liveEvent] (the `paymentEvents` collector): the payment is settling
+     *   NOW, while we are connected — first sight ends the wake whether or not
+     *   the ring already owns it (the foreground listener may have claimed a
+     *   receive the user watched land; the wake must still end, just without a
+     *   second banner).
+     * - Poll (`recentIncomingReceives`): the feed reaches 600s back, so it
+     *   returns HISTORY — a payment notified by an earlier wake would otherwise
+     *   end this wake seconds after connect, before the pushed payment's lockup
+     *   is even visible, and would do so again on every wake until it ages out
+     *   of the floor. Only a NEWLY CLAIMED receive ends the wake here; an
+     *   already-claimed one keeps the loop polling. The cost — a redundant wake
+     *   (fee-bump `swap_updated`, or a push for a foreground-settled payment)
+     *   burns the bounded 45s budget — is the lesser evil vs. delaying money.
+     *
+     * The banner itself is gated on claiming alone (not prefs), so enabling
+     * notifications later must not back-notify an old payment.
      *
      * Synchronized: the event collector and the poll loop race on both
      * [seenThisWake] and the persisted ring.
@@ -613,22 +627,21 @@ class SonarPushProcessingService : Service() {
         ev: WalletPaymentEvent,
         prefs: SonarNotificationPrefs,
         seenThisWake: MutableSet<String>,
+        liveEvent: Boolean,
     ): Boolean {
         // Ledger capture (idempotent) — normally already recorded at the event
         // source; this covers poll-fallback payments the listener never saw.
         PaymentActivityStore.recordIncomingWalletPayment(ev)
         val firstThisWake = seenThisWake.add(ev.paymentId)
-        // Notify at most once per payment across wakes and process deaths.
-        // Claiming (not prefs) is the gate, so enabling notifications later
-        // must not back-notify an old payment.
-        if (claimNotifiedPaymentId(ev.paymentId)) {
+        val claimed = claimNotifiedPaymentId(ev.paymentId)
+        if (claimed) {
             SonarNotificationRouter.buildWalletReceive(
                 idKey = "wallet-${ev.paymentId}",
                 sats = ev.amountSats,
                 prefs = prefs,
             )?.let { Notifier.notify(it.id, it.title, it.body) }
         }
-        return firstThisWake
+        return claimed || (liveEvent && firstThisWake)
     }
 
     override fun onDestroy() {
