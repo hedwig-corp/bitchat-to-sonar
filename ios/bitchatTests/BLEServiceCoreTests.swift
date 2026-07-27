@@ -280,9 +280,13 @@ struct BLEServiceCoreTests {
     // still could not survive a second consecutive loss (3×43 = 129s).
     @Test
     func reachabilityRetentionToleratesTwoMissedAnnounceCycles() {
+        // Include the dispatch-timer leeway: the maintenance timer may fire up
+        // to `bleMaintenanceLeewaySeconds` late, so a cadence check can land 6s
+        // after the previous one, not 5s.
         let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
             + TransportConfig.bleConnectedAnnounceJitterDense
             + TransportConfig.bleMaintenanceInterval
+            + TimeInterval(TransportConfig.bleMaintenanceLeewaySeconds)
 
         // BOTH trust classes are held to the DENSE bar: the cadence comes from
         // topology (`connectedCount`) and the window from identity trust, so an
@@ -310,9 +314,13 @@ struct BLEServiceCoreTests {
         // marks a healthily-announcing peer unreachable for part of every cycle
         // and a mesh-only contact's DM is marked `.failed` ("recipient
         // unreachable") while the radar still shows them.
+        // Include the dispatch-timer leeway: the maintenance timer may fire up
+        // to `bleMaintenanceLeewaySeconds` late, so a cadence check can land 6s
+        // after the previous one, not 5s.
         let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
             + TransportConfig.bleConnectedAnnounceJitterDense
             + TransportConfig.bleMaintenanceInterval
+            + TimeInterval(TransportConfig.bleMaintenanceLeewaySeconds)
         #expect(TransportConfig.bleRoutingReachabilitySeconds >= denseWorstGap)
 
         // Routing gives up after ONE missed announce, the radar after two.

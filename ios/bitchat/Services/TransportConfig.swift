@@ -94,8 +94,10 @@ enum TransportConfig {
     // How long to retain a peer as "reachable" (not directly connected) since
     // lastSeen. Announce emissions are spaced [interval, interval + maintenance
     // tick] apart (the cadence is only evaluated once per 5s tick), so the
-    // worst gap is 30+8+5 = 43s. Surviving TWO lost announces means lasting
-    // until the THIRD emission: >= 3x43 = 129s. Anything shorter evicts a peer
+    // worst gap is 30+8+5+1 = 44s — the maintenance timer carries
+    // `bleMaintenanceLeewaySeconds` of dispatch leeway, so a cadence check can
+    // land 6s after the previous one, not 5s. Surviving TWO lost announces
+    // means lasting until the THIRD emission: >= 3x44 = 132s. Anything shorter evicts a peer
     // while it is still announcing on schedule and it flaps in and out of the
     // radar.
     //
@@ -109,8 +111,8 @@ enum TransportConfig {
     // may drop below the dense bar.
     // Same failure-tolerance bar as the Rust mesh engine's LINK_STALE_MS
     // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
-    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 130.0    // >= 3x(30+8+5)
-    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 130.0  // >= 3x(30+8+5)
+    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 135.0    // >= 3x(30+8+5+1)
+    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 135.0  // >= 3x(30+8+5+1)
     // Window for DM TRANSPORT SELECTION, tighter than the radar windows above
     // but NOT tighter than one announce cycle. `MessageRouter` is built as
     // `[meshService, nostrTransport]` and picks the first transport whose
@@ -120,12 +122,12 @@ enum TransportConfig {
     //
     // The floor matters just as much as the ceiling: `ChatViewModel` gates
     // sending on this same `isPeerReachable`, so a value below the worst-case
-    // announce gap (30+8+5 = 43s dense) marks a peer that is announcing
+    // announce gap (30+8+5+1 = 44s dense, incl. timer leeway) marks a peer that is announcing
     // perfectly healthily as unreachable for part of every cycle — and a
     // mesh-only contact's DM is then marked `.failed` ("recipient
     // unreachable") while the radar still shows them. So: one worst-case gap,
     // give up after ONE missed announce, where the radar gives up after two.
-    static let bleRoutingReachabilitySeconds: TimeInterval = 45.0  // >= 1x(30+8+5)
+    static let bleRoutingReachabilitySeconds: TimeInterval = 45.0  // >= 1x(30+8+5+1)
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0
