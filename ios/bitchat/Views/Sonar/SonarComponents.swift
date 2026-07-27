@@ -4505,12 +4505,18 @@ struct SNPrimaryButton: View {
     var disabled: Bool = false
     let action: () -> Void
 
+    // Disabled = neutral chip (surface2 + text3), matching Compose
+    // `SNPrimaryButton`. Fading the whole button instead made the label
+    // vanish in dark mode, where `onAccent` is a near-black ink meant to sit
+    // on a bright fill — at 0.4 opacity it read as an inert dark blob.
     private var fill: Color {
+        if disabled { return SonarTheme.surface2 }
         if danger { return SonarTheme.danger }
         return net ? SonarTheme.netFill : SonarTheme.accentFill
     }
 
     private var foreground: Color {
+        if disabled { return SonarTheme.text3 }
         if danger { return Color(sonarHex: 0xFFF6F6) }
         return net ? SonarTheme.onNet : SonarTheme.onAccent
     }
@@ -4526,7 +4532,6 @@ struct SNPrimaryButton: View {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(fill)
                 )
-                .opacity(disabled ? 0.4 : 1)
         }
         .buttonStyle(SNScaleStyle(scale: 0.98))
         .disabled(disabled)
