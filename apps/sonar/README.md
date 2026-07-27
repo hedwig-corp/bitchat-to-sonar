@@ -46,7 +46,8 @@ interops cross-platform over the same Nostr relays — plus **BLE discovery**.
     write-drain side channel this role is built on is a Sonar patch that exists
     solely in bluster's CoreBluetooth backend. On Linux `sonar_ble_advertising_supported()`
     returns false, the host skips the advertise path, and only the scan radar runs. Bringing it to BlueZ means
-    wiring bluster's cross-platform `gatt::event` channel, tracked separately.
+    wiring bluster's cross-platform `gatt::event` channel, tracked in
+    [#469](https://github.com/hedwig-corp/bitchat-to-sonar/issues/469).
 
   What this means on Linux in practice: a nearby phone with the mesh screen open
   **is** discovered, with live signal strength. But a peer's *name* comes from

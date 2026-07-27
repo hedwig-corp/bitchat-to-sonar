@@ -91,7 +91,15 @@ jobs:
       # Linux, so run them here too.
       # --release so these artifacts are shared with the build-desktop.sh
       # invocation in the JVM step below, instead of building btleplug + bluster
-      # + dbus + tokio twice in one job.
+      # + dbus + tokio twice in one job. Because sonar-ble is crate-type
+      # ["cdylib", "lib"], that later `cargo build --release --lib` is a cache
+      # hit rather than only a shared dep tree.
+      #
+      # Consequence: the BlueZ path is exercised with debug-assertions and
+      # overflow-checks OFF here, while core-tests runs the CoreBluetooth path in
+      # dev. Irrelevant for the current tests (pure predicates over
+      # PeripheralProperties), but a future test that leans on a debug assertion
+      # would only really run on the macOS job.
       - name: Test the desktop BLE bridge (BlueZ path)
         run: cargo test --release
         working-directory: core/sonar-ble
