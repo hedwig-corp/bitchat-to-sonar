@@ -79,10 +79,29 @@ enum SNMarmotProfileCache {
     }
 
     static func save(_ profiles: [String: MarmotService.Profile], to defaults: UserDefaults) {
+        guard let payload = encoded(profiles) else { return }
+        commit(payload, to: defaults)
+    }
+
+    /// The expensive half: normalize + JSON-encode the whole map. `nonisolated`
+    /// and pure so callers can run it off the main actor and commit the result
+    /// later — see `MarmotChatModel.scheduleProfileCacheWrite`.
+    nonisolated static func encoded(
+        _ profiles: [String: MarmotService.Profile]
+    ) -> (data: Data, normalized: [String: MarmotService.Profile])? {
         let normalizedProfiles = normalized(profiles)
-        guard let data = try? JSONEncoder().encode(normalizedProfiles) else { return }
-        defaults.set(data, forKey: defaultsKey)
-        syncSharedProfileNames(normalizedProfiles)
+        guard let data = try? JSONEncoder().encode(normalizedProfiles) else { return nil }
+        return (data, normalizedProfiles)
+    }
+
+    /// The cheap half: hand the encoded bytes to UserDefaults (in-memory, the
+    /// disk flush is the OS's problem) and mirror the App Group name map.
+    static func commit(
+        _ payload: (data: Data, normalized: [String: MarmotService.Profile]),
+        to defaults: UserDefaults
+    ) {
+        defaults.set(payload.data, forKey: defaultsKey)
+        syncSharedProfileNames(payload.normalized)
     }
 
     static func clear(from defaults: UserDefaults) {
@@ -170,8 +189,21 @@ enum SNMarmotDescriptorCache {
         _ descriptors: [String: MarmotService.SonarDescriptor],
         to defaults: UserDefaults
     ) {
-        let bounded = capped(descriptors)
-        guard let data = try? JSONEncoder().encode(bounded) else { return }
+        guard let data = encoded(descriptors) else { return }
+        commit(data, to: defaults)
+    }
+
+    /// The expensive half: cap + JSON-encode the whole map. `nonisolated` and
+    /// pure so callers can run it off the main actor and commit the result
+    /// later — see `MarmotChatModel.scheduleDescriptorCacheWrite`.
+    nonisolated static func encoded(
+        _ descriptors: [String: MarmotService.SonarDescriptor]
+    ) -> Data? {
+        try? JSONEncoder().encode(capped(descriptors))
+    }
+
+    /// The cheap half: hand the encoded bytes to UserDefaults.
+    static func commit(_ data: Data, to defaults: UserDefaults) {
         defaults.set(data, forKey: defaultsKey)
     }
 
@@ -484,6 +516,10 @@ final class MarmotChatModel: ObservableObject {
     /// Bumped on identity teardown so a descriptor fetch started under the old
     /// account cannot land — and persist — after the wipe.
     private var descriptorCacheGeneration = 0
+    /// Bumped by every teardown that clears a contact cache. A deferred write
+    /// that encoded before the clear is dropped instead of resurrecting erased
+    /// contact data (an Account Key Durability-class failure).
+    private var contactCacheWriteGeneration = 0
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -2367,7 +2403,7 @@ final class MarmotChatModel: ObservableObject {
         await MainActor.run {
             profilesByNpub[key] = profile
             profileFetchedAt[key] = Date()
-            SNMarmotProfileCache.save(profilesByNpub, to: defaults)
+            scheduleProfileCacheWrite()
             onOwnProfileFetched?(profile)
         }
         let claimed = await service.claimedHandle()
@@ -2493,7 +2529,7 @@ final class MarmotChatModel: ObservableObject {
                     if key != npubToFetch {
                         self.profilesByNpub.removeValue(forKey: npubToFetch)
                     }
-                    SNMarmotProfileCache.save(self.profilesByNpub, to: self.defaults)
+                    self.scheduleProfileCacheWrite()
                 } else {
                     if !hadCachedProfile {
                         self.profileFetches.remove(key) // not published yet — allow retry
@@ -2586,6 +2622,51 @@ final class MarmotChatModel: ObservableObject {
         return sonarDescriptorsByNpub[npubToFetch]
     }
 
+    // ── Contact-cache persistence (profiles + Sonar descriptors) ──
+    //
+    // Both caches re-encode their WHOLE map on every successful fetch, and both
+    // `save` calls used to run inside `MainActor.run`. A boot / foreground sweep
+    // (`refreshDescriptors(forKnownNpubs:)`, `refreshChatMemberProfiles`)
+    // resolves N contacts, so that was N full-map JSON encodes on the main
+    // actor while the user may be scrolling or sending.
+    //
+    // These schedule the encode off the actor and commit on it. The commit
+    // itself is cheap — `defaults.set` is in-memory, the OS flushes later — and
+    // doing it back on the actor is what makes the ordering safe: a teardown
+    // that bumps `contactCacheWriteGeneration` is serialized against the commit
+    // hop, so a write encoded before a wipe can never land after it.
+    //
+    // Teardown paths must NOT use these. They call `.clear(from:)` directly,
+    // which is synchronous, and bump the generation.
+
+    private func scheduleProfileCacheWrite() {
+        let snapshot = profilesByNpub
+        let defaults = self.defaults
+        let generation = contactCacheWriteGeneration
+        Task.detached(priority: .utility) { [weak self] in
+            guard let payload = SNMarmotProfileCache.encoded(snapshot) else { return }
+            guard let self else { return }
+            await MainActor.run {
+                guard generation == self.contactCacheWriteGeneration else { return }
+                SNMarmotProfileCache.commit(payload, to: defaults)
+            }
+        }
+    }
+
+    private func scheduleDescriptorCacheWrite() {
+        let snapshot = sonarDescriptorsByNpub
+        let defaults = self.defaults
+        let generation = contactCacheWriteGeneration
+        Task.detached(priority: .utility) { [weak self] in
+            guard let data = SNMarmotDescriptorCache.encoded(snapshot) else { return }
+            guard let self else { return }
+            await MainActor.run {
+                guard generation == self.contactCacheWriteGeneration else { return }
+                SNMarmotDescriptorCache.commit(data, to: defaults)
+            }
+        }
+    }
+
     /// Apply a completed descriptor fetch to the cache.
     ///
     /// A relay MISS (`fetched == nil`) is a transient answer, not proof the peer
@@ -2635,7 +2716,7 @@ final class MarmotChatModel: ObservableObject {
                 // that once per missed contact for no state change. Compose's
                 // miss branch does not persist either.
                 if !outcome.missed {
-                    SNMarmotDescriptorCache.save(self.sonarDescriptorsByNpub, to: self.defaults)
+                    self.scheduleDescriptorCacheWrite()
                 }
             }
         } catch {
@@ -4177,6 +4258,9 @@ final class MarmotChatModel: ObservableObject {
         refreshTask?.cancel()
         refreshTask = nil
         clearStickerCaches()
+        // Invalidate every deferred contact-cache write queued so far, so none
+        // of them can commit after these clears.
+        contactCacheWriteGeneration &+= 1
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -4195,6 +4279,7 @@ final class MarmotChatModel: ObservableObject {
         sonarDescriptorFetchedAtByNpub = [:]
         descriptorFetches = []
         descriptorCacheGeneration &+= 1
+        contactCacheWriteGeneration &+= 1
         SNMarmotDescriptorCache.clear(from: defaults)
     }
 

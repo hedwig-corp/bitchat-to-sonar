@@ -940,7 +940,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
-            sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCache(); descriptorCacheGeneration++
+            sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCacheNow(); descriptorCacheGeneration++
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
             needsSonarDescriptorPublish = false
@@ -1017,7 +1017,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             pendingMarmotGroups = emptyMap()
             linkByFp.clear(); linkCapsByFp.clear(); groupFoldMap.clear()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
-            profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCache()
+            profilesByNpub = emptyMap(); profileFetches.clear(); persistProfileCacheNow()
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             meshBroadcast = emptyList(); meshDmRows = emptyList()
             updateBleDiscoveryPolicy()
@@ -3466,14 +3466,14 @@ class SonarAppState(private val scope: CoroutineScope) {
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
-                sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCache(); descriptorCacheGeneration++
+                sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCacheNow(); descriptorCacheGeneration++
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
                 publishedSonarDescriptor = false
                 publishedSonarDescriptorBolt12Offer = null
                 publishingSonarDescriptor = false
                 needsSonarDescriptorPublish = false
                 rawMeshPeerIds = emptySet(); meshPeerFirstSeenMs.clear(); pendingCapabilityRefreshPeers.clear()
-                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCache()
+                profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
                 socialState = SonarSocialState(); persistSocialState()
                 bip353 = ""; SonarCore.saveBlob("bip353", "")
                 coreClaimedHandle = null
@@ -4749,8 +4749,61 @@ class SonarAppState(private val scope: CoroutineScope) {
         sonarDescriptorFetches.remove(key)
     }
 
+    // ── Contact-cache persistence (profiles + Sonar descriptors) ──
+    //
+    // Both caches re-encode their WHOLE map on every successful fetch, and this
+    // state's scope is a `rememberCoroutineScope()` (App.kt) — i.e. Main. A
+    // relay-startup sweep (`refreshKnownContactDescriptors` /
+    // `refreshChatMemberProfiles`) resolves N contacts, so the naive form did N
+    // full-map encodes on the render path. On desktop it is worse than it looks:
+    // `SonarCore.saveBlob` → `DesktopEnv.putString` writes the properties file
+    // synchronously, so the write itself blocks too.
+    //
+    // So the per-fetch path snapshots the (immutable) map on Main and does the
+    // encode AND the write on IO. Wipe/teardown must NOT use that path: it has
+    // to observe the blob cleared before the account is replaced, so it writes
+    // through [writeContactCacheNow], which is awaited.
+    //
+    // The mutex + generation are what keep a deferred write from landing after a
+    // wipe and resurrecting erased contact data (an Account Key Durability-class
+    // failure). Every synchronous write bumps the generation under the lock, so
+    // any deferred write that encoded before the wipe is dropped rather than
+    // committed.
+    private val contactCacheWriteMutex = Mutex()
+    private var contactCacheWriteGeneration = 0
+
+    /** Snapshot now on the caller's thread, encode + write on IO. Use for the
+     *  per-fetch paths, never for wipe/teardown. */
+    private fun scheduleContactCacheWrite(key: String, encode: () -> String) {
+        val generation = contactCacheWriteGeneration
+        scope.launch(Dispatchers.IO) {
+            val encoded = encode()
+            contactCacheWriteMutex.withLock {
+                if (generation != contactCacheWriteGeneration) return@withLock
+                SonarCore.saveBlob(key, encoded)
+            }
+        }
+    }
+
+    /** Write immediately and invalidate every deferred write queued so far.
+     *  Wipe/teardown only — callers must await this before replacing the
+     *  account. */
+    private suspend fun writeContactCacheNow(key: String, encoded: String) {
+        contactCacheWriteMutex.withLock {
+            contactCacheWriteGeneration++
+            withContext(Dispatchers.IO) { SonarCore.saveBlob(key, encoded) }
+        }
+    }
+
     private fun persistSonarDescriptorCache() {
-        SonarCore.saveBlob(
+        val snapshot = sonarDescriptorsByNpubHex
+        scheduleContactCacheWrite(SONAR_DESCRIPTOR_CACHE_BLOB_KEY) {
+            encodeSonarDescriptorCache(snapshot)
+        }
+    }
+
+    private suspend fun persistSonarDescriptorCacheNow() {
+        writeContactCacheNow(
             SONAR_DESCRIPTOR_CACHE_BLOB_KEY,
             encodeSonarDescriptorCache(sonarDescriptorsByNpubHex),
         )
@@ -4766,9 +4819,18 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     private fun persistProfileCache() {
+        val snapshot = profilesByNpub
+        scheduleContactCacheWrite(PROFILE_CACHE_BLOB_KEY) {
+            val encoded = encodeProfileCache(snapshot)
+            sonarLog("SonarProfile", "persist cache: ${snapshot.size} profiles → ${encoded.length} chars")
+            encoded
+        }
+    }
+
+    private suspend fun persistProfileCacheNow() {
         val encoded = encodeProfileCache(profilesByNpub)
-        sonarLog("SonarProfile", "persist cache: ${profilesByNpub.size} profiles → ${encoded.length} chars")
-        SonarCore.saveBlob(PROFILE_CACHE_BLOB_KEY, encoded)
+        sonarLog("SonarProfile", "persist cache (sync): ${profilesByNpub.size} profiles → ${encoded.length} chars")
+        writeContactCacheNow(PROFILE_CACHE_BLOB_KEY, encoded)
     }
 
     fun openChat(chat: SonarChat, jumpMessageId: String? = null) {

@@ -37,6 +37,49 @@ struct MarmotProfileCacheTests {
         #expect(loaded[npub]?.about == "hello")
     }
 
+    /// `save` is now `encoded` (off-actor, expensive) + `commit` (on-actor,
+    /// cheap), so the deferred write path can skip the main actor for the JSON
+    /// encode. The App Group name mirror moved from `save` into `commit` — the
+    /// NSE resolves kill-state banner senders through it, so pin that both the
+    /// split call and the direct one still populate it.
+    @Test
+    func encodeThenCommitMatchesSaveIncludingTheAppGroupMirror() throws {
+        let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defer { SonarSharedProfileNames.clear() }
+
+        let npub = "npub1vincent"
+        let profile = MarmotService.Profile(
+            name: "vincent",
+            displayName: "Vincent",
+            about: "hello",
+            picture: nil,
+            nip05: nil
+        )
+
+        SonarSharedProfileNames.clear()
+        let payload = try #require(SNMarmotProfileCache.encoded([npub: profile]))
+        SNMarmotProfileCache.commit(payload, to: defaults)
+
+        let viaSplit = SNMarmotProfileCache.load(from: defaults)
+        #expect(viaSplit[npub]?.bestName == "Vincent")
+        #expect(viaSplit[npub]?.about == "hello")
+        #expect(!SonarSharedProfileNames.load().isEmpty)
+
+        // The synchronous convenience wrapper must stay equivalent. Compared by
+        // decoded value, not raw bytes: JSONEncoder does not promise a stable
+        // key order for a Dictionary, so two encodes of the same map can differ
+        // byte-for-byte while meaning the same thing.
+        let otherSuite = "MarmotProfileCacheTests-\(UUID().uuidString)"
+        let otherDefaults = UserDefaults(suiteName: otherSuite)!
+        defer { otherDefaults.removePersistentDomain(forName: otherSuite) }
+        SNMarmotProfileCache.save([npub: profile], to: otherDefaults)
+
+        #expect(SNMarmotProfileCache.load(from: otherDefaults)
+            == SNMarmotProfileCache.load(from: defaults))
+    }
+
     @Test
     func clearRemovesCachedProfiles() {
         let suiteName = "MarmotProfileCacheTests-\(UUID().uuidString)"
