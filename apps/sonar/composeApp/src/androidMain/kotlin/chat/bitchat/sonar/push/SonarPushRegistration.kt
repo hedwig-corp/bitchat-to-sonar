@@ -146,13 +146,17 @@ object SonarPushRegistration {
             var backoff = 2_000L
             for (attempt in 1..MAX_RETRIES) {
                 try {
-                    SonarCore.start()
-                    SonarCore.connectRelays()
-                    SonarCore.registerPushToken(
-                        platform = "fcm",
-                        token = fcmToken.toByteArray(Charsets.UTF_8),
-                        serverNpub = transponderNpub,
-                    )
+                    // Token refresh can fire in a UI-less process; claim the node
+                    // so a scheduled auto-backup seal cannot close it mid-publish.
+                    chat.bitchat.sonar.backup.withMarmotSessionClaim {
+                        SonarCore.start()
+                        SonarCore.connectRelays()
+                        SonarCore.registerPushToken(
+                            platform = "fcm",
+                            token = fcmToken.toByteArray(Charsets.UTF_8),
+                            serverNpub = transponderNpub,
+                        )
+                    }
                     Log.d(TAG, "Transponder: MIP-05 push token registered")
                     return@launch
                 } catch (e: Exception) {

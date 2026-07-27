@@ -58,6 +58,12 @@ struct BitchatApp: App {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
+        #if os(iOS)
+        AutoBackupBackgroundScheduler.shared.store = _sonarStore.wrappedValue
+        if _sonarStore.wrappedValue.isAutoBackupDisclosed() {
+            AutoBackupBackgroundScheduler.shared.schedule()
+        }
+        #endif
     }
 
     private var chatViewModel: ChatViewModel { sonarStore.chatViewModel }
@@ -88,6 +94,10 @@ struct BitchatApp: App {
                     appDelegate.chatViewModel = chatViewModel
                     #if os(iOS)
                     appDelegate.sonarStore = sonarStore
+                    AutoBackupBackgroundScheduler.shared.store = sonarStore
+                    if sonarStore.isAutoBackupDisclosed() {
+                        AutoBackupBackgroundScheduler.shared.schedule()
+                    }
                     #endif
 
                     // Initialize network activation policy; will start Tor/Nostr only when allowed
@@ -117,6 +127,9 @@ struct BitchatApp: App {
                         // local name and restricts service-UUID advertising in the
                         // background, so receiving payments is foreground-only.
                         sonarStore.setForeground(false)
+                        AutoBackupBackgroundScheduler.shared.store = sonarStore
+                        AutoBackupBackgroundScheduler.shared.schedule()
+                        AutoBackupBackgroundScheduler.shared.runOpportunisticBackgroundBackupIfDue()
                         // Always send Tor to dormant on background for a clean restart later.
                         TorManager.shared.setAppForeground(false)
                         TorManager.shared.goDormantOnBackground()
@@ -257,6 +270,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
             Self.pushLog.warning("GoogleService-Info.plist missing; Breez NDS offline receive disabled")
         }
         application.registerForRemoteNotifications()
+        AutoBackupBackgroundScheduler.shared.register()
         return true
     }
 

@@ -1886,6 +1886,8 @@ pub struct SonarClient {
     claimed_handle: Arc<Mutex<Option<String>>>,
     /// Durable path for the claimed handle (None for in-memory sessions).
     handle_state_path: Option<PathBuf>,
+    /// Persistent Marmot DB path for auto-backup dirty marks (None in-memory).
+    marmot_db_path: Option<PathBuf>,
     /// Atomic throttle + single-flight gate for the per-group catch-up pass;
     /// see `GroupCatchupGate`.
     group_catchup_gate: Arc<Mutex<GroupCatchupGate>>,
@@ -1946,6 +1948,7 @@ impl SonarClient {
             *client.claimed_handle.lock().unwrap() = Some(address);
         }
         client.handle_state_path = Some(handle_path);
+        client.marmot_db_path = Some(db_path.to_path_buf());
         client.materialize_index_if_empty();
         Ok(client)
     }
@@ -2402,6 +2405,7 @@ impl SonarClient {
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
+            marmot_db_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
         // Open the live Marmot subscriptions for real sessions. In-memory test
@@ -3036,6 +3040,9 @@ impl SonarClient {
             .remove_group_entries(&group_id_hex)?;
         self.remove_index_for_group(group_id);
         self.notify_conversation_changed(&group_id_hex);
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
         self.schedule_resubscribe_marmot_groups_if_live();
         self.schedule_best_effort_leave_publish(leave_update);
         Ok(())
@@ -3280,6 +3287,7 @@ impl SonarClient {
         let conversation_index = self.conversation_index.clone();
         let sync_state = self.sync_state.clone();
         let sync_watermark_frozen = self.sync_watermark_frozen.clone();
+        let marmot_db_path = self.marmot_db_path.clone();
         let event_id_hex = event_id.to_hex();
         std::thread::spawn(move || {
             if let Some(ref idx) = conversation_index {
@@ -3298,6 +3306,11 @@ impl SonarClient {
                 ) {
                     tracing::warn!(%e, "deferred index upsert failed");
                 }
+            }
+            if let Some(ref db_path) = marmot_db_path {
+                // Outbound sends mutate the local transcript too — opportunistic
+                // backup must not wait for the 24h daily floor alone.
+                crate::account_backup::mark_backup_dirty(db_path);
             }
             {
                 let mut state = sync_state.lock().unwrap();
@@ -6758,6 +6771,9 @@ impl SonarClient {
             .unwrap()
             .remove_group_entries(&group_id_hex)?;
         self.remove_index_for_group(group_id);
+        if let Some(ref db_path) = self.marmot_db_path {
+            crate::account_backup::mark_backup_dirty(db_path);
+        }
         self.notify_conversation_changed(&group_id_hex);
         self.schedule_resubscribe_marmot_groups_if_live();
         Ok(())
@@ -6810,25 +6826,29 @@ impl SonarClient {
     }
 
     fn upsert_index_for_message(&self, message: &ChatMessage, group_name: Option<&str>) {
-        let Some(ref idx) = self.conversation_index else {
-            return;
-        };
-        let group_id_hex = hex::encode(message.group_id.as_slice());
-        let name = group_name.unwrap_or("");
-        if let Err(e) = idx.lock().unwrap().upsert_summary(
-            &group_id_hex,
-            name,
-            &index_preview(message),
-            &message.sender.to_string(),
-            message.created_at.as_secs(),
-            message.mine,
-            // Hidden control lines (⚡PAYDONE / ☎CALL) must not raise unread:
-            // hosts place the unread divider by walking `unread_count` VISIBLE
-            // incoming rows back from the tail, so counting a row that never
-            // renders opens the chat that much further up its history.
-            message.classification.is_transcript_visible(),
-        ) {
-            tracing::warn!(%e, "index upsert failed");
+        if let Some(ref idx) = self.conversation_index {
+            let group_id_hex = hex::encode(message.group_id.as_slice());
+            let name = group_name.unwrap_or("");
+            if let Err(e) = idx.lock().unwrap().upsert_summary(
+                &group_id_hex,
+                name,
+                &index_preview(message),
+                &message.sender.to_string(),
+                message.created_at.as_secs(),
+                message.mine,
+                // Hidden control lines (⚡PAYDONE / ☎CALL) must not raise unread:
+                // hosts place the unread divider by walking `unread_count` VISIBLE
+                // incoming rows back from the tail, so counting a row that never
+                // renders opens the chat that much further up its history.
+                message.classification.is_transcript_visible(),
+            ) {
+                tracing::warn!(%e, "index upsert failed");
+            }
+        }
+        if let Some(ref db_path) = self.marmot_db_path {
+            // Auto-backup policy: local transcript change ⇒ opportunistic due later.
+            // mark_backup_dirty is cache-backed; disk I/O only on first dirty / remake.
+            crate::account_backup::mark_backup_dirty(db_path);
         }
     }
 
@@ -7235,6 +7255,7 @@ impl SonarClient {
         let sticker_result = wipe_sticker_cache_for_db(db_path);
         let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
         let media_staging_result = wipe_media_staging_for_db(db_path);
+        crate::account_backup::wipe_backup_policy_for_db(db_path);
         db_result?;
         index_result?;
         push_result?;

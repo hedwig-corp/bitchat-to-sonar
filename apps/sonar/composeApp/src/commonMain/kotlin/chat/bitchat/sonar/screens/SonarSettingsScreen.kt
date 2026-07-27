@@ -75,7 +75,9 @@ import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.backup_chats
 import chat.bitchat.sonar.resources.cancel
+import chat.bitchat.sonar.resources.chat_backup
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
+import chat.bitchat.sonar.resources.encrypted_cloud_backup_when_chats_change
 import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
 import chat.bitchat.sonar.resources.paste_from_clipboard
 import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
@@ -108,6 +110,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var transcriptSpikeB by remember { mutableStateOf(false) }
     var transcriptPolicyHost by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
+    LaunchedEffect(Unit) { state.refreshBackupPolicy() }
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
     val iconLabel = when (state.prefStr("icon", "cyan")) {
@@ -229,11 +232,13 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
                 ) { exportKey = true }
                 SNXSettingsRow(
-                    label = stringResource(Res.string.backup_chats),
-                    sub = stringResource(Res.string.encrypted_cloud_backup_recover_chats),
+                    label = stringResource(Res.string.chat_backup),
+                    sub = state.autoBackupStatusLine.ifBlank {
+                        stringResource(Res.string.encrypted_cloud_backup_recover_chats)
+                    },
                     chevron = true,
                     icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
-                ) { state.backupAccountNow() }
+                ) { state.push(Screen.Backup) }
                 SNXSettingsRow(
                     label = stringResource(Res.string.restore_account),
                     sub = stringResource(Res.string.replace_this_account_with_an_nsec_from),

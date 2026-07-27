@@ -145,11 +145,117 @@ fn backup_runtime() -> FfiResult<tokio::runtime::Runtime> {
         .map_err(|e| SonarFfiError::Core(format!("tokio runtime: {e}")))
 }
 
+/// Auto-backup policy snapshot for Settings / host executors.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BackupPolicyInfo {
+    pub enabled: bool,
+    pub dirty: bool,
+    pub last_success_at: Option<u64>,
+    pub last_attempt_at: Option<u64>,
+    pub last_error: Option<String>,
+    pub opportunistic_debounce_secs: u64,
+    pub daily_interval_secs: u64,
+}
+
+fn policy_info(p: sonar_core::account_backup::BackupPolicy) -> BackupPolicyInfo {
+    BackupPolicyInfo {
+        enabled: p.enabled,
+        dirty: p.dirty,
+        last_success_at: p.last_success_at,
+        last_attempt_at: p.last_attempt_at,
+        last_error: p.last_error,
+        opportunistic_debounce_secs: p.opportunistic_debounce_secs,
+        daily_interval_secs: p.daily_interval_secs,
+    }
+}
+
+#[uniffi::export]
+pub fn get_backup_policy(db_path: String) -> BackupPolicyInfo {
+    policy_info(sonar_core::account_backup::load_backup_policy(Path::new(
+        &db_path,
+    )))
+}
+
+#[uniffi::export]
+pub fn set_backup_enabled(db_path: String, enabled: bool) -> FfiResult<()> {
+    sonar_core::account_backup::set_backup_enabled(Path::new(&db_path), enabled)?;
+    Ok(())
+}
+
+/// Persist on-by-default only when the policy sidecar is missing. Safe to call
+/// from onboarding — never overwrites an existing opt-out or fail-closed file.
+#[uniffi::export]
+pub fn ensure_backup_policy_default(db_path: String) -> FfiResult<()> {
+    sonar_core::account_backup::ensure_backup_policy_default(Path::new(&db_path))?;
+    Ok(())
+}
+
+#[uniffi::export]
+pub fn backup_is_due(db_path: String) -> bool {
+    sonar_core::account_backup::backup_is_due_now(Path::new(&db_path))
+}
+
+#[uniffi::export]
+pub fn mark_backup_dirty(db_path: String) {
+    sonar_core::account_backup::mark_backup_dirty(Path::new(&db_path));
+}
+
+#[uniffi::export]
+pub fn record_backup_success(db_path: String) -> FfiResult<()> {
+    sonar_core::account_backup::record_backup_success(Path::new(&db_path))?;
+    Ok(())
+}
+
+#[uniffi::export]
+pub fn record_backup_failure(db_path: String, error: String) -> FfiResult<()> {
+    sonar_core::account_backup::record_backup_failure(Path::new(&db_path), &error)?;
+    Ok(())
+}
+
+/// Seal only (exclusive DB access). Hosts should reopen the node, then call
+/// [`upload_sealed_account_backup`] so chat is not blocked on Blossom upload.
+#[uniffi::export]
+pub fn seal_account_backup(
+    nsec: String,
+    db_path: String,
+    db_key_hex: String,
+) -> FfiResult<Vec<u8>> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    Ok(sonar_core::account_backup::seal_account_backup_files(
+        identity.keys(),
+        Path::new(&db_path),
+        &db_key_hex,
+    )?)
+}
+
+/// Upload already-sealed ciphertext. Does **not** need a closed SonarNode.
+#[uniffi::export]
+pub fn upload_sealed_account_backup(
+    nsec: String,
+    sealed: Vec<u8>,
+    blossom_server: Option<String>,
+) -> FfiResult<AccountBackupUploadInfo> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    let server = blossom_server.unwrap_or_default();
+    let runtime = backup_runtime()?;
+    let uploaded = runtime.block_on(sonar_core::account_backup::upload_sealed_backup(
+        identity.keys(),
+        &server,
+        sealed,
+    ))?;
+    Ok(AccountBackupUploadInfo {
+        url: uploaded.url,
+        sha256_hex: uploaded.sha256_hex,
+        size: uploaded.size,
+    })
+}
+
 /// Encrypt the Marmot DB at `db_path` (plus conversation index) with a key
 /// derived from `nsec`, then upload to Blossom (BUD-02).
 ///
 /// Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
 /// Empty `blossom_server` uses the default Blossom host.
+/// Prefer seal → reconnect → [`upload_sealed_account_backup`] for auto-backup.
 #[uniffi::export]
 pub fn backup_account_to_blossom(
     nsec: String,

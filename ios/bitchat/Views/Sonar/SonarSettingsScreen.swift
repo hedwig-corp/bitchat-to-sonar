@@ -156,10 +156,12 @@ struct SonarSettingsScreen: View {
                         }
                         SNSettingsRow(
                             icon: .shieldCheck, tone: .cyan,
-                            label: String(localized: "Backup chats"),
-                            sub: String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                            label: String(localized: "Chat backup"),
+                            sub: store.autoBackupStatusLine.isEmpty
+                                ? String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                                : store.autoBackupStatusLine
                         ) {
-                            Task { await store.backupAccountNow() }
+                            store.push(.backup)
                         }
                         SNSettingsRow(
                             icon: .importKey, tone: .cyan,

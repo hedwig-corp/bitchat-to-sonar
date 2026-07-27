@@ -72,6 +72,11 @@
 		<string>audio</string>
 		<string>voip</string>
 		<string>remote-notification</string>
+		<string>fetch</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>sh.hedwig.sonar.auto-backup</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

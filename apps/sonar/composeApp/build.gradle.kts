@@ -208,6 +208,8 @@ kotlin {
         androidMain.dependencies {
             implementation(libs.androidx.activity.compose)
             implementation(libs.coroutines.android)
+            // Periodic auto-backup when the process is not foreground.
+            implementation(libs.androidx.work.runtime)
             // Android-supported WebSocket transport for relay diagnostics.
             implementation(libs.okhttp.client)
             // On-device Lightning wallet (Breez SDK Liquid) for ⚡PAY.

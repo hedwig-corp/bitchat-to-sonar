@@ -6,8 +6,12 @@
 //!
 //! Blossom sees ciphertext only (`application/vnd.sonar.account-backup-v1`).
 
-use std::fs;
-use std::path::Path;
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ::hkdf::Hkdf;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -17,6 +21,7 @@ use nostr::hashes::Hash;
 use nostr::prelude::*;
 use nostr_blossom::prelude::*;
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use crate::conversation_index::index_db_path_for_db;
@@ -35,6 +40,329 @@ const DEFAULT_BLOSSOM_SERVER: &str = "https://nostr.download";
 /// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
 /// guards memory against a malicious Blossom response.
 const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
+/// Sidecar next to the Marmot DB: `{db_filename}.sonar-backup-policy.json`.
+const BACKUP_POLICY_SUFFIX: &str = ".sonar-backup-policy.json";
+/// Default opportunistic debounce after a dirty mark (30 minutes).
+pub const DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS: u64 = 30 * 60;
+/// Default daily floor when the account is quiet (24 hours).
+pub const DEFAULT_DAILY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const MAX_POLICY_ERROR_CHARS: usize = 240;
+
+/// Core-owned auto-backup policy (Approach B). Hosts only execute when due.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupPolicy {
+    /// On-by-default for new installs (missing sidecar ⇒ default).
+    pub enabled: bool,
+    /// Set when local transcript/index changes; cleared on successful upload
+    /// only when no newer dirty mark arrived after the seal attempt.
+    pub dirty: bool,
+    /// Wall time of the latest dirty mark (bumped on every mark, even if already dirty).
+    #[serde(default)]
+    pub last_dirty_at: Option<u64>,
+    /// Monotonic dirty counter — bumped on every mark so same-second remakes
+    /// during upload are not cleared by [`record_backup_success`].
+    #[serde(default)]
+    pub dirty_seq: u64,
+    /// `dirty_seq` snapshotted by [`record_backup_attempt`]; success clears dirty
+    /// only when `dirty_seq` still equals this value.
+    #[serde(default)]
+    pub attempt_dirty_seq: Option<u64>,
+    pub last_success_at: Option<u64>,
+    pub last_attempt_at: Option<u64>,
+    pub last_error: Option<String>,
+    pub opportunistic_debounce_secs: u64,
+    pub daily_interval_secs: u64,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dirty: false,
+            last_dirty_at: None,
+            dirty_seq: 0,
+            attempt_dirty_seq: None,
+            last_success_at: None,
+            last_attempt_at: None,
+            last_error: None,
+            opportunistic_debounce_secs: DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS,
+            daily_interval_secs: DEFAULT_DAILY_INTERVAL_SECS,
+        }
+    }
+}
+
+/// Serializes policy RMW and holds an in-process cache so the message hot path
+/// can skip disk reads/writes once `dirty` is already set (and at most one
+/// remake bump while a seal/upload is in flight).
+static POLICY_STATE: LazyLock<Mutex<HashMap<String, BackupPolicy>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn policy_cache_key(db_path: &Path) -> String {
+    backup_policy_path_for_db(db_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn with_policy_state<R>(f: impl FnOnce(&mut HashMap<String, BackupPolicy>) -> R) -> R {
+    let mut guard = POLICY_STATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    f(&mut guard)
+}
+
+fn cached_policy(map: &mut HashMap<String, BackupPolicy>, db_path: &Path) -> BackupPolicy {
+    let key = policy_cache_key(db_path);
+    if let Some(p) = map.get(&key) {
+        return p.clone();
+    }
+    let p = load_backup_policy_from_disk(db_path);
+    map.insert(key, p.clone());
+    p
+}
+
+fn store_policy(
+    map: &mut HashMap<String, BackupPolicy>,
+    db_path: &Path,
+    policy: &BackupPolicy,
+) -> Result<()> {
+    save_backup_policy_to_disk(db_path, policy)?;
+    map.insert(policy_cache_key(db_path), policy.clone());
+    Ok(())
+}
+
+/// Path of the durable policy sidecar for `db_path`.
+pub fn backup_policy_path_for_db(db_path: &Path) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("marmot.sqlite");
+    db_path.with_file_name(format!("{name}{BACKUP_POLICY_SUFFIX}"))
+}
+
+/// Load policy (cache-aware). Missing file ⇒ on-by-default. Corrupt file ⇒
+/// fail closed (`enabled: false`) and persist that so opt-out survives.
+pub fn load_backup_policy(db_path: &Path) -> BackupPolicy {
+    with_policy_state(|map| cached_policy(map, db_path))
+}
+
+fn load_backup_policy_from_disk(db_path: &Path) -> BackupPolicy {
+    let path = backup_policy_path_for_db(db_path);
+    let Ok(bytes) = fs::read(&path) else {
+        return BackupPolicy::default();
+    };
+    match serde_json::from_slice::<BackupPolicy>(&bytes) {
+        Ok(mut p) => {
+            if p.opportunistic_debounce_secs == 0 {
+                p.opportunistic_debounce_secs = DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS;
+            }
+            if p.daily_interval_secs == 0 {
+                p.daily_interval_secs = DEFAULT_DAILY_INTERVAL_SECS;
+            }
+            // Stale in-flight marker from a crashed process — clear so the
+            // hot path does not fsync on every message after restart.
+            p.attempt_dirty_seq = None;
+            p
+        }
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                path = %path.display(),
+                "backup policy corrupt; fail-closed (disabled)"
+            );
+            let mut p = BackupPolicy::default();
+            p.enabled = false;
+            p.last_error = Some("backup policy corrupt".into());
+            let _ = save_backup_policy_to_disk(db_path, &p);
+            p
+        }
+    }
+}
+
+/// Persist policy atomically (unique tmp + fsync + rename) and refresh cache.
+pub fn save_backup_policy(db_path: &Path, policy: &BackupPolicy) -> Result<()> {
+    with_policy_state(|map| store_policy(map, db_path, policy))
+}
+
+fn save_backup_policy_to_disk(db_path: &Path, policy: &BackupPolicy) -> Result<()> {
+    let path = backup_policy_path_for_db(db_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            Error::InvalidInput(format!("backup policy mkdir {}: {e}", parent.display()))
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(policy)
+        .map_err(|e| Error::InvalidInput(format!("backup policy encode: {e}")))?;
+    let tmp = path.with_file_name(format!(
+        "{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("sonar-backup-policy.json"),
+        std::process::id(),
+        now_unix_secs()
+    ));
+    {
+        let mut f = File::create(&tmp).map_err(|e| {
+            Error::InvalidInput(format!("backup policy create {}: {e}", tmp.display()))
+        })?;
+        f.write_all(&bytes).map_err(|e| {
+            Error::InvalidInput(format!("backup policy write {}: {e}", tmp.display()))
+        })?;
+        f.sync_all().map_err(|e| {
+            Error::InvalidInput(format!("backup policy fsync {}: {e}", tmp.display()))
+        })?;
+    }
+    fs::rename(&tmp, &path)
+        .map_err(|e| Error::InvalidInput(format!("backup policy rename {}: {e}", path.display())))?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+/// Mark the account dirty so an opportunistic backup becomes due after debounce.
+///
+/// Hot path: once dirty and not in flight, update only the in-memory cache
+/// (no disk I/O). During an in-flight attempt, bump `dirty_seq` at most once
+/// so [`record_backup_success`] keeps coverage for post-seal messages.
+pub fn mark_backup_dirty(db_path: &Path) {
+    with_policy_state(|map| {
+        let mut policy = cached_policy(map, db_path);
+        let in_flight = policy.attempt_dirty_seq.is_some();
+        if policy.dirty && !in_flight {
+            return;
+        }
+        if policy.dirty && in_flight {
+            if let Some(attempt_seq) = policy.attempt_dirty_seq {
+                if policy.dirty_seq > attempt_seq {
+                    // Already remade once for this attempt — memory only.
+                    return;
+                }
+            }
+        }
+        let now = now_unix_secs();
+        policy.dirty = true;
+        policy.last_dirty_at = Some(now);
+        policy.dirty_seq = policy.dirty_seq.saturating_add(1);
+        if let Err(e) = store_policy(map, db_path, &policy) {
+            tracing::warn!(%e, "mark_backup_dirty failed");
+        }
+    });
+}
+
+pub fn set_backup_enabled(db_path: &Path, enabled: bool) -> Result<()> {
+    with_policy_state(|map| {
+        let mut policy = cached_policy(map, db_path);
+        policy.enabled = enabled;
+        store_policy(map, db_path, &policy)
+    })
+}
+
+/// Persist the on-by-default policy only when the sidecar is missing. Never
+/// overwrites an existing (including fail-closed corrupt) file.
+pub fn ensure_backup_policy_default(db_path: &Path) -> Result<()> {
+    with_policy_state(|map| {
+        let path = backup_policy_path_for_db(db_path);
+        if path.exists() {
+            let _ = cached_policy(map, db_path);
+            return Ok(());
+        }
+        store_policy(map, db_path, &BackupPolicy::default())
+    })
+}
+
+/// Whether a host should run a backup now (enabled + opportunistic or daily floor).
+pub fn backup_is_due(policy: &BackupPolicy, now_secs: u64) -> bool {
+    if !policy.enabled {
+        return false;
+    }
+    let last_ok = policy.last_success_at.unwrap_or(0);
+    let last_attempt = policy.last_attempt_at.unwrap_or(0);
+    // Don't thrash: wait at least debounce since last attempt even on failure.
+    if last_attempt > 0 && now_secs.saturating_sub(last_attempt) < policy.opportunistic_debounce_secs
+    {
+        return false;
+    }
+    if policy.dirty
+        && now_secs.saturating_sub(last_ok.max(last_attempt)) >= policy.opportunistic_debounce_secs
+    {
+        return true;
+    }
+    // Daily floor even when quiet (not dirty): keep a recent archive for reinstall.
+    if now_secs.saturating_sub(last_ok) >= policy.daily_interval_secs {
+        return true;
+    }
+    false
+}
+
+pub fn backup_is_due_now(db_path: &Path) -> bool {
+    backup_is_due(&load_backup_policy(db_path), now_unix_secs())
+}
+
+/// Stamp `last_attempt_at` before seal/upload so overlapping host executors see
+/// `backup_is_due == false` during the in-flight window (debounce). Snapshots
+/// `dirty_seq` so success can detect remakes that arrived after seal started.
+pub fn record_backup_attempt(db_path: &Path) -> Result<()> {
+    with_policy_state(|map| {
+        let now = now_unix_secs();
+        let mut policy = cached_policy(map, db_path);
+        policy.last_attempt_at = Some(now);
+        policy.attempt_dirty_seq = Some(policy.dirty_seq);
+        store_policy(map, db_path, &policy)
+    })
+}
+
+pub fn record_backup_success(db_path: &Path) -> Result<()> {
+    with_policy_state(|map| {
+        let now = now_unix_secs();
+        let mut policy = cached_policy(map, db_path);
+        // Messages that arrived after seal started must keep dirty=true so the
+        // next opportunistic backup still covers them.
+        if policy.attempt_dirty_seq == Some(policy.dirty_seq) {
+            policy.dirty = false;
+        }
+        policy.last_success_at = Some(now);
+        policy.last_attempt_at = Some(now);
+        policy.last_error = None;
+        policy.attempt_dirty_seq = None;
+        store_policy(map, db_path, &policy)
+    })
+}
+
+pub fn record_backup_failure(db_path: &Path, err: &str) -> Result<()> {
+    with_policy_state(|map| {
+        let now = now_unix_secs();
+        let mut policy = cached_policy(map, db_path);
+        policy.last_attempt_at = Some(now);
+        let truncated: String = err.chars().take(MAX_POLICY_ERROR_CHARS).collect();
+        policy.last_error = Some(truncated);
+        // End in-flight window so the message hot path stops bumping dirty_seq.
+        // Keep dirty so opportunistic retry remains due after debounce.
+        policy.attempt_dirty_seq = None;
+        store_policy(map, db_path, &policy)
+    })
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Best-effort wipe of the policy sidecar (panic wipe / account reset).
+pub fn wipe_backup_policy_for_db(db_path: &Path) {
+    with_policy_state(|map| {
+        map.remove(&policy_cache_key(db_path));
+    });
+    let path = backup_policy_path_for_db(db_path);
+    if let Err(e) = fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(%e, path = %path.display(), "wipe backup policy failed");
+        }
+    }
+}
 
 /// Plaintext package before AEAD wrap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,16 +827,47 @@ pub async fn download_latest_sealed_backup(keys: &Keys, server_url: &str) -> Res
     Ok(data)
 }
 
-/// High-level: read local DB, seal with nsec, upload to Blossom.
+/// Checkpoint + read + AEAD seal. Requires **no** live `SonarNode` on `db_path`.
+/// Hosts should reopen the node before calling [`upload_sealed_backup`] so chat
+/// is not blocked on the Blossom RTT.
+///
+/// Stamps `last_attempt_at` up front so concurrent host executors see
+/// `backup_is_due == false` for the debounce window.
+pub fn seal_account_backup_files(
+    keys: &Keys,
+    db_path: &Path,
+    db_key_hex: &str,
+) -> Result<Vec<u8>> {
+    record_backup_attempt(db_path)?;
+    let sealed = (|| {
+        let package = read_account_backup_package(db_path, db_key_hex)?;
+        seal_account_backup(&secret_bytes(keys), &package)
+    })();
+    if let Err(ref e) = sealed {
+        let _ = record_backup_failure(db_path, &e.to_string());
+    }
+    sealed
+}
+
+/// High-level convenience: seal then upload (holds exclusive DB access for the
+/// whole call). Prefer host-side seal → reconnect → [`upload_sealed_backup`].
 pub async fn backup_account_files(
     keys: &Keys,
     db_path: &Path,
     db_key_hex: &str,
     server_url: &str,
 ) -> Result<AccountBackupUpload> {
-    let package = read_account_backup_package(db_path, db_key_hex)?;
-    let sealed = seal_account_backup(&secret_bytes(keys), &package)?;
-    upload_sealed_backup(keys, server_url, sealed).await
+    let sealed = seal_account_backup_files(keys, db_path, db_key_hex)?;
+    match upload_sealed_backup(keys, server_url, sealed).await {
+        Ok(uploaded) => {
+            let _ = record_backup_success(db_path);
+            Ok(uploaded)
+        }
+        Err(e) => {
+            let _ = record_backup_failure(db_path, &e.to_string());
+            Err(e)
+        }
+    }
 }
 
 /// Download + decrypt only (no disk write). Host must persist `db_key_hex`
@@ -710,5 +1069,144 @@ mod tests {
             .unwrap();
         let v: i64 = conn.query_row("SELECT v FROM t", [], |r| r.get(0)).unwrap();
         assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn policy_defaults_enabled_and_due_without_success() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let policy = load_backup_policy(&db_path);
+        assert!(policy.enabled);
+        assert!(!policy.dirty);
+        // Never backed up ⇒ daily floor makes it due immediately.
+        assert!(backup_is_due(&policy, 1_700_000_000));
+    }
+
+    #[test]
+    fn policy_corrupt_fails_closed() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let path = backup_policy_path_for_db(&db_path);
+        std::fs::write(&path, b"{not-json").unwrap();
+        let policy = load_backup_policy(&db_path);
+        assert!(!policy.enabled);
+        assert!(!backup_is_due(&policy, 1_700_000_000));
+        // Fail-closed must be persisted so a later load / onboarding helper
+        // cannot silently re-enable from a missing-file default.
+        let reloaded = serde_json::from_slice::<BackupPolicy>(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(!reloaded.enabled);
+    }
+
+    #[test]
+    fn ensure_backup_policy_default_does_not_overwrite() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        set_backup_enabled(&db_path, false).unwrap();
+        ensure_backup_policy_default(&db_path).unwrap();
+        assert!(!load_backup_policy(&db_path).enabled);
+    }
+
+    #[test]
+    fn mark_backup_dirty_hot_path_skips_rewrite_when_already_dirty() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        mark_backup_dirty(&db_path);
+        let seq = load_backup_policy(&db_path).dirty_seq;
+        mark_backup_dirty(&db_path);
+        mark_backup_dirty(&db_path);
+        assert_eq!(load_backup_policy(&db_path).dirty_seq, seq);
+    }
+
+    #[test]
+    fn policy_dirty_respects_debounce() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        mark_backup_dirty(&db_path);
+        let mut policy = load_backup_policy(&db_path);
+        assert!(policy.dirty);
+        policy.last_attempt_at = Some(1_000);
+        policy.last_success_at = Some(1_000);
+        assert!(!backup_is_due(&policy, 1_000 + 60)); // within debounce
+        assert!(backup_is_due(
+            &policy,
+            1_000 + DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS
+        ));
+    }
+
+    #[test]
+    fn policy_disabled_never_due() {
+        let mut policy = BackupPolicy::default();
+        policy.enabled = false;
+        policy.dirty = true;
+        assert!(!backup_is_due(&policy, 1_700_000_000));
+    }
+
+    #[test]
+    fn policy_success_clears_dirty_and_error() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        mark_backup_dirty(&db_path);
+        record_backup_attempt(&db_path).unwrap();
+        record_backup_failure(&db_path, "blossom down").unwrap();
+        // Retry after failure still covers the same dirty_seq.
+        record_backup_attempt(&db_path).unwrap();
+        record_backup_success(&db_path).unwrap();
+        let policy = load_backup_policy(&db_path);
+        assert!(!policy.dirty);
+        assert!(policy.last_error.is_none());
+        assert!(policy.last_success_at.is_some());
+        // Quiet + recent success ⇒ not due until daily floor.
+        assert!(!backup_is_due(
+            &policy,
+            policy.last_success_at.unwrap() + 60
+        ));
+    }
+
+    #[test]
+    fn policy_success_keeps_dirty_when_remarked_after_attempt() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        mark_backup_dirty(&db_path);
+        record_backup_attempt(&db_path).unwrap();
+        // Message arrives while seal/upload is in flight.
+        mark_backup_dirty(&db_path);
+        record_backup_success(&db_path).unwrap();
+        let policy = load_backup_policy(&db_path);
+        assert!(policy.dirty, "post-seal dirty mark must survive success");
+        assert!(policy.last_success_at.is_some());
+    }
+
+    #[test]
+    fn policy_sidecar_roundtrips_with_fsync() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut policy = BackupPolicy::default();
+        policy.enabled = false;
+        policy.dirty = true;
+        policy.dirty_seq = 7;
+        save_backup_policy(&db_path, &policy).unwrap();
+        let loaded = load_backup_policy(&db_path);
+        assert!(!loaded.enabled);
+        assert!(loaded.dirty);
+        assert_eq!(loaded.dirty_seq, 7);
+    }
+
+    #[test]
+    fn seal_account_backup_files_roundtrip_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+                .unwrap();
+            conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (9);")
+                .unwrap();
+        }
+        let keys = Keys::generate();
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
+        assert_eq!(opened.db_key_hex, key_hex);
+        assert!(!opened.db_bytes.is_empty());
     }
 }

@@ -320,7 +320,15 @@ class SonarPushProcessingService : Service() {
     /** Owner body: reconnect + force the batched fetch, repeating while another
      *  push landed mid-drain. Failures surface through [Deferred.await] to every
      *  joined wake, which each fall back to the generic notification. */
-    private suspend fun runMarmotWakeSync(generation: Long): Boolean {
+    private suspend fun runMarmotWakeSync(generation: Long): Boolean =
+        // Claim the node for the whole wake: this process has no UI session, so
+        // without the claim a scheduled auto-backup seal would close the node
+        // underneath the drain.
+        chat.bitchat.sonar.backup.withMarmotSessionClaim {
+            runMarmotWakeSyncLocked(generation)
+        }
+
+    private suspend fun runMarmotWakeSyncLocked(generation: Long): Boolean {
         try {
             while (true) {
                 marmotWakeLock.withLock { marmotWakeNeedsRerun = false }

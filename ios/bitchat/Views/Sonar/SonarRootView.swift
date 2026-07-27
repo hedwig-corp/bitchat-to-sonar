@@ -182,6 +182,8 @@ struct SonarRootView: View {
             SonarSendPaymentScreen()
         case .paymentStatus(let activityId):
             SonarPaymentStatusScreen(activityId: activityId)
+        case .backup:
+            SonarBackupScreen()
         }
     }
 }

@@ -570,6 +570,15 @@ data class AlbumUpload(
     val mime: String,
 )
 
+/** Core-owned auto-backup policy snapshot for Settings / host executors. */
+data class BackupPolicySnapshot(
+    val enabled: Boolean,
+    val dirty: Boolean,
+    val lastSuccessAt: Long?,
+    val lastAttemptAt: Long?,
+    val lastError: String?,
+)
+
 /**
  * Shared boundary to the headless Rust core (`sonar-core`). UI in `commonMain`
  * calls these; each platform provides the `actual`:
@@ -941,8 +950,29 @@ expect object SonarCore {
      * Encrypt the local Marmot DB + SQLCipher key with the account nsec and
      * upload to Blossom. Drops the live node first; caller should `start()` /
      * reconnect afterward. Returns a short status line for toasts.
+     *
+     * Prefer [sealAccountBackup] → reconnect → [uploadSealedAccountBackup] so
+     * chat is not blocked on the Blossom RTT (auto-backup path).
+     *
+     * When [requireNoLiveUiSession] is true (Android WorkManager), abort if the
+     * Compose UI owns / is booting Marmot.
      */
-    suspend fun backupAccountToBlossom(): String
+    suspend fun backupAccountToBlossom(requireNoLiveUiSession: Boolean = false): String
+
+    /**
+     * Close node + seal only. Caller reconnects, then [uploadSealedAccountBackup].
+     * See [backupAccountToBlossom] for [requireNoLiveUiSession].
+     */
+    suspend fun sealAccountBackup(requireNoLiveUiSession: Boolean = false): ByteArray
+
+    /** Upload already-sealed ciphertext; does not need exclusive DB access. */
+    suspend fun uploadSealedAccountBackup(sealed: ByteArray): String
+
+    fun getBackupPolicy(): BackupPolicySnapshot
+    fun setBackupEnabled(enabled: Boolean)
+    fun backupIsDue(): Boolean
+    fun recordBackupSuccess()
+    fun recordBackupFailure(error: String)
 
     /**
      * After [importIdentity] wipe (or before first connect on restore): try to

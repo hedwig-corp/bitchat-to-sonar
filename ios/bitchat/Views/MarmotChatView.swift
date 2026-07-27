@@ -863,7 +863,10 @@ final class MarmotChatModel: ObservableObject {
     /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
-    private func performConnect(allowCreateIdentity: Bool = false) async -> Bool {
+    private func performConnect(
+        allowCreateIdentity: Bool = false,
+        scheduleAutoBackup: Bool = true
+    ) async -> Bool {
         // A keychain/DB failure must reveal the cached fallback instead of
         // leaving the app's launch surface visible forever.
         defer { initialLocalHomeReady = true }
@@ -950,12 +953,36 @@ final class MarmotChatModel: ObservableObject {
             #endif
             self.errorText = nil
             scheduleRelayConnect(delaySeconds: 0.25)
+            // Auto-backup executor: after local paint + relay kickoff, not on the
+            // critical path. Skip when reconnecting after a seal (backupAccount)
+            // so we do not cancel the in-flight 15‑min loop.
+            if scheduleAutoBackup {
+                scheduleAutoBackupCheck(delaySeconds: 45)
+            }
             return true
         } catch {
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc
             return false
+        }
+    }
+
+    private var autoBackupTask: Task<Void, Never>?
+    private func scheduleAutoBackupCheck(delaySeconds: Double) {
+        // One loop per session — cancel/replace only when (re)starting the session.
+        autoBackupTask?.cancel()
+        autoBackupTask = Task { @MainActor in
+            if delaySeconds > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
+            }
+            guard !Task.isCancelled else { return }
+            await runAutoBackupIfDue()
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 15 * 60 * 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                await runAutoBackupIfDue()
+            }
         }
     }
 
@@ -1062,12 +1089,12 @@ final class MarmotChatModel: ObservableObject {
         return backupOutcome
     }
 
-    /// Upload an encrypted Marmot account backup to Blossom, then reconnect.
-    ///
-    /// Always reconnects after the upload attempt — Compose `backupAccountNow`
-    /// always `boot()`s so a failed Blossom call cannot leave the node closed
-    /// (Settings tap would look dead and chats stay offline until restart).
-    func backupAccount() async throws {
+    /// Seal under exclusive access, reconnect so chat is live, then upload.
+    /// `busy` covers only the exclusive-DB window; Blossom upload must not gate
+    /// `connectRelaysIfNeeded`. Always reconnects after the seal attempt.
+    /// Auto-backup passes `respectOptOut` so a mid-flight Settings disable
+    /// aborts before upload.
+    func backupAccount(respectOptOut: Bool = false) async throws {
         // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
             throw MarmotService.ServiceError.backupAlreadyInProgress
@@ -1075,11 +1102,15 @@ final class MarmotChatModel: ObservableObject {
         accountBackupInFlight = true
         defer { accountBackupInFlight = false }
 
+        if respectOptOut {
+            let enabled = (try? service.loadBackupPolicy().enabled) ?? false
+            guard enabled else { return }
+        }
+
         let wasPolling = syncTask != nil
         // Raise `busy` before stopping poll/relay so an in-flight
         // `connectRelaysIfNeeded` body sees the fence and bails before reopen.
         busy = true
-        defer { busy = false }
         stopPolling()
         if !(await awaitRelayIdleForBackup()) {
             SecureLogger.warning(
@@ -1088,22 +1119,59 @@ final class MarmotChatModel: ObservableObject {
             )
         }
 
-        var uploadError: Error?
+        var sealedBundle: (nsec: String, dbPath: String, sealed: Data)?
+        var sealError: Error?
         do {
-            _ = try await service.uploadAccountBackup()
+            sealedBundle = try await service.prepareSealedAccountBackup()
         } catch {
-            uploadError = error
+            sealError = error
+            // Keep `busy` through reconnect so `connectIfNeeded` cannot start a
+            // second performConnect while we reopen after a failed seal.
+            try? service.noteBackupFailure(error.localizedDescription)
         }
-        let reconnected = await performConnect()
-        // Clear busy before relay attach: `performConnect` schedules
-        // `connectRelaysIfNeeded` with a short delay that no-ops while `busy`,
-        // which would leave a local-only node after Settings backup.
-        // (`defer` also clears if we're cancelled mid-`performConnect`.)
+
+        let reconnected = await performConnect(scheduleAutoBackup: false)
+        // Clear busy before relay attach / Blossom RTT.
         busy = false
         if reconnected {
             connectRelaysIfNeeded()
         }
         if wasPolling { startPolling() }
+
+        if let sealError {
+            // Seal failures are local/crypto — always surface (do not reuse
+            // upload-retry suppression, which would log "uploaded" falsely).
+            if !reconnected {
+                throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+            }
+            throw sealError
+        }
+
+        guard let sealedBundle else {
+            throw MarmotService.ServiceError.core("backup seal produced no ciphertext")
+        }
+
+        if respectOptOut {
+            let stillEnabled = (try? service.loadBackupPolicy().enabled) ?? false
+            guard stillEnabled else {
+                // Clear in-flight attempt so dirty remake / debounce state stays sane.
+                try? service.noteBackupFailure("auto-backup aborted — user opted out")
+                SecureLogger.info("Auto-backup aborted after seal — user opted out", category: .session)
+                return
+            }
+        }
+
+        var uploadError: Error?
+        do {
+            _ = try await service.pushSealedAccountBackup(
+                nsec: sealedBundle.nsec,
+                sealed: sealedBundle.sealed
+            )
+            try? service.noteBackupSuccess()
+        } catch {
+            uploadError = error
+            try? service.noteBackupFailure(error.localizedDescription)
+        }
         let outcome = MarmotAccountBackupFlow.outcome(
             uploadSucceeded: uploadError == nil,
             reconnected: reconnected
@@ -1128,6 +1196,44 @@ final class MarmotChatModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return !relayBusy
+    }
+
+    /// Host executor: if core policy says due, run seal→reconnect→upload quietly.
+    func runAutoBackupIfDue() async {
+        guard !busy, !accountBackupInFlight else { return }
+        // Upgrade / silent path: never upload until Settings or onboarding disclosed.
+        #if os(iOS) || os(macOS)
+        let disclosed = UserDefaults.standard.bool(forKey: "sonar.auto_backup_disclosed")
+        guard disclosed else { return }
+        #endif
+        let due: Bool
+        do {
+            due = try service.isBackupDue()
+        } catch {
+            SecureLogger.warning(
+                "⚠️ Backup policy check failed: \(error.localizedDescription)",
+                category: .session
+            )
+            return
+        }
+        guard due else { return }
+        do {
+            try await backupAccount(respectOptOut: true)
+            SecureLogger.info("Auto account backup uploaded", category: .session)
+        } catch {
+            SecureLogger.warning(
+                "⚠️ Auto account backup failed: \(error.localizedDescription)",
+                category: .session
+            )
+        }
+    }
+
+    func loadBackupPolicy() throws -> BackupPolicyInfo {
+        try service.loadBackupPolicy()
+    }
+
+    func updateBackupEnabled(_ enabled: Bool) throws {
+        try service.updateBackupEnabled(enabled)
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking

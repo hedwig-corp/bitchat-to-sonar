@@ -27,6 +27,9 @@ import SwiftUI
 #if canImport(UIKit)
 import UIKit
 #endif
+#if os(iOS)
+import BackgroundTasks
+#endif
 
 private enum SonarCallAudioRoute {
     static func configure(active: Bool, speakerOn: Bool, proximityEnabled: Bool = false) {
@@ -165,6 +168,7 @@ enum SonarRoute: Hashable {
     /// Status of one external payment, by activity id (design: paystatus.jsx
     /// Direction D). External payments have no chat thread to report into.
     case paymentStatus(String)
+    case backup
 }
 
 // MARK: - View models consumed by the screens
@@ -2163,6 +2167,7 @@ final class SonarAppStore: ObservableObject {
             }
             onboarded = true
             defaults.set(true, forKey: Keys.onboarded)
+            ensureAutoBackupEnabledDefault()
             path = []
             // A share that arrived through the extension before onboarding is
             // still staged and waiting: ingestPendingShares bails out while
@@ -2270,18 +2275,21 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Settings → Backup chats: encrypt Marmot DB+key with nsec and upload to
+    /// Settings → Chat backup: encrypt Marmot DB+key with nsec and upload to
     /// Blossom so delete→reinstall→paste nsec can recover history.
     func backupAccountNow() async {
+        discloseAutoBackup()
+        guard !backupInProgress else { return }
+        backupInProgress = true
+        defer { backupInProgress = false }
         // Sticky progress (no auto-dismiss) — a timed dismiss racing the long
         // upload was leaving the completion toast uncleared when the parent
         // Task was cancelled, or colliding with the result toast epoch.
-        // Platform gap (Compose): no progress string yet — iOS-only UX; track
-        // parity when Compose Settings backup grows a progress toast.
         showStickyToast(String(localized: "Backing up chats…"))
         do {
             try await marmot.backupAccount()
             showToast(String(localized: "Chat backup uploaded"))
+            refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {
             // In-flight backup owns sticky/result toasts; do not clobber with failure.
             return
@@ -2291,7 +2299,90 @@ final class SonarAppStore: ObservableObject {
                 "⚠️ Account backup failed: \(error.localizedDescription)",
                 category: .session
             )
+            refreshBackupPolicy()
         }
+    }
+
+    /// Core-owned auto-backup toggle (on-by-default when policy sidecar missing).
+    @Published private(set) var autoBackupEnabled: Bool = true
+    @Published private(set) var autoBackupStatusLine: String = ""
+    @Published private(set) var backupInProgress: Bool = false
+    @Published private(set) var backupSanityChecks: [BackupSanityItem] = []
+
+    private static let autoBackupDisclosedKey = "sonar.auto_backup_disclosed"
+
+    /// Upgrades must open Settings (or finish onboarding) before any auto-upload.
+    func isAutoBackupDisclosed() -> Bool {
+        defaults.bool(forKey: Self.autoBackupDisclosedKey)
+    }
+
+    func discloseAutoBackup() {
+        defaults.set(true, forKey: Self.autoBackupDisclosedKey)
+        #if os(iOS)
+        AutoBackupBackgroundScheduler.shared.store = self
+        AutoBackupBackgroundScheduler.shared.schedule()
+        #endif
+    }
+
+    func refreshBackupPolicy() {
+        do {
+            let policy = try marmot.loadBackupPolicy()
+            autoBackupEnabled = policy.enabled
+            if let ts = policy.lastSuccessAt, ts > 0 {
+                let date = Date(timeIntervalSince1970: TimeInterval(ts))
+                let formatted = date.formatted(date: .abbreviated, time: .shortened)
+                autoBackupStatusLine = String(
+                    format: String(localized: "Last backup %@"),
+                    locale: .current,
+                    formatted
+                )
+            } else if let err = policy.lastError, !err.isEmpty {
+                autoBackupStatusLine = String(localized: "Last backup failed")
+            } else {
+                autoBackupStatusLine = String(localized: "No backup yet")
+            }
+            backupSanityChecks = BackupSanityItem.build(
+                hasIdentity: marmot.npub != nil,
+                localDbReady: marmot.initialLocalHomeReady,
+                disclosed: isAutoBackupDisclosed(),
+                policyReadable: true,
+                autoBackupEnabled: policy.enabled,
+                lastSuccessAt: policy.lastSuccessAt.map { Int64($0) },
+                lastError: policy.lastError,
+                dirty: policy.dirty,
+                relayConnected: online
+            )
+        } catch {
+            backupSanityChecks = BackupSanityItem.build(
+                hasIdentity: marmot.npub != nil,
+                localDbReady: marmot.initialLocalHomeReady,
+                disclosed: isAutoBackupDisclosed(),
+                policyReadable: false,
+                autoBackupEnabled: autoBackupEnabled,
+                lastSuccessAt: nil,
+                lastError: error.localizedDescription,
+                dirty: false,
+                relayConnected: online
+            )
+        }
+    }
+
+    func setAutoBackupEnabled(_ enabled: Bool) {
+        discloseAutoBackup()
+        do {
+            try marmot.updateBackupEnabled(enabled)
+            autoBackupEnabled = enabled
+            refreshBackupPolicy()
+        } catch {
+            toast = String(localized: "Could not update auto-backup setting")
+        }
+    }
+
+    /// Onboarding: mark disclosure so new installs can auto-backup. Upgrades
+    /// that skip onboarding stay gated until Settings shows the backup copy.
+    func ensureAutoBackupEnabledDefault() {
+        discloseAutoBackup()
+        refreshBackupPolicy()
     }
 
     private func clearAccountBoundLocalStateForRestore() {
@@ -9333,6 +9424,15 @@ final class SonarAppStore: ObservableObject {
         resetCallState()
         bip353 = ""
         defaults.removeObject(forKey: Keys.bip353)
+        // Panic wipe must not leave auto-backup disclosure / BG tasks armed for
+        // the next account (or race a due seal against wipeDatabase).
+        defaults.removeObject(forKey: Self.autoBackupDisclosedKey)
+        #if os(iOS)
+        BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: AutoBackupBackgroundScheduler.taskIdentifier)
+        #endif
+        autoBackupEnabled = true
+        autoBackupStatusLine = ""
+        backupSanityChecks = []
         onboarded = false
         defaults.set(false, forKey: Keys.onboarded)
         if !walletWipeComplete {

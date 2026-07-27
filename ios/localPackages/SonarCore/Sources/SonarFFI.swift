@@ -3424,6 +3424,83 @@ public func FfiConverterTypeAccountBackupUploadInfo_lower(_ value: AccountBackup
 
 
 /**
+ * Auto-backup policy snapshot for Settings / host executors.
+ */
+public struct BackupPolicyInfo: Equatable, Hashable {
+    public var enabled: Bool
+    public var dirty: Bool
+    public var lastSuccessAt: UInt64?
+    public var lastAttemptAt: UInt64?
+    public var lastError: String?
+    public var opportunisticDebounceSecs: UInt64
+    public var dailyIntervalSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, dirty: Bool, lastSuccessAt: UInt64?, lastAttemptAt: UInt64?, lastError: String?, opportunisticDebounceSecs: UInt64, dailyIntervalSecs: UInt64) {
+        self.enabled = enabled
+        self.dirty = dirty
+        self.lastSuccessAt = lastSuccessAt
+        self.lastAttemptAt = lastAttemptAt
+        self.lastError = lastError
+        self.opportunisticDebounceSecs = opportunisticDebounceSecs
+        self.dailyIntervalSecs = dailyIntervalSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension BackupPolicyInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupPolicyInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupPolicyInfo {
+        return
+            try BackupPolicyInfo(
+                enabled: FfiConverterBool.read(from: &buf),
+                dirty: FfiConverterBool.read(from: &buf),
+                lastSuccessAt: FfiConverterOptionUInt64.read(from: &buf),
+                lastAttemptAt: FfiConverterOptionUInt64.read(from: &buf),
+                lastError: FfiConverterOptionString.read(from: &buf),
+                opportunisticDebounceSecs: FfiConverterUInt64.read(from: &buf),
+                dailyIntervalSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupPolicyInfo, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterBool.write(value.dirty, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastSuccessAt, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastAttemptAt, into: &buf)
+        FfiConverterOptionString.write(value.lastError, into: &buf)
+        FfiConverterUInt64.write(value.opportunisticDebounceSecs, into: &buf)
+        FfiConverterUInt64.write(value.dailyIntervalSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPolicyInfo_lift(_ buf: RustBuffer) throws -> BackupPolicyInfo {
+    return try FfiConverterTypeBackupPolicyInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPolicyInfo_lower(_ value: BackupPolicyInfo) -> RustBuffer {
+    return FfiConverterTypeBackupPolicyInfo.lower(value)
+}
+
+
+/**
  * A call state change drained by `call_wait_event`.
  */
 public struct CallEventInfo: Equatable, Hashable {
@@ -7603,6 +7680,7 @@ public func accountRestoreStagingPresent(dbPath: String) -> Bool  {
  *
  * Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
  * Empty `blossom_server` uses the default Blossom host.
+ * Prefer seal → reconnect → [`upload_sealed_account_backup`] for auto-backup.
  */
 public func backupAccountToBlossom(nsec: String, dbPath: String, dbKeyHex: String, blossomServer: String?)throws  -> AccountBackupUploadInfo  {
     return try  FfiConverterTypeAccountBackupUploadInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -7611,6 +7689,13 @@ public func backupAccountToBlossom(nsec: String, dbPath: String, dbKeyHex: Strin
         FfiConverterString.lower(dbPath),
         FfiConverterString.lower(dbKeyHex),
         FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+public func backupIsDue(dbPath: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_backup_is_due(
+        FfiConverterString.lower(dbPath),$0
     )
 })
 }
@@ -7693,6 +7778,23 @@ public func defaultHandleDomain() -> String  {
 })
 }
 /**
+ * Persist on-by-default only when the policy sidecar is missing. Safe to call
+ * from onboarding — never overwrites an existing opt-out or fail-closed file.
+ */
+public func ensureBackupPolicyDefault(dbPath: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_ensure_backup_policy_default(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
+}
+public func getBackupPolicy(dbPath: String) -> BackupPolicyInfo  {
+    return try!  FfiConverterTypeBackupPolicyInfo_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_get_backup_policy(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
  * True if `input` is plausibly a human-readable handle (`vincenzo` or
  * `alice@example.com`). Pure string check — no network, safe to call per
  * keystroke from search UIs to decide whether to offer a resolve action.
@@ -7715,6 +7817,12 @@ public func isMissingAccountBackupError(message: String) -> Bool  {
         FfiConverterString.lower(message),$0
     )
 })
+}
+public func markBackupDirty(dbPath: String)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mark_backup_dirty(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
 }
 /**
  * Largest media attachment (plaintext bytes) a receiver will download.
@@ -7988,6 +8096,19 @@ public func reconcileAccountRestore(dbPath: String, dbKeyHex: String)throws  -> 
     )
 })
 }
+public func recordBackupFailure(dbPath: String, error: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_record_backup_failure(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(error),$0
+    )
+}
+}
+public func recordBackupSuccess(dbPath: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_record_backup_success(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
+}
 /**
  * Download this identity's latest account backup from Blossom, decrypt with
  * `nsec`, and **stage** files beside `db_path`. Returns the SQLCipher
@@ -8005,6 +8126,26 @@ public func restoreAccountFromBlossom(nsec: String, dbPath: String, blossomServe
         FfiConverterOptionString.lower(blossomServer),$0
     )
 })
+}
+/**
+ * Seal only (exclusive DB access). Hosts should reopen the node, then call
+ * [`upload_sealed_account_backup`] so chat is not blocked on Blossom upload.
+ */
+public func sealAccountBackup(nsec: String, dbPath: String, dbKeyHex: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_seal_account_backup(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(dbKeyHex),$0
+    )
+})
+}
+public func setBackupEnabled(dbPath: String, enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_set_backup_enabled(
+        FfiConverterString.lower(dbPath),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
 }
 /**
  * Install (or re-configure) the on-device diagnostics log sink: a bounded,
@@ -8046,6 +8187,18 @@ public func sonarRenderNotification(input: SonarNotificationRenderInputInfo) -> 
 })
 }
 /**
+ * Upload already-sealed ciphertext. Does **not** need a closed SonarNode.
+ */
+public func uploadSealedAccountBackup(nsec: String, sealed: Data, blossomServer: String?)throws  -> AccountBackupUploadInfo  {
+    return try  FfiConverterTypeAccountBackupUploadInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_upload_sealed_account_backup(
+        FfiConverterString.lower(nsec),
+        FfiConverterData.lower(sealed),
+        FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+/**
  * Erase the persistent Marmot database at `db_path`, its SQLite sidecars
  * (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
  *
@@ -8081,7 +8234,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_account_restore_staging_present() != 58444) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_backup_account_to_blossom() != 15464) {
+    if (uniffi_sonar_ffi_checksum_func_backup_account_to_blossom() != 54340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_backup_is_due() != 64676) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_call_encode_answer() != 19224) {
@@ -8105,10 +8261,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_default_handle_domain() != 45849) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_ensure_backup_policy_default() != 1407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_get_backup_policy() != 28707) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_handle_looks_valid() != 39625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_is_missing_account_backup_error() != 20301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mark_backup_dirty() != 39321) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_max_media_plaintext_bytes() != 26928) {
@@ -8174,7 +8339,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_reconcile_account_restore() != 25360) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_record_backup_failure() != 3997) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_record_backup_success() != 41370) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_restore_account_from_blossom() != 16615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_seal_account_backup() != 2091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_set_backup_enabled() != 3327) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_setup_logging() != 6013) {
@@ -8187,6 +8364,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_sonar_render_notification() != 13744) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_upload_sealed_account_backup() != 33559) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {

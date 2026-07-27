@@ -42,10 +42,13 @@
     <string name="app_info_warning_title">WARNING</string>
     <string name="are_you_sure_you_want_to_leave_this">Are you sure you want to leave this group? You won’t be able to read or send messages anymore.</string>
     <string name="audio_is_connected">Audio is connected</string>
+    <string name="auto_backup">Auto-backup</string>
+    <string name="backing_up_chats">Backing up chats…</string>
     <string name="backup_chats">Backup chats</string>
     <string name="backup_failed_try_again_when_online">Backup failed — try again when online</string>
     <string name="bluetooth_finds_people_around_you_even">Bluetooth finds people around you, even offline.</string>
     <string name="cancel">Cancel</string>
+    <string name="chat_backup">Chat backup</string>
     <string name="chat_backup_uploaded">Chat backup uploaded</string>
     <string name="choose_an_image">Choose an image</string>
     <string name="close">Close</string>
@@ -124,6 +127,7 @@
     <string name="content_payment_lightning">pay via lightning</string>
     <string name="continue_">Continue</string>
     <string name="could_not_load_sticker_pack">Could not load sticker pack</string>
+    <string name="could_not_update_auto_backup_setting">Could not update auto-backup setting</string>
     <string name="couldn_t_decode_image">Couldn't decode image</string>
     <string name="couldn_t_load_stickers">Couldn't load stickers</string>
     <string name="create_a_new_identity">Create a new identity</string>
@@ -131,6 +135,7 @@
     <string name="direct_messages_are_end_to_end">Direct messages are end-to-end encrypted. Always.</string>
     <string name="direct_sonar_and_unify_payments_will">Direct Sonar and Unify payments will appear here after you send or receive money.</string>
     <string name="encrypted_cloud_backup_recover_chats">Encrypted cloud backup — recover chats after reinstall</string>
+    <string name="encrypted_cloud_backup_when_chats_change">Encrypted Marmot backup to Blossom — recovers chats after reinstall with your nsec</string>
     <string name="encryption_accessibility_establishing">establishing encryption</string>
     <string name="encryption_accessibility_failed">encryption failed</string>
     <string name="encryption_accessibility_not_encrypted">not encrypted</string>
@@ -176,6 +181,9 @@
     <string name="it_s_just_what_people_see_change_it">It’s just what people see — change it anytime.</string>
     <string name="join_request">Join request</string>
     <string name="key"> key </string>
+    <string name="last_backup">Last backup %1$s</string>
+    <string name="last_backup_failed">Last backup failed</string>
+    <string name="last_backup_ok">Last backup ok</string>
     <string name="leave_this_empty_if_you_do_not_want_to">Leave this empty if you do not want to announce a payment address to nearby Sonar peers.</string>
     <string name="let_someone_scan_this_to_add_you_keys">Let someone scan this to add you — keys are exchanged directly, never through a server.</string>
     <string name="lightning_wallet">Lightning wallet</string>
@@ -224,6 +232,7 @@
     <string name="new_discussion">New discussion</string>
     <string name="nickname">nickname</string>
     <string name="no_account_was_created_anywhere_your">No account was created anywhere — your identity lives on this phone.</string>
+    <string name="no_backup_yet">No backup yet</string>
     <string name="no_payments_yet">No payments yet</string>
     <string name="no_removable_members">No removable members.</string>
     <string name="no_secure_chats_yet">No secure chats yet</string>
@@ -258,6 +267,7 @@
     <string name="restore_your_account">Restore your account</string>
     <string name="restoring">Restoring...</string>
     <string name="safety_number">Safety number</string>
+    <string name="sanity_check">Sanity check</string>
     <string name="sats">sats</string>
     <string name="save">Save</string>
     <string name="save_2">save</string>
