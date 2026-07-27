@@ -887,6 +887,136 @@ reported it from airplane mode on a Pixel 10.
   `androidUnitTest` source set, so it would have shipped untested — the same
   reason `bleScanRestartReason` lives in `commonMain`.
 
+## R-020 — A backgrounded app must never reopen the store it just closed
+
+**Invariant:** Once the scene-phase suspend hook has closed the Marmot node, no
+*self-healing* timer may reopen it while the app is still backgrounded, and the
+loops that arm those timers must be stopped by the same hook that closes the
+node. Deliberate reopens (the push wake, the foreground resume) are unaffected.
+
+**Breaks as:** `RUNNINGBOARD 0xdead10cc`, round 4 — TestFlight **1.12.3 (31)**,
+the build shipping R-016. Distinguishing feature versus rounds 1-3: the process
+had been alive **8h43m**, the main thread was idle in its run loop, and no
+thread was in `SonarClient::sync` or `register_push_token` at all (R-016 works).
+What the log showed instead was two loops actively parked in
+`MarmotService.leasedNodeOperation` — `waitForMarmotEvent` and `callWaitEvent`.
+That is the tell: `leasedNodeOperation` refuses a lease when `nodeClosing` is
+set or `node` is nil, so being *inside* one proves the node was **open**. The
+question was never "what blocks the close" (rounds 1-3) but "what reopened it".
+
+**Why:** `suspendStoreForBackground()` — the scenePhase `.background` path —
+closed the node but left `syncTask` running, where its sibling
+`closeStoreAfterBackgroundWake()` cancels it. The polling loop then walked a
+route R-016 does not cover:
+
+1. `waitForMarmotEvent(25)` slices the wait into 25 one-second
+   `leasedNodeOperation` calls. With the node gone each throws `notConnected`,
+   `try?` discards it, the loop sleeps its slice, and after 25s returns `false`.
+2. The `false` branch calls `ensureSubscriptions()`, which throws
+   `ServiceError.notConnected` — a plain "no node", **not**
+   `SUSPEND_INTERRUPT_MARKER`. R-016's terminal `isSuspendInterrupted(error)`
+   check therefore does not fire.
+3. Control falls into the generic catch, which arms
+   `scheduleRelayConnect(delaySeconds: 2)`.
+4. `connectRelaysIfNeeded()` had no app-state check, so it reopened SQLCipher
+   while backgrounded — and `connect()` finishes with `startPolling()`, whose
+   next idle timeout arms step 3 again. The reopen sustains itself indefinitely,
+   which is why the process survived hours before RunningBoard collected it.
+
+R-016 anticipated the *shape* of this and closed only half of it: it audited the
+error paths reachable when the latch fires, and its own notes record the
+asymmetry — "`closeStoreAfterBackgroundWake()` already cancels `relayConnectTask`
+for exactly this reason; the scenePhase `suspendStoreForBackground()` path does
+not." The steady state *after* the close, where the error is `notConnected`
+rather than a suspend abort, was left open.
+
+**The gate is on the timer, not on connect.** `connectRelaysIfNeeded()` must
+stay callable while backgrounded: `SonarPushProcessor`'s wake reaches it through
+`ensureRelayConnected()` and needs relays with the app in `.background`, and it
+owns a bounded close afterwards. Every caller of `scheduleRelayConnect`, by
+contrast, is a retry firing on a timer with nobody waiting on it. So
+`scheduleRelayConnect` consults `RelayConnectionPolicy.shouldAutoReconnect` when
+the timer **fires**, not when it is armed — the delay routinely straddles the
+foreground→background transition, and a schedule-time check would miss exactly
+the case that crashes.
+
+**A cancelled polling loop must return before any error classification.** Quiescing
+`syncTask` is only half of it — the loop must also not mistake its own shutdown for a
+relay failure. `ensureSubscriptions()` is parked in Rust and cannot observe Swift
+cancellation, so it runs to completion and then throws `notConnected` once the node is
+gone, or aborts with `SUSPEND_INTERRUPT_MARKER` because R-016 made it suspendable. On
+the suspend path the task is cancelled *and* the error carries the marker, so an
+order that classifies first lets `isSuspendInterrupted` win and clear `syncTask`.
+
+That matters because `Task` is a **struct**: there is no `===`, so the loop cannot
+express "only clear the slot if it is still mine" (`stopPolling()` hit the same wall
+for `mediaResumeTask` and says so at its call site). A late-returning cancelled task
+therefore nils a slot a fast foreground resume may already have refilled, the next
+`startPolling()` passes its `guard syncTask == nil`, and two concurrent loops both
+call the **destructive** `drainPendingMarmot` — racing the notification metadata
+`noteDrainedForPushWake` reads. So the cancellation check goes first, in both catch
+blocks, and a cancelled loop returns without touching shared state at all.
+
+An `isDeliberatelyStopped(_:)` helper that also matched `ServiceError.cancelled` was
+tried and removed: `ensureSubscriptions()` goes through `MarmotService.run()`, which
+can only produce `invalidInput`, `core`, or `notConnected` — the `.cancelled` throws
+all live on the connect path (`connect` / `connectLocal` / `connectNode`, gated on
+`nodeClosing`) or inside `leasedNodeOperation`, neither of which `run()` touches. It
+could never fire, and dead code on this path reads as coverage that is not there.
+
+**The call loop leaked past its call.** `SonarAppStore.startCallLoop()` was only
+ever cancelled by `resetCallState()` (wipe/erase), never by `finalizeCall`, so
+after the first call of a session it parked in 1s `callWaitEvent` slices
+forever — taking a node lease every second and keeping the SQLCipher handle hot.
+That is thread 22 of the crash log, 8h in. It cannot *reopen* the store, so it
+did not cause this crash, but it delays every `closeNode()` and burns battery.
+Cancelled in `finalizeCall` now; `startCallLoop()` is idempotent so the next
+call restarts it. It is deliberately **not** stopped on background — an active
+call must survive backgrounding.
+
+**Call sites:** iOS `MarmotChatView.swift::scheduleRelayConnect` (the gate),
+`MarmotChatView.swift::suspendStoreForBackground` (the quiesce), and
+`SonarAppStore.swift::finalizeCall` (the call-loop cancel); policy in
+`RelayConnectionPolicy.swift::shouldAutoReconnect`. Compose: the *crash* does not
+apply — Android has no RunningBoard file-lock kill, same reason as R-016 — but the
+*rule* does, and Android got there first. `RelayConnectionPolicy.kt` already carries
+`shouldRetrySupersededAttach(foreground:)` with the same reasoning ("looping would
+rebuild sockets the OS is suspending"), and #440 fixed Android's analogous
+background-rebuild churn as a battery/wakelock bug rather than a kill. The two
+predicates stay separate — Kotlin's covers a superseded in-flight attach, iOS's any
+timer-driven reconnect — but share polarity and cross-reference each other, so the
+mirror stays diffable. An earlier draft of this entry claimed Compose was simply not
+applicable; that was an overclaim from a grep that missed the Kotlin file.
+
+**Guarded by:** `RelayConnectionPolicyTests.backgroundedAppMustNotSelfHealRelayConnection`, `RelayConnectionPolicyTests.foregroundAppStillSelfHealsRelayConnection`
+
+**Not guarded — and this is a real hole, not a formality.** The test pins the
+*policy helper*, not the call site, which is precisely the R-001 failure mode
+this document warns about: a future edit could delete the `guard` in
+`scheduleRelayConnect` and both tests stay green. `MarmotChatModel` is
+`@MainActor` with private task state and no test constructs it, and iOS tests do
+not run in CI regardless. Specifically unpinned: that
+`suspendStoreForBackground()` cancels `syncTask`; that the cancellation check stays
+**above** `isSuspendInterrupted` in both catch blocks — nothing but a code comment
+stops someone hoisting the classifier back on top; that `finalizeCall` cancels
+`callLoopTask`; and that no *fourth* path reopens the store while backgrounded.
+Verification is a TestFlight build backgrounded for hours with relays flapping.
+
+**History:** #446 (round 1) -> #448 (round 2) -> #449 / R-016 (round 3,
+in-flight sync uninterruptible) -> build 31 crash (round 4: reopen after the
+close) -> this fix.
+
+**Rejected:**
+- *Making `wait_for_marmot_event` / `call_wait_event` suspendable in Rust.* The
+  obvious read of the crash log, and wrong: both Swift wrappers already slice
+  into **1s** FFI parks, so neither can hold `closeNode()` for meaningfully
+  longer than a second. Latching them would have shipped a no-op and left the
+  reopen in place.
+- *Blanket-gating `connectRelaysIfNeeded()` on `applicationState`.* Kills the
+  push wake, which must attach relays precisely while backgrounded.
+- *Checking the app state when `scheduleRelayConnect` is armed.* The delay
+  spans the transition; the crash case arms in the foreground and fires after.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
