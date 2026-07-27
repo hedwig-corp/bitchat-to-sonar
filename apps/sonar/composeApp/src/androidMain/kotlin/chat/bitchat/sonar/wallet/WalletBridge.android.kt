@@ -22,6 +22,7 @@ import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
+import chat.bitchat.sonar.SonarLifecycle
 import chat.bitchat.sonar.crypto.Bech32
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -76,6 +77,10 @@ actual object WalletBridge {
     /** Upper bound on the [ensureLiveConnection] liveness probe so a hung
      *  native `getInfo()` can't hold [lock] indefinitely. */
     private const val CONNECTION_PROBE_TIMEOUT_MS = 10_000L
+
+    /** Backstop on the [createBolt12Invoice] native call. The push service's own
+     *  answer-window bound is usually tighter; this only catches a wedged SDK. */
+    private const val CREATE_INVOICE_TIMEOUT_MS = 20_000L
 
     private val ctx: Context get() = AppContextHolder.ctx
     private fun prefs() = ctx.getSharedPreferences("sonar", Context.MODE_PRIVATE)
@@ -174,6 +179,12 @@ actual object WalletBridge {
      */
     suspend fun ensureLiveConnection(nsec: String): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
+            // Same guard setupIfNeeded runs, for the same reason: an interrupted
+            // wipeLocalStorage() must finish before ANY seed is opened. Without
+            // it a headless wake reached connectLocked directly and could open
+            // the half-deleted working directory with the replacement identity's
+            // seed.
+            recoverPendingCleanupLocked()
             val existing = sdk
             if (existing != null) {
                 // Bound the probe like connectLocked bounds connect(): getInfo()
@@ -275,6 +286,14 @@ actual object WalletBridge {
         // during a headless/background FCM wakeup (no UI collector on the
         // replay-0 flow) is still captured. Idempotent by wallet payment id.
         PaymentActivityStore.recordIncomingWalletPayment(ev)
+        // A receive that settles while the UI is up has already been seen by the
+        // user, so claim the notify slot now. Otherwise the next Breez wake
+        // within BREEZ_SETTLE_LOOKBACK_SECS polls it back out of
+        // recentIncomingReceives, finds it unclaimed, and posts a stale
+        // "Payment received" banner for a payment the user watched land.
+        // A headless wake has appVisible=false, so this never steals the claim
+        // from the push service.
+        if (ev.incoming && SonarLifecycle.appVisible) claimNotifiedPaymentId(ev.paymentId)
         payments.tryEmit(ev)
     }
 
@@ -325,15 +344,33 @@ actual object WalletBridge {
      * because the KMP bindings ship no notification plugin. Held under [lock]
      * for the same reason as [recentIncomingReceives] — the handle must not be
      * torn down while the (multi-second) native call is in flight.
+     *
+     * The native call runs on [walletScope], NOT as a child of this coroutine.
+     * The caller wraps this in `withTimeoutOrNull`, and a blocking UniFFI call
+     * cannot be preempted by cancellation — a child would make the timeout wait
+     * for the call anyway AND keep [lock] held while it did, so the wake's next
+     * [recentIncomingReceives] would block behind it. Awaiting an orphan makes
+     * the await genuinely cancellable and releases [lock] on time; the abandoned
+     * call finishes harmlessly and its result is discarded. (Same reasoning as
+     * `prefetchSenderProfiles` in the push service.)
      */
     suspend fun createBolt12Invoice(offer: String, invoiceRequest: String): Result<String> =
         withContext(Dispatchers.IO) {
             lock.withLock {
                 val node = sdk
                     ?: return@withLock Result.failure(IllegalStateException("wallet not ready"))
-                runCatching {
-                    node.createBolt12Invoice(CreateBolt12InvoiceRequest(offer, invoiceRequest)).invoice
+                val work = walletScope.async {
+                    runCatching {
+                        node.createBolt12Invoice(
+                            CreateBolt12InvoiceRequest(offer, invoiceRequest)
+                        ).invoice
+                    }
                 }
+                withTimeoutOrNull(CREATE_INVOICE_TIMEOUT_MS) { work.await() }
+                    ?: run {
+                        work.cancel()
+                        Result.failure(IllegalStateException("createBolt12Invoice timed out"))
+                    }
             }
         }
 

@@ -30,7 +30,7 @@ import chat.bitchat.sonar.resolvePushSenderName
 import chat.bitchat.sonar.shortNpubLabel
 import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
-import chat.bitchat.sonar.wallet.NotifiedPaymentIds
+import chat.bitchat.sonar.wallet.claimNotifiedPaymentId
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
 import chat.bitchat.sonar.wallet.WalletPaymentEvent
@@ -113,13 +113,28 @@ class SonarPushProcessingService : Service() {
     /** API 34 short-service timeout backstop → stop before the ANR. */
     override fun onTimeout(startId: Int) {
         Log.w(TAG, "shortService onTimeout(startId=$startId) — stopping")
-        scope.cancel()
-        stopSelf()
+        stopWakeWork()
     }
 
     /** API 35 short-service timeout backstop (typed overload). */
     override fun onTimeout(startId: Int, fgsType: Int) {
         Log.w(TAG, "shortService onTimeout(startId=$startId type=$fgsType) — stopping")
+        stopWakeWork()
+    }
+
+    /**
+     * Cancel in-flight wake work and close the gate.
+     *
+     * Clearing [fgsReady] is the point: [scope] is cancelled for good, but the
+     * service instance outlives it until `onDestroy`. A push delivered in that
+     * window would reach `onStartCommand` on this still-alive instance, pass the
+     * gate, and `scope.launch { ... }` into a no-op on the cancelled
+     * `SupervisorJob` — dropping the wake AND never running the `stopSelf(startId)`
+     * inside the lambda. With the gate closed it takes the existing early-return
+     * path instead.
+     */
+    private fun stopWakeWork() {
+        fgsReady = false
         scope.cancel()
         stopSelf()
     }
@@ -430,13 +445,16 @@ class SonarPushProcessingService : Service() {
             val wakeFloorSecs =
                 System.currentTimeMillis() / 1000 - BREEZ_SETTLE_LOOKBACK_SECS
             val settled = AtomicInteger(0)
+            // Per-wake dedup, separate from the cross-wake notified ring — see
+            // handleSettledReceive.
+            val seenThisWake = HashSet<String>()
 
             coroutineScope {
                 // Subscribe BEFORE wallet setup so a receive claimed right after
                 // connect() can't slip past the collector.
                 val events = launch {
                     WalletBridge.paymentEvents.collect { ev ->
-                        if (ev.incoming && handleSettledReceive(ev, prefs)) {
+                        if (ev.incoming && handleSettledReceive(ev, prefs, seenThisWake)) {
                             settled.incrementAndGet()
                         }
                     }
@@ -482,7 +500,7 @@ class SonarPushProcessingService : Service() {
                     SystemClock.elapsedRealtime() < deadline
                 ) {
                     for (ev in WalletBridge.recentIncomingReceives(wakeFloorSecs)) {
-                        if (handleSettledReceive(ev, prefs)) settled.incrementAndGet()
+                        if (handleSettledReceive(ev, prefs, seenThisWake)) settled.incrementAndGet()
                     }
                     if (settled.get() > 0) break
                     delay(BREEZ_SETTLE_POLL_MS)
@@ -511,14 +529,17 @@ class SonarPushProcessingService : Service() {
         // The reply URL is server-injected by OUR NDS; pin it there. Comparing
         // the PARSED host (https, no userinfo) rejects both plain-http and
         // `https://user@evil/` tricks — a forged push must not redirect the
-        // invoice elsewhere.
-        val replyHost = runCatching { URL(req.replyUrl) }.getOrNull()
+        // invoice elsewhere. The path is pinned too: breez/notify always injects
+        // {NOTIFY_EXTERNAL_URL}/api/v1/response/{reqId}, so nothing else on that
+        // host is a legitimate target for a produced invoice.
+        val replyUrl = runCatching { URL(req.replyUrl) }.getOrNull()
             ?.takeIf { it.protocol == "https" && it.userInfo == null }
-            ?.host
+        val replyHost = replyUrl?.host
         if (replyHost == null ||
-            !replyHost.equals(SonarPushRegistration.expectedNdsHost(), ignoreCase = true)
+            !replyHost.equals(SonarPushRegistration.expectedNdsHost(), ignoreCase = true) ||
+            replyUrl.path?.startsWith(NDS_RESPONSE_PATH_PREFIX) != true
         ) {
-            Log.w(TAG, "invoice_request: refusing reply URL (host/scheme mismatch)")
+            Log.w(TAG, "invoice_request: refusing reply URL (host/scheme/path mismatch)")
             return
         }
         // The NDS blocks its caller ~60s from the webhook; past our own wake
@@ -573,29 +594,41 @@ class SonarPushProcessingService : Service() {
         }
 
     /**
-     * Notify-exactly-once gate for a settled incoming wallet payment. Returns
-     * true when this call newly handled the payment (whether or not prefs let
-     * the banner show — enabling notifications later must not back-notify).
-     * Synchronized: the event collector and the poll loop race on the
-     * persisted [NotifiedPaymentIds] read-modify-write.
+     * Handle a settled incoming wallet payment observed during this wake.
+     *
+     * Returns true the FIRST time this wake sees [ev] — that is the signal the
+     * settle loop uses to stop waiting, and it is deliberately NOT the same
+     * question as "should we post a banner". The persisted ring can already own
+     * the payment (an earlier wake, an SDK event replay, or the foreground
+     * listener claiming a receive the user watched land in the UI); in that case
+     * the wake must still end, we just don't post a second banner. Conflating
+     * the two made an already-claimed payment invisible to the loop, which then
+     * burned its whole budget polling.
+     *
+     * Synchronized: the event collector and the poll loop race on both
+     * [seenThisWake] and the persisted ring.
      */
     @Synchronized
     private fun handleSettledReceive(
         ev: WalletPaymentEvent,
         prefs: SonarNotificationPrefs,
+        seenThisWake: MutableSet<String>,
     ): Boolean {
         // Ledger capture (idempotent) — normally already recorded at the event
         // source; this covers poll-fallback payments the listener never saw.
         PaymentActivityStore.recordIncomingWalletPayment(ev)
-        val notifiedIds = NotifiedPaymentIds(SonarCore.loadBlob(NOTIFIED_IDS_BLOB))
-        if (!notifiedIds.markNotified(ev.paymentId)) return false
-        SonarCore.saveBlob(NOTIFIED_IDS_BLOB, notifiedIds.encode())
-        SonarNotificationRouter.buildWalletReceive(
-            idKey = "wallet-${ev.paymentId}",
-            sats = ev.amountSats,
-            prefs = prefs,
-        )?.let { Notifier.notify(it.id, it.title, it.body) }
-        return true
+        val firstThisWake = seenThisWake.add(ev.paymentId)
+        // Notify at most once per payment across wakes and process deaths.
+        // Claiming (not prefs) is the gate, so enabling notifications later
+        // must not back-notify an old payment.
+        if (claimNotifiedPaymentId(ev.paymentId)) {
+            SonarNotificationRouter.buildWalletReceive(
+                idKey = "wallet-${ev.paymentId}",
+                sats = ev.amountSats,
+                prefs = prefs,
+            )?.let { Notifier.notify(it.id, it.title, it.body) }
+        }
+        return firstThisWake
     }
 
     override fun onDestroy() {
@@ -671,7 +704,8 @@ class SonarPushProcessingService : Service() {
         // receives so a first-ever wake (empty notified-ids ring) doesn't surface
         // history. Cross-wake dedup is [NotifiedPaymentIds], not this floor.
         private const val BREEZ_SETTLE_LOOKBACK_SECS = 600L
-        /** Blob key for the persisted notified-payment-ids ring. */
-        private const val NOTIFIED_IDS_BLOB = "wallet.notifiedPaymentIds"
+        /** Path prefix breez/notify injects into every reply_url
+         *  (`{NOTIFY_EXTERNAL_URL}/api/v1/response/{reqId}`). */
+        private const val NDS_RESPONSE_PATH_PREFIX = "/api/v1/response/"
     }
 }

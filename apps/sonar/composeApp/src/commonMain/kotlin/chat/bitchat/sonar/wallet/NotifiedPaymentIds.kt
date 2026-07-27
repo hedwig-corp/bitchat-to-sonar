@@ -1,5 +1,8 @@
 package chat.bitchat.sonar.wallet
 
+import chat.bitchat.sonar.ConcurrencyLock
+import chat.bitchat.sonar.SonarCore
+
 /**
  * Tiny persisted ring of wallet payment ids that already produced a user
  * notification, so a receive settling across several NDS wakeups (swap_updated
@@ -39,4 +42,28 @@ class NotifiedPaymentIds(blob: String = "", private val cap: Int = 64) {
     fun contains(id: String): Boolean = id in ids
 
     fun encode(): String = ids.joinToString("\n")
+}
+
+/** Blob key for the persisted notified-payment-ids ring. Must not change: an
+ *  existing install's ring lives under this key. */
+const val NOTIFIED_PAYMENT_IDS_BLOB = "wallet.notifiedPaymentIds"
+
+private val notifiedIdsLock = ConcurrencyLock()
+
+/**
+ * Claim [paymentId] in the persisted [NotifiedPaymentIds] ring.
+ *
+ * Returns true when this call newly claimed it — the caller owns the one
+ * user-visible notification for that payment. Returns false when some earlier
+ * path already claimed it: a previous wake, an SDK event replay, or the
+ * foreground wallet listener claiming a receive the user watched land in the UI.
+ *
+ * Guarded because the Breez SDK callback thread and the push service's wake
+ * coroutines both run this load → mark → persist round-trip.
+ */
+fun claimNotifiedPaymentId(paymentId: String): Boolean = notifiedIdsLock.withLock {
+    val ring = NotifiedPaymentIds(SonarCore.loadBlob(NOTIFIED_PAYMENT_IDS_BLOB))
+    if (!ring.markNotified(paymentId)) return@withLock false
+    SonarCore.saveBlob(NOTIFIED_PAYMENT_IDS_BLOB, ring.encode())
+    true
 }
