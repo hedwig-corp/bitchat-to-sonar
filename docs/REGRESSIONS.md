@@ -826,6 +826,67 @@ did not touch this path.
   would have to remember to check the flag; throwing routes through the
   `runCatching { … }.getOrNull()` both call sites already have.
 
+---
+
+## R-019 — A Bluetooth power cycle must rearm the radio, not silently deafen it
+
+**Invariant:** When the Bluetooth adapter goes off and comes back — which is
+exactly what airplane mode does — the mesh radio must tear down on OFF and
+restart on ON, without the process being killed.
+
+**Breaks as:** the user toggles airplane mode (or Bluetooth) and the app never
+discovers anyone again. It still looks healthy: advertising state is shown, no
+error surfaces, the scan watchdog keeps ticking.
+
+**Why:** three failures compound, and each alone is survivable:
+1. Nothing observed the adapter — no `ACTION_STATE_CHANGED` receiver existed in
+   `androidMain`, and `startMeshRadio()` ran only from `onCreate` / the
+   permission callback.
+2. `scanning` latches. The OS tears down scan and advertiser on power-off but
+   nothing clears the flag, so `if (scanning || !available()) return` in
+   `MeshRadio.start()` makes every later start a no-op.
+3. The watchdog could not heal it **and hid that it could not**:
+   `startScanInternal` reused the cached `BluetoothLeScanner` (invalidated by
+   the power cycle) inside `runCatching`, then stamped `lastScanStartMs` /
+   `lastScanCallbackMs` / `lastNewDiscoveryMs` unconditionally — resetting its
+   own staleness heuristic on every failed restart so it never escalated.
+
+**Call sites:** Compose `MainActivity.adapterStateReceiver` →
+`bleAdapterAction` (`MeshRadio.kt`) → `MeshRadio.stop()` / `startMeshRadio()`;
+Apple: not applicable — `centralManagerDidUpdateState` fires on every
+transition and `.poweredOn` re-runs `startScanning()` (see R-006). Desktop: not
+applicable — `MeshRadio.jvm.kt` `start()` has no latch and re-enters
+`BleBridge` cleanly.
+
+**Guarded by:** `MeshLinkLivenessTest.adapterOffTearsDownAndAdapterOnRestartsTheRadio`,
+`MeshLinkLivenessTest.adapterTransitionalStatesAreIgnored`
+
+**Coverage (honest):** both tests pin the pure `commonMain` decision
+(`bleAdapterAction`) — OFF ⇒ teardown, ON ⇒ restart, transitional ⇒ ignore —
+which is the tier that actually runs in CI (`apps/sonar` has no
+`androidUnitTest` source set). They do **not** cover the receiver registration
+itself, the `IntentFilter`, the scanner re-acquisition, or the
+stamp-only-on-success change; no JVM test can drive a `BroadcastReceiver` or a
+`BluetoothLeScanner`. Those were verified by hand on a Pixel 4 XL: 0
+`MeshRadio: discovered` lines across a 15s Bluetooth-off window, 6 within 20s of
+it returning, `scanning + advertising` logged, no app restart. Keep that adb
+recipe (`adb shell svc bluetooth disable|enable`, count discoveries per window)
+for re-verification — `MeshRadio.stop()` logs nothing, so measure discovery
+counts rather than looking for a teardown line.
+
+**History:** carried as an unproven "Compose side of R-006" gap until a user
+reported it from airplane mode on a Pixel 10.
+
+**Rejected:**
+- *Relying on the scan watchdog.* It cannot re-acquire an invalidated scanner,
+  and its unconditional timer stamping made a permanently dead scanner look
+  healthy — the reason this went unnoticed.
+- *Calling `start()` on app resume instead of a receiver.* The adapter can cycle
+  while the app is foregrounded, which is the reported case; resume never fires.
+- *Putting the decision in `MainActivity`.* `apps/sonar` has no
+  `androidUnitTest` source set, so it would have shipped untested — the same
+  reason `bleScanRestartReason` lives in `commonMain`.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -840,7 +901,13 @@ its coverage is worse than an honest hole, because it stops people looking.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
 - **Mesh-DM peer-ID rotation orphaning (PR #397 Compose + PR #405 iOS).** Messages keyed by short BLE ID (16-hex) are orphaned when the peer reconnects with a rotated RP address. Compose side fixed in #397 (`echoMeshMessage` + `enqueueOutbox`); iOS side fixed in #405 (`didDisconnectFromPeer` always migrates to stable Noise key). **Residual gap:** when `derivedStableKeyHex` is nil (Noise session never established or already torn down), messages stay under the dead short BLE ID — `consolidateMessages` does not scan for orphaned 16-hex keys. Needs orphan-recovery scan in `PrivateChatManager.consolidateMessages` or deferred migration on reconnect. **Second residual gap:** when a peer has both an outbound peripheral connection and an inbound central subscription (dual BLE leg), losing either leg triggers `didDisconnectFromPeer` unconditionally (`BLEService.swift:1573` / `:4823` / `:5032`). The migration removes the short-key transcript, but messages arriving over the surviving leg continue to be stored under that short peer ID, splitting the conversation again. `notifyPeerDisconnectedDebounced` (debounce window at `:4823`) mitigates rapid double-disconnects but does not check if the other leg is still live. Fix requires per-leg connection-count tracking in `BLEService` so `didDisconnectFromPeer` only fires when all legs are gone. Neither platform has a test for this path; iOS tests don't run in CI.
 - **Account key durability.** `CLAUDE.md`'s Account Key Durability Rule lists five blocking invariants (never delete-before-add, never regenerate on keychain error, ...) with no regression test cited here.
-- **Compose side of R-006 (Bluetooth-adapter-off).** Compose has no `ACTION_STATE_CHANGED` receiver — nothing pushes adapter-off into `MeshRadio`, whose `stop()` has the right teardown but only runs on discovery-policy changes. Android links may self-clear via `BluetoothGattCallback.onConnectionStateChange`, so whether R-006 applies there is unproven; needs a Pixel with a peer in range to confirm. `apps/sonar` has no `androidUnitTest` source set, so the decision would have to move into a pure `commonMain` helper the way `bleScanRestartReason` did.
+- **R-019 receiver wiring and scanner re-acquisition.** The pure decision
+  (`bleAdapterAction`) is pinned, but the `BroadcastReceiver` registration, the
+  `IntentFilter`, the scanner re-acquisition in `startScanInternal`, and the
+  stamp-only-on-success change have no automated test — no JVM test can drive a
+  `BroadcastReceiver` or a `BluetoothLeScanner`, and `apps/sonar` has no
+  `androidUnitTest` source set. Verified by hand on a Pixel 4 XL; needs an
+  Android driver seam to automate.
 - **iOS NIP-05 verified badge cache key.** `nip05Verified` is keyed by `"canonicalKey(npub)|address"`, but the badge branch in `SonarContactProfileScreen.swift` read it by `address` alone, so the lookup always missed and the checkmark never rendered while the handle text rendered unconditionally. Verified and forged handles were therefore indistinguishable. Fixed by routing all three sites through one `static func nip05CacheKey(npub:address:)` (PR #411), which is deliberately static and npub-explicit so it is reachable without constructing the screen — unlike the `SonarAppStore` gaps above. `Nip05BadgeCacheKeyTests` pins that one handle claimed by two different keys yields two different entries. **The citation is weak on purpose:** iOS tests do not run in CI (see below), so nothing verifies it still passes. What is *not* pinned is the call-site wiring — a fourth site hand-building the key again, or the badge reading a different key than `verifyHandleIfNeeded` writes, is exactly the original bug and no test would catch it. Compose is structurally immune (`SonarContactProfileScreen.kt` scopes the state with `remember(peerNpub, nip05)`), so there is no Android mirror to pin.
 - **Apple media sends must not lose the account gate to an automerge.** Rebasing this change onto main dropped every `isCurrentAccountWork(generation)` check from `MarmotChatModel.sendMedia`/`sendMediaMulti` while keeping main's bare `ensureConnected`/`appendOptimistic`/`service.…` calls inside the PR's escaping `launchIndependentAccountWork { model, generation in … }` closure. The bare calls do not compile (`implicit use of 'self' in closure`), so the breakage was loud; the *silent* half is that a closure receiving `generation` and never checking it turns the account-mutation gate into a no-op on exactly the two paths it was added for. Both are restored: the calls are `model.`-qualified and the guards bracket every suspension point, with the listener release and echo discard deliberately running even for retired work so only the user-visible failure row is skipped. Every `sendChain` producer must carry the gate, not just the ones that looked like the pattern: `send(_ texts:to:)` and `sendQueuedText` assigned new chain tails with no generation/suspension check, and a batch spanning multiple awaits keeps assigning tails *after* a quiesce has already snapshotted the chain — so it could publish against the old account while the wipe proceeded. The batch also re-checks between items. Unpinned — iOS tests do not run in CI and no test constructs `MarmotChatModel` with a controllable send, so the only thing standing between this and a silent regression is that the uncompilable form fails loudly next to it.
 - **Sender-chosen mesh message ids are receipt-only.** The BLE file-transfer packet now carries an optional `message_id` TLV so the recipient can return an encrypted `delivered` receipt. That id arrives unauthenticated inside the Noise payload, so it must never become the identity of a *local* row: on Apple the incoming media row keeps its own generated `BitchatMessage.id` and the wire id is used only for `sendDeliveryAck`, and on Compose every id match that can withdraw or suppress a row is gated on `it.mine` (`drainMeshMedia` duplicate check, `drainMeshSendFailures`, both matches in `drainMeshMediaSendFailures`). Without those guards a peer could pick an id colliding with one of our outgoing rows and either suppress its own incoming media or have our failure path delete/evict that row. Nothing pins this: all four Compose sites need a constructed `SonarAppState`, and the Apple site needs a `BLEService` with a live peer. Close it with an injectable receive seam plus a two-device test where the peer deliberately reuses a known local id.

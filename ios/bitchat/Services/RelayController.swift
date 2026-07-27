@@ -24,7 +24,6 @@ struct MeshLinkSenderPolicy {
     static func isSelfEcho(senderIsSelf: Bool, ttl: UInt8) -> Bool {
         senderIsSelf && ttl > 0
     }
-
 }
 
 // RelayController centralizes flood control policy for relays.
