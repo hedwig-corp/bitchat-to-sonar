@@ -186,12 +186,17 @@ struct SNPaySheet: View {
     let money: (Int64) -> String
     /// Live fiat line; nil = no live rate, the € line simply doesn't render.
     let fiatText: (Int64) -> String?
+    /// Amount already fixed by the destination — a scanned Lightning invoice
+    /// that encodes one. The design's `PaySheet` `fixed` prop: the amount is
+    /// shown but the chips and keypad are hidden, because there is nothing to
+    /// choose.
+    var fixedSats: Int64?
     let onClose: () -> Void
     let onSend: (Int64) -> Void
 
     @State private var v = ""
 
-    private var sats: Int64 { Int64(v) ?? 0 }
+    private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
@@ -248,6 +253,7 @@ struct SNPaySheet: View {
             }
             .padding(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
 
+            if fixedSats == nil {
             // .pay-chips
             HStack(spacing: 8) {
                 ForEach(snPayChips, id: \.self) { c in
@@ -305,6 +311,7 @@ struct SNPaySheet: View {
                 }
             }
             .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
+            }
 
             // .bc-sheetactions
             VStack(spacing: 6) {

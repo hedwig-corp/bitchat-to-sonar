@@ -41,6 +41,7 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
+import chat.bitchat.sonar.ui.sonarQrScanSupported
 import chat.bitchat.sonar.ui.sonar
 
 /**
@@ -51,14 +52,11 @@ import chat.bitchat.sonar.ui.sonar
  * looks like an address/offer/invoice, and the "People you can pay" list of
  * contacts who publish a payment address.
  *
- * Deviation from the design, tracked as a gap on BOTH platforms: the design's
- * "Scan a QR code" row is not reproduced. Sonar has no camera decoder on
- * Android/desktop (zxing is bundled for *encoding* invite QRs only), so
- * shipping it on iOS alone would break the Cross-Platform Feature Rule.
- * Follow-up: add a shared scanner (CameraX + a decoder on Android, the
- * existing AVCaptureMetadataOutput path on iOS), then restore the row here and
- * in `SonarSendPaymentScreen.swift`. Typing or pasting the code into the field
- * covers the same destinations in the meantime.
+ * The "Scan a QR code" row is camera-backed: CameraX + zxing on Android
+ * ([SonarQrScanner]). Desktop has no camera pipeline, so
+ * [sonarQrScanSupported] is false there and the row is hidden rather than
+ * offering a dead viewfinder — pasting the code into the field reaches the
+ * same destinations.
  */
 @Composable
 fun SonarSendPaymentScreen(state: SonarAppState) {
@@ -70,6 +68,9 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     // Chosen recipient: a contact (pay through their chat) or a raw destination.
     var contactTarget by remember { mutableStateOf<PayableContact?>(null) }
     var externalTarget by remember { mutableStateOf<String?>(null) }
+    // Amount carried by a scanned invoice, if it fixes one.
+    var fixedSats by remember { mutableStateOf<Long?>(null) }
+    var scanning by remember { mutableStateOf(false) }
 
     val trimmed = query.trim()
     val contacts = state.payableContacts()
@@ -116,6 +117,34 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                         cursorBrush = SolidColor(s.accent),
                         modifier = Modifier.fillMaxWidth(),
                     )
+                }
+            }
+
+            // ── .sp-scan: scan a QR code ──
+            if (sonarQrScanSupported()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)
+                        .clip(RoundedCornerShape(14.dp)).background(s.accentSoft)
+                        .clickable { scanning = true }
+                        .padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        Modifier.size(38.dp).clip(RoundedCornerShape(11.dp)).background(s.accentFill),
+                        contentAlignment = Alignment.Center,
+                    ) { SNIcon(SNIconName.Qr, 20.dp, s.onAccent) }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "Scan a QR code",
+                            color = s.text, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            "Bitcoin, Lightning invoice or Bolt12 offer",
+                            color = s.accentDeep, fontSize = 12.5.sp, maxLines = 1,
+                        )
+                    }
+                    SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
                 }
             }
 
@@ -203,18 +232,30 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
         )
     }
 
+    if (scanning) {
+        SonarScanQrSheet(
+            onClose = { scanning = false },
+            onDetect = { destination, sats ->
+                scanning = false
+                fixedSats = sats
+                externalTarget = destination
+            },
+        )
+    }
+
     externalTarget?.let { destination ->
         PaySheet(
             peerName = payableDisplayName(destination),
             balanceSats = state.walletBalanceSats(),
             mesh = false,
+            fixedSats = fixedSats,
             fiatOf = { state.fiatOrNull(it) },
             onSend = { sats ->
                 // Detached: this screen pops on the same frame.
                 state.payDestinationDetached(destination, sats, payableDisplayName(destination))
                 state.back()
             },
-            onClose = { externalTarget = null },
+            onClose = { externalTarget = null; fixedSats = null },
         )
     }
 

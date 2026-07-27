@@ -141,6 +141,22 @@ There are two ways to start a payment:
    identity, not something the wallet can pay. Such a person shows up under
    "People you can pay" once their descriptor arrives.
 
+   - **A scanned QR code** — "Scan a QR code" opens the design's `ScanQrSheet`
+     viewfinder. iOS reuses the `AVCaptureMetadataOutput` pipeline that already
+     powers safety-number verification (`CameraScannerView`); Android uses
+     CameraX + zxing (`SonarQrScanner`), decoding the Y plane on a background
+     executor with `STRATEGY_KEEP_ONLY_LATEST` so a slow frame is dropped
+     rather than queued. The decoded payload is classified the same way as a
+     typed one, and a BOLT11 invoice that encodes an amount carries it through
+     as the sheet's fixed amount — the keypad and quick chips are then hidden,
+     matching the design's `fixed` prop.
+
+**Platform gap:** desktop has no camera pipeline (CameraX is Android-only and
+there is no cross-platform JVM webcam stack Sonar ships), so
+`sonarQrScanSupported()` is false on the JVM target and the scan row is hidden
+there rather than opening a dead viewfinder. Pasting a code into the field
+reaches every destination the scanner would.
+
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,

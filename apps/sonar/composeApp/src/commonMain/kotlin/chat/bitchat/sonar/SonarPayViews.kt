@@ -63,10 +63,17 @@ fun PaySheet(
     fiatOf: (Long) -> String?,
     onSend: (Long) -> Unit,
     onClose: () -> Unit,
+    /**
+     * Amount already fixed by the destination — a scanned Lightning invoice
+     * that encodes one. The design's `PaySheet` `fixed` prop: the amount is
+     * shown but the chips and keypad are hidden, because there is nothing to
+     * choose.
+     */
+    fixedSats: Long? = null,
 ) {
     val s = sonar
-    var v by remember { mutableStateOf("") }
-    val sats = v.toLongOrNull() ?: 0L
+    var v by remember { mutableStateOf(fixedSats?.toString().orEmpty()) }
+    val sats = fixedSats ?: (v.toLongOrNull() ?: 0L)
     val over = sats > balanceSats
     val can = sats > 0 && !over
     fun tap(k: String) {
@@ -122,6 +129,7 @@ fun PaySheet(
                     }
                 }
 
+                if (fixedSats == null) {
                 // pay-chips
                 Row(
                     Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 2.dp),
@@ -160,6 +168,8 @@ fun PaySheet(
                             }
                         }
                     }
+                }
+
                 }
 
                 // bc-sheetactions

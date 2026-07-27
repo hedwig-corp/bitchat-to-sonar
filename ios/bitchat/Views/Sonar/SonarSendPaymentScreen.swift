@@ -9,14 +9,10 @@
 // looks like an address/offer/invoice, and the "People you can pay" list of
 // contacts who publish a payment address.
 //
-// Deviation from the design, tracked as a gap on BOTH platforms: the design's
-// "Scan a QR code" row is not reproduced. Sonar has no camera decoder on
-// Android/desktop (zxing is bundled for *encoding* invite QRs only), so
-// shipping it on iOS alone would break the Cross-Platform Feature Rule.
-// Follow-up: add a shared scanner (CameraX + a decoder on Android, the existing
-// AVCaptureMetadataOutput path from VerificationViews on iOS), then restore the
-// row here and in `SonarSendPaymentScreen.kt`. Typing or pasting the code into
-// the field covers the same destinations in the meantime.
+// The "Scan a QR code" row is camera-backed, reusing the AVCaptureMetadataOutput
+// pipeline that already powers safety-number verification (`CameraScannerView`).
+// The Compose app has the matching row on Android via CameraX + zxing; desktop
+// has no camera pipeline and hides the row there.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -31,6 +27,9 @@ struct SonarSendPaymentScreen: View {
     /// Chosen recipient: a contact (pay through their chat) or a raw destination.
     @State private var contactTarget: SNPayableContact?
     @State private var externalTarget: String?
+    /// Amount carried by a scanned invoice, if it fixes one.
+    @State private var fixedSats: Int64?
+    @State private var scanning = false
     @State private var toast: String?
 
     private var trimmed: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -83,6 +82,40 @@ struct SonarSendPaymentScreen: View {
                             .fill(SonarTheme.surface2)
                     )
                     .padding(.horizontal, 14)
+
+                    // ── .sp-scan: scan a QR code ──
+                    Button {
+                        scanning = true
+                    } label: {
+                        HStack(spacing: 12) {
+                            RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                .fill(SonarTheme.accentFill)
+                                .frame(width: 38, height: 38)
+                                .overlay(
+                                    SNIcon(name: .qr, size: 20)
+                                        .foregroundColor(SonarTheme.onAccent)
+                                )
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("Scan a QR code")
+                                    .font(SonarTheme.uiFont(size: 15, weight: .bold))
+                                    .foregroundColor(SonarTheme.text)
+                                Text("Bitcoin, Lightning invoice or Bolt12 offer")
+                                    .font(SonarTheme.uiFont(size: 12.5))
+                                    .foregroundColor(SonarTheme.accentDeep)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            SNIcon(name: .chevron, size: 15, weight: 2.2)
+                                .foregroundColor(SonarTheme.text3)
+                        }
+                        .padding(EdgeInsets(top: 12, leading: 14, bottom: 12, trailing: 14))
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(SonarTheme.accentSoft)
+                        )
+                        .padding(EdgeInsets(top: 8, leading: 14, bottom: 0, trailing: 14))
+                    }
+                    .buttonStyle(SNScaleStyle(scale: 0.99))
 
                     // ── External destination ──
                     if let external = SNExternalDestination(input: trimmed) {
@@ -200,9 +233,22 @@ struct SonarSendPaymentScreen: View {
             }
         }
         .snSheet(
+            isPresented: $scanning,
+            title: "Scan to pay"
+        ) {
+            SonarScanQrSheet(
+                onClose: { scanning = false },
+                onDetect: { destination, sats in
+                    scanning = false
+                    fixedSats = sats
+                    externalTarget = destination
+                }
+            )
+        }
+        .snSheet(
             isPresented: Binding(
                 get: { externalTarget != nil },
-                set: { if !$0 { externalTarget = nil } }
+                set: { if !$0 { externalTarget = nil; fixedSats = nil } }
             ),
             title: "Send money · \(SNExternalDestination.displayName(externalTarget ?? ""))"
         ) {
@@ -213,7 +259,8 @@ struct SonarSendPaymentScreen: View {
                     transport: .internet,
                     money: { store.money($0) },
                     fiatText: { store.fiatText($0) },
-                    onClose: { externalTarget = nil },
+                    fixedSats: fixedSats,
+                    onClose: { externalTarget = nil; fixedSats = nil },
                     onSend: { sats in
                         Task {
                             let name = SNExternalDestination.displayName(destination)
