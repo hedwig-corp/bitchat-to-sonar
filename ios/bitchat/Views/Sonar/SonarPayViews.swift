@@ -197,6 +197,11 @@ struct SNPaySheet: View {
     @State private var v = ""
 
     private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
+    /// Whether there is an amount to show. `v` is the *keypad* buffer, and a
+    /// fixed amount hides the keypad — so keying the display off `v` alone
+    /// rendered "0" for an invoice that already carries its amount, even though
+    /// `sats` (and the payment) were correct.
+    private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
@@ -236,7 +241,7 @@ struct SNPaySheet: View {
             // .pay-amountbox
             VStack(spacing: 0) {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Text(verbatim: v.isEmpty ? "0" : snPayFmt(sats))
+                    Text(verbatim: hasAmount ? snPayFmt(sats) : "0")
                         .font(SonarTheme.uiFont(size: 42, weight: .heavy))
                         .kerning(-42 * 0.02)
                         .foregroundColor(over ? SonarTheme.danger : SonarTheme.text)
