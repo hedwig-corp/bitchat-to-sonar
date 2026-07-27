@@ -86,7 +86,33 @@ class NotificationService: SDKNotificationService {
                log: Self.log, type: .info, String(describing: request.content.userInfo))
         setServiceLogger(logger: NSEBreezLogger())
         #endif
-        super.didReceive(request, withContentHandler: contentHandler)
+        // Breez wake (BOLT12 invoice_request / swap update). Let the SDK do its
+        // WORK but never let it own the BANNER.
+        //
+        // `SDKNotificationService`'s tasks call `displayPushNotification` on
+        // success — `InvoiceRequestTask` with the title "Fetching Invoice",
+        // `SwapUpdatedTask` with "Received N sats" — and that call IS the
+        // content handler. So answering an invoice_request, a pure
+        // machine-to-machine step, showed the user a banner about a payment
+        // that had not happened yet, and a settled receive produced a second
+        // banner competing with the ⚡PAY chat line that is supposed to be the
+        // user-visible one. docs/SONAR-NOTIFICATIONS.md already specifies this
+        // path as silent; docs/ios-offline-receive-nse.md wrongly claimed the
+        // SDK only notifies on failure. It notifies on success too.
+        //
+        // Suppressing the content the SDK hands back does not cancel its work:
+        // `createBolt12Invoice` + `replyServer` have already run by the time it
+        // calls the handler. An empty title/body with no sound is not presented
+        // by iOS — the same mechanism the Transponder branch above relies on.
+        Self.recordDiagnostic("didReceive:breez")
+        super.didReceive(request) { content in
+            let silent = (content.mutableCopy() as? UNMutableNotificationContent)
+                ?? UNMutableNotificationContent()
+            Self.suppressTransponderNotification(silent)
+            os_log("NSE: suppressed Breez SDK banner (silent infrastructure wake)",
+                   log: Self.log, type: .info)
+            contentHandler(silent)
+        }
     }
 
     override func serviceExtensionTimeWillExpire() {

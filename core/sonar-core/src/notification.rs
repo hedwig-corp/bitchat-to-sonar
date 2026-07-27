@@ -159,6 +159,23 @@ pub fn render_notification(input: NotificationRenderInput) -> Option<Notificatio
         return None;
     }
     let content = input.content_preview.as_deref().unwrap_or("");
+    // `⚡PAYDONE` is a settlement control line, not a user event. One payment
+    // sends TWO chat messages (`⚡PAY` then `⚡PAYDONE`, see docs/SONAR-PAYMENTS.md),
+    // and both classify as `Payment` — so every host bannered a payment twice,
+    // the second time without an amount, because only `⚡PAY` carries the sats.
+    // The transcript already hides `⚡PAYDONE`; notifications must agree.
+    //
+    // Suppressed HERE rather than in each host so the rule cannot drift apart
+    // across platforms — it broke differently on each (iOS stacked two banners
+    // because its identifier is per-message; Android's is chat-scoped, so the
+    // second REPLACED the first and the amount silently disappeared).
+    //
+    // Hosts that pick one row per refresh must ALSO exclude `⚡PAYDONE` when
+    // choosing the candidate, or suppressing it here just means no notification
+    // at all — see `notifyChatIfNew` in SonarAppState.kt.
+    if parse_pay_done_line(content).is_some() {
+        return None;
+    }
     let kind = input.kind_hint.unwrap_or_else(|| classify_content(content));
     let payment_sats = payment_amount_sats(content);
     let label = visible_label(&input);
@@ -402,17 +419,43 @@ mod tests {
         assert_eq!(n.payment_sats, Some(21_000));
     }
 
+    /// One payment sends `⚡PAY` AND `⚡PAYDONE`. Only the first is a user
+    /// event; the second used to render a second, amountless banner ("Open
+    /// Sonar to view the payment.") for the same payment. Supersedes the
+    /// earlier `paydone_does_not_expose_raw_control_text`, which asserted the
+    /// leak was merely masked — not notifying at all is strictly stronger, and
+    /// covers the preimage-bearing form below.
     #[test]
-    fn paydone_does_not_expose_raw_control_text() {
-        let mut req = input(
+    fn paydone_never_notifies() {
+        for line in [
             "⚡PAYDONE|2|abc-123|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        );
-        req.show_preview = true;
-        let n = render_notification(req).unwrap();
-        assert_eq!(n.kind, NotificationKind::Payment);
-        assert_eq!(n.title, "Payment from Alice");
-        assert_eq!(n.body, "Open Sonar to view the payment.");
-        assert_eq!(n.payment_sats, None);
+            "⚡PAYDONE|1|abc-123",
+        ] {
+            let mut req = input(line);
+            // show_preview ON is the leaking configuration: it is what would
+            // otherwise put the raw line — preimage included — on a lock screen.
+            req.show_preview = true;
+            assert!(
+                render_notification(req).is_none(),
+                "⚡PAYDONE must not notify: {line}"
+            );
+        }
+    }
+
+    /// The pair must yield exactly one notification, and it must be the one
+    /// carrying the amount. Pins the whole invariant rather than each half.
+    #[test]
+    fn a_payment_notifies_once_with_its_amount() {
+        let rendered: Vec<_> = [
+            "⚡PAY|1|abc-123|21000",
+            "⚡PAYDONE|2|abc-123|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]
+        .into_iter()
+        .filter_map(|line| render_notification(input(line)))
+        .collect();
+        assert_eq!(rendered.len(), 1, "one payment must notify exactly once");
+        assert_eq!(rendered[0].payment_sats, Some(21_000));
+        assert_eq!(rendered[0].body, "21,000 sats received from Alice.");
     }
 
     #[test]

@@ -1035,6 +1035,72 @@ close) -> this fix.
   desktop push or process-lifecycle path would make the branch live and this
   rejection stale.
 
+## R-021 — One payment is one notification, and it never carries the wire line
+
+**Invariant:** a single payment produces exactly one user-visible notification,
+it is the one carrying the amount, and no notification path ever renders a
+`⚡PAY`/`⚡PAYDONE` line verbatim.
+
+**Breaks as:** two banners for one payment, the second reading "Open Sonar to
+view the payment." with no amount (iOS); or **one** banner that is the wrong one
+— amount silently missing — on Compose. Reported from a device as "the
+notification looks duplicated".
+
+**Why:** `sendPay` sends TWO chat messages, `⚡PAY|1|<uuid>|<sats>` then
+`⚡PAYDONE|2|<uuid>|<preimage>` (`SonarAppStore.sendPay`), and each becomes its
+own Marmot message, relay event, and push. `classify_content` mapped both to
+`NotificationKind::Payment`, while `payment_amount_sats` parses only `⚡PAY` — so
+the second banner was a payment notification with nothing in it. Every host gate
+skipped only `.call` and `.trill`.
+
+It presented differently per platform, which is why it read as flaky rather than
+as one deterministic bug: iOS notification identifiers are per-message
+(`sonar-payment-<messageId>`) so the two **stacked**; Compose identifiers are
+chat-scoped (`idKey.hashCode()`) so the second **replaced** the first. Same
+defect, opposite symptom.
+
+The existing dedup could never have caught it: `pushWakeNotifiedMessageIDs` and
+`removeDeliveredNSEOwnedBanners` are NSE-vs-host machinery keyed on message id,
+and these are two genuinely different messages. R-004 guarantees "a *message*
+notifies at most once", which both banners satisfy.
+
+**Fixed in three layers, and all three are load-bearing:**
+
+1. `render_notification` returns `None` for `⚡PAYDONE` — one return, both
+   platforms, because both route through the shared renderer and already handle
+   a nil envelope.
+2. Compose `notifyChatIfNew` excludes `⚡PAYDONE` at **candidate selection**, the
+   way it already excludes `⚡TRILL`. That scan keeps only the newest unseen row
+   per chat and `⚡PAYDONE` always arrives after its `⚡PAY`, so it always wins —
+   without this, layer 1 alone turns "wrong notification" into "no notification".
+3. `SonarNSEDecoratePolicy.render` gained a payment branch. The NSE does **not**
+   go through core, and its generic path assigns `body = contentPreview`
+   verbatim, so with previews on the killed-app banner printed the raw line —
+   for `⚡PAYDONE` that is the payment **preimage** on a lock screen.
+
+**Guarded by:** `notification.rs::paydone_never_notifies`, `notification.rs::a_payment_notifies_once_with_its_amount`, `SonarNSEDecoratePolicyTests.payLineNeverLeaksRaw`, `SonarNSEDecoratePolicyTests.payDoneNeverLeaksPreimage`, `SonarNSEDecoratePolicyTests.payLineHonoursShowNames`
+
+The NSE trio was
+mutation-checked: stubbing the payment branch to `if false` turns the suite red.
+
+**Call sites:** core `notification.rs::render_notification`; Compose
+`SonarAppState.notifyChatIfNew`; iOS `SonarNSEDecoratePolicy.render`. The host
+notify gates (`SonarPushProcessor` x2, `SonarAppStore.processIncomingMarmotNotifications`)
+need no change — they already `continue` on a nil envelope, which is why the core
+fix reaches them.
+
+**Rejected:** adding a `NotificationKind::PaymentSettled` variant. It reads
+cleaner, but the kind crosses the FFI into exhaustive `when`/`switch` on both
+hosts, so a purely internal suppression rule would have become a breaking
+signature change for every consumer including `sonar-cli`. Returning `None` from
+the renderer states the same thing where the decision belongs.
+
+**Not guarded:** that the three layers stay in agreement. Nothing fails if a
+future host adds a fourth notify path that skips the core renderer — which is
+exactly what the NSE already is. Also unguarded: the Compose candidate-selection
+exclusion (layer 2) needs a constructed `SonarAppState`, so only layers 1 and 3
+have tests.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

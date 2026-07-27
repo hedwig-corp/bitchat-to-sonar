@@ -242,4 +242,66 @@ struct SonarNSEDecoratePolicyTests {
         // Unicode full-width hex must not classify (core rejects it too).
         #expect(!SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|\u{FF41}\u{FF42}c"))
     }
+
+    // MARK: - ⚡PAY / ⚡PAYDONE must never reach the lock screen raw
+    //
+    // Before these, `render` had a ⚡TRILL branch and no payment branch, so with
+    // "Message preview" on the generic path set `body = contentPreview`
+    // VERBATIM. A killed-app banner therefore printed the wire line — and for
+    // ⚡PAYDONE that line carries the payment preimage, i.e. the settlement
+    // proof, to anyone who can see the screen.
+
+    @Test("⚡PAY never leaks the raw control line, preview on")
+    func payLineNeverLeaksRaw() {
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(
+                senderRaw: "Alice",
+                groupName: "",
+                contentPreview: "\u{26A1}PAY|1|abc-123|21000"
+            ),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(out.title == "Payment from Alice")
+        #expect(out.body == "Open Sonar to view the payment.")
+        #expect(!out.body.contains("\u{26A1}PAY"))
+        // The amount is deliberately absent: the NSE cannot read the
+        // payment-amount preference, and a balance is a harder leak to justify
+        // on a locked screen than a message preview.
+        #expect(!out.body.contains("21000"))
+    }
+
+    @Test("⚡PAYDONE never leaks the preimage")
+    func payDoneNeverLeaksPreimage() {
+        let preimage = String(repeating: "a", count: 64)
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(
+                senderRaw: "Alice",
+                groupName: "",
+                contentPreview: "\u{26A1}PAYDONE|2|abc-123|\(preimage)"
+            ),
+            prefs: .init(showNames: true, showPreview: true)
+        )
+        #expect(!out.body.contains(preimage))
+        #expect(!out.title.contains(preimage))
+        // ⚡PAYDONE is not a user event at all — core `render_notification`
+        // returns nil for it, so the NSE suppresses rather than decorates.
+        #expect(out.title.isEmpty)
+        #expect(out.body.isEmpty)
+    }
+
+    @Test("⚡PAY hides the sender when names are off")
+    func payLineHonoursShowNames() {
+        let out = SonarNSEDecoratePolicy.render(
+            input: .init(
+                senderRaw: "Alice",
+                groupName: "Secret Ops",
+                contentPreview: "\u{26A1}PAY|1|abc-123|21000"
+            ),
+            prefs: .init(showNames: false, showPreview: true)
+        )
+        #expect(out.title == "Payment received")
+        #expect(!out.title.contains("Alice"))
+        #expect(!out.body.contains("Secret Ops"))
+    }
+
 }

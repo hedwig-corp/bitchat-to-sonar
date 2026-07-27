@@ -19,6 +19,10 @@ enum SonarNotificationSound {
     case ble
     /// MSN-style nudge (⚡TRILL) — the distinct trill bell.
     case trill
+    /// Incoming money. Distinct from `.standard`/`.ble` so a payment does not
+    /// arrive wearing the chat tone — a mesh payment used to ring the Bluetooth
+    /// message sound, which is a property of the transport, not of the event.
+    case payment
     /// Deliver visually with no sound.
     case silent
 }
@@ -78,6 +82,15 @@ final class NotificationService {
     private static let trillNotificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_trill.wav")
     )
+    /// TODO(assets): shares the message tone until a dedicated `sonar_payment`
+    /// master exists (see assets/notifications/README.md for the mastering +
+    /// conversion step). Routed through its own constant so adding the file is
+    /// a one-line change here — and note the appex has NO synchronized-folder
+    /// sync, so a new sound must be added to the NSE target explicitly or it
+    /// is silently silent on the killed-app path (prior incident).
+    private static let paymentNotificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
+    )
 
     /// Returns true if running in test environment (XCTest, Swift Testing, or CI)
     private var isRunningTests: Bool {
@@ -102,13 +115,95 @@ final class NotificationService {
         }
     }
     
+    /// Category + thread identifiers for a payment banner.
+    ///
+    /// `sonar.payment` is registered in `registerNotificationCategories()`.
+    /// Before this existed NOTHING called `setNotificationCategories`, so the
+    /// NSE's `categoryIdentifier = "sonar.message"` referred to a category that
+    /// did not exist and iOS silently ignored it.
+    ///
+    /// The thread identifier is scoped `sonar.payment.<conversationId>`, not a
+    /// single global bucket: payments group away from the chat stack (so money
+    /// never collapses into the message thread) while still grouping per
+    /// person, and `clearNotifications(forConversationIds:)` keeps working
+    /// unchanged because it matches on `userInfo`, not on the thread.
+    static let paymentCategoryIdentifier = "sonar.payment"
+    static let messageCategoryIdentifier = "sonar.message"
+
+    static func paymentThreadIdentifier(conversationId: String?) -> String {
+        guard let conversationId, !conversationId.isEmpty else { return paymentCategoryIdentifier }
+        return "\(paymentCategoryIdentifier).\(conversationId)"
+    }
+
+    /// Register the categories the app and the NSE reference. Must run before
+    /// any notification is posted, so it lives next to the delegate assignment
+    /// at launch. Purely declarative — no actions attached yet; the categories
+    /// exist so iOS honours the identifiers and so future actions ("Open
+    /// wallet") have somewhere to hang.
+    func registerNotificationCategories() {
+        let payment = UNNotificationCategory(
+            identifier: Self.paymentCategoryIdentifier,
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+        let message = UNNotificationCategory(
+            identifier: Self.messageCategoryIdentifier,
+            actions: [],
+            intentIdentifiers: [],
+            options: []
+        )
+        UNUserNotificationCenter.current().setNotificationCategories([payment, message])
+    }
+
+    /// Post an already-routed notification with the presentation its KIND
+    /// requires, rather than the presentation its transport implies.
+    ///
+    /// Exists so the payment-vs-message decision lives in exactly one place.
+    /// Three call sites need it — the live Marmot path and both push-wake
+    /// drains — and three copies of "is this a payment" is precisely how the
+    /// notification paths drifted apart before (mesh payments ringing the
+    /// Bluetooth chat tone, one path honouring a kind the others ignored).
+    func sendRoutedNotification(
+        kind: SonarLocalNotificationKind,
+        title: String,
+        body: String,
+        identifier: String,
+        userInfo: [String: Any]?,
+        conversationId: String?,
+        sound: SonarNotificationSound
+    ) {
+        let isPayment = kind == .payment
+        sendLocalNotification(
+            title: title,
+            body: body,
+            identifier: identifier,
+            userInfo: userInfo,
+            // Money is the one chat event worth breaching Focus for. Needs the
+            // time-sensitive entitlement; without it iOS silently downgrades to
+            // `.active`, i.e. today's behaviour, so this cannot regress.
+            interruptionLevel: isPayment ? .timeSensitive : .active,
+            sound: isPayment ? .payment : sound,
+            categoryIdentifier: isPayment
+                ? Self.paymentCategoryIdentifier
+                : Self.messageCategoryIdentifier,
+            threadIdentifier: isPayment
+                ? Self.paymentThreadIdentifier(conversationId: conversationId)
+                : nil,
+            subtitle: isPayment ? "Sonar wallet" : nil
+        )
+    }
+
     func sendLocalNotification(
         title: String,
         body: String,
         identifier: String,
         userInfo: [String: Any]? = nil,
         interruptionLevel: UNNotificationInterruptionLevel = .active,
-        sound: SonarNotificationSound = .standard
+        sound: SonarNotificationSound = .standard,
+        categoryIdentifier: String? = nil,
+        threadIdentifier: String? = nil,
+        subtitle: String? = nil
     ) {
         guard !isRunningTests else { return }
         // Central per-chat mute gate: every conversation-scoped local
@@ -123,10 +218,14 @@ final class NotificationService {
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
+        if let subtitle, !subtitle.isEmpty { content.subtitle = subtitle }
+        if let categoryIdentifier { content.categoryIdentifier = categoryIdentifier }
+        if let threadIdentifier { content.threadIdentifier = threadIdentifier }
         content.sound = switch sound {
         case .standard: Self.standardNotificationSound
         case .ble: Self.bleNotificationSound
         case .trill: Self.trillNotificationSound
+        case .payment: Self.paymentNotificationSound
         case .silent: nil
         }
         content.interruptionLevel = interruptionLevel

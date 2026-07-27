@@ -115,6 +115,12 @@ actual object Notifier {
                 SonarNotificationSound.Default -> "/sonar_notification.wav"
                 SonarNotificationSound.Ble -> "/sonar_ble_notification.wav"
                 SonarNotificationSound.Trill -> "/sonar_trill.wav"
+                // Documented platform gap: desktop notifications are AWT
+                // TrayIcon balloons, which carry no channel, category, group or
+                // icon — so a desktop payment differs from a chat message only
+                // by its copy. Shares the message tone until a dedicated
+                // payment master exists (same asset gap as Android).
+                SonarNotificationSound.Payment -> "/sonar_notification.wav"
             }
             val bytes = Notifier::class.java
                 .getResourceAsStream(resource)

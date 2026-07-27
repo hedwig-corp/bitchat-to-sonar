@@ -464,11 +464,13 @@ enum SonarPushProcessor {
                 messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
                 conversationId: conversationId
             )
-            NotificationService.shared.sendLocalNotification(
+            NotificationService.shared.sendRoutedNotification(
+                kind: kind,
                 title: routed.title,
                 body: routed.body,
                 identifier: routed.identifier,
                 userInfo: routed.userInfo,
+                conversationId: conversationId,
                 sound: sound
             )
             // Correlate to local message IDs (handles truncated drain previews).
@@ -574,11 +576,13 @@ enum SonarPushProcessor {
                 messageIdHex: nil,
                 conversationId: conversationId
             )
-            NotificationService.shared.sendLocalNotification(
+            NotificationService.shared.sendRoutedNotification(
+                kind: kind,
                 title: routed.title,
                 body: routed.body,
                 identifier: routed.identifier,
                 userInfo: routed.userInfo,
+                conversationId: conversationId,
                 sound: sound
             )
             marmot.notePushWakeNotified(groupIdHex: summary.groupIdHex, content: summary.latestContent)

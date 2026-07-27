@@ -18,6 +18,9 @@ actual object Notifier {
     private const val MESSAGE_CHANNEL = "messages_v8"
     private const val BLE_CHANNEL = "ble_notifications_v6"
     private const val TRILL_CHANNEL = "trill_v1"
+    private const val PAYMENT_CHANNEL = "payments_v1"
+    /** Keeps payments out of the chat notification bundle. */
+    private const val PAYMENT_GROUP = "sonar.payments"
     private val LEGACY_CHANNELS = listOf(
         "messages",
         "messages_v2",
@@ -71,6 +74,24 @@ actual object Notifier {
                 soundResourceId = R.raw.sonar_trill,
                 // Match the in-app buzz: [40ms buzz, 60ms pause, 40ms buzz].
                 vibrationPattern = longArrayOf(0, 40, 60, 40),
+            )
+            ensureChannel(
+                nm = nm,
+                id = PAYMENT_CHANNEL,
+                name = "Payments",
+                description = "Money you receive in Sonar",
+                // TODO(assets): ships with the message tone until a dedicated
+                // `sonar_payment` master exists (assets/notifications/README.md
+                // documents the mastering + ffmpeg step). The channel is the
+                // load-bearing part — it already lets the user pick their own
+                // sound for money in system settings, which was impossible
+                // while payments rode the messages channel. Swapping the sound
+                // later requires bumping this id to `payments_v2`, since
+                // Android freezes channel sound after creation.
+                soundResourceId = R.raw.sonar_notification,
+                // Between the message buzz [0,250,200,250] and the trill's
+                // [0,40,60,40]: short double-tap, distinct from both.
+                vibrationPattern = longArrayOf(0, 60, 80, 60),
             )
         }
     }
@@ -158,14 +179,34 @@ actual object Notifier {
             SonarNotificationSound.Default -> MESSAGE_CHANNEL
             SonarNotificationSound.Ble -> BLE_CHANNEL
             SonarNotificationSound.Trill -> TRILL_CHANNEL
+            SonarNotificationSound.Payment -> PAYMENT_CHANNEL
         }
+        val isPayment = sound == SonarNotificationSound.Payment
         val n = Notification.Builder(ctx, channel)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(
+                if (isPayment) R.drawable.ic_notify_payment
+                else android.R.drawable.stat_notify_chat
+            )
             .setContentTitle(title)
             .setContentText(body)
             .setAutoCancel(true)
             .setNumber(1)
-            .setCategory(Notification.CATEGORY_MESSAGE)
+            // CATEGORY_EVENT, not CATEGORY_MESSAGE: there is no money category,
+            // and MESSAGE is what makes Android treat this as chat and bundle
+            // it into the conversation — the exact merge we are breaking.
+            .setCategory(
+                if (isPayment) Notification.CATEGORY_EVENT
+                else Notification.CATEGORY_MESSAGE
+            )
+            .apply {
+                if (isPayment) {
+                    setGroup(PAYMENT_GROUP)
+                    // Gold, matching the in-app PayBubble. Colorized only
+                    // applies to foreground-service notifications on most
+                    // versions; harmless elsewhere and correct where honoured.
+                    setColor(0xFFD4A017.toInt())
+                }
+            }
             .setContentIntent(pi)
             .build()
         manager().notify(id, n)

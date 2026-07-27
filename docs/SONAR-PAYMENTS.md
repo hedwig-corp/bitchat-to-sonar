@@ -127,6 +127,65 @@ The wallet sheet also lists direct payment activity, newest first, including:
 - Status, amount, peer name, rail, wallet payment id, fee, and failure text
   when available.
 
+## Notifications
+
+One payment must produce exactly **one** user-visible notification, and it must
+be the one carrying the amount.
+
+A payment sends **two** chat messages — `⚡PAY` then `⚡PAYDONE` — and both used
+to classify as `Payment`, so both bannered. The failure looked different on each
+platform, which is why it read as flaky rather than as one bug: iOS identifiers
+are per-message, so the two banners **stacked** (the second amountless, "Open
+Sonar to view the payment."); Compose identifiers are chat-scoped, so the second
+**replaced** the first and the amount silently vanished.
+
+Rules, in the order they are enforced:
+
+1. **`⚡PAYDONE` never notifies.** `render_notification` returns `None` for it
+   (`core/sonar-core/src/notification.rs`), so every host that routes through
+   the shared renderer is fixed by that one return. It is a settlement control
+   line, and the transcript already hides it — notifications now agree.
+2. **A host that picks one row per refresh must exclude `⚡PAYDONE` at candidate
+   selection**, exactly as it already excludes `⚡TRILL`. `⚡PAYDONE` is always
+   newer than its `⚡PAY`, so it always wins that race; suppressing it only at
+   render time would mean no notification at all. Compose:
+   `SonarAppState.notifyChatIfNew`.
+3. **The NSE has its own renderer and does not go through core.**
+   `SonarNSEDecoratePolicy.render` must carry a payment branch or the killed-app
+   path prints the raw wire line on the lock screen with previews on — and for
+   `⚡PAYDONE` that line contains the **payment preimage**. Pinned by
+   `SonarNSEDecoratePolicyTests`.
+4. **The Breez NSE path is silent infrastructure.** `SDKNotificationService`
+   posts its own banners on success ("Fetching Invoice" while answering an
+   invoice_request, "Received N sats" on swap completion). Sonar suppresses the
+   content it hands back — the SDK's work has already run by then — because the
+   user-visible "you got paid" notice is the `⚡PAY` chat line. Compose never
+   reaches this code; the Breez wake there posts nothing by construction.
+
+### Amount privacy
+
+`show_payment_amount` gates the sats figure. It defaults to the user's
+**message-preview** choice rather than to `true`: someone who hid message text
+on the lock screen has already said what they want, and a balance is a larger
+disclosure than a message preview. Keys: iOS
+`sonar.notifications.showPaymentAmount`, Compose `notifPaymentAmount`.
+
+For reference, Signal never lets an amount reach the notification layer at all —
+its payment notification is the fixed string "💳 Payment" on the ordinary
+messages channel. Sonar deliberately diverges so money reads as money, which is
+exactly why Sonar has to own this gate.
+
+### Alert class
+
+A payment is a distinct alert class, not a distinct conversation — the receipt
+is a row in that person's chat, so the tap still opens that chat. iOS: category
+`sonar.payment`, thread `sonar.payment.<conversationId>`, subtitle "Sonar
+wallet", `.timeSensitive`. Android: channel `payments_v1`, `CATEGORY_EVENT` (not
+`CATEGORY_MESSAGE`, which is what makes Android bundle it into the conversation),
+group `sonar.payments`, its own status-bar icon. Desktop is a documented gap:
+AWT tray balloons carry no channel, category, group, or icon, so a desktop
+payment differs only by copy.
+
 ## Chat receipt wire format
 
 ```text

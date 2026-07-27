@@ -5,6 +5,17 @@ enum class SonarNotificationSound {
     Ble,
     /** MSN-style trill (nudge) — the distinct double-bell alert. */
     Trill,
+    /**
+     * Incoming money. Selects a dedicated Android channel so a payment does
+     * not arrive on the messages channel wearing the messages tone — the user
+     * can then give money its own sound and importance in system settings,
+     * which is impossible while payments and chat share a channel.
+     *
+     * Not purely cosmetic: it is also what keeps payments out of Android's
+     * messaging-style bundling, so a payment cannot be collapsed into a chat
+     * conversation group.
+     */
+    Payment,
 }
 
 /**

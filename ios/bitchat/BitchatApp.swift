@@ -56,6 +56,10 @@ struct BitchatApp: App {
         }
         #endif
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
+        // Must run before any notification is posted. Nothing registered
+        // categories before this, so the NSE's `categoryIdentifier` referred to
+        // a category that did not exist and iOS ignored it silently.
+        NotificationService.shared.registerNotificationCategories()
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
     }

@@ -109,6 +109,26 @@ enum SonarNSEDecoratePolicy {
         return id.utf8.allSatisfy { $0 == 0x2D || ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) || ($0 >= 0x41 && $0 <= 0x46) }
     }
 
+    enum PayLineKind { case pay, done }
+
+    /// Classify a `⚡PAY` / `⚡PAYDONE` receipt line, mirroring core's
+    /// `parse_pay_receipt_line` / `parse_pay_done_line` (docs/SONAR-PAYMENTS.md).
+    /// Deliberately permissive on the trailing fields: this is a *suppression*
+    /// gate, so a line core would parse but this rejects means the raw text —
+    /// preimage included — reaches the lock screen. Under-matching is the
+    /// dangerous direction, over-matching only costs a generic banner.
+    static func payLineKind(_ content: String) -> PayLineKind? {
+        let parts = content
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count >= 3 else { return nil }
+        switch parts[0] {
+        case "\u{26A1}PAY": return parts[1] == "1" ? .pay : nil
+        case "\u{26A1}PAYDONE": return parts[1] == "2" || parts[1] == "1" ? .done : nil
+        default: return nil
+        }
+    }
+
     /// Match SonarLocalNotificationRouter privacy: when names are off, never
     /// surface sender or group strings on the lock screen.
     static func render(input: Input, prefs: Prefs) -> Output {
@@ -128,6 +148,33 @@ enum SonarNSEDecoratePolicy {
                 title = "Someone nudged you"
             }
             return Output(title: title, body: "\u{1F44B} They want your attention.")
+        }
+        // ⚡PAY / ⚡PAYDONE: same rule as ⚡TRILL, and it was missing. With
+        // "Message preview" on this fell through to the generic branch below,
+        // which sets `body = contentPreview` VERBATIM — so a killed-app banner
+        // printed the raw wire line on the lock screen. For ⚡PAYDONE that line
+        // carries the payment preimage, i.e. the settlement proof, to anyone
+        // who can see the screen.
+        //
+        // The amount is deliberately NOT shown here even when it is available:
+        // this policy runs in the NSE with no access to the payment-amount
+        // preference, and a balance figure on a locked screen is a harder leak
+        // to justify than a message preview. The host re-renders with the real
+        // preference once the app runs. Signal never puts an amount on a
+        // notification at all — see docs/SONAR-PAYMENTS.md.
+        if let pay = payLineKind(input.contentPreview) {
+            guard pay == .pay else {
+                // ⚡PAYDONE is not a user event (core `render_notification`
+                // returns nil for it). Suppress rather than decorate.
+                return Output(title: "", body: "")
+            }
+            let sender = prefs.showNames
+                ? senderLabel(for: input.senderRaw, cachedBestName: input.cachedBestName)
+                : nil
+            return Output(
+                title: sender.map { "Payment from \($0)" } ?? "Payment received",
+                body: "Open Sonar to view the payment."
+            )
         }
         let body: String
         if prefs.showPreview {

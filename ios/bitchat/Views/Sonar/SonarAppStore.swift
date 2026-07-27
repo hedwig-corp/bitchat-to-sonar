@@ -2808,11 +2808,13 @@ final class SonarAppStore: ObservableObject {
             unreadCount: unreadCount,
             userInfo: userInfo
         ) else { return }
-        NotificationService.shared.sendLocalNotification(
+        NotificationService.shared.sendRoutedNotification(
+            kind: kind,
             title: notification.title,
             body: notification.body,
             identifier: notification.identifier,
             userInfo: notification.userInfo,
+            conversationId: conversationId,
             sound: sound
         )
     }

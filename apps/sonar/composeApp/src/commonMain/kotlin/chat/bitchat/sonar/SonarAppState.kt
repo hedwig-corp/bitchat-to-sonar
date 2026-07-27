@@ -3924,13 +3924,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
-    private fun notificationPrefs(): SonarNotificationPrefs =
-        SonarNotificationPrefs(
+    private fun notificationPrefs(): SonarNotificationPrefs {
+        val showPreview = prefBool("notifPreview", false)
+        return SonarNotificationPrefs(
             enabled = prefBool("notifs", true),
             showNames = prefBool("notifNames", true),
-            showPreview = prefBool("notifPreview", false),
-            showPaymentAmount = true,
+            showPreview = showPreview,
+            // Defaults to the message-preview choice rather than a hardcoded
+            // true. A user who hid message text still had "21,000 sats received
+            // from Alice." on the lock screen — a strictly larger leak than the
+            // text they had already asked to hide. Mirror of iOS
+            // `SonarNotificationPreferenceStore.resolvedShowPaymentAmount`.
+            showPaymentAmount = prefBool("notifPaymentAmount", showPreview),
         )
+    }
 
     // ── Per-chat mute (docs/SONAR-TRILL.md) ──
     // chatId → mute-until epoch seconds (MUTE_FOREVER_SECS = until turned back
@@ -4088,9 +4095,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             id = notification.id,
             title = notification.title,
             body = notification.body,
-            // A trill always rings with its distinct bell, whichever path
-            // classified it.
-            sound = if (kind == SonarNotificationKind.Trill) SonarNotificationSound.Trill else sound,
+            // A trill always rings with its distinct bell, and a payment its
+            // own channel, whichever path classified them. Both override the
+            // transport-derived sound: the alert class is a property of WHAT
+            // arrived, not of how it got here — a mesh payment was ringing the
+            // Bluetooth chat tone.
+            sound = when (kind) {
+                SonarNotificationKind.Trill -> SonarNotificationSound.Trill
+                SonarNotificationKind.Payment -> SonarNotificationSound.Payment
+                else -> sound
+            },
             conversationId = idKey,
             messageId = messageId,
         )
@@ -4238,6 +4252,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 isOpen = isOpen,
                 allowsMessage = { message ->
                     !TrillLine.isTrillLine(message.content) &&
+                        // `⚡PAYDONE` is excluded for the same reason `⚡TRILL`
+                        // is: it is a control line the core refuses to render.
+                        // Excluding it at CANDIDATE selection is what makes the
+                        // core suppression correct here — this scan keeps only
+                        // the newest unseen row per chat, and a payment sends
+                        // `⚡PAY` then `⚡PAYDONE`, so `⚡PAYDONE` always wins
+                        // that race. Without this the payment would notify with
+                        // no amount (before the core fix) or not at all (after).
+                        PayLine.decode(message.content) !is PayLine.Done &&
                         socialState.allowsChatMessage(chatId, message.senderNpub, message.mine)
                 },
             )

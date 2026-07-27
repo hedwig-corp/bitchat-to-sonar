@@ -274,11 +274,15 @@ class SonarPushProcessingService : Service() {
                     id = notif.id,
                     title = notif.title,
                     body = notif.body,
-                    // A trill rings its distinct bell on background drains too.
-                    sound = if (kind == SonarNotificationKind.Trill) {
-                        SonarNotificationSound.Trill
-                    } else {
-                        SonarNotificationSound.Default
+                    // A trill rings its distinct bell on background drains too,
+                    // and a payment takes the payments channel. This is the
+                    // push-wake path — the delivery most likely to land on a
+                    // locked screen, so it is the one that most needs money to
+                    // look like money rather than another chat message.
+                    sound = when (kind) {
+                        SonarNotificationKind.Trill -> SonarNotificationSound.Trill
+                        SonarNotificationKind.Payment -> SonarNotificationSound.Payment
+                        else -> SonarNotificationSound.Default
                     },
                     conversationId = summary.groupIdHex,
                 )
