@@ -268,10 +268,21 @@ struct SonarNSEDecoratePolicyTests {
         #expect(SonarNSEDecoratePolicy.isMuted(
             groupIdHex: gid, senderNpub: "", mutesJSON: byShortForm, now: now
         ))
-        // Sender-keyed mutes (DM drain rows carry no group) match by npub.
-        let bySender = try JSONEncoder().encode(["npub1x": active])
+        // Sender-keyed mutes match. Use the production shape: core emits the
+        // drain sender as 64-hex (`sender.to_string()`), NOT bech32 — an npub
+        // sender here would test a case the real path never produces, which is
+        // how the store-npub/look-up-hex mismatch stayed green for six rounds.
+        // muteKeys now stores the hex twin of every pubkey key so this matches.
+        let senderHex = String(repeating: "cd", count: 32)
+        let bySender = try JSONEncoder().encode([senderHex: active])
         #expect(SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: "", senderNpub: "npub1x", mutesJSON: bySender, now: now
+            groupIdHex: "", senderNpub: senderHex, mutesJSON: bySender, now: now
+        ))
+        // A store that only ever saw the bech32 form cannot match a hex sender —
+        // pinning why muteKeys has to persist both encodings, not just one.
+        let bech32Only = try JSONEncoder().encode(["npub1exampleexample": active])
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: "", senderNpub: senderHex, mutesJSON: bech32Only, now: now
         ))
         // Expired reads as unmuted.
         let expired = try JSONEncoder().encode(["marmot:" + gid: now.addingTimeInterval(-1)])

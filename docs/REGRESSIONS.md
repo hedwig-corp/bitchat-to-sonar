@@ -1119,6 +1119,11 @@ the exact failure mode R-001 warns about. Nothing pins the host's
 mutes are not mirrored until `SonarChatMuteStore.shared` is first constructed,
 so an app updated but never launched fails open. Compose
 `notifyUnreadConversations` mute-skip has no test. iOS tests do not run in CI.
+The drain path's *sender* match is only as good as the stored key encoding:
+core emits the drain sender as 64-hex but group members/profiles as bech32, so
+`muteKeys` now stores both encodings of every pubkey-shaped key. A peer key
+stored in some third shape (e.g. a Noise fingerprint) would still miss, and no
+test pins the two-encoding storage.
 
 **Rejected:** Suppressing in the NSE *before* hydrate using the push payload's
 group-id hint (`SonarNSEDecoratePolicy.hintGroupIdHex`) to avoid taking the
