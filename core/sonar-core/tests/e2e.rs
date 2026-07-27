@@ -563,3 +563,102 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
         "acknowledged direct DMs are not duplicated by the gift-wrap lookback"
     );
 }
+
+/// Republishing a KeyPackage must REPLACE the addressable event at the relay,
+/// not add a second one, and a peer must resolve to the newest.
+///
+/// This is the relay-visible half of the stable-slot change. The unit tests in
+/// `persistence.rs` only prove the `d` tag is reused; whether a relay actually
+/// treats that as a NIP-33 replacement, and whether `fetch_key_package` picks
+/// the newest of what comes back, can only be shown against a real relay. This
+/// runs in CI, unlike the live-relay example harness.
+#[tokio::test]
+async fn republished_key_package_replaces_the_slot_and_newest_wins() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice_identity = Identity::generate();
+    let alice_pubkey = alice_identity.public_key();
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        [0x24; 32],
+    )
+    .await
+    .expect("alice connects");
+
+    alice.publish_key_package().await.expect("publish 1");
+    // created_at has 1s resolution, so separate the two publishes or "newest"
+    // is ambiguous and the assertion below would be luck rather than logic.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    alice.publish_key_package().await.expect("publish 2");
+
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch all key packages");
+    assert_eq!(
+        all.len(),
+        1,
+        "two publishes must occupy ONE addressable slot, got {} events",
+        all.len()
+    );
+
+    let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch key package");
+    assert_eq!(
+        picked.id, all[0].id,
+        "fetch_key_package must resolve to the surviving newest event"
+    );
+}
+
+/// A one-shot in-memory client with a DURABLE identity must not mint a new slot
+/// on every run.
+///
+/// The headless status probe (`sonar-status`) imports a fixed nsec, connects
+/// in-memory, publishes a KeyPackage and exits, once per poll. With a random
+/// slot per process that accumulated one permanent addressable event per poll
+/// forever under a stable npub, and the probe then fetched all of them inside
+/// its own degraded threshold. Two independent clients sharing one identity
+/// stand in for two polls here.
+#[tokio::test]
+async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let identity = Identity::generate();
+    let pubkey = identity.public_key();
+
+    for _ in 0..2 {
+        let probe = SonarClient::connect_in_memory(identity.clone(), vec![relay_url.clone()])
+            .await
+            .expect("probe connects");
+        probe.publish_key_package().await.expect("probe publishes");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
+        .await
+        .expect("observer connects");
+    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch all key packages");
+
+    assert_eq!(
+        all.len(),
+        1,
+        "repeat one-shot probes must reuse one slot, got {} events",
+        all.len()
+    );
+}

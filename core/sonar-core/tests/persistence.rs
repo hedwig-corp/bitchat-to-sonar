@@ -391,6 +391,11 @@ async fn wipe_removes_the_database() {
     let sync_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json.tmp");
     let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
     let outbox_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json.tmp");
+    // The slot addresses MLS key material inside this database, so a wipe must
+    // take it too. Without this assertion, dropping the suffix from
+    // sidecar_paths keeps CI green while stranding the coordinate.
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+    let slot_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot.tmp");
     std::fs::write(&sync_path, b"{}").expect("fake sync sidecar");
     std::fs::write(&sync_tmp_path, b"{}").expect("fake sync temp sidecar");
     std::fs::write(&outbox_path, b"{}").expect("fake outbox sidecar");
@@ -400,9 +405,16 @@ async fn wipe_removes_the_database() {
     assert!(sync_tmp_path.exists());
     assert!(outbox_path.exists());
     assert!(outbox_tmp_path.exists());
+    assert!(slot_path.exists(), "publishing a key package must create the slot");
+    std::fs::write(&slot_tmp_path, "leftover").expect("stage a crashed rename");
 
     MarmotEngine::wipe(&db_path).expect("wipe");
     assert!(!db_path.exists(), "db file removed by wipe");
+    assert!(!slot_path.exists(), "KeyPackage slot removed by wipe");
+    assert!(
+        !slot_tmp_path.exists(),
+        "a crashed slot rename must not survive a wipe"
+    );
     assert!(!sync_path.exists(), "sync sidecar removed by wipe");
     assert!(!sync_tmp_path.exists(), "sync temp sidecar removed by wipe");
     assert!(!outbox_path.exists(), "outbox sidecar removed by wipe");
@@ -413,4 +425,215 @@ async fn wipe_removes_the_database() {
 
     // Wipe is idempotent.
     MarmotEngine::wipe(&db_path).expect("wipe again is a no-op");
+}
+
+/// A KeyPackage must land in the SAME addressable slot across republishes, and
+/// that slot must survive a process restart.
+///
+/// Regression: `key_package_event` used to call MDK's plain
+/// `create_key_package_for_event`, which mints a fresh random `d` tag whenever
+/// no existing one is supplied. Hosts republish on every relay connect, so every
+/// launch left ANOTHER live kind-30443 event on the relays. A peer starting a DM
+/// then picks among several slots, and when two devices share one npub the
+/// welcome can be addressed to key material held only by the other install,
+/// where it can never be decrypted.
+#[tokio::test]
+async fn key_package_slot_is_stable_across_republish_and_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+
+    let identity = Identity::generate();
+    let d_first;
+    let d_second;
+    {
+        let engine = MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY)
+            .expect("persistent engine");
+        // Two publishes in one session, as a relay reconnect would do.
+        d_first = d_tag_of(&engine.key_package_event(relays()).expect("kp 1"));
+        d_second = d_tag_of(&engine.key_package_event(relays()).expect("kp 2"));
+    } // engine dropped: the process is "restarted" below.
+
+    assert_eq!(
+        d_first, d_second,
+        "republishing must reuse the slot, not mint a second one"
+    );
+
+    // Reopen at the same path, as a relaunch does.
+    // Same identity: the addressable coordinate is (kind, pubkey, d), so
+    // reopening under a different pubkey would be a different slot regardless of
+    // the d tag, and the assertion below would prove nothing.
+    let reopened =
+        MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen engine");
+    let d_after_restart = d_tag_of(&reopened.key_package_event(relays()).expect("kp 3"));
+    assert_eq!(
+        d_first, d_after_restart,
+        "a relaunch must republish into the same slot, not add a new one"
+    );
+}
+
+/// Two independent installs must NOT collide on one slot: they are different MLS
+/// clients holding different private key material, so they need separate
+/// addressable coordinates for multi-device to be possible at all.
+#[tokio::test]
+async fn separate_installs_get_separate_slots() {
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let identity = Identity::generate();
+
+    let a = MarmotEngine::persistent(identity.clone(), dir_a.path().join("marmot.sqlite"), DB_KEY)
+        .expect("engine a");
+    let b = MarmotEngine::persistent(identity, dir_b.path().join("marmot.sqlite"), DB_KEY)
+        .expect("engine b");
+
+    let d_a = d_tag_of(&a.key_package_event(relays()).expect("kp a"));
+    let d_b = d_tag_of(&b.key_package_event(relays()).expect("kp b"));
+    assert_ne!(
+        d_a, d_b,
+        "two installs of the same identity must occupy distinct slots"
+    );
+}
+
+/// A corrupt slot file must not wedge publishing: we mint a fresh slot instead
+/// of handing MDK a value it will reject.
+#[tokio::test]
+async fn malformed_stored_slot_is_replaced_not_fatal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+    std::fs::write(&slot_path, "not-a-valid-d-tag").expect("write slot");
+
+    let engine =
+        MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
+    let d = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+    assert_eq!(d.len(), 64, "expected a freshly minted 32-byte hex slot");
+    assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+/// The `d` tag of a kind-30443 KeyPackage event.
+fn d_tag_of(event: &nostr::Event) -> String {
+    event
+        .tags
+        .iter()
+        .find(|t| t.kind() == nostr::TagKind::d())
+        .and_then(|t| t.content())
+        .expect("kind-30443 event must carry a d tag")
+        .to_string()
+}
+
+/// A staged restore must not promote a new database over the OUTGOING install's
+/// KeyPackage slot.
+///
+/// The restore path stages into `<db>.sonar-restore-staging` and then renames it
+/// over `<db>`, so any cleanup keyed on the staging path never touches the live
+/// slot. Leaving it means the restored install republishes into the previous
+/// install's `(kind, pubkey, d)` coordinate while holding different MLS key
+/// material: two installs, one addressable slot, which is the failure the stable
+/// slot exists to prevent.
+#[tokio::test]
+async fn committing_a_staged_restore_drops_the_previous_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+    let slot_tmp = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot.tmp");
+
+    // A live install with a published slot.
+    {
+        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+            .expect("engine");
+        engine.key_package_event(relays()).expect("kp");
+    }
+    assert!(slot_path.exists(), "precondition: live slot exists");
+    std::fs::write(&slot_tmp, "leftover").expect("stage a crashed rename");
+
+    // A restore staged beside it, then promoted.
+    let staged = db_path.with_file_name("marmot.sqlite.sonar-restore-staging");
+    std::fs::copy(&db_path, &staged).expect("stage a restored db");
+    sonar_core::account_backup::commit_staged_account_restore(&db_path).expect("commit restore");
+
+    assert!(
+        !slot_path.exists(),
+        "the outgoing install's slot must not survive the promotion"
+    );
+    assert!(!slot_tmp.exists(), "nor its staging file");
+}
+
+/// A slot that cannot be READ (as opposed to being absent) must fail the publish
+/// rather than substituting a different slot id.
+///
+/// `key_package_event` persists whatever slot it uses, so any substitution here
+/// would be written to disk permanently. Substituting the identity-derived slot
+/// would be worst: it is a pure function of the npub, so two installs of one
+/// identity that each hit a transient read error would converge on ONE
+/// coordinate and start replacing each other's KeyPackage.
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_slot_fails_the_publish_instead_of_substituting_one() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+    let identity = Identity::generate();
+
+    let engine =
+        MarmotEngine::persistent(identity.clone(), &db_path, DB_KEY).expect("engine");
+    let original = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+
+    // New engine so the in-process memo cannot mask the read, then make the slot
+    // unreadable the way a locked container would.
+    drop(engine);
+    let engine = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("reopen");
+    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod");
+
+    let result = engine.key_package_event(relays());
+
+    std::fs::set_permissions(&slot_path, std::fs::Permissions::from_mode(0o600))
+        .expect("restore perms");
+    assert!(
+        result.is_err(),
+        "an unreadable slot must fail the publish, not silently pick another slot"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&slot_path).expect("slot readable again").trim(),
+        original,
+        "the stored slot must be untouched by the failed publish"
+    );
+}
+
+/// A persistent install must NOT use the identity-derived slot.
+///
+/// The derived slot is a pure function of the npub, so it is only safe where
+/// there is no database to collide with (in-memory engines, which have no
+/// persistent install). If someone ever extends that fallback to persistent
+/// engines, every install of one identity collapses onto a single
+/// `(kind, pubkey, d)` coordinate and they start replacing each other's
+/// KeyPackage, which is the failure the stable slot exists to prevent.
+///
+/// `separate_installs_get_separate_slots` does not catch that: MDK already
+/// minted a random `d` per call before this change, so it passes either way.
+/// This one bites.
+#[tokio::test]
+async fn a_persistent_install_does_not_use_the_derived_slot() {
+    use nostr::hashes::{sha256::Hash as Sha256Hash, Hash as _};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let identity = Identity::generate();
+    let pubkey_hex = identity.public_key().to_hex();
+
+    let engine =
+        MarmotEngine::persistent(identity, dir.path().join("marmot.sqlite"), DB_KEY)
+            .expect("engine");
+    let slot = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
+
+    // Recomputed here rather than reaching into the engine, so the test also
+    // pins the derivation itself.
+    let mut input = b"sonar-keypackage-slot-v1:".to_vec();
+    input.extend_from_slice(pubkey_hex.as_bytes());
+    let derived = Sha256Hash::hash(&input).to_string();
+
+    assert_ne!(
+        slot, derived,
+        "a persistent install must own a random slot, not the identity-derived one"
+    );
 }

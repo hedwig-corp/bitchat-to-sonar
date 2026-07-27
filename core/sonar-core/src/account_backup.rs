@@ -862,7 +862,23 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
         sync_file(&staged_index)?;
     }
     remove_wal_sidecars(db_path);
+    // Drop the OUTGOING install's KeyPackage slot id. It addresses MLS key
+    // material in the database we are about to replace, so letting it survive
+    // the promotion would make the restored install republish into the previous
+    // install's addressable coordinate while holding different key material:
+    // two installs, one `(kind, pubkey, d)`, which is precisely what the stable
+    // slot exists to prevent. This has to be tied to the rename rather than to
+    // the host wiping first, because nothing enforces that ordering.
     fs::rename(&staged, db_path).map_err(|e| Error::Storage(format!("commit db rename: {e}")))?;
+    // AFTER the rename, not before: `fs::rename` can fail (cross-device,
+    // permissions), and on that path the old database is still the live install.
+    // Dropping its slot first would leave that still-live install with key
+    // material and no coordinate, so the next publish would mint a second one
+    // while the relays still carry the first: one install, two coordinates,
+    // which is the narrower form of the bug this cleanup exists to prevent.
+    let live_slot = crate::marmot::key_package_slot_path_for(db_path);
+    let _ = fs::remove_file(crate::marmot::key_package_slot_tmp_path(&live_slot));
+    let _ = fs::remove_file(&live_slot);
     promote_staged_index_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
