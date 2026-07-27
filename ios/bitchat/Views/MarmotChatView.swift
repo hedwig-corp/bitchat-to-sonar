@@ -777,6 +777,21 @@ final class MarmotChatModel: ObservableObject {
         Task(priority: .userInitiated) { [weak self] in
             await self?.service.closeNode()
             box.endOnce()
+            // Settle a foreground resume this close may have eaten. R-020 made
+            // this path cancel `syncTask` + `relayConnectTask`, so after the
+            // close there is no self-healing timer left — the scene resume's
+            // single `connectIfNeeded()` is the ONLY reconnect, and
+            // `connectLocal` refuses it behind the `nodeClosing` fence this
+            // close raises. The wake sibling has had this recheck since it was
+            // written; the scenePhase path never got it, so a quick
+            // background→foreground bounce (or a close that hops behind a
+            // 20s relay FFI on `workQueue`) left the app foreground with a nil
+            // node. Local chat still paints from SQLCipher, which is why it
+            // reads as "working", while every relay call fails silently —
+            // descriptor fetches included, so the pay sheet showed
+            // "Fetching payment details" forever. See the "close must settle
+            // the foreground resume" bullet under `## Unguarded`.
+            await self?.reconnectIfForegroundAfterStoreClose()
         }
         #else
         Task { [weak self] in
@@ -801,7 +816,7 @@ final class MarmotChatModel: ObservableObject {
         // re-exposing the 0xdead10cc kill this close exists to prevent.
         // Foreground resume restarts polling via view onAppear/performConnect.
         // refreshTask is deliberately left running: it may be a legitimate
-        // foreground resume that reconnectIfForegroundAfterWakeClose settles.
+        // foreground resume that reconnectIfForegroundAfterStoreClose settles.
         syncTask?.cancel()
         syncTask = nil
         relayConnectTask?.cancel()
@@ -831,14 +846,16 @@ final class MarmotChatModel: ObservableObject {
         #endif
     }
 
-    /// Post-close recheck for the push-wake path. If the user foregrounded
-    /// WHILE `closeNode()` was draining, the scene-phase resume already
-    /// started a refresh whose connect attempt was rejected behind the
-    /// `nodeClosing` fence — and `refreshAfterForeground()`'s single-flight
-    /// latch would discard a plain re-kick while that doomed task is still
-    /// polling toward its timeout. Settle the in-flight refresh first, then
-    /// re-kick only when the app is foreground AND still disconnected.
-    func reconnectIfForegroundAfterWakeClose() async {
+    /// Post-close recheck. Required by BOTH close paths — the push wake
+    /// (`closeStoreAfterBackgroundWake`) and the scenePhase suspend
+    /// (`suspendStoreForBackground`). If the user foregrounded WHILE
+    /// `closeNode()` was draining, the scene-phase resume already started a
+    /// refresh whose connect attempt was rejected behind the `nodeClosing`
+    /// fence — and `refreshAfterForeground()`'s single-flight latch would
+    /// discard a plain re-kick while that doomed task is still polling toward
+    /// its timeout. Settle the in-flight refresh first, then re-kick only when
+    /// the app is foreground AND still disconnected.
+    func reconnectIfForegroundAfterStoreClose() async {
         #if os(iOS)
         if let existing = refreshTask {
             _ = await existing.value
@@ -1138,12 +1155,30 @@ final class MarmotChatModel: ObservableObject {
         if service.isConnected() { return true }
         if !busy { connectIfNeeded() }
         let start = Date()
+        var lastKick = Date()
         while Date().timeIntervalSince(start) < timeoutSeconds {
             // Honor cancellation: the push-wake rerun deadline relies on it
             // (withTimeout's group waits for the child after cancelAll()).
             if Task.isCancelled { return false }
             if service.isConnected() { return true }
             try? await Task.sleep(nanoseconds: 250_000_000)
+            // Re-kick, do not just poll. A close raises `nodeClosing` BEFORE it
+            // hops onto `workQueue`, so a connect attempted in that window is
+            // refused by `connectLocal`'s fence and `performConnect` schedules
+            // no retry — a single pre-loop kick means a resume that lost this
+            // race waits out the whole timeout against a value that can never
+            // change, then gives up for good (R-020 left no timer to heal it).
+            //
+            // Throttled to 1s rather than run at the 250ms poll rate: a retry
+            // is not free. `performConnect` reads and rewrites the Keychain
+            // nsec, and `connectLocal` takes a `workQueue` hop — the SAME
+            // serial queue the close is trying to drain. Spraying 40 of those
+            // into a close window would push against 0xdead10cc, which is
+            // precisely the thing this whole path exists to avoid.
+            if !busy, Date().timeIntervalSince(lastKick) >= 1 {
+                lastKick = Date()
+                connectIfNeeded()
+            }
         }
         return service.isConnected()
     }
@@ -2686,6 +2721,30 @@ final class MarmotChatModel: ObservableObject {
            Date().timeIntervalSince(miss) < Self.sonarDescriptorMissRetryInterval {
             return sonarDescriptorsByNpub[npubToFetch]
         }
+        // Reconnect before fetching rather than throwing `notConnected` into a
+        // swallowed `catch`. Callers of this are user-initiated (the pay sheet)
+        // and treat nil as "the peer has not published payment details yet", so
+        // a closed node is reported to the user as an endless "try again in a
+        // moment" with nothing retrying underneath. NOT one of the timer-driven
+        // reopens R-020 gates — `canPrefetchFromRelays` keeps it to foreground,
+        // where a reconnect is exactly what the resume path would do anyway.
+        //
+        // BOTH waits are needed, and the relay one is the load-bearing half:
+        // `isConnected()` means the local SQLCipher node is open, which
+        // `connectLocal` achieves with an EMPTY relay list. Fetching there does
+        // not error — `fetch_events_from` just has no relays to ask — so it
+        // returns a clean miss and lands us back on the same false "no offer".
+        //
+        // Deliberately short. This is a tap-blocking path with no spinner, and
+        // the timeouts only ever elapse in the state that used to be permanent,
+        // so a bounded wait strictly improves it; a 10s default twice over
+        // would trade a wrong answer for a frozen button.
+        if !service.isConnected(), canPrefetchFromRelays {
+            _ = await ensureConnected(timeoutSeconds: 3)
+        }
+        if !service.isRelayConnected(), canPrefetchFromRelays {
+            _ = await ensureRelayConnected(timeoutSeconds: 3)
+        }
         descriptorFetches.insert(npubToFetch)
         await performDescriptorFetch(npubToFetch, generation: descriptorCacheGeneration)
         return sonarDescriptorsByNpub[npubToFetch]
@@ -2807,6 +2866,16 @@ final class MarmotChatModel: ObservableObject {
                 }
             }
         } catch {
+            // Never silent. A throw here is NOT "this peer has no descriptor" —
+            // it is a closed node, a suspend abort, or a relay error, and the
+            // caller renders all three as "Fetching payment details — try again
+            // in a moment." Without this line there is no way to tell those
+            // apart from the peer genuinely never having published an offer,
+            // which is what made this unfalsifiable from a log capture.
+            SecureLogger.warning(
+                "⚠️ Sonar descriptor fetch failed: \(Self.describe(error))",
+                category: .session
+            )
             await MainActor.run {
                 _ = self.descriptorFetches.remove(npubToFetch)
             }

@@ -224,7 +224,7 @@ enum SonarPushProcessor {
                     // refresh and re-kick the resume (no-op if the concurrent
                     // reconnect already landed). Foreground sync also covers
                     // any push that arrived during the close.
-                    await marmot.reconnectIfForegroundAfterWakeClose()
+                    await marmot.reconnectIfForegroundAfterStoreClose()
                     keepDraining = false
                 } else {
                     let remaining = Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
@@ -792,7 +792,7 @@ enum SonarPushProcessor {
             // foregrounded app disconnected once this close finally lands. Recheck
             // here, after the close is real. Idempotent: it gates on
             // `applicationState` and `isConnected()`.
-            await marmot.reconnectIfForegroundAfterWakeClose()
+            await marmot.reconnectIfForegroundAfterStoreClose()
         }
         let start = Date()
         while Date().timeIntervalSince(start) < seconds {
