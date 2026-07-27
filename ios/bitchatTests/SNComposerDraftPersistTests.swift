@@ -2,8 +2,8 @@
 // SNComposerDraftPersistTests.swift
 // bitchatTests
 //
-// Regression: leaving a chat and returning must restore the in-progress
-// composer draft (session-scoped map; empty text removes the entry).
+// Regression: composer drafts survive leave/return and process restart
+// (UserDefaults hydrate); empty text / send / wipe clear the entry.
 //
 
 import Testing
@@ -51,5 +51,40 @@ struct SNComposerDraftPersistTests {
     func updatedDraftsKeepsWhitespaceWhileTyping() {
         let drafts = snUpdatedComposerDrafts(drafts: [:], chatId: "dm:a", text: "hi ")
         #expect(drafts["dm:a"] == "hi ")
+    }
+
+    @Test
+    func clearOnSendRemovesEntryForHydrate() {
+        let afterTyping = snUpdatedComposerDrafts(drafts: [:], chatId: "dm:a", text: "about to send")
+        let afterSend = snUpdatedComposerDrafts(drafts: afterTyping, chatId: "dm:a", text: "")
+        #expect(afterSend.isEmpty)
+        #expect(snEncodeComposerDraftsForDefaults(afterSend).isEmpty)
+        #expect(snDecodeComposerDraftsFromDefaults(snEncodeComposerDraftsForDefaults(afterSend)).isEmpty)
+    }
+
+    @Test
+    func encodeDecodeRoundTripsIncludingNewlines() {
+        let drafts = [
+            "dm:a": "hello\nworld",
+            "dm:b": "x=y",
+            "geo:u4pruy": "partial draft ",
+        ]
+        let encoded = snEncodeComposerDraftsForDefaults(drafts)
+        #expect(snDecodeComposerDraftsFromDefaults(encoded) == drafts)
+    }
+
+    @Test
+    func hydrateFromNilOrEmptyDefaultsIsEmpty() {
+        #expect(snDecodeComposerDraftsFromDefaults(nil).isEmpty)
+        #expect(snDecodeComposerDraftsFromDefaults([:]).isEmpty)
+        #expect(snDecodeComposerDraftsFromDefaults(["dm:a": ""]).isEmpty)
+    }
+
+    @Test
+    func wipeClearsPersistedDrafts() {
+        let prior = snEncodeComposerDraftsForDefaults(["dm:a": "secret draft"])
+        #expect(snDecodeComposerDraftsFromDefaults(prior) == ["dm:a": "secret draft"])
+        // wipe / erase remove the UserDefaults key → hydrate sees nil
+        #expect(snDecodeComposerDraftsFromDefaults(nil).isEmpty)
     }
 }
