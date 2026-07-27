@@ -68,7 +68,30 @@ object RelayConnectionPolicy {
      * read the other.
      */
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
+
+    /**
+     * Backoff before retrying an attach that failed outright — the core threw,
+     * usually `NoRelayConnected` ("no relay connected within timeout").
+     *
+     * The core gives the quorum a fixed 5 s window (`RELAY_CONNECT_TIMEOUT` in
+     * `client.rs`), which a radio waking from doze, a Wi-Fi/LTE handover, or a
+     * captive-portal hop routinely misses. Because [shouldInvalidateOnBackground]
+     * makes every ordinary resume re-run the attach, the common failure here is
+     * a network that is a second away from usable — not an outage. Retry fast at
+     * first so a resume heals in about a second, then settle into the slow
+     * interval once the failures look sustained (the heartbeat re-triggers the
+     * job at that cadence anyway).
+     */
+    fun connectRetryDelayMs(consecutiveFailures: Int): Long = when {
+        consecutiveFailures <= 1 -> RELAY_RETRY_FAST_MS
+        consecutiveFailures == 2 -> RELAY_RETRY_MEDIUM_MS
+        else -> RELAY_RETRY_SLOW_MS
+    }
 }
+
+private const val RELAY_RETRY_FAST_MS = 1_000L
+private const val RELAY_RETRY_MEDIUM_MS = 3_000L
+private const val RELAY_RETRY_SLOW_MS = 10_000L
 
 /** Android/iOS-style process background: true. Desktop focus loss: false. */
 internal expect fun platformShouldInvalidateRelayOnBackground(): Boolean

@@ -66,7 +66,6 @@ private const val BLANK_TRANSCRIPT_RETRY_MAX_STEP_MS = 800L
 private const val BLANK_TRANSCRIPT_RETRY_BUDGET_MS = 8_000L
 private const val LOCAL_SUMMARY_PAGE_LIMIT = 20
 private const val LOCAL_SUMMARY_CHAT_LIMIT = 5
-private const val RELAY_RECONNECT_RETRY_MS = 10_000L
 
 /** Backoff before rebuilding an attach that an invalidate superseded mid-flight.
  *  Short on purpose — the user is back in the foreground and the sockets we just
@@ -789,6 +788,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     var started by mutableStateOf(false)
         private set
     var connecting by mutableStateOf(false)
+        private set
+    /** Mirrors [SonarCore.isRelayConnected] for the UI.
+     *
+     * The status chip, the Connections sheet and the Settings row all describe
+     * *internet* reachability ("Online · reaches anyone" vs "Offline — messages
+     * wait or travel over Bluetooth"), so they must follow the relay latch.
+     * They used to read [started], which only means the local encrypted core
+     * booted, so a relay outage still rendered "Online · Connected · Nostr
+     * relays". Matches iOS `SonarAppStore.online`, which is already gated on
+     * `marmot.relayConnected`. */
+    var relayOnline by mutableStateOf(false)
+        private set
+    /** True while a relay attach is in flight, so the chip can say
+     *  "Offline · connecting…" instead of implying a dead network. */
+    var relayConnecting by mutableStateOf(false)
         private set
     /** Number of catch-up syncs in flight. Overlap-safe: concurrent
      *  foreground-cycle + immediate-sync jobs each increment/decrement so the
@@ -3873,6 +3887,7 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun onProcessBackgrounded() {
         if (!RelayConnectionPolicy.shouldInvalidateOnBackground()) return
         SonarCore.invalidateRelayConnection()
+        refreshRelayOnline()
     }
 
     fun requestImmediateSync() {
@@ -4305,45 +4320,84 @@ class SonarAppState(private val scope: CoroutineScope) {
      * running. */
     private fun startRelayConnection() {
         if (!started || relayConnectJob?.isActive == true) return
+        relayConnecting = true
         relayConnectJob = scope.launch {
-            while (isActive && started) {
-                if (!SonarCore.isRelayConnected()) {
-                    val result = runCatching { SonarCore.connectRelays() }
-                    if (result.isFailure) {
-                        toast = "relay connect failed: ${result.exceptionOrNull()?.message}"
-                        delay(RELAY_RECONNECT_RETRY_MS)
-                        continue
+            var consecutiveFailures = 0
+            try {
+                while (isActive && started) {
+                    if (!SonarCore.isRelayConnected()) {
+                        val result = runCatching { SonarCore.connectRelays() }
+                        if (result.isFailure) {
+                            consecutiveFailures++
+                            // Log, never toast. The failed attach leaves the
+                            // previously installed node in place, so the open chat
+                            // keeps sending and receiving, and since the background
+                            // invalidate every ordinary resume re-runs this attach —
+                            // a raw "relay connect failed: no relay connected within
+                            // timeout" toast fired over a conversation that was
+                            // visibly working. The status chip carries the real state
+                            // now ([relayOnline]). iOS only logs here too
+                            // (MarmotChatView "⚠️ Marmot relay connect failed").
+                            sonarLog(
+                                "SonarRelay",
+                                "relay attach failed (attempt $consecutiveFailures): " +
+                                    "${result.exceptionOrNull()?.message}",
+                            )
+                            // Same reason as the superseded case below: the node is
+                            // installed regardless of the attach outcome, so the local
+                            // half of startup must not wait on sockets. Skipping it
+                            // here left an offline cold start without the conversation
+                            // listener, the wake loop or the invite drain until relays
+                            // finally came up.
+                            completeLocalStartup()
+                            refreshRelayOnline()
+                            delay(RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures))
+                            continue
+                        }
+                        consecutiveFailures = 0
+                        npub = result.getOrThrow()
+                        SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
                     }
-                    npub = result.getOrThrow()
-                    SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
-                }
-                // The node is installed even when the attach was superseded, so
-                // local startup (listener, collectors, local refreshes) is correct
-                // either way and must not wait on a healthy latch.
-                completeLocalStartup()
-                // A successful connect that left the latch down was superseded by
-                // an invalidate landing mid-attach
-                // ([RelayConnectionPolicy.latchAfterAttach]), so we are not
-                // attached: the relay-dependent one-shots stay pending (see
-                // [completeRelayStartup]) until a real attach lands. Nothing else
-                // re-triggers this job in time either: every caller goes through
-                // startRelayConnection(), which no-ops while the job is alive, so a
-                // foreground resume racing the attach waits out
-                // awaitRelayConnectionBounded() and then sits on dead sockets until
-                // the heartbeat (up to 30 s). Retry while foreground; once genuinely
-                // backgrounded, stop — looping would rebuild sockets the OS is
-                // suspending, and the push wake / next resume start a fresh job.
-                if (!SonarCore.isRelayConnected()) {
-                    if (RelayConnectionPolicy.shouldRetrySupersededAttach(foreground)) {
-                        delay(RELAY_SUPERSEDED_RETRY_MS)
-                        continue
+                    // The node is installed even when the attach was superseded, so
+                    // local startup (listener, collectors, local refreshes) is correct
+                    // either way and must not wait on a healthy latch.
+                    completeLocalStartup()
+                    refreshRelayOnline()
+                    // A successful connect that left the latch down was superseded by
+                    // an invalidate landing mid-attach
+                    // ([RelayConnectionPolicy.latchAfterAttach]), so we are not
+                    // attached: the relay-dependent one-shots stay pending (see
+                    // [completeRelayStartup]) until a real attach lands. Nothing else
+                    // re-triggers this job in time either: every caller goes through
+                    // startRelayConnection(), which no-ops while the job is alive, so a
+                    // foreground resume racing the attach waits out
+                    // awaitRelayConnectionBounded() and then sits on dead sockets until
+                    // the heartbeat (up to 30 s). Retry while foreground; once genuinely
+                    // backgrounded, stop — looping would rebuild sockets the OS is
+                    // suspending, and the push wake / next resume start a fresh job.
+                    if (!SonarCore.isRelayConnected()) {
+                        if (RelayConnectionPolicy.shouldRetrySupersededAttach(foreground)) {
+                            delay(RELAY_SUPERSEDED_RETRY_MS)
+                            continue
+                        }
+                        return@launch
                     }
+                    completeRelayStartup()
                     return@launch
                 }
-                completeRelayStartup()
-                return@launch
+            } finally {
+                relayConnecting = false
+                refreshRelayOnline()
             }
         }
+    }
+
+    /** Republish the relay latch into UI state. The chip and the Connections
+     *  sheet read [relayOnline], so every place that can change the latch —
+     *  attach outcomes, the invalidate on background, the heartbeat — refreshes
+     *  it rather than letting the UI drift from the core. */
+    private fun refreshRelayOnline() {
+        relayOnline = SonarCore.isRelayConnected()
     }
 
     /** Wait for KeyPackage/relay-dependent operations without blocking local
@@ -4397,6 +4451,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun resetStartupFlags() {
         relayStartupCompleted = false
         localStartupCompleted = false
+        // A teardown/wipe replaces or closes the node, so the chip must not keep
+        // claiming internet from the previous session's latch.
+        refreshRelayOnline()
     }
 
     /**
@@ -10663,6 +10720,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 beat++
                 // ensureSubscriptions / sync are relay-connection upkeep — keep a
                 // wall-clock cadence (was every 4 s / every 60 s on the old tick).
+                refreshRelayOnline()
                 if (SonarCore.isRelayConnected()) {
                     runCatching { SonarCore.ensureSubscriptions() }
                     if (beat == 1L || (beat * effectiveHeartbeatMs()) % SYNC_INTERVAL_MS < effectiveHeartbeatMs()) {

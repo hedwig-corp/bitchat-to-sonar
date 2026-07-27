@@ -1070,3 +1070,33 @@ its coverage is worse than an honest hole, because it stops people looking.
 
   **No Compose mirror.** Android has no RunningBoard file-lock kill and no App Group / NSE cross-process store, so the crash is iOS-only. `SonarAppState.ensureSonarDescriptorHex` does run the same unbounded background prefetch, where it costs battery and wakelock time rather than the process; gating it on Android is tracked follow-up work, not part of this fix.
 - **Disabled-control contrast and the claim-field tap target.** `SNPrimaryButton`'s disabled state was an opacity fade over an accent fill, which in dark mode put the near-black `onAccent` ink on a dark capsule and made the label unreadable — live on onboarding `Continue`, the Restore account sheet, and the username Claim button. Now a neutral chip (`disabledFill` / `onDisabled` / `disabledStroke`) on both platforms; the stroke exists because a bare `surface2` chip is indistinguishable from the `surface2` text inputs it sits next to (New group stacked three identical pills). Nothing pins any of it: there are 13 `SNPrimaryButton` call sites across `ios/` and `apps/sonar/`, the two platforms' disabled treatments are kept in lockstep only by the paired token names, and no test on either side renders a disabled control or asserts a contrast ratio. The username field's tap-to-focus (`@FocusState` + `simultaneousGesture` on Apple, `FocusRequester` + `clickable` on Compose) is equally unpinned — SwiftUI/Compose hit-testing needs a UI-test harness neither app has. Verified by hand in the iOS Simulator only; the Compose side has been compiled but never run.
+
+- **Compose connectivity UI must follow the relay latch, not `started`.** The
+  home status chip, the Connections sheet and Settings → Connection all read
+  `SonarAppState.started` — which only means the local encrypted core booted —
+  so a relay outage still rendered "Online · reaches anyone" and "Internet:
+  Connected · Nostr relays". The only signal the user ever got that relays were
+  down was `startRelayConnection()` toasting the raw core error
+  (`relay connect failed: no relay connected within timeout`). Since #354's
+  background invalidate every ordinary resume re-runs the attach, and a failed
+  attach leaves the previously installed node in place, that toast fired over
+  conversations that were visibly sending and receiving — an alarm on the one
+  surface that was working, and silence on the one that was not. All four
+  surfaces now read `relayOnline` (mirrors `SonarCore.isRelayConnected()`,
+  refreshed at every attach outcome, at the background invalidate, at teardown
+  and on the heartbeat), matching iOS `SonarAppStore.online`, which is already
+  gated on `marmot.relayConnected`; the failure path logs via `sonarLog` like
+  iOS does. **Pinned:** only the retry schedule
+  (`RelayConnectionPolicyTest.first_connect_failure_retries_fast` /
+  `sustained_connect_failure_backs_off`). **Not pinned:** that no UI surface
+  reads `started` for internet state again, and that the failure path stays
+  toast-free — both need a constructed `SonarAppState` (same root cause as the
+  gaps above). A fifth surface hand-reading `started` is exactly the original
+  bug and nothing would catch it.
+- **A failed relay attach must still run the local half of startup.**
+  `startRelayConnection()` `continue`d on failure *before* `completeLocalStartup()`,
+  despite that function's own contract ("runs on every attach outcome … must not
+  wait on a healthy latch"). An offline cold start therefore had no conversation
+  listener, no Marmot wake loop, no BLE discovery-policy update and no invite
+  drain until relays finally came up — the local-first rule inverted by control
+  flow rather than by design. Unpinned for the same reason as above.

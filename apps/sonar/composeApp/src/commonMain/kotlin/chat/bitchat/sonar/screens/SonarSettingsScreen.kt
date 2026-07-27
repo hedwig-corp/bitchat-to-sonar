@@ -160,8 +160,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
             SNSettingsCard {
                 SNSettingsRow(
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Connection",
-                    sub = if (state.started) "Bluetooth + internet" else "Nearby only, no internet",
-                    value = if (state.started) "Online" else "Bluetooth only",
+                    // "internet" here means attached relays, not a booted core.
+                    sub = if (state.relayOnline) "Bluetooth + internet" else "Nearby only, no internet",
+                    value = if (state.relayOnline) "Online" else "Bluetooth only",
                 ) {}
                 SNSettingsRow(
                     icon = SNIconName.Mesh, tone = SNTone.Cyan, label = "Discover new people",
