@@ -1185,7 +1185,12 @@ final class MarmotChatModel: ObservableObject {
             // The push wake runs backgrounded and keeps its pre-existing
             // single-kick behavior; the resume race this loop heals is
             // foreground by definition.
-            if !busy, canPrefetchFromRelays, Date().timeIntervalSince(lastKick) >= 1 {
+            // `!Task.isCancelled` re-checked HERE, not just at loop top: the
+            // cancel routinely lands during the 250ms sleep above, and the kick
+            // spawns an unstructured `connectIfNeeded()` Task that the canceller
+            // (the push-wake rerun deadline) does not own and cannot stop.
+            if !busy, !Task.isCancelled, canPrefetchFromRelays,
+               Date().timeIntervalSince(lastKick) >= 1 {
                 lastKick = Date()
                 connectIfNeeded()
             }
@@ -2741,9 +2746,11 @@ final class MarmotChatModel: ObservableObject {
         //
         // BOTH waits are needed, and the relay one is the load-bearing half:
         // `isConnected()` means the local SQLCipher node is open, which
-        // `connectLocal` achieves with an EMPTY relay list. Fetching there does
-        // not error — `fetch_events_from` just has no relays to ask — so it
-        // returns a clean miss and lands us back on the same false "no offer".
+        // `connectLocal` achieves with an EMPTY relay list. Fetching there
+        // fails with `nostr client error: no relays specified` (observed on
+        // device), which the caller cannot distinguish from "this peer has no
+        // offer" — so waiting only on the node would still land on the same
+        // false answer.
         //
         // Deliberately bounded. This is a tap-blocking path with no spinner,
         // and the timeouts only ever elapse in the state that used to be
@@ -2883,15 +2890,25 @@ final class MarmotChatModel: ObservableObject {
             }
         } catch {
             // Never silent. A throw here is NOT "this peer has no descriptor" —
-            // it is a closed node, a suspend abort, or a relay error, and the
-            // caller renders all three as "Fetching payment details — try again
-            // in a moment." Without this line there is no way to tell those
-            // apart from the peer genuinely never having published an offer,
-            // which is what made this unfalsifiable from a log capture.
-            SecureLogger.warning(
-                "⚠️ Sonar descriptor fetch failed: \(Self.describe(error))",
-                category: .session
-            )
+            // it is a closed node or a relay error, and the caller renders both
+            // as "Fetching payment details — try again in a moment." Without
+            // this line there is no way to tell those apart from the peer
+            // genuinely never having published an offer, which is what made
+            // this unfalsifiable from a log capture.
+            //
+            // A suspend abort is excluded: it is shutdown, not failure. The
+            // foreground-resume sweep has one in-flight fetch per known
+            // contact, so every backgrounding aborted all of them and printed
+            // one warning each — into the very file we pull to diagnose a
+            // failed payment. Same classify-before-reporting rule R-016 applies
+            // in the polling loop. Verified on device: a single backgrounding
+            // emitted `fetch_sonar_descriptor interrupted for suspend`.
+            if !Self.isSuspendInterrupted(error) {
+                SecureLogger.warning(
+                    "⚠️ Sonar descriptor fetch failed: \(Self.describe(error))",
+                    category: .session
+                )
+            }
             await MainActor.run {
                 _ = self.descriptorFetches.remove(npubToFetch)
             }
