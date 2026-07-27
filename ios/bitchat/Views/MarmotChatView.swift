@@ -1294,31 +1294,6 @@ final class MarmotChatModel: ObservableObject {
         return detail.localizedCaseInsensitiveContains("interrupted for suspend")
     }
 
-    /// The polling loop was deliberately stopped, not broken by the relay.
-    ///
-    /// `suspendStoreForBackground()` cancels `syncTask` before closing the node,
-    /// but `ensureSubscriptions()` is parked in Rust and cannot observe Swift
-    /// cancellation — it completes and then throws `notConnected` (the node is
-    /// gone by then) or `cancelled`. Neither carries `SUSPEND_INTERRUPT_MARKER`,
-    /// so without this the idle catch treats an intentional shutdown as a lost
-    /// subscription: it surfaces `errorText` to the user, arms a reconnect, and
-    /// clears a `syncTask` slot that a foreground resume may already have
-    /// refilled — letting a second polling loop start. Same class as
-    /// `isSuspendInterrupted` (R-016): a control-flow signal, not an error.
-    ///
-    /// Deliberately narrow. `.notConnected` is NOT included even though a closed
-    /// node throws it: the call site pairs this with `Task.isCancelled`, which
-    /// already covers the cancel-during-`ensureSubscriptions` window this exists
-    /// for, and classifying every "node is gone" as terminal would silence the
-    /// reconnect on close paths this change has not enumerated.
-    private static func isDeliberatelyStopped(_ error: Error) -> Bool {
-        if error is CancellationError { return true }
-        if let service = error as? MarmotService.ServiceError {
-            return service == .cancelled
-        }
-        return false
-    }
-
     private func connectRelaysIfNeeded() {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
@@ -4140,7 +4115,7 @@ final class MarmotChatModel: ObservableObject {
                         // pass and start a SECOND concurrent loop. Checked
                         // BEFORE `isSuspendInterrupted`: on the suspend path
                         // both are true at once, and that branch clears the slot.
-                        if Task.isCancelled || Self.isDeliberatelyStopped(error) {
+                        if Task.isCancelled {
                             return
                         }
                         // A suspend abort is not a lost subscription — the node

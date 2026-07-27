@@ -940,6 +940,30 @@ the timer **fires**, not when it is armed — the delay routinely straddles the
 foreground→background transition, and a schedule-time check would miss exactly
 the case that crashes.
 
+**A cancelled polling loop must return before any error classification.** Quiescing
+`syncTask` is only half of it — the loop must also not mistake its own shutdown for a
+relay failure. `ensureSubscriptions()` is parked in Rust and cannot observe Swift
+cancellation, so it runs to completion and then throws `notConnected` once the node is
+gone, or aborts with `SUSPEND_INTERRUPT_MARKER` because R-016 made it suspendable. On
+the suspend path the task is cancelled *and* the error carries the marker, so an
+order that classifies first lets `isSuspendInterrupted` win and clear `syncTask`.
+
+That matters because `Task` is a **struct**: there is no `===`, so the loop cannot
+express "only clear the slot if it is still mine" (`stopPolling()` hit the same wall
+for `mediaResumeTask` and says so at its call site). A late-returning cancelled task
+therefore nils a slot a fast foreground resume may already have refilled, the next
+`startPolling()` passes its `guard syncTask == nil`, and two concurrent loops both
+call the **destructive** `drainPendingMarmot` — racing the notification metadata
+`noteDrainedForPushWake` reads. So the cancellation check goes first, in both catch
+blocks, and a cancelled loop returns without touching shared state at all.
+
+An `isDeliberatelyStopped(_:)` helper that also matched `ServiceError.cancelled` was
+tried and removed: `ensureSubscriptions()` goes through `MarmotService.run()`, which
+can only produce `invalidInput`, `core`, or `notConnected` — the `.cancelled` throws
+all live on the connect path (`connect` / `connectLocal` / `connectNode`, gated on
+`nodeClosing`) or inside `leasedNodeOperation`, neither of which `run()` touches. It
+could never fire, and dead code on this path reads as coverage that is not there.
+
 **The call loop leaked past its call.** `SonarAppStore.startCallLoop()` was only
 ever cancelled by `resetCallState()` (wipe/erase), never by `finalizeCall`, so
 after the first call of a session it parked in 1s `callWaitEvent` slices
@@ -967,7 +991,9 @@ this document warns about: a future edit could delete the `guard` in
 `scheduleRelayConnect` and both tests stay green. `MarmotChatModel` is
 `@MainActor` with private task state and no test constructs it, and iOS tests do
 not run in CI regardless. Specifically unpinned: that
-`suspendStoreForBackground()` cancels `syncTask`; that `finalizeCall` cancels
+`suspendStoreForBackground()` cancels `syncTask`; that the cancellation check stays
+**above** `isSuspendInterrupted` in both catch blocks — nothing but a code comment
+stops someone hoisting the classifier back on top; that `finalizeCall` cancels
 `callLoopTask`; and that no *fourth* path reopens the store while backgrounded.
 Verification is a TestFlight build backgrounded for hours with relays flapping.
 
