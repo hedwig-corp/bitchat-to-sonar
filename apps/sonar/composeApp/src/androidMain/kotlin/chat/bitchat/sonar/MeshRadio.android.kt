@@ -275,7 +275,18 @@ actual object MeshRadio {
             .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
             .setReportDelay(0)
             .build()
-        scanner?.startScan(filters, settings, scanCallback)
+        // Re-acquire rather than trusting the cached handle: an adapter power
+        // cycle (airplane mode, manual toggle) invalidates the previous
+        // BluetoothLeScanner, and reusing it makes every restart a silent no-op.
+        scanner = adapter()?.bluetoothLeScanner ?: scanner
+        val started = runCatching { scanner?.startScan(filters, settings, scanCallback) }.isSuccess
+        if (!started) {
+            // Do NOT stamp the freshness timers on a failed start. Stamping them
+            // unconditionally reset the watchdog's own staleness heuristic every
+            // tick, so a permanently dead scanner kept looking healthy.
+            android.util.Log.w(TAG, "startScan failed; leaving watchdog timers stale so it keeps retrying")
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         lastScanStartMs = now
         lastScanCallbackMs = now

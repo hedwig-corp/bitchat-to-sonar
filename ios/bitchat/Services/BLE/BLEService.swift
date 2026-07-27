@@ -133,9 +133,16 @@ final class BLEService: NSObject {
     // Backoff for peripherals that recently timed out connecting
     private var recentConnectTimeouts: [String: Date] = [:] // Peripheral UUID -> last timeout
     
-    // Simple announce throttling
+    // Simple announce throttling. messageQueue is CONCURRENT, so announce
+    // paths run in parallel — every check-and-set of these two timestamps
+    // must hold announceStateLock, or a burst of packets all observe the
+    // stale timestamp and all pass the throttle together. The lock is never
+    // held across a call out.
+    private let announceStateLock = NSLock()
     private var lastAnnounceSent = Date.distantPast
     private let announceMinInterval: TimeInterval = TransportConfig.bleAnnounceMinInterval
+    // Announce-back cooldown for 0x53s from unknown peers.
+    private var lastSonarAnnounceBackSent = Date.distantPast
 
     // Sonar discovery (additive, see docs/SONAR-DISCOVERY.md):
     // injected provider for the local Sonar profile (Marmot npub + optional
@@ -832,10 +839,11 @@ final class BLEService: NSObject {
             guard let info = peers[routingID] else { return false }
             if info.isConnected { return true }
             guard meshAttached else { return false }
-            // Apply reachability retention window
-            let isVerified = info.isVerifiedNickname
-            let retention: TimeInterval = isVerified ? TransportConfig.bleReachabilityRetentionVerifiedSeconds : TransportConfig.bleReachabilityRetentionUnverifiedSeconds
-            return Date().timeIntervalSince(info.lastSeen) <= retention
+            // Routing window, NOT the radar retention window. This method
+            // feeds `MessageRouter.reachableTransport`, so it decides whether
+            // a DM goes over the mesh or falls back to Nostr. The radar's
+            // longer grace lives in `UnifiedPeerService.buildPeerFromMesh`.
+            return Date().timeIntervalSince(info.lastSeen) <= TransportConfig.bleRoutingReachabilitySeconds
         }
     }
 
@@ -1086,6 +1094,14 @@ final class BLEService: NSObject {
             }
         }
 
+        // NOTE: do not exempt "direct" (full-TTL) identity packets from this
+        // check. TTL travels inside the signed packet, so it proves nothing
+        // about freshness — an attacker can replay a captured full-TTL announce
+        // verbatim on a new connection and, with this window gone, bind their
+        // link to the replayed identity. This window is what forces a replay to
+        // happen within 120s of capture. Making a clock-skewed peer visible
+        // needs freshness evidence that is NOT carried in the replayable packet
+        // (a challenge/nonce); see the follow-up rather than widening this.
         if !skipTimestampCheck {
             let maxSkew: UInt64 = 120_000
             let packetTime = packet.timestamp
@@ -1837,18 +1853,21 @@ final class BLEService: NSObject {
     private func sendAnnounce(forceSend: Bool = false) {
         guard allowsBLERadio else { return }
 
-        // Throttle announces to prevent flooding
+        // Throttle announces to prevent flooding (atomic check-and-set —
+        // see announceStateLock).
         let now = Date()
-        let timeSinceLastAnnounce = now.timeIntervalSince(lastAnnounceSent)
         
         // Even forced sends should respect a minimum interval to avoid overwhelming BLE
         let minInterval = forceSend ? TransportConfig.bleForceAnnounceMinIntervalSeconds : announceMinInterval
         
-        if timeSinceLastAnnounce < minInterval {
+        announceStateLock.lock()
+        let throttled = now.timeIntervalSince(lastAnnounceSent) < minInterval
+        if !throttled { lastAnnounceSent = now }
+        announceStateLock.unlock()
+        if throttled {
             // Skipping announce (rate limited)
             return
         }
-        lastAnnounceSent = now
         
         // Reduced logging - only log errors, not every announce
         
@@ -2462,6 +2481,16 @@ extension BLEService {
     /// Tests run this off the main thread's critical path, from the test thread.
     func _test_handleCentralState(_ state: CBManagerState) {
         bleQueue.sync { handleCentralState(state, central: nil) }
+    }
+
+    /// When the last announce was actually sent (post-throttle). Lets tests
+    /// observe the announce-back scheduled by `handleSonarAnnounce` without a
+    /// live radio: `sendAnnounce` stamps this under `announceStateLock`, so
+    /// this read is race-free for any announce path.
+    var _test_lastAnnounceSentAt: Date {
+        announceStateLock.lock()
+        defer { announceStateLock.unlock() }
+        return lastAnnounceSent
     }
 }
 #endif
@@ -4397,8 +4426,11 @@ extension BLEService {
             return
         }
 
-        // Reject stale announces to prevent ghost peers from appearing
-        // Use same 15-minute window as gossip sync (900 seconds)
+        // Reject stale announces to prevent ghost peers from appearing.
+        // Use same 15-minute window as gossip sync (900 seconds).
+        // This applies to full-TTL announces too: TTL is inside the signed
+        // packet, so a captured announce replays with its TTL intact and would
+        // otherwise resurrect the peer and bind the replayer's link to it.
         let maxAnnounceAgeSeconds: TimeInterval = 900
         let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
         let ageThresholdMs = UInt64(maxAnnounceAgeSeconds * 1000)
@@ -4609,12 +4641,30 @@ extension BLEService {
         guard let signingKey = collectionsQueue.sync(execute: { peers[peerID]?.signingPublicKey }) else {
             queuePendingSonarAnnounce(packet, from: peerID)
             SecureLogger.debug("Queued Sonar announce from unknown peer \(peerID.id.prefix(8))…", category: .security)
-            // Only announce back in normal discovery mode — in restricted mode
-            // (.knownOnly/.off), don't respond to unknown peers to avoid
-            // unbounded forced announcements from attacker-controlled traffic.
-            if discoveryMode == .normal {
-                messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                    self?.sendAnnounce(forceSend: true)
+            // Announce back so the sender can verify us and re-announce. This
+            // includes .knownOnly: the "unknown" 0x53 sender may be a known
+            // contact whose 0x01 we missed (Low Power Mode maps to .knownOnly,
+            // and without the announce-back mutual discovery there waits on the
+            // periodic timer alone). shouldAcceptPeer folds the discovery
+            // policy: .normal accepts everyone, .knownOnly only allowlisted
+            // contacts — a stranger in restricted mode cannot elicit signed
+            // mesh-wide broadcasts while battery saving is active — and .off
+            // stays silent. A dedicated cooldown additionally bounds
+            // attacker-elicited announce traffic — one announce-back per
+            // window serves every queued sender.
+            if shouldAcceptPeer(peerID, noisePublicKey: nil) {
+                // messageQueue is concurrent: a burst of unique 0x53s can land
+                // here in parallel, so the cooldown check-and-set must be
+                // atomic or every packet in the burst schedules a broadcast.
+                let nowDate = Date()
+                announceStateLock.lock()
+                let cooledDown = nowDate.timeIntervalSince(lastSonarAnnounceBackSent) >= TransportConfig.bleSonarAnnounceBackCooldownSeconds
+                if cooledDown { lastSonarAnnounceBackSent = nowDate }
+                announceStateLock.unlock()
+                if cooledDown {
+                    messageQueue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        self?.sendAnnounce(forceSend: true)
+                    }
                 }
             }
             return

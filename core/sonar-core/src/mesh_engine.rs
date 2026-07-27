@@ -2406,6 +2406,46 @@ mod tests {
         assert!(out.events.is_empty(), "own announce must not surface");
     }
 
+    // Documents a KNOWN GAP, not a guarantee we are happy with. The engine
+    // judges freshness by the driver-supplied monotonic `now_ms` and never by
+    // the wall clock in the packet, so a peer months out of date is announced
+    // normally - which is why a Pixel whose clock had drifted 153 days was
+    // visible to Android while being silently invisible to every Apple peer
+    // (Apple enforces a +/-120s skew gate and a 900s announce-age gate).
+    //
+    // The flip side is that this engine accepts a replayed captured announce
+    // indefinitely: nothing here binds acceptance to freshness evidence that an
+    // attacker cannot replay. Apple's windows at least force a replay to happen
+    // within 120s of capture. Closing this properly needs a challenge/nonce on
+    // both platforms; until then this test pins current behaviour so a change
+    // is deliberate rather than accidental.
+    #[test]
+    fn announce_from_peer_with_skewed_wall_clock_is_still_accepted() {
+        let mut a = engine(1, "pixel");
+        let mut far = engine(9, "wrong-clock-phone");
+
+        let now = 1_000_000;
+        // 153 days in the past, the real skew measured on the test device.
+        let skewed_wall = 1_000u64;
+        far.set_wall_clock(now, skewed_wall);
+        a.set_wall_clock(now, now + 153 * 24 * 60 * 60 * 1000);
+
+        a.on_dial_request("relay", now);
+        a.on_client_connected("relay", now);
+        a.on_instances_discovered("relay", &[7], now);
+        a.on_subscribe_result("relay", 7, true, now);
+
+        let skewed_announce = far.announce_bytes(now).expect("announce bytes");
+        let out = a.on_client_rx("relay", 7, &skewed_announce, now);
+
+        assert!(
+            out.events
+                .iter()
+                .any(|e| matches!(e, AppEvent::PeerAnnounced { .. })),
+            "an announce from a peer with a badly skewed clock must still surface the peer"
+        );
+    }
+
     #[test]
     fn relayed_announce_lists_but_does_not_bind_or_handshake() {
         let mut a = engine(1, "pixel");

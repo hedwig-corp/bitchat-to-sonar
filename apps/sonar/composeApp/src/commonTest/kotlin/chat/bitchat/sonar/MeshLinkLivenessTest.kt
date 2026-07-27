@@ -123,4 +123,23 @@ class MeshLinkLivenessTest {
             ).sorted(),
         )
     }
+
+    // Airplane mode powers the adapter down and back up. Turning it off must run
+    // the full teardown — `stop()` is what clears `scanning`, and while that flag
+    // stays true `MeshRadio.start()` early-returns forever, so the radio stays
+    // deaf until the process is killed. Turning it back on must re-run `start()`
+    // to re-acquire the scanner and advertiser the power cycle invalidated.
+    @Test
+    fun adapterOffTearsDownAndAdapterOnRestartsTheRadio() {
+        assertEquals(BleAdapterAction.Teardown, bleAdapterAction(BleAdapterState.Off))
+        assertEquals(BleAdapterAction.Restart, bleAdapterAction(BleAdapterState.On))
+    }
+
+    // STATE_TURNING_OFF / STATE_TURNING_ON must not act: tearing down on
+    // TURNING_ON would kill a radio that is about to work, and starting on
+    // TURNING_OFF would start one against a stack that is going away.
+    @Test
+    fun adapterTransitionalStatesAreIgnored() {
+        assertEquals(BleAdapterAction.Ignore, bleAdapterAction(BleAdapterState.Transitioning))
+    }
 }

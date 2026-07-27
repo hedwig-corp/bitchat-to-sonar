@@ -30,6 +30,11 @@ enum TransportConfig {
     static let bleDutyOnDuration: TimeInterval = 5.0
     static let bleDutyOffDuration: TimeInterval = 10.0
     static let bleAnnounceMinInterval: TimeInterval = 1.0
+    // Minimum spacing between announce-backs elicited by a Sonar 0x53 from an
+    // unknown peer. The 0.15s forced-announce throttle alone would let a
+    // stream of unique 0x53s elicit ~6 broadcasts/s; one per this window is
+    // enough because a single announce-back serves every queued sender.
+    static let bleSonarAnnounceBackCooldownSeconds: TimeInterval = 5.0
 
     // BLE discovery/quality thresholds
     static let bleDynamicRSSIThresholdDefault: Int = -90
@@ -86,9 +91,43 @@ enum TransportConfig {
     // How long without seeing traffic before we sanity-check the direct link
     // Lowered to make connected→reachable icon changes react faster when walking out of range
     static let blePeerInactivityTimeoutSeconds: TimeInterval = 8.0
-    // How long to retain a peer as "reachable" (not directly connected) since lastSeen
-    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 21.0    // 21s for verified/favorites
-    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 21.0  // 21s for unknown/unverified
+    // How long to retain a peer as "reachable" (not directly connected) since
+    // lastSeen. Announce emissions are spaced [interval, interval + maintenance
+    // tick] apart (the cadence is only evaluated once per 5s tick), so the
+    // worst gap is 30+8+5+1 = 44s — the maintenance timer carries
+    // `bleMaintenanceLeewaySeconds` of dispatch leeway, so a cadence check can
+    // land 6s after the previous one, not 5s. Surviving TWO lost announces
+    // means lasting until the THIRD emission: >= 3x44 = 132s. Anything shorter evicts a peer
+    // while it is still announcing on schedule and it flaps in and out of the
+    // radar.
+    //
+    // BOTH trust classes are sized for the DENSE gap deliberately. The cadence
+    // is picked from `connectedCount` in `performMaintenance` (topology) while
+    // the window below is picked from identity trust in
+    // `UnifiedPeerService.buildPeerFromMesh` — independent properties, so an
+    // unverified peer can perfectly well be announcing at 30+-8s. Sizing the
+    // unverified window for the sparse cadence made it flap after ONE loss.
+    // The two constants stay separate so the policy knob survives, but neither
+    // may drop below the dense bar.
+    // Same failure-tolerance bar as the Rust mesh engine's LINK_STALE_MS
+    // (core/sonar-core/src/mesh_engine.rs) that Android relies on.
+    static let bleReachabilityRetentionVerifiedSeconds: TimeInterval = 135.0    // >= 3x(30+8+5+1)
+    static let bleReachabilityRetentionUnverifiedSeconds: TimeInterval = 135.0  // >= 3x(30+8+5+1)
+    // Window for DM TRANSPORT SELECTION, tighter than the radar windows above
+    // but NOT tighter than one announce cycle. `MessageRouter` is built as
+    // `[meshService, nostrTransport]` and picks the first transport whose
+    // `isPeerReachable` is true, so a wide window hands DMs to a stale mesh
+    // route — a mesh send is marked `.sent` with no receipt timeout (#312) and
+    // never falls back to Nostr.
+    //
+    // The floor matters just as much as the ceiling: `ChatViewModel` gates
+    // sending on this same `isPeerReachable`, so a value below the worst-case
+    // announce gap (30+8+5+1 = 44s dense, incl. timer leeway) marks a peer that is announcing
+    // perfectly healthily as unreachable for part of every cycle — and a
+    // mesh-only contact's DM is then marked `.failed` ("recipient
+    // unreachable") while the radar still shows them. So: one worst-case gap,
+    // give up after ONE missed announce, where the radar gives up after two.
+    static let bleRoutingReachabilitySeconds: TimeInterval = 45.0  // >= 1x(30+8+5+1)
     static let bleFragmentLifetimeSeconds: TimeInterval = 30.0
     static let bleIngressRecordLifetimeSeconds: TimeInterval = 3.0
     static let bleConnectTimeoutBackoffWindowSeconds: TimeInterval = 120.0

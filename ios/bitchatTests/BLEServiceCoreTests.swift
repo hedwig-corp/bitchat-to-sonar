@@ -272,6 +272,195 @@ struct BLEServiceCoreTests {
         #expect(capture.profile?.npub == npub)
     }
 
+    // The reachability retention window must survive two LOST announces,
+    // which means lasting until the THIRD emission: announce emissions are
+    // spaced [interval, interval + maintenance tick] apart because the
+    // cadence is only evaluated once per tick. At 21s (original value) a
+    // relayed peer was evicted between two dense-mode announces; at 90s it
+    // still could not survive a second consecutive loss (3×43 = 129s).
+    @Test
+    func reachabilityRetentionToleratesTwoMissedAnnounceCycles() {
+        // Include the dispatch-timer leeway: the maintenance timer may fire up
+        // to `bleMaintenanceLeewaySeconds` late, so a cadence check can land 6s
+        // after the previous one, not 5s.
+        let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
+            + TransportConfig.bleConnectedAnnounceJitterDense
+            + TransportConfig.bleMaintenanceInterval
+            + TimeInterval(TransportConfig.bleMaintenanceLeewaySeconds)
+
+        // BOTH trust classes are held to the DENSE bar: the cadence comes from
+        // topology (`connectedCount`) and the window from identity trust, so an
+        // unverified peer can be announcing at 30+-8s. Holding the unverified
+        // window to the sparse gap let it flap after a single lost announce.
+        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds >= 3 * denseWorstGap)
+        #expect(TransportConfig.bleReachabilityRetentionUnverifiedSeconds >= 3 * denseWorstGap)
+    }
+
+    // The radar retention window must never leak into DM transport selection.
+    // `MessageRouter` is built as `[meshService, nostrTransport]` and takes the
+    // first transport whose `isPeerReachable` is true, so a radar-sized window
+    // in `BLEService.isPeerReachable` hands DMs to a stale mesh route — which
+    // is marked `.sent` with no receipt timeout (#312) and never falls back to
+    // Nostr. Widening radar retention must not widen routing.
+    @Test
+    func dmRoutingWindowStaysTighterThanRadarRetention() {
+        #expect(TransportConfig.bleRoutingReachabilitySeconds
+                < TransportConfig.bleReachabilityRetentionUnverifiedSeconds)
+        #expect(TransportConfig.bleRoutingReachabilitySeconds
+                < TransportConfig.bleReachabilityRetentionVerifiedSeconds)
+
+        // ...but never tighter than ONE worst-case announce gap. `ChatViewModel`
+        // gates sending on this same `isPeerReachable`, so a shorter window
+        // marks a healthily-announcing peer unreachable for part of every cycle
+        // and a mesh-only contact's DM is marked `.failed` ("recipient
+        // unreachable") while the radar still shows them.
+        // Include the dispatch-timer leeway: the maintenance timer may fire up
+        // to `bleMaintenanceLeewaySeconds` late, so a cadence check can land 6s
+        // after the previous one, not 5s.
+        let denseWorstGap = TransportConfig.bleConnectedAnnounceBaseSecondsDense
+            + TransportConfig.bleConnectedAnnounceJitterDense
+            + TransportConfig.bleMaintenanceInterval
+            + TimeInterval(TransportConfig.bleMaintenanceLeewaySeconds)
+        #expect(TransportConfig.bleRoutingReachabilitySeconds >= denseWorstGap)
+
+        // Routing gives up after ONE missed announce, the radar after two.
+        #expect(TransportConfig.bleReachabilityRetentionVerifiedSeconds
+                >= 2 * TransportConfig.bleRoutingReachabilitySeconds)
+    }
+
+    // A Sonar 0x53 from a peer we have no verified 0x01 for must trigger an
+    // announce-back in .knownOnly too, not just .normal: Low Power Mode maps to
+    // .knownOnly, and the "unknown" sender there may be a known contact whose
+    // announce we missed. Without the announce-back, mutual discovery under
+    // Low Power Mode waits on the periodic announce timer alone.
+    @Test
+    func sonarAnnounceFromUnknownPeerInKnownOnly_triggersAnnounceBack() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .knownOnly
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+        // The sender is a KNOWN contact whose 0x01 we missed — the exact case
+        // the announce-back exists for. Strangers are covered by the
+        // ...announceBackRequiresKnownContact test below.
+        ble.knownPeerProvider = { candidate, _ in candidate == peerID }
+        let npub = Data((0..<32).map { UInt8($0) })
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: npub,
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        let before = ble._test_lastAnnounceSentAt
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > before },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(didAnnounceBack)
+    }
+
+    // In .knownOnly a STRANGER's 0x53 must not elicit an announce-back: any
+    // nearby sender could otherwise provoke signed mesh-wide broadcasts
+    // precisely while battery saving is active (Codex P1 on PR #444). The
+    // allowlist gate (shouldAcceptPeer) decides, not the cooldown.
+    @Test
+    func sonarAnnounceBackInKnownOnlyRequiresKnownContact() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .knownOnly
+        ble.knownPeerProvider = { _, _ in false }
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: Data((0..<32).map { UInt8($0) }),
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > Date.distantPast },
+            timeout: 0.6
+        )
+        #expect(!didAnnounceBack)
+        #expect(ble._test_lastAnnounceSentAt == Date.distantPast)
+    }
+
+    // A stream of 0x53s from unknown peers must not elicit one forced
+    // announce each: the dedicated cooldown allows one announce-back per
+    // window (a single broadcast serves every queued sender), so a hostile
+    // flood cannot use us as an announce amplifier.
+    @Test
+    func sonarAnnounceBackIsRateLimitedByCooldown() async throws {
+        let ble = makeService()
+        ble.discoveryMode = .normal
+
+        func signedSonarPacket(_ signer: NoiseEncryptionService) throws -> BitchatPacket {
+            let peerID = PeerID(publicKey: signer.getStaticPublicKeyData())
+            let payload = try #require(SonarAnnouncePacket(
+                npub: Data((0..<32).map { UInt8($0) }),
+                bip353: nil,
+                capabilities: SonarCapability.marmotDM
+            ).encode(), "Failed to encode Sonar announce")
+            return try #require(signer.signPacket(BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
+                payload: payload,
+                signature: nil,
+                ttl: 7
+            )), "Failed to sign Sonar packet")
+        }
+
+        let firstSigner = NoiseEncryptionService(keychain: MockKeychain())
+        let firstPacket = try signedSonarPacket(firstSigner)
+        let firstPeer = PeerID(publicKey: firstSigner.getStaticPublicKeyData())
+
+        ble._test_handlePacket(firstPacket, fromPeerID: firstPeer, preseedPeer: false)
+        let didAnnounceBack = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > Date.distantPast },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(didAnnounceBack)
+        let firstAnnounceAt = ble._test_lastAnnounceSentAt
+
+        // A second unknown sender inside the cooldown window must not elicit
+        // another forced announce.
+        let secondSigner = NoiseEncryptionService(keychain: MockKeychain())
+        let secondPacket = try signedSonarPacket(secondSigner)
+        let secondPeer = PeerID(publicKey: secondSigner.getStaticPublicKeyData())
+
+        ble._test_handlePacket(secondPacket, fromPeerID: secondPeer, preseedPeer: false)
+        let didAnnounceAgain = await TestHelpers.waitUntil(
+            { ble._test_lastAnnounceSentAt > firstAnnounceAt },
+            timeout: 0.6
+        )
+        #expect(!didAnnounceAgain)
+        #expect(ble._test_lastAnnounceSentAt == firstAnnounceAt)
+    }
+
     @Test
     func restrictedDiscoveryReapply_prunesPeerAfterAllowlistChange() async throws {
         let ble = makeService()
