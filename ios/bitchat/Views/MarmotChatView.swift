@@ -520,6 +520,13 @@ final class MarmotChatModel: ObservableObject {
     /// that encoded before the clear is dropped instead of resurrecting erased
     /// contact data (an Account Key Durability-class failure).
     private var contactCacheWriteGeneration = 0
+    /// Per-cache schedule order. Detached encodes finish out of order, so
+    /// without this an older snapshot could commit after a newer one and lose
+    /// the freshest profile / BOLT12 offer from disk until the next fetch.
+    private var profileCacheScheduledSeq = 0
+    private var profileCacheCommittedSeq = 0
+    private var descriptorCacheScheduledSeq = 0
+    private var descriptorCacheCommittedSeq = 0
     /// Optimistically-echoed outgoing messages per group, kept visible until
     /// the relay round-trip brings the real copy back (then reconciled away).
     private var pendingOptimistic: [String: [MarmotService.MarmotMessage]] = [:]
@@ -2643,11 +2650,16 @@ final class MarmotChatModel: ObservableObject {
         let snapshot = profilesByNpub
         let defaults = self.defaults
         let generation = contactCacheWriteGeneration
+        profileCacheScheduledSeq &+= 1
+        let seq = profileCacheScheduledSeq
         Task.detached(priority: .utility) { [weak self] in
             guard let payload = SNMarmotProfileCache.encoded(snapshot) else { return }
             guard let self else { return }
             await MainActor.run {
                 guard generation == self.contactCacheWriteGeneration else { return }
+                // A newer snapshot already landed — this one is stale.
+                guard seq > self.profileCacheCommittedSeq else { return }
+                self.profileCacheCommittedSeq = seq
                 SNMarmotProfileCache.commit(payload, to: defaults)
             }
         }
@@ -2657,11 +2669,16 @@ final class MarmotChatModel: ObservableObject {
         let snapshot = sonarDescriptorsByNpub
         let defaults = self.defaults
         let generation = contactCacheWriteGeneration
+        descriptorCacheScheduledSeq &+= 1
+        let seq = descriptorCacheScheduledSeq
         Task.detached(priority: .utility) { [weak self] in
             guard let data = SNMarmotDescriptorCache.encoded(snapshot) else { return }
             guard let self else { return }
             await MainActor.run {
                 guard generation == self.contactCacheWriteGeneration else { return }
+                // A newer snapshot already landed — this one is stale.
+                guard seq > self.descriptorCacheCommittedSeq else { return }
+                self.descriptorCacheCommittedSeq = seq
                 SNMarmotDescriptorCache.commit(data, to: defaults)
             }
         }
@@ -4261,6 +4278,8 @@ final class MarmotChatModel: ObservableObject {
         // Invalidate every deferred contact-cache write queued so far, so none
         // of them can commit after these clears.
         contactCacheWriteGeneration &+= 1
+        profileCacheScheduledSeq = 0; profileCacheCommittedSeq = 0
+        descriptorCacheScheduledSeq = 0; descriptorCacheCommittedSeq = 0
         SNMarmotProfileCache.clear(from: defaults)
         SNMarmotChatSnapshotCache.clear(from: defaults)
     }
@@ -4280,6 +4299,7 @@ final class MarmotChatModel: ObservableObject {
         descriptorFetches = []
         descriptorCacheGeneration &+= 1
         contactCacheWriteGeneration &+= 1
+        descriptorCacheScheduledSeq = 0; descriptorCacheCommittedSeq = 0
         SNMarmotDescriptorCache.clear(from: defaults)
     }
 

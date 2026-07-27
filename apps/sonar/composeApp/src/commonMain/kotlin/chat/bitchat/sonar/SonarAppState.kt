@@ -940,7 +940,11 @@ class SonarAppState(private val scope: CoroutineScope) {
             foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
             persistLinks(); persistLinkCaps(); persistGroupFolds()
             updateBleDiscoveryPolicy()
-            sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCacheNow(); descriptorCacheGeneration++
+            // Bump BEFORE the suspending write: persistSonarDescriptorCacheNow()
+            // suspends, and an in-flight fetch resuming in that window would
+            // otherwise still pass performDescriptorFetch's generation guard and
+            // repopulate the map we just cleared.
+            sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
             sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
             publishedSonarDescriptor = false; publishedSonarDescriptorBolt12Offer = null; publishingSonarDescriptor = false
             needsSonarDescriptorPublish = false
@@ -3466,7 +3470,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 updateBleDiscoveryPolicy()
                 foldedGroupIds = emptySet(); foldedGroupPeerIds = emptyMap()
                 sonarPeerProfiles = emptyMap()
-                sonarDescriptorsByNpubHex = emptyMap(); persistSonarDescriptorCacheNow(); descriptorCacheGeneration++
+                // Generation first — see wipe(): the write below suspends.
+                sonarDescriptorsByNpubHex = emptyMap(); descriptorCacheGeneration++; persistSonarDescriptorCacheNow()
                 sonarDescriptorFetches.clear(); sonarDescriptorFetchedAt.clear(); sonarDescriptorMissedAt.clear()
                 publishedSonarDescriptor = false
                 publishedSonarDescriptorBolt12Offer = null
@@ -4771,15 +4776,26 @@ class SonarAppState(private val scope: CoroutineScope) {
     // committed.
     private val contactCacheWriteMutex = Mutex()
     private var contactCacheWriteGeneration = 0
+    /** Per-key schedule order. Encodes run concurrently and finish out of
+     *  order, so the mutex alone would serialize commits by *encode-completion*
+     *  order and let an older snapshot overwrite a newer one — losing the newest
+     *  profile or BOLT12 offer from disk until the next fetch. */
+    private val contactCacheScheduledSeq = mutableMapOf<String, Int>()
+    private val contactCacheCommittedSeq = mutableMapOf<String, Int>()
 
     /** Snapshot now on the caller's thread, encode + write on IO. Use for the
      *  per-fetch paths, never for wipe/teardown. */
     private fun scheduleContactCacheWrite(key: String, encode: () -> String) {
         val generation = contactCacheWriteGeneration
+        val seq = (contactCacheScheduledSeq[key] ?: 0) + 1
+        contactCacheScheduledSeq[key] = seq
         scope.launch(Dispatchers.IO) {
             val encoded = encode()
             contactCacheWriteMutex.withLock {
                 if (generation != contactCacheWriteGeneration) return@withLock
+                // A newer snapshot already landed — this one is stale.
+                if (seq <= (contactCacheCommittedSeq[key] ?: 0)) return@withLock
+                contactCacheCommittedSeq[key] = seq
                 SonarCore.saveBlob(key, encoded)
             }
         }
@@ -4790,7 +4806,10 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  account. */
     private suspend fun writeContactCacheNow(key: String, encoded: String) {
         contactCacheWriteMutex.withLock {
+            // Invalidates every deferred write queued so far, for every key.
             contactCacheWriteGeneration++
+            contactCacheCommittedSeq.clear()
+            contactCacheScheduledSeq.clear()
             withContext(Dispatchers.IO) { SonarCore.saveBlob(key, encoded) }
         }
     }
