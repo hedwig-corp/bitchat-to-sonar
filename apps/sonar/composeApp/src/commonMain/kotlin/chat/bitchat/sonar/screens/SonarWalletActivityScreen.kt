@@ -30,6 +30,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAppState
+import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.rowTimeLabel
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
@@ -116,6 +117,11 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
             }
         }
     }
+
+    // A payment can fail while the user is sitting on this very screen
+    // checking Activity. Without this the outcome is written to app state and
+    // never rendered — a silent failure.
+    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** .wallet-txrow — icon bubble, "To/From <who>", "<status> · <rail> · <time>", signed amount. */

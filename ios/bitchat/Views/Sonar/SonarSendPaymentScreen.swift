@@ -30,7 +30,6 @@ struct SonarSendPaymentScreen: View {
     /// Amount carried by a scanned invoice, if it fixes one.
     @State private var fixedSats: Int64?
     @State private var scanning = false
-    @State private var toast: String?
 
     /// Snapshot of the payable contacts, taken when the screen appears.
     ///
@@ -250,9 +249,13 @@ struct SonarSendPaymentScreen: View {
                     onSend: { sats in
                         // Route through the chat so the peer still gets the
                         // in-chat ⚡PAY receipt, as paying from the chat does.
+                        // The screen pops immediately, so the outcome must go
+                        // to the app-level toast (rendered by SonarRootView).
+                        // A view-local toast here is written to a dismissed
+                        // view and never appears — the payment fails silently.
                         Task {
                             if let message = await store.sendPay(contact.id, sats: sats) {
-                                showToast(message)
+                                store.showToast(message)
                             }
                         }
                         store.pop()
@@ -295,7 +298,8 @@ struct SonarSendPaymentScreen: View {
                             if let message = await store.payDestination(
                                 destination, sats: sats, displayName: name
                             ) {
-                                showToast(message)
+                                // App-level: this screen is already gone.
+                                store.showToast(message)
                             }
                         }
                         store.pop()
@@ -303,35 +307,8 @@ struct SonarSendPaymentScreen: View {
                 )
             }
         }
-        .overlay(alignment: .bottom) { toastView }
-        .animation(.easeOut(duration: 0.2), value: toast)
     }
 
-    @ViewBuilder
-    private var toastView: some View {
-        if let toast {
-            Text(verbatim: toast)
-                .font(SonarTheme.uiFont(size: 13.5, weight: .medium))
-                .foregroundColor(SonarTheme.text)
-                .multilineTextAlignment(.center)
-                .padding(EdgeInsets(top: 11, leading: 16, bottom: 11, trailing: 16))
-                .background(
-                    RoundedRectangle(cornerRadius: 13, style: .continuous)
-                        .fill(SonarTheme.surface2)
-                        .shadow(color: Color.black.opacity(0.18), radius: 12, y: 6)
-                )
-                .padding(.horizontal, 24)
-                .padding(.bottom, 88)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-        }
-    }
-
-    private func showToast(_ text: String) {
-        toast = text
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6) {
-            if toast == text { toast = nil }
-        }
-    }
 }
 
 /// How an external destination is labelled in the "Pay …" row.
