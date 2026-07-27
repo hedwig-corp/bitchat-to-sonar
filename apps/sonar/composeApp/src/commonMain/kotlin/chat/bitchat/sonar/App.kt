@@ -347,21 +347,33 @@ private fun LocalStateLaunchSurface() {
  */
 @Composable
 internal fun SonarScreenHost(state: SonarAppState) {
-    when (val sc = state.screen) {
-        is Screen.Home -> HomeScreen(state)
-        is Screen.Chat -> ChatScreen(state, sc)
-        is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
-        is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
-        is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
-        is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
-        is Screen.ShareTo -> chat.bitchat.sonar.screens.SonarShareToScreen(state)
-        is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
-        is Screen.GeoDm -> GeoDmScreen(state, sc)
-        is Screen.Call -> CallScreen(state, sc)
-        is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
-        is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
-        is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
-        is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+    // The one toast host for the whole app. It lives here because every shell —
+    // phone (App) and desktop (SonarDesktopRoot) — renders screens through this
+    // dispatch, and `state.toast` is app-level: a screen without a host used to
+    // set a message that nothing ever drew. Payment failures went missing that
+    // way twice.
+    //
+    // Box + last child, so the toast draws over whatever the screen emitted,
+    // including its own sheets and scrims (ToastBar fills its parent and aligns
+    // itself to the bottom).
+    Box(Modifier.fillMaxSize()) {
+        when (val sc = state.screen) {
+            is Screen.Home -> HomeScreen(state)
+            is Screen.Chat -> ChatScreen(state, sc)
+            is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
+            is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
+            is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
+            is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
+            is Screen.ShareTo -> chat.bitchat.sonar.screens.SonarShareToScreen(state)
+            is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
+            is Screen.GeoDm -> GeoDmScreen(state, sc)
+            is Screen.Call -> CallScreen(state, sc)
+            is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
+            is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
+            is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
+            is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+        }
+        state.toast?.let { ToastBar(it) { state.toast = null } }
     }
 }
 
@@ -608,7 +620,6 @@ private fun HomeScreen(state: SonarAppState) {
             onClose = { pendingDelete = null }
         )
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** The id mute state is keyed on: the same conversation id notifications use
@@ -2167,7 +2178,6 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     previewPackCoordinate?.let { coord ->
         StickerPackPreviewSheet(state, coord) { previewPackCoordinate = null }
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** "Add to your message" sheet — 1:1 with the iOS/prototype DM "+" sheet. */
@@ -2536,7 +2546,6 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             ) { SNIcon(SNIconName.Send, 17.dp, if (draft.isBlank()) s.text3 else s.onNet, weight = 2.3f) }
         }
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** Meta (time + via-transport icon) inline id — design .bc-meta. */

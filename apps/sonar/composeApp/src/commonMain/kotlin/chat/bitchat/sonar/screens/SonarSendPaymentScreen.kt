@@ -38,7 +38,6 @@ import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.PayableContact
 import chat.bitchat.sonar.ConvRow
 import chat.bitchat.sonar.SonarAppState
-import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -290,7 +289,6 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
         )
     }
 
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** How an external destination is labelled in the "Pay …" row. */
