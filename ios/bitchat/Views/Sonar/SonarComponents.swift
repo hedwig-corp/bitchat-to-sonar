@@ -4505,12 +4505,16 @@ struct SNPrimaryButton: View {
     var disabled: Bool = false
     let action: () -> Void
 
+    // Disabled uses the shared neutral-chip tokens — see `SonarTheme.disabledFill`
+    // for why a faded accent fill does not work here.
     private var fill: Color {
+        if disabled { return SonarTheme.disabledFill }
         if danger { return SonarTheme.danger }
         return net ? SonarTheme.netFill : SonarTheme.accentFill
     }
 
     private var foreground: Color {
+        if disabled { return SonarTheme.onDisabled }
         if danger { return Color(sonarHex: 0xFFF6F6) }
         return net ? SonarTheme.onNet : SonarTheme.onAccent
     }
@@ -4526,7 +4530,10 @@ struct SNPrimaryButton: View {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .fill(fill)
                 )
-                .opacity(disabled ? 0.4 : 1)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(disabled ? SonarTheme.disabledStroke : Color.clear, lineWidth: 1)
+                )
         }
         .buttonStyle(SNScaleStyle(scale: 0.98))
         .disabled(disabled)

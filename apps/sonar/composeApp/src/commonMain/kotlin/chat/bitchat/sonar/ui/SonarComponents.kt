@@ -2,6 +2,7 @@ package chat.bitchat.sonar.ui
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.foundation.clickable
@@ -125,13 +126,20 @@ fun SNPrimaryButton(
             .fillMaxWidth()
             .height(52.dp)
             .clip(RoundedCornerShape(15.dp))
-            .background(if (disabled) s.surface2 else fill)
+            .background(if (disabled) s.disabledFill else fill)
+            // Disabled uses the shared neutral-chip tokens — see
+            // `SonarPalette.disabledFill` for why a faded accent fill fails here.
+            .border(
+                width = 1.dp,
+                color = if (disabled) s.disabledStroke else Color.Transparent,
+                shape = RoundedCornerShape(15.dp),
+            )
             .clickable(enabled = !disabled, onClick = onClick),
         contentAlignment = Alignment.Center
     ) {
         Text(
             label,
-            color = if (disabled) s.text3 else on,
+            color = if (disabled) s.onDisabled else on,
             fontSize = 16.5.sp,
             fontWeight = FontWeight.Bold
         )

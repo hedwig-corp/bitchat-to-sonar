@@ -22,6 +22,7 @@ struct SonarHandleClaimCard: View {
 
     @State private var handleDraft = ""
     @State private var editingHandle = false
+    @FocusState private var handleFocused: Bool
 
     private var claimedAddress: String? {
         if case .claimed(let address) = store.handleClaimState { return address }
@@ -36,6 +37,8 @@ struct SonarHandleClaimCard: View {
     }
 
     private var draftValid: Bool { MarmotService.handleLooksValid(trimmedDraft) }
+
+    private var claimDisabled: Bool { claiming || !draftValid }
 
     /// A full non-default-domain address is an external payment address —
     /// saved locally, never claimed at the registrar (matches the store path).
@@ -65,6 +68,7 @@ struct SonarHandleClaimCard: View {
             if case .claimed = state {
                 editingHandle = false
                 handleDraft = ""
+                handleFocused = false
             }
         }
     }
@@ -84,6 +88,7 @@ struct SonarHandleClaimCard: View {
             Button {
                 handleDraft = String(address.split(separator: "@").first ?? "")
                 editingHandle = true
+                handleFocused = true
             } label: {
                 Text("Edit")
                     .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -98,6 +103,9 @@ struct SonarHandleClaimCard: View {
 
     @ViewBuilder
     private var claimField: some View {
+        // The whole pill is the tap target: a bare `TextField` only claims its
+        // one-line text frame, so taps in the surrounding padding used to fall
+        // through and the field looked unfocusable.
         TextField(
             "",
             text: $handleDraft,
@@ -110,10 +118,27 @@ struct SonarHandleClaimCard: View {
         .textInputAutocapitalization(.never)
         .autocorrectionDisabled()
         #endif
+        .focused($handleFocused)
         .onSubmit(claim)
         .disabled(claiming)
-        .padding(EdgeInsets(top: 10, leading: 13, bottom: 10, trailing: 13))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(EdgeInsets(top: 12, leading: 13, bottom: 12, trailing: 13))
         .background(RoundedRectangle(cornerRadius: 13, style: .continuous).fill(SonarTheme.surface2))
+        .overlay(
+            RoundedRectangle(cornerRadius: 13, style: .continuous)
+                .strokeBorder(handleFocused ? SonarTheme.accent : Color.clear, lineWidth: 1.5)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+        // `simultaneousGesture` + the already-focused guard keep this handler
+        // out of the TextField's way: it only ever fires to grant first focus,
+        // so once the field is focused every tap belongs to the field itself
+        // (caret placement, selection). A plain `onTapGesture` would instead
+        // take priority over the field's own recognizers across the whole pill.
+        .simultaneousGesture(TapGesture().onEnded {
+            guard !claiming, !handleFocused else { return }
+            handleFocused = true
+        })
+        .accessibilityLabel("Username")
 
         if !trimmedDraft.isEmpty {
             Text(verbatim: isExternalDraft
@@ -143,16 +168,21 @@ struct SonarHandleClaimCard: View {
                         : (isExternalDraft ? "Save address" : "Claim"))
                         .font(SonarTheme.uiFont(size: 13.5, weight: .bold))
                 }
-                .foregroundColor(SonarTheme.onAccent)
+                // Same disabled contract as `SNPrimaryButton`, via the shared
+                // tokens — see `SonarTheme.disabledFill`.
+                .foregroundColor(claimDisabled ? SonarTheme.onDisabled : SonarTheme.onAccent)
                 .padding(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                .background(Capsule().fill(SonarTheme.accentDeep.opacity(claiming || !draftValid ? 0.5 : 1)))
+                .background(Capsule().fill(claimDisabled ? SonarTheme.disabledFill : SonarTheme.accentFill))
+                .overlay(Capsule().strokeBorder(claimDisabled ? SonarTheme.disabledStroke : Color.clear, lineWidth: 1))
+                .contentShape(Capsule())
             }
             .buttonStyle(.plain)
-            .disabled(claiming || !draftValid)
+            .disabled(claimDisabled)
             if editingHandle {
                 Button {
                     editingHandle = false
                     handleDraft = ""
+                    handleFocused = false
                 } label: {
                     Text("Cancel")
                         .font(SonarTheme.uiFont(size: 13.5, weight: .semibold))

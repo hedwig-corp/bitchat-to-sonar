@@ -2,7 +2,9 @@ package chat.bitchat.sonar.screens
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +33,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -258,8 +263,23 @@ private fun UsernameCard(
         } else {
             val draft = payDraft.trim()
             val isExternal = '@' in draft && !draft.lowercase().endsWith("@${state.handleDomain}")
+            // Tapping anywhere on the pill focuses the field — the text field
+            // only covers its own text line, so the surrounding padding was a
+            // dead zone.
+            val handleFocus = remember { FocusRequester() }
+            var handleFocused by remember { mutableStateOf(false) }
             Box(
                 Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(s.surface2)
+                    // Accent focus ring, matching the iOS username field.
+                    .border(
+                        width = 1.5.dp,
+                        color = if (handleFocused) s.accent else Color.Transparent,
+                        shape = RoundedCornerShape(12.dp),
+                    )
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                    ) { handleFocus.requestFocus() }
                     .padding(horizontal = 12.dp, vertical = 11.dp)
             ) {
                 if (payDraft.isEmpty()) Text("yourname", color = s.text3, fontSize = 14.sp)
@@ -270,6 +290,8 @@ private fun UsernameCard(
                     textStyle = TextStyle(color = s.text, fontSize = 14.sp),
                     cursorBrush = SolidColor(s.goldDeep),
                     modifier = Modifier.fillMaxWidth()
+                        .focusRequester(handleFocus)
+                        .onFocusChanged { handleFocused = it.isFocused }
                 )
             }
             Spacer(Modifier.height(8.dp))
