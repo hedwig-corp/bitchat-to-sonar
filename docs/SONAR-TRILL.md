@@ -68,6 +68,19 @@ the mute map (see the mute section for the one-launch caveat). If hydrate
 fails (store busy, missing credentials, NSE time expiry) the generic
 placeholder banner and sound are delivered — never a raw line.
 
+**Any sound the NSE names must be a member of the `SonarNotificationService`
+target**, not only the app. That target has no synchronized-folder membership,
+so a file under `ios/bitchat/` (where `sonar_trill.wav` lives) never reaches
+the appex without an explicit `pbxproj` Resources entry — the same explicit
+membership `sonar_notification.wav` has always had. Naming a file the appex
+does not contain degrades the killed-app banner to the default sound with no
+error anywhere. Verify after touching sounds or target membership:
+
+```sh
+ls "$(ls -dt ~/Library/Developer/Xcode/DerivedData/bitchat-*/Build/Products/\
+Debug-iphonesimulator/Sonar.app | head -1)/PlugIns/SonarNotificationService.appex" | grep wav
+```
+
 Honor the platform reduce-motion setting: skip the shake (keep sound/haptic)
 when reduced motion is enabled, mirroring the design's
 `prefers-reduced-motion` rule.

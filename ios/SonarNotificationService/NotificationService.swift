@@ -45,8 +45,11 @@ class NotificationService: SDKNotificationService {
     private static let notificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
     )
-    /// Resolved by the system against the app bundle (which ships
-    /// sonar_trill.wav), not the appex bundle — same as notificationSound.
+    /// Both sounds must be members of THIS extension target, not just the app:
+    /// the appex has no synchronized-folder membership, so a file living under
+    /// ios/bitchat/ never reaches it without an explicit pbxproj Resources
+    /// entry. Shipping a name the appex does not contain degrades the killed-app
+    /// banner to the default sound, silently. See docs/SONAR-TRILL.md.
     private static let trillNotificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_trill.wav")
     )

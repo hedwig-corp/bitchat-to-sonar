@@ -10,6 +10,7 @@
 		A11D50000000000000000001 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
 		A11D50000000000000000002 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
 		A11D50000000000000000003 /* sonar_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D50000000000000000004 /* sonar_notification.wav */; };
+		A11D52000000000000000001 /* sonar_trill.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D52000000000000000004 /* sonar_trill.wav */; };
 		A11D51000000000000000001 /* sonar_ble_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D51000000000000000004 /* sonar_ble_notification.wav */; };
 		A11D51000000000000000002 /* sonar_ble_notification.wav in Resources */ = {isa = PBXBuildFile; fileRef = A11D51000000000000000004 /* sonar_ble_notification.wav */; };
 		17901751FD8010AFC8E750F2 /* bitchatShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 61F92EBA29C47C0FCC482F1F /* bitchatShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -96,6 +97,7 @@
 /* Begin PBXFileReference section */
 		A11D50000000000000000004 /* sonar_notification.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = sonar_notification.wav; path = ../assets/notifications/raw/sonar_notification.wav; sourceTree = "<group>"; };
 		A11D51000000000000000004 /* sonar_ble_notification.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = sonar_ble_notification.wav; path = ../assets/notifications/raw/sonar_ble_notification.wav; sourceTree = "<group>"; };
+		A11D52000000000000000004 /* sonar_trill.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; name = sonar_trill.wav; path = bitchat/sonar_trill.wav; sourceTree = SOURCE_ROOT; };
 		03C57F452B55FD0FD8F51421 /* bitchatTests_macOS.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = bitchatTests_macOS.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		04C92AF74AFC20D92B2BAD0A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		3CCA5BD63046ACF8E7086F97 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS18.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
@@ -527,6 +529,7 @@
 			isa = PBXResourcesBuildPhase;
 			files = (
 				A11D50000000000000000003 /* sonar_notification.wav in Resources */,
+				A11D52000000000000000001 /* sonar_trill.wav in Resources */,
 			);
 		};
 		C5E027A42ECCDFD700BD6012 /* Resources */ = {
