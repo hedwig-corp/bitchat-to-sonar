@@ -8,12 +8,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.derivedStateOf
@@ -64,49 +65,53 @@ fun SonarWalletActivityScreen(state: SonarAppState) {
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Wallet", hairline = false, onBack = { state.back() })
 
-        Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                .padding(bottom = 40.dp)
+        // LazyColumn, not a scrolling Column: a Column with verticalScroll
+        // composes every row up front, so opening the screen paid for the whole
+        // ledger and scrolling had nothing to recycle.
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 40.dp),
         ) {
-            // ── .wallet-balance: centered column, 14px top / 6px bottom, 3px gap ──
-            Column(
-                Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                // .wallet-balnum: 34/800, -0.02em. `money()` is the design's
-                // walletStr — sats or fiat, whichever the user displays in.
-                Text(
-                    state.money(balanceSats),
-                    color = s.text,
-                    fontSize = 34.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    letterSpacing = (-0.68).sp,
-                )
-                Spacer(Modifier.height(3.dp))
-                // .wallet-ballabel: 12.5px, text3
-                Text(
-                    "Balance · pays directly, no claim step",
-                    color = s.text3,
-                    fontSize = 12.5.sp,
-                )
+            item {
+                // ── .wallet-balance: centered column, 14px top / 6px bottom, 3px gap ──
+                Column(
+                    Modifier.fillMaxWidth().padding(top = 14.dp, bottom = 6.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    // .wallet-balnum: 34/800, -0.02em. `money()` is the design's
+                    // walletStr — sats or fiat, whichever the user displays in.
+                    Text(
+                        state.money(balanceSats),
+                        color = s.text,
+                        fontSize = 34.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        letterSpacing = (-0.68).sp,
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    // .wallet-ballabel: 12.5px, text3
+                    Text(
+                        "Balance · pays directly, no claim step",
+                        color = s.text3,
+                        fontSize = 12.5.sp,
+                    )
+                }
+                SNSectionLabel("Activity")
             }
 
-            SNSectionLabel("Activity")
-
             if (entries.isEmpty()) {
-                // .wallet-empty: centered text3, 14px, 30px/20px padding
-                Text(
-                    "No transactions yet.",
-                    color = s.text3,
-                    fontSize = 14.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 30.dp),
-                )
+                item {
+                    // .wallet-empty: centered text3, 14px, 30px/20px padding
+                    Text(
+                        "No transactions yet.",
+                        color = s.text3,
+                        fontSize = 14.sp,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 30.dp),
+                    )
+                }
             } else {
-                Column(Modifier.fillMaxWidth()) {
-                    entries.forEachIndexed { i, entry ->
-                        ActivityRow(entry, state, divider = i < entries.lastIndex)
-                    }
+                itemsIndexed(entries, key = { _, entry -> entry.id }) { i, entry ->
+                    ActivityRow(entry, state, divider = i < entries.lastIndex)
                 }
             }
         }

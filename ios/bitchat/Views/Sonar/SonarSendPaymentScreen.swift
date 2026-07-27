@@ -185,7 +185,10 @@ struct SonarSendPaymentScreen: View {
                         // from x=72 suppressed on the last row — and nothing on
                         // the right. Hand-rolling this row is what made the list
                         // look wrong; reuse the component instead.
-                        VStack(spacing: 0) {
+                        // LazyVStack: a plain VStack inside a ScrollView
+                        // builds every row up front and rebuilds them on each
+                        // body evaluation.
+                        LazyVStack(spacing: 0) {
                             ForEach(Array(listed.enumerated()), id: \.element.id) { index, contact in
                                 SNConvRow(
                                     title: contact.name,

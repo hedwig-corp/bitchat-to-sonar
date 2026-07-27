@@ -9,14 +9,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.derivedStateOf
@@ -95,10 +96,14 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
     Column(Modifier.fillMaxSize().background(s.bg)) {
         SNNavHeader("Send payment", hairline = false, onBack = { state.back() })
 
-        Column(
-            Modifier.fillMaxSize().verticalScroll(rememberScrollState())
-                .padding(bottom = 40.dp)
+        // LazyColumn, not a scrolling Column: a Column with verticalScroll
+        // composes every contact row up front and recomposes them all on each
+        // pass. The header is one item; only the rows are lazy.
+        LazyColumn(
+            Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 40.dp),
         ) {
+            item {
             Row(
                 Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 4.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -192,8 +197,10 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
 
             // ── People you can pay ──
             SNSectionLabel("People you can pay")
+            }
 
             if (listed.isEmpty()) {
+                item {
                 // .wallet-empty, verbatim from the design — a quiet line, not a
                 // full empty state with an icon tile.
                 Text(
@@ -201,13 +208,14 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                     color = s.text3, fontSize = 14.sp, textAlign = TextAlign.Center,
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
                 )
+                }
             } else {
                 // The design uses the shared ConvRow (`.bc-row`): 16/11
                 // padding, 16.5/650 title, a `.bc-signal` sub, a hairline from
                 // x=72 that is suppressed on the last row — and nothing on the
                 // right. Hand-rolling this row is what made the list look
                 // wrong; reuse the component instead.
-                listed.forEachIndexed { i, contact ->
+                itemsIndexed(listed, key = { _, c -> c.chatId }) { i, contact ->
                     ConvRow(
                         avatar = { SonarAvatar(contact.name, 44.dp, presence = contact.nearby) },
                         title = contact.name,
@@ -226,13 +234,15 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                 }
             }
 
-            Spacer(Modifier.height(6.dp))
+            item {
+            // .st-note already carries its own 12px top margin.
             Text(
                 "Only people who publish a payment address appear here. " +
                     "Payments settle directly to their wallet — no claim step.",
                 color = s.text3, fontSize = 12.sp, lineHeight = 17.sp,
                 modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 12.dp, bottom = 4.dp),
             )
+            }
         }
     }
 

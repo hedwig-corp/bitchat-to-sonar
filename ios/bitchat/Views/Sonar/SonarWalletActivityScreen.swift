@@ -26,6 +26,11 @@ struct SonarWalletActivityScreen: View {
                 SNHeaderName("Wallet")
             }
 
+            // Read the ledger ONCE per body. `entries` is a computed property
+            // over the activity ledger; mentioning it three times meant three
+            // passes over the whole ledger every time SwiftUI evaluated this
+            // view.
+            let rows = entries
             ScrollView {
                 VStack(spacing: 0) {
                     // ── .wallet-balance: centered, 14px top / 6px bottom, 3px gap ──
@@ -48,7 +53,7 @@ struct SonarWalletActivityScreen: View {
 
                     SNSectionLabel("Activity")
 
-                    if entries.isEmpty {
+                    if rows.isEmpty {
                         // .wallet-empty: centered text3, 14px, 30px/20px padding
                         Text("No transactions yet.")
                             .font(SonarTheme.uiFont(size: 14))
@@ -57,9 +62,14 @@ struct SonarWalletActivityScreen: View {
                             .frame(maxWidth: .infinity)
                             .padding(EdgeInsets(top: 30, leading: 20, bottom: 30, trailing: 20))
                     } else {
-                        VStack(spacing: 0) {
-                            ForEach(Array(entries.enumerated()), id: \.element.id) { index, entry in
-                                activityRow(entry, divider: index < entries.count - 1)
+                        // LazyVStack, not VStack: a plain VStack inside a
+                        // ScrollView builds every row up front and rebuilds
+                        // them on each body evaluation, which is what made the
+                        // screen slow to open and rough to scroll. Lazy builds
+                        // rows as they come into view.
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(rows.enumerated()), id: \.element.id) { index, entry in
+                                activityRow(entry, divider: index < rows.count - 1)
                             }
                         }
                     }
