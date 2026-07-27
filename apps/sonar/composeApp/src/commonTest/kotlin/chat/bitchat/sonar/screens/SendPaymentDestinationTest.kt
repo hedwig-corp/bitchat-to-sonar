@@ -38,7 +38,9 @@ class SendPaymentDestinationTest {
     fun lightningAddressNeedsAUserAndADottedHost() {
         val d = assertNotNull(payableDestination("vincenzo@stacker.news"))
         assertEquals(SNIconName.Globe, d.icon)
-        assertEquals("Lightning address · over the internet", d.subtitle)
+        // Design pay.jsx sp-exsub: anything that is not an lno1 offer reads
+        // "Resolve address · over the internet".
+        assertEquals("Resolve address · over the internet", d.subtitle)
 
         assertNull(payableDestination("@stacker.news"), "no user part")
         assertNull(payableDestination("vincenzo@"), "no host")

@@ -7578,10 +7578,16 @@ final class SonarAppStore: ObservableObject {
             guard !isContactBlocked(row.id, npub: callNpub(row.id) ?? "") else { continue }
             guard cachedPaymentOffer(row.id) != nil else { continue }
             let nearby = dmTransport(row.id) == .mesh
+            // Design pay.jsx: nearby peers read "Nearby · Bluetooth"; everyone
+            // else shows their published payment address, falling back to
+            // "over Lightning" when we do not hold one.
+            let trimmedAddress = sonarProfile(row.id)?.bip353?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let address = (trimmedAddress?.isEmpty == false) ? trimmedAddress : nil
             out.append(SNPayableContact(
                 id: row.id,
                 name: row.title,
-                subtitle: nearby ? "Nearby · Bluetooth" : "Over Lightning",
+                subtitle: nearby ? "Nearby · Bluetooth" : (address ?? "over Lightning"),
                 nearby: nearby
             ))
         }

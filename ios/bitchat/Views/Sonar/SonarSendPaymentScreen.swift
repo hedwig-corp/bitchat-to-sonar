@@ -65,7 +65,7 @@ struct SonarSendPaymentScreen: View {
                         TextField(
                             "",
                             text: $query,
-                            prompt: Text(verbatim: "Name, name@domain or Bolt12\u{2026}")
+                            prompt: Text(verbatim: "Name, @username, name@domain or Bolt12\u{2026}")
                                 .foregroundColor(SonarTheme.text3)
                         )
                         .textFieldStyle(.plain)
@@ -159,13 +159,14 @@ struct SonarSendPaymentScreen: View {
                     SNSectionLabel("People you can pay")
 
                     if listed.isEmpty {
-                        SNEmptyState(
-                            icon: .coin,
-                            title: contacts.isEmpty ? "Nobody to pay yet" : "No matching contacts",
-                            desc: "Only people who publish a payment address show up here. "
-                                + "You can still pay any Lightning address or Bolt12 offer using the field above."
-                        )
-                        .frame(height: 220)
+                        // .wallet-empty, verbatim from the design — a quiet
+                        // line, not a full empty state with an icon tile.
+                        Text("No matching contacts. Try a username or Bolt12 offer above.")
+                            .font(SonarTheme.uiFont(size: 14))
+                            .foregroundColor(SonarTheme.text3)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity)
+                            .padding(EdgeInsets(top: 24, leading: 20, bottom: 24, trailing: 20))
                     } else {
                         VStack(spacing: 0) {
                             ForEach(listed) { contact in
@@ -178,9 +179,23 @@ struct SonarSendPaymentScreen: View {
                                             Text(verbatim: contact.name)
                                                 .font(SonarTheme.uiFont(size: 16, weight: .semibold))
                                                 .foregroundColor(SonarTheme.text)
-                                            Text(verbatim: contact.subtitle)
-                                                .font(SonarTheme.uiFont(size: 13))
-                                                .foregroundColor(SonarTheme.text2)
+                                            // .bc-signal — a BLE dot when
+                                            // nearby, otherwise a bolt glyph in
+                                            // front of the payment address.
+                                            HStack(spacing: 6) {
+                                                if contact.nearby {
+                                                    Circle()
+                                                        .fill(SonarTheme.accent)
+                                                        .frame(width: 8, height: 8)
+                                                } else {
+                                                    SNIcon(name: .bolt, size: 12, weight: 2.2)
+                                                        .foregroundColor(SonarTheme.net)
+                                                }
+                                                Text(verbatim: contact.subtitle)
+                                                    .font(SonarTheme.uiFont(size: 13))
+                                                    .foregroundColor(SonarTheme.text2)
+                                                    .lineLimit(1)
+                                            }
                                         }
                                         .frame(maxWidth: .infinity, alignment: .leading)
                                         SNIcon(name: .chevron, size: 15, weight: 2.2)
@@ -193,7 +208,8 @@ struct SonarSendPaymentScreen: View {
                         }
                     }
 
-                    Text("Payments settle straight to their wallet — there is no claim step.")
+                    Text("Only people who publish a payment address appear here. "
+                         + "Payments settle directly to their wallet — no claim step.")
                         .font(SonarTheme.uiFont(size: 12.5))
                         .lineSpacing(12.5 * 0.3)
                         .foregroundColor(SonarTheme.text3)
@@ -345,7 +361,7 @@ struct SNExternalDestination {
             self.fixedSats = SNScannedKind.bolt11AmountSats(v)
         } else if Self.looksLikeLightningAddress(v) {
             self.icon = .globe
-            self.subtitle = "Lightning address · over the internet"
+            self.subtitle = "Resolve address · over the internet"
             self.destination = trimmed
             self.fixedSats = nil
         } else {

@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
@@ -28,6 +29,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.PaySheet
@@ -35,7 +37,6 @@ import chat.bitchat.sonar.PayableContact
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.payFmt
-import chat.bitchat.sonar.ui.SNEmptyState
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNNavHeader
@@ -107,7 +108,7 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                 Spacer(Modifier.width(9.dp))
                 Box(Modifier.weight(1f)) {
                     if (query.isEmpty()) {
-                        Text("Name, name@domain or Bolt12…", color = s.text3, fontSize = 15.sp)
+                        Text("Name, @username, name@domain or Bolt12…", color = s.text3, fontSize = 15.sp)
                     }
                     BasicTextField(
                         value = query,
@@ -179,11 +180,12 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
             SNSectionLabel("People you can pay")
 
             if (listed.isEmpty()) {
-                SNEmptyState(
-                    icon = SNIconName.Coin,
-                    title = if (contacts.isEmpty()) "Nobody to pay yet" else "No matching contacts",
-                    desc = "Only people who publish a payment address show up here. " +
-                        "You can still pay any Lightning address or Bolt12 offer using the field above.",
+                // .wallet-empty, verbatim from the design — a quiet line, not a
+                // full empty state with an icon tile.
+                Text(
+                    "No matching contacts. Try a username or Bolt12 offer above.",
+                    color = s.text3, fontSize = 14.sp, textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 24.dp),
                 )
             } else {
                 listed.forEach { contact ->
@@ -199,7 +201,17 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
                                 contact.name,
                                 color = s.text, fontSize = 16.sp, fontWeight = FontWeight.SemiBold,
                             )
-                            Text(contact.subtitle, color = s.text2, fontSize = 13.sp)
+                            // .bc-signal — a BLE dot when nearby, otherwise a
+                            // bolt glyph in front of the payment address.
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (contact.nearby) {
+                                    Box(Modifier.size(8.dp).clip(CircleShape).background(s.accent))
+                                } else {
+                                    SNIcon(SNIconName.Bolt, 12.dp, s.net, weight = 2.2f)
+                                }
+                                Spacer(Modifier.width(6.dp))
+                                Text(contact.subtitle, color = s.text2, fontSize = 13.sp, maxLines = 1)
+                            }
                         }
                         SNIcon(SNIconName.Chevron, 15.dp, s.text3, weight = 2.2f)
                     }
@@ -208,7 +220,8 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
 
             Spacer(Modifier.height(6.dp))
             Text(
-                "Payments settle straight to their wallet — there is no claim step.",
+                "Only people who publish a payment address appear here. " +
+                    "Payments settle directly to their wallet — no claim step.",
                 color = s.text3, fontSize = 12.5.sp, lineHeight = 17.sp,
                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp),
             )
@@ -298,7 +311,7 @@ internal fun payableDestination(input: String): ExternalDestination? {
         // A Lightning address needs a user and a dotted host: "a@b.c".
         v.count { it == '@' } == 1 && v.substringBefore('@').isNotEmpty() &&
             v.substringAfter('@').let { it.contains('.') && !it.startsWith('.') && !it.endsWith('.') } ->
-            ExternalDestination(SNIconName.Globe, "Lightning address · over the internet", input.trim())
+            ExternalDestination(SNIconName.Globe, "Resolve address · over the internet", input.trim())
         else -> null
     }
 }

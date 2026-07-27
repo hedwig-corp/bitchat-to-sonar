@@ -2990,10 +2990,18 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (isContactBlocked(chatId)) return
             if (directPaymentOffer(chatId).isNullOrBlank()) return
             val nearby = isMeshChat(chatId) && hasLiveMeshRoute(meshPeerId(chatId))
+            // Design pay.jsx: nearby peers read "Nearby · Bluetooth"; everyone
+            // else shows their published payment address, falling back to
+            // "over Lightning" when we do not hold one.
+            val address = if (isMeshChat(chatId)) {
+                preferredMeshAliases(meshPeerId(chatId)).firstNotNullOfOrNull { alias ->
+                    sonarProfile(alias)?.bip353?.takeIf { it.isNotBlank() }
+                }
+            } else null
             out += PayableContact(
                 chatId = chatId,
                 name = callPeerName(chatId),
-                subtitle = if (nearby) "Nearby · Bluetooth" else "Over Lightning",
+                subtitle = if (nearby) "Nearby · Bluetooth" else (address ?: "over Lightning"),
                 nearby = nearby,
             )
         }
