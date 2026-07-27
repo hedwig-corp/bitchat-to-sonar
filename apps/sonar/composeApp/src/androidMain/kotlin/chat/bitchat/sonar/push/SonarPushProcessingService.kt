@@ -755,6 +755,13 @@ class SonarPushProcessingService : Service() {
             firstThisWake = seenThisWake.add(ev.paymentId),
             alreadyNotified = wasPaymentNotified(ev.paymentId),
         )
+        // Silence on this path has two very different causes — a PENDING receive
+        // that correctly stays quiet, and a `settled` mapping that never becomes
+        // true so nothing EVER notifies. Those are indistinguishable from the
+        // outside, and a missing "you were paid" banner is a worse failure than
+        // the one this service exists to fix. One line makes them tell apart.
+        Log.d(TAG, "receive ${ev.paymentId.take(12)} settled=${ev.settled} " +
+            "live=$liveEvent endsWake=${outcome.endsWake} notifies=${outcome.notifies}")
         if (outcome.notifies) {
             // Ledger capture (idempotent) — normally already recorded at the
             // event source; this covers poll payments the listener never saw.
