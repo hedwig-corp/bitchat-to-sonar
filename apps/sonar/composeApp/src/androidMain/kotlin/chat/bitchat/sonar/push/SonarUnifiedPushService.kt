@@ -50,6 +50,11 @@ class SonarUnifiedPushService : PushService() {
         SonarPushRegistration.onUnifiedPushUnregistered()
     }
 
+    override fun onTempUnavailable(instance: String) {
+        Log.w(TAG, "UnifiedPush distributor temporarily unavailable")
+        SonarPushRegistration.onUnifiedPushTempUnavailable()
+    }
+
     companion object {
         private const val TAG = "SonarUnifiedPush"
     }

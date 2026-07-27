@@ -11,9 +11,11 @@ firebase-bom = "33.7.0"
 google-services = "4.4.2"
 # Degoogled push (GrapheneOS without sandboxed Play): distributor-based
 # endpoint delivery. Maven Central artifact — google() is content-filtered.
-# Pinned to the last release built with Kotlin 2.2.x: 3.2.0+ ship Kotlin 2.3.0
-# metadata, which this repo's Kotlin 2.1.0 compiler rejects. Bump alongside
-# the repo-wide Kotlin upgrade.
+# Pinned: 3.2.0+ depend on kotlin-stdlib 2.3.0, whose 2.3 metadata the repo's
+# Kotlin 2.1.0 compiler rejects once dependency resolution puts it on the
+# compile classpath (the connector's own class metadata is older and fine).
+# Bump with the repo-wide Kotlin upgrade, or pin a stdlib resolution
+# constraint if it must move sooner.
 unifiedpush-connector = "3.1.2"
 # GoogleApiAvailability for the push-transport probe (FCM vs UnifiedPush).
 play-services-base = "18.5.0"

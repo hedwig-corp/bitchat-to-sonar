@@ -51,12 +51,21 @@ trap cleanup EXIT
 declare -a SO_FILES=()
 if [[ -d "$TARGET" ]]; then
   while IFS= read -r f; do SO_FILES+=("$f"); done < <(find "$TARGET" -name '*.so' | sort)
-elif [[ -f "$TARGET" && "$TARGET" == *.apk ]]; then
+elif [[ -f "$TARGET" ]]; then
+  # Detect archives by content, not extension — .apk, .aab and split-APK
+  # artifacts are all zips. A corrupt archive is a distinct error from an
+  # archive that simply carries no native libs.
+  if ! unzip -l "$TARGET" >/dev/null 2>&1; then
+    echo "error: $TARGET is not a readable zip archive (.apk/.aab expected)" >&2
+    exit 2
+  fi
   WORKDIR="$(mktemp -d)"
-  unzip -q "$TARGET" 'lib/*' -d "$WORKDIR" || true
+  # unzip exits non-zero when the filter matches nothing; that case is handled
+  # by the "no .so files found" check below.
+  unzip -q "$TARGET" 'lib/*' '*/lib/*' -d "$WORKDIR" 2>/dev/null || true
   while IFS= read -r f; do SO_FILES+=("$f"); done < <(find "$WORKDIR" -name '*.so' | sort)
 else
-  echo "usage: $0 [jniLibs-dir | app.apk]" >&2
+  echo "usage: $0 [jniLibs-dir | app.apk|app.aab]" >&2
   exit 2
 fi
 
@@ -66,13 +75,18 @@ fail=0
 for so in "${SO_FILES[@]}"; do
   # Minimum LOAD-segment alignment; readelf prints it in the last column
   # (hex like 0x4000 or decimal). Hex→dec in bash arithmetic — BSD awk (macOS)
-  # has no strtonum. Take the smallest across segments.
+  # has no strtonum. A readelf failure must NOT read as "FAIL 0x0": that would
+  # be indistinguishable from a real under-alignment, so bail with exit 2.
+  load_aligns="$("$READELF" -lW "$so" 2>/dev/null | awk '$1 == "LOAD" { print $NF }')" || load_aligns=""
+  if [[ -z "$load_aligns" ]]; then
+    echo "error: could not read LOAD segments from $so (readelf failed or no LOAD entries)" >&2
+    exit 2
+  fi
   min=""
   while IFS= read -r a; do
     v=$(( a ))   # bash arithmetic accepts both 0x-hex and decimal
     if [[ -z "$min" || $v -lt $min ]]; then min=$v; fi
-  done < <("$READELF" -lW "$so" | awk '$1 == "LOAD" { print $NF }')
-  min="${min:-0}"
+  done <<< "$load_aligns"
   # Only 64-bit ABIs can run under a 16 KB-page kernel; armeabi-v7a (32-bit)
   # never does, so its 4 KB alignment is expected — report, don't fail.
   enforced=1

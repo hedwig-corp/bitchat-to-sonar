@@ -54,6 +54,14 @@ specifics see [`GRAPHENEOS.md`](GRAPHENEOS.md).
 Pinned by `core/sonar-core/src/push.rs` test
 `platform_byte_accepts_known_platforms_only`.
 
+**Decision — no RFC 8291 payload encryption for `unifiedpush` in v1:** the
+connector exposes Web Push keys (`PushEndpoint.pubKeySet`), but Sonar
+registers only the bare endpoint URL. Transponder wakes are plaintext-free
+pings (no content to protect), so encrypting the POST body adds no privacy
+today. If wake payloads ever carry data, the auth/p256dh keys must ride the
+token payload (`url|auth|p256dh`, still under the 1021-byte ceiling) or a new
+platform byte — revisit before the upstream transponder PR freezes the format.
+
 ## Cross-platform gaps (tracked)
 
 1. **Upstream transponder** (`marmot-protocol/transponder`) does not yet POST

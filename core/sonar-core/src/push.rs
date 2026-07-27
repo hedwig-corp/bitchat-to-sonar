@@ -331,13 +331,17 @@ mod tests {
         // tokens: fixed-size plaintext, so length is not observable either.
         let endpoint =
             "https://ntfy.sh/upSoNaRdEviCeAbCdEfGhIjKlMnOpQrStUvWxYz0123456789?up=1";
-        let blob = encrypt_token(0x03, endpoint.as_bytes(), &server).expect("endpoint encrypts");
+        let blob = encrypt_token(PLATFORM_UNIFIEDPUSH, endpoint.as_bytes(), &server)
+            .expect("endpoint encrypts");
         // 32B ephemeral X-only key + 12B nonce + ciphertext(1024 + 16B tag).
         assert_eq!(blob.len(), 32 + 12 + TOKEN_PLAINTEXT_SIZE + 16);
 
-        // Ceiling still enforced.
+        // Ceiling pinned on both sides: largest accepted is SIZE - 3, first
+        // rejected is SIZE - 2 — an off-by-one tightening fails here.
+        let max_ok = vec![b'a'; TOKEN_PLAINTEXT_SIZE - 3];
+        assert!(encrypt_token(PLATFORM_UNIFIEDPUSH, &max_ok, &server).is_ok());
         let oversized = vec![b'a'; TOKEN_PLAINTEXT_SIZE - 2];
-        assert!(encrypt_token(0x03, &oversized, &server).is_err());
+        assert!(encrypt_token(PLATFORM_UNIFIEDPUSH, &oversized, &server).is_err());
     }
 
     #[test]
