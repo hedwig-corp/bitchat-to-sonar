@@ -217,8 +217,15 @@ kotlin {
             // as proper jniLibs (the plain jar hides it as a classpath resource
             // and you get UnsatisfiedLinkError).
             implementation("net.java.dev.jna:jna:5.14.0@aar")
-            // QR encoding for shareable group invite links.
+            // QR encoding for shareable group invite links, and QR *decoding*
+            // for "Scan a QR code" in the send-payment picker (design pay.jsx
+            // ScanQrSheet) — zxing core reads the CameraX luminance planes.
             implementation("com.google.zxing:core:3.5.3")
+            // Camera preview + frame analysis for the payment QR scanner.
+            implementation("androidx.camera:camera-core:1.4.1")
+            implementation("androidx.camera:camera-camera2:1.4.1")
+            implementation("androidx.camera:camera-lifecycle:1.4.1")
+            implementation("androidx.camera:camera-view:1.4.1")
         }
         androidInstrumentedTest.dependencies {
             implementation(libs.androidx.test.runner)

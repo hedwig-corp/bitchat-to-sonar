@@ -63,10 +63,22 @@ fun PaySheet(
     fiatOf: (Long) -> String?,
     onSend: (Long) -> Unit,
     onClose: () -> Unit,
+    /**
+     * Amount already fixed by the destination — a scanned Lightning invoice
+     * that encodes one. The design's `PaySheet` `fixed` prop: the amount is
+     * shown but the chips and keypad are hidden, because there is nothing to
+     * choose.
+     */
+    fixedSats: Long? = null,
 ) {
     val s = sonar
-    var v by remember { mutableStateOf("") }
-    val sats = v.toLongOrNull() ?: 0L
+    var v by remember { mutableStateOf(fixedSats?.toString().orEmpty()) }
+    val sats = fixedSats ?: (v.toLongOrNull() ?: 0L)
+    // `v` is the keypad buffer and a fixed amount hides the keypad, so the
+    // display must not key off `v` alone — that is what rendered "0" on iOS for
+    // an invoice that already carries its amount. Stated explicitly here too so
+    // the two platforms cannot drift.
+    val hasAmount = fixedSats != null || v.isNotEmpty()
     val over = sats > balanceSats
     val can = sats > 0 && !over
     fun tap(k: String) {
@@ -101,7 +113,7 @@ fun PaySheet(
                 ) {
                     Row(verticalAlignment = Alignment.Bottom) {
                         Text(
-                            if (v.isNotEmpty()) payFmt(sats) else "0",
+                            if (hasAmount) payFmt(sats) else "0",
                             color = if (over) s.danger else s.text,
                             fontSize = 42.sp, fontWeight = FontWeight.ExtraBold
                         )
@@ -122,6 +134,7 @@ fun PaySheet(
                     }
                 }
 
+                if (fixedSats == null) {
                 // pay-chips
                 Row(
                     Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 2.dp),
@@ -160,6 +173,8 @@ fun PaySheet(
                             }
                         }
                     }
+                }
+
                 }
 
                 // bc-sheetactions

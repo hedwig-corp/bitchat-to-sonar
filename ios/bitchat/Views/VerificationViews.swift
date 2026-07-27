@@ -210,6 +210,7 @@ struct CameraScannerView: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
+        context.coordinator.updateHandler(onCode)
         context.coordinator.setActive(isActive)
     }
 
@@ -223,23 +224,82 @@ struct CameraScannerView: UIViewRepresentable {
         private var permissionGranted = false
         private var desiredActive = false
 
+        /// Camera that can actually focus on a QR code held at arm's length.
+        ///
+        /// `AVCaptureDevice.default(for: .video)` returns the main wide camera,
+        /// whose minimum focus distance on recent Pro iPhones (14 Pro / 15 Pro,
+        /// 48 MP sensor) is around 20 cm. People hold a code at 10–15 cm, so it
+        /// never comes into focus and the metadata detector sees nothing but
+        /// blur — the scanner looks broken while the preview looks fine.
+        ///
+        /// The dual-wide virtual device fixes it: below its switch-over zoom
+        /// factor the system uses the ultra-wide, which focuses within a couple
+        /// of centimetres. Ultra-wide alone is the next best thing, and the
+        /// plain wide camera stays as the last resort (older/non-Pro phones,
+        /// where it focuses close enough anyway).
+        private func preferredDevice() -> AVCaptureDevice? {
+            let discovery = AVCaptureDevice.DiscoverySession(
+                deviceTypes: [.builtInDualWideCamera, .builtInUltraWideCamera, .builtInWideAngleCamera],
+                mediaType: .video,
+                position: .back
+            )
+            for type in [AVCaptureDevice.DeviceType.builtInDualWideCamera,
+                         .builtInUltraWideCamera,
+                         .builtInWideAngleCamera] {
+                if let match = discovery.devices.first(where: { $0.deviceType == type }) {
+                    return match
+                }
+            }
+            return AVCaptureDevice.default(for: .video)
+        }
+
+        /// Continuous autofocus, biased to near subjects, and — on the virtual
+        /// dual-wide device — a zoom factor that keeps us on the ultra-wide
+        /// lens so close codes stay sharp.
+        private func configureForCloseFocus(_ device: AVCaptureDevice) {
+            guard (try? device.lockForConfiguration()) != nil else { return }
+            defer { device.unlockForConfiguration() }
+
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+            if device.isAutoFocusRangeRestrictionSupported {
+                device.autoFocusRangeRestriction = .near
+            }
+            // Stay just under the hand-off point: above it the system switches
+            // to the wide lens and we are back to the 20 cm problem.
+            if let switchOver = device.virtualDeviceSwitchOverVideoZoomFactors.first?.doubleValue {
+                let target = max(device.minAvailableVideoZoomFactor, CGFloat(switchOver) * 0.9)
+                device.videoZoomFactor = min(target, device.maxAvailableVideoZoomFactor)
+            }
+        }
+
         func setup(sessionOwner: PreviewView, onCode: @escaping (String) -> Void) {
             self.owner = sessionOwner
             self.onCode = onCode
             session.beginConfiguration()
             session.sessionPreset = .high
-            guard let device = AVCaptureDevice.default(for: .video),
+            guard let device = preferredDevice(),
                   let input = try? AVCaptureDeviceInput(device: device),
-                  session.canAddInput(input) else { return }
+                  session.canAddInput(input) else {
+                // Every early exit must still commit, or the session is left
+                // mid-configuration and never delivers a frame.
+                session.commitConfiguration()
+                return
+            }
             session.addInput(input)
             let output = AVCaptureMetadataOutput()
-            guard session.canAddOutput(output) else { return }
+            guard session.canAddOutput(output) else {
+                session.commitConfiguration()
+                return
+            }
             session.addOutput(output)
             output.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
             if output.availableMetadataObjectTypes.contains(.qr) {
                 output.metadataObjectTypes = [.qr]
             }
             session.commitConfiguration()
+            configureForCloseFocus(device)
             sessionOwner.videoPreviewLayer.session = session
             // Request permission and start
             AVCaptureDevice.requestAccess(for: .video) { granted in
@@ -248,6 +308,12 @@ struct CameraScannerView: UIViewRepresentable {
                     self.setActive(true)
                 }
             }
+        }
+
+        /// Keep the delivered closure current — `makeUIView` runs once, so
+        /// without this the coordinator holds the very first one forever.
+        func updateHandler(_ onCode: @escaping (String) -> Void) {
+            self.onCode = onCode
         }
 
         func setActive(_ active: Bool) {

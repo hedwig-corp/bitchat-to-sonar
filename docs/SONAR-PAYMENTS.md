@@ -112,11 +112,70 @@ report:
    start, so a wipe landing mid-flight cannot persist the old account's contacts
    into the new one.
 
+## Entry points
+
+There are two ways to start a payment:
+
+1. **From inside a chat** — the "+" composer action. Pays that conversation's
+   peer and posts the ⚡PAY receipt bubbles into the transcript.
+2. **From the new-chat sheet** — *Start a chat → Send a payment*, which opens
+   the standalone send-payment picker
+   (`SonarSendPaymentScreen.kt` / `SonarSendPaymentScreen.swift`, reproducing
+   the design's `SendPaymentScreen` in
+   `design/handoff/project/sonar/pay.jsx`). It offers two recipient kinds:
+   - **A contact** from "People you can pay" — every conversation whose peer
+     already published a BOLT12 offer. The payment is routed through
+     `sendPay(chatId)`, so it is identical to paying from inside the chat and
+     the peer still gets the in-chat receipt. The list is built **cache-only**:
+     it never fetches a descriptor, so opening the picker cannot block on the
+     relay. A contact whose descriptor has not arrived yet is simply not
+     listed.
+   - **Anyone else** — a BOLT12 offer (`lno1…`), a BOLT11 invoice
+     (`lnbc…`/`lntb…`), or a Lightning address (`name@domain`) typed into the
+     field. The wallet resolves the destination
+     (`payDestination` / `payDestinationDetached`). There is no conversation to
+     post a receipt into, so only the wallet activity row is written, with
+     `peerKey = "wallet"`.
+
+   An `npub` is deliberately **not** an external destination: it is a Sonar
+   identity, not something the wallet can pay. Such a person shows up under
+   "People you can pay" once their descriptor arrives.
+
+   - **A scanned QR code** — "Scan a QR code" opens the design's `ScanQrSheet`
+     viewfinder. iOS reuses the `AVCaptureMetadataOutput` pipeline that already
+     powers safety-number verification (`CameraScannerView`); Android uses
+     CameraX + zxing (`SonarQrScanner`), decoding the Y plane on a background
+     executor with `STRATEGY_KEEP_ONLY_LATEST` so a slow frame is dropped
+     rather than queued. The decoded payload is classified the same way as a
+     typed one, and a BOLT11 invoice that encodes an amount carries it through
+     as the sheet's fixed amount — the keypad and quick chips are then hidden,
+     matching the design's `fixed` prop.
+
+**Platform gap:** desktop has no camera pipeline (CameraX is Android-only and
+there is no cross-platform JVM webcam stack Sonar ships), so
+`sonarQrScanSupported()` is false on the JVM target and the scan row is hidden
+there rather than opening a dead viewfinder. Pasting a code into the field
+reaches every destination the scanner would.
+
 ## Chat UX
 
 Money still appears inside the chat. A direct send pays the receiver's wallet,
 then posts gold payment receipt bubbles using the encrypted chat transport.
 There is no "tap to claim" step for these bubbles.
+
+The **Wallet → Activity** screen is a log only, reproducing the design's
+`WalletScreen` + `WalletActivity`: the centered balance block, then the
+transaction list — no Send/Receive buttons, because paying always starts from
+the new-chat sheet or from inside a chat. Each row is
+`send`/`download` glyph on indigo/green · "To <who>" / "From <who>" ·
+"<status> · <rail> · <time>" · a signed amount that greys out and strikes
+through when the payment failed.
+
+One data gap feeds that row: Compose's `PayEntry` does not persist a peer key,
+so a chat ⚡PAY receipt with no matching wallet-activity row has no name to
+show and falls back to the design's own "unknown". Direct wallet activity
+always carries `peerName`. iOS renders from the activity ledger only, so it is
+unaffected.
 
 The wallet sheet also lists direct payment activity, newest first, including:
 

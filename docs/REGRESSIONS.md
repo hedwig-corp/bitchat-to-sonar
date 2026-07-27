@@ -1035,6 +1035,57 @@ close) -> this fix.
   desktop push or process-lifecycle path would make the branch live and this
   rejection stale.
 
+## R-021 — A payment destination pays what the payload says, not what we guessed
+
+**Invariant:** Every payable payload is resolved before the wallet sees it — a
+BIP-21 URI pays the rail inside it (`lno` > `lightning` > address), a BOLT11
+carries its own amount and is never handed one of ours, and a decimal BTC
+`amount` is converted digit-by-digit rather than through a `Double`.
+
+**Breaks as:** Silently paying the wrong thing, or nothing at all.
+`bitcoin:bc1q…?lno=lno1…` was labelled "Bitcoin address · On-chain" and the whole
+URI — query string included — was handed to the wallet, so the BOLT12 offer in
+`lno=` was never paid and the send failed with
+`AmountMissing: "Expected invoice with an amount"`.
+
+**Why:** This looks like string handling and is really money handling, and each
+rule is invisible unless you already know it. The BOLT11 amount ends at the
+*last* `1`, not the first, because bech32 excludes `1` from the data charset —
+read it the obvious way and `lnbc21u1…` becomes 2 BTC instead of 2,100 sats.
+BIP-21 hides the good rails in the query string behind an on-chain address that
+parses fine on its own, so a prefix check finds "an address" and stops looking.
+And Breez takes a BOLT11's amount from the invoice: passing our own risks
+`"Receiver amount and invoice amount do not match"`, and an amountless invoice
+cannot be paid at all no matter what we pass.
+
+**Call sites:** Compose `wallet/PaymentDestination.kt::bolt11AmountSats`,
+`screens/SonarScanQrSheet.kt::scannedKind`,
+`SonarAppState.kt::payDestination`; iOS
+`SonarScanQrSheet.swift::SNScannedKind`,
+`SonarAppStore.swift::payDestination`
+
+**Guarded by:** `Bolt11AmountTest.everyMultiplierScalesCorrectly`,
+`Bolt11AmountTest.microBtcInvoiceIsTwentyOneHundredSats`,
+`Bip21ScanTest.unifiedUriPrefersTheBolt12Offer`,
+`Bip21ScanTest.btcToSatsIsExactAndRefusesWhatItCannotRepresent`
+
+**History:** #491.
+
+**Rejected:** Passing our own parsed amount alongside a BOLT11 that already
+carries one — it reads as harmless belt-and-braces and is the opposite, because
+any disagreement with the invoice (the parser rounds `p`-denominated amounts up)
+becomes `"Receiver amount and invoice amount do not match"`. Also rejected:
+offering the keypad for an amountless invoice, which looks like a courtesy but
+is a control that always fails, since the SDK refuses the payment regardless of
+the amount supplied.
+
+**Not guarded:** No test asserts the wallet is actually called with a *nil*
+amount for a BOLT11 — that needs a wallet double — and the amountless refusal in
+`payDestination` has no test on either platform. iOS has no unit test for
+`SNScannedKind` at all: the Kotlin tests are the only coverage, so a Swift-side
+divergence would not be caught. Nothing here is exercised end-to-end against a
+real wallet.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

@@ -186,12 +186,22 @@ struct SNPaySheet: View {
     let money: (Int64) -> String
     /// Live fiat line; nil = no live rate, the € line simply doesn't render.
     let fiatText: (Int64) -> String?
+    /// Amount already fixed by the destination — a scanned Lightning invoice
+    /// that encodes one. The design's `PaySheet` `fixed` prop: the amount is
+    /// shown but the chips and keypad are hidden, because there is nothing to
+    /// choose.
+    var fixedSats: Int64?
     let onClose: () -> Void
     let onSend: (Int64) -> Void
 
     @State private var v = ""
 
-    private var sats: Int64 { Int64(v) ?? 0 }
+    private var sats: Int64 { fixedSats ?? (Int64(v) ?? 0) }
+    /// Whether there is an amount to show. `v` is the *keypad* buffer, and a
+    /// fixed amount hides the keypad — so keying the display off `v` alone
+    /// rendered "0" for an invoice that already carries its amount, even though
+    /// `sats` (and the payment) were correct.
+    private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
@@ -231,7 +241,7 @@ struct SNPaySheet: View {
             // .pay-amountbox
             VStack(spacing: 0) {
                 HStack(alignment: .firstTextBaseline, spacing: 7) {
-                    Text(verbatim: v.isEmpty ? "0" : snPayFmt(sats))
+                    Text(verbatim: hasAmount ? snPayFmt(sats) : "0")
                         .font(SonarTheme.uiFont(size: 42, weight: .heavy))
                         .kerning(-42 * 0.02)
                         .foregroundColor(over ? SonarTheme.danger : SonarTheme.text)
@@ -248,6 +258,7 @@ struct SNPaySheet: View {
             }
             .padding(EdgeInsets(top: 8, leading: 0, bottom: 2, trailing: 0))
 
+            if fixedSats == nil {
             // .pay-chips
             HStack(spacing: 8) {
                 ForEach(snPayChips, id: \.self) { c in
@@ -305,6 +316,7 @@ struct SNPaySheet: View {
                 }
             }
             .padding(EdgeInsets(top: 8, leading: 18, bottom: 2, trailing: 18))
+            }
 
             // .bc-sheetactions
             VStack(spacing: 6) {

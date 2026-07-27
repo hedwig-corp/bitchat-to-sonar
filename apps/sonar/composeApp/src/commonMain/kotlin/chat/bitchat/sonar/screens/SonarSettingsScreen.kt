@@ -50,7 +50,6 @@ import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarClock
 import chat.bitchat.sonar.SonarCore
-import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.TranscriptPolicyHostDemo
 import chat.bitchat.sonar.TranscriptSpikeBDemo
 import chat.bitchat.sonar.sonarTranscriptPolicyHostEntryVisible
@@ -346,7 +345,6 @@ fun SonarSettingsScreen(state: SonarAppState) {
         }
     }
 
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** st-note: 12px text3 hanging under a card (padding 0 24px 4px). */

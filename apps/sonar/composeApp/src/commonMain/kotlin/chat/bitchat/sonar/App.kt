@@ -91,6 +91,7 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.text.InlineTextContent
@@ -346,20 +347,33 @@ private fun LocalStateLaunchSurface() {
  */
 @Composable
 internal fun SonarScreenHost(state: SonarAppState) {
-    when (val sc = state.screen) {
-        is Screen.Home -> HomeScreen(state)
-        is Screen.Chat -> ChatScreen(state, sc)
-        is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
-        is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
-        is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
-        is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
-        is Screen.ShareTo -> chat.bitchat.sonar.screens.SonarShareToScreen(state)
-        is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
-        is Screen.GeoDm -> GeoDmScreen(state, sc)
-        is Screen.Call -> CallScreen(state, sc)
-        is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
-        is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
-        is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
+    // The one toast host for the whole app. It lives here because every shell —
+    // phone (App) and desktop (SonarDesktopRoot) — renders screens through this
+    // dispatch, and `state.toast` is app-level: a screen without a host used to
+    // set a message that nothing ever drew. Payment failures went missing that
+    // way twice.
+    //
+    // Box + last child, so the toast draws over whatever the screen emitted,
+    // including its own sheets and scrims (ToastBar fills its parent and aligns
+    // itself to the bottom).
+    Box(Modifier.fillMaxSize()) {
+        when (val sc = state.screen) {
+            is Screen.Home -> HomeScreen(state)
+            is Screen.Chat -> ChatScreen(state, sc)
+            is Screen.Settings -> chat.bitchat.sonar.screens.SonarSettingsScreen(state)
+            is Screen.Profile -> chat.bitchat.sonar.screens.SonarProfileScreen(state)
+            is Screen.Nearby -> chat.bitchat.sonar.screens.SonarRadarScreen(state)
+            is Screen.Search -> chat.bitchat.sonar.screens.SonarSearchScreen(state)
+            is Screen.ShareTo -> chat.bitchat.sonar.screens.SonarShareToScreen(state)
+            is Screen.Channel -> chat.bitchat.sonar.screens.SonarChannelScreen(state, sc)
+            is Screen.GeoDm -> GeoDmScreen(state, sc)
+            is Screen.Call -> CallScreen(state, sc)
+            is Screen.ContactProfile -> chat.bitchat.sonar.screens.SonarContactProfileScreen(state, sc)
+            is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
+            is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
+            is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+        }
+        state.toast?.let { ToastBar(it) { state.toast = null } }
     }
 }
 
@@ -606,7 +620,6 @@ private fun HomeScreen(state: SonarAppState) {
             onClose = { pendingDelete = null }
         )
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** The id mute state is keyed on: the same conversation id notifications use
@@ -692,10 +705,14 @@ private fun geoShort(level: GeoLevel): String = when (level) {
  *  hairline under the row inset to the text column (hidden on the last row). */
 @Composable
 @OptIn(ExperimentalFoundationApi::class)
-private fun ConvRow(
+internal fun ConvRow(
     avatar: @Composable () -> Unit,
     title: String,
     sub: String,
+    /** Glyph rendered before the sub text (design `.bc-signal`). */
+    subLeading: (@Composable () -> Unit)? = null,
+    /** `.bc-rowsub` is 14; a nested `.bc-signal` renders at 13.5. */
+    subFontSize: TextUnit = 14.sp,
     time: String? = null,
     lock: Boolean = false,
     verified: Boolean = false,
@@ -729,8 +746,9 @@ private fun ConvRow(
                 // bc-rowsub: 14 text2, single line, ellipsized (npubs must never wrap).
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (lock) { SNIcon(SNIconName.Lock, 12.dp, s.text3, weight = 2.2f); Spacer(Modifier.width(4.dp)) }
+                    if (subLeading != null) { subLeading(); Spacer(Modifier.width(6.dp)) }
                     Text(
-                        sub, color = s.text2, fontSize = 14.sp,
+                        sub, color = s.text2, fontSize = subFontSize,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f, fill = false)
                     )
@@ -2160,7 +2178,6 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     previewPackCoordinate?.let { coord ->
         StickerPackPreviewSheet(state, coord) { previewPackCoordinate = null }
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** "Add to your message" sheet — 1:1 with the iOS/prototype DM "+" sheet. */
@@ -2529,7 +2546,6 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             ) { SNIcon(SNIconName.Send, 17.dp, if (draft.isBlank()) s.text3 else s.onNet, weight = 2.3f) }
         }
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 /** Meta (time + via-transport icon) inline id — design .bc-meta. */
@@ -4470,7 +4486,7 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                     .padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 22.dp)
             ) {
                 if (findUsername) {
-                    Text("New discussion", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    Text("Find by username", color = s.text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(8.dp))
                     Text(
                         "Type a username — just vincenzo for @${state.handleDomain}, a full name@domain, or paste a key.",
@@ -4590,9 +4606,12 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
                 ActionRow(SNIconName.Rings, "People nearby", "Open the radar to see everyone in range") {
                     onClose(); state.push(Screen.Nearby)
                 }
-                ActionRow(SNIconName.Key, "New discussion", "Username, name@domain, or paste a key — reaches anywhere") {
+                ActionRow(SNIconName.Key, "Find by username", "Username, name@domain, or paste a key — reaches anywhere") {
                     findUsername = true; groupEntry = false
                     findDraft = ""; findNpub = null; findMiss = false
+                }
+                ActionRow(SNIconName.Coin, "Send a payment", "Pay a contact, Lightning address or Bolt12 offer") {
+                    onClose(); state.push(Screen.SendPayment)
                 }
                 ActionRow(SNIconName.People, "New group", "Invite contacts or paste keys") {
                     groupEntry = true; findUsername = false

@@ -40,7 +40,6 @@ import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SlashHints
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarChannelMsg
-import chat.bitchat.sonar.ToastBar
 import chat.bitchat.sonar.composerDraftKeyForChannel
 import chat.bitchat.sonar.ui.SNBanner
 import chat.bitchat.sonar.ui.SNBannerTone
@@ -196,7 +195,6 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             onClose = { authorSheet = null },
         )
     }
-    state.toast?.let { ToastBar(it) { state.toast = null } }
 }
 
 @Composable

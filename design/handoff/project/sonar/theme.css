@@ -298,6 +298,99 @@
   background: var(--surface2); font-size: 16px; font-weight: 700;
 }
 .dn-renew { font-size: 12.5px; color: var(--text3); margin-top: 20px; line-height: 1.5; }
+
+/* ── send-payment picker ── */
+.sp-field {
+  display: flex; align-items: center; gap: 9px;
+  margin: 0 14px 4px; padding: 12px 14px;
+  background: var(--surface2); border-radius: 13px;
+}
+.sp-field .bc-input { font-size: 15px; }
+.sp-external {
+  display: flex; align-items: center; gap: 12px;
+  width: calc(100% - 28px); margin: 8px 14px 2px; padding: 12px 14px;
+  border: none; border-radius: 14px; cursor: pointer; text-align: left;
+  font-family: inherit; color: var(--text);
+  background: var(--net-soft); box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.sp-external:active { transform: scale(0.99); }
+.sp-exic { width: 38px; height: 38px; flex: none; border-radius: 11px; background: var(--net-fill); color: var(--on-net); display: flex; align-items: center; justify-content: center; }
+.sp-exmain { flex: 1; min-width: 0; }
+.sp-exname { font-size: 15px; font-weight: 700; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-exsub { font-size: 12.5px; color: var(--net-deep); display: block; margin-top: 1px; }
+
+/* ── scan to pay ── */
+.sp-scan {
+  display: flex; align-items: center; gap: 12px;
+  width: calc(100% - 28px); margin: 8px 14px 2px; padding: 12px 14px;
+  border: none; border-radius: 14px; cursor: pointer; text-align: left;
+  font-family: inherit; color: var(--text);
+  background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--hairline);
+}
+.sp-scan:active { transform: scale(0.99); }
+.sp-scanic { width: 38px; height: 38px; flex: none; border-radius: 11px; background: var(--accent-fill); color: var(--on-accent); display: flex; align-items: center; justify-content: center; }
+.scan-view { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 10px 16px 4px; }
+.scan-frame {
+  position: relative; width: 210px; height: 210px; border-radius: 22px;
+  background: linear-gradient(150deg, #101820, #06090C 70%);
+  box-shadow: inset 0 0 0 1px var(--hairline); overflow: hidden;
+}
+.scan-frame .c { position: absolute; width: 34px; height: 34px; border: 3px solid var(--accent); }
+.scan-frame .tl { top: 14px; left: 14px; border-right: 0; border-bottom: 0; border-radius: 10px 0 0 0; }
+.scan-frame .tr { top: 14px; right: 14px; border-left: 0; border-bottom: 0; border-radius: 0 10px 0 0; }
+.scan-frame .bl { bottom: 14px; left: 14px; border-right: 0; border-top: 0; border-radius: 0 0 0 10px; }
+.scan-frame .br { bottom: 14px; right: 14px; border-left: 0; border-top: 0; border-radius: 0 0 10px 0; }
+.scan-line {
+  position: absolute; left: 18px; right: 18px; height: 2px; border-radius: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  box-shadow: 0 0 14px var(--accent);
+  animation: scanSweep 2.2s ease-in-out infinite;
+}
+@keyframes scanSweep { 0%, 100% { top: 26px; } 50% { top: 180px; } }
+.scan-hint { font-size: 13px; color: var(--text3); text-align: center; }
+.scan-alts { display: flex; gap: 8px; justify-content: center; padding: 6px 0 2px; }
+.scan-alt {
+  padding: 7px 14px; border: none; border-radius: 999px; cursor: pointer;
+  background: var(--surface2); color: var(--text2);
+  font-family: inherit; font-size: 12.5px; font-weight: 650;
+}
+.scan-found { display: flex; align-items: center; gap: 12px; padding: 10px 14px 6px; }
+.scan-foundic { width: 44px; height: 44px; flex: none; border-radius: 13px; background: var(--net-soft); color: var(--net); display: flex; align-items: center; justify-content: center; }
+.scan-code {
+  font-family: var(--mono); font-size: 12px; color: var(--text2);
+  background: var(--surface2); border-radius: 12px;
+  padding: 11px 13px; margin: 4px 14px 2px; word-break: break-all;
+}
+@media (prefers-reduced-motion: reduce) { .scan-line { animation: none; top: 100px; } }
+
+/* ── chat backup ── */
+.bk-hero { text-align: center; padding: 16px 24px 10px; }
+.bk-heroic {
+  width: 64px; height: 64px; border-radius: 20px; margin: 0 auto 14px;
+  background: var(--surface2); color: var(--text2);
+  display: flex; align-items: center; justify-content: center;
+}
+.bk-heroic.on { background: var(--accent-soft); color: var(--accent-deep); box-shadow: 0 8px 22px rgba(34,211,238,0.18); }
+.bk-herotitle { font-size: 23px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 8px; }
+.bk-herosub { font-size: 14.5px; color: var(--text2); line-height: 1.5; margin: 0 0 4px; }
+.bk-feat { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; position: relative; }
+.bk-feat::after { content: ''; position: absolute; left: 56px; right: 0; bottom: 0; height: 1px; background: var(--hairline); }
+.st-card .bk-feat:last-child::after { display: none; }
+.bk-featic { width: 34px; height: 34px; flex: none; border-radius: 10px; background: var(--accent-soft); color: var(--accent-deep); display: flex; align-items: center; justify-content: center; }
+.bk-featmain { flex: 1; min-width: 0; }
+.bk-featmain b { font-size: 15px; font-weight: 700; display: block; }
+.bk-featmain span { font-size: 13px; color: var(--text2); display: block; margin-top: 1px; }
+.bk-stats { display: flex; gap: 9px; padding: 10px 14px 2px; }
+.bk-stat { flex: 1; background: var(--surface2); border-radius: 14px; padding: 13px 8px; text-align: center; }
+.bk-stat b { font-size: 15px; font-weight: 800; letter-spacing: -0.01em; display: block; }
+.bk-stat span { font-size: 11.5px; color: var(--text3); display: block; margin-top: 2px; }
+.bk-reckey { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 8px; }
+.bk-recword { display: flex; align-items: center; gap: 6px; background: var(--surface2); border-radius: 10px; padding: 9px 10px; font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text); }
+.bk-recword i { font-style: normal; font-size: 10px; color: var(--text3); min-width: 14px; }
+.bk-donehead { text-align: center; padding: 8px 18px 4px; }
+.bk-doneic { width: 68px; height: 68px; border-radius: 22px; margin: 0 auto 14px; background: var(--accent-soft); color: var(--accent-deep); display: flex; align-items: center; justify-content: center; }
+.bk-donetitle { font-size: 20px; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 8px; }
+.bk-donesub { font-size: 14px; color: var(--text2); line-height: 1.5; margin: 0; }
 .bc-groupav { position: relative; display: inline-block; flex: none; }
 .bc-groupav-a { position: absolute; line-height: 0; }
 .bc-headtap {

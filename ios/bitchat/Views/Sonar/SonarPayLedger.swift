@@ -311,11 +311,24 @@ final class SonarPaymentActivityLedger: ObservableObject {
         }
     }
 
+    /// Newest-first activity, sorted once per mutation rather than per read.
+    ///
+    /// This used to sort `entries.values` on every access, and the wallet
+    /// screen reads it several times per SwiftUI `body` evaluation — so opening
+    /// and scrolling the Activity list re-sorted the whole ledger over and
+    /// over. `activities(peerKey:)` sorts-then-filters through here too.
     var sorted: [SonarPaymentActivity] {
-        entries.values.sorted {
+        if let cached = sortedCache { return cached }
+        let value = entries.values.sorted {
             ($0.settledAt ?? $0.createdAt) > ($1.settledAt ?? $1.createdAt)
         }
+        sortedCache = value
+        return value
     }
+
+    /// Invalidated by every mutator; `entries` is private(set) so this class is
+    /// the only writer and the cache cannot go stale behind our back.
+    private var sortedCache: [SonarPaymentActivity]?
 
     func activities(peerKey: String) -> [SonarPaymentActivity] {
         sorted.filter { $0.peerKey == peerKey }
@@ -325,6 +338,7 @@ final class SonarPaymentActivityLedger: ObservableObject {
     func recordPending(_ activity: SonarPaymentActivity) -> Bool {
         guard entries[activity.id] == nil else { return false }
         entries[activity.id] = activity
+        sortedCache = nil
         persist()
         return true
     }
@@ -338,6 +352,7 @@ final class SonarPaymentActivityLedger: ObservableObject {
         entry.settledAt = payment.timestamp
         entry.failure = nil
         entries[id] = entry
+        sortedCache = nil
         persist()
         return true
     }
@@ -349,12 +364,14 @@ final class SonarPaymentActivityLedger: ObservableObject {
         entry.failure = message
         entry.settledAt = Date()
         entries[id] = entry
+        sortedCache = nil
         persist()
         return true
     }
 
     func wipe() {
         entries = [:]
+        sortedCache = nil
         defaults.removeObject(forKey: key)
     }
 
