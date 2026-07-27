@@ -8503,6 +8503,14 @@ final class SonarAppStore: ObservableObject {
     /// Record the call-log entry, clear state, and pop the call screen.
     private func finalizeCall(_ c: SNActiveCall, _ ev: CallEventInfo) {
         callTickerTask?.cancel(); callTickerTask = nil
+        // The event loop outlives the call it was started for unless we stop it
+        // here — only `resetCallState()` (wipe/erase) used to cancel it. It parks
+        // in 1s `callWaitEvent` slices, so it re-took a node lease every second
+        // forever after the first call of the session, keeping the SQLCipher
+        // handle hot and delaying `closeNode()`. Thread 22 of the 1.12.3 (31)
+        // 0xdead10cc crash log was this loop, 8h into the process (R-020).
+        // `startCallLoop()` is idempotent, so the next call restarts it.
+        callLoopTask?.cancel(); callLoopTask = nil
         SonarCallAudioRoute.configure(active: false, speakerOn: false)
         let secs = Int(ev.durationSecs)
         recordCall(convId: c.convId, video: c.video, mine: !c.incoming, seconds: secs)

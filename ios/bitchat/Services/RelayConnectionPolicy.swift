@@ -31,6 +31,23 @@ enum RelayConnectionPolicy {
         startEpoch == currentEpoch
     }
 
+    /// Whether a *self-healing* relay reconnect may open the store right now.
+    ///
+    /// These fire on a timer with nobody waiting on them — the polling loop's
+    /// idle-timeout retry, a failed connect's backoff retry, the post-local-open
+    /// attach. While the app is backgrounded that makes them the paths that can
+    /// REOPEN the SQLCipher store after `closeNode()` released it for
+    /// suspension, and RunningBoard then kills the process with 0xdead10cc
+    /// (R-020). Note the reopen is self-sustaining: `connect()` ends with
+    /// `startPolling()`, whose next idle timeout arms the retry again.
+    ///
+    /// Deliberate reopens are NOT gated here and must keep calling
+    /// `connectRelaysIfNeeded()` directly: the push wake
+    /// (`ensureRelayConnected`) legitimately needs relays while backgrounded and
+    /// owns its own bounded close afterwards, and the foreground resume is not
+    /// backgrounded by definition.
+    static func mayAutoReconnect(appBackgrounded: Bool) -> Bool { !appBackgrounded }
+
     /// Whether a push wake should drop the relay latch.
     ///
     /// Only a real background scene can have had its sockets suspended. `.inactive`

@@ -49,6 +49,26 @@ struct RelayConnectionPolicyTests {
         #expect(RelayConnectionPolicy.latchAfterAttach(startEpoch: 4, currentEpoch: 4))
     }
 
+    @Test("a backgrounded app must not self-heal its relay connection")
+    func backgroundedAppMustNotSelfHealRelayConnection() {
+        // Consumed by `MarmotChatModel.scheduleRelayConnect`, which is the timer
+        // behind all three self-healing retries (polling idle, connect backoff,
+        // post-local-open attach). Flipping this to true reopens the SQLCipher
+        // store that `suspendStoreForBackground()` just closed, and because
+        // `connect()` ends with `startPolling()` whose idle timeout arms the
+        // retry again, the reopen sustains itself until RunningBoard kills the
+        // process with 0xdead10cc — TestFlight 1.12.3 (31), R-020.
+        #expect(RelayConnectionPolicy.mayAutoReconnect(appBackgrounded: true) == false)
+    }
+
+    @Test("a foreground app still self-heals its relay connection")
+    func foregroundAppStillSelfHealsRelayConnection() {
+        // The gate must be background-only: returning false here would strand a
+        // foreground app on a dead websocket after any relay drop, since the
+        // polling loop's idle branch is the only thing that retries.
+        #expect(RelayConnectionPolicy.mayAutoReconnect(appBackgrounded: false))
+    }
+
     @Test("push while app is visible keeps the healthy node")
     func pushWhileVisibleKeepsHealthyNode() {
         // `.inactive` maps to appVisible: true — Control Center or a system

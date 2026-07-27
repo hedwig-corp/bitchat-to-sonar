@@ -749,6 +749,23 @@ final class MarmotChatModel: ObservableObject {
     /// a fire-and-forget Task alone often loses the race with Transponder NSE.
     func suspendStoreForBackground() {
         #if os(iOS)
+        // Quiesce the same machinery `closeStoreAfterBackgroundWake()` does, and
+        // for the same reason. Leaving the polling loop running was the round-4
+        // 0xdead10cc hole (R-020): its `waitForMarmotEvent` slices all fail
+        // `notConnected` once the node is gone, `try?` swallows them, and 25s
+        // later the idle branch's `ensureSubscriptions()` throws plain
+        // `notConnected` — NOT a suspend interrupt, so R-016's terminal check at
+        // the bottom of `startPolling()` does not fire — and arms
+        // `scheduleRelayConnect(2)`. That reopened the store while backgrounded
+        // and `connect()` restarted polling, so the cycle sustained itself for
+        // hours until RunningBoard killed us. `scheduleRelayConnect` now also
+        // refuses to fire while backgrounded; this is the other half, so no
+        // pointless 25s of `notConnected` slices runs during suspension either.
+        // Foreground resume restarts polling via performConnect / onAppear.
+        syncTask?.cancel()
+        syncTask = nil
+        relayConnectTask?.cancel()
+        relayConnectTask = nil
         let box = SNBackgroundTaskBox()
         box.set(
             UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
@@ -1139,6 +1156,22 @@ final class MarmotChatModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: nanos)
             }
             guard !Task.isCancelled else { return }
+            #if os(iOS)
+            // Checked when the timer FIRES, not when it was armed: the delay
+            // routinely straddles the foreground→background transition, and
+            // every caller of this is a self-healing retry that would otherwise
+            // reopen the SQLCipher store `suspendStoreForBackground()` just
+            // closed — RunningBoard 0xdead10cc (R-020). Dropping the attempt is
+            // safe: the foreground resume reconnects via `refreshAfterForeground`
+            // and a push wake attaches relays through `ensureRelayConnected()`,
+            // which calls `connectRelaysIfNeeded()` directly and is not gated.
+            guard RelayConnectionPolicy.mayAutoReconnect(
+                appBackgrounded: UIApplication.shared.applicationState == .background
+            ) else {
+                self?.relayConnectTask = nil
+                return
+            }
+            #endif
             self?.connectRelaysIfNeeded()
             self?.relayConnectTask = nil
         }
