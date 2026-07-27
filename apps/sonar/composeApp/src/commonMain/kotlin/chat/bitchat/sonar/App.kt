@@ -416,7 +416,14 @@ private fun HomeScreen(state: SonarAppState) {
 
             // status chip — centered pill
             Box(Modifier.fillMaxWidth().padding(bottom = 10.dp), contentAlignment = Alignment.Center) {
-                StatusChipPill(state.started, state.connecting, meshCount, syncing = state.syncing) { connSheet = true }
+                // Online == relays attached, not "the local core booted": this pill
+                // says "reaches anyone", which is only true over the internet.
+                StatusChipPill(
+                    online = state.relayOnline,
+                    connecting = state.connecting || state.relayConnecting,
+                    meshCount = meshCount,
+                    syncing = state.syncing,
+                ) { connSheet = true }
             }
 
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 120.dp)) {
@@ -558,7 +565,7 @@ private fun HomeScreen(state: SonarAppState) {
     }
 
     if (composeSheet) ComposeSheet(state) { composeSheet = false }
-    if (connSheet) ConnectivitySheet(online = state.started, meshCount = meshCount) { connSheet = false }
+    if (connSheet) ConnectivitySheet(online = state.relayOnline, meshCount = meshCount) { connSheet = false }
     if (wipeAsk) WipeConfirmSheet(onWipe = { wipeAsk = false; state.wipe() }, onClose = { wipeAsk = false })
     pendingInvite?.let { invite ->
         GroupInviteSheet(

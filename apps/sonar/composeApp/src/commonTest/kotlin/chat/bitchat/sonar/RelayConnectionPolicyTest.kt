@@ -1,6 +1,7 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -47,5 +48,88 @@ class RelayConnectionPolicyTest {
         // Backgrounded: the push wake / next foreground resume retrigger instead
         // of rebuilding sockets the OS is suspending.
         assertFalse(RelayConnectionPolicy.shouldRetrySupersededAttach(foreground = false))
+    }
+
+    @Test
+    fun first_connect_failure_retries_fast_in_foreground() {
+        // The core's quorum window is a fixed 5 s, which a radio waking from
+        // doze routinely misses, so the first failure is a network that is about
+        // to work — not an outage. Waiting the slow interval left a resumed app
+        // detached for up to 10 s with nothing on screen explaining it.
+        assertEquals(
+            1_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 1, foreground = true),
+        )
+        assertTrue(
+            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 1, foreground = true) <
+                RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 3, foreground = true),
+        )
+    }
+
+    @Test
+    fun sustained_connect_failure_backs_off() {
+        assertEquals(
+            3_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 2, foreground = true),
+        )
+        assertEquals(
+            10_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 3, foreground = true),
+        )
+        // Monotonic and capped: a long outage must not spin, nor grow unbounded
+        // past the heartbeat that re-triggers the job anyway.
+        assertEquals(
+            10_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(consecutiveFailures = 50, foreground = true),
+        )
+    }
+
+    @Test
+    fun backgrounded_attach_never_uses_the_fast_retries() {
+        // Every retry is a full SonarNode.connect. Where backgrounding really
+        // suspends sockets (mobile), that rebuild buys nothing — the same
+        // reason shouldRetrySupersededAttach refuses to loop there. The fast
+        // head is a foreground affordance ("the user just came back"), so it
+        // must not survive a real background transition.
+        //
+        // backgroundSuspendsSockets is passed explicitly: the default reads the
+        // platform actual, and this file compiles into the JVM target where it
+        // is false. See RelayConnectionPolicyDesktopTest for that half.
+        assertEquals(
+            10_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 1,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ),
+        )
+        assertEquals(
+            10_000L,
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 2,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ),
+        )
+    }
+
+    @Test
+    fun retry_delay_is_positive_for_a_zeroed_counter() {
+        // Defensive: a caller that has not incremented yet must still back off,
+        // never busy-loop rebuilding sockets.
+        assertTrue(
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 0,
+                foreground = true,
+                backgroundSuspendsSockets = true,
+            ) > 0L,
+        )
+        assertTrue(
+            RelayConnectionPolicy.connectRetryDelayMs(
+                consecutiveFailures = 0,
+                foreground = false,
+                backgroundSuspendsSockets = true,
+            ) > 0L,
+        )
     }
 }

@@ -1016,6 +1016,24 @@ close) -> this fix.
   push wake, which must attach relays precisely while backgrounded.
 - *Checking the app state when `scheduleRelayConnect` is armed.* The delay
   spans the transition; the crash case arms in the foreground and fires after.
+- *Relaxing the Compose `shouldRetrySupersededAttach(foreground)` gate the way
+  #461 relaxed its sibling `connectRetryDelayMs`.* Proposed twice off the same
+  plausible reading — `foreground` is window focus on desktop
+  (`Main.kt` `WindowFocusListener`), `platformShouldInvalidateRelayOnBackground()`
+  is `false` there, so alt-tab appears to strand a superseded attach until the
+  30 s heartbeat. **The premise is wrong: on desktop that branch is
+  unreachable.** `relayEpoch` advances only in `invalidateRelayConnection()`,
+  whose only callers are `SonarAppState.onProcessBackgrounded()` (gated on
+  `shouldInvalidateOnBackground()`, and `SonarDesktopRoot` installs only
+  `onForeground`, so it is never even reached) and Android's
+  `SonarPushProcessingService`. Epoch frozen ⇒ `latchAfterAttach` always `true`
+  ⇒ no desktop attach is ever superseded. The change would have bought nothing
+  and loosened the gate this entry exists to keep tight. `connectRetryDelayMs`
+  was a legitimate case because it only scales a delay inside a loop already
+  committed to retrying; this one decides *whether* to reconnect. Note the
+  unreachability is emergent — two independent facts, not one assertion — so a
+  desktop push or process-lifecycle path would make the branch live and this
+  rejection stale.
 
 ## Unguarded
 
@@ -1070,3 +1088,47 @@ its coverage is worse than an honest hole, because it stops people looking.
 
   **No Compose mirror.** Android has no RunningBoard file-lock kill and no App Group / NSE cross-process store, so the crash is iOS-only. `SonarAppState.ensureSonarDescriptorHex` does run the same unbounded background prefetch, where it costs battery and wakelock time rather than the process; gating it on Android is tracked follow-up work, not part of this fix.
 - **Disabled-control contrast and the claim-field tap target.** `SNPrimaryButton`'s disabled state was an opacity fade over an accent fill, which in dark mode put the near-black `onAccent` ink on a dark capsule and made the label unreadable — live on onboarding `Continue`, the Restore account sheet, and the username Claim button. Now a neutral chip (`disabledFill` / `onDisabled` / `disabledStroke`) on both platforms; the stroke exists because a bare `surface2` chip is indistinguishable from the `surface2` text inputs it sits next to (New group stacked three identical pills). Nothing pins any of it: there are 13 `SNPrimaryButton` call sites across `ios/` and `apps/sonar/`, the two platforms' disabled treatments are kept in lockstep only by the paired token names, and no test on either side renders a disabled control or asserts a contrast ratio. The username field's tap-to-focus (`@FocusState` + `simultaneousGesture` on Apple, `FocusRequester` + `clickable` on Compose) is equally unpinned — SwiftUI/Compose hit-testing needs a UI-test harness neither app has. Verified by hand in the iOS Simulator only; the Compose side has been compiled but never run.
+
+- **Compose connectivity UI must follow the relay latch, not `started`.** The
+  home status chip, the Connections sheet and Settings → Connection all read
+  `SonarAppState.started` — which only means the local encrypted core booted —
+  so a relay outage still rendered "Online · reaches anyone" and "Internet:
+  Connected · Nostr relays". The only signal the user ever got that relays were
+  down was `startRelayConnection()` toasting the raw core error
+  (`relay connect failed: no relay connected within timeout`). Since #354's
+  background invalidate every ordinary resume re-runs the attach, and a failed
+  attach leaves the previously installed node in place, that toast fired over
+  conversations that were visibly sending and receiving — an alarm on the one
+  surface that was working, and silence on the one that was not. All four
+  surfaces now read `relayOnline` (mirrors `SonarCore.isRelayConnected()`,
+  refreshed at every attach outcome, at the background invalidate, at teardown
+  and on the heartbeat), matching iOS `SonarAppStore.online`, which is already
+  gated on `marmot.relayConnected`; the failure path logs via `sonarLog` like
+  iOS does. **Pinned:** only the retry schedule
+  (`RelayConnectionPolicyTest.first_connect_failure_retries_fast_in_foreground`
+  / `sustained_connect_failure_backs_off` /
+  `backgrounded_attach_never_uses_the_fast_retries`, plus
+  `RelayConnectionPolicyDesktopTest.unfocused_desktop_window_keeps_the_fast_retries`
+  for the half that cannot live in `commonTest` — the schedule takes
+  `backgroundSuspendsSockets` rather than reading the platform actual precisely
+  so both halves stay assertable, since alt-tab on desktop suspends nothing and
+  must not be slowed to the mobile backoff). **Not pinned:** that no UI
+  surface reads `started` for internet state again, that the failure path stays
+  toast-free, and that `relayConnecting` is cleared on the first failure — all
+  three need a constructed `SonarAppState` (same root cause as the gaps above).
+  A fifth surface hand-reading `started` is exactly the original bug and nothing
+  would catch it. **The `relayConnecting` half is the sharper hole:** self-review
+  caught that leaving the flag up for the whole outage made
+  `StatusChipPill`'s `else -> "$meshCount nearby on Bluetooth"` branch
+  unreachable — the chip's offline copy, dead in exactly the state it exists
+  for. That bug lives in the interaction between a Compose flag and a `when`
+  branch order, which no test reachable today could see. If the chip's branch
+  order is ever rearranged, re-check that a sustained outage can still fall
+  through to the mesh count.
+- **A failed relay attach must still run the local half of startup.**
+  `startRelayConnection()` `continue`d on failure *before* `completeLocalStartup()`,
+  despite that function's own contract ("runs on every attach outcome … must not
+  wait on a healthy latch"). An offline cold start therefore had no conversation
+  listener, no Marmot wake loop, no BLE discovery-policy update and no invite
+  drain until relays finally came up — the local-first rule inverted by control
+  flow rather than by design. Unpinned for the same reason as above.

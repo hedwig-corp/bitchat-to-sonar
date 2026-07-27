@@ -252,7 +252,10 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
 
         // status chip
         Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp)) {
-            StatusBanner(online = state.started, connecting = state.connecting)
+            StatusBanner(
+                online = state.relayOnline,
+                connecting = state.connecting || state.relayConnecting,
+            )
         }
 
         // search affordance

@@ -66,9 +66,80 @@ object RelayConnectionPolicy {
      * separate member because it covers any timer-driven reconnect rather than a
      * superseded in-flight attach. Same polarity on purpose — if you change one,
      * read the other.
+     *
+     * **Do not "fix" `foreground` here the way [connectRetryDelayMs] does.** It
+     * looks like the same conflation of "not frontmost" with "sockets are
+     * suspended", and on desktop it looks like alt-tab strands a superseded
+     * attach until the heartbeat. It does not: on desktop this branch is
+     * unreachable. `relayEpoch` only advances in `invalidateRelayConnection()`,
+     * whose two callers are `SonarAppState.onProcessBackgrounded()` — gated on
+     * [shouldInvalidateOnBackground], `false` on JVM, and never wired anyway
+     * since `SonarDesktopRoot` installs only `onForeground` — and Android's
+     * `SonarPushProcessingService`. With the epoch frozen, [latchAfterAttach]
+     * always returns `true`, so a desktop attach is never superseded and this
+     * function is never asked. Relaxing it would therefore change nothing on
+     * desktop while loosening the gate that keeps iOS alive.
+     *
+     * That unreachability is emergent, not enforced: it is two independent facts
+     * (`false` on JVM, hook not installed) rather than one assertion. Adding any
+     * desktop push or process-lifecycle path that invalidates the latch makes
+     * this branch live, and this note wrong — re-derive it then rather than
+     * trusting it.
      */
     fun shouldRetrySupersededAttach(foreground: Boolean): Boolean = foreground
+
+    /**
+     * Backoff before retrying an attach that failed outright — the core threw,
+     * usually `NoRelayConnected` ("no relay connected within timeout").
+     *
+     * The core gives the quorum a fixed 5 s window (`RELAY_CONNECT_TIMEOUT` in
+     * `client.rs`), which a radio waking from doze, a Wi-Fi/LTE handover, or a
+     * captive-portal hop routinely misses. Because [shouldInvalidateOnBackground]
+     * makes every ordinary resume re-run the attach, the common failure in the
+     * foreground is a network that is a second away from usable — not an outage.
+     * Retry fast at first so a resume heals in about a second, then settle into
+     * the slow interval once the failures look sustained (the heartbeat
+     * re-triggers the job at that cadence anyway).
+     *
+     * Skip the fast head only where leaving the foreground actually suspends the
+     * sockets, which is what [backgroundSuspendsSockets] means — not merely
+     * "not frontmost". Every retry is a full `SonarNode.connect` (SQLCipher
+     * open, restore reconcile, relay dial), and rebuilding that against sockets
+     * the OS is tearing down buys nothing; the push wake and the next resume
+     * start a fresh job anyway. On desktop `foreground` is window focus
+     * (`Main.kt` bridges `WindowFocusListener`), and alt-tab suspends nothing —
+     * so an unfocused desktop window keeps the fast head, exactly as
+     * [shouldInvalidateOnBackground] keeps its healthy node.
+     *
+     * Passed rather than read inside so the schedule stays a pure function: a
+     * `commonTest` assertion about the backgrounded branch compiles into the JVM
+     * target, where the platform actual is `false`.
+     *
+     * **This deliberately does NOT share polarity with
+     * [shouldRetrySupersededAttach] / iOS `shouldAutoReconnect`, and must not be
+     * "made consistent" with them.** Those decide *whether* to reconnect at all,
+     * which on iOS is what reopens a closed SQLCipher store and gets the process
+     * killed (`R-020`) — so they gate on bare `!foreground`, the conservative
+     * answer. This one only scales a delay inside a loop that is already running
+     * and already committed to retrying, so the extra precision costs nothing
+     * and buys desktop its fast head back. Widening those two the same way is a
+     * separate change that has to keep the iOS gate intact.
+     */
+    fun connectRetryDelayMs(
+        consecutiveFailures: Int,
+        foreground: Boolean,
+        backgroundSuspendsSockets: Boolean = shouldInvalidateOnBackground(),
+    ): Long = when {
+        !foreground && backgroundSuspendsSockets -> RELAY_RETRY_SLOW_MS
+        consecutiveFailures <= 1 -> RELAY_RETRY_FAST_MS
+        consecutiveFailures == 2 -> RELAY_RETRY_MEDIUM_MS
+        else -> RELAY_RETRY_SLOW_MS
+    }
 }
+
+private const val RELAY_RETRY_FAST_MS = 1_000L
+private const val RELAY_RETRY_MEDIUM_MS = 3_000L
+private const val RELAY_RETRY_SLOW_MS = 10_000L
 
 /** Android/iOS-style process background: true. Desktop focus loss: false. */
 internal expect fun platformShouldInvalidateRelayOnBackground(): Boolean
