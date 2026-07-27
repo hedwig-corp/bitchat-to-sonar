@@ -6746,7 +6746,11 @@ class SonarAppState(private val scope: CoroutineScope) {
     /** Import results arrive after platform file IO. Queue the first selected
      * attachment behind the pre-existing direct-chat setup, then send using the
      * resolved group id rather than the transient pending chat id. */
-    internal fun sendDroppedAttachments(chatId: String, dropped: DroppedFiles) {
+    internal fun sendDroppedAttachments(
+        chatId: String,
+        dropped: DroppedFiles,
+        onRouteFailure: (() -> Unit)? = null,
+    ) {
         if (dropped.files.isEmpty()) {
             toast = "Couldn't attach that file."
             return
@@ -6763,9 +6767,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
                 AttachmentRoutePreparation.Unavailable -> {
                     toast = "This contact must be online to receive files."
+                    onRouteFailure?.invoke()
                 }
                 AttachmentRoutePreparation.Failed -> {
                     toast = "Couldn't set up a secure file transfer."
+                    onRouteFailure?.invoke()
                 }
             }
         }
@@ -9052,7 +9058,21 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun cancelPendingShare() {
+        markShareResolved(pendingShare)
         pendingShare = null
+    }
+
+    /**
+     * Record durably that the user resolved this share, so a task restored
+     * after process death recognises the redelivered intent instead of
+     * offering it again.
+     *
+     * Written at RESOLUTION, never at hand-off: a process killed while the
+     * picker was still open must re-offer the share, because `pendingShare`
+     * itself does not survive that death.
+     */
+    private fun markShareResolved(content: SharedContent?) {
+        content?.consumedMarker?.let { SonarCore.saveBlob(CONSUMED_SHARE_BLOB_KEY, it) }
     }
 
     /**
@@ -9064,13 +9084,28 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun sendPendingShare(chatId: String, open: () -> Unit) {
         val content = pendingShare ?: return
         pendingShare = null
+        // Picking a recipient IS the resolution — mark it before any send, so a
+        // process death mid-send cannot resurrect the intent and re-deliver
+        // text that already went out.
+        markShareResolved(content)
         // Leave the picker before opening the chat so Back from the chat lands
         // on Home rather than re-showing the resolved share.
         back()
         open()
         content.text?.takeIf { it.isNotBlank() }?.let { send(chatId, it) }
         if (content.files.files.isNotEmpty()) {
-            sendDroppedAttachments(chatId, content.files)
+            sendDroppedAttachments(chatId, content.files) {
+                // Transient route failure (out-of-range mesh peer, failed
+                // secure-chat setup). Keep the files and reopen the picker so
+                // the user can retry — the picker deliberately lists
+                // out-of-range rows, so this is reachable by design. Apple does
+                // the same in `SonarShareIntake.sendPendingShare`.
+                //
+                // Text is dropped from the retry: it was already sent above,
+                // and re-offering it would deliver it twice.
+                pendingShare = content.copy(text = null)
+                if (screen !is Screen.ShareTo) push(Screen.ShareTo)
+            }
         } else if (content.files.rejectedCount > 0) {
             toast = "Some files couldn't be attached."
         }

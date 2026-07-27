@@ -161,6 +161,24 @@ extension SonarAppStore {
         openDM(conversationID)
 
         if let text, !text.isEmpty {
+            // Record that the text is spoken for BEFORE sending it. The staged
+            // manifest outlives this process; if we die between the send and the
+            // attachment work finishing, relaunch re-ingests the manifest, and
+            // with the text still in it the user would send it a second time.
+            // Rewriting first makes the crash window offer files only.
+            if !fileURLs.isEmpty {
+                try? SonarShareInbox.commit(
+                    SonarSharePayload(
+                        version: share.payload.version,
+                        id: payloadID,
+                        createdAt: share.payload.createdAt,
+                        text: nil,
+                        items: share.payload.items,
+                        droppedCount: droppedCount
+                    ),
+                    appGroupID: groupID
+                )
+            }
             sendDm(conversationID, text)
         }
 

@@ -25,6 +25,17 @@ internal data class DroppedFiles(
 internal data class SharedContent(
     val text: String?,
     val files: DroppedFiles,
+    /**
+     * Fingerprint of the delivering intent, recorded durably only once the user
+     * resolves this share (sends or cancels).
+     *
+     * Deliberately NOT recorded at hand-off: a process killed while the picker
+     * is still open would then have the restored intent suppressed while
+     * `pendingShare` — memory-only — died with the process, silently losing a
+     * share the user never resolved. Marking at resolution means an unresolved
+     * share is correctly re-offered.
+     */
+    val consumedMarker: String? = null,
 ) {
     val isEmpty: Boolean
         get() = text.isNullOrBlank() && files.files.isEmpty()
@@ -37,6 +48,13 @@ internal data class SharedContent(
             else -> "${files.files.size} files"
         }
 }
+
+/**
+ * Blob key holding the fingerprint of the last share the user actually
+ * resolved. Read on Android when a task is restored, to tell a redelivered root
+ * ACTION_SEND intent from a genuinely new share.
+ */
+internal const val CONSUMED_SHARE_BLOB_KEY = "share.lastConsumedSignature"
 
 /** A `sinvite1` token followed by its hex payload, anywhere in the input. */
 internal val INVITE_TOKEN_IN_TEXT = Regex("sinvite1[0-9a-fA-F]{2,}")

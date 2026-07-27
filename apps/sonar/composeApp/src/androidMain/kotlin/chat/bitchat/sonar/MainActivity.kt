@@ -39,7 +39,6 @@ class MainActivity : ComponentActivity() {
         const val DEBUG_MESH_TIMEOUT_MS = 45_000L
         const val DEBUG_MESH_RETRY_MS = 1_000L
         const val DEBUG_MESH_TAG = "SonarBleDebug"
-        const val CONSUMED_SHARE_BLOB_KEY = "share.lastConsumedSignature"
     }
 
     @Volatile
@@ -425,17 +424,24 @@ class MainActivity : ComponentActivity() {
         // same Intent and same-process recreation; the persisted-signature
         // guard above closes the process-death + task-restore case. Same
         // pattern as handleNotificationIntent.
+        // Clears only the in-process extras. The DURABLE marker is written by
+        // SonarAppState when the user actually resolves the share (sends or
+        // cancels) — writing it here would suppress the restored intent after a
+        // process death that happened while the picker was still open, and
+        // `pendingShare` does not survive that death, so the share would be
+        // lost rather than re-offered.
         fun consume() {
             intent.removeExtra(Intent.EXTRA_TEXT)
             intent.removeExtra(Intent.EXTRA_STREAM)
-            SonarCore.saveBlob(CONSUMED_SHARE_BLOB_KEY, signature)
         }
 
         // Pure text share: there is no content:// I/O to do, so submit
         // synchronously and avoid adding any latency before the picker opens.
         if (uris.isEmpty()) {
             if (text == null) return
-            SonarLifecycle.submitSharedContent(SharedContent(text, DroppedFiles(emptyList(), 0)))
+            SonarLifecycle.submitSharedContent(
+                SharedContent(text, DroppedFiles(emptyList(), 0), consumedMarker = signature)
+            )
             consume()
             return
         }
@@ -452,12 +458,12 @@ class MainActivity : ComponentActivity() {
             val files = withContext(Dispatchers.IO) { readSharedFiles(uris) }
             if (text == null && files.files.isEmpty()) {
                 if (files.rejectedCount > 0) {
-                    SonarLifecycle.submitSharedContent(SharedContent(null, files))
+                    SonarLifecycle.submitSharedContent(SharedContent(null, files, consumedMarker = signature))
                     consume()
                 }
                 return@launch
             }
-            SonarLifecycle.submitSharedContent(SharedContent(text, files))
+            SonarLifecycle.submitSharedContent(SharedContent(text, files, consumedMarker = signature))
             consume()
         }
     }
