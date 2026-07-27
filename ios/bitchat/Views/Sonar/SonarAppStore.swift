@@ -7607,6 +7607,27 @@ final class SonarAppStore: ObservableObject {
         let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
         guard sats > 0, !dest.isEmpty else { return nil }
         guard case .ready = walletState else { return "Set up the wallet first." }
+
+        // A BOLT11 invoice carries its own amount, and the wallet takes it from
+        // there. Two failure modes come out of ignoring that, both seen on
+        // device:
+        //
+        //  * an amountless invoice is simply unpayable — the SDK answers
+        //    "Amount is missing: Expected invoice with an amount" no matter what
+        //    amount we pass, so let the user know instead of taking an amount
+        //    and failing after the fact;
+        //  * supplying our own amount for an invoice that already has one risks
+        //    "Receiver amount and invoice amount do not match", so we pass none
+        //    and let the invoice speak.
+        //
+        // Offers and addresses are the opposite — they need the amount from us.
+        let lower = dest.lowercased()
+        let isBolt11 = lower.hasPrefix("lnbc") || lower.hasPrefix("lntb") || lower.hasPrefix("lnbcrt")
+        if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
+            return "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
+        }
+        let amountForWallet: Int64 = isBolt11 ? 0 : sats
+
         let activityId = UUID().uuidString.lowercased()
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
@@ -7625,7 +7646,7 @@ final class SonarAppStore: ObservableObject {
         do {
             let payment = try await wallet.send(
                 destination: dest,
-                amountSats: sats,
+                amountSats: amountForWallet,
                 note: "Sonar payment \(activityId)"
             )
             paymentActivityLedger.markPaid(activityId, payment: payment)

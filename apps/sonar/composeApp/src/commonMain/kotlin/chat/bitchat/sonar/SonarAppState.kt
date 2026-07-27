@@ -3026,6 +3026,27 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!walletAvailable || walletState !is WalletState.Ready) {
             return "Set up the wallet first."
         }
+
+        // A BOLT11 invoice carries its own amount, and the wallet takes it from
+        // there. Two failure modes come out of ignoring that, both seen on
+        // device:
+        //
+        //  * an amountless invoice is simply unpayable — the SDK answers
+        //    "Amount is missing: Expected invoice with an amount" no matter what
+        //    amount we pass, so let the user know instead of taking an amount
+        //    and failing after the fact;
+        //  * supplying our own amount for an invoice that already has one risks
+        //    "Receiver amount and invoice amount do not match", so we pass none
+        //    and let the invoice speak.
+        //
+        // Offers and addresses are the opposite — they need the amount from us.
+        val lower = dest.lowercase()
+        val isBolt11 = lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
+        if (isBolt11 && chat.bitchat.sonar.screens.bolt11AmountSats(lower) == null) {
+            return "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
+        }
+        val amountForWallet = if (isBolt11) 0L else sats
+
         val payId = randomPayId()
         PaymentActivityStore.recordPending(
             SonarPaymentActivity(
@@ -3045,7 +3066,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         )
         scope.launch {
             var failureMessage: String? = null
-            val result = runCatching { WalletBridge.send(dest, sats, "Sonar payment $payId") }
+            val result = runCatching { WalletBridge.send(dest, amountForWallet, "Sonar payment $payId") }
                 .getOrElse {
                     failureMessage = "Payment failed: ${it.message}"
                     SendResult(false)

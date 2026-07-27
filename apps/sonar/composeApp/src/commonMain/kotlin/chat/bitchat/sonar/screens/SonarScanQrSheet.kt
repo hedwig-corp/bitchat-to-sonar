@@ -253,7 +253,8 @@ internal fun scannedKind(raw: String): ScannedKind {
             val sats = bolt11AmountSats(clean) ?: uriSats
             return ScannedKind(
                 SNIconName.Bolt, "Lightning invoice",
-                if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested" else "No amount · you choose",
+                if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested"
+                else "No amount — this invoice can't be paid",
                 sats, clean,
             )
         }
@@ -281,7 +282,8 @@ internal fun scannedKind(raw: String): ScannedKind {
             ScannedKind(
                 SNIconName.Bolt,
                 "Lightning invoice",
-                if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested" else "No amount · you choose",
+                if (sats != null) "${chat.bitchat.sonar.payFmt(sats)} sats requested"
+                else "No amount — this invoice can't be paid",
                 sats, lower,
             )
         }

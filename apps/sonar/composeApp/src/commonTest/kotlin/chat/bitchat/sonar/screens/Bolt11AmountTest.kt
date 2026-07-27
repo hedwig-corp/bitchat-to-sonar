@@ -57,7 +57,10 @@ class Bolt11AmountTest {
     fun scannedKindLabelsTheDecodedPayload() {
         assertEquals("Lightning invoice", scannedKind("lnbc21u1p3k9").name)
         assertEquals("2,100 sats requested", scannedKind("lnbc21u1p3k9").sub)
-        assertEquals("No amount · you choose", scannedKind("lnbc1p3k9").sub)
+        // Breez SDK Liquid takes a BOLT11's amount from the invoice, so an
+        // amountless one cannot be paid at all — say so on the card rather
+        // than inviting an amount and failing at send time.
+        assertEquals("No amount — this invoice can't be paid", scannedKind("lnbc1p3k9").sub)
         assertEquals("Bolt12 offer", scannedKind("lno1pg257enx").name)
         assertEquals("Lightning address", scannedKind("vincenzo@stacker.news").sub)
         assertEquals("Bitcoin address", scannedKind("bc1q9x2v8fz4").name)

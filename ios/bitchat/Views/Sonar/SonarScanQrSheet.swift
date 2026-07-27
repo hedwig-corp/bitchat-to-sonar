@@ -234,7 +234,7 @@ struct SNScannedKind {
                 let sats = SNScannedKind.bolt11AmountSats(clean) ?? uriSats
                 icon = .bolt
                 name = "Lightning invoice"
-                sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount · you choose"
+                sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount — this invoice can't be paid"
                 fixedSats = sats
                 destination = clean
                 return
@@ -264,7 +264,7 @@ struct SNScannedKind {
             let sats = SNScannedKind.bolt11AmountSats(lower)
             icon = .bolt
             name = "Lightning invoice"
-            sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount · you choose"
+            sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount — this invoice can't be paid"
             fixedSats = sats
             destination = lower
         } else if bare.contains("@") {
