@@ -32,6 +32,7 @@ import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.wallet.claimNotifiedPaymentId
+import chat.bitchat.sonar.wallet.settleWakeOutcome
 import chat.bitchat.sonar.wallet.wasPaymentNotified
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.WalletBridge
@@ -564,6 +565,15 @@ class SonarPushProcessingService : Service() {
                 val nsec = SonarCore.identityNsec()
                 if (nsec.isBlank()) {
                     Log.d(TAG, "Breez wakeup skipped: no identity")
+                    // Should be unreachable — no identity means no wallet, no
+                    // offer and no NDS registration, so no invoice_request for
+                    // us can exist. Answer anyway if one somehow does: every
+                    // other abandon path replies, and an unreachable branch that
+                    // silently hangs a payer is exactly the asymmetry that made
+                    // the original bug hard to see.
+                    if (notificationType == NOTIF_TYPE_INVOICE_REQUEST) {
+                        replyInvoiceRequestError(payload, "wallet unavailable")
+                    }
                     events.cancel()
                     return@coroutineScope
                 }
@@ -736,30 +746,31 @@ class SonarPushProcessingService : Service() {
         seenThisWake: MutableSet<String>,
         liveEvent: Boolean,
     ): Boolean {
-        val firstThisWake = seenThisWake.add(ev.paymentId)
-        if (!ev.settled) {
-            // PENDING: lockup seen, claim in flight. Funds are arriving, so this
-            // still ends the wake (that is why recentIncomingReceives asks for
-            // PENDING at all) — but it must NOT notify or write a permanent
-            // `Paid` row: the swap can still fail or the lockup be reorged, and
-            // claiming the notify slot now would block the eventual correction
-            // AND suppress the real "received" banner when it completes.
-            // Exclude one we already announced, or a stale pending row would
-            // end every wake for the rest of the lookback window.
-            return firstThisWake && !wasPaymentNotified(ev.paymentId)
+        // The decision itself is a pure function so it can be pinned — see
+        // settleWakeOutcome / SettleWakeOutcomeTest. Keeping it inline here is
+        // what let it regress once with every test still green.
+        val outcome = settleWakeOutcome(
+            settled = ev.settled,
+            liveEvent = liveEvent,
+            firstThisWake = seenThisWake.add(ev.paymentId),
+            alreadyNotified = wasPaymentNotified(ev.paymentId),
+        )
+        if (outcome.notifies) {
+            // Ledger capture (idempotent) — normally already recorded at the
+            // event source; this covers poll payments the listener never saw.
+            PaymentActivityStore.recordIncomingWalletPayment(ev)
+            // Re-check by claiming: `alreadyNotified` above is a read, and the
+            // SDK callback thread can claim between the two. The claim is the
+            // authority on who owns the banner.
+            if (claimNotifiedPaymentId(ev.paymentId)) {
+                SonarNotificationRouter.buildWalletReceive(
+                    idKey = "wallet-${ev.paymentId}",
+                    sats = ev.amountSats,
+                    prefs = prefs,
+                )?.let { Notifier.notify(it.id, it.title, it.body) }
+            }
         }
-        // Ledger capture (idempotent) — normally already recorded at the event
-        // source; this covers poll-fallback payments the listener never saw.
-        PaymentActivityStore.recordIncomingWalletPayment(ev)
-        val claimed = claimNotifiedPaymentId(ev.paymentId)
-        if (claimed) {
-            SonarNotificationRouter.buildWalletReceive(
-                idKey = "wallet-${ev.paymentId}",
-                sats = ev.amountSats,
-                prefs = prefs,
-            )?.let { Notifier.notify(it.id, it.title, it.body) }
-        }
-        return claimed || (liveEvent && firstThisWake)
+        return outcome.endsWake
     }
 
     override fun onDestroy() {
