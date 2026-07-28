@@ -92,13 +92,20 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
     }
 }
 
+/// Built once. `NumberFormatter` is expensive to allocate and this is on the
+/// payment-status screen's 1 Hz render path — a live payment re-derives the
+/// headline, money line and wallet row every tick.
+private let sonarSatsFormatter: NumberFormatter = {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    return f
+}()
+
 /// Locale-grouped sats with no unit — "2,100". Use this when the amount is
 /// composed into a longer phrase ("2,100 sats in flight"); `sonarFormatSats`
 /// already carries the unit and appending another one reads "2,100 sats sats".
 func sonarGroupedSats(_ sats: Int64) -> String {
-    let f = NumberFormatter()
-    f.numberStyle = .decimal
-    return f.string(from: NSNumber(value: sats)) ?? String(sats)
+    sonarSatsFormatter.string(from: NSNumber(value: sats)) ?? String(sats)
 }
 
 /// Minimal, locale-grouped sats formatting — the ONLY money formatting done

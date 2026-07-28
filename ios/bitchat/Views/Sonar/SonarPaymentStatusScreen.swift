@@ -30,9 +30,6 @@ struct SonarPaymentStatusScreen: View {
 
     let activityId: String
 
-    /// Drives the .spin keyframes on the live indicator.
-    @State private var spinning = false
-
     /// The screen follows a retry onto the new activity without a push, so
     /// Back still lands on home rather than on a stack of attempts.
     @State private var retriedId: String?
@@ -76,7 +73,6 @@ struct SonarPaymentStatusScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
-        .onAppear { spinning = true }
     }
 
     // MARK: .rs-sheet
@@ -100,7 +96,9 @@ struct SonarPaymentStatusScreen: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 if status.phase.isLive {
-                    // .rs-x — same effect as the dismiss action below it.
+                    // .rs-x — closes the screen only. Unlike the labelled
+                    // Cancel action below, it never aborts the payment: ✕ is
+                    // "I am done looking", Cancel is "do not send this".
                     SNIconButton(action: { store.pop() }) {
                         SNIcon(name: .x, size: 14, weight: 2.4)
                             .foregroundColor(SonarTheme.text2)
@@ -180,11 +178,7 @@ struct SonarPaymentStatusScreen: View {
                             phase.isWarn ? SonarTheme.goldFill : SonarTheme.accent,
                             style: StrokeStyle(lineWidth: 4, lineCap: .round)
                         )
-                        .rotationEffect(.degrees(spinning ? 360 : 0))
-                        .animation(
-                            .linear(duration: 1).repeatForever(autoreverses: false),
-                            value: spinning
-                        )
+                        .modifier(SNSpinForever())
                 )
                 .padding(2)
         } else {

@@ -308,6 +308,11 @@ settled one belongs in wallet Activity, not pinned over the chat list. A
 it can never resolve itself, and a banner that never goes away is worse than
 none. Tapping the strip opens the status screen.
 
+The `✕` on the status card closes the screen and nothing else — only the
+labelled `Cancel` aborts a payment, and only while it has not reached the wallet.
+Two dismiss affordances with different money semantics is deliberate (`✕` is
+"I am done looking"), so do not collapse them.
+
 That whole decision lives in `snHomeStripStatus` / `homeStripStatus` — pure, and
 the call sites are one-line delegates — so the rule is pinned where it is
 actually decided rather than in a helper the test feeds itself

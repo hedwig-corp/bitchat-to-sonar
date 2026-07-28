@@ -182,7 +182,9 @@ private fun StatusCard(
                 )
             }
             if (status.phase.isLive) {
-                // .rs-x — same effect as the dismiss action below it.
+                // .rs-x — closes the screen only. Unlike the labelled Cancel
+                // action below, it never aborts the payment: ✕ is "I am done
+                // looking", Cancel is "do not send this".
                 Box(
                     Modifier.size(30.dp).clip(CircleShape).background(s.surface2)
                         .clickable(onClick = onClose),
