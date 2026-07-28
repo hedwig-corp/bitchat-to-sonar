@@ -3944,9 +3944,29 @@ class SonarAppState(private val scope: CoroutineScope) {
         chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
     }
 
+    /** Whole policy snapshot for the redesigned backup screen (stats + cadence). */
+    var backupPolicy by mutableStateOf<BackupPolicySnapshot?>(null)
+
+    /** Account footprint for Settings → Storage; null until measured. */
+    var storageBytes by mutableStateOf<Long?>(null)
+
+    /**
+     * Measure the account's on-disk size off the UI thread.
+     *
+     * Walks the account directory, so it must never run on the Compose render
+     * path — Settings calls it once on open.
+     */
+    fun refreshStorageBytes() {
+        scope.launch(Dispatchers.Default) {
+            val measured = runCatching { SonarCore.accountStorageBytes() }.getOrNull()
+            if (measured != null) storageBytes = measured
+        }
+    }
+
     fun refreshBackupPolicy() {
         runCatching {
             val policy = SonarCore.getBackupPolicy()
+            backupPolicy = policy
             autoBackupEnabled = policy.enabled
             autoBackupStatusLine = when {
                 policy.lastSuccessAt != null && policy.lastSuccessAt > 0L ->
