@@ -35,6 +35,28 @@ final class SonarPaymentStatusTests: XCTestCase {
         )
     }
 
+    private func activity(_ status: SonarPaymentActivity.Status) -> SonarPaymentActivity {
+        SonarPaymentActivity(
+            id: "a1",
+            kind: .sonarDirect,
+            peerKey: "wallet",
+            peerName: "Café Lumen",
+            direction: .outgoing,
+            sats: 2_100,
+            via: "internet",
+            createdAt: Date(),
+            destinationHash: "hash",
+            status: status
+        )
+    }
+
+    private func liveSend() -> SNLivePayment {
+        SNLivePayment(
+            id: "a1", payeeName: "Café Lumen", sats: 2_100,
+            startedAt: Date(), handedToWallet: true
+        )
+    }
+
     // MARK: Live phase derivation
 
     func testResolvingUntilTheWalletIsCalled() {
@@ -175,5 +197,81 @@ final class SonarPaymentStatusTests: XCTestCase {
         // sonarFormatSats, rendering "2,100 sats sats".
         let label = "Continue · \(sonarFormatSats(2_100))"
         XCTAssertEqual(label.components(separatedBy: "sats").count - 1, 1)
+    }
+
+    // MARK: Home-strip visibility
+
+    func testStripShowsOnlyWhileTheSendIsLiveAndPending() {
+        XCTAssertTrue(
+            snShowsOnHomeStrip(live: liveSend(), activity: activity(.pending)),
+            "a live, still-pending send is exactly what the strip is for"
+        )
+    }
+
+    func testStripClearsOnSettleOrFailure() {
+        // The owner's explicit requirement: gone the moment it concludes.
+        for status in [SonarPaymentActivity.Status.paid, .failed] {
+            XCTAssertFalse(
+                snShowsOnHomeStrip(live: liveSend(), activity: activity(status)),
+                "\(status.rawValue) must not stay pinned over the chat list"
+            )
+        }
+    }
+
+    func testStripIgnoresAPendingRowLeftByAKilledProcess() {
+        // No live send means nothing will ever resolve this row, so a banner
+        // would sit there forever.
+        XCTAssertFalse(snShowsOnHomeStrip(live: nil, activity: activity(.pending)))
+        XCTAssertFalse(snShowsOnHomeStrip(live: liveSend(), activity: nil))
+    }
+
+    // MARK: The call site's decision, not just the helper
+
+    func testHomeStripShowsTheLiveInFlightPayment() {
+        let started = Date()
+        let live = SNLivePayment(
+            id: "a1", payeeName: "Café Lumen", sats: 2_100,
+            startedAt: started, handedToWallet: true
+        )
+        let status = snHomeStripStatus(
+            livePayments: ["a1": live],
+            activityOf: { _ in self.activity(.pending) },
+            now: started.addingTimeInterval(6)
+        )
+        XCTAssertEqual(status?.phase, .paying)
+        XCTAssertEqual(status?.payeeName, "Café Lumen")
+    }
+
+    func testHomeStripClearsTheMomentThePaymentConcludes() {
+        // The owner's explicit requirement. This is the test that fails if the
+        // gate is dropped from the call site.
+        for concluded in [SonarPaymentActivity.Status.paid, .failed] {
+            XCTAssertNil(
+                snHomeStripStatus(
+                    livePayments: ["a1": liveSend()],
+                    activityOf: { _ in self.activity(concluded) },
+                    now: Date()
+                ),
+                "\(concluded.rawValue) must not stay pinned over the chat list"
+            )
+        }
+    }
+
+    func testHomeStripStaysEmptyWithoutALiveSend() {
+        XCTAssertNil(
+            snHomeStripStatus(
+                livePayments: [:],
+                activityOf: { _ in self.activity(.pending) },
+                now: Date()
+            )
+        )
+        // A pending row whose activity is gone (wiped) shows nothing either.
+        XCTAssertNil(
+            snHomeStripStatus(
+                livePayments: ["a1": liveSend()],
+                activityOf: { _ in nil },
+                now: Date()
+            )
+        )
     }
 }

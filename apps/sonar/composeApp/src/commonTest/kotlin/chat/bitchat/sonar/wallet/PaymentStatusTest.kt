@@ -3,6 +3,7 @@ package chat.bitchat.sonar.wallet
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -208,6 +209,87 @@ class PaymentStatusTest {
         assertEquals(
             "Sending 2,100 sats" to "Café Lumen · tap for details",
             PayStatusCopy.homeStrip(PayPhase.Paying, "Café Lumen", 2_100),
+        )
+    }
+
+    @Test
+    fun stripShowsOnlyWhileTheSendIsLiveAndPending() {
+        assertTrue(
+            showsOnHomeStrip(live(), activity(SonarPaymentActivity.Status.Pending)),
+            "a live, still-pending send is exactly what the strip is for",
+        )
+    }
+
+    @Test
+    fun stripClearsOnSettleOrFailure() {
+        // The owner's explicit requirement: gone the moment it concludes.
+        for (status in listOf(
+            SonarPaymentActivity.Status.Paid,
+            SonarPaymentActivity.Status.Failed,
+        )) {
+            assertFalse(
+                showsOnHomeStrip(live(), activity(status)),
+                "$status must not stay pinned over the chat list",
+            )
+        }
+    }
+
+    @Test
+    fun stripIgnoresAPendingRowLeftByAKilledProcess() {
+        // No live send means nothing will ever resolve this row, so a banner
+        // would sit there forever.
+        assertFalse(showsOnHomeStrip(null, activity(SonarPaymentActivity.Status.Pending)))
+        assertFalse(showsOnHomeStrip(live(), null))
+    }
+
+    // ── the call site's decision, not just the helper ──
+
+    @Test
+    fun homeStripShowsTheLiveInFlightPayment() {
+        val status = homeStripStatus(
+            livePayments = mapOf("a1" to live()),
+            activityOf = { activity(SonarPaymentActivity.Status.Pending) },
+            nowSecs = 1_006,
+        )
+        assertEquals(PayPhase.Paying, status?.phase)
+        assertEquals("Café Lumen", status?.payeeName)
+    }
+
+    @Test
+    fun homeStripClearsTheMomentThePaymentConcludes() {
+        // The owner's explicit requirement. This is the test that fails if the
+        // gate is dropped from the call site.
+        for (concluded in listOf(
+            SonarPaymentActivity.Status.Paid,
+            SonarPaymentActivity.Status.Failed,
+        )) {
+            assertNull(
+                homeStripStatus(
+                    livePayments = mapOf("a1" to live()),
+                    activityOf = { activity(concluded) },
+                    nowSecs = 1_006,
+                ),
+                "$concluded must not stay pinned over the chat list",
+            )
+        }
+    }
+
+    @Test
+    fun homeStripStaysEmptyWithoutALiveSend() {
+        assertNull(
+            homeStripStatus(
+                livePayments = emptyMap(),
+                activityOf = { activity(SonarPaymentActivity.Status.Pending) },
+                nowSecs = 1_006,
+            ),
+        )
+        // A pending row whose activity is gone (wiped) shows nothing either.
+        assertNull(
+            homeStripStatus(
+                livePayments = mapOf("a1" to live()),
+                activityOf = { null },
+                nowSecs = 1_006,
+            ),
         )
     }
 }

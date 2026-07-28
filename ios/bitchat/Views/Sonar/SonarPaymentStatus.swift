@@ -308,3 +308,86 @@ enum SNPayStatusCopy {
         }
     }
 }
+
+/// Whether an external payment belongs on the H1 home strip.
+///
+/// Two conditions, and both matter:
+///  - there is a **live** send in this process. A `pending` row left behind by
+///    a killed process can never resolve itself, and a banner that never goes
+///    away is worse than none.
+///  - the ledger row is still `pending`. The strip must clear the moment the
+///    payment settles or fails — a settled payment belongs in wallet Activity,
+///    not pinned over the chat list.
+///
+/// Named rather than inlined so it can be tested: the rule used to hold only
+/// because the send path happened to drop the live entry on a terminal state.
+func snShowsOnHomeStrip(live: SNLivePayment?, activity: SonarPaymentActivity?) -> Bool {
+    guard live != nil, let activity else { return false }
+    return activity.status == .pending
+}
+
+/// Project a ledger row (plus an optional live send) into the design's state
+/// machine. Pure, so it can be tested without a store. Mirrors the Compose
+/// `paymentStatusOf`.
+///
+/// The ledger is the source of truth: a live entry only refines a row that is
+/// still `pending`. A `pending` row with no live send is the honest "unknown"
+/// case — the process died mid-send and Lightning will settle or refund on its
+/// own.
+func snPaymentStatus(
+    activity: SonarPaymentActivity,
+    live: SNLivePayment?,
+    now: Date,
+    canRetry: Bool
+) -> SNPaymentStatus {
+    if let live, activity.status == .pending {
+        return SNPaymentStatus(
+            id: activity.id,
+            payeeName: live.payeeName,
+            sats: live.sats,
+            phase: live.phase(now: now),
+            elapsedSeconds: live.elapsedSeconds(now: now),
+            preimage: nil,
+            canRetry: canRetry
+        )
+    }
+    let phase: SNPayPhase
+    switch activity.status {
+    case .paid: phase = .sent
+    case .failed: phase = .failedSafe
+    case .pending: phase = .unknown
+    }
+    let reference = activity.settledAt ?? now
+    return SNPaymentStatus(
+        id: activity.id,
+        payeeName: activity.peerName,
+        sats: activity.sats,
+        phase: phase,
+        elapsedSeconds: Int(max(0, reference.timeIntervalSince(activity.createdAt))),
+        preimage: activity.preimage,
+        canRetry: canRetry
+    )
+}
+
+/// The whole H1 home-strip decision: which payment the strip shows, or none.
+///
+/// The call site is a one-line delegate to this so the rule is pinned where it
+/// is actually decided — a test against `snShowsOnHomeStrip` alone would stay
+/// green if someone dropped the gate from the call site
+/// (`docs/REGRESSIONS.md` rule 2).
+///
+/// The returned status carries `canRetry = false`: the strip renders no
+/// actions, only the phase, the payee and the amount.
+func snHomeStripStatus(
+    livePayments: [String: SNLivePayment],
+    activityOf: (String) -> SonarPaymentActivity?,
+    now: Date
+) -> SNPaymentStatus? {
+    // Oldest first: if two sends overlap, the one that has been waiting
+    // longest is the one worth surfacing.
+    guard let live = livePayments.values.min(by: { $0.startedAt < $1.startedAt }),
+          let activity = activityOf(live.id),
+          snShowsOnHomeStrip(live: live, activity: activity)
+    else { return nil }
+    return snPaymentStatus(activity: activity, live: live, now: now, canRetry: false)
+}

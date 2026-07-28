@@ -17,6 +17,7 @@ import chat.bitchat.sonar.wallet.Money
 import chat.bitchat.sonar.wallet.PaymentActivityStore
 import chat.bitchat.sonar.wallet.PaymentStatus
 import chat.bitchat.sonar.wallet.paymentStatusOf
+import chat.bitchat.sonar.wallet.homeStripStatus
 import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
@@ -1023,6 +1024,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+            clearPaymentStatusState()
             mutedUntilByChat = emptyMap() // blob dies with SonarCore.wipe()
             bip353 = ""
             callLogs.clear(); callVersion++
@@ -1087,6 +1089,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
+            clearPaymentStatusState()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
@@ -2951,6 +2954,10 @@ class SonarAppState(private val scope: CoroutineScope) {
                 stopPaymentClockIfIdle()
                 return@launch
             }
+            // Nothing suspends between the guard above and this line today, so
+            // the marker cannot be set in between — drain it anyway so a future
+            // suspension here cannot leave a stale id behind.
+            cancelledPayments -= payId
             livePayments[payId]?.let { live ->
                 livePayments = livePayments + (payId to live.copy(handedToWallet = true))
             }
@@ -3023,10 +3030,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      * is deliberately excluded — it can never resolve itself, and pinning a
      * banner over the chat list forever is worse than saying nothing.
      */
-    fun livePaymentStatus(): PaymentStatus? {
-        val live = livePayments.values.minByOrNull { it.startedAtSecs } ?: return null
-        return paymentStatus(live.id)
-    }
+    fun livePaymentStatus(): PaymentStatus? =
+        homeStripStatus(livePayments, PaymentActivityStore::get, SonarClock.nowSecs())
 
     private fun startPaymentClock() {
         if (paymentClockJob?.isActive == true) return
@@ -3042,6 +3047,22 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (livePayments.isNotEmpty()) return
         paymentClockJob?.cancel()
         paymentClockJob = null
+    }
+
+    /**
+     * Drops every trace of in-flight/past external payments held in memory.
+     *
+     * [paymentDestinations] holds PLAINTEXT Lightning destinations; the
+     * persisted ledger only ever holds a SHA-256 of them. A wipe that clears
+     * the ledger and leaves this map behind would keep exactly the data the
+     * hashing exists to avoid keeping. Mirrors iOS `clearPaymentStatusState`.
+     */
+    fun clearPaymentStatusState() {
+        paymentClockJob?.cancel()
+        paymentClockJob = null
+        livePayments = emptyMap()
+        paymentDestinations.clear()
+        cancelledPayments.clear()
     }
 
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
@@ -3827,6 +3848,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
+                clearPaymentStatusState()
                 cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++

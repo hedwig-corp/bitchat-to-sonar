@@ -289,6 +289,16 @@ tracked follow-up, not a UI change.
   needed to re-send is memory-only, so after a relaunch the action is replaced
   by `Done` rather than offering a retry that cannot run.
 
+### In-memory state and wipe
+
+`paymentDestinations` holds the **plaintext** destination of every external
+payment sent this session — the ledger only ever holds a SHA-256 of it — so
+every reset path (`wipe`, erase-all-chats, restore) calls
+`clearPaymentStatusState()` alongside the ledger wipe. That drops the plaintext
+map, the live-send map, the cancel markers, and the elapsed clock. A wipe that
+cleared the ledger and left this behind would keep exactly the data the hashing
+exists to avoid keeping.
+
 ### Home surface
 
 H1 (pinned strip) shipped, shown **only while a payment is live** and cleared on
@@ -297,6 +307,12 @@ settled one belongs in wallet Activity, not pinned over the chat list. A
 `pending` row left by a killed process is deliberately excluded from the strip:
 it can never resolve itself, and a banner that never goes away is worse than
 none. Tapping the strip opens the status screen.
+
+That whole decision lives in `snHomeStripStatus` / `homeStripStatus` — pure, and
+the call sites are one-line delegates — so the rule is pinned where it is
+actually decided rather than in a helper the test feeds itself
+(`docs/REGRESSIONS.md` rule 2). Dropping the gate fails
+`homeStripClearsTheMomentThePaymentConcludes`, verified by mutation.
 
 ### Known cross-platform gap
 

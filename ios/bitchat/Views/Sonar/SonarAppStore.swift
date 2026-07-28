@@ -2352,6 +2352,7 @@ final class SonarAppStore: ObservableObject {
         pendingPayPeer = nil
         payLedger.wipe()
         paymentActivityLedger.wipe()
+        clearPaymentStatusState()
         cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
@@ -7677,7 +7678,10 @@ final class SonarAppStore: ObservableObject {
         }
 
         let activityId = UUID().uuidString.lowercased()
-        let payeeName = displayName.isEmpty ? dest : displayName
+        // Compose falls back to a short label; falling back to the raw
+        // destination here would put a ~100-char BOLT12 offer in the status
+        // card title. Keep the two apps rendering the same thing.
+        let payeeName = displayName.isEmpty ? SNExternalDestination.displayName(dest) : displayName
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .sonarDirect,
@@ -7714,6 +7718,10 @@ final class SonarAppStore: ObservableObject {
                 self.stopPaymentClockIfIdle()
                 return
             }
+            // Nothing suspends between the guard above and this line today, so
+            // the marker cannot be set in between — drain it anyway so a future
+            // `await` here cannot leave a stale id behind.
+            self.cancelledPayments.remove(activityId)
             self.livePayments[activityId]?.handedToWallet = true
             do {
                 let payment = try await self.wallet.send(
@@ -7770,34 +7778,11 @@ final class SonarAppStore: ObservableObject {
     /// refund on its own.
     func paymentStatus(_ activityId: String) -> SNPaymentStatus? {
         guard let activity = paymentActivityLedger.entries[activityId] else { return nil }
-        let now = Date()
-        let canRetry = paymentDestinations[activityId] != nil
-        if let live = livePayments[activityId], activity.status == .pending {
-            return SNPaymentStatus(
-                id: activityId,
-                payeeName: live.payeeName,
-                sats: live.sats,
-                phase: live.phase(now: now),
-                elapsedSeconds: live.elapsedSeconds(now: now),
-                preimage: nil,
-                canRetry: canRetry
-            )
-        }
-        let phase: SNPayPhase
-        switch activity.status {
-        case .paid: phase = .sent
-        case .failed: phase = .failedSafe
-        case .pending: phase = .unknown
-        }
-        let reference = activity.settledAt ?? now
-        return SNPaymentStatus(
-            id: activityId,
-            payeeName: activity.peerName,
-            sats: activity.sats,
-            phase: phase,
-            elapsedSeconds: Int(max(0, reference.timeIntervalSince(activity.createdAt))),
-            preimage: activity.preimage,
-            canRetry: canRetry
+        return snPaymentStatus(
+            activity: activity,
+            live: livePayments[activityId],
+            now: Date(),
+            canRetry: paymentDestinations[activityId] != nil
         )
     }
 
@@ -7807,8 +7792,11 @@ final class SonarAppStore: ObservableObject {
     /// is deliberately excluded — it can never resolve itself, and pinning a
     /// banner over the chat list forever is worse than saying nothing.
     var livePaymentStatus: SNPaymentStatus? {
-        guard let live = livePayments.values.min(by: { $0.startedAt < $1.startedAt }) else { return nil }
-        return paymentStatus(live.id)
+        snHomeStripStatus(
+            livePayments: livePayments,
+            activityOf: { [weak self] in self?.paymentActivityLedger.entries[$0] },
+            now: Date()
+        )
     }
 
     private func startPaymentClock() {
@@ -7826,6 +7814,20 @@ final class SonarAppStore: ObservableObject {
         guard livePayments.isEmpty else { return }
         paymentClockTask?.cancel()
         paymentClockTask = nil
+    }
+
+    /// Drops every trace of in-flight/past external payments held in memory.
+    ///
+    /// `paymentDestinations` holds PLAINTEXT Lightning destinations; the
+    /// persisted ledger only ever holds a SHA-256 of them. A wipe that clears
+    /// the ledger and leaves this map behind would keep exactly the data the
+    /// hashing exists to avoid keeping.
+    func clearPaymentStatusState() {
+        paymentClockTask?.cancel()
+        paymentClockTask = nil
+        livePayments = [:]
+        paymentDestinations = [:]
+        cancelledPayments = []
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
@@ -9205,6 +9207,7 @@ final class SonarAppStore: ObservableObject {
         // The Lightning wallet seed/balance is separate and is NOT touched.
         payLedger.wipe()
         paymentActivityLedger.wipe()
+        clearPaymentStatusState()
         cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
@@ -9312,6 +9315,7 @@ final class SonarAppStore: ObservableObject {
         // of this async wipe, before any new onboarding can begin.
         payLedger.wipe()
         paymentActivityLedger.wipe()
+        clearPaymentStatusState()
         cancelAllMediaDownloads()
         mediaImageCache = [:]
         pendingUploadMediaCache = [:]
