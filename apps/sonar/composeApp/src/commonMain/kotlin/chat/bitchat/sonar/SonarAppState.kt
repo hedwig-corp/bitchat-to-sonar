@@ -4042,7 +4042,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
         return runCatching {
             SonarCore.uploadSealedAccountBackup(sealed)
-            SonarCore.recordBackupSuccess()
+            SonarCore.recordBackupSuccess(sealed.size.toLong())
         }.onFailure { err ->
             runCatching {
                 SonarCore.recordBackupFailure(err.message ?: "backup failed")
@@ -4194,7 +4194,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             runCatching {
                 SonarCore.uploadSealedAccountBackup(sealed)
-                SonarCore.recordBackupSuccess()
+                SonarCore.recordBackupSuccess(sealed.size.toLong())
             }.onFailure { err ->
                 runCatching {
                     SonarCore.recordBackupFailure(err.message ?: "auto-backup failed")

@@ -577,6 +577,27 @@ data class BackupPolicySnapshot(
     val lastSuccessAt: Long?,
     val lastAttemptAt: Long?,
     val lastError: String?,
+    /** Sealed size of the last successful upload; null until one succeeds. */
+    val lastSizeBytes: Long? = null,
+    /** Messages that upload covered, counted at success time. */
+    val lastMessageCount: Long? = null,
+    /** "manual" | "daily" | "weekly" — derived by core from enabled + interval. */
+    val frequency: String = "daily",
+)
+
+/** One conversation inside a sealed backup, for the dry-run preview. */
+data class BackupPreviewConversation(
+    val name: String,
+    val latestContent: String,
+    val messageCount: Long,
+)
+
+/** What restoring the latest backup would recover. Changes nothing. */
+data class AccountBackupPreview(
+    val conversations: List<BackupPreviewConversation>,
+    val totalMessages: Long,
+    val sizeBytes: Long,
+    val uploadedAtSecs: Long,
 )
 
 /**
@@ -970,8 +991,20 @@ expect object SonarCore {
 
     fun getBackupPolicy(): BackupPolicySnapshot
     fun setBackupEnabled(enabled: Boolean)
+
+    /** Settings cadence: "manual" | "daily" | "weekly". */
+    fun setBackupFrequency(frequency: String)
+
+    /** On-disk footprint of this account, excluding logs. */
+    fun accountStorageBytes(): Long
+
+    /**
+     * Dry run: what a restore would bring back. Never stages, commits, or opens
+     * the live store, so it is safe to call while chatting.
+     */
+    suspend fun previewAccountBackup(): AccountBackupPreview
     fun backupIsDue(): Boolean
-    fun recordBackupSuccess()
+    fun recordBackupSuccess(sizeBytes: Long?)
     fun recordBackupFailure(error: String)
 
     /**

@@ -914,7 +914,7 @@ actual object SonarCore {
             try {
                 val sealed = sealAccountBackup(requireNoLiveUiSession)
                 val status = uploadSealedAccountBackup(sealed)
-                runCatching { recordBackupSuccess() }
+                runCatching { recordBackupSuccess(sealed.size.toLong()) }
                 status
             } catch (t: Throwable) {
                 runCatching { recordBackupFailure(t.message ?: "backup failed") }
@@ -957,6 +957,34 @@ actual object SonarCore {
             lastSuccessAt = p.lastSuccessAt?.toLong(),
             lastAttemptAt = p.lastAttemptAt?.toLong(),
             lastError = p.lastError,
+            lastSizeBytes = p.lastSizeBytes?.toLong(),
+            lastMessageCount = p.lastMessageCount?.toLong(),
+            frequency = p.frequency,
+        )
+    }
+
+    actual fun setBackupFrequency(frequency: String) {
+        SonarNativeLoader.ensureLoaded()
+        uniffi.sonar_ffi.setBackupFrequency(marmotDbPath(), frequency)
+    }
+
+    actual fun accountStorageBytes(): Long {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.accountStorageBytes(marmotDbPath()).toLong()
+    }
+
+    actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        val nsec = DesktopSecrets.get("nsec") ?: error("no identity to preview")
+        // No lock, no closeNode: the preview never touches the live store.
+        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, null)
+        AccountBackupPreview(
+            conversations = info.conversations.map {
+                BackupPreviewConversation(it.name, it.latestContent, it.messageCount.toLong())
+            },
+            totalMessages = info.totalMessages.toLong(),
+            sizeBytes = info.sizeBytes.toLong(),
+            uploadedAtSecs = info.uploadedAtSecs.toLong(),
         )
     }
 
@@ -970,9 +998,9 @@ actual object SonarCore {
         return uniffi.sonar_ffi.backupIsDue(marmotDbPath())
     }
 
-    actual fun recordBackupSuccess() {
+    actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
-        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath())
+        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong())
     }
 
     actual fun recordBackupFailure(error: String) {
