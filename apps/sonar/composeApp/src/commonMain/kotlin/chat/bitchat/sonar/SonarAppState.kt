@@ -3963,6 +3963,23 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    /** Settings cadence: "daily" | "weekly" | "manual". Core owns the mapping. */
+    fun updateBackupFrequency(frequency: String) {
+        discloseAutoBackup()
+        runCatching { SonarCore.setBackupFrequency(frequency) }
+            .onSuccess {
+                refreshBackupPolicy()
+                // Manual only means nothing should be scheduled at the OS level
+                // either — leaving the worker armed would contradict the row.
+                if (frequency == "manual") {
+                    chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
+                } else {
+                    chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
+                }
+            }
+            .onFailure { toast = "Could not change backup frequency" }
+    }
+
     fun refreshBackupPolicy() {
         runCatching {
             val policy = SonarCore.getBackupPolicy()
