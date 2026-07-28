@@ -1081,8 +1081,14 @@ pub struct AccountBackupPreview {
 /// the node — the failure mode of a "preview" that mutates state is losing the
 /// chats the user was trying to inspect.
 pub async fn preview_account_backup(keys: &Keys, server_url: &str) -> Result<AccountBackupPreview> {
-    let hosts = backup_search_hosts(server_url)?;
-    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_with_meta(keys, &hosts).await?;
+    preview_account_backup_from(keys, &backup_search_hosts(server_url)?).await
+}
+
+/// Same, against already-validated hosts. Split out so tests can drive the real
+/// download -> decrypt -> read path against a loopback mock without loosening
+/// the https requirement in [`blossom_base`].
+async fn preview_account_backup_from(keys: &Keys, hosts: &[Url]) -> Result<AccountBackupPreview> {
+    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_with_meta(keys, hosts).await?;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     let size_bytes = sealed.len() as u64;
     let Some(index_bytes) = package.index_bytes.as_ref() else {
@@ -1916,6 +1922,136 @@ mod tests {
         assert!(!loaded.enabled);
         assert!(loaded.dirty);
         assert_eq!(loaded.dirty_seq, 7);
+    }
+
+    /// Build a real account (SQLCipher DB + conversation index with summaries)
+    /// and seal it, returning the sealed blob and the account dir.
+    fn sealed_account_with_chats(keys: &Keys) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+                .unwrap();
+            conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (9);")
+                .unwrap();
+        }
+        let key: [u8; 32] = hex::decode(&key_hex).unwrap().try_into().unwrap();
+        {
+            let index = crate::conversation_index::ConversationIndex::open(
+                &crate::conversation_index::index_db_path_for_db(&db_path),
+                key,
+            )
+            .unwrap();
+            index
+                .upsert_summary(
+                    "aa11",
+                    "Lake crew",
+                    "bringing the speaker",
+                    "maya",
+                    100,
+                    false,
+                    true,
+                )
+                .unwrap();
+            index
+                .upsert_summary(
+                    "bb22",
+                    "Maya",
+                    "find me by the coffee table",
+                    "maya",
+                    200,
+                    false,
+                    true,
+                )
+                .unwrap();
+            index
+                .upsert_summary("bb22", "Maya", "on my way", "maya", 300, true, true)
+                .unwrap();
+        }
+        let sealed = seal_account_backup_files(keys, &db_path, &key_hex).unwrap();
+        (dir, db_path, sealed)
+    }
+
+    /// Snapshot every file in the account dir so a test can prove nothing moved.
+    fn account_fingerprint(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let bytes = fs::read(e.path()).unwrap_or_default();
+                    out.push((name, bytes));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// The dry run reports what a restore would recover.
+    #[tokio::test]
+    async fn preview_lists_the_chats_inside_the_backup() {
+        let keys = Keys::generate();
+        let (_dir, _db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
+
+        let preview = preview_account_backup_from(&keys, &[base]).await.unwrap();
+
+        assert_eq!(preview.size_bytes, sealed.len() as u64);
+        assert_eq!(
+            preview.conversations.len(),
+            2,
+            "{:?}",
+            preview.conversations
+        );
+        let maya = preview
+            .conversations
+            .iter()
+            .find(|c| c.name == "Maya")
+            .expect("Maya listed");
+        assert_eq!(maya.message_count, 2, "counts come from the sealed index");
+        assert_eq!(maya.latest_content, "on my way");
+        assert_eq!(preview.total_messages, 3);
+        assert_eq!(preview.uploaded_at_secs, 7, "descriptor timestamp");
+    }
+
+    /// The whole promise of a dry run: it changes nothing. If this regresses,
+    /// a user previewing a backup could lose the chats they opened it to check.
+    #[tokio::test]
+    async fn preview_leaves_the_live_account_byte_identical() {
+        let keys = Keys::generate();
+        let (dir, _db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed);
+
+        let before = account_fingerprint(dir.path());
+        assert!(!before.is_empty(), "fixture must have written files");
+
+        preview_account_backup_from(&keys, &[base]).await.unwrap();
+
+        let after = account_fingerprint(dir.path());
+        assert_eq!(
+            before.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            after.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            "a preview must not add or remove files (staging left behind?)",
+        );
+        for ((name, a), (_, b)) in before.iter().zip(after.iter()) {
+            assert_eq!(a, b, "preview modified {name}");
+        }
+    }
+
+    /// No backup on the server is a typed miss, not a transport failure — hosts
+    /// key their copy off that distinction.
+    #[tokio::test]
+    async fn preview_without_a_backup_reports_missing() {
+        let keys = Keys::generate();
+        let (base, _seen) =
+            spawn_mock_blossom_list(Keys::generate().public_key(), b"someone else".to_vec());
+        let err = preview_account_backup_from(&keys, &[base])
+            .await
+            .expect_err("nothing stored for this pubkey");
+        assert!(is_missing_backup_error(&err), "got {err:?}");
     }
 
     #[test]
