@@ -458,7 +458,16 @@ actual object WalletBridge {
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
-                val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                // #141: reserve the sender fee on a "Max"/drain send (amount ==
+                // full balance) so sendPayment does not reject with InsufficientFunds.
+                val toSend = if (amountSats > 0) {
+                    val bal = (state() as? WalletState.Ready)?.balanceSats ?: 0L
+                    val safe = safeSendAmount(amountSats, bal, prepared.feesSat.toLong())
+                    if (safe != amountSats && safe > 0)
+                        node.prepareSendPayment(PrepareSendRequest(destination.trim(), PayAmount.Bitcoin(safe.toULong())))
+                    else prepared
+                } else prepared
+                val resp = node.sendPayment(SendPaymentRequest(toSend, null, note.ifBlank { null }))
                 val payment = resp.payment
                 val lightning = payment.details as? PaymentDetails.Lightning
                 refreshBalance()

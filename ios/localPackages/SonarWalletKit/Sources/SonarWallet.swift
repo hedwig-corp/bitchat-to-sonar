@@ -331,13 +331,32 @@ public final class SonarWallet {
 
     // MARK: - Payments
 
+    /// #141 — fee-aware send amount (Swift twin of Compose `safeSendAmount`).
+    /// Reserves the sender fee on a "Max"/drain send so it can settle.
+    func sonarSafeSendAmount(requestedSats: Int64, balanceSats: Int64, feeSats: Int64) -> Int64 {
+        guard requestedSats > 0, balanceSats > 0 else { return requestedSats }
+        if requestedSats < balanceSats { return requestedSats }
+        let safe = balanceSats - feeSats
+        return (1..<requestedSats).contains(safe) ? safe : requestedSats
+    }
+
     @discardableResult
     public func send(destination: String, amountSats: Int64 = 0, note: String = "") async throws -> Payment {
         guard let node = sdk else { throw WalletError.notConfigured }
         return try await run {
             let amount: PayAmount? = amountSats > 0 ? .bitcoin(receiverAmountSat: UInt64(amountSats)) : nil
             let prepared = try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
-            let resp = try node.sendPayment(req: SendPaymentRequest(prepareResponse: prepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note))
+            // #141: reserve the sender fee on a "Max"/drain send (amount == full
+            // balance) so sendPayment does not reject with InsufficientFunds.
+            var sendPrepared = prepared
+            if amountSats > 0 {
+                let bal = (try? node.getInfo().walletInfo.balanceSat) ?? 0
+                let safe = sonarSafeSendAmount(requestedSats: amountSats, balanceSats: Int64(bal), feeSats: Int64(prepared.feesSat))
+                if safe != amountSats && safe > 0 {
+                    sendPrepared = try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: .bitcoin(receiverAmountSat: UInt64(safe))))
+                }
+            }
+            let resp = try node.sendPayment(req: SendPaymentRequest(prepareResponse: sendPrepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note))
             return Self.map(resp.payment)
         }
     }
