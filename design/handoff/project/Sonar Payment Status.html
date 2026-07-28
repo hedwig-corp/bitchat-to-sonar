@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sonar — external payment status explorations</title>
+<link rel="icon" href="sonar/brand/favicon.ico" sizes="any">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700;800&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="sonar/theme.css">
+<style>
+  body { margin: 0; background: #101315; font-family: 'Figtree', system-ui, sans-serif; color: #EFF3F4; -webkit-font-smoothing: antialiased; }
+  .page { padding: 26px 30px 70px; }
+  .head { max-width: 900px; margin-bottom: 22px; }
+  .head h1 { font-size: 25px; font-weight: 800; letter-spacing: -0.02em; margin: 0 0 8px; }
+  .head p { font-size: 14.5px; line-height: 1.6; color: #9AA6AB; margin: 0 0 10px; text-wrap: pretty; }
+  .head .prob { background: rgba(240,176,58,0.1); border-left: 3px solid #F0B03A; border-radius: 0 10px 10px 0; padding: 11px 14px; font-size: 13.5px; color: #E3D6BC; line-height: 1.55; }
+  .head .prob b { color: #F5C56B; }
+
+  .bar { position: sticky; top: 0; z-index: 20; background: rgba(16,19,21,0.93); backdrop-filter: blur(10px); border-bottom: 1px solid rgba(255,255,255,0.09); padding: 12px 30px; margin: 0 -30px 26px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .bar .lbl { font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: #65717A; margin-right: 2px; }
+  .sbtn { border: none; cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 650; padding: 8px 14px; border-radius: 999px; background: #1B2126; color: #9AA6AB; box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08); }
+  .sbtn:hover { color: #EFF3F4; }
+  .sbtn.on { background: rgba(34,211,238,0.15); color: #67E2F4; box-shadow: none; }
+  .sbtn.play { background: #1FC0DE; color: #04222B; box-shadow: none; }
+
+  .row { display: flex; gap: 26px; align-items: flex-start; overflow-x: auto; padding-bottom: 14px; }
+  .col { width: 372px; flex: none; }
+  .col > h3 { font-size: 15.5px; font-weight: 750; margin: 0 0 3px; letter-spacing: -0.01em; }
+  .col > .tag { font-size: 12px; color: #65717A; margin-bottom: 12px; display: block; }
+  .frame { width: 372px; height: 736px; border-radius: 40px; background: #06090B; box-shadow: 0 0 0 8px #1A2126, 0 0 0 9px rgba(255,255,255,0.06), 0 26px 60px rgba(0,0,0,0.5); overflow: hidden; position: relative; }
+  .frame .bc-app { height: 100%; }
+  .notes { font-size: 12.5px; line-height: 1.55; color: #9AA6AB; margin-top: 14px; }
+  .notes b { color: #EFF3F4; font-weight: 700; }
+  .notes ul { margin: 6px 0 0; padding-left: 17px; display: flex; flex-direction: column; gap: 4px; }
+
+  /* shared inside-frame chrome */
+  .sc-head { display: flex; align-items: center; gap: 6px; padding: 44px 12px 6px; }
+  .sc-title { flex: 1; padding-left: 6px; font-size: 16px; font-weight: 700; }
+  .sc-body { padding: 4px 18px 18px; overflow-y: auto; height: calc(100% - 92px); }
+  .sc-foot { position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 16px 26px; background: linear-gradient(to top, var(--bg) 60%, transparent); }
+
+  /* recipient header shared by all */
+  .rc { display: flex; align-items: center; gap: 11px; padding: 10px 0 4px; }
+  .rc-av { width: 46px; height: 46px; border-radius: 14px; flex: none; background: var(--net-soft); color: var(--net); display: flex; align-items: center; justify-content: center; }
+  .rc-main { flex: 1; min-width: 0; }
+  .rc-name { font-size: 16.5px; font-weight: 750; display: block; }
+  .rc-sub { font-size: 12.5px; color: var(--text3); font-family: var(--mono); margin-top: 2px; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rc-amt { text-align: right; flex: none; }
+  .rc-amt b { font-size: 17px; font-weight: 800; display: block; }
+  .rc-amt span { font-size: 11.5px; color: var(--text3); }
+
+  /* ── A · stepped ledger ── */
+  .stp { display: flex; flex-direction: column; margin-top: 14px; }
+  .stp-i { display: flex; gap: 12px; }
+  .stp-rail { width: 22px; flex: none; display: flex; flex-direction: column; align-items: center; }
+  .stp-dot { width: 22px; height: 22px; border-radius: 50%; flex: none; display: flex; align-items: center; justify-content: center; background: var(--surface2); color: var(--text3); }
+  .stp-dot.done { background: var(--green); color: #fff; }
+  .stp-dot.live { background: var(--accent-fill); color: var(--on-accent); }
+  .stp-dot.warn { background: var(--gold-fill); color: var(--on-gold); }
+  .stp-dot.bad { background: var(--danger); color: #fff; }
+  .stp-line { width: 2px; flex: 1; min-height: 22px; background: var(--hairline); margin: 2px 0; border-radius: 1px; }
+  .stp-line.done { background: var(--green); opacity: 0.5; }
+  .stp-txt { flex: 1; padding-bottom: 16px; }
+  .stp-t { font-size: 14.5px; font-weight: 650; line-height: 1.3; display: block; }
+  .stp-i.idle .stp-t { color: var(--text3); font-weight: 550; }
+  .stp-s { font-size: 12.5px; color: var(--text2); margin-top: 2px; line-height: 1.45; display: block; }
+  .stp-s .mono { font-family: var(--mono); font-size: 11.5px; word-break: break-all; }
+  .money { display: flex; align-items: center; gap: 9px; border-radius: 14px; padding: 13px 14px; font-size: 13.5px; line-height: 1.45; margin-top: 4px; }
+  .money b { font-weight: 750; }
+  .money.safe { background: var(--surface2); color: var(--text2); }
+  .money.flight { background: var(--net-soft); color: var(--net-deep); }
+  .money.good { background: var(--green-soft); color: var(--green-deep); }
+  .money.warn { background: var(--gold-soft); color: var(--gold-deep); }
+
+  /* ── B · one sentence ── */
+  .one { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 40px 8px 0; }
+  .ring { position: relative; width: 132px; height: 132px; margin-bottom: 26px; }
+  .ring svg { transform: rotate(-90deg); }
+  .ring .glyph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--accent); }
+  .ring.good .glyph { color: var(--green); }
+  .ring.bad .glyph { color: var(--danger); }
+  .ring.warn .glyph { color: var(--gold-fill); }
+  .one-h { font-size: 25px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; margin: 0 0 10px; }
+  .one-s { font-size: 15px; color: var(--text2); line-height: 1.5; margin: 0 12px 18px; }
+  .one-money { font-size: 13.5px; font-weight: 700; padding: 9px 16px; border-radius: 999px; }
+  .disc { width: 100%; margin-top: 24px; }
+  .disc-btn { display: flex; align-items: center; gap: 8px; width: 100%; border: none; background: none; cursor: pointer; font-family: inherit; font-size: 13.5px; font-weight: 650; color: var(--text2); padding: 10px 2px; }
+  .disc-body { font-family: var(--mono); font-size: 11.5px; line-height: 1.7; color: var(--text3); background: var(--surface2); border-radius: 12px; padding: 11px 13px; text-align: left; }
+  .disc-body .ok { color: var(--green-deep); }
+
+  /* ── C · journey rail ── */
+  .jr { margin-top: 26px; }
+  .jr-track { position: relative; height: 78px; margin: 0 4px; }
+  .jr-line { position: absolute; left: 26px; right: 26px; top: 34px; height: 3px; border-radius: 2px; background: var(--surface2); overflow: hidden; }
+  .jr-fill { position: absolute; inset: 0 100% 0 0; background: linear-gradient(90deg, var(--accent), var(--net)); transition: right 0.7s cubic-bezier(0.3,0.9,0.3,1); }
+  .jr-fill.good { background: var(--green); }
+  .jr-fill.bad { background: var(--danger); }
+  .jr-end { position: absolute; top: 20px; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; background: var(--surface2); color: var(--text2); box-shadow: 0 0 0 4px var(--bg); }
+  .jr-end.me { left: 10px; }
+  .jr-end.them { right: 10px; }
+  .jr-end.lit { background: var(--net-fill); color: var(--on-net); }
+  .jr-end.good { background: var(--green); color: #fff; }
+  .jr-coin { position: absolute; top: 18px; width: 36px; height: 36px; margin-left: -18px; border-radius: 50%; background: linear-gradient(140deg, var(--gold-fill), #C97F0A); color: var(--on-gold); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 17px; box-shadow: 0 4px 14px rgba(0,0,0,0.4); transition: left 0.7s cubic-bezier(0.3,0.9,0.3,1); }
+  .jr-coin.pulse { animation: jrp 1.3s ease-in-out infinite; }
+  @keyframes jrp { 0%,100% { transform: scale(1); } 50% { transform: scale(1.09); } }
+  .jr-caps { display: flex; justify-content: space-between; padding: 0 6px; font-size: 11.5px; color: var(--text3); font-weight: 600; }
+  .jr-stat { text-align: center; margin-top: 22px; }
+  .jr-stat h4 { font-size: 20px; font-weight: 800; letter-spacing: -0.015em; margin: 0 0 7px; }
+  .jr-stat p { font-size: 14px; color: var(--text2); line-height: 1.5; margin: 0 6px; }
+  .jr-mile { display: flex; gap: 7px; justify-content: center; margin-top: 18px; }
+  .jr-mile i { width: 7px; height: 7px; border-radius: 50%; background: var(--surface2); }
+  .jr-mile i.on { background: var(--accent); }
+
+  /* ── D · resumable ── */
+  .rs-sheet { background: var(--surface); border-radius: 22px; box-shadow: 0 0 0 1px var(--hairline); padding: 16px; margin-top: 16px; }
+  .rs-top { display: flex; align-items: center; gap: 11px; }
+  .rs-spin { width: 38px; height: 38px; flex: none; }
+  .rs-t { flex: 1; min-width: 0; }
+  .rs-t > b { font-size: 15.5px; font-weight: 750; display: block; }
+  .rs-t > span { font-size: 12.5px; color: var(--text2); display: block; margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rs-x { width: 30px; height: 30px; border-radius: 50%; border: none; background: var(--surface2); color: var(--text2); cursor: pointer; flex: none; display: flex; align-items: center; justify-content: center; }
+  .rs-bar { height: 4px; border-radius: 2px; background: var(--surface2); margin-top: 14px; overflow: hidden; }
+  .rs-bar i { display: block; height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.7s ease; }
+  .rs-bar i.good { background: var(--green); }
+  .rs-bar i.bad { background: var(--danger); }
+  .rs-hint { font-size: 12.5px; color: var(--text2); line-height: 1.5; margin-top: 12px; }
+  .rs-acts { display: flex; gap: 8px; margin-top: 14px; }
+  .rs-act { flex: 1; padding: 11px; border: none; border-radius: 12px; background: var(--surface2); color: var(--text); font-family: inherit; font-size: 13.5px; font-weight: 700; cursor: pointer; }
+  .rs-act.pri { background: var(--accent-fill); color: var(--on-accent); }
+  .rs-act.dim { color: var(--text2); }
+  .rs-lbl { font-size: 11.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text3); margin: 24px 2px 8px; }
+  .rs-row { display: flex; align-items: center; gap: 11px; padding: 11px 12px; border-radius: 14px; background: var(--surface); box-shadow: inset 0 0 0 1px var(--hairline); }
+  .rs-ric { width: 36px; height: 36px; border-radius: 11px; flex: none; display: flex; align-items: center; justify-content: center; background: var(--surface2); color: var(--text2); }
+  .rs-ric.live { background: var(--accent-soft); color: var(--accent-deep); }
+  .rs-ric.good { background: var(--green-soft); color: var(--green-deep); }
+  .rs-ric.bad { background: rgba(212,58,62,0.14); color: var(--danger); }
+  .rs-ric.warn { background: var(--gold-soft); color: var(--gold-deep); }
+  .rs-rmain { flex: 1; min-width: 0; }
+  .rs-rmain > b { font-size: 14.5px; font-weight: 700; display: block; }
+  .rs-rmain > span { font-size: 12px; color: var(--text2); display: block; margin-top: 1px; }
+  .rs-ramt { font-size: 14px; font-weight: 750; flex: none; }
+  .rs-note { font-size: 12px; color: var(--text3); line-height: 1.5; margin-top: 10px; padding: 0 2px; }
+  .spin { animation: sp 1s linear infinite; transform-origin: center; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spin, .jr-coin.pulse { animation: none; } }
+
+  /* ── home chat-list surfaces ── */
+  .hp-av { width: 52px; height: 52px; flex: none; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 20px; }
+
+  /* H1 · pinned strip */
+  .hp-strip { display: flex; align-items: center; gap: 11px; width: calc(100% - 28px); margin: 2px 14px 8px; padding: 12px 14px; border: none; border-radius: 16px; cursor: pointer; text-align: left; font-family: inherit; color: var(--text); background: var(--accent-soft); box-shadow: inset 0 0 0 1px rgba(34,211,238,0.28); }
+  .hp-strip.warn { background: var(--gold-soft); box-shadow: inset 0 0 0 1px rgba(240,176,58,0.3); }
+  .hp-strip.good { background: var(--green-soft); box-shadow: inset 0 0 0 1px rgba(65,188,118,0.3); }
+  .hp-strip.bad { background: rgba(212,58,62,0.12); box-shadow: inset 0 0 0 1px rgba(241,106,106,0.3); }
+  .hp-sm { flex: 1; min-width: 0; }
+  .hp-sm > b { font-size: 14.5px; font-weight: 750; display: block; }
+  .hp-sm > span { font-size: 12.5px; color: var(--text2); display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* H2 · list row */
+  .hp-coin { background: linear-gradient(140deg, var(--gold-fill), #C97F0A); color: var(--on-gold); border-radius: 14px; }
+  .hp-pamt { font-size: 14px; font-weight: 750; flex: none; }
+
+  /* H3 · slim bar */
+  .hp-bar { display: flex; align-items: center; gap: 9px; padding: 9px 16px; font-size: 13px; font-weight: 650; background: var(--accent-fill); color: var(--on-accent); }
+  .hp-bar.warn { background: var(--gold-fill); color: var(--on-gold); }
+  .hp-bar.good { background: var(--green); color: #fff; }
+  .hp-bar.bad { background: var(--danger); color: #fff; }
+  .hp-bar b { margin-left: auto; font-weight: 700; opacity: 0.85; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="head">
+    <h1>External payment status — four directions</h1>
+    <p>Paying a scanned invoice or an off-app destination hides a lot of machinery: resolving the address, finding a Lightning route, an HTLC in flight, then a settlement proof. Today the app just says “sending”, so the user can’t tell what stage they’re at or whether their money is at risk.</p>
+    <div class="prob"><b>The question every state must answer:</b> what is happening right now, <b>where is my money</b> (still mine / in flight / gone / refunded), and what do I do next. “Failed” is never enough on its own.</div>
+  </div>
+
+  <div class="bar" id="bar">
+    <span class="lbl">State</span>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <h3>A · Stepped ledger</h3>
+      <span class="tag">Trust through transparency</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fA"></div></div>
+      <div class="notes">
+        Shows the <b>real</b> stages as a receipt that fills in. The pinned money line is the emotional anchor and always names where the sats are.
+        <ul><li>Best for: first-time external payments, larger amounts</li><li>Risk: can feel technical if the copy slips</li></ul>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>B · One sentence</h3>
+      <span class="tag">Calm minimal, details on demand</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fB"></div></div>
+      <div class="notes">
+        One ring, one plain-language headline, one money pill. The technical trace hides behind <b>“What’s happening?”</b> so power users can still audit.
+        <ul><li>Best for: everyday small payments</li><li>Risk: hides progress detail when things stall</li></ul>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>C · Journey rail</h3>
+      <span class="tag">Spatial metaphor, glanceable</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fC"></div></div>
+      <div class="notes">
+        The coin physically travels you → recipient. On failure it <b>visibly comes back</b>, which answers “where’s my money” without reading a word.
+        <ul><li>Best for: comprehension at a glance, demos</li><li>Risk: motion must never imply success early</li></ul>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>D · Resumable status</h3>
+      <span class="tag">You can leave — it keeps working</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fD"></div></div>
+      <div class="notes">
+        Dismissible sheet plus a <b>live wallet row</b> that survives navigation, with explicit next actions per terminal state (proof, retry, refund).
+        <ul><li>Best for: slow/stuck Lightning payments</li><li>Risk: two surfaces to keep in sync</li></ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="head" style="margin-top: 46px;">
+    <h1>Where does it live on home?</h1>
+    <p>An external payment has <b>no chat thread</b> — there's no conversation with a scanned QR code. So it needs its own place in the list. Same state switcher drives all three; each opens Direction B.</p>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <h3>H1 · Pinned strip</h3>
+      <span class="tag">Above the list, only while active</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fH1"></div></div>
+      <div class="notes">
+        A tinted card pinned above <b>Messages</b>. Present only while in flight or needing attention; clears itself a few seconds after success.
+        <ul><li>Wins: impossible to miss, doesn't pollute history</li><li>Cost: pushes conversations down</li></ul>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>H2 · A row in the list</h3>
+      <span class="tag">Payments are conversations too</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fH2"></div></div>
+      <div class="notes">
+        The payment sits inline, sorted by time, with a gold coin tile. It <b>stays</b> as history after settling — tap for the receipt.
+        <ul><li>Wins: one mental model, permanent record</li><li>Cost: less urgent; can scroll away</li></ul>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>H3 · Slim bar</h3>
+      <span class="tag">Like an active call</span>
+      <div class="frame"><div class="bc-app" data-mode="dark" id="fH3"></div></div>
+      <div class="notes">
+        A full-width bar under the title, borrowing the <b>call-in-progress</b> idiom. Highest urgency, smallest footprint.
+        <ul><li>Wins: zero layout disruption, reads as system state</li><li>Cost: too loud for a routine 2,100 sats</li></ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script type="text/babel" src="sonar/icons.jsx"></script>
+<script src="sonar/data.js"></script>
+<script type="text/babel" src="sonar/components.jsx"></script>
+<script type="text/babel" src="sonar/pay.jsx"></script>
+<script type="text/babel" src="sonar/call.jsx"></script>
+<script type="text/babel" src="sonar/settings.jsx"></script>
+<script type="text/babel" src="sonar/screens.jsx"></script>
+<script type="text/babel" src="sonar/paystatus.jsx"></script>
+</body>
+</html>

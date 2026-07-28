@@ -233,3 +233,95 @@ When a peer has no direct receive offer:
 - New "Send money" is hidden because there is no direct receive offer to pay.
 
 This avoids presenting a claimable UX for a payment that now settles directly.
+
+## External payment status (paystatus.jsx Direction D)
+
+A payment to a *contact* reports into their chat as a `⚡PAY` receipt. A payment
+to an **external destination** — a scanned QR, a pasted BOLT12 offer or BOLT11
+invoice, a `name@domain` Lightning address — has no conversation to report into,
+so it gets its own screen: `Send payment → Pay → Payment`.
+
+The design (`design/handoff/project/Sonar Payment Status.html` +
+`sonar/paystatus.jsx`) explored four directions; **D · resumable status**
+shipped, because the persisted `SonarPaymentActivityLedger` already owns the
+outcome and keeps updating after the screen is gone — the promise D makes is the
+only one the architecture can honestly keep.
+
+The brief every state must answer: *what is happening*, **where is my money**,
+and *what do I do next*. The copy tables that answer it live in exactly two
+places and must stay in step:
+
+- `ios/bitchat/Views/Sonar/SonarPaymentStatus.swift` (`SNPayStatusCopy`)
+- `apps/sonar/.../wallet/PaymentStatus.kt` (`PayStatusCopy`)
+
+Both are pinned by `SonarPaymentStatusTests` / `PaymentStatusTest`.
+
+### Phases and how each is derived
+
+| Phase | Source | Reachable today |
+| --- | --- | --- |
+| `resolving` | live send, wallet not yet called | yes (brief) |
+| `paying` | live send, wallet called | yes |
+| `slow` | live send, in flight ≥ 20s | yes |
+| `sent` | ledger row `paid` | yes |
+| `failedSafe` | ledger row `failed` | yes |
+| `refunded` | — | **no** (see below) |
+| `unknown` | ledger row `pending`, no live send | yes (killed mid-send) |
+
+The ledger is the source of truth; the in-memory live entry only refines a row
+that is still `pending`. That ordering is what stops the screen from showing
+"sending" over a payment that already settled.
+
+`refunded` is rendered but unreachable: the wallet's `send` either returns a
+settled payment or throws, so we cannot today distinguish "money left and came
+back" from "never left". Reaching it needs a wallet-side refund event —
+tracked follow-up, not a UI change.
+
+### Deliberate deviations from the design
+
+- **Cancel is dropped once the payment reaches the wallet.** The design offers
+  `Cancel` on `resolving` and `Cancel payment` on `slow`. An in-flight Lightning
+  payment cannot be recalled, and a button that claims otherwise is the exact
+  dishonesty this screen exists to remove. `resolving` keeps its `Cancel`
+  because it is genuinely before the hand-off.
+- **`Try again` only within the session.** The ledger stores a SHA-256 of the
+  destination, never the destination itself, and that stays true. The plaintext
+  needed to re-send is memory-only, so after a relaunch the action is replaced
+  by `Done` rather than offering a retry that cannot run.
+
+### In-memory state and wipe
+
+`paymentDestinations` holds the **plaintext** destination of every external
+payment sent this session — the ledger only ever holds a SHA-256 of it — so
+every reset path (`wipe`, erase-all-chats, restore) calls
+`clearPaymentStatusState()` alongside the ledger wipe. That drops the plaintext
+map, the live-send map, the cancel markers, and the elapsed clock. A wipe that
+cleared the ledger and left this behind would keep exactly the data the hashing
+exists to avoid keeping.
+
+### Home surface
+
+H1 (pinned strip) shipped, shown **only while a payment is live** and cleared on
+settle or failure — an in-flight payment must be impossible to miss, but a
+settled one belongs in wallet Activity, not pinned over the chat list. A
+`pending` row left by a killed process is deliberately excluded from the strip:
+it can never resolve itself, and a banner that never goes away is worse than
+none. Tapping the strip opens the status screen.
+
+The `✕` on the status card closes the screen and nothing else — only the
+labelled `Cancel` aborts a payment, and only while it has not reached the wallet.
+Two dismiss affordances with different money semantics is deliberate (`✕` is
+"I am done looking"), so do not collapse them.
+
+That whole decision lives in `snHomeStripStatus` / `homeStripStatus` — pure, and
+the call sites are one-line delegates — so the rule is pinned where it is
+actually decided rather than in a helper the test feeds itself
+(`docs/REGRESSIONS.md` rule 2). Dropping the gate fails
+`homeStripClearsTheMomentThePaymentConcludes`, verified by mutation.
+
+### Known cross-platform gap
+
+Amount grouping differs: iOS `sonarGroupedSats` follows the device locale
+(`2.100` on it-IT), Compose `payFmt` hard-codes en-US commas (`2,100`). This
+predates the status screen and affects every money surface in both apps; the
+status tests assert wording, not the separator. Unifying it is a follow-up.

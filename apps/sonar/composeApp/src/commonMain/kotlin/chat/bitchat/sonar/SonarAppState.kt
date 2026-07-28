@@ -11,9 +11,13 @@ import chat.bitchat.sonar.unify.UnifyBIP321
 import chat.bitchat.sonar.unify.UnifyPeer
 import chat.bitchat.sonar.unify.UnifyRadio
 import chat.bitchat.sonar.wallet.ExchangeRate
+import chat.bitchat.sonar.wallet.LivePayment
 import chat.bitchat.sonar.wallet.FiatCurrency
 import chat.bitchat.sonar.wallet.Money
 import chat.bitchat.sonar.wallet.PaymentActivityStore
+import chat.bitchat.sonar.wallet.PaymentStatus
+import chat.bitchat.sonar.wallet.paymentStatusOf
+import chat.bitchat.sonar.wallet.homeStripStatus
 import chat.bitchat.sonar.wallet.SendResult
 import chat.bitchat.sonar.wallet.SonarPaymentActivity
 import chat.bitchat.sonar.wallet.WalletActivityItem
@@ -348,6 +352,11 @@ sealed interface Screen {
     data object WalletActivity : Screen
     /** Standalone send-payment picker (new-chat sheet → "Send a payment"). */
     data object SendPayment : Screen
+    /**
+     * Status of one external payment, by activity id (design: paystatus.jsx
+     * Direction D). External payments have no chat thread to report into.
+     */
+    data class PaymentStatus(val activityId: String) : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
@@ -938,6 +947,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         stack = stack + s
     }
 
+    /**
+     * Swap the top of the stack for another screen, so Back skips the screen
+     * that led here. The send-payment picker uses this to hand over to the
+     * payment status screen: going back from the status belongs on home, not on
+     * a picker whose payment is already gone.
+     */
+    fun replaceTop(s: Screen) {
+        if (stack.size > 1) stack = stack.dropLast(1)
+        push(s)
+    }
+
     private fun popCallScreenIfNeeded() {
         if (screen is Screen.Call && stack.size > 1) stack = stack.dropLast(1)
     }
@@ -1004,6 +1024,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             presenceByGeohash = emptyMap()
             payLedger = SonarPayLedger(); payVersion++
             PaymentActivityStore.wipe() // iOS wipes both payment ledgers together
+            clearPaymentStatusState()
             mutedUntilByChat = emptyMap() // blob dies with SonarCore.wipe()
             bip353 = ""
             callLogs.clear(); callVersion++
@@ -1068,6 +1089,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             // iOS eraseChatsKeepIdentity also wipes the activity ledger.
             payLedger = SonarPayLedger(); persistPay(); payVersion++
             PaymentActivityStore.wipe()
+            clearPaymentStatusState()
             cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
             mediaCache.clear(); clearStickerCaches()
             callLogs.clear(); callVersion++
@@ -2842,6 +2864,207 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun walletActivity(): List<WalletActivityItem> =
         mergeWalletActivity(walletPayEntries(), PaymentActivityStore.sorted())
 
+    // ── External payment status (design: paystatus.jsx, Direction D) ──
+
+    /**
+     * External payments this process is currently sending, keyed by activity
+     * id. The persisted ledger owns the outcome; this holds only what it
+     * deliberately does not keep — the resolving/paying/slow split and the
+     * clock behind "Sending · 6s".
+     */
+    var livePayments by mutableStateOf(mapOf<String, LivePayment>())
+        private set
+
+    /**
+     * Bumped once a second while a payment is live so elapsed labels tick.
+     * Runs only while [livePayments] is non-empty (Signal-Comparable
+     * Performance Rule: no idle loop on the render path).
+     */
+    var paymentClock by mutableStateOf(0)
+        private set
+    private var paymentClockJob: Job? = null
+
+    /**
+     * Plaintext destinations of payments sent this session, so `Try again` can
+     * re-send. The ledger only ever stores a hash of the destination, and that
+     * stays true — this map is memory-only and dies with the process.
+     */
+    private val paymentDestinations = mutableMapOf<String, String>()
+
+    /** Activity ids whose `Cancel` was tapped before the wallet was called. */
+    private val cancelledPayments = mutableSetOf<String>()
+
+    /**
+     * Starts paying an arbitrary Lightning destination from the send-payment
+     * picker. Returns the activity id to open the status screen on, or null
+     * when the destination was refused before anything was sent (the reason is
+     * shown as a toast).
+     *
+     * The send runs on the app scope, so leaving the status screen — or the
+     * picker popping out from under it — cannot cancel a payment in flight.
+     */
+    fun beginDestinationPayment(destination: String, sats: Long, displayName: String): String? {
+        val dest = destination.trim()
+        if (sats <= 0 || dest.isEmpty()) return null
+        val amountForWallet = when (val check = destinationSendAmount(dest, sats)) {
+            is DestinationCheck.Refuse -> {
+                toast = check.message
+                return null
+            }
+            is DestinationCheck.Send -> check.amountSats
+        }
+
+        val payId = randomPayId()
+        val payeeName = displayName.ifBlank { shortNpubLabel(dest) }
+        val startedAt = SonarClock.nowSecs()
+        PaymentActivityStore.recordPending(
+            SonarPaymentActivity(
+                id = payId,
+                kind = SonarPaymentActivity.Kind.SonarDirect,
+                // No conversation backs this one — "wallet" is the documented
+                // peerKey for payments that do not belong to a chat.
+                peerKey = "wallet",
+                peerName = payeeName,
+                direction = SonarPaymentActivity.Direction.Outgoing,
+                sats = sats,
+                via = "internet",
+                createdAtSecs = startedAt,
+                destinationHash = paymentDestinationHash(dest),
+                status = SonarPaymentActivity.Status.Pending,
+            )
+        )
+        paymentDestinations[payId] = dest
+        livePayments = livePayments + (payId to LivePayment(
+            id = payId,
+            payeeName = payeeName,
+            sats = sats,
+            startedAtSecs = startedAt,
+            handedToWallet = false,
+        ))
+        startPaymentClock()
+
+        scope.launch {
+            // The app scope is the main/UI dispatcher, so the cancel check and
+            // the hand-off cannot interleave: once handedToWallet is set,
+            // Cancel is no longer offered.
+            if (payId in cancelledPayments) {
+                cancelledPayments -= payId
+                livePayments = livePayments - payId
+                PaymentActivityStore.markFailed(payId, "Cancelled before sending")
+                stopPaymentClockIfIdle()
+                return@launch
+            }
+            // Nothing suspends between the guard above and this line today, so
+            // the marker cannot be set in between — drain it anyway so a future
+            // suspension here cannot leave a stale id behind.
+            cancelledPayments -= payId
+            livePayments[payId]?.let { live ->
+                livePayments = livePayments + (payId to live.copy(handedToWallet = true))
+            }
+            var failureMessage: String? = null
+            val result = runCatching { WalletBridge.send(dest, amountForWallet, "Sonar payment $payId") }
+                .getOrElse {
+                    failureMessage = "Payment failed: ${it.message}"
+                    SendResult(false)
+                }
+            walletState = WalletBridge.state()
+            if (result.ok) {
+                PaymentActivityStore.markPaid(
+                    payId, result.paymentId, result.feesSats,
+                    result.settledAtSecs ?: SonarClock.nowSecs(),
+                )
+            } else {
+                PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
+                // The status screen states the failure in full, and the home
+                // strip clears on a terminal state — so without this a user who
+                // walked away from the screen would never learn it failed.
+                val watching = (screen as? Screen.PaymentStatus)?.activityId == payId
+                if (!watching) toast = failureMessage ?: "Payment failed"
+            }
+            // Terminal: drop out of the live set so the home strip clears and
+            // the clock can stop. The status screen reads the ledger from here.
+            livePayments = livePayments - payId
+            stopPaymentClockIfIdle()
+        }
+        return payId
+    }
+
+    /**
+     * The design's `Try again`: re-send the same amount to the same destination
+     * as a fresh activity. Returns the new activity id, or null when the
+     * destination is no longer known (a relaunch drops it — the ledger only
+     * ever stored its hash).
+     */
+    fun retryDestinationPayment(activityId: String): String? {
+        val destination = paymentDestinations[activityId] ?: return null
+        val previous = PaymentActivityStore.get(activityId) ?: return null
+        return beginDestinationPayment(destination, previous.sats, previous.peerName)
+    }
+
+    /**
+     * Aborts a payment that has not reached the wallet yet. No-op once it has —
+     * an in-flight Lightning payment cannot be recalled, and the status screen
+     * stops offering Cancel at that point.
+     */
+    fun cancelDestinationPayment(activityId: String) {
+        val live = livePayments[activityId] ?: return
+        if (live.handedToWallet) return
+        cancelledPayments += activityId
+    }
+
+    /** The design's state machine for one payment (paystatus.jsx). */
+    fun paymentStatus(activityId: String): PaymentStatus? {
+        val activity = PaymentActivityStore.get(activityId) ?: return null
+        return paymentStatusOf(
+            activity = activity,
+            live = livePayments[activityId],
+            nowSecs = SonarClock.nowSecs(),
+            canRetry = paymentDestinations.containsKey(activityId),
+        )
+    }
+
+    /**
+     * The H1 home strip: the payment in flight right now, if any.
+     *
+     * Only live sends qualify. A `Pending` row left behind by a killed process
+     * is deliberately excluded — it can never resolve itself, and pinning a
+     * banner over the chat list forever is worse than saying nothing.
+     */
+    fun livePaymentStatus(): PaymentStatus? =
+        homeStripStatus(livePayments, PaymentActivityStore::get, SonarClock.nowSecs())
+
+    private fun startPaymentClock() {
+        if (paymentClockJob?.isActive == true) return
+        paymentClockJob = scope.launch {
+            while (livePayments.isNotEmpty()) {
+                delay(1000)
+                paymentClock++
+            }
+        }
+    }
+
+    private fun stopPaymentClockIfIdle() {
+        if (livePayments.isNotEmpty()) return
+        paymentClockJob?.cancel()
+        paymentClockJob = null
+    }
+
+    /**
+     * Drops every trace of in-flight/past external payments held in memory.
+     *
+     * [paymentDestinations] holds PLAINTEXT Lightning destinations; the
+     * persisted ledger only ever holds a SHA-256 of them. A wipe that clears
+     * the ledger and leaves this map behind would keep exactly the data the
+     * hashing exists to avoid keeping. Mirrors iOS `clearPaymentStatusState`.
+     */
+    fun clearPaymentStatusState() {
+        paymentClockJob?.cancel()
+        paymentClockJob = null
+        livePayments = emptyMap()
+        paymentDestinations.clear()
+        cancelledPayments.clear()
+    }
+
     private fun persistPay() { SonarCore.saveBlob("pay.ledger", payLedger.serialize()) }
 
     private fun paymentNpubHex(chatId: String): String? =
@@ -2956,19 +3179,19 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     /**
-     * Fire-and-forget wrappers for the send-payment picker, which pops itself
-     * as soon as the amount is confirmed. The screen's `rememberCoroutineScope`
+     * Fire-and-forget wrapper for the send-payment picker, which pops itself as
+     * soon as the amount is confirmed. The screen's `rememberCoroutineScope`
      * dies with the screen, so launching there and popping in the same frame
      * would cancel the payment mid-flight (the descriptor fetch inside
-     * [sendPay] suspends). These run on the app scope instead, and surface the
-     * outcome through [toast] / the Wallet activity screen.
+     * [sendPay] suspends). This runs on the app scope instead, and surfaces the
+     * outcome through [toast] / the peer's in-chat ⚡PAY receipt.
+     *
+     * External destinations do not come through here — they have no chat to
+     * report into, so they get [beginDestinationPayment] and the payment status
+     * screen.
      */
     fun sendPayDetached(chatId: String, sats: Long) {
         scope.launch { sendPay(chatId, sats)?.let { toast = it } }
-    }
-
-    fun payDestinationDetached(destination: String, sats: Long, displayName: String) {
-        scope.launch { payDestination(destination, sats, displayName)?.let { toast = it } }
     }
 
     /**
@@ -3011,78 +3234,42 @@ class SonarAppState(private val scope: CoroutineScope) {
         return out.sortedWith(compareByDescending<PayableContact> { it.nearby }.thenBy { it.name.lowercase() })
     }
 
-    /**
-     * Pay an arbitrary Lightning destination typed into the send-payment picker
-     * — a BOLT12 offer, a BOLT11 invoice, or a `name@domain` Lightning address.
-     * Breez resolves the destination, so this only records the wallet-side
-     * activity: there is no conversation to post a ⚡PAY receipt into.
-     *
-     * Returns a message to surface to the user, or null when the send was
-     * accepted (the outcome then lands on the Wallet activity screen).
-     */
-    suspend fun payDestination(destination: String, sats: Long, displayName: String): String? {
-        val dest = destination.trim()
-        if (sats <= 0 || dest.isEmpty()) return null
-        if (!walletAvailable || walletState !is WalletState.Ready) {
-            return "Set up the wallet first."
-        }
+    /** Result of the pre-flight check on an external destination. */
+    private sealed interface DestinationCheck {
+        /** Amount to hand the wallet (0 lets a BOLT11 invoice speak for itself). */
+        data class Send(val amountSats: Long) : DestinationCheck
+        data class Refuse(val message: String) : DestinationCheck
+    }
 
-        // A BOLT11 invoice carries its own amount, and the wallet takes it from
-        // there. Two failure modes come out of ignoring that, both seen on
-        // device:
-        //
-        //  * an amountless invoice is simply unpayable — the SDK answers
-        //    "Amount is missing: Expected invoice with an amount" no matter what
-        //    amount we pass, so let the user know instead of taking an amount
-        //    and failing after the fact;
-        //  * supplying our own amount for an invoice that already has one risks
-        //    "Receiver amount and invoice amount do not match", so we pass none
-        //    and let the invoice speak.
-        //
-        // Offers and addresses are the opposite — they need the amount from us.
+    /**
+     * Refuses an external destination the wallet cannot pay, before any
+     * activity is recorded.
+     *
+     * A BOLT11 invoice carries its own amount, and the wallet takes it from
+     * there. Two failure modes come out of ignoring that, both seen on device:
+     *
+     *  * an amountless invoice is simply unpayable — the SDK answers
+     *    "Amount is missing: Expected invoice with an amount" no matter what
+     *    amount we pass, so let the user know instead of taking an amount and
+     *    failing after the fact;
+     *  * supplying our own amount for an invoice that already has one risks
+     *    "Receiver amount and invoice amount do not match", so we pass none and
+     *    let the invoice speak.
+     *
+     * Offers and addresses are the opposite — they need the amount from us.
+     */
+    private fun destinationSendAmount(dest: String, sats: Long): DestinationCheck {
+        if (!walletAvailable || walletState !is WalletState.Ready) {
+            return DestinationCheck.Refuse("Set up the wallet first.")
+        }
         val lower = dest.lowercase()
         val isBolt11 = lower.startsWith("lnbc") || lower.startsWith("lntb") || lower.startsWith("lnbcrt")
         if (isBolt11 && chat.bitchat.sonar.wallet.bolt11AmountSats(lower) == null) {
-            return "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
-        }
-        val amountForWallet = if (isBolt11) 0L else sats
-
-        val payId = randomPayId()
-        PaymentActivityStore.recordPending(
-            SonarPaymentActivity(
-                id = payId,
-                kind = SonarPaymentActivity.Kind.SonarDirect,
-                // No conversation backs this one — "wallet" is the documented
-                // peerKey for payments that do not belong to a chat.
-                peerKey = "wallet",
-                peerName = displayName.ifBlank { shortNpubLabel(dest) },
-                direction = SonarPaymentActivity.Direction.Outgoing,
-                sats = sats,
-                via = "internet",
-                createdAtSecs = SonarClock.nowSecs(),
-                destinationHash = paymentDestinationHash(dest),
-                status = SonarPaymentActivity.Status.Pending,
+            return DestinationCheck.Refuse(
+                "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
             )
-        )
-        scope.launch {
-            var failureMessage: String? = null
-            val result = runCatching { WalletBridge.send(dest, amountForWallet, "Sonar payment $payId") }
-                .getOrElse {
-                    failureMessage = "Payment failed: ${it.message}"
-                    SendResult(false)
-                }
-            walletState = WalletBridge.state()
-            if (result.ok) {
-                PaymentActivityStore.markPaid(
-                    payId, result.paymentId, result.feesSats,
-                    result.settledAtSecs ?: SonarClock.nowSecs(),
-                )
-            } else {
-                PaymentActivityStore.markFailed(payId, failureMessage ?: "Payment failed")
-                toast = failureMessage ?: "Payment failed"
-            }
         }
-        return null
+        return DestinationCheck.Send(if (isBolt11) 0L else sats)
     }
 
     private suspend fun sendPaymentReceiptLines(chatId: String, lines: List<String>): Boolean {
@@ -3661,6 +3848,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 lastWnGroups = -1; lastWnMsgs = -1
                 payLedger = SonarPayLedger(); persistPay(); payVersion++
                 PaymentActivityStore.wipe()
+                clearPaymentStatusState()
                 cancelAllMediaDownloads(); MediaCache.wipe(); clearOpenChatTransientState()
                 mediaCache.clear(); clearStickerCaches()
                 callLogs.clear(); callVersion++

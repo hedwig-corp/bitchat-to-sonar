@@ -168,7 +168,7 @@ struct SonarScanQrSheet: View {
 
             VStack(spacing: 6) {
                 SNPrimaryButton(
-                    label: kind.fixedSats.map { "Continue · \(sonarFormatSats($0)) sats" } ?? "Enter amount",
+                    label: kind.fixedSats.map { "Continue · \(sonarFormatSats($0))" } ?? "Enter amount",
                     net: true,
                     action: { onDetect(kind.destination, kind.fixedSats) }
                 )
@@ -234,7 +234,7 @@ struct SNScannedKind {
                 let sats = SNScannedKind.bolt11AmountSats(clean) ?? uriSats
                 icon = .bolt
                 name = "Lightning invoice"
-                sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount — this invoice can't be paid"
+                sub = sats.map { "\(sonarFormatSats($0)) requested" } ?? "No amount — this invoice can't be paid"
                 fixedSats = sats
                 destination = clean
                 return
@@ -264,7 +264,7 @@ struct SNScannedKind {
             let sats = SNScannedKind.bolt11AmountSats(lower)
             icon = .bolt
             name = "Lightning invoice"
-            sub = sats.map { "\(sonarFormatSats($0)) sats requested" } ?? "No amount — this invoice can't be paid"
+            sub = sats.map { "\(sonarFormatSats($0)) requested" } ?? "No amount — this invoice can't be paid"
             fixedSats = sats
             destination = lower
         } else if bare.contains("@") {
