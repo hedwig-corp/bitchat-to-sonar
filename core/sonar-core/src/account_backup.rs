@@ -83,6 +83,48 @@ pub struct BackupPolicy {
     pub last_error: Option<String>,
     pub opportunistic_debounce_secs: u64,
     pub daily_interval_secs: u64,
+    /// Sealed size of the last successful upload, for the Settings stats strip.
+    /// `None` until one succeeds — hosts must render "—", never a guess.
+    #[serde(default)]
+    pub last_size_bytes: Option<u64>,
+    /// Messages covered by that upload, read from the conversation index at
+    /// success time rather than recounted later (the DB moves on).
+    #[serde(default)]
+    pub last_message_count: Option<u64>,
+}
+
+/// The three cadences the Settings UI offers, mapped onto policy fields.
+///
+/// `Manual` is `enabled = false`: the executors already refuse to run when the
+/// policy is disabled, so "manual only" needs no separate flag — one source of
+/// truth for "will something upload without me asking".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupFrequency {
+    Manual,
+    Daily,
+    Weekly,
+}
+
+impl BackupFrequency {
+    pub fn interval_secs(self) -> u64 {
+        match self {
+            // Kept at the daily floor so flipping Manual -> Daily later does not
+            // inherit a stale week-long interval.
+            BackupFrequency::Manual | BackupFrequency::Daily => DEFAULT_DAILY_INTERVAL_SECS,
+            BackupFrequency::Weekly => 7 * DEFAULT_DAILY_INTERVAL_SECS,
+        }
+    }
+
+    pub fn from_policy(policy: &BackupPolicy) -> Self {
+        if !policy.enabled {
+            return BackupFrequency::Manual;
+        }
+        if policy.daily_interval_secs > DEFAULT_DAILY_INTERVAL_SECS {
+            BackupFrequency::Weekly
+        } else {
+            BackupFrequency::Daily
+        }
+    }
 }
 
 impl Default for BackupPolicy {
@@ -98,6 +140,8 @@ impl Default for BackupPolicy {
             last_error: None,
             opportunistic_debounce_secs: DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS,
             daily_interval_secs: DEFAULT_DAILY_INTERVAL_SECS,
+            last_size_bytes: None,
+            last_message_count: None,
         }
     }
 }
@@ -222,8 +266,9 @@ fn save_backup_policy_to_disk(db_path: &Path, policy: &BackupPolicy) -> Result<(
             Error::InvalidInput(format!("backup policy fsync {}: {e}", tmp.display()))
         })?;
     }
-    fs::rename(&tmp, &path)
-        .map_err(|e| Error::InvalidInput(format!("backup policy rename {}: {e}", path.display())))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        Error::InvalidInput(format!("backup policy rename {}: {e}", path.display()))
+    })?;
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
             let _ = dir.sync_all();
@@ -291,7 +336,8 @@ pub fn backup_is_due(policy: &BackupPolicy, now_secs: u64) -> bool {
     let last_ok = policy.last_success_at.unwrap_or(0);
     let last_attempt = policy.last_attempt_at.unwrap_or(0);
     // Don't thrash: wait at least debounce since last attempt even on failure.
-    if last_attempt > 0 && now_secs.saturating_sub(last_attempt) < policy.opportunistic_debounce_secs
+    if last_attempt > 0
+        && now_secs.saturating_sub(last_attempt) < policy.opportunistic_debounce_secs
     {
         return false;
     }
@@ -324,7 +370,11 @@ pub fn record_backup_attempt(db_path: &Path) -> Result<()> {
     })
 }
 
-pub fn record_backup_success(db_path: &Path) -> Result<()> {
+pub fn record_backup_success(db_path: &Path, size_bytes: Option<u64>) -> Result<()> {
+    // Count at success time, not on read: the Settings strip describes what the
+    // uploaded blob contains, and the live index moves on the moment a message
+    // arrives. Best-effort — a missing count renders as "—", never as zero.
+    let message_count = count_indexed_messages(db_path);
     with_policy_state(|map| {
         let now = now_unix_secs();
         let mut policy = cached_policy(map, db_path);
@@ -337,6 +387,103 @@ pub fn record_backup_success(db_path: &Path) -> Result<()> {
         policy.last_attempt_at = Some(now);
         policy.last_error = None;
         policy.attempt_dirty_seq = None;
+        if size_bytes.is_some() {
+            policy.last_size_bytes = size_bytes;
+        }
+        if message_count.is_some() {
+            policy.last_message_count = message_count;
+        }
+        store_policy(map, db_path, &policy)
+    })
+}
+
+/// Total messages across every conversation in the local index.
+fn count_indexed_messages(db_path: &Path) -> Option<u64> {
+    let key = load_index_key_for_db(db_path)?;
+    let index = crate::conversation_index::ConversationIndex::open(
+        &crate::conversation_index::index_db_path_for_db(db_path),
+        key,
+    )
+    .ok()?;
+    let summaries = index.summaries_ordered().ok()?;
+    Some(summaries.iter().map(|s| s.message_count).sum())
+}
+
+/// Persist the SQLCipher key beside the DB so read-only consumers (stats,
+/// preview) can reopen the index without the host handing it over again.
+fn load_index_key_for_db(db_path: &Path) -> Option<[u8; 32]> {
+    let hex = fs::read_to_string(index_key_path_for_db(db_path)).ok()?;
+    let bytes = hex::decode(hex.trim()).ok()?;
+    bytes.try_into().ok()
+}
+
+fn index_key_path_for_db(db_path: &Path) -> PathBuf {
+    let name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "marmot.sqlite".to_string());
+    db_path.with_file_name(format!("{name}.sonar-index-key"))
+}
+
+/// Remember the index key for later read-only opens. Called by the client when
+/// it opens the index; a no-op when the value has not changed.
+pub fn remember_index_key(db_path: &Path, key: &[u8; 32]) {
+    let path = index_key_path_for_db(db_path);
+    let encoded = hex::encode(key);
+    if fs::read_to_string(&path)
+        .map(|c| c.trim() == encoded)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let _ = fs::write(path, encoded);
+}
+
+/// On-disk footprint of this account: the encrypted DB, its index, every
+/// sidecar, staged media and the sticker cache. Logs are excluded — they are
+/// diagnostics, not the user's data, and showing them would inflate the number
+/// the Settings row promises is "your chats".
+pub fn account_storage_bytes(db_path: &Path) -> u64 {
+    let Some(dir) = db_path.parent() else {
+        return file_len(db_path);
+    };
+    dir_size_excluding(dir, &["logs"])
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+fn dir_size_excluding(dir: &Path, skip: &[&str]) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if skip.iter().any(|s| *s == name) {
+            continue;
+        }
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                total = total.saturating_add(dir_size_excluding(&entry.path(), skip))
+            }
+            Ok(t) if t.is_file() => {
+                total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0))
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+/// Apply a Settings cadence choice to the policy.
+pub fn set_backup_frequency(db_path: &Path, frequency: BackupFrequency) -> Result<()> {
+    with_policy_state(|map| {
+        let mut policy = cached_policy(map, db_path);
+        policy.enabled = frequency != BackupFrequency::Manual;
+        policy.daily_interval_secs = frequency.interval_secs();
         store_policy(map, db_path, &policy)
     })
 }
@@ -483,7 +630,10 @@ fn decode_plaintext(bytes: &[u8]) -> Result<AccountBackupPackage> {
 }
 
 /// AEAD-seal a package with a key derived from the account secret.
-pub fn seal_account_backup(nsec_secret: &[u8; 32], package: &AccountBackupPackage) -> Result<Vec<u8>> {
+pub fn seal_account_backup(
+    nsec_secret: &[u8; 32],
+    package: &AccountBackupPackage,
+) -> Result<Vec<u8>> {
     let key = derive_wrapping_key(nsec_secret)?;
     let plaintext = encode_plaintext(package)?;
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -518,7 +668,11 @@ pub fn open_account_backup(nsec_secret: &[u8; 32], sealed: &[u8]) -> Result<Acco
 }
 
 fn validate_db_key_hex(db_key_hex: &str) -> Result<()> {
-    if db_key_hex.len() != 64 || hex::decode(db_key_hex).map(|b| b.len() != 32).unwrap_or(true) {
+    if db_key_hex.len() != 64
+        || hex::decode(db_key_hex)
+            .map(|b| b.len() != 32)
+            .unwrap_or(true)
+    {
         return Err(Error::InvalidInput(
             "db_key_hex must be 64 hex chars (32 bytes)".into(),
         ));
@@ -554,7 +708,10 @@ fn checkpoint_sqlcipher_file(path: &Path, db_key_hex: &str) -> Result<()> {
 
 /// Read Marmot DB (+ optional conversation index) from disk into a package.
 /// Checkpoints WAL first so the sealed bytes include recent commits.
-pub fn read_account_backup_package(db_path: &Path, db_key_hex: &str) -> Result<AccountBackupPackage> {
+pub fn read_account_backup_package(
+    db_path: &Path,
+    db_key_hex: &str,
+) -> Result<AccountBackupPackage> {
     validate_db_key_hex(db_key_hex)?;
     checkpoint_sqlcipher_file(db_path, db_key_hex)?;
     let index_path = index_db_path_for_db(db_path);
@@ -898,6 +1055,102 @@ fn backup_search_hosts(server_url: &str) -> Result<Vec<Url>> {
     Ok(hosts)
 }
 
+/// One conversation as it exists inside a sealed backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupPreviewConversation {
+    pub name: String,
+    pub latest_content: String,
+    pub message_count: u64,
+}
+
+/// What a restore *would* bring back. Produced without touching the live store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountBackupPreview {
+    pub conversations: Vec<BackupPreviewConversation>,
+    pub total_messages: u64,
+    pub size_bytes: u64,
+    /// When the blob was uploaded, per the Blossom descriptor.
+    pub uploaded_at_secs: u64,
+}
+
+/// Dry run: read a backup and report what restoring it would recover.
+///
+/// Deliberately never calls the staging/commit path. It decrypts in memory and
+/// opens only the conversation *index* from a scratch copy, so a preview can
+/// never disturb the live SQLCipher store, leave staged files behind, or race
+/// the node — the failure mode of a "preview" that mutates state is losing the
+/// chats the user was trying to inspect.
+pub async fn preview_account_backup(keys: &Keys, server_url: &str) -> Result<AccountBackupPreview> {
+    let hosts = backup_search_hosts(server_url)?;
+    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_with_meta(keys, &hosts).await?;
+    let package = open_account_backup(&secret_bytes(keys), &sealed)?;
+    let size_bytes = sealed.len() as u64;
+    let Some(index_bytes) = package.index_bytes.as_ref() else {
+        // A backup with no index still restores; there is just nothing to list.
+        return Ok(AccountBackupPreview {
+            conversations: Vec::new(),
+            total_messages: 0,
+            size_bytes,
+            uploaded_at_secs,
+        });
+    };
+
+    let scratch = tempfile::tempdir()
+        .map_err(|e| Error::Storage(format!("backup preview scratch dir: {e}")))?;
+    let index_path = scratch.path().join("preview-index.db");
+    fs::write(&index_path, index_bytes)
+        .map_err(|e| Error::Storage(format!("backup preview index write: {e}")))?;
+    let key: [u8; 32] = hex::decode(&package.db_key_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| Error::InvalidInput("backup db key malformed".into()))?;
+
+    let summaries = crate::conversation_index::ConversationIndex::open(&index_path, key)
+        .and_then(|idx| idx.summaries_ordered())
+        .unwrap_or_default();
+    let conversations: Vec<_> = summaries
+        .into_iter()
+        .map(|s| BackupPreviewConversation {
+            name: s.name,
+            latest_content: s.latest_content,
+            message_count: s.message_count,
+        })
+        .collect();
+    let total_messages = conversations.iter().map(|c| c.message_count).sum();
+    // `scratch` drops here: the decrypted index never outlives the call.
+    Ok(AccountBackupPreview {
+        conversations,
+        total_messages,
+        size_bytes,
+        uploaded_at_secs,
+    })
+}
+
+/// Newest account backup plus its upload timestamp, searching each host in turn.
+async fn download_latest_sealed_backup_with_meta(
+    keys: &Keys,
+    bases: &[Url],
+) -> Result<(Vec<u8>, u64)> {
+    let mut last_missing = Error::AccountBackupMissing;
+    for base in bases {
+        let mut blobs = match list_account_backup_blobs(keys, base).await {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+        blobs.retain(|b| b.mime_type.as_deref() == Some(ACCOUNT_BACKUP_MIME));
+        if blobs.is_empty() {
+            last_missing = Error::AccountBackupMissing;
+            continue;
+        }
+        blobs.sort_by_key(|b| b.uploaded);
+        let latest = blobs.pop().expect("non-empty after retain");
+        let uploaded = latest.uploaded.as_secs();
+        let data = download_latest_sealed_backup_at(keys, base).await?;
+        return Ok((data, uploaded));
+    }
+    Err(last_missing)
+}
+
 /// List this pubkey's blobs and download the newest account-backup MIME.
 pub async fn download_latest_sealed_backup(keys: &Keys, server_url: &str) -> Result<Vec<u8>> {
     download_latest_sealed_backup_from(keys, &backup_search_hosts(server_url)?).await
@@ -956,11 +1209,7 @@ async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec
 ///
 /// Stamps `last_attempt_at` up front so concurrent host executors see
 /// `backup_is_due == false` for the debounce window.
-pub fn seal_account_backup_files(
-    keys: &Keys,
-    db_path: &Path,
-    db_key_hex: &str,
-) -> Result<Vec<u8>> {
+pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) -> Result<Vec<u8>> {
     record_backup_attempt(db_path)?;
     let sealed = (|| {
         let package = read_account_backup_package(db_path, db_key_hex)?;
@@ -983,7 +1232,7 @@ pub async fn backup_account_files(
     let sealed = seal_account_backup_files(keys, db_path, db_key_hex)?;
     match upload_sealed_backup(keys, server_url, sealed).await {
         Ok(uploaded) => {
-            let _ = record_backup_success(db_path);
+            let _ = record_backup_success(db_path, None);
             Ok(uploaded)
         }
         Err(e) => {
@@ -1192,6 +1441,85 @@ mod tests {
         // An explicit server is honoured alone, no public-host fallback.
         let explicit = backup_search_hosts("https://blossom.example").unwrap();
         assert_eq!(explicit.len(), 1);
+    }
+
+    /// Manual is `enabled = false` — the executors already refuse to run a
+    /// disabled policy, so "manual only" needs no second flag to fall out of
+    /// sync with. Round-trips through the sidecar.
+    #[test]
+    fn frequency_round_trips_through_the_policy() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        for (freq, enabled) in [
+            (BackupFrequency::Weekly, true),
+            (BackupFrequency::Manual, false),
+            (BackupFrequency::Daily, true),
+        ] {
+            set_backup_frequency(&db, freq).unwrap();
+            let policy = load_backup_policy(&db);
+            assert_eq!(policy.enabled, enabled, "{freq:?} enabled");
+            assert_eq!(
+                BackupFrequency::from_policy(&policy),
+                freq,
+                "{freq:?} round trip"
+            );
+        }
+    }
+
+    /// Manual must never be "due": it is the opt-out.
+    #[test]
+    fn manual_frequency_is_never_due() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        set_backup_frequency(&db, BackupFrequency::Manual).unwrap();
+        mark_backup_dirty(&db);
+        assert!(!backup_is_due_now(&db), "manual-only must not auto-upload");
+    }
+
+    /// The Settings strip reports the uploaded blob, so a failed upload must not
+    /// overwrite the last known-good size with nothing.
+    #[test]
+    fn success_records_size_and_failure_keeps_it() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        record_backup_success(&db, Some(282_748)).unwrap();
+        assert_eq!(load_backup_policy(&db).last_size_bytes, Some(282_748));
+
+        record_backup_failure(&db, "network down").unwrap();
+        let after = load_backup_policy(&db);
+        assert_eq!(
+            after.last_size_bytes,
+            Some(282_748),
+            "a failure must not erase the last good size",
+        );
+        assert_eq!(after.last_error.as_deref(), Some("network down"));
+
+        // A success with no size reported leaves the previous one intact.
+        record_backup_success(&db, None).unwrap();
+        assert_eq!(load_backup_policy(&db).last_size_bytes, Some(282_748));
+    }
+
+    /// Storage counts the user's data and excludes logs — otherwise the number
+    /// grows with diagnostics the row does not claim to measure.
+    #[test]
+    fn storage_counts_account_data_and_skips_logs() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        fs::write(&db, vec![7u8; 4096]).unwrap();
+        fs::write(
+            db.with_file_name("marmot.sqlite.sonar-index.db"),
+            vec![1u8; 2048],
+        )
+        .unwrap();
+        let media = dir.path().join("media");
+        fs::create_dir_all(&media).unwrap();
+        fs::write(media.join("blob.bin"), vec![2u8; 1024]).unwrap();
+        let logs = dir.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("sonar-app.log"), vec![3u8; 500_000]).unwrap();
+
+        let total = account_storage_bytes(&db);
+        assert_eq!(total, 4096 + 2048 + 1024, "logs must be excluded: {total}");
     }
 
     #[test]
@@ -1451,8 +1779,10 @@ mod tests {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
                 .unwrap();
-            conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);")
-                .unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (42);",
+            )
+            .unwrap();
         }
         let package = read_account_backup_package(&db_path, &key_hex).unwrap();
         assert_eq!(package.db_key_hex, key_hex);
@@ -1489,7 +1819,8 @@ mod tests {
         assert!(!backup_is_due(&policy, 1_700_000_000));
         // Fail-closed must be persisted so a later load / onboarding helper
         // cannot silently re-enable from a missing-file default.
-        let reloaded = serde_json::from_slice::<BackupPolicy>(&std::fs::read(&path).unwrap()).unwrap();
+        let reloaded =
+            serde_json::from_slice::<BackupPolicy>(&std::fs::read(&path).unwrap()).unwrap();
         assert!(!reloaded.enabled);
     }
 
@@ -1546,7 +1877,7 @@ mod tests {
         record_backup_failure(&db_path, "blossom down").unwrap();
         // Retry after failure still covers the same dirty_seq.
         record_backup_attempt(&db_path).unwrap();
-        record_backup_success(&db_path).unwrap();
+        record_backup_success(&db_path, None).unwrap();
         let policy = load_backup_policy(&db_path);
         assert!(!policy.dirty);
         assert!(policy.last_error.is_none());
@@ -1566,7 +1897,7 @@ mod tests {
         record_backup_attempt(&db_path).unwrap();
         // Message arrives while seal/upload is in flight.
         mark_backup_dirty(&db_path);
-        record_backup_success(&db_path).unwrap();
+        record_backup_success(&db_path, None).unwrap();
         let policy = load_backup_policy(&db_path);
         assert!(policy.dirty, "post-seal dirty mark must survive success");
         assert!(policy.last_success_at.is_some());

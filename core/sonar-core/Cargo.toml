@@ -44,6 +44,9 @@ bytes = { version = "1", optional = true }
 # Serialize Sonar Nostr descriptors and, behind `calls`, the iroh `EndpointAddr`
 # into the `nodeAddrB64` field of the ☎CALL signaling.
 base64 = "0.22"
+# Scratch dir for the backup dry-run: the decrypted index is written to disk to
+# be opened by SQLCipher, so it must be cleaned up even on an error path.
+tempfile.workspace = true
 sonar-stickers = { path = "../sonar-stickers" }
 serde_json.workspace = true
 mdk-core.workspace = true

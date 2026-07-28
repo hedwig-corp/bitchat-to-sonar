@@ -1921,6 +1921,9 @@ impl SonarClient {
         let db_path = db_path.as_ref();
         let engine = MarmotEngine::persistent(identity.clone(), db_path, db_key)?;
         let index_path = index_db_path_for_db(db_path);
+        // Let read-only consumers (backup stats, storage row) reopen the index
+        // without the host re-supplying the key.
+        crate::account_backup::remember_index_key(db_path, &db_key);
         let index = match ConversationIndex::open(&index_path, db_key) {
             Ok(idx) => Some(idx),
             Err(err) => {
