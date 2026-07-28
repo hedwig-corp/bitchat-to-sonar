@@ -66,6 +66,10 @@ struct BitchatApp: App {
         WindowGroup {
             SonarRootView()
                 .environmentObject(sonarStore)
+                // Separate from the store on purpose: only the payment-status
+                // views observe this 1 Hz tick, so an in-flight payment does
+                // not re-render the whole app every second (SNPaymentClock).
+                .environmentObject(sonarStore.paymentClock)
                 .onAppear {
                     NotificationDelegate.shared.bind(
                         chatViewModel: chatViewModel,

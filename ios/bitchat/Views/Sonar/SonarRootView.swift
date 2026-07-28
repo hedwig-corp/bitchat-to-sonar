@@ -180,6 +180,8 @@ struct SonarRootView: View {
             SonarWalletActivityScreen()
         case .sendPayment:
             SonarSendPaymentScreen()
+        case .paymentStatus(let activityId):
+            SonarPaymentStatusScreen(activityId: activityId)
         }
     }
 }

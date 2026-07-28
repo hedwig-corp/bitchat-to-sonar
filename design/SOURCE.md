@@ -4,6 +4,25 @@ The complete design handoff bundle lives in `design/handoff/`. It is **vendored*
 (checked in) so agents read it from disk instead of re-fetching every time.
 
 - **Source share:** https://api.anthropic.com/v1/design/h/UQethAMsRlMNd4xMzNISTA?open_file=Sonar+Prototype.html (Claude Design / claude.ai/design) — **dead (404)**; refresh through the `DesignSync` MCP tool against the project id below instead.
+- **Payment-status refresh (2026-07-28)** — Claude Design project
+  `c6936a45-1fde-470e-9d0b-56b04428e60b`
+  ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Payment+Status.html)):
+  ADDS the **external payment status** explorations. New files vendored here:
+  `project/Sonar Payment Status.html` (the exploration page — its own `<style>`
+  block carries every `.rs-*` / `.stp-*` / `.jr-*` / `.one-*` / `.hp-*` rule, so
+  `theme.css` is untouched) and `project/sonar/paystatus.jsx` (one shared
+  7-state machine — `resolving · paying · slow · sent · failed_safe · refunded ·
+  unknown` — rendered four ways: **A** stepped ledger, **B** one sentence, **C**
+  journey rail, **D** resumable status; plus three home surfaces **H1** pinned
+  strip / **H2** list row / **H3** slim bar).
+  The page does not pick a direction. **D + H1 shipped** (owner's call):
+  `ios/bitchat/Views/Sonar/SonarPaymentStatus{,Screen}.swift` and
+  `apps/sonar/.../wallet/PaymentStatus.kt` +
+  `apps/sonar/.../screens/SonarPaymentStatusScreen.kt`, reached from
+  `Send payment → Pay` on an external destination. H1 is shown only while the
+  payment is live. Deviations, unreachable states and the copy-table contract
+  are written up in [`docs/SONAR-PAYMENTS.md`](../docs/SONAR-PAYMENTS.md).
+  Nothing else in the project changed for this refresh.
 - **Send-payment refresh (2026-07-27)** — Claude Design project
   `c6936a45-1fde-470e-9d0b-56b04428e60b`
   ([open](https://claude.ai/design/p/c6936a45-1fde-470e-9d0b-56b04428e60b?file=Sonar+Prototype.html)):
@@ -96,6 +115,9 @@ Per the bundle README (`design/handoff/README.md`) and the repo DESIGN RULE
 - **App design** = `design/handoff/project/Sonar Prototype.html` + its imports in
   `design/handoff/project/sonar/*` (`app.jsx`, `screens.jsx`, `components.jsx`,
   `data.js`, `icons.jsx`, `pay.jsx`, `settings.jsx`, `theme.css`).
+- **External payment status** = `Sonar Payment Status.html` + `sonar/paystatus.jsx`
+  (an exploration page, not a shipped screen — Direction **D** and home surface
+  **H1** are the ones implemented).
 - **Desktop** = `Sonar Desktop.html` + `sonar/desktop*.{jsx,css}`.
 - **Marketing site** (NOT the app) = `Sonar Landing.html`.
 - **Intent / back-and-forth** = `design/handoff/chats/chat1.md` (read this for what the user wanted).

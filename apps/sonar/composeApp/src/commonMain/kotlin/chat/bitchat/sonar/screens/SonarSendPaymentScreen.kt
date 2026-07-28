@@ -37,6 +37,7 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.PaySheet
 import chat.bitchat.sonar.PayableContact
 import chat.bitchat.sonar.ConvRow
+import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.payFmt
 import chat.bitchat.sonar.ui.SNIcon
@@ -282,9 +283,18 @@ fun SonarSendPaymentScreen(state: SonarAppState) {
             fixedSats = fixedSats,
             fiatOf = { state.fiatOrNull(it) },
             onSend = { sats ->
-                // Detached: this screen pops on the same frame.
-                state.payDestinationDetached(destination, sats, payableDisplayName(destination))
-                state.back()
+                // An external payment has no chat thread to report into, so it
+                // gets its own status screen (design: paystatus.jsx Direction
+                // D). The send runs on the app scope, not here, so popping this
+                // picker cannot cancel it. `replaceTop` keeps Back on home: the
+                // picker's payment is already gone by then.
+                val name = payableDisplayName(destination)
+                externalTarget = null
+                fixedSats = null
+                val activityId = state.beginDestinationPayment(destination, sats, name)
+                // Null means the destination was refused before anything was
+                // sent (the state toasted why) — stay on the picker to fix it.
+                if (activityId != null) state.replaceTop(Screen.PaymentStatus(activityId))
             },
             onClose = { externalTarget = null; fixedSats = null },
         )

@@ -183,7 +183,7 @@ struct SonarMacRootView: View {
         case .profile:
             selection = .profile
             store.path.removeAll()
-        case .contactProfile, .groupInfo, .walletActivity, .sendPayment:
+        case .contactProfile, .groupInfo, .walletActivity, .sendPayment, .paymentStatus:
             // Pushed detail screens: they live on store.path, so the sidebar
             // selection stays where it is.
             break
@@ -510,6 +510,8 @@ private struct SonarMacMainPane: View {
             SonarWalletActivityScreen()
         case .sendPayment:
             SonarSendPaymentScreen()
+        case .paymentStatus(let activityId):
+            SonarPaymentStatusScreen(activityId: activityId)
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
         case .contactProfile(let id, let name):

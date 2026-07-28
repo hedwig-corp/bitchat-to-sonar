@@ -372,6 +372,8 @@ internal fun SonarScreenHost(state: SonarAppState) {
             is Screen.GroupInfo -> chat.bitchat.sonar.screens.SonarGroupInfoScreen(state, sc)
             is Screen.WalletActivity -> chat.bitchat.sonar.screens.SonarWalletActivityScreen(state)
             is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
+            is Screen.PaymentStatus ->
+                chat.bitchat.sonar.screens.SonarPaymentStatusScreen(state, sc.activityId)
         }
         state.toast?.let { ToastBar(it) { state.toast = null } }
     }
@@ -441,6 +443,11 @@ private fun HomeScreen(state: SonarAppState) {
             }
 
             LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 120.dp)) {
+                // H1 pinned strip (design: paystatus.jsx). An external payment
+                // has no conversation to live in, so while one is in flight it
+                // sits above the list; it clears itself the moment it settles
+                // or fails.
+                item { chat.bitchat.sonar.screens.HomePaymentStrip(state) }
                 item { SNSectionLabel("Around you") }
                 // "Around you" collapses the geohash precision ladder (+ Mesh) into one
                 // card with a tier picker (design: HereCard) instead of a flat list.

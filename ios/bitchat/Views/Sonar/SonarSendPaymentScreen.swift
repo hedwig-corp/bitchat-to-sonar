@@ -293,16 +293,23 @@ struct SonarSendPaymentScreen: View {
                     fixedSats: fixedSats,
                     onClose: { externalTarget = nil; fixedSats = nil },
                     onSend: { sats in
-                        Task {
-                            let name = SNExternalDestination.displayName(destination)
-                            if let message = await store.payDestination(
-                                destination, sats: sats, displayName: name
-                            ) {
-                                // App-level: this screen is already gone.
-                                store.showToast(message)
-                            }
+                        // An external payment has no chat thread to report
+                        // into, so it gets its own status screen (design:
+                        // paystatus.jsx Direction D). The send runs on the
+                        // store, not here, so popping this picker cannot
+                        // cancel it. `replaceTop` keeps Back on home: the
+                        // picker's payment is already gone by then.
+                        let name = SNExternalDestination.displayName(destination)
+                        externalTarget = nil
+                        fixedSats = nil
+                        guard let activityId = store.beginDestinationPayment(
+                            destination, sats: sats, displayName: name
+                        ) else {
+                            // Refused before anything was sent; the store
+                            // toasted why, so stay on the picker to fix it.
+                            return
                         }
-                        store.pop()
+                        store.replaceTop(.paymentStatus(activityId))
                     }
                 )
             }

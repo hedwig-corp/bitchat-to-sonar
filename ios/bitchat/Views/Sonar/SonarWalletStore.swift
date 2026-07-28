@@ -92,14 +92,20 @@ struct SonarWalletPayment: Equatable, Codable, Sendable {
     }
 }
 
+/// Locale-grouped sats with no unit — "2,100". Use this when the amount is
+/// composed into a longer phrase ("2,100 sats in flight"); `sonarFormatSats`
+/// already carries the unit and appending another one reads "2,100 sats sats".
+func sonarGroupedSats(_ sats: Int64) -> String {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    return f.string(from: NSNumber(value: sats)) ?? String(sats)
+}
+
 /// Minimal, locale-grouped sats formatting — the ONLY money formatting done
 /// in Swift. Used for the honest offline case (no live rate) where we must
 /// NOT show a fiat conversion. Everything else flows through the SDK.
 func sonarFormatSats(_ sats: Int64) -> String {
-    let f = NumberFormatter()
-    f.numberStyle = .decimal
-    let grouped = f.string(from: NSNumber(value: sats)) ?? String(sats)
-    return "\(grouped) sats"
+    "\(sonarGroupedSats(sats)) sats"
 }
 
 /// What the payments UI needs from a wallet. Implementations must be safe

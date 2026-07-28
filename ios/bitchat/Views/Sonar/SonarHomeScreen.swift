@@ -62,6 +62,11 @@ struct SonarHomeScreen: View {
                 }
                 ScrollView {
                     VStack(spacing: 0) {
+                        // H1 pinned strip (design: paystatus.jsx). An external
+                        // payment has no conversation to live in, so while one
+                        // is in flight it sits above the list; it clears itself
+                        // the moment it settles or fails.
+                        SNHomePaymentStrip()
                         SNSectionLabel("Around you")
                         channelList
                         let saved = store.savedChannels

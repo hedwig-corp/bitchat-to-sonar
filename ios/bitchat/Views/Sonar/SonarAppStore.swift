@@ -162,6 +162,9 @@ enum SonarRoute: Hashable {
     case walletActivity
     /// Standalone send-payment picker (new-chat sheet → "Send a payment").
     case sendPayment
+    /// Status of one external payment, by activity id (design: paystatus.jsx
+    /// Direction D). External payments have no chat thread to report into.
+    case paymentStatus(String)
 }
 
 // MARK: - View models consumed by the screens
@@ -923,6 +926,22 @@ final class SonarAppStore: ObservableObject {
     /// Navigation stack below the home root.
     @Published var path: [SonarRoute] = []
     @Published var toast: String? = nil
+    /// External payments this process is currently sending, keyed by activity
+    /// id. The persisted ledger owns the outcome; this holds only what it
+    /// deliberately does not keep — the resolving/paying/slow split and the
+    /// clock behind "Sending · 6s" (design: paystatus.jsx).
+    @Published private(set) var livePayments: [String: SNLivePayment] = [:]
+    /// Ticks once a second while a payment is live so elapsed labels update.
+    /// Runs only while `livePayments` is non-empty, and is deliberately NOT
+    /// republished through the store — see `SNPaymentClock`.
+    let paymentClock = SNPaymentClock()
+    private var paymentClockTask: Task<Void, Never>?
+    /// Plaintext destinations of payments sent this session, so `Try again`
+    /// can re-send. The ledger only ever stores a hash of the destination, and
+    /// that stays true — this map is memory-only and dies with the process.
+    private var paymentDestinations: [String: String] = [:]
+    /// Activity ids whose `Cancel` was tapped before the wallet was called.
+    private var cancelledPayments: Set<String> = []
     /// Invalidates in-flight toast dismissals when a newer toast is shown.
     private var toastSession = SNToastSession()
     /// Replaced on each `showToast` so rapid toasts don't pile sleeping tasks.
@@ -7597,45 +7616,75 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
-    /// Pays an arbitrary Lightning destination typed into the send-payment
-    /// picker — a BOLT12 offer, a BOLT11 invoice, or a `name@domain` Lightning
-    /// address. The wallet resolves the destination, so this only records the
-    /// wallet-side activity: there is no conversation to post a ⚡PAY receipt
-    /// into. Returns a user-facing message, or nil when the payment settled.
-    @discardableResult
-    func payDestination(_ destination: String, sats: Int64, displayName: String) async -> String? {
-        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard sats > 0, !dest.isEmpty else { return nil }
-        guard case .ready = walletState else { return "Set up the wallet first." }
+    /// Refuses an external destination the wallet cannot pay, before any
+    /// activity is recorded. Returns the amount to hand the wallet, or the
+    /// message to show the user.
+    ///
+    /// A BOLT11 invoice carries its own amount, and the wallet takes it from
+    /// there. Two failure modes come out of ignoring that, both seen on device:
+    ///
+    ///  * an amountless invoice is simply unpayable — the SDK answers
+    ///    "Amount is missing: Expected invoice with an amount" no matter what
+    ///    amount we pass, so let the user know instead of taking an amount and
+    ///    failing after the fact;
+    ///  * supplying our own amount for an invoice that already has one risks
+    ///    "Receiver amount and invoice amount do not match", so we pass none
+    ///    and let the invoice speak.
+    ///
+    /// Offers and addresses are the opposite — they need the amount from us.
+    private enum SNDestinationCheck {
+        /// Amount to hand the wallet (0 lets a BOLT11 invoice speak for itself).
+        case send(Int64)
+        case refuse(String)
+    }
 
-        // A BOLT11 invoice carries its own amount, and the wallet takes it from
-        // there. Two failure modes come out of ignoring that, both seen on
-        // device:
-        //
-        //  * an amountless invoice is simply unpayable — the SDK answers
-        //    "Amount is missing: Expected invoice with an amount" no matter what
-        //    amount we pass, so let the user know instead of taking an amount
-        //    and failing after the fact;
-        //  * supplying our own amount for an invoice that already has one risks
-        //    "Receiver amount and invoice amount do not match", so we pass none
-        //    and let the invoice speak.
-        //
-        // Offers and addresses are the opposite — they need the amount from us.
+    private func destinationSendAmount(_ dest: String, sats: Int64) -> SNDestinationCheck {
+        guard case .ready = walletState else { return .refuse("Set up the wallet first.") }
         let lower = dest.lowercased()
         let isBolt11 = lower.hasPrefix("lnbc") || lower.hasPrefix("lntb") || lower.hasPrefix("lnbcrt")
         if isBolt11, SNScannedKind.bolt11AmountSats(lower) == nil {
-            return "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
+            return .refuse(
+                "This invoice has no amount. Ask for one with an amount — the wallet can't set it for a Lightning invoice."
+            )
         }
-        let amountForWallet: Int64 = isBolt11 ? 0 : sats
+        return .send(isBolt11 ? 0 : sats)
+    }
+
+    /// Starts paying an arbitrary Lightning destination from the send-payment
+    /// picker — a BOLT12 offer, a BOLT11 invoice, or a `name@domain` Lightning
+    /// address. The wallet resolves the destination, so this only records the
+    /// wallet-side activity: there is no conversation to post a ⚡PAY receipt
+    /// into.
+    ///
+    /// Returns the activity id to open the status screen on, or nil when the
+    /// destination was refused before anything was sent (the reason is shown as
+    /// a toast). The send itself runs detached on the store's own task, so
+    /// leaving the status screen — or the picker popping out from under it —
+    /// cannot cancel a payment in flight.
+    @discardableResult
+    func beginDestinationPayment(
+        _ destination: String, sats: Int64, displayName: String
+    ) -> String? {
+        let dest = destination.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard sats > 0, !dest.isEmpty else { return nil }
+        let amountForWallet: Int64
+        switch destinationSendAmount(dest, sats: sats) {
+        case .send(let amount):
+            amountForWallet = amount
+        case .refuse(let message):
+            showToast(message)
+            return nil
+        }
 
         let activityId = UUID().uuidString.lowercased()
+        let payeeName = displayName.isEmpty ? dest : displayName
         paymentActivityLedger.recordPending(SonarPaymentActivity(
             id: activityId,
             kind: .sonarDirect,
             // No conversation backs this one — "wallet" is the documented
             // peerKey for payments that do not belong to a chat.
             peerKey: "wallet",
-            peerName: displayName.isEmpty ? dest : displayName,
+            peerName: payeeName,
             direction: .outgoing,
             sats: sats,
             via: SNVia.internet.rawValue,
@@ -7643,19 +7692,140 @@ final class SonarAppStore: ObservableObject {
             destinationHash: Self.sha256Hex(dest),
             status: .pending
         ))
-        do {
-            let payment = try await wallet.send(
-                destination: dest,
-                amountSats: amountForWallet,
-                note: "Sonar payment \(activityId)"
-            )
-            paymentActivityLedger.markPaid(activityId, payment: payment)
-            return nil
-        } catch {
-            paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
-            SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
-            return "Payment failed: \(error.localizedDescription)"
+        paymentDestinations[activityId] = dest
+        livePayments[activityId] = SNLivePayment(
+            id: activityId,
+            payeeName: payeeName,
+            sats: sats,
+            startedAt: Date(),
+            handedToWallet: false
+        )
+        startPaymentClock()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Everything here runs on the main actor, so the cancel check and
+            // the hand-off cannot interleave: once `handedToWallet` is set,
+            // Cancel is no longer offered.
+            guard !self.cancelledPayments.contains(activityId) else {
+                self.cancelledPayments.remove(activityId)
+                self.livePayments[activityId] = nil
+                self.paymentActivityLedger.markFailed(activityId, message: "Cancelled before sending")
+                self.stopPaymentClockIfIdle()
+                return
+            }
+            self.livePayments[activityId]?.handedToWallet = true
+            do {
+                let payment = try await self.wallet.send(
+                    destination: dest,
+                    amountSats: amountForWallet,
+                    note: "Sonar payment \(activityId)"
+                )
+                self.paymentActivityLedger.markPaid(activityId, payment: payment)
+            } catch {
+                self.paymentActivityLedger.markFailed(activityId, message: error.localizedDescription)
+                SecureLogger.error("Sonar destination payment failed: \(error)", category: .session)
+                // The status screen states the failure in full, and the home
+                // strip clears on a terminal state — so without this a user who
+                // walked away from the screen would never learn it failed.
+                if self.path.last != .paymentStatus(activityId) {
+                    self.showToast("Payment failed: \(error.localizedDescription)")
+                }
+            }
+            // Terminal: drop out of the live set so the home strip clears and
+            // the clock can stop. The status screen reads the ledger from here.
+            self.livePayments[activityId] = nil
+            self.stopPaymentClockIfIdle()
         }
+        return activityId
+    }
+
+    /// The design's `Try again`: re-send the same amount to the same
+    /// destination as a fresh activity. Returns the new activity id, or nil
+    /// when the destination is no longer known (a relaunch drops it — the
+    /// ledger only ever stored its hash).
+    @discardableResult
+    func retryDestinationPayment(_ activityId: String) -> String? {
+        guard let destination = paymentDestinations[activityId],
+              let previous = paymentActivityLedger.entries[activityId]
+        else { return nil }
+        return beginDestinationPayment(
+            destination, sats: previous.sats, displayName: previous.peerName
+        )
+    }
+
+    /// Aborts a payment that has not reached the wallet yet. No-op once it has
+    /// — an in-flight Lightning payment cannot be recalled, and the status
+    /// screen stops offering Cancel at that point.
+    func cancelDestinationPayment(_ activityId: String) {
+        guard let live = livePayments[activityId], !live.handedToWallet else { return }
+        cancelledPayments.insert(activityId)
+    }
+
+    /// The design's state machine for one payment (paystatus.jsx).
+    ///
+    /// The ledger is the source of truth: a live entry only refines a row that
+    /// is still `pending`. A `pending` row with no live send is the honest
+    /// "unknown" case — the process died mid-send and Lightning will settle or
+    /// refund on its own.
+    func paymentStatus(_ activityId: String) -> SNPaymentStatus? {
+        guard let activity = paymentActivityLedger.entries[activityId] else { return nil }
+        let now = Date()
+        let canRetry = paymentDestinations[activityId] != nil
+        if let live = livePayments[activityId], activity.status == .pending {
+            return SNPaymentStatus(
+                id: activityId,
+                payeeName: live.payeeName,
+                sats: live.sats,
+                phase: live.phase(now: now),
+                elapsedSeconds: live.elapsedSeconds(now: now),
+                preimage: nil,
+                canRetry: canRetry
+            )
+        }
+        let phase: SNPayPhase
+        switch activity.status {
+        case .paid: phase = .sent
+        case .failed: phase = .failedSafe
+        case .pending: phase = .unknown
+        }
+        let reference = activity.settledAt ?? now
+        return SNPaymentStatus(
+            id: activityId,
+            payeeName: activity.peerName,
+            sats: activity.sats,
+            phase: phase,
+            elapsedSeconds: Int(max(0, reference.timeIntervalSince(activity.createdAt))),
+            preimage: activity.preimage,
+            canRetry: canRetry
+        )
+    }
+
+    /// The H1 home strip: the payment in flight right now, if any.
+    ///
+    /// Only live sends qualify. A `pending` row left behind by a killed process
+    /// is deliberately excluded — it can never resolve itself, and pinning a
+    /// banner over the chat list forever is worse than saying nothing.
+    var livePaymentStatus: SNPaymentStatus? {
+        guard let live = livePayments.values.min(by: { $0.startedAt < $1.startedAt }) else { return nil }
+        return paymentStatus(live.id)
+    }
+
+    private func startPaymentClock() {
+        guard paymentClockTask == nil else { return }
+        paymentClockTask = Task { @MainActor [weak self] in
+            while let self, !self.livePayments.isEmpty {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { return }
+                self.paymentClock.advance()
+            }
+        }
+    }
+
+    private func stopPaymentClockIfIdle() {
+        guard livePayments.isEmpty else { return }
+        paymentClockTask?.cancel()
+        paymentClockTask = nil
     }
 
     /// Sends money directly to the receiver's BOLT12 offer from their
@@ -8387,6 +8557,15 @@ final class SonarAppStore: ObservableObject {
         }
         if !path.isEmpty { path.removeLast() }
         syncViewingUnreadGroups()
+    }
+
+    /// Swap the top of the stack for another route, so Back skips the screen
+    /// that led here. The send-payment picker uses this to hand over to the
+    /// payment status screen: going back from the status belongs on home, not
+    /// on a picker whose payment is already gone.
+    func replaceTop(_ route: SonarRoute) {
+        if !path.isEmpty { path.removeLast() }
+        push(route)
     }
 
     /// Keep Marmot unread-badge suppression tied to the top DM route so a

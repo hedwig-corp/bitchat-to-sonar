@@ -258,6 +258,10 @@ struct SonarPaymentActivity: Codable, Equatable, Identifiable {
     var feesSats: Int64?
     var settledAt: Date?
     var failure: String?
+    /// Lightning preimage, when the wallet surfaced one. Optional so rows
+    /// persisted before the payment-status screen still decode. This is the
+    /// "proof" the status screen's `Copy proof` action copies.
+    var preimage: String?
 
     init(
         id: String,
@@ -273,7 +277,8 @@ struct SonarPaymentActivity: Codable, Equatable, Identifiable {
         walletPaymentId: String? = nil,
         feesSats: Int64? = nil,
         settledAt: Date? = nil,
-        failure: String? = nil
+        failure: String? = nil,
+        preimage: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -289,6 +294,7 @@ struct SonarPaymentActivity: Codable, Equatable, Identifiable {
         self.feesSats = feesSats
         self.settledAt = settledAt
         self.failure = failure
+        self.preimage = preimage
     }
 }
 
@@ -351,6 +357,7 @@ final class SonarPaymentActivityLedger: ObservableObject {
         entry.feesSats = payment.feesSats
         entry.settledAt = payment.timestamp
         entry.failure = nil
+        entry.preimage = payment.preimage ?? entry.preimage
         entries[id] = entry
         sortedCache = nil
         persist()
