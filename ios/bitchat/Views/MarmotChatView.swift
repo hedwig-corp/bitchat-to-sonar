@@ -1228,12 +1228,22 @@ final class MarmotChatModel: ObservableObject {
         }
     }
 
+    /// Dry run passthrough — see `MarmotService.previewBackup`.
+    func previewBackup() async throws -> AccountBackupPreviewInfo {
+        try await service.previewBackup()
+    }
+
     func loadBackupPolicy() throws -> BackupPolicyInfo {
         try service.loadBackupPolicy()
     }
 
     func updateBackupEnabled(_ enabled: Bool) throws {
         try service.updateBackupEnabled(enabled)
+    }
+
+    /// Settings cadence passthrough: "manual" | "daily" | "weekly".
+    func updateBackupFrequency(_ frequency: String) throws {
+        try service.updateBackupFrequency(frequency)
     }
 
     /// Await until the Marmot node is connected (or a short timeout), kicking

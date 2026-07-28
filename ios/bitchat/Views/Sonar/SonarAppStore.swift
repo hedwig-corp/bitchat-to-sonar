@@ -2393,6 +2393,18 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    /// Settings cadence: "daily" | "weekly" | "manual". Core owns the mapping;
+    /// the BGAppRefresh handler already refuses a disabled policy, so manual
+    /// needs no separate scheduler change.
+    func updateBackupFrequency(_ frequency: String) {
+        do {
+            try marmot.updateBackupFrequency(frequency)
+            refreshBackupPolicy()
+        } catch {
+            toast = String(localized: "Could not change backup frequency")
+        }
+    }
+
     func setAutoBackupEnabled(_ enabled: Bool) {
         discloseAutoBackup()
         do {

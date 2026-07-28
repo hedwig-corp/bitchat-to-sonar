@@ -1713,6 +1713,26 @@ final class MarmotService: @unchecked Sendable {
         return accountStorageBytes(dbPath: dbPath)
     }
 
+    /// Dry run: what a restore would bring back. The core call never stages,
+    /// commits, or opens the live store, so no lock and no closeNode here —
+    /// safe to run while chatting. Named `previewBackup` (not the FFI's
+    /// `previewAccountBackup`) so the member cannot shadow the global and
+    /// recurse.
+    func previewBackup() async throws -> AccountBackupPreviewInfo {
+        guard let nsec = snapshotIdentity()?.nsec() else {
+            throw ServiceError.core("no identity to preview")
+        }
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(returning: try previewAccountBackup(nsec: nsec, blossomServer: nil))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     /// Settings cadence: "manual" | "daily" | "weekly".
     func updateBackupFrequency(_ frequency: String) throws {
         let (dbPath, _) = try Self.databaseConfig()
