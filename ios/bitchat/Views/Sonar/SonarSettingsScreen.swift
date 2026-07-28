@@ -258,6 +258,14 @@ struct SonarSettingsScreen: View {
             }
         }
         .background(SonarTheme.bg.ignoresSafeArea())
+        .onAppear {
+            // Hydrate the Data & storage rows: the policy feeds the Chat backup
+            // sub line, and the storage walk feeds the Storage value. Without
+            // this the row would read "—" forever — the store never measures on
+            // its own.
+            store.refreshBackupPolicy()
+            store.refreshStorageBytes()
+        }
         .snSheet(isPresented: $connSheet, title: "Connection") {
             SNConnectivitySheetContent(onClose: { connSheet = false })
         }

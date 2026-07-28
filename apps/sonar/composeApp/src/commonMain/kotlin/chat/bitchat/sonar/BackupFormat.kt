@@ -70,7 +70,6 @@ object BackupFormat {
             ago < 60 -> "Just now"
             dayAt == dayNow -> "Today, $clock"
             dayNow - dayAt == 1L -> "Yesterday, $clock"
-            ago < 7 * 86_400 -> "${ago / 86_400} d ago"
             else -> "${ago / 86_400} d ago"
         }
     }

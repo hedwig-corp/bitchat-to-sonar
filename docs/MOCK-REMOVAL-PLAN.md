@@ -41,7 +41,7 @@ value rendered now comes from the real services:
 | 13 | Settings: Message requests (fake "driftwood" request) | **HIDDEN** | Needs a real message-request queue (unknown-sender gating) in the chat pipeline. |
 | 14 | Settings: App icon picker (Cyan/Midnight/Paper) | **HIDDEN** | No `CFBundleAlternateIcons` registered. Register alternate icons + `setAlternateIconName` to unhide. |
 | 15 | Settings: Notifications sheet (allow / show names / preview toggles) | **SHIPPED** | Prefs live in `SonarNotificationPreferenceStore`; mesh/mention paths and `SonarPushProcessor` route through `SonarLocalNotificationRouter`. Killed-app NSE still lacks Marmot DB (#146) so names/previews stay generic until App Group catch-up. |
-| 16 | Settings: Data & storage ("124 MB", "Wi-Fi only") | **HIDDEN** | Fabricated numbers. Needs real storage measurement / data-usage policy. |
+| 16 | Settings: Data & storage | **SHIPPED** | Real numbers since the Data & storage redesign: Storage measures the on-disk account footprint (`account_storage_bytes`, logs excluded), Chat backup reads the policy sidecar, Data usage persists the wifiOnly pref. Unmeasured values render as a dash, never a fabricated figure. |
 | 17 | Settings: Help row | **HIDDEN** | No destination. Needs a real help URL/screen. |
 | 18 | Composer "+" sheet: "Share location" row | **HIDDEN** | Needs a real location-share message type over mesh/Nostr. ("People nearby" kept — it opens the real radar.) |
 | 19 | Composer "+" sheet: "Reactions" row | **HIDDEN** | Needs a real reaction message type. ("Verify safety number" kept — real data.) |
