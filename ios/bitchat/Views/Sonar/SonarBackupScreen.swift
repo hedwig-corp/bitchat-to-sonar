@@ -346,7 +346,10 @@ private struct SonarBackupDryRunSheet: View {
                             .frame(width: 30, height: 30)
                             .overlay(SNIcon(name: .lock, size: 15).foregroundColor(SonarTheme.text2))
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(verbatim: c.name)
+                            // DM summaries carry no group name in the index —
+                            // display names live in profiles, which a preview
+                            // of a not-yet-restored backup cannot resolve.
+                            Text(verbatim: c.name.isEmpty ? String(localized: "Direct chat") : c.name)
                                 .font(SonarTheme.uiFont(size: 14.5, weight: .semibold))
                                 .foregroundColor(SonarTheme.text)
                             if !c.latestContent.isEmpty {

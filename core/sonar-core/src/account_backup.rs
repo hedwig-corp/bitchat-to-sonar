@@ -1118,7 +1118,14 @@ async fn preview_account_backup_from(keys: &Keys, hosts: &[Url]) -> Result<Accou
         .into_iter()
         .map(|s| BackupPreviewConversation {
             name: s.name,
-            latest_content: s.latest_content,
+            // Control lines (⚡TRILL / ⚡PAY / ☎CALL) are transcript-hidden;
+            // leaking them here was caught on device — the dry run rendered a
+            // raw "⚡TRILL|1|…" as a chat's preview. Blank anything that is not
+            // a plain message and let hosts render name/count only.
+            latest_content: match crate::notification::classify_content(&s.latest_content) {
+                crate::notification::NotificationKind::Message => s.latest_content,
+                _ => String::new(),
+            },
             message_count: s.message_count,
         })
         .collect();

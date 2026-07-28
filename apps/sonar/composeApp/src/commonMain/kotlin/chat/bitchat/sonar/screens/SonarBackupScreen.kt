@@ -424,7 +424,11 @@ private fun BackupDryRunSheet(onClose: () -> Unit) {
                 Spacer(Modifier.width(11.dp))
                 Column(Modifier.weight(1f)) {
                     Text(
-                        c.name, color = s.text, fontSize = 14.5.sp,
+                        // DM summaries carry no group name in the index; hosts
+                        // resolve display names from profiles, which a preview
+                        // of a not-yet-restored backup cannot do.
+                        c.name.ifBlank { "Direct chat" },
+                        color = s.text, fontSize = 14.5.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
                     if (c.latestContent.isNotBlank()) {

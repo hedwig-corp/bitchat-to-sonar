@@ -58,7 +58,11 @@ enum BackupFormat {
     ///
     /// `now` is injected so this stays pure and testable — a helper that read the
     /// clock itself could not be pinned.
-    static func lastBackup(atSecs: UInt64?, nowSecs: UInt64, offsetSecs: Int64 = 0) -> String? {
+    static func lastBackup(
+        atSecs: UInt64?,
+        nowSecs: UInt64,
+        offsetSecs: Int64 = Int64(TimeZone.current.secondsFromGMT())
+    ) -> String? {
         guard let at = atSecs, at > 0 else { return nil }
         // A backup stamped in the future is clock skew, not a negative duration.
         if at >= nowSecs { return "Just now" }

@@ -1,5 +1,7 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.backup.currentUtcOffsetSecs
+
 /**
  * Formatting for the Settings "Data & storage" rows and the Chat backup stats.
  *
@@ -56,7 +58,11 @@ object BackupFormat {
      * [nowSecs] is injected so this stays pure and testable — a helper that read
      * the clock itself could not be pinned.
      */
-    fun lastBackup(atSecs: Long?, nowSecs: Long, offsetSecs: Long = 0): String? {
+    fun lastBackup(
+        atSecs: Long?,
+        nowSecs: Long,
+        offsetSecs: Long = currentUtcOffsetSecs(),
+    ): String? {
         val at = atSecs ?: return null
         if (at <= 0) return null
         val ago = nowSecs - at

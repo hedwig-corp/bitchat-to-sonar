@@ -18,3 +18,10 @@ expect fun setLiveUiSessionForAutoBackup(live: Boolean)
  * uploaded, this no-ops.
  */
 expect fun enqueueOneShotPlatformAutoBackup()
+
+/**
+ * Device UTC offset in seconds, for rendering "Today/Yesterday" boundaries in
+ * the user's own day rather than UTC's. Caught on device: a 23:33 local backup
+ * rendered as "Today, 21:33" at 01:38 the next morning.
+ */
+expect fun currentUtcOffsetSecs(): Long

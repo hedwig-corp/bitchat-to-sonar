@@ -15,3 +15,6 @@ actual fun setLiveUiSessionForAutoBackup(live: Boolean) {
 actual fun enqueueOneShotPlatformAutoBackup() {
     enqueueOneShotAndroidAutoBackup()
 }
+
+actual fun currentUtcOffsetSecs(): Long =
+    java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000L

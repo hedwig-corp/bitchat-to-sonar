@@ -16,8 +16,8 @@ class BackupFormatTest {
         // A dash is honest; "0 B" would claim we measured an empty account.
         assertNull(BackupFormat.bytes(null))
         assertNull(BackupFormat.count(null))
-        assertNull(BackupFormat.lastBackup(null, nowSecs = 1_785_200_000))
-        assertNull(BackupFormat.lastBackup(0, nowSecs = 1_785_200_000))
+        assertNull(BackupFormat.lastBackup(null, nowSecs = 1_785_200_000, offsetSecs = 0))
+        assertNull(BackupFormat.lastBackup(0, nowSecs = 1_785_200_000, offsetSecs = 0))
     }
 
     @Test
@@ -53,17 +53,17 @@ class BackupFormatTest {
         val midnight = 1_785_196_800L
         val now = midnight + 10 * 3600 + 30 * 60 // 10:30 the same day
 
-        assertEquals("Today, 04:12", BackupFormat.lastBackup(midnight + 4 * 3600 + 12 * 60, now))
-        assertEquals("Yesterday, 22:40", BackupFormat.lastBackup(midnight - 3600 - 20 * 60, now))
-        assertEquals("3 d ago", BackupFormat.lastBackup(now - 3 * 86_400, now))
+        assertEquals("Today, 04:12", BackupFormat.lastBackup(midnight + 4 * 3600 + 12 * 60, now, offsetSecs = 0))
+        assertEquals("Yesterday, 22:40", BackupFormat.lastBackup(midnight - 3600 - 20 * 60, now, offsetSecs = 0))
+        assertEquals("3 d ago", BackupFormat.lastBackup(now - 3 * 86_400, now, offsetSecs = 0))
     }
 
     @Test
     fun aBackupSecondsOldReadsAsJustNow() {
         val now = 1_785_200_000L
-        assertEquals("Just now", BackupFormat.lastBackup(now - 5, now))
+        assertEquals("Just now", BackupFormat.lastBackup(now - 5, now, offsetSecs = 0))
         // Clock skew must not produce a negative-duration string.
-        assertEquals("Just now", BackupFormat.lastBackup(now + 30, now))
+        assertEquals("Just now", BackupFormat.lastBackup(now + 30, now, offsetSecs = 0))
     }
 
     @Test

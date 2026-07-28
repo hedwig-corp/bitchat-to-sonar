@@ -10,3 +10,6 @@ actual fun enqueueOneShotPlatformAutoBackup() {
     // Desktop has no WorkManager and no process-death-while-backgrounded
     // problem — the in-process attempt is the whole story.
 }
+
+actual fun currentUtcOffsetSecs(): Long =
+    java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000L
