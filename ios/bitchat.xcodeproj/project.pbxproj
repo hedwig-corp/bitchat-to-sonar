@@ -277,6 +277,7 @@
 				A15C0DE300000000000000E6 /* SonarSharedProfileNames.swift */,
 				A11D50000000000000000004 /* sonar_notification.wav */,
 				A11D51000000000000000004 /* sonar_ble_notification.wav */,
+				A11D52000000000000000004 /* sonar_trill.wav */,
 				A6E32C972E762EA70032EA8A /* bitchat */,
 				E0A1B2C3D4E5F6012345678A /* ../relays/online_relays_gps.csv */,
 				A6E32D212E762EAB0032EA8A /* bitchatShareExtension */,

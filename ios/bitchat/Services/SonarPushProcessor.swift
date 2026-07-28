@@ -698,8 +698,10 @@ enum SonarPushProcessor {
     }
 
     /// Pure filter: NSE-owned delivered ids that match tip message / conversation.
+    /// A suppressed multi-group drain stamps every covered conversation into
+    /// `conversationIds`, so the target id matching ANY of them counts too.
     static func nseOwnedIdsToRemove(
-        delivered: [(id: String, messageId: String?, conversationId: String?)],
+        delivered: [(id: String, messageId: String?, conversationId: String?, conversationIds: [String])],
         messageIdHex: String?,
         conversationId: String?
     ) -> [String] {
@@ -707,7 +709,10 @@ enum SonarPushProcessor {
         let cid = conversationId?.trimmingCharacters(in: .whitespacesAndNewlines)
         return delivered.compactMap { row in
             if let mid, !mid.isEmpty, row.messageId == mid { return row.id }
-            if let cid, !cid.isEmpty, row.conversationId == cid { return row.id }
+            if let cid, !cid.isEmpty,
+               row.conversationId == cid || row.conversationIds.contains(cid) {
+                return row.id
+            }
             return nil
         }
     }
@@ -761,12 +766,13 @@ enum SonarPushProcessor {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let center = UNUserNotificationCenter.current()
             center.getDeliveredNotifications { notes in
-                let rows: [(id: String, messageId: String?, conversationId: String?)] = notes.compactMap { note in
+                let rows: [(id: String, messageId: String?, conversationId: String?, conversationIds: [String])] = notes.compactMap { note in
                     let content = note.request.content
                     guard isNSEOwned(content) else { return nil }
                     let mid = content.userInfo["sonar.messageId"] as? String
                     let cid = content.userInfo[SonarNotificationKeys.conversationId] as? String
-                    return (note.request.identifier, mid, cid)
+                    let cids = content.userInfo[SonarNotificationKeys.conversationIds] as? [String] ?? []
+                    return (note.request.identifier, mid, cid, cids)
                 }
                 let ids = nseOwnedIdsToRemove(
                     delivered: rows,

@@ -154,7 +154,10 @@ final class SonarTrillThrottle {
 /// entry reads as unmuted and is dropped on the next query.
 final class SonarChatMuteStore: ObservableObject {
     static let shared = SonarChatMuteStore()
-    static let defaultsKey = "sonar.chat.mutes.v1"
+    /// Single declaration lives in `SonarNSEDecoratePolicy` (compiled into
+    /// both the app and the appex), so the writer and the NSE reader cannot
+    /// drift apart on the key string.
+    static let defaultsKey = SonarNSEDecoratePolicy.mutesUserDefaultsKey
     static let appGroupId = "group.sh.hedwig.sonar"
 
     @Published private(set) var mutedUntil: [String: Date]
@@ -167,7 +170,16 @@ final class SonarChatMuteStore: ObservableObject {
         self.key = key
         if let data = defaults.data(forKey: key),
            let stored = try? JSONDecoder().decode([String: Date].self, from: data) {
-            mutedUntil = stored
+            // Legacy entries may carry mixed-case hex; normalize to the
+            // lowercase shape `normalizedCandidates` produces, keeping the
+            // later expiry when two casings collide.
+            var normalized: [String: Date] = [:]
+            normalized.reserveCapacity(stored.count)
+            for (k, until) in stored {
+                let lk = k.lowercased()
+                normalized[lk] = max(normalized[lk] ?? .distantPast, until)
+            }
+            mutedUntil = normalized
         } else {
             mutedUntil = [:]
         }
@@ -178,18 +190,11 @@ final class SonarChatMuteStore: ObservableObject {
 
     /// Equivalent lookup keys for one raw conversation key, so the check
     /// works whichever id shape a notification path carries (see
-    /// docs/CHAT-TYPES.md — five strings can identify one conversation):
-    /// the raw key, a 64-hex fingerprint's canonical 16-hex short form, and
-    /// a `marmot:<groupId>` route's bare group id (and vice versa).
+    /// docs/CHAT-TYPES.md — five strings can identify one conversation).
+    /// Delegates to the NSE policy helper — one normalization for the
+    /// store's writes and the appex's reads.
     static func normalizedCandidates(_ rawKey: String) -> [String] {
-        var keys = [rawKey]
-        if rawKey.hasPrefix("marmot:") {
-            keys.append(String(rawKey.dropFirst("marmot:".count)))
-        } else if rawKey.count == 64, rawKey.allSatisfy(\.isHexDigit) {
-            keys.append(String(rawKey.prefix(16)))
-            keys.append("marmot:" + rawKey)
-        }
-        return keys
+        SonarNSEDecoratePolicy.normalizedMuteCandidates(rawKey)
     }
 
     func isMuted(_ rawKey: String, now: Date = Date()) -> Bool {
@@ -267,8 +272,19 @@ final class SonarChatMuteStore: ObservableObject {
     }
 
     /// Only the real store mirrors — test instances with injected defaults
-    /// must never write into the shared container.
-    private var mirrorsToAppGroup: Bool { defaults === UserDefaults.standard }
+    /// must never write into the shared container. `bitchatTests_iOS` runs
+    /// in-process with the app's App Group entitlement, so a test touching
+    /// `.shared` would otherwise overwrite the device's real mirror.
+    private var mirrorsToAppGroup: Bool {
+        defaults === UserDefaults.standard && !Self.isRunningTests
+    }
+
+    private static var isRunningTests: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return NSClassFromString("XCTestCase") != nil ||
+            env["XCTestConfigurationFilePath"] != nil ||
+            env["XCTestBundlePath"] != nil
+    }
 
     /// Write-through mirror for the NSE. `.standard` stays the source of
     /// truth (no migration risk); the App Group copy is read-only for the

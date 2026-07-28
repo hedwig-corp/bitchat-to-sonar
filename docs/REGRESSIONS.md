@@ -1109,7 +1109,7 @@ NSE decorate on it.
 
 **Guarded by:** `SonarNSEDecoratePolicyTests.nseMuteCheck`
 
-**Also guarded by:** `SonarNSEDecoratePolicyTests.nseMuteCandidatesMatchStoreNormalization`, `SonarTrillMessageTests.testMutedChatTrillIsRowOnly`, `SonarTrillMessageTests.testMuteKeyNormalizationBridgesIdShapes`, `SonarTrillTest.muteSuppressesUntilExpiryAndForeverNeverExpires`, `SonarTrillTest.muteMapRoundTripsThroughBlob`
+**Also guarded by:** `SonarNSEDecoratePolicyTests.mutedDMSenderDoesNotSilenceGroups` (a muted DM's sender key must not silence that peer's messages in unmuted groups — the NSE judges directness with `meaningfulGroupName`, mirroring the host's gate in `SonarPushProcessor`), `SonarNSEDecoratePolicyTests.nseMuteCandidatesMatchStoreNormalization`, `SonarTrillMessageTests.testMutedChatTrillIsRowOnly`, `SonarTrillMessageTests.testMuteKeyNormalizationBridgesIdShapes`, `SonarTrillTest.muteSuppressesUntilExpiryAndForeverNeverExpires`, `SonarTrillTest.muteMapRoundTripsThroughBlob`
 
 **Not guarded:** The NSE `apply()` call-site wiring. The cited tests pin
 `SonarNSEDecoratePolicy.isMuted` and the key-shape agreement, not the filter

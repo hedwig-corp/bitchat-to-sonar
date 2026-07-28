@@ -261,49 +261,86 @@ struct SonarNSEDecoratePolicyTests {
         // marmot:-prefixed store key matches a bare 64-hex group id.
         let byGroup = try JSONEncoder().encode(["marmot:" + gid: active])
         #expect(SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: "npub1x", mutesJSON: byGroup, now: now
+            groupIdHex: gid, senderNpub: "npub1x", groupName: "friends", mutesJSON: byGroup, now: now
         ))
         // 16-hex short-form store key matches too.
         let byShortForm = try JSONEncoder().encode([String(gid.prefix(16)): active])
         #expect(SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: "", mutesJSON: byShortForm, now: now
+            groupIdHex: gid, senderNpub: "", groupName: "", mutesJSON: byShortForm, now: now
         ))
-        // Sender-keyed mutes match. Use the production shape: core emits the
-        // drain sender as 64-hex (`sender.to_string()`), NOT bech32 — an npub
-        // sender here would test a case the real path never produces, which is
-        // how the store-npub/look-up-hex mismatch stayed green for six rounds.
-        // muteKeys now stores the hex twin of every pubkey key so this matches.
+        // Sender-keyed mutes match FOR A DIRECT CHAT. Use the production
+        // shape: core emits the drain sender as 64-hex (`sender.to_string()`),
+        // NOT bech32 — an npub sender here would test a case the real path
+        // never produces, which is how the store-npub/look-up-hex mismatch
+        // stayed green for six rounds.
         let senderHex = String(repeating: "cd", count: 32)
         let bySender = try JSONEncoder().encode([senderHex: active])
         #expect(SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: "", senderNpub: senderHex, mutesJSON: bySender, now: now
+            groupIdHex: "", senderNpub: senderHex, groupName: "", mutesJSON: bySender, now: now
+        ))
+        // Mixed-case hex from any side still matches (every other hex
+        // comparison in the NSE lowercases; muting must not be the exception).
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid.uppercased(), senderNpub: "", groupName: "",
+            mutesJSON: byGroup, now: now
         ))
         // A store that only ever saw the bech32 form cannot match a hex sender —
         // pinning why muteKeys has to persist both encodings, not just one.
         let bech32Only = try JSONEncoder().encode(["npub1exampleexample": active])
         #expect(!SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: "", senderNpub: senderHex, mutesJSON: bech32Only, now: now
+            groupIdHex: "", senderNpub: senderHex, groupName: "", mutesJSON: bech32Only, now: now
         ))
         // Expired reads as unmuted.
         let expired = try JSONEncoder().encode(["marmot:" + gid: now.addingTimeInterval(-1)])
         #expect(!SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: "", mutesJSON: expired, now: now
+            groupIdHex: gid, senderNpub: "", groupName: "", mutesJSON: expired, now: now
         ))
         // Missing or undecodable mirror fails open (unmuted).
         #expect(!SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: "", mutesJSON: nil, now: now
+            groupIdHex: gid, senderNpub: "", groupName: "", mutesJSON: nil, now: now
         ))
         #expect(!SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: "", mutesJSON: Data("junk".utf8), now: now
+            groupIdHex: gid, senderNpub: "", groupName: "", mutesJSON: Data("junk".utf8), now: now
+        ))
+    }
+
+    @Test("a muted DM must not silence that peer inside an unmuted group")
+    func mutedDMSenderDoesNotSilenceGroups() throws {
+        // The host refuses this asymmetry in SonarPushProcessor (sender-keyed
+        // check gated on no group name); the NSE must match. muteKeys for a DM
+        // stores the peer's pubkey, so an unconditional sender match would
+        // silence every group message from that peer on the killed-app path.
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let senderHex = String(repeating: "cd", count: 32)
+        let gid = String(repeating: "ab", count: 32)
+        let dmMuted = try JSONEncoder().encode([senderHex: now.addingTimeInterval(3600)])
+
+        // Group message from the muted-DM peer: NOT muted.
+        #expect(!SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: senderHex, groupName: "friends",
+            mutesJSON: dmMuted, now: now
+        ))
+        // The DM itself: muted.
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: senderHex, groupName: "",
+            mutesJSON: dmMuted, now: now
+        ))
+        // Placeholder group names count as a DM (enrichEmptyContentPreviews
+        // can backfill "Sonar agent DM" before the mute check runs).
+        #expect(SonarNSEDecoratePolicy.isMuted(
+            groupIdHex: gid, senderNpub: senderHex, groupName: "Sonar agent DM",
+            mutesJSON: dmMuted, now: now
         ))
     }
 
     @Test("NSE mute lookup covers every key shape the store persists")
     func nseMuteCandidatesMatchStoreNormalization() throws {
-        // Drift guard: the appex cannot compile the SwiftUI file SonarChatMuteStore
-        // lives in, so mutedLookupCandidates hand-copies normalizedCandidates.
-        // Nothing else pins the two together — add a shape to the store without
-        // adding it here and mutes silently stop working on the killed-app path.
+        // The store now delegates its normalization to
+        // SonarNSEDecoratePolicy.normalizedMuteCandidates, so drift between
+        // the writer and the appex reader is impossible by construction. This
+        // test keeps the end-to-end guarantee pinned anyway: every key the
+        // store persists is found by the NSE lookup, through the store's OWN
+        // serialized blob (pinning the JSONEncoder/Decoder date agreement).
         let suiteName = "test.nse.mute.drift"
         let defaults = UserDefaults(suiteName: suiteName)!
         // Clear before AND after: a crashed prior run would otherwise leave
@@ -321,7 +358,9 @@ struct SonarNSEDecoratePolicyTests {
         }
 
         let lookedUp = Set(
-            SonarNSEDecoratePolicy.mutedLookupCandidates(groupIdHex: gid, senderNpub: npub)
+            SonarNSEDecoratePolicy.mutedLookupCandidates(
+                groupIdHex: gid, senderNpub: npub, groupName: ""
+            )
         )
         for stored in store.mutedUntil.keys {
             #expect(lookedUp.contains(stored), "NSE lookup misses stored mute key \(stored)")
@@ -332,7 +371,7 @@ struct SonarNSEDecoratePolicyTests {
         let blob = defaults.data(forKey: storeKey)
         #expect(blob != nil)
         #expect(SonarNSEDecoratePolicy.isMuted(
-            groupIdHex: gid, senderNpub: npub, mutesJSON: blob, now: Date()
+            groupIdHex: gid, senderNpub: npub, groupName: "", mutesJSON: blob, now: Date()
         ))
     }
 
