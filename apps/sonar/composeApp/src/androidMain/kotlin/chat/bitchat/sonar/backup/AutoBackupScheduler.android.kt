@@ -11,3 +11,7 @@ actual fun cancelPlatformAutoBackupWork() {
 actual fun setLiveUiSessionForAutoBackup(live: Boolean) {
     MarmotSessionGate.setLiveUiSession(live)
 }
+
+actual fun enqueueOneShotPlatformAutoBackup() {
+    enqueueOneShotAndroidAutoBackup()
+}

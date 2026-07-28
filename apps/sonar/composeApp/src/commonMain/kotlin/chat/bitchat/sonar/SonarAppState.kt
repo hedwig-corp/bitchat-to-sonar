@@ -4524,9 +4524,41 @@ class SonarAppState(private val scope: CoroutineScope) {
      * is false on JVM and the desktop root does not install the hook).
      */
     fun onProcessBackgrounded() {
-        if (!RelayConnectionPolicy.shouldInvalidateOnBackground()) return
-        SonarCore.invalidateRelayConnection()
-        refreshRelayOnline()
+        if (RelayConnectionPolicy.shouldInvalidateOnBackground()) {
+            SonarCore.invalidateRelayConnection()
+            refreshRelayOnline()
+        }
+        runOpportunisticBackupOnBackground()
+    }
+
+    /**
+     * Opportunistic backup at the background transition: fresh chats must not
+     * wait for the daily floor or the 12-hour periodic job to be safe.
+     *
+     * In-process attempt first — this session owns the gate, so the seal is as
+     * safe here as behind the manual path — plus a one-shot WorkManager
+     * fallback for the process being killed before the attempt lands. Both
+     * halves re-check `backup_is_due`, so at most one of them uploads.
+     */
+    private fun runOpportunisticBackupOnBackground() {
+        if (!isAutoBackupDisclosed() || !autoBackupEnabled) return
+        chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()
+        scope.launch {
+            val due = runCatching {
+                withContext(Dispatchers.Default) { SonarCore.backupIsDue() }
+            }.getOrDefault(false)
+            if (!due) return@launch
+            if (!backupMutex.tryLock()) return@launch
+            backupInProgress = true
+            val ok = try {
+                performAccountBackupSealReconnectUpload()
+            } finally {
+                backupInProgress = false
+                backupMutex.unlock()
+            }
+            refreshBackupPolicy()
+            if (ok) sonarLog("Backup", "opportunistic background backup uploaded")
+        }
     }
 
     fun requestImmediateSync() {

@@ -4,6 +4,8 @@ import android.content.Context
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.NetworkType
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
@@ -97,6 +99,7 @@ class AutoBackupWorker(
 
     companion object {
         const val UNIQUE_NAME = "sonar-auto-backup"
+        const val ONE_SHOT_NAME = "sonar-auto-backup-oneshot"
         const val DISCLOSED_PREF = "pref.auto_backup_disclosed"
 
         fun enqueue(context: Context) {
@@ -116,8 +119,32 @@ class AutoBackupWorker(
             )
         }
 
+        /**
+         * One-shot attempt ~3 minutes after the app backgrounds. REPLACE so a
+         * quick app switch just resets the timer instead of stacking jobs; the
+         * worker re-checks `backup_is_due` and the session gate, so a run that
+         * races the user reopening the app degrades to a no-op, never a seal
+         * under a live session.
+         */
+        fun enqueueOneShot(context: Context) {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .build()
+            val request = OneTimeWorkRequestBuilder<AutoBackupWorker>()
+                .setInitialDelay(3, TimeUnit.MINUTES)
+                .setConstraints(constraints)
+                .build()
+            WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+                ONE_SHOT_NAME,
+                ExistingWorkPolicy.REPLACE,
+                request,
+            )
+        }
+
         fun cancel(context: Context) {
-            WorkManager.getInstance(context.applicationContext).cancelUniqueWork(UNIQUE_NAME)
+            val wm = WorkManager.getInstance(context.applicationContext)
+            wm.cancelUniqueWork(UNIQUE_NAME)
+            wm.cancelUniqueWork(ONE_SHOT_NAME)
         }
     }
 }
@@ -141,4 +168,13 @@ fun cancelAndroidAutoBackupWork() {
         return
     }
     AutoBackupWorker.cancel(ctx)
+}
+
+fun enqueueOneShotAndroidAutoBackup() {
+    val ctx = try {
+        AppContextHolder.ctx
+    } catch (_: UninitializedPropertyAccessException) {
+        return
+    }
+    AutoBackupWorker.enqueueOneShot(ctx)
 }
