@@ -4605,6 +4605,8 @@ enum SNSettingsTrail {
     case chevron
     case arrowOut
     case toggle(Bool)
+    /// Selected item in a picker sheet (design: `trail="check"`).
+    case check
     case none
 }
 
@@ -4655,6 +4657,9 @@ struct SNSettingsRow: View {
                         .foregroundColor(SonarTheme.text3)
                 case .toggle(let on):
                     SNSwitch(on: on)
+                case .check:
+                    SNIcon(name: .check, size: 16, weight: 2.2)
+                        .foregroundColor(SonarTheme.accent)
                 case .none:
                     EmptyView()
                 }

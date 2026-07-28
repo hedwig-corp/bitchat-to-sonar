@@ -30,6 +30,7 @@ struct SonarSettingsScreen: View {
     @State private var exportKeySheet = false
     @State private var restoreKeySheet = false
     @State private var diagnosticsSheet = false
+    @State private var dataUsageSheet = false
     @State private var transcriptSpikeB = false
     @State private var collectionHostEnabled = SNTranscriptCollectionHostFlag.isEnabled
 
@@ -155,15 +156,6 @@ struct SonarSettingsScreen: View {
                             exportKeySheet = true
                         }
                         SNSettingsRow(
-                            icon: .shieldCheck, tone: .cyan,
-                            label: String(localized: "Chat backup"),
-                            sub: store.autoBackupStatusLine.isEmpty
-                                ? String(localized: "Encrypted cloud backup — recover chats after reinstall")
-                                : store.autoBackupStatusLine
-                        ) {
-                            store.push(.backup)
-                        }
-                        SNSettingsRow(
                             icon: .importKey, tone: .cyan,
                             label: String(localized: "Restore account"),
                             sub: String(localized: "Replace this account with an nsec from a backup")
@@ -212,6 +204,37 @@ struct SonarSettingsScreen: View {
                                     transcriptSpikeB = true
                                 }
                             }
+                        }
+                    }
+
+                    // Design order: Chat backup, Storage, Data usage. Numbers are
+                    // measured — the prototype's 124 MB is fiction, and
+                    // MOCK-REMOVAL-PLAN.md row 16 hid this section for that reason.
+                    SNSectionLabel("Data & storage")
+                    SNSettingsCard {
+                        SNSettingsRow(
+                            icon: .shieldCheck, tone: .cyan,
+                            label: String(localized: "Chat backup"),
+                            sub: store.autoBackupEnabled
+                                ? (BackupFormat.lastBackup(
+                                    atSecs: store.backupLastSuccessAt,
+                                    nowSecs: UInt64(Date().timeIntervalSince1970)
+                                   ).map { "On · last backup \($0)" } ?? "On")
+                                : "Off",
+                            value: store.autoBackupEnabled ? nil : "Set up"
+                        ) {
+                            store.push(.backup)
+                        }
+                        SNSettingsRow(
+                            icon: .drive, label: "Storage",
+                            value: BackupFormat.bytes(store.storageBytes) ?? "—"
+                        ) {}
+                        SNSettingsRow(
+                            icon: .data, label: "Data usage",
+                            value: store.wifiOnly ? "Wi-Fi only" : "Always",
+                            divider: false
+                        ) {
+                            dataUsageSheet = true
                         }
                     }
 
@@ -278,6 +301,29 @@ struct SonarSettingsScreen: View {
         }
         .snSheet(isPresented: $diagnosticsSheet, title: "Diagnostics") {
             SNDiagnosticsSheetContent()
+        }
+        .snSheet(isPresented: $dataUsageSheet, title: "Data usage") {
+            // The design renders Data usage as a value row with a chevron, so
+            // the choice lives in a sheet rather than an inline toggle.
+            VStack(spacing: 0) {
+                SNSettingsRow(
+                    icon: .data, label: "Wi-Fi only",
+                    sub: "Large media waits for Wi-Fi",
+                    trail: store.wifiOnly ? .check : .none
+                ) {
+                    store.wifiOnly = true
+                    dataUsageSheet = false
+                }
+                SNSettingsRow(
+                    icon: .data, label: "Always",
+                    sub: "Use mobile data too",
+                    trail: store.wifiOnly ? .none : .check,
+                    divider: false
+                ) {
+                    store.wifiOnly = false
+                    dataUsageSheet = false
+                }
+            }
         }
         #if os(iOS)
         .fullScreenCover(isPresented: $transcriptSpikeB) {

@@ -2306,6 +2306,28 @@ final class SonarAppStore: ObservableObject {
     /// Core-owned auto-backup toggle (on-by-default when policy sidecar missing).
     @Published private(set) var autoBackupEnabled: Bool = true
     @Published private(set) var autoBackupStatusLine: String = ""
+    /// Whole policy fields the redesigned backup screen renders (stats, cadence).
+    @Published private(set) var backupLastSuccessAt: UInt64?
+    @Published private(set) var backupSizeBytes: UInt64?
+    @Published private(set) var backupMessageCount: UInt64?
+    @Published private(set) var backupFrequency: String = "daily"
+    /// Account footprint for Settings → Storage; nil until measured.
+    @Published private(set) var storageBytes: UInt64?
+
+    /// Large media waits for Wi-Fi. Host preference, mirrored from Compose.
+    var wifiOnly: Bool {
+        get { UserDefaults.standard.object(forKey: "sonar.wifiOnly") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "sonar.wifiOnly") }
+    }
+
+    /// Measure the account's on-disk size off the main actor — it walks the
+    /// account directory, so it must never run on a render pass.
+    func refreshStorageBytes() {
+        Task.detached(priority: .utility) { [weak self] in
+            guard let measured = try? await MarmotService.accountStorageBytesOnDisk() else { return }
+            await MainActor.run { self?.storageBytes = measured }
+        }
+    }
     @Published private(set) var backupInProgress: Bool = false
     @Published private(set) var backupSanityChecks: [BackupSanityItem] = []
 
@@ -2328,6 +2350,10 @@ final class SonarAppStore: ObservableObject {
         do {
             let policy = try marmot.loadBackupPolicy()
             autoBackupEnabled = policy.enabled
+            backupLastSuccessAt = policy.lastSuccessAt
+            backupSizeBytes = policy.lastSizeBytes
+            backupMessageCount = policy.lastMessageCount
+            backupFrequency = policy.frequency
             if let ts = policy.lastSuccessAt, ts > 0 {
                 let date = Date(timeIntervalSince1970: TimeInterval(ts))
                 let formatted = date.formatted(date: .abbreviated, time: .shortened)

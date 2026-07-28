@@ -1705,6 +1705,24 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
+    /// On-disk footprint of this account (DB, index, sidecars, media, stickers;
+    /// logs excluded). Static + off-actor: it walks the directory, so it must
+    /// not run on a render pass.
+    static func accountStorageBytesOnDisk() throws -> UInt64 {
+        let (dbPath, _) = try Self.databaseConfig()
+        return accountStorageBytes(dbPath: dbPath)
+    }
+
+    /// Settings cadence: "manual" | "daily" | "weekly".
+    func updateBackupFrequency(_ frequency: String) throws {
+        let (dbPath, _) = try Self.databaseConfig()
+        do {
+            try setBackupFrequency(dbPath: dbPath, frequency: frequency)
+        } catch let error as SonarFfiError {
+            throw Self.mapFfi(error)
+        }
+    }
+
     func isBackupDue() throws -> Bool {
         let (dbPath, _) = try Self.databaseConfig()
         return backupIsDue(dbPath: dbPath)
