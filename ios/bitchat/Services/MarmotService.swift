@@ -1710,10 +1710,14 @@ final class MarmotService: @unchecked Sendable {
         return backupIsDue(dbPath: dbPath)
     }
 
-    func noteBackupSuccess() throws {
+    /// Record a successful upload. [sizeBytes] is the sealed blob's size — the
+    /// Settings stats strip describes what was uploaded, so it comes from the
+    /// bytes we actually pushed rather than a later measurement of a DB that has
+    /// moved on.
+    func noteBackupSuccess(sizeBytes: UInt64? = nil) throws {
         let (dbPath, _) = try Self.databaseConfig()
         do {
-            try recordBackupSuccess(dbPath: dbPath)
+            try recordBackupSuccess(dbPath: dbPath, sizeBytes: sizeBytes)
         } catch let error as SonarFfiError {
             throw Self.mapFfi(error)
         }

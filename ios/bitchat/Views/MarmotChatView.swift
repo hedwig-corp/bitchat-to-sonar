@@ -1167,7 +1167,7 @@ final class MarmotChatModel: ObservableObject {
                 nsec: sealedBundle.nsec,
                 sealed: sealedBundle.sealed
             )
-            try? service.noteBackupSuccess()
+            try? service.noteBackupSuccess(sizeBytes: UInt64(sealedBundle.sealed.count))
         } catch {
             uploadError = error
             try? service.noteBackupFailure(error.localizedDescription)
