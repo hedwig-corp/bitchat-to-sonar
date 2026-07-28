@@ -1601,6 +1601,27 @@ final class MarmotService: @unchecked Sendable {
         guard let nsec = snapshotIdentity()?.nsec() else {
             throw ServiceError.core("no identity to back up")
         }
+
+        // Hold the cross-process store lock across close+seal. The Notification
+        // Service Extension is a SEPARATE PROCESS that tries this same lock
+        // non-blocking and hydrates the store when it wins; if nothing holds it
+        // between `closeNode` and the end of the seal it can write the SQLCipher
+        // files while we checkpoint(TRUNCATE) + read them, capturing a torn
+        // database. Pluck the existing hold off `storeLock` (under `nodeLock`)
+        // WITHOUT releasing it so `closeNode` below sees `storeLock == nil` and
+        // leaves it alone; take a fresh one when no node was open.
+        #if os(iOS)
+        let sealStoreLock: MarmotStoreLock = try await run { service -> MarmotStoreLock in
+            service.nodeLock.lock()
+            defer { service.nodeLock.unlock() }
+            if let held = service.storeLock {
+                service.storeLock = nil
+                return held
+            }
+            return try MarmotStoreLock.acquireExclusive()
+        }
+        #endif
+
         await closeNode(keepClosed: true)
         do {
             let config = try await runAccountBackupHostWork {
@@ -1613,9 +1634,20 @@ final class MarmotService: @unchecked Sendable {
                     dbKeyHex: config.1
                 )
             }
+            // Release BEFORE clearing the fence: once `nodeClosing` drops,
+            // reconnect runs `prepareStoreLockForConnectSync`, which on Darwin
+            // takes a second LOCK_EX on a DIFFERENT fd in this same process —
+            // that conflicts (EWOULDBLOCK) with a seal lock still held here and
+            // would leave the Marmot store permanently closed.
+            #if os(iOS)
+            sealStoreLock.release()
+            #endif
             await clearNodeClosingFence()
             return (nsec, config.0, sealed)
         } catch {
+            #if os(iOS)
+            sealStoreLock.release()
+            #endif
             await clearNodeClosingFence()
             throw error
         }

@@ -11,6 +11,10 @@ final class AutoBackupBackgroundScheduler {
     static let shared = AutoBackupBackgroundScheduler()
     static let taskIdentifier = "sh.hedwig.sonar.auto-backup"
 
+    /// Minimum background execution window (seconds) we require before we'll
+    /// start an opportunistic backup. See `runOpportunisticBackgroundBackupIfDue()`.
+    private static let minimumBackgroundWindowSeconds: TimeInterval = 25
+
     weak var store: SonarAppStore?
 
     private init() {}
@@ -68,6 +72,7 @@ final class AutoBackupBackgroundScheduler {
     /// Finish an in-flight due backup when the user backgrounds the app.
     func runOpportunisticBackgroundBackupIfDue() {
         guard let store, store.isAutoBackupDisclosed() else { return }
+
         var lease = UIBackgroundTaskIdentifier.invalid
         var work: Task<Void, Never>?
         lease = UIApplication.shared.beginBackgroundTask(withName: "sonar-auto-backup") {
@@ -77,6 +82,37 @@ final class AutoBackupBackgroundScheduler {
                 lease = .invalid
             }
         }
+
+        // Read the time budget *after* starting the lease:
+        // `backgroundTimeRemaining` reports `.greatestFiniteMagnitude` until a
+        // background task is active (or while still in the foreground), so we
+        // need the lease in flight to get a real number. `.greatestFiniteMagnitude`
+        // itself means "plenty of time" and must not fail this check.
+        //
+        // WHY this guard exists: `runAutoBackupIfDue()` -> `backupAccount()`
+        // closes the node, seals (checkpoint + AEAD), then RECONNECTS THE NODE —
+        // which reopens the SQLCipher store — before uploading to Blossom over a
+        // network we do not control. If the system suspends us with that reopened
+        // store open, we hit `0xdead10cc` (the watchdog kill this repo has
+        // already fixed four times). The 12-hour `BGAppRefresh` path stays as the
+        // fallback, so skipping the opportunistic run here is safe.
+        let remaining = UIApplication.shared.backgroundTimeRemaining
+        if remaining < Self.minimumBackgroundWindowSeconds,
+           remaining != .greatestFiniteMagnitude {
+            SecureLogger.info(
+                "Auto-backup: skipped opportunistic run — background window too short "
+                    + "(\(String(format: "%.1f", remaining))s < "
+                    + "\(Int(Self.minimumBackgroundWindowSeconds))s). "
+                    + "Relying on the 12-hour BGAppRefresh fallback.",
+                category: .session
+            )
+            if lease != .invalid {
+                UIApplication.shared.endBackgroundTask(lease)
+                lease = .invalid
+            }
+            return
+        }
+
         work = Task { @MainActor in
             defer {
                 if lease != .invalid {

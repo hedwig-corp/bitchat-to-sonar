@@ -961,7 +961,10 @@ actual object SonarCore {
         val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
             ?: error("no identity to back up")
         val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
-        sonarLog("Backup", "upload OK: ${info.size} bytes -> ${info.url}")
+        // Blob sha prefix, not the URL: Diagnostics → Share exports this log
+        // (#176), and the full URL is a direct fetch handle to the user's
+        // backup ciphertext.
+        sonarLog("Backup", "upload OK: ${info.size} bytes (${info.sha256Hex.take(12)}…)")
         "uploaded ${info.size} bytes"
     }
 
