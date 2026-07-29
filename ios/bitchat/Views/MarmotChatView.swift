@@ -2720,10 +2720,15 @@ final class MarmotChatModel: ObservableObject {
     /// kind-0 BEFORE republishing, or a blank/stale local name would replace
     /// the durable relay profile after an nsec restore.
     ///
-    /// `generation` is the account generation at dispatch. The chain used to
-    /// run inside `relayConnectTask`, which `connectRelaysIfNeeded` cancels;
-    /// an unstructured `Task {}` inherits neither that cancellation nor the
-    /// lease's `Task.isCancelled` check, so without this it could park in
+    /// `generation` is the account generation at dispatch.
+    ///
+    /// Do NOT remove this guard on the theory that the caller cancels us.
+    /// Before #265 the chain ran inline in `connectRelaysIfNeeded`'s
+    /// unstructured `Task {}` — which is never stored in `relayConnectTask`
+    /// (that field is only ever assigned in `scheduleRelayConnect`), so it was
+    /// never cancelled either. The chain has therefore NEVER had caller
+    /// cancellation; this guard fixes a latent bug rather than restoring
+    /// something the detach took away. Without it the chain can park in
     /// `fetchOwnProfile(npub: <old npub>)` across an account switch and then
     /// hand the PREVIOUS account's name/nip05 to the host and republish it
     /// under the new key — the hazard `descriptorCacheGeneration` already
