@@ -1808,6 +1808,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     onClose = { emojiTray = false },
                 )
             }
+            if (recording) {
+                // Do not pop the chat while the pointer gesture owns the recorder.
+                // Release or the explicit trash control completes/cancels the note.
+                TransientBackHandler {}
+            }
             // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
             // (text field↔recording pill) swap; the mic Box on the right MUST stay
             // mounted while recording, or Compose cancels its hold-to-record gesture
@@ -4434,7 +4439,6 @@ private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color)
 @Composable
 private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
     val s = sonar
-    TransientBackHandler(onClose)
     val scope = rememberCoroutineScope()
     var groupEntry by remember { mutableStateOf(false) }
     var findUsername by remember { mutableStateOf(false) }
@@ -4460,6 +4464,14 @@ private fun ComposeSheet(state: SonarAppState, onClose: () -> Unit) {
         findNpub = null
         findMiss = false
         findStartError = null
+    }
+
+    TransientBackHandler {
+        when {
+            groupEntry -> groupEntry = false
+            findUsername -> resetFind()
+            else -> onClose()
+        }
     }
 
     fun isValidNpub(value: String): Boolean {
