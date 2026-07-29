@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.sonar
+import chat.bitchat.sonar.wallet.SpendableBalance
 
 /** Grouped sats, like the prototype's payFmt (en-US thousands separators). */
 internal fun payFmt(sats: Long): String =
@@ -147,12 +148,15 @@ fun PaySheet(
                                 .clickable { v = c.toString() }.padding(horizontal = 14.dp, vertical = 7.dp)
                         ) { Text(payFmt(c), color = s.goldDeep, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
-                    // "Max" = the entire spendable balance (to drain the wallet to
-                    // this recipient). Filled gold to stand out from the presets.
-                    if (balanceSats > 0) {
+                    // "Max" = everything that can actually settle: the balance
+                    // minus a fee reserve (#141 — proposing the full balance
+                    // made the send fail locally with a raw InsufficientFunds).
+                    // A balance at or below the reserve offers no Max at all.
+                    val maxSendable = SpendableBalance.maxSendableSats(balanceSats)
+                    if (maxSendable > 0) {
                         Box(
                             Modifier.clip(RoundedCornerShape(999.dp)).background(s.goldFill)
-                                .clickable { v = balanceSats.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
+                                .clickable { v = maxSendable.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
                         ) { Text("Max", color = s.onGold, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
                 }

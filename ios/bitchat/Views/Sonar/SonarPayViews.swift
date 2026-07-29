@@ -274,11 +274,13 @@ struct SNPaySheet: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = the entire spendable balance (to drain the wallet to
-                // this recipient). Filled gold to stand out from the presets.
-                if balance > 0 {
+                // "Max" = everything that can actually settle: the balance
+                // minus a fee reserve (#141 — proposing the full balance made
+                // the send fail locally with a raw InsufficientFunds). A
+                // balance at or below the reserve offers no Max at all.
+                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
                     Button {
-                        v = String(balance)
+                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
                     } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -703,10 +705,13 @@ private struct UnifyAmountKeypad: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = the entire spendable balance — drains the wallet to
-                // this recipient (the Unify nearby-wallet send).
-                if balance > 0 {
-                    Button { v = String(balance) } label: {
+                // "Max" = everything that can actually settle: the balance
+                // minus a fee reserve (#141). Same policy as the main pay
+                // sheet — see SonarSpendableBalance.
+                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
+                    Button {
+                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
+                    } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
                             .foregroundColor(SonarTheme.onGold)
