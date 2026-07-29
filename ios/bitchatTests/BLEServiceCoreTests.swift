@@ -178,6 +178,90 @@ struct BLEServiceCoreTests {
         #expect(!ble.isPeerConnected(peerID))
     }
 
+    /// #425 (mirror of the Rust #422 fix): the 8-byte wire sender id is
+    /// public, so an attacker in radio range can reuse a verified peer's id.
+    /// A public message claiming that id must still prove possession of the
+    /// peer's PINNED signing key, or it renders under the victim's nickname.
+    @Test
+    func publicMessageForgedUnderAVerifiedPeersIdIsRejected() async throws {
+        let ble = makeService()
+        let delegate = PublicCaptureDelegate()
+        ble.delegate = delegate
+
+        // Victim announces for real, so its signing key is pinned.
+        let victim = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Victim",
+            noisePublicKey: victim.getStaticPublicKeyData(),
+            signingPublicKey: victim.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let victimPeerID = PeerID(publicKey: announcement.noisePublicKey)
+        let announcePayload = try #require(announcement.encode())
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+        let signedAnnounce = try #require(victim.signPacket(BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: victimPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now,
+            payload: announcePayload,
+            signature: nil,
+            ttl: 7
+        )))
+        ble._test_handlePacket(signedAnnounce, fromPeerID: victimPeerID, preseedPeer: false)
+        _ = await TestHelpers.waitUntil({ ble.isPeerConnected(victimPeerID) },
+                                        timeout: TestConstants.shortTimeout)
+
+        // The victim's own signed public message is accepted.
+        let genuine = try #require(victim.signPacket(BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: victimPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 1,
+            payload: Data("from the real victim".utf8),
+            signature: nil,
+            ttl: 3
+        )))
+        ble._test_handlePacket(genuine, fromPeerID: victimPeerID, preseedPeer: false)
+        let sawGenuine = await TestHelpers.waitUntil(
+            { delegate.publicMessagesSnapshot().contains { $0.content == "from the real victim" } },
+            timeout: TestConstants.shortTimeout
+        )
+        #expect(sawGenuine, "a genuinely signed public message must still be delivered")
+
+        // Mallory reuses the victim's sender id, signing with her own key.
+        let mallory = NoiseEncryptionService(keychain: MockKeychain())
+        let forged = try #require(mallory.signPacket(BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: victimPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 2,
+            payload: Data("forged under the victim".utf8),
+            signature: nil,
+            ttl: 3
+        )))
+        ble._test_handlePacket(forged, fromPeerID: victimPeerID, preseedPeer: false)
+
+        // And an entirely unsigned one.
+        let unsigned = BitchatPacket(
+            type: MessageType.message.rawValue,
+            senderID: Data(hexString: victimPeerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 3,
+            payload: Data("unsigned under the victim".utf8),
+            signature: nil,
+            ttl: 3
+        )
+        ble._test_handlePacket(unsigned, fromPeerID: victimPeerID, preseedPeer: false)
+
+        _ = await TestHelpers.waitUntil({ delegate.publicMessagesSnapshot().count > 1 }, timeout: 0.3)
+        let contents = delegate.publicMessagesSnapshot().map(\.content)
+        #expect(!contents.contains("forged under the victim"),
+                "a message signed by another key must not render under the victim")
+        #expect(!contents.contains("unsigned under the victim"),
+                "an unsigned message must not render under a pinned peer")
+    }
+
     @Test
     func announceSenderMismatch_isRejected() async throws {
         let ble = makeService()
