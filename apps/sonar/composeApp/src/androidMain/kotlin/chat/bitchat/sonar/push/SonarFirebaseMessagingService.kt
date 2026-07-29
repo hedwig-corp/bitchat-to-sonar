@@ -96,18 +96,30 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
             // ForegroundServiceStartNotAllowedException: the push was not
             // high-priority (or arrived in a restricted state), or the Android
             // 15 dataSync budget is exhausted. We are still inside the FCM
-            // execution window, so surface a generic notification instead of
-            // dropping the wake silently.
+            // execution window, so run the bounded inline fallback — a real
+            // (budgeted) sync + titled notifications, degrading to the generic
+            // banner only when nothing landed — instead of dropping the wake
+            // or degrading straight to the contentless banner (#203).
             Log.w(TAG, "Push service start rejected (highPriority=$highPriority), " +
-                "showing generic notification: ${t.message}")
-            val prefs = SonarPushPrefs.notificationPrefs(this)
+                "running inline fallback: ${t.message}")
             Notifier.ensureChannel()
-            SonarNotificationRouter.build(
-                idKey = "marmot-push",
-                kind = SonarNotificationKind.Message,
-                unreadCount = 1,
-                prefs = prefs.copy(showPreview = false),
-            )?.let { Notifier.notify(it.id, it.title, it.body) }
+            runCatching {
+                SonarPushInlineFallback.run(
+                    this,
+                    SonarPushProcessingService.TYPE_MARMOT,
+                    notificationType = "",
+                    payload = "",
+                )
+            }.onFailure { e ->
+                Log.e(TAG, "Inline Marmot fallback failed", e)
+                val prefs = SonarPushPrefs.notificationPrefs(this)
+                SonarNotificationRouter.build(
+                    idKey = "marmot-push",
+                    kind = SonarNotificationKind.Message,
+                    unreadCount = 1,
+                    prefs = prefs.copy(showPreview = false),
+                )?.let { Notifier.notify(it.id, it.title, it.body) }
+            }
         }
     }
 
@@ -125,13 +137,25 @@ class SonarFirebaseMessagingService : FirebaseMessagingService() {
         try {
             startForegroundService(intent)
         } catch (t: Throwable) {
-            // Breez wakeups are silent infrastructure; nothing to render, but
-            // the failure must not be invisible in diagnostics. Most likely
-            // ForegroundServiceStartNotAllowedException: the push was not
-            // high-priority (or arrived in a restricted state), so we can't
-            // legally start a foreground service from the background.
-            Log.w(TAG, "Breez push service start refused (highPriority=$highPriority, " +
-                "push likely not high-priority): ${t.message}")
+            // Most likely ForegroundServiceStartNotAllowedException: the push
+            // was not high-priority (or arrived in a restricted state), so we
+            // can't legally start a foreground service from the background.
+            // For an invoice_request a payer is blocked on the NDS's 60s
+            // window — answer (or error-reply) inline within the FCM window
+            // rather than letting them time out; other Breez wakes reconcile
+            // silently on the next open (#203).
+            Log.w(TAG, "Breez push service start refused (highPriority=$highPriority), " +
+                "running inline fallback: ${t.message}")
+            runCatching {
+                SonarPushInlineFallback.run(
+                    this,
+                    SonarPushProcessingService.TYPE_BREEZ,
+                    notificationType = data["notification_type"] ?: "",
+                    payload = data["notification_payload"] ?: "",
+                )
+            }.onFailure { e ->
+                Log.w(TAG, "Inline Breez fallback failed (silent)", e)
+            }
         }
     }
 
