@@ -172,12 +172,17 @@ final class SonarChatMuteStore: ObservableObject {
            let stored = try? JSONDecoder().decode([String: Date].self, from: data) {
             // Legacy entries may carry mixed-case hex; normalize to the
             // lowercase shape `normalizedCandidates` produces, keeping the
-            // later expiry when two casings collide.
+            // later expiry when two casings collide. Entries written before
+            // both encodings were stored can be npub-only, which no push-path
+            // lookup can reach — backfill the hex twin here so an upgraded
+            // install honours mutes it already had, without the user having to
+            // mute the chat again.
             var normalized: [String: Date] = [:]
             normalized.reserveCapacity(stored.count)
             for (k, until) in stored {
-                let lk = k.lowercased()
-                normalized[lk] = max(normalized[lk] ?? .distantPast, until)
+                for candidate in Self.persistableCandidates(k) {
+                    normalized[candidate] = max(normalized[candidate] ?? .distantPast, until)
+                }
             }
             mutedUntil = normalized
         } else {
@@ -195,6 +200,26 @@ final class SonarChatMuteStore: ObservableObject {
     /// store's writes and the appex's reads.
     static func normalizedCandidates(_ rawKey: String) -> [String] {
         SonarNSEDecoratePolicy.normalizedMuteCandidates(rawKey)
+    }
+
+    /// Keys to persist for one raw key: the normalized shapes plus, when the
+    /// key is a bech32 `npub1…`, the same pubkey as 64-hex.
+    ///
+    /// Storage has to carry both encodings because the two sides disagree:
+    /// group members and profiles reach us as bech32 (`to_bech32()`), while a
+    /// killed-app drain row carries the sender as 64-hex
+    /// (`sender.to_string()`). The lookup cannot bridge them — it is shared
+    /// with the notification extension, which does not compile `Bech32` — so
+    /// the writer resolves it here, where `Bech32` exists.
+    static func persistableCandidates(_ rawKey: String) -> [String] {
+        var keys = normalizedCandidates(rawKey)
+        let lowered = rawKey.lowercased()
+        guard lowered.hasPrefix("npub1"),
+              let decoded = try? Bech32.decode(lowered),
+              decoded.hrp == "npub",
+              decoded.data.count == 32 else { return keys }
+        keys += normalizedCandidates(decoded.data.hexEncodedString())
+        return keys
     }
 
     func isMuted(_ rawKey: String, now: Date = Date()) -> Bool {
@@ -234,9 +259,10 @@ final class SonarChatMuteStore: ObservableObject {
     func mute(keys: [String], until: Date) {
         guard !keys.isEmpty else { return }
         // Store every normalized shape too, so lookups and removals work
-        // whichever id form a path carries later.
+        // whichever id form a path carries later — including the hex twin of a
+        // bech32 peer key, which is the shape push drains look up by.
         for raw in keys where !raw.isEmpty {
-            for candidate in Self.normalizedCandidates(raw) {
+            for candidate in Self.persistableCandidates(raw) {
                 mutedUntil[candidate] = until
             }
         }

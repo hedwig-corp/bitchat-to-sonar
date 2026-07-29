@@ -371,26 +371,43 @@ struct SonarNSEDecoratePolicyTests {
             store.mute(keys: [raw], until: until)
         }
 
-        let lookedUp = Set(
+        // Drift guard: no shape the store writes may be unreachable from the
+        // push path. Measured against the union of the lookups that path really
+        // performs — by group id, and by the sender as 64-hex — NOT against a
+        // single bech32-sender lookup. The store intentionally persists extra
+        // hex-derived encodings precisely so the hex sender can match, and those
+        // are not candidates of a bech32 lookup by design.
+        let reachable = Set(
             SonarNSEDecoratePolicy.mutedLookupCandidates(
                 groupIdHex: gid, senderNpub: npub, groupName: ""
             )
+        ).union(
+            SonarNSEDecoratePolicy.mutedLookupCandidates(
+                groupIdHex: gid, senderNpub: npubHex, groupName: ""
+            )
         )
         for stored in store.mutedUntil.keys {
-            #expect(lookedUp.contains(stored), "NSE lookup misses stored mute key \(stored)")
+            #expect(reachable.contains(stored), "no push-path lookup reaches stored mute key \(stored)")
         }
-        // The real point: production drains carry `sender.to_string()` = 64-hex,
-        // so a mute stored under the npub MUST also be findable by hex. Assert
-        // both encodings are candidates, and that a hex-only sender matches.
-        #expect(lookedUp.contains(npubHex), "hex form of the npub must be a lookup candidate")
-        let hexOnlyLookup = Set(
+        // The real point: production drains carry `sender.to_string()` = 64-hex
+        // (client.rs:6478), so a mute stored under a bech32 npub has to be
+        // reachable by hex. That bridge belongs to the STORE, not to this
+        // lookup: `mutedLookupCandidates` is compiled into the appex, which does
+        // not include `Bech32`, and an npub-shaped sender is not a shape the
+        // drain path ever produces. So assert what actually protects the user —
+        // the store persisted the hex twin — and that a hex sender then matches.
+        #expect(
+            store.mutedUntil[npubHex] != nil,
+            "muting by npub must also persist the 64-hex twin push drains look up"
+        )
+        let byHexSender = Set(
             SonarNSEDecoratePolicy.mutedLookupCandidates(
                 groupIdHex: "", senderNpub: npubHex, groupName: ""
             )
         )
         #expect(
-            hexOnlyLookup.contains(npub) || hexOnlyLookup.contains(npubHex),
-            "a hex sender must reach the npub-keyed mute"
+            byHexSender.contains(where: { store.mutedUntil[$0] != nil }),
+            "a hex sender must reach the mute stored from its npub"
         )
 
         // Round-trip the store's OWN persisted blob, so the implicit
