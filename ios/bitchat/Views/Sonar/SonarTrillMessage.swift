@@ -168,6 +168,7 @@ final class SonarChatMuteStore: ObservableObject {
     init(defaults: UserDefaults = .standard, key: String = SonarChatMuteStore.defaultsKey) {
         self.defaults = defaults
         self.key = key
+        var didMigrate = false
         if let data = defaults.data(forKey: key),
            let stored = try? JSONDecoder().decode([String: Date].self, from: data) {
             // Legacy entries may carry mixed-case hex; normalize to the
@@ -184,13 +185,21 @@ final class SonarChatMuteStore: ObservableObject {
                     normalized[candidate] = max(normalized[candidate] ?? .distantPast, until)
                 }
             }
+            didMigrate = normalized != stored
             mutedUntil = normalized
         } else {
             mutedUntil = [:]
         }
         // Mirror on init so mutes recorded before the mirror existed become
-        // visible to the NSE without waiting for the next mute/unmute.
-        mirrorToAppGroup()
+        // visible to the NSE without waiting for the next mute/unmute. When the
+        // load actually migrated something, write the map back as well —
+        // otherwise `.standard` keeps the pre-migration shape and every launch
+        // redoes the same expansion. `persist()` mirrors too.
+        if didMigrate {
+            persist()
+        } else {
+            mirrorToAppGroup()
+        }
     }
 
     /// Equivalent lookup keys for one raw conversation key, so the check

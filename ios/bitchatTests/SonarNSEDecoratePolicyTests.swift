@@ -419,6 +419,41 @@ struct SonarNSEDecoratePolicyTests {
         ))
     }
 
+    @Test("a legacy npub-only mute gains its hex twin on store init")
+    func legacyNpubMuteMigratesOnLoad() throws {
+        // Pins the MIGRATION, not the helper: the user never mutes again, so
+        // only the init path can make a pre-upgrade npub-only entry reachable
+        // from the 64-hex sender a killed-app drain carries.
+        let suiteName = "test.nse.mute.migrate"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let storeKey = "test.mutes.migrate"
+
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+        let npubHex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+        let until = Date().addingTimeInterval(3600)
+        // Exactly what muteKeys wrote before it stored both encodings.
+        defaults.set(try JSONEncoder().encode([npub: until]), forKey: storeKey)
+
+        let store = SonarChatMuteStore(defaults: defaults, key: storeKey)
+        #expect(
+            store.mutedUntil[npubHex] != nil,
+            "init must backfill the 64-hex twin the push path looks up"
+        )
+        #expect(
+            store.isMuted(npubHex),
+            "a hex sender must match a legacy npub-only mute after load"
+        )
+
+        // And the migration is written back, so it happens once rather than on
+        // every launch.
+        let blob = defaults.data(forKey: storeKey)
+        #expect(blob != nil)
+        let reloaded = try JSONDecoder().decode([String: Date].self, from: blob ?? Data())
+        #expect(reloaded[npubHex] != nil, "the migrated map must be persisted")
+    }
+
     @Test("malformed trill lines are not treated as trills")
     func malformedTrillNotClassified() {
         #expect(SonarNSEDecoratePolicy.isTrillLine("\u{26A1}TRILL|1|abc-123"))
