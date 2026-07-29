@@ -1759,7 +1759,18 @@ final class MarmotChatModel: ObservableObject {
     /// This deliberately performs no relay sync.
     @discardableResult
     func loadLocalWhenConnected(groupId: String? = nil, timeoutSeconds: Double = 10) async -> Bool {
-        guard await ensureConnected(timeoutSeconds: timeoutSeconds) else { return false }
+        guard await ensureConnected(timeoutSeconds: timeoutSeconds) else {
+            // Timing out waiting for the store IS the unreadable-store case this
+            // recovery exists for, so it must schedule the retry rather than
+            // return with the transcript blank. `loadLocalWindow` below is the
+            // only other place that schedules it, and this path never reaches
+            // it — the chat then stayed blank until an unrelated sync or refresh
+            // happened to repaint it.
+            if let groupId {
+                scheduleBlankTranscriptRecovery(groupId: groupId, storeReadable: false)
+            }
+            return false
+        }
         await loadLocalWindow(groupId: groupId, mode: .newestPage)
         return true
     }
@@ -1853,7 +1864,14 @@ final class MarmotChatModel: ObservableObject {
                 // Rows arrived by any route (sync, drain, another load): done.
                 if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
                 // Transcript-only: the metadata hydrate must not run ten times.
-                _ = await self.loadLocalPage(
+                // Keep the result: `loadLocalPage` returns false when it threw
+                // OR when it coalesced against another in-flight load for this
+                // group, and both mean THIS attempt proved nothing about the
+                // store. Hard-coding `true` here turned "my read failed" into
+                // "the store is fine and this chat is empty", which ended the
+                // retry budget after the first 100ms attempt — precisely in the
+                // racy case the budget exists for.
+                let storeReadable = await self.loadLocalPage(
                     groupId: groupId,
                     mode: .newestPage,
                     hydrateMetadata: false
@@ -1865,7 +1883,7 @@ final class MarmotChatModel: ObservableObject {
                 let summary = self.conversationSummariesByGroup[groupId]
                 if !SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
                     knownNonEmpty: (summary?.messageCount ?? 0) > 0,
-                    storeReadable: true,
+                    storeReadable: storeReadable,
                     sourcesResolved: self.groups.contains { $0.id == groupId }
                 ) { return }
             }
