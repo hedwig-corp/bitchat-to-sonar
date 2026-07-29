@@ -2416,6 +2416,11 @@ final class SonarAppStore: ObservableObject {
     /// the BGAppRefresh handler already refuses a disabled policy, so manual
     /// needs no separate scheduler change.
     func updateBackupFrequency(_ frequency: String) {
+        // Parity with Compose `updateAutoBackupFrequency`: choosing a cadence is
+        // an informed choice about backups, so it counts as disclosure. Without
+        // this, a user who only ever touches Frequency leaves the executors
+        // gated and never gets a background upload.
+        discloseAutoBackup()
         do {
             try marmot.updateBackupFrequency(frequency)
             refreshBackupPolicy()

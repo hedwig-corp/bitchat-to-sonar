@@ -129,6 +129,10 @@ struct BitchatApp: App {
                         sonarStore.setForeground(false)
                         AutoBackupBackgroundScheduler.shared.store = sonarStore
                         AutoBackupBackgroundScheduler.shared.schedule()
+                        // Near-term retry as well as the floor: the opportunistic
+                        // run below bails when the background window is too short,
+                        // and without this that session's chats would wait 12 hours.
+                        AutoBackupBackgroundScheduler.shared.scheduleSoon()
                         AutoBackupBackgroundScheduler.shared.runOpportunisticBackgroundBackupIfDue()
                         // Always send Tor to dormant on background for a clean restart later.
                         TorManager.shared.setAppForeground(false)
