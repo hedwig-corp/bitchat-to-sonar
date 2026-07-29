@@ -207,7 +207,8 @@ pub async fn probe_blossom_servers(
 
     let keys = match probe_secret {
         Some(secret) => match Identity::import(secret) {
-            Ok(id) => Some(id.keys().clone()),
+            // Identity::import always yields in-process keys.
+            Ok(id) => Some(id.local_keys().expect("imported identity").clone()),
             Err(e) => {
                 return MediaProbeReport {
                     ok: false,

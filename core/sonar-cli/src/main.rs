@@ -603,11 +603,14 @@ async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Outp
     .await?;
     let skipped_signal_sticker_ids = imported.skipped_sticker_ids.clone();
     let pack = upload_imported_signal_pack(&identity, &args.blossom, imported).await?;
+    let keys = identity
+        .local_keys()
+        .map_err(|e| CliError::Message(format!("cli identity: {e}")))?;
     let event = EventBuilder::new(Kind::Custom(STICKER_PACK_KIND), "")
         .tags(build_pack_tags(&pack))
-        .sign_with_keys(identity.keys())
+        .sign_with_keys(keys)
         .map_err(|e| CliError::Message(format!("sign sticker pack event: {e}")))?;
-    let nostr = NostrClient::new(identity.keys().clone());
+    let nostr = NostrClient::new(identity.signer());
     for relay in &loaded.relays {
         nostr
             .add_relay(relay.clone())
@@ -689,12 +692,13 @@ async fn upload_sticker_blob(
 ) -> Result<String> {
     let base = Url::parse(blossom_server)
         .map_err(|e| CliError::Message(format!("bad Blossom server URL {blossom_server}: {e}")))?;
+    let signer = identity.signer();
     let descriptor = BlossomClient::new(base)
         .upload_blob(
             sticker.bytes.clone(),
             Some(sticker.mime.clone()),
             None,
-            Some(identity.keys()),
+            Some(&signer),
         )
         .await
         .map_err(|e| CliError::Message(format!("upload sticker {}: {e}", sticker.id)))?;
@@ -798,7 +802,9 @@ fn init(home: PathBuf, relay_overrides: Vec<String>, args: InitArgs) -> Result<O
     };
     let config = AgentConfig {
         version: CONFIG_VERSION,
-        nsec: identity.export_nsec(),
+        nsec: identity
+            .export_nsec()
+            .map_err(|e| CliError::Message(format!("cli identity: {e}")))?,
         db_key_hex: random_hex_32()?,
         relays,
     };

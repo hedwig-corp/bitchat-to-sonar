@@ -301,7 +301,7 @@ async fn run_step(
     // Key packages for everyone but the creator.
     let mut kps = Vec::with_capacity(n - 1);
     for agent in &agents[1..] {
-        match agent.engine.key_package_event(relays.clone()) {
+        match agent.engine.key_package_event(relays.clone()).await {
             Ok(kp) => kps.push(kp),
             Err(e) => anomalies.push(format!("key_package_event({}): {e}", agent.pk)),
         }
@@ -474,8 +474,8 @@ async fn run_chaos(mut agents: Vec<Agent>, group_id: GroupId, n: usize) -> Chaos
 
     let fresh_a = new_agent();
     let fresh_b = new_agent();
-    let kp_a = fresh_a.engine.key_package_event(relays.clone());
-    let kp_b = fresh_b.engine.key_package_event(relays);
+    let kp_a = fresh_a.engine.key_package_event(relays.clone()).await;
+    let kp_b = fresh_b.engine.key_package_event(relays).await;
     let (Ok(kp_a), Ok(kp_b)) = (kp_a, kp_b) else {
         return ChaosResult {
             n,
