@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::hkdf::Hkdf;
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -56,6 +56,9 @@ const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
 const INITIAL_DOWNLOAD_CAPACITY: usize = 1024 * 1024;
 /// Prefix for dry-run scratch dirs, so a leftover can be recognised and reaped.
 const PREVIEW_SCRATCH_PREFIX: &str = ".sonar-backup-preview-";
+/// How old a scratch dir must be before a later preview reaps it. Long enough
+/// that a dry run still in flight is never mistaken for debris.
+const PREVIEW_SCRATCH_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 /// Sidecar next to the Marmot DB: `{db_filename}.sonar-backup-policy.json`.
 const BACKUP_POLICY_SUFFIX: &str = ".sonar-backup-policy.json";
 /// Default opportunistic debounce after a dirty mark (30 minutes).
@@ -1252,7 +1255,7 @@ fn preview_scratch_dir(db_path: &Path) -> Result<tempfile::TempDir> {
     let parent = db_path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|e| Error::Storage(format!("backup preview scratch parent: {e}")))?;
-    reap_stale_preview_scratch(parent);
+    reap_stale_preview_scratch(parent, PREVIEW_SCRATCH_MAX_AGE);
     tempfile::Builder::new()
         .prefix(PREVIEW_SCRATCH_PREFIX)
         .tempdir_in(parent)
@@ -1265,17 +1268,34 @@ fn preview_scratch_dir(db_path: &Path) -> Result<tempfile::TempDir> {
 /// the process being killed mid-preview — and the account dir is exactly where
 /// a leftover is most expensive, because `account_storage_bytes` counts it and
 /// one accumulates per kill.
-fn reap_stale_preview_scratch(parent: &Path) {
+///
+/// Only dirs older than `max_age` are touched. Neither host serialises dry
+/// runs, so a second preview starting while the first is still reading would
+/// otherwise delete the live scratch out from under it; anything recent is
+/// assumed to belong to a preview in flight. A dir whose age cannot be read is
+/// left alone for the same reason.
+fn reap_stale_preview_scratch(parent: &Path, max_age: Duration) {
     let Ok(entries) = fs::read_dir(parent) else {
         return;
     };
+    let now = SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with(PREVIEW_SCRATCH_PREFIX) {
             continue;
         }
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .map(|age| age >= max_age)
+            .unwrap_or(false);
+        if stale {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
@@ -2438,11 +2458,40 @@ mod tests {
         // A real store file beside it must survive the sweep.
         fs::write(&db_path, b"live").unwrap();
 
-        let scratch = preview_scratch_dir(&db_path).unwrap();
+        // Age zero: everything counts as stale, which is the debris case.
+        reap_stale_preview_scratch(dir.path(), Duration::ZERO);
 
         assert!(!orphan.exists(), "stale scratch must be reaped");
         assert!(db_path.is_file(), "the sweep must not touch the account");
-        assert!(scratch.path().is_dir(), "the fresh scratch still exists");
+
+        let scratch = preview_scratch_dir(&db_path).unwrap();
+        assert!(scratch.path().is_dir(), "a fresh scratch is still created");
+    }
+
+    /// Neither host serialises dry runs, so a second preview sweeping the
+    /// account dir must not delete the scratch the first one is still reading.
+    /// Reaping by prefix alone did exactly that.
+    #[test]
+    fn a_sweep_leaves_a_concurrent_previews_scratch_alone() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+
+        // Preview A is in flight: its scratch was created moments ago.
+        let live = preview_scratch_dir(&db_path).unwrap();
+        let live_path = live.path().to_path_buf();
+        fs::write(live_path.join("preview-index.db"), b"in use").unwrap();
+
+        // Preview B starts and sweeps with the production age threshold.
+        let _b = preview_scratch_dir(&db_path).unwrap();
+
+        assert!(
+            live_path.is_dir(),
+            "a preview in flight must survive another preview's sweep"
+        );
+        assert!(
+            live_path.join("preview-index.db").is_file(),
+            "and so must the index it is reading"
+        );
     }
 
     #[test]
