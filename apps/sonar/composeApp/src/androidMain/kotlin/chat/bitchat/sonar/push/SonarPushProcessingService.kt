@@ -205,14 +205,19 @@ class SonarPushProcessingService : Service() {
             // still refused below.
             Log.w(TAG, "onStartCommand: no foreground service, running inline fallback")
             val type = intent?.getStringExtra(EXTRA_PUSH_TYPE) ?: TYPE_MARMOT
-            runCatching {
-                SonarPushInlineFallback.run(
-                    applicationContext,
-                    type,
-                    notificationType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
-                    payload = intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: "",
-                )
-            }.onFailure { Log.w(TAG, "Inline fallback after refused startForeground failed", it) }
+            val notifType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: ""
+            val payload = intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: ""
+            val app = applicationContext
+            // MUST hop off this thread: onStartCommand is a MAIN-THREAD
+            // callback and the fallback blocks for seconds — running it here
+            // is a guaranteed ANR. (The FCM handler's own call is fine: that
+            // one already runs on a Firebase background executor.) Fire and
+            // forget on a scope that outlives this service instance, since we
+            // stop immediately below.
+            fallbackScope.launch {
+                runCatching { SonarPushInlineFallback.run(app, type, notifType, payload) }
+                    .onFailure { Log.w(TAG, "Inline fallback after refused startForeground failed", it) }
+            }
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -620,6 +625,11 @@ class SonarPushProcessingService : Service() {
          * something instead of waiting out the NDS's 60s window.
          */
         private val bailoutScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        /** Runs the denied-FGS fallback off the main thread. Process-scoped on
+         *  purpose: `onStartCommand` stops the service immediately after
+         *  dispatching, so a service-scoped job would be cancelled at birth. */
+        private val fallbackScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
 
         // Marmot push-triggered background sync budget.
