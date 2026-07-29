@@ -1000,7 +1000,8 @@ actual object SonarCore {
 
     actual fun recordBackupSuccess(sizeBytes: Long?) {
         SonarNativeLoader.ensureLoaded()
-        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong())
+        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
+        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
     }
 
     actual fun recordBackupFailure(error: String) {

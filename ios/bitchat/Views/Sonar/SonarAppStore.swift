@@ -2317,7 +2317,10 @@ final class SonarAppStore: ObservableObject {
     /// Large media waits for Wi-Fi. Host preference, mirrored from Compose.
     var wifiOnly: Bool {
         get { UserDefaults.standard.object(forKey: "sonar.wifiOnly") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "sonar.wifiOnly") }
+        set {
+            objectWillChange.send()
+            UserDefaults.standard.set(newValue, forKey: "sonar.wifiOnly")
+        }
     }
 
     /// Measure the account's on-disk size off the main actor — it walks the

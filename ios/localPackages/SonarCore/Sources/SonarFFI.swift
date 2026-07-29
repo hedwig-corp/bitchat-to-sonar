@@ -8306,10 +8306,11 @@ public func recordBackupFailure(dbPath: String, error: String)throws   {try rust
     )
 }
 }
-public func recordBackupSuccess(dbPath: String, sizeBytes: UInt64?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+public func recordBackupSuccess(dbPath: String, sizeBytes: UInt64?, dbKeyHex: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_func_record_backup_success(
         FfiConverterString.lower(dbPath),
-        FfiConverterOptionUInt64.lower(sizeBytes),$0
+        FfiConverterOptionUInt64.lower(sizeBytes),
+        FfiConverterOptionString.lower(dbKeyHex),$0
     )
 }
 }
@@ -8563,7 +8564,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_record_backup_failure() != 3997) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_record_backup_success() != 63349) {
+    if (uniffi_sonar_ffi_checksum_func_record_backup_success() != 38947) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_restore_account_from_blossom() != 16615) {

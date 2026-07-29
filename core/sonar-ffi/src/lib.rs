@@ -217,8 +217,16 @@ pub fn mark_backup_dirty(db_path: String) {
 }
 
 #[uniffi::export]
-pub fn record_backup_success(db_path: String, size_bytes: Option<u64>) -> FfiResult<()> {
-    sonar_core::account_backup::record_backup_success(Path::new(&db_path), size_bytes)?;
+pub fn record_backup_success(
+    db_path: String,
+    size_bytes: Option<u64>,
+    db_key_hex: Option<String>,
+) -> FfiResult<()> {
+    sonar_core::account_backup::record_backup_success(
+        Path::new(&db_path),
+        size_bytes,
+        db_key_hex.as_deref(),
+    )?;
     Ok(())
 }
 

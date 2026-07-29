@@ -1753,9 +1753,9 @@ final class MarmotService: @unchecked Sendable {
     /// bytes we actually pushed rather than a later measurement of a DB that has
     /// moved on.
     func noteBackupSuccess(sizeBytes: UInt64? = nil) throws {
-        let (dbPath, _) = try Self.databaseConfig()
+        let (dbPath, dbKeyHex) = try Self.databaseConfig()
         do {
-            try recordBackupSuccess(dbPath: dbPath, sizeBytes: sizeBytes)
+            try recordBackupSuccess(dbPath: dbPath, sizeBytes: sizeBytes, dbKeyHex: dbKeyHex)
         } catch let error as SonarFfiError {
             throw Self.mapFfi(error)
         }

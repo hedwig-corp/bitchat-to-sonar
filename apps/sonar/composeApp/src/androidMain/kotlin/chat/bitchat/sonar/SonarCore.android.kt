@@ -1016,7 +1016,10 @@ actual object SonarCore {
     actual fun backupIsDue(): Boolean = uniffi.sonar_ffi.backupIsDue(marmotDbPath())
 
     actual fun recordBackupSuccess(sizeBytes: Long?) {
-        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong())
+        // The key never touches disk outside the Keystore-encrypted prefs; the
+        // core needs it transiently to count messages in the SQLCipher index.
+        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
+        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
     }
 
     actual fun recordBackupFailure(error: String) {

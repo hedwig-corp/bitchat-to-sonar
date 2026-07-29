@@ -370,11 +370,20 @@ pub fn record_backup_attempt(db_path: &Path) -> Result<()> {
     })
 }
 
-pub fn record_backup_success(db_path: &Path, size_bytes: Option<u64>) -> Result<()> {
+pub fn record_backup_success(
+    db_path: &Path,
+    size_bytes: Option<u64>,
+    db_key_hex: Option<&str>,
+) -> Result<()> {
     // Count at success time, not on read: the Settings strip describes what the
     // uploaded blob contains, and the live index moves on the moment a message
     // arrives. Best-effort — a missing count renders as "—", never as zero.
-    let message_count = count_indexed_messages(db_path);
+    // The key comes from the caller: hosts hold it in Keychain/Keystore, and a
+    // persisted copy on disk is exactly what SQLCipher exists to prevent.
+    let message_count = db_key_hex.and_then(|key| count_indexed_messages(db_path, key));
+    // Heal installs that ran the withdrawn `remember_index_key`: that sidecar
+    // was the raw key in plaintext beside the DB it unlocks.
+    let _ = fs::remove_file(index_key_path_for_db(db_path));
     with_policy_state(|map| {
         let now = now_unix_secs();
         let mut policy = cached_policy(map, db_path);
@@ -398,8 +407,8 @@ pub fn record_backup_success(db_path: &Path, size_bytes: Option<u64>) -> Result<
 }
 
 /// Total messages across every conversation in the local index.
-fn count_indexed_messages(db_path: &Path) -> Option<u64> {
-    let key = load_index_key_for_db(db_path)?;
+fn count_indexed_messages(db_path: &Path, db_key_hex: &str) -> Option<u64> {
+    let key: [u8; 32] = hex::decode(db_key_hex).ok()?.try_into().ok()?;
     let index = crate::conversation_index::ConversationIndex::open(
         &crate::conversation_index::index_db_path_for_db(db_path),
         key,
@@ -409,34 +418,22 @@ fn count_indexed_messages(db_path: &Path) -> Option<u64> {
     Some(summaries.iter().map(|s| s.message_count).sum())
 }
 
-/// Persist the SQLCipher key beside the DB so read-only consumers (stats,
-/// preview) can reopen the index without the host handing it over again.
-fn load_index_key_for_db(db_path: &Path) -> Option<[u8; 32]> {
-    let hex = fs::read_to_string(index_key_path_for_db(db_path)).ok()?;
-    let bytes = hex::decode(hex.trim()).ok()?;
-    bytes.try_into().ok()
+/// Wipe hook: remove a plaintext key sidecar left by builds that briefly wrote
+/// one. The Account Key Durability Rule requires wipe to clear every location
+/// that can hold key material.
+pub fn wipe_index_key_sidecar_for_db(db_path: &Path) {
+    let _ = fs::remove_file(index_key_path_for_db(db_path));
 }
 
+/// Path of the WITHDRAWN plaintext key sidecar. Kept only so record-success and
+/// wipe can delete a copy left by builds that briefly wrote it — persisting the
+/// SQLCipher key beside the DB defeats the encryption it belongs to.
 fn index_key_path_for_db(db_path: &Path) -> PathBuf {
     let name = db_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "marmot.sqlite".to_string());
     db_path.with_file_name(format!("{name}.sonar-index-key"))
-}
-
-/// Remember the index key for later read-only opens. Called by the client when
-/// it opens the index; a no-op when the value has not changed.
-pub fn remember_index_key(db_path: &Path, key: &[u8; 32]) {
-    let path = index_key_path_for_db(db_path);
-    let encoded = hex::encode(key);
-    if fs::read_to_string(&path)
-        .map(|c| c.trim() == encoded)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    let _ = fs::write(path, encoded);
 }
 
 /// On-disk footprint of this account: the encrypted DB, its index, every
@@ -1243,9 +1240,10 @@ pub async fn backup_account_files(
     server_url: &str,
 ) -> Result<AccountBackupUpload> {
     let sealed = seal_account_backup_files(keys, db_path, db_key_hex)?;
+    let sealed_len = sealed.len() as u64;
     match upload_sealed_backup(keys, server_url, sealed).await {
         Ok(uploaded) => {
-            let _ = record_backup_success(db_path, None);
+            let _ = record_backup_success(db_path, Some(sealed_len), Some(db_key_hex));
             Ok(uploaded)
         }
         Err(e) => {
@@ -1489,13 +1487,41 @@ mod tests {
         assert!(!backup_is_due_now(&db), "manual-only must not auto-upload");
     }
 
+    /// The SQLCipher key must never be persisted beside the DB it unlocks. A
+    /// briefly-shipped sidecar did exactly that; record-success now deletes any
+    /// copy it finds and never writes one.
+    #[test]
+    fn success_never_leaves_a_key_sidecar_and_heals_a_legacy_one() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        let sidecar = dir.path().join("marmot.sqlite.sonar-index-key");
+        fs::write(&sidecar, "55".repeat(32)).unwrap();
+
+        record_backup_success(&db, Some(1), Some(&"55".repeat(32))).unwrap();
+
+        assert!(
+            !sidecar.exists(),
+            "legacy plaintext key sidecar must be deleted"
+        );
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("index-key"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no key material on disk: {leftovers:?}"
+        );
+    }
+
     /// The Settings strip reports the uploaded blob, so a failed upload must not
     /// overwrite the last known-good size with nothing.
     #[test]
     fn success_records_size_and_failure_keeps_it() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("marmot.sqlite");
-        record_backup_success(&db, Some(282_748)).unwrap();
+        record_backup_success(&db, Some(282_748), None).unwrap();
         assert_eq!(load_backup_policy(&db).last_size_bytes, Some(282_748));
 
         record_backup_failure(&db, "network down").unwrap();
@@ -1508,7 +1534,7 @@ mod tests {
         assert_eq!(after.last_error.as_deref(), Some("network down"));
 
         // A success with no size reported leaves the previous one intact.
-        record_backup_success(&db, None).unwrap();
+        record_backup_success(&db, None, None).unwrap();
         assert_eq!(load_backup_policy(&db).last_size_bytes, Some(282_748));
     }
 
@@ -1890,7 +1916,7 @@ mod tests {
         record_backup_failure(&db_path, "blossom down").unwrap();
         // Retry after failure still covers the same dirty_seq.
         record_backup_attempt(&db_path).unwrap();
-        record_backup_success(&db_path, None).unwrap();
+        record_backup_success(&db_path, None, None).unwrap();
         let policy = load_backup_policy(&db_path);
         assert!(!policy.dirty);
         assert!(policy.last_error.is_none());
@@ -1910,7 +1936,7 @@ mod tests {
         record_backup_attempt(&db_path).unwrap();
         // Message arrives while seal/upload is in flight.
         mark_backup_dirty(&db_path);
-        record_backup_success(&db_path, None).unwrap();
+        record_backup_success(&db_path, None, None).unwrap();
         let policy = load_backup_policy(&db_path);
         assert!(policy.dirty, "post-seal dirty mark must survive success");
         assert!(policy.last_success_at.is_some());
