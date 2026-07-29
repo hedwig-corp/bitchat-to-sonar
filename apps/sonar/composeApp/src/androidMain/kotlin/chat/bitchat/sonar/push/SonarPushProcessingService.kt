@@ -62,6 +62,14 @@ class SonarPushProcessingService : Service() {
      *  foreground service the process can be killed mid-answer or ANR. */
     @Volatile private var fgsReady = false
 
+    /// True once startForeground has succeeded at least once on this instance.
+    ///
+    /// `fgsReady` is also cleared deliberately by `stopWakeWork`/`onTimeout`
+    /// to gate later deliveries, so it cannot answer "did Android ever grant
+    /// us a foreground service?" — and the denied-FGS fallback must run only
+    /// for the genuine denial, not for a wake we cancelled ourselves.
+    @Volatile private var fgsEverGranted = false
+
     /**
      * Wakes currently running on [scope].
      *
@@ -108,6 +116,7 @@ class SonarPushProcessingService : Service() {
             }
         }
         fgsReady = enterForeground()
+        if (fgsReady) fgsEverGranted = true
         if (!fgsReady) {
             // e.g. the background-start allowlist expired before we reached
             // startForeground. Nothing can run without the FGS; stop cleanly
@@ -203,7 +212,16 @@ class SonarPushProcessingService : Service() {
             // by definition: no foreground service means no execution
             // guarantee, which is exactly why the money-path settle wait is
             // still refused below.
-            Log.w(TAG, "onStartCommand: no foreground service, running inline fallback")
+            if (fgsEverGranted) {
+                // We closed our own gate (suspend/timeout/cancelled wake), not
+                // a platform denial. The historical early-return is correct
+                // here; running the fallback would turn every later delivery
+                // on this instance into extra background work.
+                Log.w(TAG, "onStartCommand: wake gate closed by us, skipping work")
+                stopSelf(startId)
+                return START_NOT_STICKY
+            }
+            Log.w(TAG, "onStartCommand: startForeground was refused, running inline fallback")
             val type = intent?.getStringExtra(EXTRA_PUSH_TYPE) ?: TYPE_MARMOT
             val notifType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: ""
             val payload = intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: ""
@@ -478,7 +496,13 @@ class SonarPushProcessingService : Service() {
         // From here a payer is blocked on us, so a cancelled wake owes them an
         // error reply — see stopWakeWork. Cleared on every exit path below.
         pendingReplyUrl = req.replyUrl
-        val answered = withTimeoutOrNull(remainingMs) {
+        // The reply slot is ONE-SHOT: whoever POSTs to /api/v1/response/{id}
+        // first decides the answer. So the POST is owned by a job that
+        // outlives our deadline — otherwise a POST that starts before the
+        // budget and lands after it gets raced by the bail-out error below,
+        // and the payer can receive "timed out" for an invoice we actually
+        // produced. We only bound how long we WAIT.
+        val answerJob = bailoutScope.async {
             val invoice = WalletBridge.createBolt12Invoice(req.offer, req.invoiceRequest)
             val body = invoice.fold(
                 onSuccess = { JsonLite.encodeObject("invoice", it) },
@@ -492,12 +516,12 @@ class SonarPushProcessingService : Service() {
             )
             postNdsReply(req.replyUrl, body) to invoice.isSuccess
         }
+        val answered = withTimeoutOrNull(remainingMs) { answerJob.await() }
         pendingReplyUrl = null
         if (answered == null) {
-            // Our own bound tripped before the SDK produced anything. Still owe
-            // the payer an answer rather than the NDS's 60s expiry.
-            Log.w(TAG, "invoice_request: timed out producing the invoice, sending error")
-            postNdsReply(req.replyUrl, JsonLite.encodeObject("error", "timed out"))
+            // Our bound tripped while the job still owns the reply slot: do
+            // NOT post a competing error — let it finish.
+            Log.w(TAG, "invoice_request: still answering past our budget; leaving it to finish")
         }
         // `posted` is only the HTTP 2xx — BOTH an invoice and an {"error": ...}
         // reply post successfully, so log the outcome separately. Without this
