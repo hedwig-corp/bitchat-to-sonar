@@ -862,6 +862,7 @@ internal fun ChatRowActionsSheet(
     onClose: () -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter
@@ -897,6 +898,7 @@ internal fun MuteSheet(
     onClose: () -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     Box(
         Modifier.fillMaxSize().background(s.scrim).clickable(onClick = onClose),
         contentAlignment = Alignment.BottomCenter

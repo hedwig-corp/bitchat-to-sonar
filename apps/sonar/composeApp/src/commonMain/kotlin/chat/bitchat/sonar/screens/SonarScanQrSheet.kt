@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.ui.SNGhostButton
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
@@ -62,6 +63,7 @@ fun SonarScanQrSheet(
     onDetect: (destination: String, fixedSats: Long?) -> Unit,
 ) {
     val s = sonar
+    TransientBackHandler(onClose)
     var found by remember { mutableStateOf<String?>(null) }
     var failure by remember { mutableStateOf<String?>(null) }
 
