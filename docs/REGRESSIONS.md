@@ -1086,6 +1086,67 @@ amount for a BOLT11 — that needs a wallet double — and the amountless refusa
 divergence would not be caught. Nothing here is exercised end-to-end against a
 real wallet.
 
+## R-022 — Restore recovers the account, or leaves it exactly as it was
+
+**Invariant:** Every path into the account store either restores the backup or
+changes nothing. Staged bytes are promoted only when a restore was actually
+requested; a pasted key that matches the signed-in account wipes nothing; and a
+dry run reads a backup without touching the live store on any platform.
+
+**Breaks as:** Chats gone with no way back. Three distinct shapes, all shipped
+in the same feature:
+
+1. Boot reconcile promoted any staging file that opened under the live key. A
+   backup taken by *this* install stages a DB the live key opens, so the key
+   check cannot reject it — an interrupted restore left debris that the next
+   launch silently promoted, rolling the account back to the backup.
+2. Re-pasting your own `nsec` ran the full account-replacement path: wallet
+   storage, host caches, and the Marmot store wiped, then restore from Blossom.
+   For the current account that trades a live database for the last upload, and
+   for anyone who never opened the backup screen — where the disclosure gate
+   means nothing was ever uploaded — it destroyed everything with nothing to
+   restore.
+3. The dry run scratched the decrypted index into `env::temp_dir()`. Android app
+   processes have no `TMPDIR` and cannot write `/tmp`, so the one affordance for
+   checking a backup is real before a delete-and-reinstall failed on every
+   Android device, and users could only take the backup on faith.
+
+**Why:** All three are invisible from the code. The staging file *looks* like
+proof a restore is in flight, and the case where it is not is exactly the case
+the key check cannot detect. `restoreAccount` reads as "replace this account",
+so the same-key call looks like a no-op and is the most destructive input it
+accepts. And `tempfile::tempdir()` is correct on every platform the tests run
+on — the host suite passes because macOS `/tmp` is writable.
+
+**Call sites:** core `account_backup.rs::reconcile_staged_account_restore`,
+`::restore_account_files`, `::preview_account_backup`; Compose
+`SonarAppState.kt::restoreAccount`, `SonarCore.android.kt::importIdentity`,
+`SonarCore.jvm.kt::importIdentity`, `SonarCore.android.kt::previewAccountBackup`;
+iOS `SonarAppStore.swift::restoreAccount`,
+`MarmotChatView.swift::restoreIdentity`, `MarmotService.swift::previewBackup`
+
+**Guarded by:**
+`account_backup::tests::reconcile_discards_staging_with_no_intent_marker`,
+`account_backup::tests::preview_scratch_lives_beside_the_database`,
+`account_backup::tests::preview_leaves_the_live_account_byte_identical`
+
+**History:** #368.
+
+**Rejected:** Comparing staged and live modification times instead of an intent
+marker — mtime is not a fact about intent, it is a fact about the filesystem,
+and a restore staged before the last local write would be discarded for looking
+old. Also rejected: keeping the same-key guard only in the core import, which
+would still let the store-level path wipe wallet storage and host caches before
+the core ever sees the key.
+
+**Not guarded:** The same-key `nsec` guard has no test on either platform — both
+entry points need a constructible app object (see the Unguarded root cause), and
+verifying it by hand means typing a real account key. The intent marker is
+proven end-to-end only by the `backup_roundtrip_driver` example, which is not
+run by CI. Nothing pins that restored chats *render*: the Android leg was
+verified at the file level, and the synthetic backup used has no MLS groups
+behind its conversation summaries.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

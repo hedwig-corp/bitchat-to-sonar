@@ -132,7 +132,7 @@ struct SonarBackupScreen: View {
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
             Spacer().frame(height: 8)
-            dryRunCard
+            actionsCard
         }
     }
 
@@ -157,6 +157,37 @@ struct SonarBackupScreen: View {
 
     private var dryRunCard: some View {
         SNSettingsCard {
+            SNSettingsRow(
+                icon: .importKey,
+                label: String(localized: "Dry run a restore"),
+                sub: String(localized: "Preview what would come back — changes nothing"),
+                divider: false
+            ) {
+                dryRunSheet = true
+            }
+        }
+    }
+
+    /// Backups on: manual capture above the dry run.
+    ///
+    /// The scheduled job runs at most daily, so without this the moment a user
+    /// most wants a backup — right before a reinstall or a new phone — is
+    /// exactly when they cannot take one, and they leave with whatever
+    /// yesterday captured.
+    private var actionsCard: some View {
+        SNSettingsCard {
+            SNSettingsRow(
+                icon: .shieldCheck,
+                tone: .cyan,
+                label: String(localized: "Back up now"),
+                sub: store.backupInProgress
+                    ? String(localized: "Backing up…")
+                    : String(localized: "Capture everything up to this moment"),
+                trail: .none
+            ) {
+                guard !store.backupInProgress else { return }
+                Task { await store.backupAccountNow() }
+            }
             SNSettingsRow(
                 icon: .importKey,
                 label: String(localized: "Dry run a restore"),

@@ -43,6 +43,7 @@ import chat.bitchat.sonar.ui.SNPrimaryButton
 import chat.bitchat.sonar.ui.SNSettingsCard
 import chat.bitchat.sonar.ui.SNSettingsRow
 import chat.bitchat.sonar.ui.SNTone
+import chat.bitchat.sonar.ui.SNTrail
 import chat.bitchat.sonar.ui.sonar
 
 /**
@@ -102,6 +103,17 @@ fun SonarBackupScreen(state: SonarAppState) {
                 )
                 Spacer(Modifier.height(8.dp))
                 SNSettingsCard {
+                    // The scheduled job runs at most daily, so without this the
+                    // moment a user most wants a backup — right before a
+                    // reinstall or a new phone — is exactly when they cannot
+                    // take one, and they leave with whatever yesterday captured.
+                    SNSettingsRow(
+                        icon = SNIconName.ShieldCheck, tone = SNTone.Cyan,
+                        label = "Back up now",
+                        sub = if (state.backupInProgress) "Backing up…"
+                        else "Capture everything up to this moment",
+                        trail = SNTrail.None,
+                    ) { if (!state.backupInProgress) state.backupAccountNow() }
                     SNSettingsRow(
                         icon = SNIconName.ImportKey, label = "Dry run a restore",
                         sub = "Preview what would come back — changes nothing",

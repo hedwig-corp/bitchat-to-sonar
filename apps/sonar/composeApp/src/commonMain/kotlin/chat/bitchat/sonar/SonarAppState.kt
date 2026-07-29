@@ -3936,8 +3936,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         private set
     var backupInProgress by mutableStateOf(false)
         private set
-    var backupSanityChecks by mutableStateOf<List<BackupSanityItem>>(emptyList())
-        private set
     private var autoBackupJob: Job? = null
     private val backupMutex = Mutex()
 
@@ -4005,29 +4003,8 @@ class SonarAppState(private val scope: CoroutineScope) {
                 !policy.lastError.isNullOrBlank() -> "Last backup failed"
                 else -> "No backup yet"
             }
-            backupSanityChecks = buildBackupSanityChecks(
-                hasIdentity = npub.isNotBlank(),
-                localDbReady = localCoreReady || started,
-                disclosed = isAutoBackupDisclosed(),
-                policyReadable = true,
-                autoBackupEnabled = policy.enabled,
-                lastSuccessAt = policy.lastSuccessAt,
-                lastError = policy.lastError,
-                dirty = policy.dirty,
-                relayConnected = SonarCore.isRelayConnected(),
-            )
         }.onFailure {
-            backupSanityChecks = buildBackupSanityChecks(
-                hasIdentity = npub.isNotBlank(),
-                localDbReady = localCoreReady || started,
-                disclosed = isAutoBackupDisclosed(),
-                policyReadable = false,
-                autoBackupEnabled = autoBackupEnabled,
-                lastSuccessAt = null,
-                lastError = it.message,
-                dirty = false,
-                relayConnected = SonarCore.isRelayConnected(),
-            )
+            autoBackupStatusLine = "Last backup failed"
         }
     }
 
