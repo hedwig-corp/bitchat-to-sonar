@@ -1,27 +1,30 @@
 package chat.bitchat.sonar
 
 import kotlin.test.Test
-import kotlin.test.assertFalse
-import kotlin.test.assertTrue
+import kotlin.test.assertEquals
 
 class SystemBackPolicyTest {
     @Test
-    fun interceptsSystemBackAwayFromRoot() {
-        assertTrue(shouldHandleSystemBack(isAtRoot = false))
+    fun navigatesThroughSonarStackAwayFromRoot() {
+        assertEquals(
+            SystemBackAction.Navigate,
+            systemBackAction(isAtRoot = false, isCallScreen = false),
+        )
     }
 
     @Test
-    fun letsAndroidHandleSystemBackAtRoot() {
-        assertFalse(shouldHandleSystemBack(isAtRoot = true))
+    fun leavesRootBackToAndroid() {
+        assertEquals(
+            SystemBackAction.System,
+            systemBackAction(isAtRoot = true, isCallScreen = false),
+        )
     }
 
     @Test
-    fun interceptsSystemBackForTransientUiAtRoot() {
-        assertTrue(shouldHandleSystemBack(isAtRoot = true, hasTransientUi = true))
-    }
-
-    @Test
-    fun interceptsSystemBackForTransientUiAwayFromRoot() {
-        assertTrue(shouldHandleSystemBack(isAtRoot = false, hasTransientUi = true))
+    fun consumesBackOnCallScreenWithoutPoppingIt() {
+        assertEquals(
+            SystemBackAction.Consume,
+            systemBackAction(isAtRoot = false, isCallScreen = true),
+        )
     }
 }

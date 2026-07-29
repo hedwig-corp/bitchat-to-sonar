@@ -2,15 +2,23 @@ package chat.bitchat.sonar
 
 import androidx.compose.runtime.Composable
 
-/**
- * System Back belongs to Sonar when there is transient UI to dismiss or the
- * app-owned navigation stack is away from Home. At the true root, with no
- * transient UI, Android keeps its default Activity-exit behavior.
- */
-internal fun shouldHandleSystemBack(
-    isAtRoot: Boolean,
-    hasTransientUi: Boolean = false,
-): Boolean = hasTransientUi || !isAtRoot
+internal enum class SystemBackAction {
+    /** Leave Back unhandled so Android can finish/background the root Activity. */
+    System,
+
+    /** Pop exactly one entry from Sonar's app-owned route stack. */
+    Navigate,
+
+    /** Keep a modal route visible without performing a destructive action. */
+    Consume,
+}
+
+/** Calls are modal routes: only their explicit Decline/End controls may leave them. */
+internal fun systemBackAction(isAtRoot: Boolean, isCallScreen: Boolean): SystemBackAction = when {
+    isCallScreen -> SystemBackAction.Consume
+    isAtRoot -> SystemBackAction.System
+    else -> SystemBackAction.Navigate
+}
 
 /** Platform hook for system Back. Desktop has no activity Back dispatcher. */
 @Composable
@@ -18,6 +26,23 @@ internal expect fun PlatformBackHandler(
     enabled: Boolean,
     onBack: () -> Unit,
 )
+
+/** Connect Android's dispatcher to Sonar's route stack without popping modal calls. */
+@Composable
+internal fun SonarSystemBackHandler(
+    enabled: Boolean,
+    isAtRoot: Boolean,
+    isCallScreen: Boolean,
+    onNavigate: () -> Unit,
+) {
+    val action = systemBackAction(isAtRoot = isAtRoot, isCallScreen = isCallScreen)
+    PlatformBackHandler(
+        enabled = enabled && action != SystemBackAction.System,
+        onBack = {
+            if (action == SystemBackAction.Navigate) onNavigate()
+        },
+    )
+}
 
 /**
  * Give a visible Compose-owned overlay priority over the route-level handler.
@@ -27,7 +52,7 @@ internal expect fun PlatformBackHandler(
 @Composable
 internal fun TransientBackHandler(onBack: () -> Unit) {
     PlatformBackHandler(
-        enabled = shouldHandleSystemBack(isAtRoot = true, hasTransientUi = true),
+        enabled = true,
         onBack = onBack,
     )
 }

@@ -247,12 +247,13 @@ fun App(
             SonarLifecycle.clearOpenConversationHandler()
         }
     }
-    PlatformBackHandler(
+    SonarSystemBackHandler(
         enabled = state.onboarded &&
             !state.locked &&
-            state.homeMessagesHydrated &&
-            shouldHandleSystemBack(isAtRoot = state.isHome),
-        onBack = state::back,
+            state.homeMessagesHydrated,
+        isAtRoot = state.isHome,
+        isCallScreen = state.screen is Screen.Call,
+        onNavigate = state::back,
     )
     LaunchedEffect(state) {
         SonarLifecycle.onForeground = { state.setForeground(it) }
@@ -1785,25 +1786,28 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
             if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(screen.id, it) }
-            if (emojiTray && !recording) chat.bitchat.sonar.screens.SonarEmojiPicker(
-                onEmoji = { state.setComposerDraft(screen.id, draft + it) },
-                onGif = { item ->
-                    emojiTray = false
-                    state.sendGifItem(screen.id, item)
-                },
-                onSticker = { sticker, packCoordinate ->
-                    emojiTray = false
-                    state.sendStickerItem(screen.id, sticker, packCoordinate)
-                },
-                loadStickerPack = { author, identifier, relays ->
-                    state.stickerPack(author, identifier, relays)
-                },
-                loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
-                fetchInstalledPacks = { state.fetchInstalledPacks() },
-                initialStickerPacks = stickerPacks,
-                onStickerPacksLoaded = { stickerPacks = it },
-                onClose = { emojiTray = false }
-            )
+            if (emojiTray && !recording) {
+                TransientBackHandler { emojiTray = false }
+                chat.bitchat.sonar.screens.SonarEmojiPicker(
+                    onEmoji = { state.setComposerDraft(screen.id, draft + it) },
+                    onGif = { item ->
+                        emojiTray = false
+                        state.sendGifItem(screen.id, item)
+                    },
+                    onSticker = { sticker, packCoordinate ->
+                        emojiTray = false
+                        state.sendStickerItem(screen.id, sticker, packCoordinate)
+                    },
+                    loadStickerPack = { author, identifier, relays ->
+                        state.stickerPack(author, identifier, relays)
+                    },
+                    loadStickerImage = { url, expectedSha256 -> state.stickerImage(url, expectedSha256) },
+                    fetchInstalledPacks = { state.fetchInstalledPacks() },
+                    initialStickerPacks = stickerPacks,
+                    onStickerPacksLoaded = { stickerPacks = it },
+                    onClose = { emojiTray = false },
+                )
+            }
             // ONE composer row in BOTH states. Only the left (plus↔trash) and middle
             // (text field↔recording pill) swap; the mic Box on the right MUST stay
             // mounted while recording, or Compose cancels its hold-to-record gesture

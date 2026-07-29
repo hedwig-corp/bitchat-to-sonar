@@ -228,10 +228,14 @@ kotlin {
             implementation("androidx.camera:camera-view:1.4.1")
         }
         androidInstrumentedTest.dependencies {
+            @OptIn(org.jetbrains.compose.ExperimentalComposeLibrary::class)
+            implementation(compose.uiTest)
+            implementation("androidx.compose.ui:ui-test-junit4:1.7.6")
             implementation(libs.androidx.test.runner)
             implementation(libs.androidx.test.ext.junit)
             implementation(libs.junit)
             implementation(libs.okhttp.mockwebserver)
+            implementation("androidx.test.espresso:espresso-core:3.6.1")
         }
         val jvmMain by getting {
             // The desktop Breez API key is written here by `generateBreezKeyResource`
@@ -257,6 +261,10 @@ kotlin {
             }
         }
     }
+}
+
+dependencies {
+    add("debugImplementation", "androidx.compose.ui:ui-test-manifest:1.7.6")
 }
 
 compose.resources {
