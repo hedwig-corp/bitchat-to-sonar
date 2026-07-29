@@ -1086,6 +1086,52 @@ amount for a BOLT11 — that needs a wallet double — and the amountless refusa
 divergence would not be caught. Nothing here is exercised end-to-end against a
 real wallet.
 
+## R-022 — A send reads the draft the composer holds, not the one it last composed
+
+**Invariant:** Whatever commits a message — desktop Enter or the send button —
+sends the text the field currently holds. The hoisted draft a composition
+captured is only a snapshot of the last completed frame and must never be the
+value that gets sent.
+
+**Breaks as:** The message arrives truncated. The composer shows the full text
+right up to the keypress, the sent bubble is missing its tail, and the amount cut
+varies with load — which reads as random corruption rather than a race.
+
+**Why it happens:** Key events are dispatched as they arrive; recomposition
+happens on the next frame. Any keystroke that lands after the last recomposition
+is invisible to a lambda that closed over the composed `draft`. A laggy frame
+queues a whole burst of AWT key events plus the Enter behind it, so the loss is
+a burst, not one character.
+
+**Call sites:** Compose `MessageComposerTextField` (`onSend` now receives the
+field's live text) plus the three send buttons in `ChatScreen`, `GeoDmScreen`,
+and `SonarChannelScreen`, which read the draft back from
+`SonarAppState.composerDraft` at click time. Apple is not affected in the same
+shape: SwiftUI `SNMessageComposerField` sends through a `@Binding` that the
+`.onKeyPress(.return)` handler reads at event time, not a per-frame capture.
+
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTypedTextWhenCallSiteHasNotRecomposed`
+(fails without the fix: `onSend` receives `""`), with
+`returnKeyDoesNotResendDraftClearedByCaller` pinning the other half — a caller
+that owns the draft again (cleared after send, slash-hint completion) still wins.
+
+**Coverage (honest):** The tests pin the shared field. The three send *buttons*
+are not covered — they live inside large screen composables with a constructed
+`SonarAppState`, so the fresh-read at those call sites is by inspection only.
+Nothing pins the Apple side.
+
+**Rejected:**
+- *Reading the hoisted `value` inside the key handler.* It is the same
+  composition-time snapshot the call site captured, so it is stale in exactly
+  the same window.
+- *Fixing only the three `onSend` call sites by reading `composerDraft` fresh.*
+  It works, but leaves the footgun in place for the next composer — the field
+  itself is the only thing that always knows its own text. The buttons take that
+  form because they cannot see the field's live text.
+- *Mutating the live-text holder during composition instead of in `SideEffect`.*
+  A discarded composition would leave the holder advanced past the text the
+  field actually kept.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

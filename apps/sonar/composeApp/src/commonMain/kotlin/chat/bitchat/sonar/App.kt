@@ -1870,13 +1870,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                         emojiTray = false
                                     }
                                 },
-                            onSend = {
-                                if (draft.isBlank()) return@MessageComposerTextField
-                                val d = draft
+                            onSend = { typed ->
+                                if (typed.isBlank()) return@MessageComposerTextField
                                 state.setComposerDraft(screen.id, "")
                                 emojiTray = false
-                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                                    state.send(screen.id, d)
+                                if (!state.handleCommand(typed, peerName, channelGeohash = null, chatId = screen.id)) {
+                                    state.send(screen.id, typed)
                                 }
                             },
                         )
@@ -1954,7 +1953,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(sendBg)
                             .clickable(enabled = sendEnabled) {
-                                val d = draft
+                                // Read the draft back from state, not from this
+                                // composition: keystrokes land before the call site
+                                // recomposes, so `draft` here can miss the tail.
+                                val d = state.composerDraft(screen.id)
                                 state.setComposerDraft(screen.id, "")
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
@@ -2561,11 +2563,10 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
                     modifier = Modifier.fillMaxWidth(),
-                    onSend = {
-                        if (draft.isBlank()) return@MessageComposerTextField
-                        val d = draft
+                    onSend = { typed ->
+                        if (typed.isBlank()) return@MessageComposerTextField
                         state.setComposerDraft(draftKey, "")
-                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
+                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, typed)
                     },
                 )
             }
@@ -2573,7 +2574,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             Box(
                 Modifier.size(34.dp).clip(CircleShape).background(if (draft.isBlank()) s.surface2 else s.netFill)
                     .clickable(enabled = draft.isNotBlank()) {
-                        val d = draft
+                        val d = state.composerDraft(draftKey)
                         state.setComposerDraft(draftKey, "")
                         state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
                     },

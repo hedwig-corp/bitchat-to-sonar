@@ -34,8 +34,8 @@ class MessageComposerFieldUiTest {
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
                 modifier = Modifier.testTag("message-composer"),
-                onSend = {
-                    sent = text
+                onSend = { typed ->
+                    sent = typed
                     text = ""
                 },
             )
@@ -64,8 +64,8 @@ class MessageComposerFieldUiTest {
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
                 modifier = Modifier.testTag("message-composer"),
-                onSend = {
-                    sent = text
+                onSend = { typed ->
+                    sent = typed
                     text = ""
                 },
             )
@@ -77,6 +77,73 @@ class MessageComposerFieldUiTest {
 
         runOnIdle {
             assertEquals("from numpad", sent)
+            assertEquals("", text)
+        }
+    }
+
+    /**
+     * The truncation bug: a keystroke burst reaches the field before the call
+     * site recomposes, so the hoisted `value` the composition captured is
+     * missing the tail. Enter must send what the field holds, not that stale
+     * value — here the call site never catches up at all.
+     */
+    @Test
+    fun returnKeySendsTypedTextWhenCallSiteHasNotRecomposed() = runComposeUiTest {
+        val hoisted = ""
+        var reported: String? = null
+        var sent: String? = null
+        setContent {
+            MessageComposerTextField(
+                value = hoisted,
+                onValueChange = { reported = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                modifier = Modifier.testTag("message-composer"),
+                onSend = { typed -> sent = typed },
+            )
+        }
+
+        onNodeWithTag("message-composer").performClick()
+        onNodeWithTag("message-composer").performTextInput("hello desktop")
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+
+        runOnIdle {
+            assertEquals("hello desktop", reported)
+            assertEquals("hello desktop", sent)
+        }
+    }
+
+    /**
+     * The other side of that rule: once the caller owns the draft again (it
+     * cleared it after the send), a second Enter must not resend the old text.
+     */
+    @Test
+    fun returnKeyDoesNotResendDraftClearedByCaller() = runComposeUiTest {
+        var text by mutableStateOf("")
+        val sent = mutableListOf<String>()
+        setContent {
+            MessageComposerTextField(
+                value = text,
+                onValueChange = { text = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                modifier = Modifier.testTag("message-composer"),
+                onSend = { typed ->
+                    if (typed.isNotBlank()) {
+                        sent += typed
+                        text = ""
+                    }
+                },
+            )
+        }
+
+        onNodeWithTag("message-composer").performClick()
+        onNodeWithTag("message-composer").performTextInput("only once")
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+
+        runOnIdle {
+            assertEquals(listOf("only once"), sent)
             assertEquals("", text)
         }
     }
