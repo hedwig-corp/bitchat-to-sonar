@@ -4541,12 +4541,19 @@ class SonarAppState(private val scope: CoroutineScope) {
      * halves re-check `backup_is_due`, so at most one of them uploads.
      */
     private fun runOpportunisticBackupOnBackground() {
-        if (!isAutoBackupDisclosed() || !autoBackupEnabled) return
+        if (!isAutoBackupDisclosed() || !autoBackupEnabled) {
+            sonarLog("Backup", "opportunistic: skipped (disclosed=${isAutoBackupDisclosed()} enabled=$autoBackupEnabled)")
+            return
+        }
         chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()
         scope.launch {
             val due = runCatching {
                 withContext(Dispatchers.Default) { SonarCore.backupIsDue() }
-            }.getOrDefault(false)
+            }.getOrElse { err ->
+                sonarLog("Backup", "opportunistic: due check failed: ${err.message}")
+                false
+            }
+            sonarLog("Backup", "opportunistic: due=$due")
             if (!due) return@launch
             if (!backupMutex.tryLock()) return@launch
             backupInProgress = true

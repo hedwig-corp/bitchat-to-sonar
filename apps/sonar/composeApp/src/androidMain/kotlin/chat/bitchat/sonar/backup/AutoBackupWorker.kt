@@ -91,8 +91,12 @@ class AutoBackupWorker(
         } catch (e: CancellationException) {
             // Structured concurrency cancel must not become Result.retry().
             throw e
-        } catch (_: Exception) {
-            // Do not swallow Error (OOM / LinkageError) as retry.
+        } catch (e: Exception) {
+            // Do not swallow Error (OOM / LinkageError) as retry. Log before
+            // retrying: a silent retry made the on-device worker test
+            // undiagnosable — the job "ran" and nothing said why nothing
+            // happened.
+            android.util.Log.w("AutoBackupWorker", "background backup failed; will retry", e)
             Result.retry()
         }
     }
