@@ -1700,6 +1700,35 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarCall", "ignoring blocked call control chatId=$callChatId")
             return
         }
+        // #420: bind control to a 2-party conversation AND to its peer. A
+        // ☎CALL line is an ordinary group message, so without this any member
+        // of a group containing the victim could ring them with an OFFER
+        // carrying the attacker's own address, or answer someone else's call
+        // (core's on_answer overwrites the pin — the last answerer wins).
+        // Silent drop: replying decline into a group leaks presence to every
+        // member.
+        val kind = when (ctrl) {
+            is SonarCallControl.Offer -> CallControlAdmission.Kind.Offer
+            is SonarCallControl.Answer -> CallControlAdmission.Kind.Answer
+            is SonarCallControl.Cancel -> CallControlAdmission.Kind.Cancel
+            is SonarCallControl.End -> CallControlAdmission.Kind.End
+        }
+        // A mesh/NIP-17 DM is keyed by the peer itself, so it is 2-party by
+        // construction and carries no roster; a Marmot conversation must be
+        // judged on its member list.
+        val structurallyDirect = isMeshChat(chatId) || isMeshChat(callChatId)
+        if (!CallControlAdmission.isAdmissible(
+                kind = kind,
+                otherMemberKeys = otherMemberKeys(chatId).ifEmpty { otherMemberKeys(callChatId) },
+                structurallyDirect = structurallyDirect,
+                senderKey = canonicalProfileKey(m.senderNpub),
+                activeCallConversationId = activeCall?.chatId,
+                conversationId = callChatId,
+            )
+        ) {
+            sonarLog("SonarCall", "dropping unbound call control chatId=$chatId folded=$callChatId")
+            return
+        }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
             if (shouldDeferOfferForSonarDescriptor(callChatId)) {
                 sonarLog("SonarCall", "deferring offer until Sonar descriptor lookup completes chatId=$chatId folded=$callChatId")
@@ -10740,14 +10769,36 @@ class SonarAppState(private val scope: CoroutineScope) {
         return if (peerId == null) marmotChatPeerNpubHex(chatId) else npubRawFor(peerId)?.toHexLower()
     }
 
+    /// The conversation's single other member, or null.
+    ///
+    /// `singleOrNull`, NOT `firstOrNull` (#420): with `firstOrNull` a
+    /// >2-member group resolved to whichever member happened to be first, so
+    /// `canCall(<group>)` returned true whenever THAT member's descriptor
+    /// supported calls — which is what put call buttons on group chats and let
+    /// any member's forged OFFER ring the victim under an innocent member's
+    /// name. A group has no unambiguous call peer; it must resolve to null,
+    /// matching iOS `snDirectMarmotPeerKey`.
     private fun marmotChatPeerNpubHex(chatId: String): String? {
         val mine = canonicalProfileKey(npub)
         val other = chats.firstOrNull { it.id == chatId }
             ?.members
             ?.map { canonicalProfileKey(it) }
-            ?.firstOrNull { it != mine && it.isNotBlank() }
+            ?.filter { it != mine && it.isNotBlank() }
+            ?.distinct()
+            ?.singleOrNull()
             ?: return null
         return canonicalNpubHex(other)
+    }
+
+    /// Members of `chatId` other than us, canonicalized — the input to the
+    /// call-control admission check (#420).
+    private fun otherMemberKeys(chatId: String): List<String> {
+        val mine = canonicalProfileKey(npub)
+        return chats.firstOrNull { it.id == chatId }
+            ?.members
+            ?.map { canonicalProfileKey(it) }
+            ?.filter { it != mine && it.isNotBlank() }
+            .orEmpty()
     }
 
     private fun randomMeshId(): String =

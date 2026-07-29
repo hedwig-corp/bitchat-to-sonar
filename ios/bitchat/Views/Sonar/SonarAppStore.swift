@@ -8796,6 +8796,26 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Calls
 
+    /// Canonical comparison form for a call-control identity: lowercase hex
+    /// or bech32 as stored, trimmed. Both sides of the #420 check go through
+    /// this so an encoding difference cannot silently admit a stranger.
+    static func canonicalCallKey(_ npub: String) -> String {
+        npub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Members of a call conversation other than us, canonicalized. Empty for
+    /// mesh DMs (no roster) — those are judged `structurallyDirect` instead.
+    private func callConversationOtherMembers(_ convId: String) -> [String] {
+        guard let groupId = marmotGroupId(convId) ?? marmotGroupId(callConversationId(convId)) else {
+            return []
+        }
+        guard let group = marmot.groups.first(where: { $0.id == groupId }) else { return [] }
+        let mine = Self.canonicalCallKey(marmot.npub ?? "")
+        return group.memberNpubs
+            .map(Self.canonicalCallKey)
+            .filter { !$0.isEmpty && $0 != mine }
+    }
+
     /// mm:ss formatter (call.jsx `fmtCall`): minutes unpadded, seconds padded.
     static func fmtCall(_ sec: Int) -> String {
         "\(sec / 60):" + String(format: "%02d", sec % 60)
@@ -9083,7 +9103,10 @@ final class SonarAppStore: ObservableObject {
                     continue
                 }
                 let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
-                if handleCallControl(ctrl, convId: peerID.id, via: via, messageId: m.id) {
+                // A Noise mesh DM is keyed by the peer, so it is 2-party by
+                // construction and surfaces no roster/sender npub.
+                if handleCallControl(ctrl, convId: peerID.id, via: via, messageId: m.id,
+                                     senderNpub: "", structurallyDirect: true) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }
@@ -9099,7 +9122,8 @@ final class SonarAppStore: ObservableObject {
                     scannedCallMessageIDs.insert(m.id)
                     continue
                 }
-                if handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet, messageId: m.id) {
+                if handleCallControl(ctrl, convId: Self.marmotIDPrefix + groupId, via: .internet, messageId: m.id,
+                                     senderNpub: m.senderNpub, structurallyDirect: false) {
                     scannedCallMessageIDs.insert(m.id)
                 }
             }
@@ -9134,8 +9158,41 @@ final class SonarAppStore: ObservableObject {
     }
 
     @discardableResult
-    private func handleCallControl(_ ctrl: CallControlInfo, convId: String, via: SNVia, messageId: String) -> Bool {
+    private func handleCallControl(
+        _ ctrl: CallControlInfo,
+        convId: String,
+        via: SNVia,
+        messageId: String,
+        senderNpub: String,
+        structurallyDirect: Bool
+    ) -> Bool {
         let conversationId = callConversationId(convId)
+        // #420: bind control to a 2-party conversation AND to its peer, for
+        // EVERY control kind. The pre-existing OFFER refusal below rode on the
+        // conversation-folding helper, which is a routing detail rather than a
+        // security check, and Answer/Cancel/End had no binding at all — a
+        // callId learned in a group could steer a live call. Returning `true`
+        // marks the message consumed: dropped silently, since replying into a
+        // group would leak presence to every member.
+        let kind: SonarCallControlAdmission.Kind = {
+            switch ctrl {
+            case .offer: return .offer
+            case .answer: return .answer
+            case .cancel: return .cancel
+            case .end: return .end
+            }
+        }()
+        if !SonarCallControlAdmission.isAdmissible(
+            kind: kind,
+            otherMemberKeys: callConversationOtherMembers(convId),
+            structurallyDirect: structurallyDirect,
+            senderKey: Self.canonicalCallKey(senderNpub),
+            activeCallConversationId: activeCall?.convId,
+            conversationId: conversationId
+        ) {
+            SecureLogger.debug("SonarCall: dropping unbound call control convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))", category: .session)
+            return true
+        }
         if case let .offer(callId, _, _, _) = ctrl, !canCall(conversationId) {
             if shouldDeferOfferForSonarDescriptor(conversationId) {
                 SecureLogger.debug("SonarCall: deferring offer until Sonar descriptor lookup completes convId=\(convId.prefix(16)) folded=\(conversationId.prefix(16))", category: .session)

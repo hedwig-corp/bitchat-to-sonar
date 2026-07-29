@@ -1372,6 +1372,61 @@ path and the pending-chat flush paths (`flushPendingDirectMarmot`,
 gate; a retry/first-send whose canonical row lands out-of-window can drop until
 the newest-edge reload. Same shape, separate call sites — gate them the same
 way when touched.
+## R-026 — Call control is honored only from the 2-party peer
+
+**Invariant:** A `☎CALL` control line may drive call state only when it
+arrives in a conversation with exactly one other member, FROM that member —
+and for `ANSWER`/`CANCEL`/`END`, only in the same conversation as the call in
+progress.
+
+**Breaks as:** A group member rings you with a spoofed caller name and your
+accept sends live mic/camera to them (the OFFER carries the attacker's own
+iroh address, and core's endpoint pin then matches it); or a group member
+answers your outgoing call and takes the media, because `on_answer`
+overwrites `slot.remote_id` unconditionally — the last answerer wins. Either
+way every member learns who called whom, the media kind, and both parties'
+endpoint addresses.
+
+**Why:** `CallControl` carries no sender identity and core enforces nothing
+about conversation shape, so binding is host responsibility — and both hosts
+dispatched call lines from every conversation including groups. Compose's
+only gate was `canCall`, which resolved a group's "peer" with
+`firstOrNull { it != mine }`, so a group whose first other member supported
+calls was callable. Apple's OFFER leg happened to be blocked by the
+conversation-*folding* helper (`snDirectMarmotPeerKey`, `others.count == 1`),
+which is a routing detail, not a security check; its ANSWER/CANCEL/END legs
+matched on `callId` alone.
+
+**Call sites:** Compose `SonarAppState.onCallControl` (via
+`CallControlAdmission.isAdmissible`) plus the `singleOrNull` fix in
+`marmotChatPeerNpubHex`; iOS `SonarAppStore.handleCallControl` (via
+`SonarCallControlAdmission.isAdmissible`), with the sender threaded in from
+both dispatch loops.
+
+**Guarded by:** `CallControlAdmissionTest.groupMemberCannotRingYou`
+
+**Also guarded by:** `CallControlAdmissionTest.groupMemberCannotAnswerYourCall`, `CallControlAdmissionTest.meshDmsStayCallableWithoutARoster`, `CallControlAdmissionTest.answerFromAnotherConversationCannotSteerTheActiveCall` — Apple mirror: `SonarCallControlAdmissionTests.groupMemberCannotRingYou`, `SonarCallControlAdmissionTests.groupMemberCannotAnswerYourCall`, `SonarCallControlAdmissionTests.meshDmsStayCallableWithoutARoster`
+
+**Not guarded:** the call-site wiring itself on either platform (neither
+`SonarAppState` nor `SonarAppStore` is constructible in a test), so a
+regression that stops CONSULTING the predicate keeps these green. Nothing
+pins that the UI hides call buttons on group chats, and iOS tests do not run
+in CI. Core still accepts an `on_answer` that overwrites an existing pin —
+the host is the only thing refusing it.
+
+**This is a mirror pair.** The predicate exists twice by necessity; drift is
+the failure mode.
+
+**Rejected:**
+- *Replying `ANSWER|decline` when refusing a group offer.* That is the
+  pre-existing Apple behaviour and it leaks presence to every member of the
+  group. Refused lines are dropped silently.
+- *Gating on member count alone.* The attacker is a legitimate member, so
+  membership proves nothing — the sender must BE the single peer.
+- *Requiring a sender on every transport.* Mesh DMs are keyed by the peer and
+  surface no npub; demanding one would break mesh calling. They are admitted
+  as structurally direct instead, which is safe because no third party can
+  inject into a peer-keyed conversation.
 
 ## Unguarded
 
