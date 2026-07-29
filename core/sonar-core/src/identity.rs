@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use nostr::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::{Error, Result};
 
@@ -38,8 +39,10 @@ pub struct Identity {
     keys: Option<Keys>,
     /// Root for deterministic derivations (geohash keys, iroh call identity).
     /// Local accounts: the secret-key bytes. Remote accounts: a host-provided
-    /// device-local random root.
-    kdf_root: [u8; 32],
+    /// device-local random root. `Zeroizing` because for local accounts these
+    /// ARE the account secret — a plain array would leave unwiped copies
+    /// behind on every drop of a cloned `Identity`.
+    kdf_root: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Identity {
@@ -54,7 +57,7 @@ impl std::fmt::Debug for Identity {
 
 impl Identity {
     fn from_keys(keys: Keys) -> Self {
-        let kdf_root = keys.secret_key().to_secret_bytes();
+        let kdf_root = Zeroizing::new(keys.secret_key().to_secret_bytes());
         Self {
             public_key: keys.public_key(),
             signer: Arc::new(keys.clone()),
@@ -88,7 +91,7 @@ impl Identity {
             public_key,
             signer,
             keys: None,
-            kdf_root,
+            kdf_root: Zeroizing::new(kdf_root),
         }
     }
 

@@ -22,6 +22,12 @@ object Nip55 {
      * Every kind Sonar signs with the ACCOUNT identity key. Kind-445 group
      * messages and outer kind-1059 wraps use ephemeral keys and never reach
      * the signer; MLS itself has its own credentials.
+     *
+     * MIRROR of the core-owned `sonar_core::signer_kinds::IDENTITY_SIGNED_KINDS`
+     * (exported as `identitySignedKinds()` over the FFI) — this copy exists
+     * only because commonMain cannot touch the FFI. `Nip55KindsFfiParityTest`
+     * (jvmTest) pins the two lists against each other, so drift on EITHER
+     * side fails CI.
      */
     val SIGN_EVENT_KINDS: List<Int> = listOf(
         22242, // NIP-42 relay auth
@@ -95,25 +101,13 @@ object Nip55 {
      */
     const val DECRYPT_FAILURE_SENTINEL = "Could not decrypt the message"
 
-    /** True when a non-rejected result payload is actually usable. */
+    /** True when a non-rejected result payload is actually usable.
+     *  Signature-only `sign_event` responses need no assembly here: the Rust
+     *  adapter accepts a bare 128-hex signature and builds + verifies the
+     *  event itself (event construction is NIP-01 logic and lives in core,
+     *  so NIP-46/desktop hosts don't each reimplement it). */
     fun isUsableResult(result: String?): Boolean =
         !result.isNullOrBlank() && result != DECRYPT_FAILURE_SENTINEL
-
-    /**
-     * Assemble full signed-event JSON from the unsigned event JSON we sent and
-     * a bare 64-byte schnorr signature (some NIP-55 signers return only the
-     * `signature`/`result` extra, no `event`). Purely mechanical: appends a
-     * `"sig"` field to the JSON object. Callers verify the result end-to-end
-     * (id, author, signature) in the Rust adapter, so a bad assembly can only
-     * fail closed. Returns null when the inputs don't have the right shape.
-     */
-    fun assembleSignedEvent(unsignedEventJson: String, signatureHex: String): String? {
-        val sig = signatureHex.trim()
-        if (!sig.matches(Regex("^[0-9a-fA-F]{128}$"))) return null
-        val json = unsignedEventJson.trim()
-        if (!json.startsWith("{") || !json.endsWith("}")) return null
-        return json.dropLast(1) + ",\"sig\":\"" + sig + "\"}"
-    }
 
     // ── minimal JSON extraction (same no-dependency style as RelayDiagnostics) ──
 

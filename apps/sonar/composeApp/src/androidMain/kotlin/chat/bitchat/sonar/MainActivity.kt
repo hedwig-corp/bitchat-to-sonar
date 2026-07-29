@@ -175,7 +175,14 @@ class MainActivity : ComponentActivity() {
         )
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
         ExternalSignerBridge.launchSignerIntent = { intent ->
-            runOnUiThread { externalSignerLauncher.launch(intent) }
+            runOnUiThread {
+                // This runs on a later main-looper turn, OUTSIDE the caller's
+                // try — an unguarded throw here (signer uninstalled
+                // mid-session → ActivityNotFoundException, recreated activity
+                // → unregistered launcher) would crash the process.
+                runCatching { externalSignerLauncher.launch(intent) }
+                    .onFailure { AmberSignerClient.onLaunchFailed(intent, it) }
+            }
         }
         setContent {
             App(

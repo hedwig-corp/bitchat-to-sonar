@@ -21,6 +21,8 @@ pub mod noise;
 pub mod notification;
 pub mod outbox;
 pub mod push;
+pub mod signer_failure;
+pub mod signer_kinds;
 pub mod relay_directory;
 pub mod sonar_descriptor;
 pub mod sticker_cache;

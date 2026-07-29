@@ -99,6 +99,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
     val s = sonar
     var wipeAsk by remember { mutableStateOf(false) }
     var eraseAsk by remember { mutableStateOf(false) }
+    // Read ONCE per screen entry (a synchronous Keystore decrypt — must not
+    // run on every recomposition); account mode can't change while open.
+    val usesExternalSigner = remember { state.usesExternalSigner() }
     var exportKey by remember { mutableStateOf(false) }
     var restoreKey by remember { mutableStateOf(false) }
     var currencyPick by remember { mutableStateOf(false) }
@@ -223,7 +226,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = SNIconName.ShieldCheck, tone = SNTone.Cyan, label = "Verified people",
                     value = state.verifiedCount().toString(),
                 ) { state.push(Screen.Nearby) }
-                if (state.usesExternalSigner()) {
+                if (usesExternalSigner) {
                     // NIP-55 account: there is no local nsec to export, and the
                     // Blossom account backup/restore is keyed on the nsec —
                     // both are unavailable by design (documented gap).

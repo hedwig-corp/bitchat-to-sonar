@@ -181,3 +181,99 @@ async fn remote_identity_gates_local_key_operations() {
     // Deterministic derivations still work off the device-local root.
     assert_eq!(identity.kdf_root(), &[42u8; 32]);
 }
+
+/// Signer whose NIP-44 decrypt fails with a marked external-signer failure —
+/// simulates the Amber bridge when the app is backgrounded (transient) or the
+/// user rejected the request (permanent).
+#[derive(Debug)]
+struct FailingDecryptSigner {
+    keys: Keys,
+    marker: &'static str,
+}
+
+impl NostrSigner for FailingDecryptSigner {
+    fn backend(&self) -> SignerBackend<'_> {
+        SignerBackend::Custom("test-nip55".into())
+    }
+
+    fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
+        Box::pin(async move { Ok(self.keys.public_key()) })
+    }
+
+    fn sign_event(&self, unsigned: UnsignedEvent) -> BoxedFuture<'_, Result<Event, SignerError>> {
+        self.keys.sign_event(unsigned)
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        self.keys.nip04_encrypt(public_key, content)
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        self.keys.nip04_decrypt(public_key, content)
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        self.keys.nip44_encrypt(public_key, content)
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        let message = format!("external signer {}nip44_decrypt: simulated", self.marker);
+        Box::pin(async move { Err(SignerError::from(message)) })
+    }
+}
+
+/// A TRANSIENT signer failure while unwrapping must surface as
+/// `Error::Signer` (retryable — the sync layer leaves the event in the
+/// window), while a PERMANENT rejection keeps the terminal `Error::Nip59`
+/// shape. Without this split, a backgrounded signer turned every undelivered
+/// welcome/DM into silent permanent data loss.
+#[tokio::test]
+async fn signer_unwrap_failures_classify_transient_vs_permanent() {
+    use sonar_core::signer_failure::{PERMANENT_MARKER, TRANSIENT_MARKER};
+
+    let bob = MarmotEngine::in_memory(Identity::generate());
+
+    for (marker, expect_retryable) in [(TRANSIENT_MARKER, true), (PERMANENT_MARKER, false)] {
+        let keys = Keys::generate();
+        let identity = Identity::with_remote_signer(
+            keys.public_key(),
+            Arc::new(FailingDecryptSigner {
+                keys: keys.clone(),
+                marker,
+            }),
+            [9u8; 32],
+        );
+        let alice = MarmotEngine::in_memory(identity);
+        let rumor =
+            EventBuilder::new(Kind::Custom(14), "ping").build(bob.identity().public_key());
+        let gift = bob
+            .gift_wrap_rumor(&keys.public_key(), rumor)
+            .await
+            .expect("bob wraps rumor");
+        let err = alice
+            .unwrap_gift(&gift)
+            .await
+            .expect_err("decrypt must fail");
+        let is_signer = matches!(err, sonar_core::Error::Signer(_));
+        assert_eq!(
+            is_signer, expect_retryable,
+            "marker {marker}: got {err:?}"
+        );
+    }
+}

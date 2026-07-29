@@ -6344,71 +6344,78 @@ impl SonarClient {
                 continue;
             }
 
-            // Intercept account-level gift wraps that are not Marmot MLS input
-            // before they reach the MLS engine: push-token shares (kind 447)
-            // and plain bitchat fallback DMs (NIP-17 kind 14).
-            if event.kind == Kind::GiftWrap {
-                if let Ok(unwrapped) =
-                    UnwrappedGift::from_gift_wrap(&self.engine.identity().signer(), &event).await
-                {
-                    if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
-                        match self
-                            .handle_push_token_share(&unwrapped.sender, &unwrapped.rumor.content)
-                        {
-                            Ok(()) => {
+            // Gift wraps are unwrapped exactly ONCE here (an external-signer
+            // account pays two IPC round-trips per unwrap): the account-level
+            // intercepts (push-token shares kind 447, NIP-17 kind-14 DMs) peek
+            // at the rumor, and everything else feeds the SAME unwrap into the
+            // MLS engine via `process_unwrapped_gift`.
+            let outcome = if event.kind == Kind::GiftWrap {
+                match self.engine.unwrap_gift(&event).await {
+                    Err(err) => Err(err),
+                    Ok(unwrapped) => {
+                        if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
+                            match self.handle_push_token_share(
+                                &unwrapped.sender,
+                                &unwrapped.rumor.content,
+                            ) {
+                                Ok(()) => {
+                                    self.mark_sync_event_processed(&event.id);
+                                    report.record_processed();
+                                }
+                                Err(err) => {
+                                    tracing::debug!(
+                                        %err,
+                                        event_id = %event.id,
+                                        event_created_at = event.created_at.as_secs(),
+                                        context,
+                                        "push token share needs retry"
+                                    );
+                                    report.record_retryable(event.created_at.as_secs());
+                                }
+                            }
+                            continue;
+                        }
+                        if unwrapped.rumor.kind.as_u16() == 14 {
+                            if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
+                                &unwrapped.rumor.content,
+                            ) {
+                                let event_id = event.id.to_hex();
+                                let mut buf = self.direct_dm.lock().unwrap();
+                                if !buf.iter().any(|existing| {
+                                    existing.event_id == event_id
+                                        || (existing.id == dm.message_id
+                                            && existing.sender == unwrapped.sender)
+                                }) {
+                                    if buf.len() >= DIRECT_DM_BUFFER_CAP {
+                                        buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
+                                    }
+                                    buf.push(RawDirectDm {
+                                        event_id,
+                                        id: dm.message_id,
+                                        sender: unwrapped.sender,
+                                        content: dm.content,
+                                        ts: unwrapped.rumor.created_at.as_secs(),
+                                    });
+                                }
+                                report.record_retryable(event.created_at.as_secs());
+                            } else {
+                                tracing::debug!(
+                                    event_id = %event.id,
+                                    "ignoring non-bitchat account-level NIP-17 DM"
+                                );
                                 self.mark_sync_event_processed(&event.id);
                                 report.record_processed();
                             }
-                            Err(err) => {
-                                tracing::debug!(
-                                    %err,
-                                    event_id = %event.id,
-                                    event_created_at = event.created_at.as_secs(),
-                                    context,
-                                    "push token share needs retry"
-                                );
-                                report.record_retryable(event.created_at.as_secs());
-                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if unwrapped.rumor.kind.as_u16() == 14 {
-                        if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
-                            &unwrapped.rumor.content,
-                        ) {
-                            let event_id = event.id.to_hex();
-                            let mut buf = self.direct_dm.lock().unwrap();
-                            if !buf.iter().any(|existing| {
-                                existing.event_id == event_id
-                                    || (existing.id == dm.message_id
-                                        && existing.sender == unwrapped.sender)
-                            }) {
-                                if buf.len() >= DIRECT_DM_BUFFER_CAP {
-                                    buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
-                                }
-                                buf.push(RawDirectDm {
-                                    event_id,
-                                    id: dm.message_id,
-                                    sender: unwrapped.sender,
-                                    content: dm.content,
-                                    ts: unwrapped.rumor.created_at.as_secs(),
-                                });
-                            }
-                            report.record_retryable(event.created_at.as_secs());
-                        } else {
-                            tracing::debug!(
-                                event_id = %event.id,
-                                "ignoring non-bitchat account-level NIP-17 DM"
-                            );
-                            self.mark_sync_event_processed(&event.id);
-                            report.record_processed();
-                        }
-                        continue;
+                        self.engine.process_unwrapped_gift(&event, &unwrapped)
                     }
                 }
-            }
+            } else {
+                self.engine.process_incoming(&event).await
+            };
 
-            match self.engine.process_incoming(&event).await {
+            match outcome {
                 Ok(Incoming::Failed) => {
                     // Count the delivery as handled so one bad ciphertext does
                     // not pin the global watermark, but do NOT add it to Sonar's
