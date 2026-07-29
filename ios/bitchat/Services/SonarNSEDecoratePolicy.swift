@@ -61,12 +61,13 @@ enum SonarNSEDecoratePolicy {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let lowered = trimmed.lowercased()
-        let placeholders: Set<String> = [
-            "sonar agent dm",
-            "dm",
-            "direct message",
-            "new chat",
-        ]
+        // ONLY the locally-generated placeholder. `groupName` comes from the
+        // remote group, so treating generic strings as "this is a DM" lets an
+        // attacker name a group "New chat" to route it through the DM branch
+        // of the mute lookup and suppress its killed-app banner for anyone who
+        // muted a DM with the sender — and "New chat" is a name a real user
+        // would type, so it is a false positive even without an attacker.
+        let placeholders: Set<String> = ["sonar agent dm"]
         if placeholders.contains(lowered) { return nil }
         return trimmed
     }

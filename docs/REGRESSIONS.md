@@ -1125,6 +1125,13 @@ core emits the drain sender as 64-hex but group members/profiles as bech32, so
 stored in some third shape (e.g. a Noise fingerprint) would still miss, and no
 test pins the two-encoding storage.
 
+Also not guarded: nothing pins that a REMOTE group name cannot buy the DM
+branch of the mute lookup. `meaningfulGroupName` is now placeholder-only
+(`sonar agent dm`) for exactly that reason — treating generic strings like
+`new chat` as "this is a DM" let a group's name route it through the
+sender-keyed lookup and suppress its killed-app banner for anyone who muted
+a DM with the sender.
+
 **Rejected:** Suppressing in the NSE *before* hydrate using the push payload's
 group-id hint (`SonarNSEDecoratePolicy.hintGroupIdHex`) to avoid taking the
 store lock — the wake drain is not scoped to the hinted group, so an unmuted

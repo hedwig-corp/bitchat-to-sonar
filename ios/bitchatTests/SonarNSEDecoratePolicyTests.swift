@@ -325,12 +325,21 @@ struct SonarNSEDecoratePolicyTests {
             groupIdHex: gid, senderNpub: senderHex, groupName: "",
             mutesJSON: dmMuted, now: now
         ))
-        // Placeholder group names count as a DM (enrichEmptyContentPreviews
-        // can backfill "Sonar agent DM" before the mute check runs).
+        // The locally-generated placeholder counts as a DM
+        // (enrichEmptyContentPreviews can backfill it before the mute check).
         #expect(SonarNSEDecoratePolicy.isMuted(
             groupIdHex: gid, senderNpub: senderHex, groupName: "Sonar agent DM",
             mutesJSON: dmMuted, now: now
         ))
+        // But a REMOTE group name must not buy the DM branch: groupName comes
+        // from the group, so an attacker could otherwise name a group "New
+        // chat" to suppress its banner for anyone who muted a DM with them.
+        for spoofed in ["New chat", "dm", "Direct message"] {
+            #expect(!SonarNSEDecoratePolicy.isMuted(
+                groupIdHex: gid, senderNpub: senderHex, groupName: spoofed,
+                mutesJSON: dmMuted, now: now
+            ), "a remote group name must not route through the DM mute branch: \(spoofed)")
+        }
     }
 
     @Test("NSE mute lookup covers every key shape the store persists")
