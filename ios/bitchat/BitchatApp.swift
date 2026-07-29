@@ -58,12 +58,14 @@ struct BitchatApp: App {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
-        #if os(iOS)
-        AutoBackupBackgroundScheduler.shared.store = _sonarStore.wrappedValue
-        if _sonarStore.wrappedValue.isAutoBackupDisclosed() {
-            AutoBackupBackgroundScheduler.shared.schedule()
-        }
-        #endif
+        // Do NOT touch `sonarStore` here. Reading `_sonarStore.wrappedValue`
+        // before SwiftUI installs the `@StateObject` builds a throwaway store
+        // on every access, and the one the view later observes is a different
+        // instance — so the throwaway connects (the log even shows it opening
+        // the account) while the view's store never leaves its launch state and
+        // the app sits on the splash forever. Proven on an iPhone 14 Pro Max.
+        // The scheduler is wired from the scene's task below, where the real
+        // store exists; its handler already tolerates a nil store.
     }
 
     private var chatViewModel: ChatViewModel { sonarStore.chatViewModel }
