@@ -19,7 +19,6 @@ struct NoiseDecryptFailureTrackerTests {
     private let other = PeerID(str: "1100ffeeddccbbaa")
 
     @Test
-
     func singleFailureDoesNotResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
@@ -27,7 +26,6 @@ struct NoiseDecryptFailureTrackerTests {
     }
 
     @Test
-
     func failuresBelowThresholdDoNotResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
@@ -36,7 +34,6 @@ struct NoiseDecryptFailureTrackerTests {
     }
 
     @Test
-
     func thresholdConsecutiveFailuresResetTheSession() {
         var tracker = NoiseDecryptFailureTracker(threshold: 3, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
@@ -59,7 +56,6 @@ struct NoiseDecryptFailureTrackerTests {
     }
 
     @Test
-
     func failuresAreTrackedPerPeer() {
         var tracker = NoiseDecryptFailureTracker(threshold: 2, trackingCap: 8)
         #expect(tracker.recordFailure(for: peer) == false)
@@ -69,15 +65,23 @@ struct NoiseDecryptFailureTrackerTests {
         #expect(tracker.recordFailure(for: peer) == true)
     }
 
-    /// A flood of unknown sender IDs must not grow the map without bound.
+    /// The map stays bounded, and reaching the cap must not reset everyone.
+    /// A wipe would let anyone who can get entries in here erase a genuinely
+    /// desynchronized peer's run on demand, so it can never reach the threshold
+    /// that recovers it.
     @Test
-    func trackingIsBounded() {
-        var tracker = NoiseDecryptFailureTracker(threshold: 5, trackingCap: 4)
-        for index in 0..<12 {
-            _ = tracker.recordFailure(for: PeerID(str: String(format: "%016x", index)))
+    func reachingTheCapEvictsOneEntryRatherThanWipingTheMap() {
+        let cap = 4
+        var tracker = NoiseDecryptFailureTracker(threshold: 5, trackingCap: cap)
+        let tracked = (0..<12).map { PeerID(str: String(format: "%016x", $0)) }
+        for peerID in tracked {
+            _ = tracker.recordFailure(for: peerID)
         }
-        // Cap reached at least once, so earlier entries were dropped rather
-        // than retained forever.
-        #expect(tracker.failureCount(for: PeerID(str: String(format: "%016x", 0))) == 0)
+
+        let surviving = tracked.filter { tracker.failureCount(for: $0) > 0 }
+        #expect(surviving.count == cap, "the map is bounded by the cap")
+        // The most recent entry is always still there: eviction takes one
+        // victim, so a peer recording failures now cannot be wiped by the cap.
+        #expect(tracker.failureCount(for: tracked[tracked.count - 1]) == 1)
     }
 }

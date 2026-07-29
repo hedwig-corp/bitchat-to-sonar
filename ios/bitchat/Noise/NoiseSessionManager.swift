@@ -226,7 +226,13 @@ final class NoiseSessionManager {
     ) -> Bool {
         let rawKey = remoteKey.rawRepresentation
         if claimedPeerID.isShort {
-            return PeerID(publicKey: rawKey) == claimedPeerID
+            // Compare the bare 16 hex, not the whole identifier. `isShort` is
+            // true for a prefixed ID such as `mesh:<16hex>`, while
+            // `PeerID(publicKey:)` always produces an unprefixed one, so a
+            // whole-ID `==` would reject the *genuine* peer behind a prefixed
+            // claim. Comparing bare parts keeps the check about the key rather
+            // than about which caller shaped the identifier.
+            return PeerID(publicKey: rawKey).id == claimedPeerID.bare
         }
         if let claimedNoiseKey = claimedPeerID.noiseKey {
             return claimedNoiseKey == rawKey

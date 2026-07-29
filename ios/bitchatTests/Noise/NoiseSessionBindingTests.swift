@@ -65,7 +65,6 @@ struct NoiseSessionBindingTests {
     }
 
     @Test
-
     func handshakeAuthenticatedByAnotherKeyCannotClaimAPeerID() throws {
         let alice = manager(aliceKey)
         let mallory = manager(malloryKey)
@@ -79,7 +78,6 @@ struct NoiseSessionBindingTests {
     }
 
     @Test
-
     func forgedReplacementHandshakeLeavesTheEstablishedSessionIntact() throws {
         let alice = manager(aliceKey)
         let bob = manager(bobKey)

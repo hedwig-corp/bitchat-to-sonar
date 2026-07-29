@@ -87,8 +87,10 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
-    /// Consecutive Noise decrypt failures per peer. Guarded by `collectionsQueue`.
+    /// Consecutive Noise decrypt failures per peer, guarded by its own lock so
+    /// the inbound decrypt path does not contend with `collectionsQueue`.
     private var decryptFailures = NoiseDecryptFailureTracker()
+    private let decryptFailuresLock = NSLock()
     /// False while the radio is unusable (`.poweredOff` / `.unauthorized` / `.resetting`).
     ///
     /// Announces are processed on `messageQueue`, so one received a few ms before
@@ -799,6 +801,9 @@ final class BLEService: NSObject {
 
         // Clear processed messages
         messageDeduplicator.reset()
+
+        // Every session these runs described is gone, so the runs must go too.
+        resetDecryptFailureTracking()
 
         // Clear peripheral references (synchronized access to avoid races with BLE callbacks)
         bleQueue.sync {
@@ -4978,11 +4983,19 @@ extension BLEService {
             if !noiseService.hasSession(with: peerID) {
                 initiateNoiseHandshake(with: peerID)
             }
-        } catch NoiseSecurityError.rateLimitExceeded {
-            // Being rate limited says nothing about session health. Clearing here
-            // handed an attacker a session-teardown primitive: flood packets under
-            // a victim's claimed sender ID and the victim's session is discarded.
-            SecureLogger.warning("🚫 Rate limited decrypt from \(peerID.id.prefix(8))…; keeping the established session", category: .security)
+        } catch let policyError as NoiseSecurityError {
+            // Every `NoiseSecurityError` is a pre-decryption policy rejection
+            // that `NoiseEncryptionService.decrypt` raises *before* it consults
+            // the session: `messageTooLarge` comes ahead of both the rate limiter
+            // and the `hasEstablishedSession` guard, and `rateLimitExceeded`
+            // ahead of the guard. Neither says anything about session health and
+            // neither needs a session to provoke, so counting them would hand
+            // back the teardown primitive this method exists to remove — three
+            // oversized frames under a victim's claimed sender ID, at zero
+            // rate-limit cost, would otherwise evict that victim's session.
+            // Catching the whole enum keeps this true if another pre-check is
+            // added in front of the session later.
+            SecureLogger.warning("🚫 Rejected decrypt from \(peerID.id.prefix(8))… before the session was consulted (\(policyError)); keeping any established session", category: .security)
         } catch {
             // Decryption failed. Anyone can emit a packet under any claimed sender
             // ID, so a single AEAD failure is not evidence that our session is out
@@ -5003,15 +5016,28 @@ extension BLEService {
     /// Records a decrypt failure, returning whether the run has reached the
     /// threshold at which the session is treated as desynchronized.
     private func noteDecryptFailed(for peerID: PeerID) -> Bool {
-        collectionsQueue.sync(flags: .barrier) {
-            decryptFailures.recordFailure(for: peerID)
-        }
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        return decryptFailures.recordFailure(for: peerID)
     }
 
+    /// Runs on every successful inbound decrypt, so it takes the tracker's own
+    /// lock rather than a `collectionsQueue` barrier: serialising the hot DM
+    /// path against the peer map, relays and fragment assembly to clear a key
+    /// that is absent in the common case would be a needless cost on exactly
+    /// the path the Signal-Comparable Performance Rule protects.
     private func noteDecryptSucceeded(for peerID: PeerID) {
-        collectionsQueue.sync(flags: .barrier) {
-            decryptFailures.recordSuccess(for: peerID)
-        }
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.recordSuccess(for: peerID)
+    }
+
+    /// Drops all decrypt-failure runs. Used on panic/teardown so a stale run
+    /// cannot outlive the sessions it described.
+    private func resetDecryptFailureTracking() {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.removeAll()
     }
 
     // MARK: Helper Functions

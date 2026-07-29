@@ -194,14 +194,21 @@ enum TransportConfig {
     // Consecutive Noise decrypt failures tolerated before an established session
     // is treated as desynchronized and torn down.
     //
-    // No value here defeats a determined flooder — their packets arrive
-    // consecutively, so they reach any small threshold. What actually removes
-    // the teardown primitive is that `rateLimitExceeded` no longer counts as a
-    // failure at all, so flooding hits the rate limiter instead of the session.
-    // This threshold buys something narrower: a single stray packet (one probe,
-    // a late duplicate, a corrupted frame) must not cost a working session,
-    // while a genuinely desynchronized one still recovers within a few packets.
-    // 3 is that margin; 1 is the bug this replaced.
+    // Be precise about what this does and does not buy.
+    //
+    // It does NOT stop a flooder. Three forged ciphertexts under a victim's
+    // claimed sender ID reach this threshold at 3% of `maxMessagesPerSecond`
+    // (100), so the rate limiter never fires, and each teardown re-initiates a
+    // handshake against `maxHandshakesPerMinute` (10) — so a modest packet rate
+    // can still evict a session and exhaust the victim's handshake budget. That
+    // residual is tracked; a real fix has to distinguish a forged packet from a
+    // desynchronized one, which an AEAD failure alone cannot do.
+    //
+    // What it does buy: one stray packet (a probe, a late duplicate, a corrupted
+    // frame) no longer costs a working session, and the two teardown variants
+    // that needed no session at all are gone — `messageTooLarge` and
+    // `rateLimitExceeded` are raised before the session is consulted and are
+    // caught without counting. 3 is the stray-packet margin; 1 was the bug.
     static let noiseDecryptFailuresBeforeSessionReset: Int = 3
     static let noiseDecryptFailureTrackingCap: Int = 512
 

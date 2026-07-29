@@ -38,16 +38,19 @@ struct NoiseDecryptFailureTracker {
     /// threshold and the session should be reset, clearing the run so the next
     /// attempt starts fresh.
     mutating func recordFailure(for peerID: PeerID) -> Bool {
-        // The map is already bounded by the number of peers we hold an
-        // established session with: `NoiseEncryptionService.decrypt` throws
-        // `sessionNotEstablished` for an unknown sender before ever reaching a
-        // session, and that lands in a different catch. So this cap is a
-        // backstop against a session-table explosion, not a defence against a
-        // sender-ID flood, and it can only fire with `trackingCap` concurrent
-        // established sessions — where clearing every peer's run at once is the
-        // fail-safe direction (nobody is evicted) rather than the risky one.
-        if counts[peerID] == nil && counts.count >= trackingCap {
-            counts.removeAll()
+        // Callers must only record failures that came from decryption itself.
+        // Everything `NoiseEncryptionService.decrypt` rejects before consulting
+        // the session throws `NoiseSecurityError` (or `sessionNotEstablished`)
+        // and is caught elsewhere, so entries here correspond to peers we hold
+        // an established session with and the map is bounded by that count.
+        //
+        // The cap is a backstop for that invariant, not a flood defence. It
+        // evicts a single entry rather than clearing the map: a wipe would
+        // reset every peer's run at once, so anyone who could get entries in
+        // here could erase a genuinely desynchronized peer's progress on demand
+        // and keep it from ever reaching the threshold that recovers it.
+        if counts[peerID] == nil, counts.count >= trackingCap, let victim = counts.keys.first {
+            counts.removeValue(forKey: victim)
         }
         let next = (counts[peerID] ?? 0) + 1
         guard next >= threshold else {
