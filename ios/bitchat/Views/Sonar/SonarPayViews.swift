@@ -202,7 +202,11 @@ struct SNPaySheet: View {
     /// rendered "0" for an invoice that already carries its amount, even though
     /// `sats` (and the payment) were correct.
     private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
-    private var over: Bool { sats > balance }
+    // Compare against what can actually SETTLE, not the raw balance: an amount
+    // in (maxSendable, balance] reaches Breez and fails with the raw
+    // InsufficientFunds string (#141). Max already proposes the safe number;
+    // this catches a hand-typed one.
+    private var over: Bool { sats > SonarSpendableBalance.maxSendable(balanceSats: balance) }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
         if transport == .mesh {
@@ -652,7 +656,8 @@ private struct UnifyAmountKeypad: View {
     @State private var v = ""
 
     private var sats: Int64 { Int64(v) ?? 0 }
-    private var over: Bool { sats > balance }
+    // See SNPaySheet.over (#141).
+    private var over: Bool { sats > SonarSpendableBalance.maxSendable(balanceSats: balance) }
     private var can: Bool { sats > 0 && !over }
 
     private func tap(_ k: String) {

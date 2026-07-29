@@ -24,14 +24,12 @@ class SpendableBalanceTest {
     }
 
     @Test
-    fun reserveIsClamped() {
+    fun reserveIsFlooredButUncapped() {
         // Small balance: the floor applies, not 0.5% of nothing.
         assertEquals(SpendableBalance.MIN_FEE_RESERVE_SATS, SpendableBalance.feeReserveSats(1_000))
-        // Large balance: the ceiling applies, so we don't withhold an absurd amount.
-        assertEquals(
-            SpendableBalance.MAX_FEE_RESERVE_SATS,
-            SpendableBalance.feeReserveSats(100_000_000),
-        )
+        // Large balance: NO ceiling — a proportional fee needs a proportional
+        // reserve, and any flat cap re-introduces #141 above some balance.
+        assertEquals(500_000, SpendableBalance.feeReserveSats(100_000_000))
         // Mid balance: proportional.
         assertEquals(500, SpendableBalance.feeReserveSats(100_000))
     }
@@ -64,7 +62,10 @@ class SpendableBalanceTest {
         for (balance in listOf(1_000L, 20_000L, 500_000L, 10_000_000L)) {
             val max = SpendableBalance.maxSendableSats(balance)
             if (max <= 0) continue
-            val plausibleFee = SpendableBalance.feeReserveSats(balance)
+            // An INDEPENDENT fee model, not the reserve tested against itself:
+            // the old version could never fail because both sides were the
+            // same function. 0.4% + 10 is the upper end of Breez sender fees.
+            val plausibleFee = maxOf(10L, balance * 40 / 10_000)
             assertFalse(
                 SpendableBalance.insufficientAfterFee(max, plausibleFee, balance),
                 "max for balance $balance must settle at a reserve-sized fee",

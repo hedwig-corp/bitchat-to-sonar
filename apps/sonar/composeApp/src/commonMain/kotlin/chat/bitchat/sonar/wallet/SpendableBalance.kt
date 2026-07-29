@@ -23,24 +23,34 @@ object SpendableBalance {
     /** Floor for the reserve: covers the smallest realistic Lightning fee. */
     const val MIN_FEE_RESERVE_SATS: Long = 10
 
-    /** Ceiling: a large balance should not withhold an absurd amount. */
-    const val MAX_FEE_RESERVE_SATS: Long = 1_000
+    /**
+     * There is deliberately NO ceiling on the reserve.
+     *
+     * Breez sender fees are proportional, so a flat ceiling re-introduces the
+     * exact bug this file exists to fix: at 1000 sats it bit from ~250k sats
+     * upward, and even 25_000 still under-reserves above ~6.25M sats. A
+     * proportional fee needs a proportional reserve — [FEE_RESERVE_BPS] is set
+     * above the worst-case fee rate so the proposed Max always clears it.
+     */
+    const val NO_FEE_RESERVE_CEILING: Boolean = true
 
     /**
-     * Proportional part of the reserve, in basis points (0.5%). Lightning
-     * routing fees are largely proportional, so the reserve tracks the amount
-     * rather than being a flat guess.
+     * The reserve, in basis points (0.5%). Lightning routing fees are
+     * largely proportional, so the reserve tracks the amount rather than
+     * being a flat guess — and it is set ABOVE the worst-case observed fee
+     * rate (~0.4%) so the Max it proposes always clears its own check.
      */
     const val FEE_RESERVE_BPS: Long = 50
 
     /**
      * Sats withheld from a `Max` send so fees have somewhere to come from.
-     * Clamped to [MIN_FEE_RESERVE_SATS]..[MAX_FEE_RESERVE_SATS].
+     * Floored at [MIN_FEE_RESERVE_SATS]; deliberately uncapped (see
+     * [NO_FEE_RESERVE_CEILING]).
      */
     fun feeReserveSats(balanceSats: Long): Long {
         if (balanceSats <= 0) return 0
         val proportional = balanceSats * FEE_RESERVE_BPS / 10_000
-        return proportional.coerceIn(MIN_FEE_RESERVE_SATS, MAX_FEE_RESERVE_SATS)
+        return maxOf(proportional, MIN_FEE_RESERVE_SATS)
     }
 
     /**
@@ -62,4 +72,12 @@ object SpendableBalance {
      */
     fun insufficientAfterFee(amountSats: Long, feeSats: Long, balanceSats: Long): Boolean =
         amountSats > 0 && amountSats + feeSats > balanceSats
+
+    /**
+     * User-facing copy for the blocked case — replaces the raw
+     * `InsufficientFunds(message: "Cannot pay: not enough funds")` string.
+     * Mirror of the Swift `insufficientMessage`; keep the two in step.
+     */
+    fun insufficientMessage(amountSats: Long, feeSats: Long, balanceSats: Long): String =
+        "Amount plus fee ($amountSats + $feeSats sats) exceeds your balance of $balanceSats sats."
 }

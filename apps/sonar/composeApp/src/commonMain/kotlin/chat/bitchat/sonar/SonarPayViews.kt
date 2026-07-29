@@ -81,7 +81,10 @@ fun PaySheet(
     // an invoice that already carries its amount. Stated explicitly here too so
     // the two platforms cannot drift.
     val hasAmount = fixedSats != null || v.isNotEmpty()
-    val over = sats > balanceSats
+    // Compare against what can actually SETTLE, not the raw
+    // balance: an amount in (maxSendable, balance] reaches
+    // Breez and fails with the raw InsufficientFunds (#141).
+    val over = sats > SpendableBalance.maxSendableSats(balanceSats)
     val can = sats > 0 && !over
     fun tap(k: String) {
         if (k == "del") { v = v.dropLast(1); return }

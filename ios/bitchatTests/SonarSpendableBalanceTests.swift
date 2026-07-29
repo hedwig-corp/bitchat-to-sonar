@@ -26,11 +26,12 @@ struct SonarSpendableBalanceTests {
     }
 
     @Test
-    func reserveIsClamped() {
+    func reserveIsFlooredButUncapped() {
         #expect(SonarSpendableBalance.feeReserve(balanceSats: 1_000)
                 == SonarSpendableBalance.minFeeReserveSats)
-        #expect(SonarSpendableBalance.feeReserve(balanceSats: 100_000_000)
-                == SonarSpendableBalance.maxFeeReserveSats)
+        // NO ceiling — a proportional fee needs a proportional reserve, and
+        // any flat cap re-introduces #141 above some balance.
+        #expect(SonarSpendableBalance.feeReserve(balanceSats: 100_000_000) == 500_000)
         #expect(SonarSpendableBalance.feeReserve(balanceSats: 100_000) == 500)
     }
 
@@ -61,11 +62,14 @@ struct SonarSpendableBalanceTests {
     @Test
     func proposedMaxSurvivesTheCheck() {
         for balance in [Int64(1_000), 20_000, 500_000, 10_000_000] {
-            let max = SonarSpendableBalance.maxSendable(balanceSats: balance)
-            if max <= 0 { continue }
-            let plausibleFee = SonarSpendableBalance.feeReserve(balanceSats: balance)
+            let proposed = SonarSpendableBalance.maxSendable(balanceSats: balance)
+            if proposed <= 0 { continue }
+            // An INDEPENDENT fee model, not the reserve tested against itself:
+            // the old version could never fail because both sides were the
+            // same function. 0.4% + 10 is the upper end of Breez sender fees.
+            let plausibleFee = Swift.max(10, balance * 40 / 10_000)
             #expect(!SonarSpendableBalance.insufficientAfterFee(
-                amountSats: max, feeSats: plausibleFee, balanceSats: balance))
+                amountSats: proposed, feeSats: plausibleFee, balanceSats: balance))
         }
     }
 
@@ -73,7 +77,6 @@ struct SonarSpendableBalanceTests {
     @Test
     func constantsMatchTheComposeMirror() {
         #expect(SonarSpendableBalance.minFeeReserveSats == 10)
-        #expect(SonarSpendableBalance.maxFeeReserveSats == 1_000)
         #expect(SonarSpendableBalance.feeReserveBps == 50)
     }
 }

@@ -30,19 +30,25 @@ enum SonarSpendableBalance {
     /// Floor for the reserve: covers the smallest realistic Lightning fee.
     static let minFeeReserveSats: Int64 = 10
 
-    /// Ceiling: a large balance should not withhold an absurd amount.
-    static let maxFeeReserveSats: Int64 = 1_000
+    /// There is deliberately NO ceiling on the reserve. Breez sender fees are
+    /// proportional, so a flat ceiling re-introduces the exact bug this file
+    /// exists to fix: at 1000 sats it bit from ~250k sats upward, and even
+    /// 25_000 still under-reserves above ~6.25M sats. A proportional fee needs
+    /// a proportional reserve — `feeReserveBps` is set above the worst-case
+    /// fee rate so the proposed Max always clears it.
+    static let noFeeReserveCeiling: Bool = true
 
-    /// Proportional part of the reserve, in basis points (0.5%). Lightning
-    /// routing fees are largely proportional, so the reserve tracks the
-    /// amount rather than being a flat guess.
+    /// The reserve, in basis points (0.5%). Lightning routing fees are largely
+    /// proportional, so the reserve tracks the amount rather than being a flat
+    /// guess — and it is set ABOVE the worst-case observed fee rate (~0.4%) so
+    /// the Max it proposes always clears its own check.
     static let feeReserveBps: Int64 = 50
 
     /// Sats withheld from a `Max` send so fees have somewhere to come from.
     static func feeReserve(balanceSats: Int64) -> Int64 {
         guard balanceSats > 0 else { return 0 }
         let proportional = balanceSats * feeReserveBps / 10_000
-        return min(max(proportional, minFeeReserveSats), maxFeeReserveSats)
+        return max(proportional, minFeeReserveSats)
     }
 
     /// The amount `Max` should propose: balance minus the fee reserve, never
