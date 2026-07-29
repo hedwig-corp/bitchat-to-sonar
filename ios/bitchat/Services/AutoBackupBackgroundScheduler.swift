@@ -136,7 +136,7 @@ final class AutoBackupBackgroundScheduler {
         }
         SecureLogger.info("Auto-backup \(label): running", category: .session)
         let work = Task { @MainActor in
-            await store.marmot.runAutoBackupIfDue()
+            await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
         }
         task.expirationHandler = { work.cancel() }
         await work.value
@@ -194,7 +194,7 @@ final class AutoBackupBackgroundScheduler {
                     lease = .invalid
                 }
             }
-            await store.marmot.runAutoBackupIfDue()
+            await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
         }
     }
 }

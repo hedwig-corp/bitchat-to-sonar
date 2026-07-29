@@ -1215,7 +1215,22 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Host executor: if core policy says due, run seal→reconnect→upload quietly.
-    func runAutoBackupIfDue() async {
+    /// - Parameter allowWhileActive: only the background-transition and
+    ///   `BGTask` callers pass true. A backup closes the Marmot node, seals the
+    ///   whole database, reopens it and uploads — several seconds of stalled
+    ///   chat on a large account. Doing that 45s into a session the user is
+    ///   sitting in reads as the app freezing, so the periodic in-app loop hands
+    ///   the work to the background paths instead of doing it itself.
+    func runAutoBackupIfDue(allowWhileActive: Bool = false) async {
+        #if os(iOS)
+        if !allowWhileActive, UIApplication.shared.applicationState == .active {
+            SecureLogger.info(
+                "Auto-backup executor: deferred (app active — leaving it to the background paths)",
+                category: .session
+            )
+            return
+        }
+        #endif
         guard !busy, !accountBackupInFlight else {
             SecureLogger.info(
                 "Auto-backup executor: skipped (busy=\(busy) inFlight=\(accountBackupInFlight))",

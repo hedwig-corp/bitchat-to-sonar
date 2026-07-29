@@ -4237,6 +4237,15 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     private suspend fun runAutoBackupIfDue() {
         if (!started || connecting) return
+        // A backup takes the node exclusively: cancel jobs, seal the whole
+        // database, reopen, upload. That is several seconds of frozen chat on a
+        // large account, and doing it inside a session the user is sitting in
+        // reads as the app hanging. The background transition and the
+        // WorkManager jobs both run this same work off the user's path.
+        if (foreground) {
+            sonarLog("Backup", "executor: deferred (app foreground — leaving it to the background paths)")
+            return
+        }
         // Never exclusive-seal before first local chat-list paint.
         if (!homeMessagesHydrated) return
         // Upgrade / silent path: never upload until Settings or onboarding disclosed.
