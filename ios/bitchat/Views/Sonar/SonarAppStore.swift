@@ -8796,11 +8796,15 @@ final class SonarAppStore: ObservableObject {
 
     // MARK: Calls
 
-    /// Canonical comparison form for a call-control identity: lowercase hex
-    /// or bech32 as stored, trimmed. Both sides of the #420 check go through
-    /// this so an encoding difference cannot silently admit a stranger.
+    /// Canonical comparison form for a call-control identity. Delegates to the
+    /// same hex/bech32 canonicalizer the profile cache uses, NOT a hand-rolled
+    /// lowercase: today both sides of this check are bech32, but this repo has
+    /// already shipped the bug where one side was 64-hex and the other bech32
+    /// (it broke the mute lookups). If that happened here, our own key would
+    /// stop matching, we would stay in the roster, and EVERY Marmot DM call
+    /// would be refused — a silent, total call outage.
     static func canonicalCallKey(_ npub: String) -> String {
-        npub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        SNMarmotProfileCache.canonicalKey(npub).lowercased()
     }
 
     /// Members of a call conversation other than us, canonicalized. Empty for
@@ -9182,9 +9186,19 @@ final class SonarAppStore: ObservableObject {
             case .end: return .end
             }
         }()
+        let roster = callConversationOtherMembers(convId)
+        // "Roster not loaded" is NOT "refused". `messagesByGroup` is published
+        // before `groups` on a newly welcomed conversation, so a call arriving
+        // right after the chat is created sees an empty roster. Returning
+        // `true` here would mark the line consumed and drop a legitimate call
+        // permanently; `false` leaves it for the next scan.
+        if roster.isEmpty && !structurallyDirect {
+            SecureLogger.debug("SonarCall: roster not loaded yet, retrying convId=\(convId.prefix(16))", category: .session)
+            return false
+        }
         if !SonarCallControlAdmission.isAdmissible(
             kind: kind,
-            otherMemberKeys: callConversationOtherMembers(convId),
+            otherMemberKeys: roster,
             structurallyDirect: structurallyDirect,
             senderKey: Self.canonicalCallKey(senderNpub),
             activeCallConversationId: activeCall?.convId,

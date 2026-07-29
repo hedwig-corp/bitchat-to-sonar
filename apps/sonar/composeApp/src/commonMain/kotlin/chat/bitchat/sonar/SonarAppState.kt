@@ -1717,9 +1717,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         // construction and carries no roster; a Marmot conversation must be
         // judged on its member list.
         val structurallyDirect = isMeshChat(chatId) || isMeshChat(callChatId)
+        val roster = otherMemberKeys(chatId).ifEmpty { otherMemberKeys(callChatId) }
+        // "Roster not loaded" is NOT "refused". The caller adds this message to
+        // `scannedCall` BEFORE dispatch, so simply returning would drop a
+        // legitimate call permanently — remove it so the next scan retries.
+        if (roster.isEmpty() && !structurallyDirect) {
+            scannedCall.remove(m.id)
+            sonarLog("SonarCall", "roster not loaded yet, retrying chatId=$chatId folded=$callChatId")
+            return
+        }
         if (!CallControlAdmission.isAdmissible(
                 kind = kind,
-                otherMemberKeys = otherMemberKeys(chatId).ifEmpty { otherMemberKeys(callChatId) },
+                otherMemberKeys = roster,
                 structurallyDirect = structurallyDirect,
                 senderKey = canonicalProfileKey(m.senderNpub),
                 activeCallConversationId = activeCall?.chatId,

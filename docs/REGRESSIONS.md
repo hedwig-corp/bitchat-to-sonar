@@ -1412,7 +1412,15 @@ both dispatch loops.
 regression that stops CONSULTING the predicate keeps these green. Nothing
 pins that the UI hides call buttons on group chats, and iOS tests do not run
 in CI. Core still accepts an `on_answer` that overwrites an existing pin —
-the host is the only thing refusing it.
+the host is the only thing refusing it. Neither platform's
+roster-availability path is pinned either: an empty `marmot.groups` /
+`chats` must return NOT-CONSUMED (so the next scan retries) rather than
+refusing, or a call arriving right after a chat is created is dropped
+permanently — `messagesByGroup` is published before `groups`. And nothing
+pins that `SonarAppStore.canonicalCallKey` and Compose
+`canonicalProfileKey` canonicalize the same encodings; a hex/bech32 split
+there would refuse EVERY Marmot DM call, which is the shape that already
+broke the mute lookups once.
 
 **This is a mirror pair.** The predicate exists twice by necessity; drift is
 the failure mode.
