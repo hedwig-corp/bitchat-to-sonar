@@ -202,11 +202,14 @@ struct SNPaySheet: View {
     /// rendered "0" for an invoice that already carries its amount, even though
     /// `sats` (and the payment) were correct.
     private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
-    // Compare against what can actually SETTLE, not the raw balance: an amount
-    // in (maxSendable, balance] reaches Breez and fails with the raw
-    // InsufficientFunds string (#141). Max already proposes the safe number;
-    // this catches a hand-typed one.
-    private var over: Bool { sats > SonarSpendableBalance.maxSendable(balanceSats: balance) }
+    // Gate on the RAW balance. The reserve is a conservative ESTIMATE (0.5%, no
+    // route knowledge), so treating it as a hard ceiling rejects payments that
+    // are genuinely affordable: with 100k sats and a real 100-sat fee, a
+    // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
+    // invoice cannot be lowered, so that user simply could not pay at all. Max
+    // still proposes the reserve-adjusted amount, and the REAL prepared fee is
+    // enforced in `SonarWallet.send` before Breez is asked to pay.
+    private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
         if transport == .mesh {
@@ -657,7 +660,7 @@ private struct UnifyAmountKeypad: View {
 
     private var sats: Int64 { Int64(v) ?? 0 }
     // See SNPaySheet.over (#141).
-    private var over: Bool { sats > SonarSpendableBalance.maxSendable(balanceSats: balance) }
+    private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
 
     private func tap(_ k: String) {

@@ -72,4 +72,23 @@ class SpendableBalanceTest {
             )
         }
     }
+    /**
+     * The reserve is an ESTIMATE and must never be used as a hard affordability
+     * ceiling: an amount above `maxSendable` but affordable at the real route
+     * fee has to remain payable. A fixed invoice cannot be lowered, so treating
+     * the estimate as a limit made such an invoice unpayable outright.
+     */
+    @Test
+    fun amountAboveTheEstimateIsStillAffordableAtARealFee() {
+        val balance = 100_000L
+        val max = SpendableBalance.maxSendableSats(balance) // 99_500 at 0.5%
+        val amount = max + 100                             // 99_600: over the estimate
+        val realFee = 100L                                 // the actual route fee
+        assertTrue(amount > max, "the amount must sit above the estimate")
+        assertFalse(
+            SpendableBalance.insufficientAfterFee(amount, realFee, balance),
+            "an amount over the ESTIMATE but under balance-minus-REAL-fee must " +
+                "stay payable — this is what a fixed invoice hits",
+        )
+    }
 }

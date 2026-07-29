@@ -65,6 +65,25 @@ public final class SonarWallet {
     public enum WalletError: Error, Equatable {
         case notConfigured
         case core(String)
+        /// The prepared route's REAL fee does not fit in the balance (#141).
+        ///
+        /// Carries the numbers so any caller can format its own copy; the
+        /// canonical wording is `insufficientMessage` below, which the app's
+        /// `SonarSpendableBalance` delegates to. The Compose side keeps a mirror
+        /// because it cannot share Swift source.
+        case insufficientAfterFee(amountSats: Int64, feeSats: Int64, balanceSats: Int64)
+
+        /// Canonical wording for the blocked case, so the message exists in ONE
+        /// place on this platform. `SonarSpendableBalance.insufficientMessage`
+        /// delegates here; the Compose mirror keeps its own copy because it
+        /// cannot share Swift source.
+        public static func insufficientMessage(
+            amountSats: Int64,
+            feeSats: Int64,
+            balanceSats: Int64
+        ) -> String {
+            "Amount plus fee (\(amountSats) + \(feeSats) sats) exceeds your balance of \(balanceSats) sats."
+        }
     }
 
     public struct SupportedCurrency: Sendable, Equatable {
@@ -337,6 +356,34 @@ public final class SonarWallet {
         return try await run {
             let amount: PayAmount? = amountSats > 0 ? .bitcoin(receiverAmountSat: UInt64(amountSats)) : nil
             let prepared = try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
+            // Enforce affordability against the REAL prepared fee, before Breez
+            // is asked to pay (#141). The UI gates on the raw balance and `Max`
+            // uses a 0.5% estimate; neither knows the route. Without this check
+            // an over-estimate route reaches `sendPayment` and surfaces the raw
+            // SDK failure, which is the symptom #141 reports.
+            //
+            // `feesSat` is optional in the SDK: when it is absent there is
+            // nothing to validate against, so the payment proceeds exactly as
+            // before rather than being blocked on a number we do not have.
+            if let feesSat = prepared.feesSat {
+                let fee = Int64(feesSat)
+                // The prepared amount is authoritative for amountless
+                // destinations (BOLT12 offers, LNURL), where `amountSats` is 0.
+                let sending: Int64
+                if case let .bitcoin(receiverAmountSat) = prepared.amount {
+                    sending = Int64(receiverAmountSat)
+                } else {
+                    sending = amountSats
+                }
+                let balance = Int64(try node.getInfo().walletInfo.balanceSat)
+                if sending > 0, sending + fee > balance {
+                    throw WalletError.insufficientAfterFee(
+                        amountSats: sending,
+                        feeSats: fee,
+                        balanceSats: balance
+                    )
+                }
+            }
             let resp = try node.sendPayment(req: SendPaymentRequest(prepareResponse: prepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note))
             return Self.map(resp.payment)
         }
@@ -502,6 +549,28 @@ public final class SonarWallet {
 
     private static func hex(_ bytes: [UInt8]) -> String {
         bytes.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+
+/// The send path throws `WalletError`, and every catch site renders
+/// `error.localizedDescription` — without this the typed insufficient-funds
+/// error would surface as a generic "operation couldn't be completed" string,
+/// which is the raw-error UX #141 is about.
+extension SonarWallet.WalletError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notConfigured:
+            return "Wallet is not configured."
+        case let .core(message):
+            return message
+        case let .insufficientAfterFee(amountSats, feeSats, balanceSats):
+            return SonarWallet.WalletError.insufficientMessage(
+                amountSats: amountSats,
+                feeSats: feeSats,
+                balanceSats: balanceSats
+            )
+        }
     }
 }
 

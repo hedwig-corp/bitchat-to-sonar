@@ -458,6 +458,30 @@ actual object WalletBridge {
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                // Enforce affordability against the REAL prepared fee before
+                // Breez is asked to pay (#141). The UI gates on the raw balance
+                // and `Max` uses a 0.5% estimate; neither knows the route, so
+                // without this an over-estimate route reaches sendPayment and
+                // surfaces the raw SDK error — the symptom #141 reports.
+                //
+                // `feesSat` is nullable in the SDK: with no fee to check the
+                // payment proceeds exactly as before rather than being blocked
+                // on a number we do not have.
+                prepared.feesSat?.let { feesSat ->
+                    val fee = feesSat.toLong()
+                    // For amountless destinations (BOLT12 offer, LNURL) the
+                    // caller passes 0 and the prepared response carries the
+                    // real amount.
+                    val sending = (prepared.amount as? PayAmount.Bitcoin)
+                        ?.receiverAmountSat?.toLong() ?: amountSats
+                    val bal = node.getInfo().walletInfo.balanceSat.toLong()
+                    if (SpendableBalance.insufficientAfterFee(sending, fee, bal)) {
+                        return@withContext SendResult(
+                            ok = false,
+                            error = SpendableBalance.insufficientMessage(sending, fee, bal),
+                        )
+                    }
+                }
                 val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
                 val payment = resp.payment
                 val lightning = payment.details as? PaymentDetails.Lightning

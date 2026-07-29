@@ -68,6 +68,11 @@ enum SonarSpendableBalance {
 
     /// User-facing copy for the blocked case — replaces the raw
     /// `InsufficientFunds(message: "Cannot pay: not enough funds")` string.
+    /// Kept in step with TWO other copies of this sentence, because neither can
+    /// import the others: `SonarWallet.WalletError.insufficientMessage` (the
+    /// wallet package cannot see the app target, and this file compiles into a
+    /// target that does not link the package) and the Compose
+    /// `SpendableBalance.insufficientMessage`. Change one, change all three.
     static func insufficientMessage(amountSats: Int64, feeSats: Int64, balanceSats: Int64) -> String {
         "Amount plus fee (\(amountSats) + \(feeSats) sats) exceeds your balance of \(balanceSats) sats."
     }

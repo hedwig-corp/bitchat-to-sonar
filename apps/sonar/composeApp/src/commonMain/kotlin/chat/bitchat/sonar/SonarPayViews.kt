@@ -81,10 +81,15 @@ fun PaySheet(
     // an invoice that already carries its amount. Stated explicitly here too so
     // the two platforms cannot drift.
     val hasAmount = fixedSats != null || v.isNotEmpty()
-    // Compare against what can actually SETTLE, not the raw
-    // balance: an amount in (maxSendable, balance] reaches
-    // Breez and fails with the raw InsufficientFunds (#141).
-    val over = sats > SpendableBalance.maxSendableSats(balanceSats)
+    // Gate on the RAW balance. The reserve is a conservative ESTIMATE (0.5%,
+    // no route knowledge), so treating it as a hard ceiling rejects payments
+    // that are genuinely affordable: with 100k sats and a real 100-sat fee, a
+    // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
+    // invoice cannot be lowered, so that user simply could not pay at all.
+    // `Max` still proposes the reserve-adjusted amount, and the REAL prepared
+    // fee is enforced in the send pipeline before Breez is asked to pay
+    // (WalletBridge.send -> SpendableBalance.insufficientAfterFee).
+    val over = sats > balanceSats
     val can = sats > 0 && !over
     fun tap(k: String) {
         if (k == "del") { v = v.dropLast(1); return }

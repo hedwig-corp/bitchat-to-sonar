@@ -79,4 +79,22 @@ struct SonarSpendableBalanceTests {
         #expect(SonarSpendableBalance.minFeeReserveSats == 10)
         #expect(SonarSpendableBalance.feeReserveBps == 50)
     }
+    /// Mirror of the Compose `amountAboveTheEstimateIsStillAffordableAtARealFee`.
+    /// The reserve is an ESTIMATE, never a hard affordability ceiling: an amount
+    /// above `maxSendable` but affordable at the real route fee must remain
+    /// payable. A fixed invoice cannot be lowered, so treating the estimate as a
+    /// limit made such an invoice unpayable outright.
+    @Test
+    func amountAboveTheEstimateIsStillAffordableAtARealFee() {
+        let balance: Int64 = 100_000
+        let maxSendable = SonarSpendableBalance.maxSendable(balanceSats: balance)
+        let amount = maxSendable + 100
+        let realFee: Int64 = 100
+        #expect(amount > maxSendable)
+        #expect(!SonarSpendableBalance.insufficientAfterFee(
+            amountSats: amount,
+            feeSats: realFee,
+            balanceSats: balance
+        ))
+    }
 }
