@@ -980,6 +980,24 @@ actual object SonarCore {
             }
         }
 
+    actual suspend fun abandonPendingExternalSigner(): Unit = withContext(Dispatchers.IO) {
+        lock.withLock {
+            val account = storedAccount()
+            // Only a PENDING login is abandonable: a completed signer account
+            // is an account, and dropping its binding here would strand the
+            // user's chats (Account Key Durability rule).
+            if (account !is StoredAccount.Signer || !account.pendingLogin) return@withLock
+            AndroidSecrets.remove(SIGNER_PUBKEY, durable = true)
+            AndroidSecrets.remove(SIGNER_PACKAGE, durable = true)
+            AndroidSecrets.remove(SIGNER_KDF_ROOT, durable = true)
+            AndroidSecrets.remove(SIGNER_PENDING, durable = true)
+            // Drop the cached identity so the next start() re-reads storage.
+            npub = ""
+            pubkeyHex = ""
+            closeNode()
+        }
+    }
+
     actual fun walletSecretHex(): String =
         when (val account = storedAccount()) {
             is StoredAccount.LocalKey -> Bech32.nsecToSecretHex(account.nsec) ?: ""

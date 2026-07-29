@@ -852,6 +852,9 @@ actual object SonarCore {
     actual suspend fun adoptExternalSigner(pubkey: String, packageName: String?): String =
         throw UnsupportedOperationException("External signers are not supported on desktop")
 
+    /** No-op: desktop never has a signer binding to abandon. */
+    actual suspend fun abandonPendingExternalSigner() = Unit
+
     actual fun walletSecretHex(): String {
         val nsec = DesktopSecrets.get("nsec") ?: return ""
         return chat.bitchat.sonar.crypto.Bech32.nsecToSecretHex(nsec) ?: ""

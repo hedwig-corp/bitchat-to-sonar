@@ -201,6 +201,10 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                     restoring = false
                     restoreError = null
                     nsec = ""
+                    // Explicit "fresh identity": drop an Amber binding this
+                    // onboarding may already have persisted, or onboarding
+                    // would complete with the signer account instead.
+                    state.chooseFreshLocalIdentity()
                 }
             } else {
                 when (step) {
@@ -212,7 +216,13 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                             Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
-                            SNPrimaryButton(stringResource(Res.string.get_started), Modifier.weight(1f)) { step = 1 }
+                            SNPrimaryButton(stringResource(Res.string.get_started), Modifier.weight(1f)) {
+                                // Same "fresh identity" intent as the restore
+                                // screen's create-new action (reachable after
+                                // backing out of an Amber sign-in).
+                                state.chooseFreshLocalIdentity()
+                                step = 1
+                            }
                             Box(
                                 Modifier.weight(1f).height(52.dp)
                                     .clip(RoundedCornerShape(15.dp)).background(s.accentSoft)

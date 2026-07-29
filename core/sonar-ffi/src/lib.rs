@@ -299,6 +299,13 @@ pub enum ForeignSignerResult {
     Ok { value: String },
     /// The user explicitly rejected this request — permanent; do not retry.
     Rejected,
+    /// The signer answered definitively that it CANNOT fulfil the request:
+    /// a NIP-44 decrypt of a corrupt ciphertext or one addressed to a key it
+    /// does not hold. Permanent — retrying re-prompts the user for something
+    /// that can never succeed, and (for gift wraps) pins the sync watermark
+    /// forever. Classified terminal, matching how a local-key account's own
+    /// `nip44::decrypt` failure is treated.
+    Failed { reason: String },
     /// The signer could not be reached right now (no foreground UI, approval
     /// timeout, signer app busy/uninstalled) — transient; retry later.
     Unavailable { reason: String },
@@ -356,6 +363,9 @@ impl RemoteSignerAdapter {
             ForeignSignerResult::Rejected => Err(SignerError::backend(
                 FfiSignerFailure::permanent(op, "rejected by user".into()),
             )),
+            ForeignSignerResult::Failed { reason } => {
+                Err(SignerError::backend(FfiSignerFailure::permanent(op, reason)))
+            }
             ForeignSignerResult::Unavailable { reason } => {
                 Err(SignerError::backend(FfiSignerFailure::transient(op, reason)))
             }
@@ -3915,6 +3925,8 @@ mod signer_tests {
         Tampered,
         /// User explicitly rejected (permanent).
         Reject,
+        /// Signer decrypted and definitively failed (permanent).
+        DecryptFailed,
         /// Signer unreachable right now (transient).
         Unavailable,
     }
@@ -3954,7 +3966,7 @@ mod signer_tests {
                         .build(self.keys.public_key());
                     Some(forged.sign_with_keys(&self.keys).ok()?.as_json())
                 }
-                SignerMode::Reject | SignerMode::Unavailable => None,
+                SignerMode::Reject | SignerMode::Unavailable | SignerMode::DecryptFailed => None,
             }
         }
     }
@@ -4005,6 +4017,11 @@ mod signer_tests {
 
         fn nip44_decrypt(&self, peer_pubkey_hex: String, ciphertext: String) -> ForeignSignerResult {
             match &self.mode {
+                SignerMode::DecryptFailed => {
+                    return ForeignSignerResult::Failed {
+                        reason: "signer could not decrypt the payload".into(),
+                    }
+                }
                 SignerMode::Reject => return ForeignSignerResult::Rejected,
                 SignerMode::Unavailable => {
                     return ForeignSignerResult::Unavailable {
@@ -4086,6 +4103,22 @@ mod signer_tests {
             .await
             .expect_err("rejection must surface as an error");
         // Permanent marker → NOT classified as retryable by the core.
+        let msg = err.to_string();
+        assert!(msg.contains(sonar_core::signer_failure::PERMANENT_MARKER), "{msg}");
+        assert!(!sonar_core::signer_failure::is_transient_signer_failure(&msg));
+    }
+
+    /// A signer that answered "I cannot decrypt this" is PERMANENT: retrying
+    /// re-prompts for something that can never succeed and would pin the sync
+    /// watermark forever (the local-key path drops such a wrap after one try).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_maps_definitive_failure_to_permanent_error() {
+        let (adapter, _keys) = adapter(SignerMode::DecryptFailed);
+        let peer = Keys::generate().public_key();
+        let err = adapter
+            .nip44_decrypt(&peer, "garbage")
+            .await
+            .expect_err("definitive decrypt failure must surface as an error");
         let msg = err.to_string();
         assert!(msg.contains(sonar_core::signer_failure::PERMANENT_MARKER), "{msg}");
         assert!(!sonar_core::signer_failure::is_transient_signer_failure(&msg));

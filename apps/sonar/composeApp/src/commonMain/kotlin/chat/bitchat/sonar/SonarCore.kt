@@ -937,6 +937,16 @@ expect object SonarCore {
     suspend fun adoptExternalSigner(pubkey: String, packageName: String?): String
 
     /**
+     * Discard a signer binding whose onboarding never completed, so the user
+     * can still choose a fresh local identity after an Amber sign-in they
+     * changed their mind about (or that a process death interrupted).
+     * No-op unless the stored account is a PENDING signer login — a completed
+     * signer account is only replaced by nsec restore or a wipe (Account Key
+     * Durability rule).
+     */
+    suspend fun abandonPendingExternalSigner()
+
+    /**
      * 64-char hex secret the Lightning wallet seed derives from: the nsec's
      * raw bytes for local accounts (byte-identical to the historical
      * derivation), or a device-local random entropy for external-signer

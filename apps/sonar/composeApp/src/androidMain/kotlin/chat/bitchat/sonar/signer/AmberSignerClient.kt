@@ -82,6 +82,15 @@ class AmberSignerClient(
             peerPubkeyHex = peerPubkeyHex,
         ) { _, result -> result?.takeIf(Nip55::isUsableResult) }
 
+    /**
+     * True when the signer answered "I definitively cannot decrypt this".
+     * Distinct from "no remembered grant": retrying (or prompting) can never
+     * turn this into plaintext, and a gift wrap stuck on it would pin the
+     * sync watermark forever while re-prompting the user.
+     */
+    private fun isDefinitiveDecryptFailure(type: String, result: String?): Boolean =
+        type == Nip55.TYPE_NIP44_DECRYPT && result == Nip55.DECRYPT_FAILURE_SENTINEL
+
     /** Provider-first, intent-fallback request with tri-state outcome. */
     private fun request(
         type: String,
@@ -96,6 +105,12 @@ class AmberSignerClient(
             is ProviderResult.Success -> {
                 val value = extract(viaProvider.event, viaProvider.result)
                 if (value != null) return ForeignSignerResult.Ok(value)
+                // The signer decrypted and failed: permanent. Do NOT fall
+                // through to the intent path — prompting cannot help, and
+                // classifying it transient would pin the sync watermark.
+                if (isDefinitiveDecryptFailure(type, viaProvider.result)) {
+                    return ForeignSignerResult.Failed("signer could not decrypt the payload")
+                }
                 // A row came back but carried nothing usable — treat like a
                 // missing grant and let the intent path ask the user.
             }
@@ -123,12 +138,23 @@ class AmberSignerClient(
                 }
                 else -> {
                     val value = extract(response.event, response.result)
-                    if (value != null) {
-                        approvalBreaker.recordSuccess()
-                        ForeignSignerResult.Ok(value)
-                    } else {
-                        approvalBreaker.recordFailure()
-                        unavailable(type, "signer returned no usable value")
+                    when {
+                        value != null -> {
+                            approvalBreaker.recordSuccess()
+                            ForeignSignerResult.Ok(value)
+                        }
+                        // The user approved and the signer still could not
+                        // decrypt — permanent (see isDefinitiveDecryptFailure).
+                        // Counts as a success for the breaker: the approval UI
+                        // worked, the ciphertext is simply undecryptable.
+                        isDefinitiveDecryptFailure(type, response.result) -> {
+                            approvalBreaker.recordSuccess()
+                            ForeignSignerResult.Failed("signer could not decrypt the payload")
+                        }
+                        else -> {
+                            approvalBreaker.recordFailure()
+                            unavailable(type, "signer returned no usable value")
+                        }
                     }
                 }
             }
@@ -167,8 +193,16 @@ class AmberSignerClient(
                     if (cursor == null || !cursor.moveToFirst()) {
                         return@runCatching ProviderResult.Unavailable
                     }
+                    // Read the VALUE, not just the column's presence: Amber
+                    // only emits this column when rejecting, but a signer that
+                    // mirrors the response object (rejected=false on success)
+                    // would otherwise have every successful call misread as a
+                    // permanent rejection — which silently disables all
+                    // background signing.
                     if (cursor.getColumnIndex("rejected") >= 0) {
-                        return@runCatching ProviderResult.Rejected
+                        val raw = cursor.readColumn("rejected")
+                        val rejected = raw == null || raw == "1" || raw.equals("true", true)
+                        if (rejected) return@runCatching ProviderResult.Rejected
                     }
                     val result = cursor.readColumn("result") ?: cursor.readColumn("signature")
                     val event = cursor.readColumn("event")
@@ -220,6 +254,10 @@ class AmberSignerClient(
         /** In-flight intent requests awaiting an activity result, by request id. */
         private val pending = ConcurrentHashMap<String, CompletableDeferred<Nip55.Response>>()
 
+        /** Set once any request times out: a stale answer to it may still
+         *  arrive, so id-less responses can no longer be attributed safely. */
+        private val idLessAttributionUnsafe = java.util.concurrent.atomic.AtomicBoolean(false)
+
         /** Stops a peer-driven approval storm: any drain of N gift wraps
          *  without a remembered decrypt grant would otherwise pop N approval
          *  screens. After [ApprovalBreaker.MAX_CONSECUTIVE_FAILURES] rejected
@@ -253,7 +291,9 @@ class AmberSignerClient(
                 ?: throw ExternalSignerException("Signer sign-in timed out")
             if (response.rejected) throw ExternalSignerException("Signer sign-in was rejected")
             val raw = response.result?.trim().orEmpty()
-            if (raw.isEmpty()) throw ExternalSignerException("Signer returned no public key")
+            // Also the RESULT_CANCELED (back-press) shape: failAllPending
+            // completes transiently with no result.
+            if (raw.isEmpty()) throw ExternalSignerException("Signer sign-in did not complete")
             // Older Amber builds omit the `package` extra outside get_public_key
             // responses and may omit it in batched results; fall back to the
             // sole installed signer so later requests can be targeted.
@@ -305,7 +345,11 @@ class AmberSignerClient(
                 val response = runBlocking {
                     withTimeoutOrNull(INTENT_TIMEOUT_MS) { deferred.await() }
                 }
-                if (response == null) approvalBreaker.recordFailure()
+                if (response == null) {
+                    approvalBreaker.recordFailure()
+                    // The signer may still answer this abandoned request later.
+                    idLessAttributionUnsafe.set(true)
+                }
                 response
             } catch (e: Exception) {
                 Log.w(TAG, "signer intent launch failed: ${e.message}")
@@ -371,8 +415,17 @@ class AmberSignerClient(
                 }
                 return
             }
-            // No id echoed at all: resolve the single pending request if
-            // unambiguous, otherwise drop.
+            // No id echoed at all: resolve the single pending request only
+            // while attribution is still unambiguous ACROSS TIME. Once any
+            // request has timed out, its approval screen may still be
+            // answered later — attributing that late answer to whatever is
+            // pending now would hand one message's plaintext to another
+            // decrypt call (we always send an `id`, so compliant signers
+            // never take this path).
+            if (idLessAttributionUnsafe.get()) {
+                Log.w(TAG, "dropping id-less signer response: a prior request timed out")
+                return
+            }
             val keys = pending.keys().toList()
             if (keys.size == 1) {
                 pending.remove(keys[0])?.complete(response)
@@ -381,11 +434,18 @@ class AmberSignerClient(
             }
         }
 
+        /**
+         * Fail every in-flight request TRANSIENTLY. Reached on
+         * `RESULT_CANCELED` — a back-press or a killed signer activity, which
+         * NIP-55 does not define as a rejection (that is `RESULT_OK` + the
+         * `rejected` extra). Marking these permanent made one back-press
+         * during a drain durably drop every pending welcome/DM.
+         */
         private fun failAllPending() {
             val entries = pending.keys().toList()
             entries.forEach { id ->
                 pending.remove(id)?.complete(
-                    Nip55.Response(id = id, result = null, event = null, rejected = true, packageName = null),
+                    Nip55.Response(id = id, result = null, event = null, rejected = false, packageName = null),
                 )
             }
         }

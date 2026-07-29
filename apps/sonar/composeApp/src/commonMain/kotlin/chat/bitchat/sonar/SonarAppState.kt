@@ -3768,6 +3768,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      * only after the identity is durably persisted, per the Account Key
      * Durability rule).
      */
+    /**
+     * The user chose a fresh local identity: discard a signer binding whose
+     * onboarding never completed, so `completeOnboarding` mints a local key
+     * instead of silently continuing with the Amber account they abandoned.
+     */
+    fun chooseFreshLocalIdentity() {
+        scope.launch {
+            runCatching { SonarCore.abandonPendingExternalSigner() }
+            npub = ""
+        }
+    }
+
     fun loginWithExternalSigner(onResult: (Result<Unit>) -> Unit) {
         scope.launch {
             val result = runCatching {
