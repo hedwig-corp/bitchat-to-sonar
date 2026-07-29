@@ -97,6 +97,11 @@ struct BitchatApp: App {
                     #if os(iOS)
                     appDelegate.sonarStore = sonarStore
                     AutoBackupBackgroundScheduler.shared.store = sonarStore
+                    // An account that upgraded into this feature has never been
+                    // disclosed, so it would never back up at all. Do it before
+                    // the disclosure check below so the first backup is
+                    // scheduled on this launch rather than the next one.
+                    sonarStore.discloseAutoBackupForExistingAccountIfNeeded()
                     if sonarStore.isAutoBackupDisclosed() {
                         AutoBackupBackgroundScheduler.shared.schedule()
                     }

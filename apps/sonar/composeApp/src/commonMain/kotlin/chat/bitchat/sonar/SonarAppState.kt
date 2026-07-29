@@ -4017,11 +4017,43 @@ class SonarAppState(private val scope: CoroutineScope) {
 
     /**
      * Onboarding: user has seen the product; mark disclosure and keep core
-     * default (enabled). Upgrades that skip onboarding stay gated until Settings.
+     * default (enabled). Upgrades that skip onboarding are handled by
+     * [discloseAutoBackupForExistingAccountIfNeeded] at startup instead.
      */
     fun ensureAutoBackupEnabledDefault() {
         discloseAutoBackup()
         refreshBackupPolicy()
+    }
+
+    /**
+     * First start of an account that has never been backed up: disclose and let
+     * the executors run, so the first backup happens on its own.
+     *
+     * Disclosure was only ever marked at onboarding completion, so every
+     * install that upgraded into this feature stayed gated forever — an account
+     * with years of chats and no backup, waiting for a trip to Settings that
+     * most people never make. Finishing onboarding (on any build) is the same
+     * signal the onboarding path already treats as disclosure.
+     *
+     * Runs once: after the first success this returns early, so a user who
+     * later opts out is not re-disclosed. Opt-out lives in `policy.enabled`,
+     * which is independent of disclosure and fail-closed, so this cannot
+     * resurrect backups someone turned off.
+     */
+    fun discloseAutoBackupForExistingAccountIfNeeded() {
+        val policy = backupPolicy
+        val should = shouldDiscloseForFirstBackup(
+            onboarded = onboarded,
+            alreadyDisclosed = isAutoBackupDisclosed(),
+            // A policy we could not read must not be mistaken for "never
+            // backed up"; a readable policy with a null timestamp is exactly
+            // the case to handle.
+            policyReadable = policy != null,
+            lastSuccessAt = policy?.lastSuccessAt,
+        )
+        if (!should) return
+        sonarLog("Backup", "existing account has no backup yet — disclosing so the first one can run")
+        discloseAutoBackup()
     }
 
     fun backupAccountNow() {
@@ -5336,6 +5368,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 startRelayConnection()
                 scheduleAutoBackupExecutor()
                 refreshBackupPolicy()
+                discloseAutoBackupForExistingAccountIfNeeded()
                 if (isAutoBackupDisclosed()) {
                     chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
                 }

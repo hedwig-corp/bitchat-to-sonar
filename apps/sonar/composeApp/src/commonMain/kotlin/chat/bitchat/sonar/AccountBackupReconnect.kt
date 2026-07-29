@@ -86,3 +86,27 @@ internal fun buildBackupSanityChecks(
         detail = if (relayConnected) "Online — upload can reach Blossom" else "Offline — seal works; upload needs network",
     ),
 )
+
+/**
+ * Whether an existing account should be disclosed so its first backup can run.
+ *
+ * Disclosure used to be marked only when onboarding completed, so every install
+ * that upgraded into the backup feature stayed gated forever — an account full
+ * of chats and no backup, waiting for a trip to Settings most people never
+ * make. Finishing onboarding on any build is the same signal the onboarding
+ * path already treats as disclosure.
+ *
+ * @param policyReadable false when the policy could not be loaded. An
+ *   unreadable policy must not be mistaken for "never backed up".
+ * @param lastSuccessAt null or 0 means no backup has ever succeeded — the case
+ *   this exists to handle, so it must not be confused with "unknown".
+ */
+internal fun shouldDiscloseForFirstBackup(
+    onboarded: Boolean,
+    alreadyDisclosed: Boolean,
+    policyReadable: Boolean,
+    lastSuccessAt: Long?,
+): Boolean {
+    if (!onboarded || alreadyDisclosed || !policyReadable) return false
+    return (lastSuccessAt ?: 0L) <= 0L
+}

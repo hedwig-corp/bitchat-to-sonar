@@ -2441,10 +2441,38 @@ final class SonarAppStore: ObservableObject {
     }
 
     /// Onboarding: mark disclosure so new installs can auto-backup. Upgrades
-    /// that skip onboarding stay gated until Settings shows the backup copy.
+    /// that skip onboarding are handled by
+    /// `discloseAutoBackupForExistingAccountIfNeeded()` at startup instead.
     func ensureAutoBackupEnabledDefault() {
         discloseAutoBackup()
         refreshBackupPolicy()
+    }
+
+    /// First start of an account that has never been backed up: disclose and
+    /// let the executors run, so the first backup happens on its own.
+    ///
+    /// Disclosure was only ever marked at onboarding completion, so every
+    /// install that upgraded into this feature stayed gated forever — an
+    /// account with years of chats and no backup, waiting for a trip to
+    /// Settings that most people never make. Finishing onboarding (on any
+    /// build) is the same signal the onboarding path already treats as
+    /// disclosure.
+    ///
+    /// Runs once: after the first success this returns early, so a user who
+    /// later opts out is not re-disclosed. Opt-out lives in `policy.enabled`,
+    /// which is independent of disclosure and fail-closed, so this cannot
+    /// resurrect backups someone turned off.
+    func discloseAutoBackupForExistingAccountIfNeeded() {
+        guard onboarded, !isAutoBackupDisclosed() else { return }
+        // Read the policy directly and bail if it cannot be read: an unreadable
+        // policy must not be mistaken for "never backed up".
+        guard let policy = try? marmot.loadBackupPolicy() else { return }
+        if let last = policy.lastSuccessAt, last > 0 { return }
+        SecureLogger.info(
+            "Auto-backup: existing account has no backup yet — disclosing so the first one can run",
+            category: .session
+        )
+        discloseAutoBackup()
     }
 
     private func clearAccountBoundLocalStateForRestore() {
