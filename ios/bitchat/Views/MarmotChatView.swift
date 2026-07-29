@@ -1222,6 +1222,13 @@ final class MarmotChatModel: ObservableObject {
     ///   sitting in reads as the app freezing, so the periodic in-app loop hands
     ///   the work to the background paths instead of doing it itself.
     func runAutoBackupIfDue(allowWhileActive: Bool = false) async {
+        // TRACKED GAP (macOS): this guard is iOS-only, so the macOS in-app loop
+        // still seals while the app is active — the freeze this exists to
+        // prevent. Deliberate: macOS has no BGTask/WorkManager equivalent and
+        // its scene lifecycle makes "background" unreliable, so deferring there
+        // would trade a stall for possibly no automatic backups at all. Fixing
+        // it properly means an NSApplication.isActive gate plus a macOS
+        // background executor; until then macOS keeps the pre-guard behaviour.
         #if os(iOS)
         if !allowWhileActive, UIApplication.shared.applicationState == .active {
             SecureLogger.info(

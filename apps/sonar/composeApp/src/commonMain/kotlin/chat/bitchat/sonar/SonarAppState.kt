@@ -48,6 +48,7 @@ import chat.bitchat.sonar.resources.account_restored_chat_backup_restore
 import chat.bitchat.sonar.resources.account_restored_chats_recovered_from
 import chat.bitchat.sonar.resources.account_restored_chats_start_empty
 import chat.bitchat.sonar.resources.backup_failed_try_again_when_online
+import chat.bitchat.sonar.resources.chat_backup_is_on_encrypted_backups
 import chat.bitchat.sonar.resources.chat_backup_uploaded
 import chat.bitchat.sonar.resources.could_not_reopen_chats_after_backup
 import org.jetbrains.compose.resources.getString
@@ -4054,6 +4055,11 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (!should) return
         sonarLog("Backup", "existing account has no backup yet — disclosing so the first one can run")
         discloseAutoBackup()
+        // Review consensus (glm-5.2 / grok-4.5 / kimi-k3): silently starting to
+        // upload an account that predates the backup feature is a consent
+        // problem even when the payload is sealed. One visible, dismissable
+        // line; the screen it points at has the off switch.
+        scope.launch { toast = getString(Res.string.chat_backup_is_on_encrypted_backups) }
     }
 
     fun backupAccountNow() {

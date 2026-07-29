@@ -2473,6 +2473,11 @@ final class SonarAppStore: ObservableObject {
             category: .session
         )
         discloseAutoBackup()
+        // Review consensus (glm-5.2 / grok-4.5 / kimi-k3): silently starting to
+        // upload an account that predates the backup feature is a consent
+        // problem even when the payload is sealed. One visible, dismissable
+        // line; the screen it points at has the off switch.
+        showToast(String(localized: "Chat backup is on — encrypted backups upload automatically. Manage in Settings."))
     }
 
     private func clearAccountBoundLocalStateForRestore() {
