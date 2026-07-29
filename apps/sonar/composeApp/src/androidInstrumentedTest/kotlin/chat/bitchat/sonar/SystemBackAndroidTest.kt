@@ -4,9 +4,11 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.espresso.Espresso.pressBack
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import chat.bitchat.sonar.screens.SonarScanQrSheet
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -114,6 +116,59 @@ class SystemBackAndroidTest {
         composeRule.runOnIdle {
             assertFalse(trayVisible)
             assertEquals(0, navigations)
+        }
+    }
+
+    @Test
+    fun chatRowActionsSheetDismissesBeforeRootBackFallsThrough() {
+        assertSheetOwnsBack { onClose ->
+            ChatRowActionsSheet(
+                name = "Test chat",
+                isGroup = false,
+                muted = false,
+                onMute = {},
+                onDelete = {},
+                onClose = onClose,
+            )
+        }
+    }
+
+    @Test
+    fun muteSheetDismissesBeforeRootBackFallsThrough() {
+        assertSheetOwnsBack { onClose ->
+            MuteSheet(
+                name = "Test chat",
+                muted = false,
+                onMute = {},
+                onUnmute = {},
+                onClose = onClose,
+            )
+        }
+    }
+
+    @Test
+    fun scanQrSheetDismissesBeforeSendPaymentRouteBack() {
+        assertSheetOwnsBack { onClose ->
+            SonarScanQrSheet(
+                onClose = onClose,
+                onDetect = { _, _ -> },
+            )
+        }
+    }
+
+    private fun assertSheetOwnsBack(content: @Composable (() -> Unit) -> Unit) {
+        var closed by mutableStateOf(false)
+        var fallthroughs by mutableIntStateOf(0)
+        composeRule.setContent {
+            PlatformBackHandler(enabled = true) { fallthroughs++ }
+            content { closed = true }
+        }
+
+        pressBack()
+
+        composeRule.runOnIdle {
+            assertTrue(closed)
+            assertEquals(0, fallthroughs)
         }
     }
 }
