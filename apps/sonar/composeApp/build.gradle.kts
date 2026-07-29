@@ -232,6 +232,7 @@ kotlin {
             implementation(compose.uiTest)
             implementation(libs.androidx.compose.ui.test.junit4)
             implementation(libs.androidx.test.runner)
+            implementation(libs.androidx.test.rules)
             implementation(libs.androidx.test.ext.junit)
             implementation(libs.junit)
             implementation(libs.okhttp.mockwebserver)
