@@ -199,10 +199,47 @@ class CallControlAdmissionTest {
             CallControlAdmission.isAdmissible(
                 kind = Kind.Offer,
                 otherMemberKeys = listOf(peer),
-                structurallyDirect = true,
+                structurallyDirect = false,
                 senderKey = "   ",
                 activeCallConversationId = null,
                 conversationId = "marmot:dm",
+            )
+        )
+    }
+
+    /**
+     * The other side of that refusal, and the reason it is conditional: a mesh
+     * chat is keyed by the peer, so the TRANSPORT proves 2-party-ness. The
+     * caller still supplies a roster for it, because a folded conversation
+     * resolves the Marmot leg's members (`otherMemberKeys(callChatId)`), and a
+     * Bitchat peer may have no npub yet. Refusing every blank sender dropped
+     * those calls silently.
+     */
+    @Test
+    fun aStructurallyDirectControlStaysAdmissibleWithoutASender() {
+        assertTrue(
+            CallControlAdmission.isAdmissible(
+                kind = Kind.Offer,
+                otherMemberKeys = listOf(peer),
+                structurallyDirect = true,
+                senderKey = "",
+                activeCallConversationId = null,
+                conversationId = "mesh:dm",
+            )
+        )
+    }
+
+    /** A NAMED sender must still match, even on a direct transport. */
+    @Test
+    fun aStructurallyDirectControlFromAnotherNamedSenderIsNotAdmissible() {
+        assertFalse(
+            CallControlAdmission.isAdmissible(
+                kind = Kind.Offer,
+                otherMemberKeys = listOf(peer),
+                structurallyDirect = true,
+                senderKey = "npub1someoneelse",
+                activeCallConversationId = null,
+                conversationId = "mesh:dm",
             )
         )
     }

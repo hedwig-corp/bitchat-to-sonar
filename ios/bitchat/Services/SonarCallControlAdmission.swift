@@ -69,14 +69,26 @@ enum SonarCallControlAdmission {
             // The line must come FROM that peer. Membership alone is what made
             // the group hijack work.
             //
-            // A BLANK sender is a refusal, not a pass. "when we can see who
-            // sent it" was a fail-open: a roster-backed (Marmot) message whose
-            // author we cannot canonicalize proves nothing about who authored
-            // it, and admitting it hands the supplied endpoint control of the
-            // call — mic and camera — under the peer's name. Missing sender
-            // identity is only safe for `structurallyDirect` mesh messages,
-            // which carry no roster and take the branch above.
-            guard !senderKey.isEmpty, senderKey == peer else { return false }
+            // A named sender must BE the peer.
+            //
+            // A blank sender is a refusal only when the roster is the sole
+            // proof of 2-party-ness. Checking the sender merely "when we can
+            // see who sent it" was a fail-open: a Marmot message whose author
+            // we cannot canonicalize proves nothing, and admitting it hands the
+            // supplied endpoint control of the call — mic and camera — under
+            // the peer's name.
+            //
+            // But refusing EVERY blank sender over-corrects: a mesh chat is
+            // keyed by the peer, so the transport itself proves 2-party-ness,
+            // and the caller still passes a roster for it because a folded
+            // conversation resolves the Marmot leg's members. A Bitchat peer
+            // with no npub yet would then have its calls dropped. When the
+            // transport is structurally direct, absent author identity is fine.
+            if !senderKey.isEmpty {
+                if senderKey != peer { return false }
+            } else if !structurallyDirect {
+                return false
+            }
         }
         switch kind {
         case .offer:

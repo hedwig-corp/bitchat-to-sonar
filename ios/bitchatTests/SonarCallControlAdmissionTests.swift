@@ -151,16 +151,32 @@ struct SonarCallControlAdmissionTests {
             conversationId: "marmot:dm"))
     }
 
-    /// Same hole, with the transport claiming to be direct: a roster still
-    /// exists, so the author binding still has to hold.
+    /// The other side of that refusal, and why it is conditional: a mesh chat is
+    /// keyed by the peer, so the TRANSPORT proves 2-party-ness. The caller still
+    /// supplies a roster because a folded conversation resolves the Marmot leg's
+    /// members, and a Bitchat peer may have no npub yet — refusing every blank
+    /// sender dropped those calls silently. Mirror of the Compose
+    /// `aStructurallyDirectControlStaysAdmissibleWithoutASender`.
     @Test
-    func aRosterBackedControlWithNoSenderIsNotAdmissibleEvenWhenStructurallyDirect() {
-        #expect(!SonarCallControlAdmission.isAdmissible(
+    func aStructurallyDirectControlStaysAdmissibleWithoutASender() {
+        #expect(SonarCallControlAdmission.isAdmissible(
             kind: .offer,
             otherMemberKeys: [peer],
             structurallyDirect: true,
             senderKey: "",
             activeCallConversationId: nil,
-            conversationId: "marmot:dm"))
+            conversationId: "mesh:dm"))
+    }
+
+    /// A NAMED sender must still match, even on a direct transport.
+    @Test
+    func aStructurallyDirectControlFromAnotherNamedSenderIsNotAdmissible() {
+        #expect(!SonarCallControlAdmission.isAdmissible(
+            kind: .offer,
+            otherMemberKeys: [peer],
+            structurallyDirect: true,
+            senderKey: "npub1someoneelse",
+            activeCallConversationId: nil,
+            conversationId: "mesh:dm"))
     }
 }
