@@ -1518,29 +1518,27 @@ final class MarmotChatModel: ObservableObject {
                 // disconnect). Does not block cold start; Blossom itself does
                 // not need the relay, but publish still uses the outbox.
                 self.scheduleResumePendingMediaUploads()
-                try? await self.service.publishKeyPackageBackground()
+                // Identity publishes are relay I/O that nothing on the
+                // cold-start path waits for, so they run detached on their own
+                // lane: awaiting them here kept this Task — and, before the
+                // dedicated lane, the serial engine queue — busy between
+                // relay-connect and first drain (#265: 25-57s t3→t3a on a
+                // 43-group account). Receive was already unblocked by starting
+                // the drain above; this stops the publish chain from competing
+                // with it at all.
+                Task { [weak self] in await self?.publishIdentityAfterConnect() }
                 // After nsec restore the local nick/handle sidecars are empty.
                 // Fetch our own kind-0 first so the host can adopt name + nip05
                 // before any republish — publishing blank/stale metadata would
                 // replace the durable relay profile.
-                let safeToPublish = await self.hydrateOwnProfileFromRelays()
-                // Republish our kind-0 profile here too (not just on the npub
-                // signal / rename): the KeyPackage lands reliably on every relay
-                // connect, but the profile previously did not, so peers saw our
-                // raw npub when the opportunistic publish lost the relay /
-                // onboarding race. Keep them in lockstep. Never publish a blank
-                // name or before the handle sidecar is seeded (would wipe
-                // relay metadata / nip05).
-                if safeToPublish,
-                   let name = self.profileNameProvider?()
-                    .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-                    try? await self.service.publishProfileBackground(name: name)
-                }
                 #if DEBUG
-                // SONAR_BENCH: KeyPackage + profile publish ENQUEUED (T3a). The
-                // relay sends complete in the background inside the core; this
-                // marker now measures event creation, not relay OK acks (see
-                // docs/PERFORMANCE.md).
+                // SONAR_BENCH: the publish chain is DISPATCHED (T3a). Since
+                // #265 the chain runs detached on the publish lane, so this
+                // marker measures the connect path handing it off, not the
+                // relay round trips — t3→t3a is now the cost the cold start
+                // actually pays. `publishIdentityAfterConnect` logs its own
+                // completion (t3a_publish_done) for the publish latency
+                // itself; see docs/PERFORMANCE.md.
                 SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
                 self.startSendBenchmarkIfRequested()
                 self.startStickerBenchmarkIfRequested()
@@ -2711,6 +2709,29 @@ final class MarmotChatModel: ObservableObject {
     /// re-claim the handle when the core sidecar is empty so later publishes
     /// cannot drop `nip05`. Returns whether it is safe to republish kind-0.
     @discardableResult
+    /// KeyPackage + profile publish, detached from the cold-start connect
+    /// path (#265). Ordering inside the chain still matters: fetch our own
+    /// kind-0 BEFORE republishing, or a blank/stale local name would replace
+    /// the durable relay profile after an nsec restore.
+    func publishIdentityAfterConnect() async {
+        try? await service.publishKeyPackageBackground()
+        let safeToPublish = await hydrateOwnProfileFromRelays()
+        // Republish our kind-0 profile here too (not just on the npub signal /
+        // rename): the KeyPackage lands reliably on every relay connect, but
+        // the profile previously did not, so peers saw our raw npub when the
+        // opportunistic publish lost the relay / onboarding race. Keep them in
+        // lockstep. Never publish a blank name or before the handle sidecar is
+        // seeded (would wipe relay metadata / nip05).
+        if safeToPublish,
+           let name = profileNameProvider?()
+            .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            try? await service.publishProfileBackground(name: name)
+        }
+        #if DEBUG
+        SecureLogger.info("SONAR_BENCH t3a_publish_done", category: .session)
+        #endif
+    }
+
     func hydrateOwnProfileFromRelays() async -> Bool {
         let localNick = (profileNameProvider?() ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2750,7 +2771,9 @@ final class MarmotChatModel: ObservableObject {
                 coreClaimedHandle: claimedNow
             )
         }
-        guard let profile = try? await service.fetchProfile(npub: me) else {
+        // Own kind-0 on the publish lane: it gates the republish below, so it
+        // must not park the serial engine queue the first drain needs (#265).
+        guard let profile = try? await service.fetchOwnProfile(npub: me) else {
             // Do not set didFetchOwnProfileThisSession — a miss should retry.
             return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
                 localBip353: localBip,

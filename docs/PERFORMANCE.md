@@ -47,7 +47,8 @@ so the identity + Marmot groups persist — and diffs the marker timestamps.
 | `t1_local_paint` | `MarmotChatModel.performConnect` | local groups hydrated from the encrypted DB (first paint, no relays) |
 | `t2_relay_connect_begin` | `MarmotChatModel.connectRelaysIfNeeded` | relay attach begins |
 | `t3_relay_connected` | `MarmotChatModel.connectRelaysIfNeeded` | relays quorum-connected (`SonarNode.connect` returned) |
-| `t3a_published` | `MarmotChatModel.connectRelaysIfNeeded` | KeyPackage + profile publish ENQUEUED: events are created/persisted and the relay sends run in the background inside the core (`publish_*_background`). Before 2026-07, this marker measured the blocking relay OK waits (~18-57 s on device); `startPolling()` now starts BEFORE the publishes, so t3a no longer gates the drain loop |
+| `t3a_published` | `MarmotChatModel.connectRelaysIfNeeded` | the publish chain is DISPATCHED. Since #265 `publishIdentityAfterConnect()` runs detached on a dedicated `publishQueue` lane, so this marker measures the connect path handing it off — it is expected to be ~0 from `t3`. Historically (before 2026-07) it measured blocking relay OK waits (~18-57 s on device); `startPolling()` then moved ahead of the publishes, and #265 moved the publishes off the serial `workQueue` they shared with `sync`/`syncForce` |
+| `t3a_publish_done` | `MarmotChatModel.publishIdentityAfterConnect` | KeyPackage + own-profile fetch + profile republish all completed on the publish lane. This is where the publish latency now lives; it runs CONCURRENTLY with the drain, so a large value here is no longer a cold-start regression on its own — compare `t3b→t4` to judge the drain |
 | `t3b_first_wake` | `MarmotChatModel.startPolling` | first `waitForMarmotEvent` returned (splits wait vs drain) |
 | `t4_first_drain` | `MarmotChatModel.startPolling` | first relay event burst applied to local storage (initial sync produced data) |
 

@@ -337,6 +337,22 @@ final class MarmotService: @unchecked Sendable {
     /// mutation, never for a relay quorum fetch.
     private let drainQueue = DispatchQueue(label: "chat.bitchat.marmot-drain", qos: .userInitiated)
 
+    /// Serial identity-publish lane: KeyPackage (kind 30443) and our own
+    /// kind-0 profile, plus the self-profile relay fetch that gates the
+    /// republish.
+    ///
+    /// These used to run through `run { }` on `workQueue` — the SAME serial
+    /// lane as `sync`/`syncForce` — so on a cold start every per-relay
+    /// publish and the self-profile fetch (each parkable for the core's ~10s
+    /// timeout) sat between relay-connect and the sync work that produces the
+    /// first drain. On a 43-group account that showed up as a 25-57s
+    /// `t3→t3a` in the cold-start benchmark (#265): not the publishes being
+    /// slow so much as them holding the queue the drain needs. They are pure
+    /// relay I/O and touch no MLS state, so a lane of their own costs nothing
+    /// and takes them off the critical path — same reasoning that gave send,
+    /// media and drain their own lanes.
+    private let publishQueue = DispatchQueue(label: "chat.bitchat.marmot-publish", qos: .utility)
+
     /// Concurrent queue for read-only FFI calls (groups, messages, summaries).
     /// SQLCipher supports concurrent readers; these never touch MLS state, so
     /// they are safe to run in parallel with each other (and alongside writes
@@ -643,7 +659,7 @@ final class MarmotService: @unchecked Sendable {
     /// core in the background. For the relay-connect republish path, where the
     /// OK wait must not hold the serial engine queue ahead of the first drain.
     func publishKeyPackageBackground() async throws {
-        try await run { try $0.requireNode().publishKeyPackageBackground() }
+        try await publishLane { try $0.publishKeyPackageBackground() }
     }
 
     /// Publish our kind-0 Nostr profile (NIP-01) so peers can show our name
@@ -656,10 +672,22 @@ final class MarmotService: @unchecked Sendable {
     /// the background inside the core — same contract as
     /// `publishKeyPackageBackground()`.
     func publishProfileBackground(name: String, about: String? = nil, picture: String? = nil) async throws {
-        try await run { try $0.requireNode().publishProfileBackground(name: name, about: about, picture: picture) }
+        try await publishLane { try $0.publishProfileBackground(name: name, about: about, picture: picture) }
     }
 
     /// Fetch a peer's kind-0 profile (npub or hex). nil if they have none.
+    /// Our OWN kind-0, fetched on the publish lane: it gates the profile
+    /// republish, so it belongs with the publishes and off `workQueue` (#265).
+    /// Peer profile fetches keep using `fetchProfile` — they are driven by UI
+    /// hydration, not by the cold-start publish chain.
+    func fetchOwnProfile(npub: String) async throws -> Profile? {
+        try await publishLane {
+            try $0.fetchProfile(npub: npub).map {
+                Profile(name: $0.name, displayName: $0.displayName, about: $0.about, picture: $0.picture, nip05: $0.nip05)
+            }
+        }
+    }
+
     func fetchProfile(npub: String) async throws -> Profile? {
         try await run {
             try $0.requireNode().fetchProfile(npub: npub).map {
@@ -2209,6 +2237,13 @@ final class MarmotService: @unchecked Sendable {
     /// `workQueue` with blocking `syncForce` (see `drainQueue` doc).
     private func drainLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: drainQueue, body)
+    }
+
+    /// Identity publishes + the self-profile fetch that gates them. Off
+    /// `workQueue` so they never sit between relay-connect and first drain
+    /// (#265).
+    private func publishLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
+        try await leasedNodeOperation(on: publishQueue, body)
     }
 
     private func readOnlyNonThrowing<T: Sendable>(_ body: @escaping @Sendable (SonarNode) -> T, default defaultValue: T) async -> T {
