@@ -1711,24 +1711,66 @@ file tags"), which is why upstream derives its media receipt id from fields
 already on the wire instead of adding a TLV. Two decoders written from the same
 spec disagreed, and the tolerant one was the one Sonar read.
 
-**Call sites:** `mesh_engine.rs::Engine::send_file` (Compose/Android/desktop, via
-the core) and `BLEService.sendFilePrivate` / `sendFileBroadcast` →
-`BLEService.wireFilePacket` (iOS). Capability is recorded where the `0x53` is
-*verified*: `mesh_engine.rs::handle_sonar` and `BLEService.handleSonarAnnounce`.
-Broadcasts never carry the extension on either platform — they reach every client
-on the mesh and are never acked anyway.
+**Call sites — emitters:** `mesh_engine.rs::Engine::send_file`
+(Compose/Android/desktop, via the core) and `BLEService.sendFilePrivate` /
+`sendFileBroadcast` → `BLEService.wireFilePacket` (iOS). Broadcasts never carry
+the extension on either platform — they reach every client on the mesh and are
+never acked anyway. `sonar_ffi::mesh_encode_file_packet` is a **third, ungated**
+emitter: an exported entry point with no route, so it has no capability to gate
+on. No app calls it today (only the generated bindings expose it) and its doc
+comment now says so; a caller that sets `message_id` must have proven Sonar
+support itself.
 
-**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `BLEServiceCoreTests.fileTransferToNonSonarPeer_carriesNoUnknownTLV`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`
+**Call sites — capability:** three, not two, and every one of them must record.
+`0x53` verification happens in `mesh_engine.rs::handle_sonar`, **and again** in
+`handle_announce`'s replay of a `0x53` that arrived before the announce carrying
+its signing key, **and** in `BLEService.handleSonarAnnounce` (which iOS also uses
+for its replay, so iOS has one site where Rust has two). The Rust replay was
+missed on the first pass: it verified and emitted `SonarPayload` without
+recording, so the peer read as Sonar in the UI while `send_file` treated it as
+stock bitchat — in exactly the ordering `pending_sonar` exists to handle. Both
+Rust sites now go through `record_sonar_capability`.
 
-The Rust pair pins the real call site: it drives two engines through
-`Engine::send_file` and runs bitchat-android's decoder, transcribed, over the
-bytes that actually go out.
+**Eviction and lifetime:** the marking set is recency-tracked and evicts the
+single stalest entry only when it is outside a 5-minute protection window,
+refusing new markings while every one is live — `record_sonar_capability` /
+`evict_stalest_sonar_peer`, mirrored by `BLEService.recordSonarCapabilityLocked`.
+It must never `clear()` wholesale: every entry is cheap to mint (one keypair, one
+TOFU announce, one self-signed `0x53`), so a cap-sized flood would flush the real
+peers' markings, sustainably. That costs more than a receipt — with no message id
+the recipient skips its duplicate check, so a re-send lands as a second row plus
+a second stored file against the media quota, evicting older attachments live
+transcripts still point at. This is the same attack the identity pin map dropped
+`clear()` for; see `evict_stalest_identity` and R-008's neighbourhood. The cap is
+256 on both platforms (`SONAR_PEER_CAP` / `sonarCapablePeerCap`) — the Rust side
+first reused `MAX_PENDING_SONAR` (128), a bound sized for parked packets, which
+was an accident rather than a decision. The set deliberately **survives**
+`Engine::reset()`, matching iOS: it is keyed by remote fingerprint, so it
+describes the peer's software rather than our radio, and `reset()` runs on an
+ordinary BLE stop/restart — clearing it would send the first transfer after every
+radio cycle out unmarked for no security gain, since forgetting can only make the
+gate more conservative.
 
-**Not guarded:** the iOS *wiring* — `wireFilePacket` and `isSonarCapable` are each
-pinned, but nothing exercises `sendFilePrivate` end-to-end, which needs a live BLE
-route. iOS tests also do not run in CI. Nothing runs against a real bitchat-android
-build; the strict decoders in both test suites are transcriptions, so an upstream
-change to bitchat-android's TLV handling will not show up here.
+**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `mesh_engine.rs::out_of_order_sonar_announce_still_grants_capability`, `mesh_engine.rs::unverified_sonar_announce_grants_no_capability`, `mesh_engine.rs::a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one`, `BLEServiceCoreTests.fileTransferToNonSonarPeer_carriesNoUnknownTLV`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`, `BLEServiceCoreTests.sonarCapability_survivesAFloodOfThrowawayPeers`
+
+The Rust tests pin the real call site: they drive two engines through
+`Engine::send_file` and run bitchat-android's decoder, transcribed, over the bytes
+that actually go out. Each was mutation-checked — dropping the replay record,
+hoisting the record above the signature guard, and restoring the wholesale
+`clear()` each fail their own test and nothing else.
+
+**Not guarded:** the iOS *wiring* — `wireFilePacket`, `isSonarCapable` and the
+recorder are each pinned, but nothing exercises `sendFilePrivate` end-to-end,
+which needs a live BLE route. The iOS flood test drives the recorder through a
+`_test_` hook rather than signed announces, because flooding past the cap that
+way needs hundreds of keypairs; the packet-level path is covered separately.
+iOS tests also do not run in CI. Nothing here runs against a real
+bitchat-android build — both suites use a transcription of its decoder, so an
+upstream change to its TLV handling will not show up. A scheduled job that
+compiles the real `BitchatFilePacket.kt` and decodes captured
+`Engine::send_file` bytes would close that permanently; kwsantiago ran exactly
+that by hand while reviewing #471, reproducing both the pre-fix `null` and the
+post-fix decode.
 
 **History:** Introduced with the media delivery receipt in #312 on the stated
 premise that unknown tags are skipped. R-015 (same TLV) named this exact hole in
@@ -1749,6 +1791,19 @@ as "sending images between bitchat and Sonar is broken".
   instead of the mesh `0x53`.* Not available synchronously at send time on the
   BLE path, and absent for a mesh-only peer — it would fail open, which is the
   failure this entry exists to prevent.
+- *Waiting for bitchat-android to fix its decoder instead.* The strict decoder is
+  the odd one out among three in that project — bitchat-iOS's file decoder skips
+  unknown tags, and bitchat-android's own `IdentityAnnouncement.decode` skips
+  them too, with a comment saying it does so for forward compatibility. Proposed
+  upstream in permissionlesstech/bitchat-android#826 (and pinned on the iOS side
+  in permissionlesstech/bitchat#1550). But already-installed Android builds keep
+  dropping these packets whenever that lands, so this gate is permanent
+  architecture, not a stopgap.
+- *Adding a freshness window to `0x53` in the core to match iOS's 900s.* Filed
+  separately as pre-existing. It does not weaken this gate: a replayed `0x53`
+  carries its original signature, so it can only grant capability to a
+  fingerprint that genuinely did prove Sonar — an attacker replaying one gains
+  nothing it could not get by relaying the live packet.
 
 ## Unguarded
 

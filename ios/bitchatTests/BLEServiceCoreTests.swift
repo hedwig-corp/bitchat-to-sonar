@@ -338,8 +338,13 @@ struct BLEServiceCoreTests {
         )), "Failed to sign announce packet")
         ble._test_handlePacket(announcePacket, fromPeerID: peerID, preseedPeer: false)
 
+        // Gate on an observable positive rather than a fixed sleep:
+        // `_test_handlePacket` dispatches to a concurrent `messageQueue`, so a
+        // timed wait would pass simply because nothing had run yet.
+        let announceLanded = await TestHelpers.waitUntil({ !ble.currentPeerSnapshots().isEmpty },
+                                                         timeout: TestConstants.shortTimeout)
+        #expect(announceLanded)
         // A plain bitchat announce says nothing about Sonar support.
-        try await Task.sleep(nanoseconds: 50_000_000)
         #expect(ble.isSonarCapable(peerID) == false)
 
         let sonarPayload = try #require(SonarAnnouncePacket(
@@ -356,11 +361,61 @@ struct BLEServiceCoreTests {
             signature: nil,
             ttl: 7
         )), "Failed to sign Sonar packet")
-        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
 
+        // "Verified" is load-bearing, not decoration: the signature guard is
+        // what stops any peer on the mesh claiming another fingerprint speaks
+        // Sonar. Same bytes, one flipped signature byte. Polled for the full
+        // window, so this cannot pass by simply outrunning the queue.
+        //
+        // The tampered copy carries a DIFFERENT timestamp from the valid one
+        // below: `messageDeduplicator` keys on (sender, timestamp, type), so
+        // reusing it would make the valid packet a duplicate and the positive
+        // control would silently never arrive.
+        var tamperedSignature = try #require(sonarPacket.signature, "Sonar packet must be signed")
+        tamperedSignature[tamperedSignature.startIndex] ^= 0xFF
+        let tamperedPacket = BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 2,
+            payload: sonarPayload,
+            signature: tamperedSignature,
+            ttl: 7
+        )
+        ble._test_handlePacket(tamperedPacket, fromPeerID: peerID, preseedPeer: false)
+        let grantedByTampered = await TestHelpers.waitUntil({ ble.isSonarCapable(peerID) },
+                                                            timeout: TestConstants.shortTimeout)
+        #expect(grantedByTampered == false, "an unverified 0x53 must not grant the extension")
+
+        // Not vacuous: the same packet with its real signature does grant it,
+        // which also proves the delivery path above was live.
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
         let becameCapable = await TestHelpers.waitUntil({ ble.isSonarCapable(peerID) },
                                                         timeout: TestConstants.shortTimeout)
         #expect(becameCapable)
+    }
+
+    /// Every marking is cheap to mint — one keypair, one TOFU announce, one
+    /// self-signed 0x53 — so a wholesale `removeAll()` at the cap let roughly
+    /// `sonarCapablePeerCap` throwaway identities flush a live peer's marking,
+    /// sustainably rather than once. That costs more than a receipt: with no
+    /// message id `handleFileTransfer` skips its duplicate check, so a re-send
+    /// lands as a second row and a second stored file against the media quota.
+    @Test
+    func sonarCapability_survivesAFloodOfThrowawayPeers() async throws {
+        let ble = makeService()
+        let live = PeerID(str: "0011223344556677")
+
+        ble._test_recordSonarCapability(live)
+        #expect(ble.isSonarCapable(live))
+
+        // Flood well past the cap, all inside the protection window.
+        for i in 0..<(ble._test_sonarCapablePeerCap * 3) {
+            ble._test_recordSonarCapability(PeerID(str: String(format: "%016x", i + 1)))
+        }
+
+        #expect(ble.isSonarCapable(live), "a flood must not evict a live peer's marking")
+        #expect(ble._test_sonarCapablePeerCount <= ble._test_sonarCapablePeerCap)
     }
 
     /// bitchat-android's `BitchatFilePacket.decode`, transcribed: every tag is

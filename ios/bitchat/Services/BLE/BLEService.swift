@@ -182,8 +182,17 @@ final class BLEService: NSObject {
     // — see `sendFilePrivate`. Never cleared with the pending queues above: a
     // BLE reset does not make a Sonar peer stop being one, and the set
     // self-heals from the next announce burst anyway.
-    private var sonarCapablePeers: Set<PeerID> = []
+    // Recency-tracked, not a bare set: every entry is cheap for an attacker to
+    // mint (one keypair, one TOFU announce, one self-signed 0x53), so eviction
+    // drops the stalest marking and refuses when all are live, never wholesale.
+    // Losing a real peer's marking costs more than a receipt — with no message
+    // id `handleFileTransfer` skips its duplicate check, so a re-send lands as a
+    // second row plus a second stored file against the media quota.
+    private var sonarCapablePeers: [PeerID: Date] = [:]
+    // Matches the core's `SONAR_PEER_CAP` so both platforms forget together.
     private let sonarCapablePeerCap = 256
+    // Mirrors the core's `IDENTITY_PROTECT_MS`.
+    private let sonarCapableProtectWindow: TimeInterval = 5 * 60
 
     // Application state tracking (thread-safe)
     #if os(iOS)
@@ -2531,6 +2540,23 @@ extension BLEService {
 #if DEBUG
 // Test-only helper to inject packets into the receive pipeline
 extension BLEService {
+    /// Exercises the real capability recorder, including its eviction policy.
+    /// The packet-level path is covered by
+    /// `sonarCapability_requiresAVerifiedSonarAnnounce`; this exists because
+    /// flooding past the cap through signed announces would need hundreds of
+    /// keypairs.
+    func _test_recordSonarCapability(_ peerID: PeerID) {
+        collectionsQueue.sync(flags: .barrier) {
+            recordSonarCapabilityLocked(peerID)
+        }
+    }
+
+    var _test_sonarCapablePeerCount: Int {
+        collectionsQueue.sync { sonarCapablePeers.count }
+    }
+
+    var _test_sonarCapablePeerCap: Int { sonarCapablePeerCap }
+
     func _test_handlePacket(_ packet: BitchatPacket, fromPeerID: PeerID, preseedPeer: Bool = true) {
         if preseedPeer {
             // Ensure the synthetic peer is known and marked verified for public-message tests
@@ -4774,10 +4800,7 @@ extension BLEService {
         // A verified 0x53 is the only proof the peer speaks Sonar, and so the
         // only licence to put Sonar's optional file TLV on the wire for it.
         collectionsQueue.sync(flags: .barrier) {
-            if sonarCapablePeers.count >= sonarCapablePeerCap {
-                sonarCapablePeers.removeAll()
-            }
-            sonarCapablePeers.insert(peerID)
+            recordSonarCapabilityLocked(peerID)
         }
 
         NotificationCenter.default.post(
@@ -4793,7 +4816,34 @@ extension BLEService {
     /// Whether `peerID` has proven, with a verified 0x53 Sonar announce, that it
     /// can decode the optional TLVs Sonar adds to bitchat's file packet.
     func isSonarCapable(_ peerID: PeerID) -> Bool {
-        collectionsQueue.sync { sonarCapablePeers.contains(peerID) }
+        collectionsQueue.sync { sonarCapablePeers[peerID] != nil }
+    }
+
+    /// Records the Sonar-capability marking earned by a *verified* 0x53.
+    /// Must be called on `collectionsQueue` with a barrier.
+    ///
+    /// Mirrors the core's `record_sonar_capability` / `evict_stalest_sonar_peer`
+    /// and, through those, `evict_stalest_identity`: at the cap drop the single
+    /// stalest marking and only when it is outside the protection window,
+    /// refusing the new one while every marking is live. A wholesale
+    /// `removeAll()` let roughly `sonarCapablePeerCap` throwaway identities
+    /// flush the real peers' markings, sustainably rather than once.
+    private func recordSonarCapabilityLocked(_ peerID: PeerID) {
+        let now = Date()
+        // A re-announce refreshes recency, so a concurrent flood cannot evict a
+        // peer we are actively talking to.
+        if sonarCapablePeers[peerID] != nil {
+            sonarCapablePeers[peerID] = now
+            return
+        }
+        if sonarCapablePeers.count >= sonarCapablePeerCap {
+            guard let stalest = sonarCapablePeers.min(by: { $0.value < $1.value }),
+                  now.timeIntervalSince(stalest.value) >= sonarCapableProtectWindow else {
+                return
+            }
+            sonarCapablePeers.removeValue(forKey: stalest.key)
+        }
+        sonarCapablePeers[peerID] = now
     }
 
     /// Strips Sonar-only TLVs from a file packet unless the recipient is known

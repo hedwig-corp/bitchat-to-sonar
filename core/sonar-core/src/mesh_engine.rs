@@ -84,6 +84,10 @@ pub const FRAGMENT_CHUNK_SIZE: usize =
 pub const MAX_FILE_TRANSFER_BYTES: usize = 1024 * 1024;
 pub const MAX_V1_FILE_PAYLOAD_BYTES: usize = 0xFFFF;
 const MAX_PENDING_SONAR: usize = 128;
+/// Sonar-capability markings retained per session. Sized for peers seen, not
+/// for parked packets, and deliberately identical to the iOS
+/// `sonarCapablePeerCap` so the two platforms forget at the same point.
+const SONAR_PEER_CAP: usize = 256;
 const SEEN_CAP: usize = 1024;
 /// Minimum spacing between instance re-discoveries on one connection.
 const REFRESH_INSTANCES_COOLDOWN_MS: u64 = 30_000;
@@ -280,9 +284,18 @@ pub struct Engine {
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
     pending_sonar: HashMap<String, Vec<u8>>,
     /// Fingerprints that proved they run Sonar by sending a *verified* 0x53
-    /// Sonar announce. Only these peers may receive the optional file-transfer
-    /// TLVs Sonar adds on top of bitchat's format — see `send_file`.
-    sonar_peers: HashSet<String>,
+    /// Sonar announce, mapped to when that proof last arrived. Only these peers
+    /// may receive the optional file-transfer TLVs Sonar adds on top of
+    /// bitchat's format — see `send_file`.
+    ///
+    /// Recency-tracked, not a bare set, for the reason the identity pin map is:
+    /// every entry here is cheap for an attacker to mint (one keypair, one TOFU
+    /// announce, one self-signed 0x53), so eviction must drop the stalest entry
+    /// and refuse when all are live, never `clear()` wholesale. Losing a real
+    /// peer's marking costs more than a receipt: with no message id the
+    /// recipient's duplicate check is skipped, so a re-send lands as a second
+    /// row plus a second stored file against the media quota.
+    sonar_peers: HashMap<String, u64>,
     seen_broadcasts: HashSet<String>,
     seen_files: HashSet<String>,
     reassembler: mesh::fragment::Reassembler,
@@ -339,7 +352,7 @@ impl Engine {
             identity_refused: 0,
             identity_map_cap: IDENTITY_MAP_CAP,
             pending_sonar: HashMap::new(),
-            sonar_peers: HashSet::new(),
+            sonar_peers: HashMap::new(),
             seen_broadcasts: HashSet::new(),
             seen_files: HashSet::new(),
             reassembler: mesh::fragment::Reassembler::new(),
@@ -796,7 +809,7 @@ impl Engine {
         // byte-for-byte stock bitchat, at the cost of a delivery receipt.
         let message_id = self
             .sonar_peers
-            .contains(fingerprint)
+            .contains_key(fingerprint)
             .then(|| message_id.to_string());
         let payload = mesh::file_packet::FilePacket {
             file_name: Some(file_name.to_string()),
@@ -967,7 +980,13 @@ impl Engine {
         self.identity_lru.clear();
         self.identity_refused = 0;
         self.pending_sonar.clear();
-        self.sonar_peers.clear();
+        // `sonar_peers` deliberately SURVIVES a reset. It is keyed by remote
+        // fingerprint, so it describes the peer's software, not our radio, and
+        // `reset()` runs on an ordinary BLE stop/restart. Clearing it would
+        // send the first transfer after every radio cycle out unmarked — the
+        // same hole as an unrecorded out-of-order 0x53 — while buying nothing:
+        // forgetting can only make the gate MORE conservative, never less.
+        // iOS keeps its set for the same reason; see R-022.
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();
@@ -1018,6 +1037,45 @@ impl Engine {
             self.fingerprint_by_peer.remove(&stale);
         }
         true
+    }
+
+    /// The ONLY way a fingerprint earns the Sonar file-TLV extension. Every
+    /// site that verifies a 0x53 must call this — the direct one in
+    /// `handle_sonar` and the replay in `handle_announce` of a 0x53 that beat
+    /// the announce carrying its signing key.
+    fn record_sonar_capability(&mut self, fp: &str, now_ms: u64) {
+        if fp.is_empty() {
+            return;
+        }
+        // A re-announce refreshes recency, so a concurrent flood of throwaway
+        // identities cannot evict a peer we are actively talking to.
+        if let Some(seen) = self.sonar_peers.get_mut(fp) {
+            *seen = now_ms;
+            return;
+        }
+        if self.sonar_peers.len() >= SONAR_PEER_CAP && !self.evict_stalest_sonar_peer(now_ms) {
+            return;
+        }
+        self.sonar_peers.insert(fp.to_string(), now_ms);
+    }
+
+    /// Mirrors `evict_stalest_identity`: drop the single stalest marking, and
+    /// only when it is outside the protection window. If every marking is
+    /// recent, refuse the new one rather than hand an attacker a way to flush
+    /// live peers by minting `SONAR_PEER_CAP` throwaway identities.
+    fn evict_stalest_sonar_peer(&mut self, now_ms: u64) -> bool {
+        let stalest = self
+            .sonar_peers
+            .iter()
+            .min_by_key(|(_, seen)| **seen)
+            .map(|(fp, seen)| (fp.clone(), *seen));
+        match stalest {
+            Some((fp, seen)) if now_ms.saturating_sub(seen) >= IDENTITY_PROTECT_MS => {
+                self.sonar_peers.remove(&fp);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `(pinned identities, announces refused because every pin was protected)`.
@@ -1344,7 +1402,7 @@ impl Engine {
                 }
             }
             msg_type::FILE_TRANSFER => self.handle_file(origin, bytes, &packet, &mut out),
-            msg_type::SONAR_ANNOUNCE => self.handle_sonar(origin, bytes, &packet, &mut out),
+            msg_type::SONAR_ANNOUNCE => self.handle_sonar(origin, bytes, &packet, now_ms, &mut out),
             _ => {}
         }
         out
@@ -1477,6 +1535,12 @@ impl Engine {
                     && mesh::verify_packet(&p, &announce.signing_public_key)
                     && !fp.is_empty()
                 {
+                    // The replay is a SECOND verification site, and it is the
+                    // one the ordering `pending_sonar` exists for: without this
+                    // the peer shows as Sonar in the UI while `send_file`
+                    // treats it as stock bitchat, so the first transfer after
+                    // connecting goes out unmarked and earns no receipt.
+                    self.record_sonar_capability(&fp, now_ms);
                     out.events.push(AppEvent::SonarPayload {
                         fingerprint: fp.clone(),
                         payload: p.payload,
@@ -2032,6 +2096,7 @@ impl Engine {
         origin: Origin,
         raw: &[u8],
         packet: &mesh::Packet,
+        now_ms: u64,
         out: &mut Output,
     ) {
         let _ = origin;
@@ -2061,12 +2126,7 @@ impl Engine {
         if !self.fp_allowed(&fp) {
             return;
         }
-        // A verified 0x53 is the only proof that the peer speaks Sonar, and so
-        // the only licence to put Sonar's optional file TLV on the wire for it.
-        if self.sonar_peers.len() >= MAX_PENDING_SONAR {
-            self.sonar_peers.clear();
-        }
-        self.sonar_peers.insert(fp.clone());
+        self.record_sonar_capability(&fp, now_ms);
         out.events.push(AppEvent::SonarPayload {
             fingerprint: fp,
             payload: packet.payload.clone(),
@@ -2377,6 +2437,137 @@ mod tests {
             None,
             "the Sonar-only message id must not be on the wire for a stock peer",
         );
+    }
+
+    /// A 0x53 can arrive before the 0x01 announce that carries its signing key;
+    /// it is parked in `pending_sonar` and replayed from `handle_announce`. That
+    /// replay is a second verification site, and it used to emit
+    /// `SonarPayload` without recording capability — so the peer read as Sonar
+    /// in the UI while `send_file` treated it as stock bitchat, in exactly the
+    /// ordering `pending_sonar` exists to handle. `establish()` always delivers
+    /// the announce first, so no other test reaches this path.
+    #[test]
+    fn out_of_order_sonar_announce_still_grants_capability() {
+        let mut a = engine(1, "sonar-a");
+        let mut b = engine(9, "sonar-b");
+        let _ = b.set_sonar_payload(Some(b"sonar-b".to_vec()), 900);
+
+        let conn = "84:2F";
+        let instance = 34;
+        let now = 1_000u64;
+        let out = a.on_dial_request(conn, now);
+        assert!(matches!(out.commands.as_slice(), [Command::Dial { .. }]));
+        a.on_client_connected(conn, now);
+        b.on_server_connected("droid", now);
+        let _ = a.on_instances_discovered(conn, &[instance], now);
+        let sub = a.on_subscribe_result(conn, instance, true, now);
+        let link = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+
+        // The 0x53 lands BEFORE the 0x01: `a` cannot verify it yet, so it parks.
+        let b_sonar = b.sonar_bytes(now).expect("b 0x53");
+        let _ = a.on_client_rx(conn, instance, &b_sonar, now);
+        assert_eq!(a.pending_sonar.len(), 1, "0x53 must be parked");
+
+        let b_ann = b.announce_bytes(now).expect("b announce");
+        let ann_out = a.on_client_rx(conn, instance, &b_ann, now);
+        let mut first = Output::default();
+        first.merge(sub);
+        first.merge(ann_out);
+        let _ = pump(&mut a, &link, &mut b, "droid", first, now);
+        assert!(
+            a.pending_sonar.is_empty(),
+            "parked 0x53 must have been replayed"
+        );
+
+        let send = a
+            .send_file(
+                &fp_of(&b),
+                "media-mid",
+                &[0x42; 64],
+                "photo.jpg",
+                "image/jpeg",
+                3_000,
+            )
+            .expect("media route");
+        let payload = sent_file_payload(&send);
+        assert_eq!(
+            mesh::file_packet::FilePacket::decode(&payload)
+                .expect("self-decode")
+                .message_id
+                .as_deref(),
+            Some("media-mid"),
+            "a peer that proved Sonar via an out-of-order 0x53 must still get the receipt id",
+        );
+    }
+
+    /// "Verified" is load-bearing, not decoration: the signature guard is what
+    /// stops any peer on the mesh from claiming another fingerprint speaks
+    /// Sonar. Recording capability before that guard leaves every other test
+    /// green, so this pins the order.
+    #[test]
+    fn unverified_sonar_announce_grants_no_capability() {
+        let mut a = engine(1, "sonar-a");
+        let mut b = engine(9, "sonar-b");
+        let link = establish(&mut a, &mut b, "84:2F", 34, 1_000);
+        let _ = b.set_sonar_payload(Some(b"sonar-b".to_vec()), 1_400);
+
+        // Same bytes, one flipped signature byte.
+        let good = b.sonar_bytes(1_500).expect("b 0x53");
+        let mut tampered = mesh::Packet::decode(&good).expect("decode 0x53");
+        let mut sig = tampered.signature.expect("0x53 must be signed");
+        sig[0] ^= 0xFF;
+        tampered.signature = Some(sig);
+        let tampered_bytes = tampered.encode().expect("re-encode");
+
+        let _ = a.on_client_rx(&link.conn, link.instance, &tampered_bytes, 1_500);
+        assert!(
+            !a.sonar_peers.contains_key(&fp_of(&b)),
+            "an unverified 0x53 must not grant the extension",
+        );
+
+        // Not vacuous: the untampered packet does grant it.
+        let _ = a.on_client_rx(&link.conn, link.instance, &good, 1_600);
+        assert!(
+            a.sonar_peers.contains_key(&fp_of(&b)),
+            "the same packet with a valid signature must grant it",
+        );
+    }
+
+    /// Every marking is cheap to mint — one keypair, one TOFU announce, one
+    /// self-signed 0x53 — so a wholesale `clear()` at the cap let ~256
+    /// throwaway identities flush a live peer's marking, and sustainably. That
+    /// costs more than a receipt: with no message id the recipient skips its
+    /// duplicate check, so a re-send lands as a second row and a second stored
+    /// file against the media quota.
+    #[test]
+    fn a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one() {
+        let mut a = engine(1, "sonar-a");
+        let live = "a".repeat(64);
+        a.record_sonar_capability(&live, 10_000);
+
+        // Flood well past the cap, all within the protection window.
+        for i in 0..(SONAR_PEER_CAP * 3) {
+            a.record_sonar_capability(&format!("{i:064x}"), 10_000 + i as u64);
+        }
+
+        assert!(
+            a.sonar_peers.contains_key(&live),
+            "a flood must not evict a live peer's marking",
+        );
+        assert!(
+            a.sonar_peers.len() <= SONAR_PEER_CAP,
+            "the set must stay bounded, got {}",
+            a.sonar_peers.len(),
+        );
+
+        // Once the live marking is genuinely stale it may be evicted, so the
+        // bound is enforced by recency rather than by refusing forever.
+        let stale_now = 10_000 + IDENTITY_PROTECT_MS + 1;
+        a.record_sonar_capability("f".repeat(64).as_str(), stale_now);
+        assert!(a.sonar_peers.len() <= SONAR_PEER_CAP);
     }
 
     /// The extension is not removed, only gated: a peer that proved it runs
