@@ -14,10 +14,8 @@ import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.RelayConnectionPolicy
 import chat.bitchat.sonar.SonarCore
 import chat.bitchat.sonar.SonarLifecycle
-import chat.bitchat.sonar.SonarNotificationKind
 import chat.bitchat.sonar.SonarNotificationPrefs
 import chat.bitchat.sonar.SonarNotificationRouter
-import chat.bitchat.sonar.shortNpubLabel
 import chat.bitchat.sonar.wallet.InvoiceRequestPayload
 import chat.bitchat.sonar.wallet.JsonLite
 import chat.bitchat.sonar.BuildConfig
@@ -197,7 +195,24 @@ class SonarPushProcessingService : Service() {
         // process could be killed mid-answer. Stop cleanly; the app reconciles
         // on next open / next high-priority wake.
         if (!fgsReady) {
-            Log.w(TAG, "onStartCommand: no foreground service, skipping wake work")
+            // The start was ACCEPTED but startForeground() was refused in
+            // onCreate (the allowlist expired in between). The FCM handler has
+            // already returned, so its inline fallback cannot cover this —
+            // run the same bounded fallback here instead of dropping the wake
+            // silently (#203, the other half of the denial). It is best-effort
+            // by definition: no foreground service means no execution
+            // guarantee, which is exactly why the money-path settle wait is
+            // still refused below.
+            Log.w(TAG, "onStartCommand: no foreground service, running inline fallback")
+            val type = intent?.getStringExtra(EXTRA_PUSH_TYPE) ?: TYPE_MARMOT
+            runCatching {
+                SonarPushInlineFallback.run(
+                    applicationContext,
+                    type,
+                    notificationType = intent?.getStringExtra(EXTRA_NOTIFICATION_TYPE) ?: "",
+                    payload = intent?.getStringExtra(EXTRA_NOTIFICATION_PAYLOAD) ?: "",
+                )
+            }.onFailure { Log.w(TAG, "Inline fallback after refused startForeground failed", it) }
             stopSelf(startId)
             return START_NOT_STICKY
         }
@@ -276,104 +291,10 @@ class SonarPushProcessingService : Service() {
         }
     }
 
-    /**
-     * Single-flight relay reconnect + gap-recovery sync for a Marmot wake
-     * (mirrors iOS `marmotWakeInFlight` / `marmotWakeNeedsRerun` in
-     * `SonarPushProcessor`).
-     *
-     * Two FCM deliveries arrive as two independent coroutines. Left concurrent,
-     * the second wake's [SonarCore.invalidateRelayConnection] supersedes the
-     * first wake's in-flight attach and then replaces and closes its node while
-     * it is inside [SonarCore.syncForce] — and syncForce swallows node failures,
-     * so the first wake is recorded as synced without ever fetching its message.
-     * Followers join the owner instead of starting their own reconnect, and a
-     * push observed while the owner is already draining sets the rerun flag so
-     * its own row is still fetched before the owner completes.
-     */
-    private suspend fun syncMarmotForWake(): Boolean {
-        val owner = marmotWakeLock.withLock {
-            // Only an in-flight owner can be joined: a leftover completed (or
-            // cancelled-with-the-service) Deferred must not swallow this wake.
-            // An owner that already closed its rerun gate has cleared the slot,
-            // so a late delivery becomes a new owner instead of setting a flag
-            // nobody will read.
-            marmotWakeInFlight?.takeIf { it.isActive }?.also { marmotWakeNeedsRerun = true }
-                ?: run {
-                    val generation = ++marmotWakeOwnerGeneration
-                    scope.async { runMarmotWakeSync(generation) }
-                        .also { marmotWakeInFlight = it }
-                }
-        }
-        return owner.await()
-    }
-
-    /** Owner body: reconnect + force the batched fetch, repeating while another
-     *  push landed mid-drain. Failures surface through [Deferred.await] to every
-     *  joined wake, which each fall back to the generic notification. */
-    private suspend fun runMarmotWakeSync(generation: Long): Boolean =
-        // Claim the node for the whole wake: this process has no UI session, so
-        // without the claim a scheduled auto-backup seal would close the node
-        // underneath the drain.
-        chat.bitchat.sonar.backup.withMarmotSessionClaim {
-            runMarmotWakeSyncLocked(generation)
-        }
-
-    private suspend fun runMarmotWakeSyncLocked(generation: Long): Boolean {
-        try {
-            while (true) {
-                marmotWakeLock.withLock { marmotWakeNeedsRerun = false }
-                val synced = withTimeoutOrNull(MARMOT_PUSH_SYNC_TIMEOUT_MS) {
-                    SonarCore.start()
-                    // Doze/freeze can leave the host latch true after sockets die.
-                    // Without this, connectRelays() no-ops and syncForce talks to a
-                    // dead node — the killed-app path works only because a fresh
-                    // process starts with relayConnected=false. A push that lands
-                    // while the UI is visible reaches a healthy node, so leave it
-                    // alone: rebuilding would close a node in-flight sends hold.
-                    if (RelayConnectionPolicy.shouldInvalidateOnPushWake(SonarLifecycle.appVisible)) {
-                        SonarCore.invalidateRelayConnection()
-                    }
-                    SonarCore.connectRelays()
-                    // Push wake: force the batched gap-recovery fetch. A routine
-                    // sync() would short-circuit while live subscriptions are marked
-                    // active even though the socket was torn down while backgrounded,
-                    // leaving the pushed message unfetched.
-                    SonarCore.syncForce()
-                } != null
-                // Close the rerun gate and retire this owner in ONE locked
-                // section. Checking the flag, releasing, then clearing the slot
-                // leaves a window where a delivery still sees an active owner and
-                // sets a flag that owner will never read — its message goes
-                // unfetched while it inherits synced=true and skips the fallback
-                // notification.
-                val retired = marmotWakeLock.withLock {
-                    if (marmotWakeNeedsRerun) {
-                        false
-                    } else {
-                        retireWake(generation)
-                        true
-                    }
-                }
-                if (retired) return synced
-            }
-        } finally {
-            // Must run even when the service scope is cancelled mid-wake, or the
-            // stale owner would be joined by the next process-alive wake. No-op
-            // once the loop retired us, so it cannot clear a newer owner.
-            withContext(NonCancellable) {
-                marmotWakeLock.withLock { retireWake(generation) }
-            }
-        }
-    }
-
-    /** Clear the owner slot iff [generation] is still the installed owner, so a
-     *  retired wake's cleanup cannot evict the owner that replaced it. Caller
-     *  must hold [marmotWakeLock]. */
-    private fun retireWake(generation: Long) {
-        if (marmotWakeOwnerGeneration != generation) return
-        marmotWakeInFlight = null
-        marmotWakeNeedsRerun = false
-    }
+    /** Delegates to the process-wide single-flight (shared with the denied-FGS
+     *  inline fallback — see SonarMarmotWakeSync). */
+    private suspend fun syncMarmotForWake(): Boolean =
+        SonarMarmotWakeSync.syncForWake(scope, MARMOT_PUSH_SYNC_TIMEOUT_MS)
 
     /** Delegates to the shared renderer so the foreground-service wake and the
      *  denied-FGS inline fallback cannot drift (see SonarWakeNotifications). */
@@ -700,22 +621,6 @@ class SonarPushProcessingService : Service() {
          */
         private val bailoutScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-        private val marmotWakeLock = Mutex()
-
-        /** The wake currently reconnecting + draining. Later deliveries join it
-         *  instead of invalidating and replacing the node underneath it. */
-        private var marmotWakeInFlight: Deferred<Boolean>? = null
-
-        /** Set when a delivery joins an owner that may already be past the
-         *  drain, so the owner runs one more fetch before completing — otherwise
-         *  the joining push's own message can be missed. */
-        private var marmotWakeNeedsRerun = false
-
-        /** Identifies the installed owner so a retiring wake only clears its own
-         *  slot. Without it, the `finally` cleanup of a wake that already retired
-         *  normally could null out the owner a later delivery installed, and two
-         *  owners would reconnect concurrently again. */
-        private var marmotWakeOwnerGeneration = 0L
 
         // Marmot push-triggered background sync budget.
         // On a cold wake the core must start, connect relays, and reach EOSE
