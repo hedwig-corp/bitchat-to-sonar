@@ -4983,26 +4983,40 @@ extension BLEService {
             if !noiseService.hasSession(with: peerID) {
                 initiateNoiseHandshake(with: peerID)
             }
-        } catch let policyError as NoiseSecurityError {
-            // Every `NoiseSecurityError` is a pre-decryption policy rejection
-            // that `NoiseEncryptionService.decrypt` raises *before* it consults
-            // the session: `messageTooLarge` comes ahead of both the rate limiter
-            // and the `hasEstablishedSession` guard, and `rateLimitExceeded`
-            // ahead of the guard. Neither says anything about session health and
-            // neither needs a session to provoke, so counting them would hand
-            // back the teardown primitive this method exists to remove — three
-            // oversized frames under a victim's claimed sender ID, at zero
-            // rate-limit cost, would otherwise evict that victim's session.
-            // Catching the whole enum keeps this true if another pre-check is
-            // added in front of the session later.
-            SecureLogger.warning("🚫 Rejected decrypt from \(peerID.id.prefix(8))… before the session was consulted (\(policyError)); keeping any established session", category: .security)
+        } catch NoiseSecurityError.messageTooLarge, NoiseSecurityError.rateLimitExceeded {
+            // These two, and only these two, are policy rejections that
+            // `NoiseEncryptionService.decrypt` raises *before* it consults the
+            // session: `messageTooLarge` ahead of both the rate limiter and the
+            // `hasEstablishedSession` guard, `rateLimitExceeded` ahead of the
+            // guard. Neither says anything about session health and neither
+            // needs a session to provoke, so counting them would hand back the
+            // teardown primitive this method exists to remove — three oversized
+            // frames under a victim's claimed sender ID, at zero rate-limit
+            // cost, would otherwise evict that victim's session.
+            //
+            // Enumerate them rather than catching `NoiseSecurityError` whole.
+            // The enum also carries session-originated cases — `sessionExpired`
+            // is thrown from inside `SecureNoiseSession.decrypt`, after the
+            // established-session guard has passed — and those are exactly the
+            // evidence the counting path below exists to act on. A broad catch
+            // swallows any such case silently; listing the pre-session two makes
+            // a newly added case a visible decision instead.
+            SecureLogger.warning("🚫 Rejected decrypt from \(peerID.id.prefix(8))… before the session was consulted; keeping any established session", category: .security)
         } catch {
-            // Decryption failed. Anyone can emit a packet under any claimed sender
-            // ID, so a single AEAD failure is not evidence that our session is out
-            // of sync, and tearing it down on one packet is the same denial of
-            // service this file now refuses on the handshake path. Only a run of
-            // consecutive failures indicates real desync (nonce mismatch, peer
-            // restart), and any successful decrypt resets the run.
+            // Decryption failed against the session itself. Anyone can emit a
+            // packet under any claimed sender ID, so a single AEAD failure is not
+            // evidence that our session is out of sync, and tearing it down on one
+            // packet is the same denial of service this file now refuses on the
+            // handshake path. Only a run of consecutive failures indicates real
+            // desync (nonce mismatch, peer restart), and any successful decrypt
+            // resets the run.
+            //
+            // `NoiseSecurityError.sessionExpired` reaches here deliberately: it is
+            // raised by the session, past the established-session guard, and is
+            // the session reporting that it is finished. This is its only
+            // decrypt-side recovery — nothing else clears an aged-out session
+            // promptly, since `needsRenegotiation()` keys off `lastActivityTime`,
+            // which stops advancing once decrypt starts throwing.
             guard noteDecryptFailed(for: peerID) else {
                 SecureLogger.warning("❌ Failed to decrypt message from \(peerID.id.prefix(8))…; keeping the session: \(error)", category: .security)
                 return

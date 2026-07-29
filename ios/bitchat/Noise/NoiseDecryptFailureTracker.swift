@@ -49,6 +49,12 @@ struct NoiseDecryptFailureTracker {
         // reset every peer's run at once, so anyone who could get entries in
         // here could erase a genuinely desynchronized peer's progress on demand
         // and keep it from ever reaching the threshold that recovers it.
+        //
+        // The victim is whichever key the dictionary yields first, which is
+        // unordered — so eviction can take a peer mid-run rather than an idle
+        // one. Reaching the cap needs `trackingCap` concurrent established
+        // sessions, so this is not reachable in practice; if it ever is, hold
+        // a last-touched timestamp per entry and evict the stalest.
         if counts[peerID] == nil, counts.count >= trackingCap, let victim = counts.keys.first {
             counts.removeValue(forKey: victim)
         }
