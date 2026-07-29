@@ -360,7 +360,12 @@ struct SonarNSEDecoratePolicyTests {
         let store = SonarChatMuteStore(defaults: defaults, key: storeKey)
 
         let gid = String(repeating: "ab", count: 32) // 64-hex group id
-        let npub = "npub1exampleexample"
+        // A REAL npub, not a syntactic lookalike. "npub1exampleexample" does
+        // not decode, so it round-trips unchanged and the test stayed green
+        // even with the bech32 -> hex conversion deleted — i.e. it proved
+        // nothing about the representation mismatch it exists to guard.
+        let npub = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+        let npubHex = "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
         let until = Date().addingTimeInterval(3600)
         for raw in [gid, "marmot:" + gid, npub] {
             store.mute(keys: [raw], until: until)
@@ -374,6 +379,19 @@ struct SonarNSEDecoratePolicyTests {
         for stored in store.mutedUntil.keys {
             #expect(lookedUp.contains(stored), "NSE lookup misses stored mute key \(stored)")
         }
+        // The real point: production drains carry `sender.to_string()` = 64-hex,
+        // so a mute stored under the npub MUST also be findable by hex. Assert
+        // both encodings are candidates, and that a hex-only sender matches.
+        #expect(lookedUp.contains(npubHex), "hex form of the npub must be a lookup candidate")
+        let hexOnlyLookup = Set(
+            SonarNSEDecoratePolicy.mutedLookupCandidates(
+                groupIdHex: "", senderNpub: npubHex, groupName: ""
+            )
+        )
+        #expect(
+            hexOnlyLookup.contains(npub) || hexOnlyLookup.contains(npubHex),
+            "a hex sender must reach the npub-keyed mute"
+        )
 
         // Round-trip the store's OWN persisted blob, so the implicit
         // JSONEncoder/JSONDecoder date-strategy agreement is pinned too.

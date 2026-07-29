@@ -403,7 +403,14 @@ enum SonarPushProcessor {
             // marmot:<groupId> conversation id this loop puts in userInfo.
             // (Drained rows DO carry a group id; core sets group_id_hex on
             // every DrainNotification.)
-            if notif.groupName.isEmpty, !notif.senderNpub.isEmpty,
+            // Directness decided by the SAME helper the NSE uses. Testing
+            // `groupName.isEmpty` here while the NSE also treats the local
+            // placeholder as direct made the two disagree: a drained direct row
+            // carrying that placeholder took the DM branch in the NSE but not in
+            // this backstop, so when the NSE's mirror was stale or missing the
+            // host posted exactly the banner this backstop exists to suppress.
+            if SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil,
+               !notif.senderNpub.isEmpty,
                SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
                 // The NSE suppresses muted chats itself, but it fails open when
                 // the App Group mute mirror is missing (app updated and never
