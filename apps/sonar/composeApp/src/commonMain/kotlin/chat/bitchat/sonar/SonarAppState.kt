@@ -49,6 +49,7 @@ import chat.bitchat.sonar.resources.account_restored_chats_recovered_from
 import chat.bitchat.sonar.resources.account_restored_chats_start_empty
 import chat.bitchat.sonar.resources.backup_failed_try_again_when_online
 import chat.bitchat.sonar.resources.chat_backup_uploaded
+import chat.bitchat.sonar.resources.could_not_reopen_chats_after_backup
 import org.jetbrains.compose.resources.getString
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
@@ -3775,6 +3776,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                     )
                 }
 
+                // Pasting the key you are already signed in with is not a
+                // restore. Everything below is destructive — wallet storage,
+                // message store, media, pay ledger, nickname, then the Marmot
+                // database itself — and for the current account it would trade
+                // live chats for whatever Blossom last held, or for nothing at
+                // all if this user never enabled backup.
+                if (npub.isNotBlank() && npub == expectedNpub) {
+                    sonarLog("Identity", "restore: key matches the signed-in account — nothing to do")
+                    return@runCatching
+                }
+
                 // Unregister the old offer while its node is still available, but
                 // preserve the device token for immediate registration by the new
                 // account. Wallet teardown/storage removal are strict: no identity
@@ -3902,13 +3914,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // will not re-fire — boot explicitly. From onboarding, false→true
                 // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
                 if (needsExplicitBoot) boot()
-                toast = when (SonarCore.lastImportBackupOutcome()) {
+                when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
-                        getString(Res.string.account_restored_chats_recovered_from)
+                        toast = getString(Res.string.account_restored_chats_recovered_from)
                     AccountBackupRestoreOutcome.Missing ->
-                        getString(Res.string.account_restored_chats_start_empty)
+                        toast = getString(Res.string.account_restored_chats_start_empty)
                     AccountBackupRestoreOutcome.Failed ->
-                        getString(Res.string.account_restored_chat_backup_restore)
+                        toast = getString(Res.string.account_restored_chat_backup_restore)
+                    // Same account re-pasted: nothing was replaced, so say nothing.
+                    AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
@@ -4066,12 +4080,12 @@ class SonarAppState(private val scope: CoroutineScope) {
             cancelMarmotJobsForExclusiveBackup()
             SonarCore.sealAccountBackup()
         }.onFailure { err ->
-            runCatching { ensureMarmotAfterExclusiveSeal() }
+            reopenMarmotAfterSealOrReport()
             runCatching {
                 SonarCore.recordBackupFailure(err.message ?: "backup failed")
             }
         }.getOrNull() ?: return false
-        if (runCatching { ensureMarmotAfterExclusiveSeal() }.isFailure) {
+        if (!reopenMarmotAfterSealOrReport()) {
             runCatching {
                 SonarCore.recordBackupFailure("reconnect failed")
             }
@@ -4148,6 +4162,25 @@ class SonarAppState(private val scope: CoroutineScope) {
      * (accepts LocalStateLaunchSurface flash) so the Marmot node is never left
      * closed when both soft attempts fail.
      */
+    /**
+     * Reopen after a seal, reporting a total failure instead of swallowing it.
+     *
+     * [ensureMarmotAfterExclusiveSeal] exhausting every attempt leaves the node
+     * closed: chat is dead until the app is restarted. Recording a backup
+     * failure alone is not enough — the user sees a silently broken app and no
+     * reason for it.
+     *
+     * @return true when the node is open again.
+     */
+    private suspend fun reopenMarmotAfterSealOrReport(): Boolean {
+        val reopened = runCatching { ensureMarmotAfterExclusiveSeal() }
+        if (reopened.isFailure) {
+            sonarLog("Backup", "reopen after seal FAILED: ${reopened.exceptionOrNull()?.message}")
+            toast = getString(Res.string.could_not_reopen_chats_after_backup)
+        }
+        return reopened.isSuccess
+    }
+
     private suspend fun ensureMarmotAfterExclusiveSeal() {
         try {
             reconnectAfterAccountBackupSeal()
@@ -4209,12 +4242,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 cancelMarmotJobsForExclusiveBackup()
                 SonarCore.sealAccountBackup()
             }.onFailure { err ->
-                runCatching { ensureMarmotAfterExclusiveSeal() }
+                reopenMarmotAfterSealOrReport()
                 runCatching {
                     SonarCore.recordBackupFailure(err.message ?: "auto-backup failed")
                 }
             }.getOrNull() ?: return
-            if (runCatching { ensureMarmotAfterExclusiveSeal() }.isFailure) {
+            if (!reopenMarmotAfterSealOrReport()) {
                 runCatching {
                     SonarCore.recordBackupFailure("auto-backup reconnect failed")
                 }

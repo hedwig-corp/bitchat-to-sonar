@@ -30,6 +30,10 @@ enum AccountBackupRestoreOutcome: Equatable, Sendable {
     case restored
     case missing
     case failed
+    /// The pasted key is the one already signed in — nothing was wiped,
+    /// downloaded, or replaced. Distinct from `restored`: there is no backup
+    /// involved and no toast to show, because nothing happened.
+    case unchanged
 }
 
 final class MarmotService: @unchecked Sendable {
@@ -1722,10 +1726,19 @@ final class MarmotService: @unchecked Sendable {
         guard let nsec = snapshotIdentity()?.nsec() else {
             throw ServiceError.core("no identity to preview")
         }
+        // Passed only to place the scratch copy in app-private storage; the
+        // core never reads or writes this file during a preview.
+        let (dbPath, _) = try Self.databaseConfig()
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
-                    continuation.resume(returning: try previewAccountBackup(nsec: nsec, blossomServer: nil))
+                    continuation.resume(
+                        returning: try previewAccountBackup(
+                            nsec: nsec,
+                            dbPath: dbPath,
+                            blossomServer: nil
+                        )
+                    )
                 } catch {
                     continuation.resume(throwing: error)
                 }

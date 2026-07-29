@@ -127,6 +127,7 @@
     <string name="content_payment_lightning">pay via lightning</string>
     <string name="continue_">Continue</string>
     <string name="could_not_load_sticker_pack">Could not load sticker pack</string>
+    <string name="could_not_reopen_chats_after_backup">Could not reopen chats after backup — please restart Sonar</string>
     <string name="could_not_update_auto_backup_setting">Could not update auto-backup setting</string>
     <string name="couldn_t_decode_image">Couldn't decode image</string>
     <string name="couldn_t_load_stickers">Couldn't load stickers</string>

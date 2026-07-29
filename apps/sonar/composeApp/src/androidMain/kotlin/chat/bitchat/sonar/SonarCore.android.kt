@@ -889,6 +889,18 @@ actual object SonarCore {
                 val previousIdentity = AndroidSecrets
                     .getMigrating("nsec", durable = true)
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                // Re-pasting the key you are already signed in with must be a
+                // no-op. The path below wipes the store and restores from
+                // Blossom: for the same account that trades a live database for
+                // whatever was last uploaded, and for anyone who never enabled
+                // backup it destroys every chat with nothing to restore.
+                if (previousIdentity != null && previousIdentity.npub() == identity.npub()) {
+                    sonarLog("Identity", "import matches the current account — keeping local data")
+                    npub = identity.npub()
+                    pubkeyHex = identity.pubkeyHex()
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write npub
+                }
                 closeNode()
                 val marmotDir = File(ctx.filesDir, "sonar-marmot")
                 try {
@@ -997,8 +1009,10 @@ actual object SonarCore {
     actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
         val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
             ?: error("no identity to preview")
-        // No lock, no closeNode: the preview never touches the live store.
-        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, null)
+        // No lock, no closeNode: the preview never touches the live store. The
+        // DB path is passed only so the scratch copy lands in app-private
+        // storage — Android app processes have no usable process temp dir.
+        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, marmotDbPath(), null)
         AccountBackupPreview(
             conversations = info.conversations.map {
                 BackupPreviewConversation(it.name, it.latestContent, it.messageCount.toLong())

@@ -51,7 +51,9 @@ fn main() {
         "preview" => {
             let preview = rt
                 .block_on(sonar_core::account_backup::preview_account_backup(
-                    &keys, "",
+                    &keys,
+                    Path::new(&db_path),
+                    "",
                 ))
                 .expect("preview");
             println!(

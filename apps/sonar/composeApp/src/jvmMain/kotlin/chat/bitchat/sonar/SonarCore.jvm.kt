@@ -879,6 +879,15 @@ actual object SonarCore {
                 val previousIdentity = DesktopSecrets
                     .get("nsec")
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                // Same guard as Android: re-pasting the signed-in key must not
+                // wipe the store and fall back to whatever Blossom last held.
+                if (previousIdentity != null && previousIdentity.npub() == identity.npub()) {
+                    sonarLog("Identity", "import matches the current account — keeping local data")
+                    npub = identity.npub()
+                    pubkeyHex = identity.pubkeyHex()
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write npub
+                }
                 closeNode()
                 val marmotDir = marmotDir()
                 try {
@@ -976,8 +985,9 @@ actual object SonarCore {
     actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
         SonarNativeLoader.ensureLoaded()
         val nsec = DesktopSecrets.get("nsec") ?: error("no identity to preview")
-        // No lock, no closeNode: the preview never touches the live store.
-        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, null)
+        // No lock, no closeNode: the preview never touches the live store. The
+        // DB path only places the scratch copy beside the account data.
+        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, marmotDbPath(), null)
         AccountBackupPreview(
             conversations = info.conversations.map {
                 BackupPreviewConversation(it.name, it.latestContent, it.messageCount.toLong())

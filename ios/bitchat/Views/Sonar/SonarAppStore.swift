@@ -2219,7 +2219,20 @@ final class SonarAppStore: ObservableObject {
         let key = nsec.trimmingCharacters(in: .whitespacesAndNewlines)
         // Validate before any destructive work. An invalid paste must leave the
         // current identity, chats, wallet, and push registrations untouched.
-        _ = try SonarIdentity.import(nsec: key)
+        let incoming = try SonarIdentity.import(nsec: key)
+
+        // Pasting the key you are already signed in with is not a restore.
+        // Everything below is destructive — wallet storage wipe, host cache
+        // clear, Marmot store wipe — and for the current account it would trade
+        // a live database for whatever was last uploaded, or for nothing at all
+        // if this user never enabled backup. Bail before the first wipe.
+        if let current = marmot.npub, current == incoming.npub() {
+            SecureLogger.info(
+                "ℹ️ Restore account: key matches the signed-in account — nothing to do",
+                category: .session
+            )
+            return
+        }
 
         // Hold Marmot's send/setup suspension across wallet deletion and every
         // host-owned cache mutation, not just the core database replacement.
@@ -2272,6 +2285,9 @@ final class SonarAppStore: ObservableObject {
             showToast(String(localized: "Account restored — chats start empty until you back up"))
         case .failed:
             showToast(String(localized: "Account restored — chat backup restore failed; try again when online"))
+        case .unchanged:
+            // Same account, nothing replaced — no toast, because nothing happened.
+            break
         }
     }
 

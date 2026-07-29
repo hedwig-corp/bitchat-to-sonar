@@ -508,6 +508,10 @@ fn now_unix_secs() -> u64 {
 
 /// Best-effort wipe of the policy sidecar (panic wipe / account reset).
 pub fn wipe_backup_policy_for_db(db_path: &Path) {
+    // An erase must also drop any in-flight restore. Leaving staging plus its
+    // intent marker behind would let the next boot's reconcile promote the
+    // backup over the account the user just erased.
+    abort_staged_account_restore(db_path);
     with_policy_state(|map| {
         map.remove(&policy_cache_key(db_path));
     });
@@ -733,11 +737,41 @@ pub fn read_account_backup_package(
 /// persisted yet). Host must [`commit_staged_account_restore`] or
 /// [`abort_staged_account_restore`].
 const RESTORE_STAGING_SUFFIX: &str = ".sonar-restore-staging";
+const RESTORE_INTENT_SUFFIX: &str = ".sonar-restore-intent";
 
 fn staging_db_path(db_path: &Path) -> std::path::PathBuf {
     let mut staged = db_path.as_os_str().to_owned();
     staged.push(RESTORE_STAGING_SUFFIX);
     std::path::PathBuf::from(staged)
+}
+
+/// Marker proving a restore was actually asked for, written next to the staging
+/// DB and cleared by both commit and abort.
+///
+/// Boot reconcile promotes staged bytes over the live account. Presence of a
+/// staging file alone is not proof of intent: a staging DB left by an
+/// interrupted restore of *this same account* opens under the live key, so
+/// without this marker reconcile would silently roll the database back to the
+/// backup and drop everything received since.
+fn restore_intent_path(db_path: &Path) -> std::path::PathBuf {
+    let mut p = db_path.as_os_str().to_owned();
+    p.push(RESTORE_INTENT_SUFFIX);
+    std::path::PathBuf::from(p)
+}
+
+fn mark_restore_intent(db_path: &Path) -> Result<()> {
+    let path = restore_intent_path(db_path);
+    let mut f = File::create(&path)
+        .map_err(|e| Error::Storage(format!("restore intent create {}: {e}", path.display())))?;
+    f.write_all(b"1")
+        .map_err(|e| Error::Storage(format!("restore intent write: {e}")))?;
+    f.sync_all()
+        .map_err(|e| Error::Storage(format!("restore intent fsync: {e}")))?;
+    Ok(())
+}
+
+fn clear_restore_intent(db_path: &Path) {
+    let _ = fs::remove_file(restore_intent_path(db_path));
 }
 
 fn remove_db_tree(db_path: &Path) {
@@ -811,6 +845,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     if !staged.is_file() {
         // Already promoted (or never staged). Finish any leftover staged index.
         promote_staged_index_best_effort(db_path);
+        clear_restore_intent(db_path);
         return Ok(());
     }
     sync_file(&staged)?;
@@ -827,6 +862,10 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
         p.push(suffix);
         let _ = fs::remove_file(Path::new(&p));
     }
+    // Last: the restore is done, so the intent must not survive to the next
+    // boot. Clearing it before the rename would let a crash mid-commit look
+    // like an unrequested staging file and get aborted.
+    clear_restore_intent(db_path);
     Ok(())
 }
 
@@ -860,6 +899,7 @@ fn promote_staged_index_best_effort(db_path: &Path) {
 /// aborting staging is what orphans chats.
 pub fn abort_staged_account_restore(db_path: &Path) {
     remove_db_tree(&staging_db_path(db_path));
+    clear_restore_intent(db_path);
 }
 
 fn verify_sqlcipher_opens(path: &Path, db_key_hex: &str) -> Result<()> {
@@ -894,6 +934,20 @@ pub fn reconcile_staged_account_restore(db_path: &Path, db_key_hex: &str) -> Res
     if !staged.is_file() {
         // Crash after DB rename / before index rename — finish the index only.
         promote_staged_index_best_effort(db_path);
+        clear_restore_intent(db_path);
+        return Ok(false);
+    }
+    // Staging without intent is debris, not a restore. Promoting it would
+    // overwrite the live account with older bytes — and when the backup came
+    // from this same install the key check cannot tell the two apart, because
+    // the staged DB opens under the live key. Discard instead: the live
+    // database is always the safer of the two to keep.
+    if !restore_intent_path(db_path).is_file() {
+        tracing::warn!(
+            db = %db_path.display(),
+            "restore staging without intent marker; discarding rather than promoting"
+        );
+        abort_staged_account_restore(db_path);
         return Ok(false);
     }
     match verify_sqlcipher_opens(&staged, db_key_hex) {
@@ -1032,6 +1086,91 @@ async fn list_account_backup_blobs(keys: &Keys, base: &Url) -> Result<Vec<BlobDe
         .map_err(|e| Error::Blossom(format!("blossom list decode: {e}")))
 }
 
+/// BUD-01 blob endpoint for `sha256`: `{base}/{sha256}`.
+///
+/// Segment-wise for the same reason as [`backup_list_url`]: `Url::join` would
+/// drop the last path segment of a based-under-a-path server.
+fn backup_blob_url(base: &Url, sha256: &Sha256Hash) -> Result<Url> {
+    let mut url = base.clone();
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| Error::Blossom(format!("blossom base cannot be a base: {base}")))?;
+        segments.pop_if_empty();
+        segments.push(&sha256.to_string());
+    }
+    Ok(url)
+}
+
+/// Download a blob, refusing to buffer more than `MAX_BACKUP_BYTES`.
+///
+/// `BlossomClient::get_blob` calls `Response::bytes()`, which buffers the whole
+/// body before any size check can run. The advertised `size` in the list
+/// response is the server's own claim, so a hostile or compromised host can
+/// advertise a small blob and then stream gigabytes — turning a restore into an
+/// OOM kill on a phone. Cap the read itself and abort mid-stream instead.
+async fn download_blob_capped(keys: &Keys, base: &Url, sha256: Sha256Hash) -> Result<Vec<u8>> {
+    download_blob_capped_to(keys, base, sha256, MAX_BACKUP_BYTES).await
+}
+
+/// Same, with an injectable ceiling so tests can prove the mid-stream abort
+/// without moving 200 MiB.
+async fn download_blob_capped_to(
+    keys: &Keys,
+    base: &Url,
+    sha256: Sha256Hash,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    let url = backup_blob_url(base, &sha256)?;
+    let expiration = Timestamp::now() + std::time::Duration::from_secs(300);
+    let auth_event = EventBuilder::new(Kind::BlossomAuth, "Blossom get authorization")
+        .tags([
+            Tag::parse(["server", &blossom_server_scope(base)])
+                .map_err(|e| Error::Blossom(format!("blossom server tag: {e}")))?,
+            Tag::expiration(expiration),
+            Tag::hashtag("get"),
+            Tag::parse(["x", &sha256.to_string()])
+                .map_err(|e| Error::Blossom(format!("blossom x tag: {e}")))?,
+        ])
+        .sign(keys)
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom get auth: {e}")))?;
+    let header = {
+        use base64::Engine as _;
+        format!(
+            "Nostr {}",
+            base64::engine::general_purpose::STANDARD.encode(auth_event.as_json())
+        )
+    };
+    let mut response = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, header)
+        .send()
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom get: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Blossom(format!("blossom get http {status}")));
+    }
+    // Trust the advertised length only as a pre-allocation hint, never as a bound.
+    let mut body = Vec::with_capacity(
+        response.content_length().unwrap_or(0).min(limit as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Blossom(format!("blossom get body: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(Error::Blossom(
+                "downloaded backup exceeds size cap".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Hosts to search on restore: the caller's server, or — when it defaulted —
 /// the current default followed by [`LEGACY_BACKUP_BLOSSOM_SERVERS`].
 ///
@@ -1077,14 +1216,42 @@ pub struct AccountBackupPreview {
 /// never disturb the live SQLCipher store, leave staged files behind, or race
 /// the node — the failure mode of a "preview" that mutates state is losing the
 /// chats the user was trying to inspect.
-pub async fn preview_account_backup(keys: &Keys, server_url: &str) -> Result<AccountBackupPreview> {
-    preview_account_backup_from(keys, &backup_search_hosts(server_url)?).await
+///
+/// `db_path` is not read or written — only its directory is used to place the
+/// scratch copy. It must be the live DB path so the scratch lands in
+/// app-private storage: the process temp dir is **not** usable on Android,
+/// where `TMPDIR` is unset for app processes and `/tmp` is `shell`-owned and
+/// unwritable, so `env::temp_dir()` fails the dry run outright.
+pub async fn preview_account_backup(
+    keys: &Keys,
+    db_path: &Path,
+    server_url: &str,
+) -> Result<AccountBackupPreview> {
+    preview_account_backup_from(keys, db_path, &backup_search_hosts(server_url)?).await
+}
+
+/// Scratch dir for the dry run, always inside `db_path`'s own directory.
+///
+/// Returns a [`TempDir`] so the decrypted index is removed on every exit path,
+/// including errors and panics.
+fn preview_scratch_dir(db_path: &Path) -> Result<tempfile::TempDir> {
+    let parent = db_path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|e| Error::Storage(format!("backup preview scratch parent: {e}")))?;
+    tempfile::Builder::new()
+        .prefix(".sonar-backup-preview-")
+        .tempdir_in(parent)
+        .map_err(|e| Error::Storage(format!("backup preview scratch dir: {e}")))
 }
 
 /// Same, against already-validated hosts. Split out so tests can drive the real
 /// download -> decrypt -> read path against a loopback mock without loosening
 /// the https requirement in [`blossom_base`].
-async fn preview_account_backup_from(keys: &Keys, hosts: &[Url]) -> Result<AccountBackupPreview> {
+async fn preview_account_backup_from(
+    keys: &Keys,
+    db_path: &Path,
+    hosts: &[Url],
+) -> Result<AccountBackupPreview> {
     let (sealed, uploaded_at_secs) = download_latest_sealed_backup_with_meta(keys, hosts).await?;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     let size_bytes = sealed.len() as u64;
@@ -1098,8 +1265,7 @@ async fn preview_account_backup_from(keys: &Keys, hosts: &[Url]) -> Result<Accou
         });
     };
 
-    let scratch = tempfile::tempdir()
-        .map_err(|e| Error::Storage(format!("backup preview scratch dir: {e}")))?;
+    let scratch = preview_scratch_dir(db_path)?;
     let index_path = scratch.path().join("preview-index.db");
     fs::write(&index_path, index_bytes)
         .map_err(|e| Error::Storage(format!("backup preview index write: {e}")))?;
@@ -1185,7 +1351,6 @@ async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Resul
 /// real list → download → verify path against a loopback mock without
 /// loosening the https requirement in [`blossom_base`].
 async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec<u8>> {
-    let client = BlossomClient::new(base.clone());
     let mut blobs = list_account_backup_blobs(keys, base).await?;
     blobs.retain(|b| b.mime_type.as_deref() == Some(ACCOUNT_BACKUP_MIME));
     if blobs.is_empty() {
@@ -1199,13 +1364,7 @@ async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec
             latest.size
         )));
     }
-    let data = client
-        .get_blob(latest.sha256, None, None, Some(keys))
-        .await
-        .map_err(|e| Error::Blossom(e.to_string()))?;
-    if data.len() > MAX_BACKUP_BYTES {
-        return Err(Error::Blossom("downloaded backup exceeds size cap".into()));
-    }
+    let data = download_blob_capped(keys, base, latest.sha256).await?;
     let hash = Sha256Hash::hash(&data);
     if hash != latest.sha256 {
         return Err(Error::Blossom("backup sha256 mismatch".into()));
@@ -1286,6 +1445,11 @@ pub async fn restore_account_files(
     }
     // Refuse to hand hosts a key for corrupt / wrong-key empty SQLCipher bytes.
     verify_sqlcipher_opens(&staged, &package.db_key_hex)?;
+    // Only now, with verified staged bytes on disk, record that a restore was
+    // genuinely requested. Boot reconcile promotes staging only against this
+    // marker; written last so a crash mid-staging leaves debris that reconcile
+    // discards instead of promoting over the live account.
+    mark_restore_intent(db_path)?;
     Ok(package.db_key_hex)
 }
 
@@ -1786,9 +1950,50 @@ mod tests {
             conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (7);")
                 .unwrap();
         }
+        mark_restore_intent(&db_path).unwrap();
         assert!(reconcile_staged_account_restore(&db_path, &key_hex).unwrap());
         assert!(db_path.is_file());
         assert!(!staged.is_file());
+        assert!(
+            !restore_intent_path(&db_path).exists(),
+            "a committed restore must not re-arm reconcile on the next boot"
+        );
+    }
+
+    /// Staging that nobody asked for must never be promoted. The dangerous
+    /// shape is a backup taken by *this* install: the staged DB opens under the
+    /// live key, so the key check cannot reject it, and promoting would roll
+    /// the account back to the backup and drop every message since.
+    #[test]
+    fn reconcile_discards_staging_with_no_intent_marker() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        // Live account, same key as the leftover staging.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+                .unwrap();
+            conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (99);")
+                .unwrap();
+        }
+        let live_before = std::fs::read(&db_path).unwrap();
+        let staged = staging_db_path(&db_path);
+        {
+            let conn = Connection::open(&staged).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+                .unwrap();
+            conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+        }
+        // No mark_restore_intent: this staging is debris, not a restore.
+        assert!(!reconcile_staged_account_restore(&db_path, &key_hex).unwrap());
+        assert!(!staged.is_file(), "debris staging must be cleaned up");
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            live_before,
+            "the live account must survive byte-identical"
+        );
     }
 
     #[test]
@@ -1804,9 +2009,11 @@ mod tests {
                 .unwrap();
             conn.execute_batch("CREATE TABLE t (v INTEGER);").unwrap();
         }
+        mark_restore_intent(&db_path).unwrap();
         assert!(!reconcile_staged_account_restore(&db_path, &wrong).unwrap());
         assert!(!staged.is_file());
         assert!(!db_path.is_file());
+        assert!(!restore_intent_path(&db_path).exists());
     }
 
     #[test]
@@ -2027,10 +2234,12 @@ mod tests {
     #[tokio::test]
     async fn preview_lists_the_chats_inside_the_backup() {
         let keys = Keys::generate();
-        let (_dir, _db, sealed) = sealed_account_with_chats(&keys);
+        let (_dir, db, sealed) = sealed_account_with_chats(&keys);
         let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
 
-        let preview = preview_account_backup_from(&keys, &[base]).await.unwrap();
+        let preview = preview_account_backup_from(&keys, &db, &[base])
+            .await
+            .unwrap();
 
         assert_eq!(preview.size_bytes, sealed.len() as u64);
         assert_eq!(
@@ -2055,13 +2264,29 @@ mod tests {
     #[tokio::test]
     async fn preview_leaves_the_live_account_byte_identical() {
         let keys = Keys::generate();
-        let (dir, _db, sealed) = sealed_account_with_chats(&keys);
+        let (dir, db, sealed) = sealed_account_with_chats(&keys);
         let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed);
 
         let before = account_fingerprint(dir.path());
         assert!(!before.is_empty(), "fixture must have written files");
 
-        preview_account_backup_from(&keys, &[base]).await.unwrap();
+        preview_account_backup_from(&keys, &db, &[base])
+            .await
+            .unwrap();
+
+        // The scratch dir now lives *inside* the account dir (it cannot live in
+        // the process temp dir — see `preview_scratch_dir`), so assert it was
+        // reaped: a leaked dir means a decrypted index outlived the call.
+        let leftover_dirs: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftover_dirs.is_empty(),
+            "preview left scratch dirs behind: {leftover_dirs:?}"
+        );
 
         let after = account_fingerprint(dir.path());
         assert_eq!(
@@ -2074,6 +2299,32 @@ mod tests {
         }
     }
 
+    /// A restore must not be able to OOM the app. The advertised blob size is
+    /// the server's own claim, so the ceiling has to bind the body itself:
+    /// stop reading mid-stream rather than buffering whatever arrives.
+    #[tokio::test]
+    async fn download_refuses_a_body_over_the_cap() {
+        use sha2::Digest;
+        let keys = Keys::generate();
+        let blob = vec![7u8; 4096];
+        let sha = Sha256Hash::from_slice(&sha2::Sha256::digest(&blob)).unwrap();
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), blob.clone());
+
+        let err = download_blob_capped_to(&keys, &base, sha, 1024)
+            .await
+            .expect_err("4096 bytes must not pass a 1024 byte ceiling");
+        assert!(
+            err.to_string().contains("exceeds size cap"),
+            "got {err:?}"
+        );
+
+        // Same blob, ample ceiling: the cap must not break honest restores.
+        let ok = download_blob_capped_to(&keys, &base, sha, 8192)
+            .await
+            .expect("under the ceiling");
+        assert_eq!(ok, blob);
+    }
+
     /// No backup on the server is a typed miss, not a transport failure — hosts
     /// key their copy off that distinction.
     #[tokio::test]
@@ -2081,10 +2332,34 @@ mod tests {
         let keys = Keys::generate();
         let (base, _seen) =
             spawn_mock_blossom_list(Keys::generate().public_key(), b"someone else".to_vec());
-        let err = preview_account_backup_from(&keys, &[base])
+        let dir = tempdir().unwrap();
+        let err = preview_account_backup_from(&keys, &dir.path().join("marmot.sqlite"), &[base])
             .await
             .expect_err("nothing stored for this pubkey");
         assert!(is_missing_backup_error(&err), "got {err:?}");
+    }
+
+    /// Regression pin for the Android dry run. `tempfile::tempdir()` resolves
+    /// `env::temp_dir()`, which on Android is `/tmp` (unset `TMPDIR`) — a
+    /// `shell`-owned dir the app UID cannot write, so the preview failed on
+    /// every device. The scratch must live beside the DB, in app-private
+    /// storage, and must never depend on the process temp dir.
+    #[test]
+    fn preview_scratch_lives_beside_the_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("nested").join("marmot.sqlite");
+
+        let scratch = preview_scratch_dir(&db_path).unwrap();
+        let path = scratch.path().to_path_buf();
+
+        assert!(
+            path.starts_with(db_path.parent().unwrap()),
+            "scratch {} escaped the account dir",
+            path.display()
+        );
+        assert!(path.is_dir(), "scratch dir was not created (parent unmade?)");
+        drop(scratch);
+        assert!(!path.exists(), "scratch dir must be reaped on drop");
     }
 
     #[test]

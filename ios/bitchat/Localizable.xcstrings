@@ -60,6 +60,9 @@
     "No backup yet" : {
 
     },
+    "Could not reopen chats after backup — please restart Sonar" : {
+
+    },
     "Could not update auto-backup setting" : {
 
     },

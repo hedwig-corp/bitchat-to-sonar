@@ -1011,13 +1011,29 @@ final class MarmotChatModel: ObservableObject {
         let nsec = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         // Validate without mutating the live service. A failed import must leave
         // the currently connected identity and its local database untouched.
-        _ = try SonarIdentity.import(nsec: nsec)
+        let incoming = try SonarIdentity.import(nsec: nsec)
         // Retain the previous account key only in memory until the replacement
         // local database is open. If that final commit step fails, restore the
         // old identity instead of returning an error with a half-switched account.
         let previousNsec = await service.exportNsec()
             ?? keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
                 .flatMap { String(data: $0, encoding: .utf8) }
+        // Re-pasting the key you are already signed in with must be a no-op.
+        // Below, an import wipes the store and restores from Blossom — for the
+        // same account that trades a live database for whatever was last
+        // uploaded, and for anyone who never enabled backup it destroys every
+        // chat with nothing to restore. Compare derived npubs, not raw strings,
+        // and read the stored key (not just the connected node) so the guard
+        // also holds before the first connect.
+        let currentNpub = await service.currentNpub()
+            ?? previousNsec.flatMap { try? SonarIdentity.import(nsec: $0).npub() }
+        if let currentNpub, currentNpub == incoming.npub() {
+            SecureLogger.info(
+                "ℹ️ Identity import is the current account — keeping the local database",
+                category: .session
+            )
+            return .unchanged
+        }
         // Block connectIfNeeded while the old node, database, and identity-bound
         // caches are invalidated and the replacement identity is connected.
         busy = true

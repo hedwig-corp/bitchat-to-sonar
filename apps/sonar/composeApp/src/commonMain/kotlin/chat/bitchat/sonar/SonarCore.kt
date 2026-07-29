@@ -538,7 +538,14 @@ data class SonarChannelMsg(
 enum class SonarCallState { Ringing, Connecting, Connected, Ended, Failed, Declined, Busy, Missed }
 
 /** Result of soft-trying a Blossom Marmot backup during nsec import. */
-enum class AccountBackupRestoreOutcome { Restored, Missing, Failed }
+/**
+ * Result of an identity import.
+ *
+ * [Unchanged] means the pasted key is the account already signed in: nothing
+ * was wiped, downloaded, or replaced. It is deliberately distinct from
+ * [Restored] — no backup was involved, so there is nothing to report.
+ */
+enum class AccountBackupRestoreOutcome { Restored, Missing, Failed, Unchanged }
 
 /** A call state change emitted by the engine (drained via [SonarCore.callWaitEvent]). */
 data class SonarCallEvent(

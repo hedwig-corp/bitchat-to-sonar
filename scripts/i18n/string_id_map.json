@@ -31,6 +31,7 @@
   "Compare these numbers with %@ in person or on a call. If they match, this chat is end-to-end encrypted and nobody is in the middle.": "compare_these_numbers_with_in_person_or_2",
   "Continue": "continue_",
   "Could not load sticker pack": "could_not_load_sticker_pack",
+  "Could not reopen chats after backup — please restart Sonar": "could_not_reopen_chats_after_backup",
   "Could not update auto-backup setting": "could_not_update_auto_backup_setting",
   "Couldn't decode image": "couldn_t_decode_image",
   "Couldn't load stickers": "couldn_t_load_stickers",

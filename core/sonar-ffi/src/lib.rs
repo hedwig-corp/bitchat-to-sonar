@@ -350,9 +350,14 @@ pub struct AccountBackupPreviewInfo {
 /// Never stages or commits, and never opens the live store — it decrypts in
 /// memory and reads only the conversation index from a scratch copy that is
 /// deleted before returning. Safe to call with the node open.
+///
+/// `db_path` is neither read nor written; its directory is the scratch parent.
+/// Hosts must pass the real DB path — the process temp dir is unusable on
+/// Android, so a preview scratched there fails on every device.
 #[uniffi::export]
 pub fn preview_account_backup(
     nsec: String,
+    db_path: String,
     blossom_server: Option<String>,
 ) -> FfiResult<AccountBackupPreviewInfo> {
     let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
@@ -360,6 +365,7 @@ pub fn preview_account_backup(
     let runtime = backup_runtime()?;
     let preview = runtime.block_on(sonar_core::account_backup::preview_account_backup(
         identity.keys(),
+        Path::new(&db_path),
         &server,
     ))?;
     Ok(AccountBackupPreviewInfo {

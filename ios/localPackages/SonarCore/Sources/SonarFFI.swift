@@ -8278,11 +8278,16 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
  * Never stages or commits, and never opens the live store — it decrypts in
  * memory and reads only the conversation index from a scratch copy that is
  * deleted before returning. Safe to call with the node open.
+ *
+ * `db_path` is neither read nor written; its directory is the scratch parent.
+ * Hosts must pass the real DB path — the process temp dir is unusable on
+ * Android, so a preview scratched there fails on every device.
  */
-public func previewAccountBackup(nsec: String, blossomServer: String?)throws  -> AccountBackupPreviewInfo  {
+public func previewAccountBackup(nsec: String, dbPath: String, blossomServer: String?)throws  -> AccountBackupPreviewInfo  {
     return try  FfiConverterTypeAccountBackupPreviewInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_func_preview_account_backup(
         FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
         FfiConverterOptionString.lower(blossomServer),$0
     )
 })
@@ -8555,7 +8560,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_preview_account_backup() != 44957) {
+    if (uniffi_sonar_ffi_checksum_func_preview_account_backup() != 26257) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_reconcile_account_restore() != 25360) {
