@@ -48,6 +48,13 @@ actual object SonarCore {
      *  key and is NOT restorable from it (documented gap). */
     private const val WALLET_ENTROPY = "wallet.entropyHex"
 
+    /** Set while a signer login is persisted but onboarding has not completed.
+     *  A pending binding is not yet an account: the lost-prefs onboarding
+     *  recovery must not treat it as one, or a process death between the Amber
+     *  approval and the nickname step would skip onboarding and boot an
+     *  account with an empty profile. */
+    private const val SIGNER_PENDING = "signer.pendingLogin"
+
     // Must match the iOS MarmotService relays so the two interop.
     private val relayUrls = listOf(
         "wss://relay.damus.io",
@@ -887,7 +894,10 @@ actual object SonarCore {
                 SonarIdentity.import(saved)
                 return@runCatching true
             }
-            !AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank()
+            // A pending (mid-onboarding) signer login is not yet an account —
+            // see SIGNER_PENDING.
+            !AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank() &&
+                AndroidSecrets.get(SIGNER_PENDING) == null
         }
             .getOrDefault(false)
 
@@ -907,6 +917,9 @@ actual object SonarCore {
                 val kdfRoot = AndroidSecrets.get(SIGNER_KDF_ROOT) ?: randomHex32()
                 // Validate + normalize (hex or npub input) through the core.
                 val identity = SonarIdentity.remote(pubkey.trim(), kdfRoot, AmberSignerClient)
+                // Pending until onboarding completes (cleared in
+                // prepareIdentityForOnboarding) — see SIGNER_PENDING.
+                AndroidSecrets.put(SIGNER_PENDING, "1", durable = true)
                 // Update-in-place, durable commit — never delete-then-add.
                 AndroidSecrets.put(SIGNER_KDF_ROOT, kdfRoot, durable = true)
                 AndroidSecrets.put(SIGNER_PUBKEY, identity.pubkeyHex(), durable = true)
@@ -915,9 +928,7 @@ actual object SonarCore {
                 }
                 // The wallet entropy is minted here so a later killed-app push
                 // wake can open the wallet without any signer round-trip.
-                if (AndroidSecrets.get(WALLET_ENTROPY).isNullOrBlank()) {
-                    AndroidSecrets.put(WALLET_ENTROPY, randomHex32(), durable = true)
-                }
+                ensureWalletEntropy()
                 AmberSignerClient.currentUserHex = identity.pubkeyHex()
                 AmberSignerClient.signerPackage = AndroidSecrets.get(SIGNER_PACKAGE)
                 npub = identity.npub()
@@ -930,11 +941,18 @@ actual object SonarCore {
         val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
         if (nsec != null) return Bech32.nsecToSecretHex(nsec) ?: ""
         if (AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank()) return ""
-        AndroidSecrets.get(WALLET_ENTROPY)?.takeIf(String::isNotBlank)?.let { return it }
         // Self-heal a missing entropy (e.g. interrupted adopt): mint one now.
-        val entropy = randomHex32()
-        AndroidSecrets.put(WALLET_ENTROPY, entropy, durable = true)
-        return entropy
+        return ensureWalletEntropy()
+    }
+
+    /** Guards the wallet-entropy mint: boot (`setupWallet`) and a push wake can
+     *  race [walletSecretHex], and two mints would fork the device wallet. */
+    private val walletEntropyMintLock = Any()
+
+    /** Return the persisted wallet entropy, minting it exactly once. */
+    private fun ensureWalletEntropy(): String = synchronized(walletEntropyMintLock) {
+        AndroidSecrets.get(WALLET_ENTROPY)?.takeIf(String::isNotBlank)
+            ?: randomHex32().also { AndroidSecrets.put(WALLET_ENTROPY, it, durable = true) }
     }
 
     actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
@@ -945,7 +963,11 @@ actual object SonarCore {
             // Signer-backed onboarding: the account already exists in the
             // signer app — never mint a local key next to it.
             AndroidSecrets.get(SIGNER_PUBKEY)?.takeIf(String::isNotBlank)?.let {
-                return@withLock remoteIdentity(it).npub()
+                val remoteNpub = remoteIdentity(it).npub()
+                // Onboarding is completing right after this call — the binding
+                // is no longer a pending login.
+                AndroidSecrets.remove(SIGNER_PENDING, durable = true)
+                return@withLock remoteNpub
             }
             val identity = SonarIdentity.generate()
             AndroidSecrets.put("nsec", identity.nsec(), durable = true)
@@ -975,6 +997,7 @@ actual object SonarCore {
                     AndroidSecrets.remove(SIGNER_PACKAGE, durable = true)
                     AndroidSecrets.remove(SIGNER_KDF_ROOT, durable = true)
                     AndroidSecrets.remove(WALLET_ENTROPY, durable = true)
+                    AndroidSecrets.remove(SIGNER_PENDING, durable = true)
                     AmberSignerClient.reset()
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()

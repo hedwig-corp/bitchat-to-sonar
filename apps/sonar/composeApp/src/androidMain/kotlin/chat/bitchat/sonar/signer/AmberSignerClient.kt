@@ -4,6 +4,7 @@ import android.content.Intent
 import android.net.Uri
 import android.util.Log
 import chat.bitchat.sonar.AppContextHolder
+import chat.bitchat.sonar.SonarLifecycle
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
@@ -94,7 +95,8 @@ object AmberSignerClient : uniffi.sonar_ffi.ForeignNostrSigner {
         )
         when (viaProvider) {
             is ProviderResult.Success ->
-                return viaProvider.event ?: viaProvider.result
+                return viaProvider.event
+                    ?: viaProvider.result?.let { Nip55.assembleSignedEvent(unsignedEventJson, it) }
             ProviderResult.Rejected -> return null
             ProviderResult.Unavailable -> Unit // fall through to the intent path
         }
@@ -102,7 +104,10 @@ object AmberSignerClient : uniffi.sonar_ffi.ForeignNostrSigner {
             baseIntent(payload = unsignedEventJson, type = Nip55.TYPE_SIGN_EVENT),
         ) ?: return null
         if (response.rejected) return null
-        return response.event ?: response.result?.takeIf(Nip55::isUsableResult)
+        // Prefer the signer's full event; a signature-only response is
+        // assembled locally (the Rust adapter verifies either way).
+        return response.event
+            ?: response.result?.let { Nip55.assembleSignedEvent(unsignedEventJson, it) }
     }
 
     override fun nip44Encrypt(peerPubkeyHex: String, plaintext: String): String? =
@@ -199,6 +204,14 @@ object AmberSignerClient : uniffi.sonar_ffi.ForeignNostrSigner {
     private fun launchForResult(intent: Intent): Nip55.Response? {
         val launcher = ExternalSignerBridge.launchSignerIntent ?: run {
             Log.w(TAG, "no foreground activity for signer intent (${intent.getStringExtra("type")})")
+            return null
+        }
+        // Background sync must never pop the signer UI (the OS would block the
+        // start anyway) — fail fast instead of parking on the 60s timeout.
+        // Exception: while requests are in flight, the signer's own approval
+        // screen covers us (appVisible=false) and new intents merge into it.
+        if (!SonarLifecycle.appVisible && pending.isEmpty()) {
+            Log.w(TAG, "signer intent skipped: app not visible (${intent.getStringExtra("type")})")
             return null
         }
         val id = UUID.randomUUID().toString()

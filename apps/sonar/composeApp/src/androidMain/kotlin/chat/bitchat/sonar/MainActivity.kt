@@ -642,6 +642,9 @@ class MainActivity : ComponentActivity() {
         debugMeshGeneration++
         debugHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(adapterStateReceiver) }
+        // Drop the signer launcher: a destroyed activity can never deliver a
+        // result. On recreation onCreate installs the fresh one.
+        ExternalSignerBridge.launchSignerIntent = null
         MeshRadio.stop()
         super.onDestroy()
     }

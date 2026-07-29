@@ -99,6 +99,22 @@ object Nip55 {
     fun isUsableResult(result: String?): Boolean =
         !result.isNullOrBlank() && result != DECRYPT_FAILURE_SENTINEL
 
+    /**
+     * Assemble full signed-event JSON from the unsigned event JSON we sent and
+     * a bare 64-byte schnorr signature (some NIP-55 signers return only the
+     * `signature`/`result` extra, no `event`). Purely mechanical: appends a
+     * `"sig"` field to the JSON object. Callers verify the result end-to-end
+     * (id, author, signature) in the Rust adapter, so a bad assembly can only
+     * fail closed. Returns null when the inputs don't have the right shape.
+     */
+    fun assembleSignedEvent(unsignedEventJson: String, signatureHex: String): String? {
+        val sig = signatureHex.trim()
+        if (!sig.matches(Regex("^[0-9a-fA-F]{128}$"))) return null
+        val json = unsignedEventJson.trim()
+        if (!json.startsWith("{") || !json.endsWith("}")) return null
+        return json.dropLast(1) + ",\"sig\":\"" + sig + "\"}"
+    }
+
     // ── minimal JSON extraction (same no-dependency style as RelayDiagnostics) ──
 
     /** Split the body of a JSON array into its top-level `{...}` chunks. */

@@ -103,4 +103,19 @@ class Nip55Test {
         assertEquals("real-id", parsed[0].id)
         assertEquals("""payload with "id": inside""", parsed[0].result)
     }
+
+    @Test
+    fun assembleSignedEventAppendsSigField() {
+        val unsigned =
+            """{"id":"aa","pubkey":"bb","created_at":1,"kind":1,"tags":[],"content":"x"}"""
+        val sig = "c".repeat(128)
+        assertEquals(
+            """{"id":"aa","pubkey":"bb","created_at":1,"kind":1,"tags":[],"content":"x","sig":"$sig"}""",
+            Nip55.assembleSignedEvent(unsigned, sig),
+        )
+        // Signature must be 128 hex chars; payload must be a JSON object.
+        assertNull(Nip55.assembleSignedEvent(unsigned, "deadbeef"))
+        assertNull(Nip55.assembleSignedEvent(unsigned, "z".repeat(128)))
+        assertNull(Nip55.assembleSignedEvent("[]", sig))
+    }
 }
