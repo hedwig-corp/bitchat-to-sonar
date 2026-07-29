@@ -916,12 +916,44 @@ expect object SonarCore {
     /** Grouped key-fingerprint string for the verify/profile surfaces. */
     fun fingerprint(): String
 
-    /** Our Nostr secret key (`nsec1…`), empty until an identity exists. The
-     *  Lightning wallet derives its deterministic seed from this. */
+    /** Our Nostr secret key (`nsec1…`), empty until an identity exists — and
+     *  always empty for external-signer accounts (the secret never enters
+     *  this process). Gate key-export UI on [usesExternalSigner]. */
     fun identityNsec(): String
 
-    /** True when a persisted account key exists locally. */
+    /** True when a persisted account (local key OR external signer) exists. */
     fun hasIdentity(): Boolean
+
+    /** True when the account key lives in an external NIP-55 signer (Amber). */
+    fun usesExternalSigner(): Boolean
+
+    /**
+     * Adopt an external NIP-55 signer as THIS device's account: persist the
+     * signer's pubkey + package durably (Account Key Durability rule — the
+     * onboarding flag is only set by the caller afterwards). Also mints and
+     * persists the device-local derivation roots (geohash/call, wallet).
+     * Returns our npub. Android-only; desktop actuals throw.
+     */
+    suspend fun adoptExternalSigner(pubkey: String, packageName: String?): String
+
+    /**
+     * Discard a signer binding whose onboarding never completed, so the user
+     * can still choose a fresh local identity after an Amber sign-in they
+     * changed their mind about (or that a process death interrupted).
+     * No-op unless the stored account is a PENDING signer login — a completed
+     * signer account is only replaced by nsec restore or a wipe (Account Key
+     * Durability rule).
+     */
+    suspend fun abandonPendingExternalSigner()
+
+    /**
+     * 64-char hex secret the Lightning wallet seed derives from: the nsec's
+     * raw bytes for local accounts (byte-identical to the historical
+     * derivation), or a device-local random entropy for external-signer
+     * accounts (the wallet is then NOT restorable from the account key —
+     * documented gap). Empty when no identity exists.
+     */
+    fun walletSecretHex(): String
 
     /** Ensure the local account key exists before first-run onboarding completes. */
     suspend fun prepareIdentityForOnboarding(): String

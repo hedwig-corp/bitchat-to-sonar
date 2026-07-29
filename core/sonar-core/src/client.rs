@@ -1984,7 +1984,7 @@ impl SonarClient {
         conversation_index: Option<Arc<Mutex<ConversationIndex>>>,
     ) -> Result<Self> {
         let boot_start = std::time::Instant::now();
-        let nostr = Client::new(identity.keys().clone());
+        let nostr = Client::new(identity.signer());
         for relay in &relays {
             nostr.add_relay(relay.clone()).await?;
         }
@@ -2070,7 +2070,7 @@ impl SonarClient {
         let direct_dm: DirectDmBuf = Arc::new(Mutex::new(Vec::new()));
         let geo_presence: GeoPresenceBuf = Arc::new(Mutex::new(HashMap::new()));
         let geo_subscribed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-        let identity_secret = identity.keys().secret_key().to_secret_bytes();
+        let identity_secret = *identity.kdf_root();
 
         let pending_marmot_giftwraps: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_marmot_groups: Arc<Mutex<Vec<Event>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2099,7 +2099,7 @@ impl SonarClient {
         let handler_buffer_drops = buffer_drops_total.clone();
         // Our MAIN identity pubkey hex: a kind-1059 with this `p` tag is a Marmot
         // welcome (vs a geohash DM, whose `p` is a per-geohash ephemeral key).
-        let my_pubkey_hex = identity.keys().public_key().to_hex();
+        let my_pubkey_hex = identity.public_key().to_hex();
         let mut notifications = nostr.notifications();
         tokio::spawn(async move {
             let mut live_dedup = LiveEventDeduper::new(LIVE_EVENT_DEDUP_TTL, LIVE_EVENT_DEDUP_CAP);
@@ -2438,7 +2438,7 @@ impl SonarClient {
     /// Waits for the relay OK acks — callers that need durability (a peer is
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
         self.nostr.send_event(&event).await?;
         Ok(())
     }
@@ -2452,7 +2452,7 @@ impl SonarClient {
     /// not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let event = self.engine.key_package_event(self.relays.clone()).await?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
             if let Err(err) = nostr.send_event(&event).await {
@@ -2578,7 +2578,7 @@ impl SonarClient {
         // wipe every field Sonar does not manage. Propagate the fetch error
         // instead of publishing blind — never destroy a profile we could
         // not read.
-        let me = self.engine.identity().keys().public_key();
+        let me = self.engine.identity().public_key();
         let current = self.nostr.fetch_metadata(me, FETCH_TIMEOUT).await?;
         let metadata = Self::merge_profile_metadata(
             current.as_ref(),
@@ -2603,7 +2603,7 @@ impl SonarClient {
     ) {
         let nostr = self.nostr.clone();
         let claimed = self.claimed_handle.lock().unwrap().clone();
-        let me = self.engine.identity().keys().public_key();
+        let me = self.engine.identity().public_key();
         let name = name.to_string();
         let about = about.map(str::to_string);
         let picture = picture.map(str::to_string);
@@ -2671,8 +2671,8 @@ impl SonarClient {
                 crate::handles::DEFAULT_HANDLE_DOMAIN
             )));
         }
-        let keys = self.engine.identity().keys().clone();
-        let event = crate::handles::build_claim_event(&keys, &parsed, offer)?;
+        let signer = self.engine.identity().signer();
+        let event = crate::handles::build_claim_event(&signer, &parsed, offer).await?;
         let url = format!("{}/v1/register", crate::handles::DEFAULT_REGISTRAR_URL);
         let resp = HANDLE_HTTP_CLIENT
             .post(&url)
@@ -3135,7 +3135,7 @@ impl SonarClient {
         };
 
         self.ensure_relays_connected(&publish_relays).await?;
-        let kp_event = self.engine.key_package_event(publish_relays.clone())?;
+        let kp_event = self.engine.key_package_event(publish_relays.clone()).await?;
         let output = self
             .nostr
             .send_event_to(publish_relays.clone(), &kp_event)
@@ -3328,7 +3328,7 @@ impl SonarClient {
             }
         };
         let my_pubkey = self.engine.identity().public_key();
-        let identity_keys = self.engine.identity().keys().clone();
+        let identity_signer = self.engine.identity().signer();
         let nostr = self.nostr.clone();
         let tokens = self.push_token_cache.lock().unwrap().clone();
         tokio::spawn(async move {
@@ -3367,14 +3367,14 @@ impl SonarClient {
                 .build(my_pubkey);
 
                 let seal_builder =
-                    match EventBuilder::seal(&identity_keys, &info.server_pubkey, rumor).await {
+                    match EventBuilder::seal(&identity_signer, &info.server_pubkey, rumor).await {
                         Ok(b) => b,
                         Err(e) => {
                             tracing::debug!(member = %member, %e, "push notify seal failed");
                             continue;
                         }
                     };
-                let seal = match seal_builder.sign(&identity_keys).await {
+                let seal = match seal_builder.sign(&identity_signer).await {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::debug!(member = %member, %e, "push notify sign seal failed");
@@ -5286,16 +5286,16 @@ impl SonarClient {
         // share keep-alive + TLS session cache (same shape as download HTTP_CLIENT).
         let client =
             BlossomClient::with_client(base, BLOSSOM_UPLOAD_HTTP_CLIENT.clone());
-        let keys = self.identity().keys();
+        let signer = self.identity().signer();
         let mime = Some(ENCRYPTED_BLOB_MIME_TYPE.to_string());
         let upload = async {
             match on_progress {
                 Some(cb) => {
                     client
-                        .upload_blob_with_progress(data, mime, None, Some(keys), Some(cb))
+                        .upload_blob_with_progress(data, mime, None, Some(&signer), Some(cb))
                         .await
                 }
-                None => client.upload_blob(data, mime, None, Some(keys)).await,
+                None => client.upload_blob(data, mime, None, Some(&signer)).await,
             }
         };
         let descriptor = tokio::time::timeout(timeout, upload)
@@ -6344,71 +6344,78 @@ impl SonarClient {
                 continue;
             }
 
-            // Intercept account-level gift wraps that are not Marmot MLS input
-            // before they reach the MLS engine: push-token shares (kind 447)
-            // and plain bitchat fallback DMs (NIP-17 kind 14).
-            if event.kind == Kind::GiftWrap {
-                if let Ok(unwrapped) =
-                    UnwrappedGift::from_gift_wrap(self.engine.identity().keys(), &event).await
-                {
-                    if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
-                        match self
-                            .handle_push_token_share(&unwrapped.sender, &unwrapped.rumor.content)
-                        {
-                            Ok(()) => {
+            // Gift wraps are unwrapped exactly ONCE here (an external-signer
+            // account pays two IPC round-trips per unwrap): the account-level
+            // intercepts (push-token shares kind 447, NIP-17 kind-14 DMs) peek
+            // at the rumor, and everything else feeds the SAME unwrap into the
+            // MLS engine via `process_unwrapped_gift`.
+            let outcome = if event.kind == Kind::GiftWrap {
+                match self.engine.unwrap_gift(&event).await {
+                    Err(err) => Err(err),
+                    Ok(unwrapped) => {
+                        if unwrapped.rumor.kind.as_u16() == crate::push::KIND_PUSH_TOKEN_SHARE {
+                            match self.handle_push_token_share(
+                                &unwrapped.sender,
+                                &unwrapped.rumor.content,
+                            ) {
+                                Ok(()) => {
+                                    self.mark_sync_event_processed(&event.id);
+                                    report.record_processed();
+                                }
+                                Err(err) => {
+                                    tracing::debug!(
+                                        %err,
+                                        event_id = %event.id,
+                                        event_created_at = event.created_at.as_secs(),
+                                        context,
+                                        "push token share needs retry"
+                                    );
+                                    report.record_retryable(event.created_at.as_secs());
+                                }
+                            }
+                            continue;
+                        }
+                        if unwrapped.rumor.kind.as_u16() == 14 {
+                            if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
+                                &unwrapped.rumor.content,
+                            ) {
+                                let event_id = event.id.to_hex();
+                                let mut buf = self.direct_dm.lock().unwrap();
+                                if !buf.iter().any(|existing| {
+                                    existing.event_id == event_id
+                                        || (existing.id == dm.message_id
+                                            && existing.sender == unwrapped.sender)
+                                }) {
+                                    if buf.len() >= DIRECT_DM_BUFFER_CAP {
+                                        buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
+                                    }
+                                    buf.push(RawDirectDm {
+                                        event_id,
+                                        id: dm.message_id,
+                                        sender: unwrapped.sender,
+                                        content: dm.content,
+                                        ts: unwrapped.rumor.created_at.as_secs(),
+                                    });
+                                }
+                                report.record_retryable(event.created_at.as_secs());
+                            } else {
+                                tracing::debug!(
+                                    event_id = %event.id,
+                                    "ignoring non-bitchat account-level NIP-17 DM"
+                                );
                                 self.mark_sync_event_processed(&event.id);
                                 report.record_processed();
                             }
-                            Err(err) => {
-                                tracing::debug!(
-                                    %err,
-                                    event_id = %event.id,
-                                    event_created_at = event.created_at.as_secs(),
-                                    context,
-                                    "push token share needs retry"
-                                );
-                                report.record_retryable(event.created_at.as_secs());
-                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if unwrapped.rumor.kind.as_u16() == 14 {
-                        if let Some(dm) = crate::mesh::decode_nip17_private_message_content(
-                            &unwrapped.rumor.content,
-                        ) {
-                            let event_id = event.id.to_hex();
-                            let mut buf = self.direct_dm.lock().unwrap();
-                            if !buf.iter().any(|existing| {
-                                existing.event_id == event_id
-                                    || (existing.id == dm.message_id
-                                        && existing.sender == unwrapped.sender)
-                            }) {
-                                if buf.len() >= DIRECT_DM_BUFFER_CAP {
-                                    buf.drain(0..DIRECT_DM_BUFFER_CAP / 2);
-                                }
-                                buf.push(RawDirectDm {
-                                    event_id,
-                                    id: dm.message_id,
-                                    sender: unwrapped.sender,
-                                    content: dm.content,
-                                    ts: unwrapped.rumor.created_at.as_secs(),
-                                });
-                            }
-                            report.record_retryable(event.created_at.as_secs());
-                        } else {
-                            tracing::debug!(
-                                event_id = %event.id,
-                                "ignoring non-bitchat account-level NIP-17 DM"
-                            );
-                            self.mark_sync_event_processed(&event.id);
-                            report.record_processed();
-                        }
-                        continue;
+                        self.engine.process_unwrapped_gift(&event, &unwrapped)
                     }
                 }
-            }
+            } else {
+                self.engine.process_incoming(&event).await
+            };
 
-            match self.engine.process_incoming(&event).await {
+            match outcome {
                 Ok(Incoming::Failed) => {
                     // Count the delivery as handled so one bad ciphertext does
                     // not pin the global watermark, but do NOT add it to Sonar's
@@ -7037,7 +7044,8 @@ impl SonarClient {
             .tags([Tag::public_key(recipient)])
             .build(self.engine.identity().public_key());
         let gift =
-            EventBuilder::gift_wrap(self.engine.identity().keys(), &recipient, rumor, []).await?;
+            EventBuilder::gift_wrap(&self.engine.identity().signer(), &recipient, rumor, [])
+                .await?;
         let output = self.nostr.send_event(&gift).await?;
         require_relay_success(&output, "direct NIP-17 DM")
     }
@@ -7089,7 +7097,7 @@ impl SonarClient {
     /// nickname in an `n` tag.
     pub async fn send_geohash(&self, geohash: &str, text: &str, nickname: &str) -> Result<()> {
         self.subscribe_geohash(geohash).await?;
-        let secret = self.identity().keys().secret_key().to_secret_bytes();
+        let secret = *self.identity().kdf_root();
         let geo = crate::geohash::derive_geohash_keys(&secret, geohash)?;
         let tags = vec![
             Tag::custom(
@@ -7146,7 +7154,7 @@ impl SonarClient {
     /// channel open and re-call on a ~60s heartbeat while the channel is active.
     pub async fn send_geohash_presence(&self, geohash: &str) -> Result<()> {
         self.subscribe_geohash(geohash).await?;
-        let secret = self.identity().keys().secret_key().to_secret_bytes();
+        let secret = *self.identity().kdf_root();
         let geo = crate::geohash::derive_geohash_keys(&secret, geohash)?;
         let event = EventBuilder::new(Kind::Custom(20001), "")
             .tags([Tag::custom(
@@ -7197,7 +7205,7 @@ impl SonarClient {
         limit: usize,
     ) -> Result<Vec<crate::geohash::GeoMessage>> {
         self.subscribe_geohash(geohash).await?;
-        let secret = self.identity().keys().secret_key().to_secret_bytes();
+        let secret = *self.identity().kdf_root();
         let my_pk = crate::geohash::derive_geohash_keys(&secret, geohash)?.public_key();
         let map = self.geo.lock().unwrap();
         let mut out: Vec<crate::geohash::GeoMessage> = map
@@ -8502,8 +8510,8 @@ mod tests {
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
         let carol = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
-        let carol_kp = carol.key_package_event(relays.clone()).expect("carol kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
+        let carol_kp = carol.key_package_event(relays.clone()).await.expect("carol kp");
 
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)
@@ -8658,7 +8666,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = std::sync::Arc::new(MarmotEngine::in_memory(Identity::generate()));
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
@@ -8744,7 +8752,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
 
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
@@ -8813,7 +8821,7 @@ mod tests {
         let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
         let alice = MarmotEngine::in_memory(Identity::generate());
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
             .expect("alice creates group");
@@ -9519,10 +9527,12 @@ mod tests {
             .expect("charlie starts without relays");
         let bob_kp = bob
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let charlie_kp = charlie
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("charlie key package");
         let creation = alice
             .create_group("rollback retry", vec![bob_kp, charlie_kp], relays.clone())
@@ -9579,6 +9589,7 @@ mod tests {
                 &bob_group_id,
                 vec![dave
                     .key_package_event(relays.clone())
+                    .await
                     .expect("dave key package")],
             )
             .expect("bob creates earlier commit");
@@ -9586,7 +9597,7 @@ mod tests {
         let alice_update = alice
             .add_members(
                 &alice_group_id,
-                vec![erin.key_package_event(relays).expect("erin key package")],
+                vec![erin.key_package_event(relays).await.expect("erin key package")],
             )
             .expect("alice creates later commit");
         assert!(
@@ -9713,6 +9724,7 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let creation = alice
             .create_group("alice & bob", vec![bob_kp], relays)
@@ -9762,9 +9774,11 @@ mod tests {
         let bob_kp = bob
             .engine
             .key_package_event(relays.clone())
+            .await
             .expect("bob key package");
         let carol_kp = carol
             .key_package_event(relays.clone())
+            .await
             .expect("carol key package");
         let creation = alice
             .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays)

@@ -21,7 +21,7 @@ async fn undecryptable_group_message_surfaces_as_failed_until_rollback() {
     // encrypted for an MLS state we do not have).
     let alice = MarmotEngine::in_memory(Identity::generate());
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
     let creation = alice
         .create_group("alice & bob", vec![bob_kp], relays())
         .expect("create group");

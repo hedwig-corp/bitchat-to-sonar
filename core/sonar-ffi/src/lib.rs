@@ -39,6 +39,12 @@ pub enum SonarFfiError {
     /// Caller passed something unparseable (bad nsec, npub, hex, relay URL).
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// The operation needs the raw local secret key and this account uses an
+    /// external signer (NIP-55). A distinct variant so hosts can gate on the
+    /// TYPE at the boundary instead of matching error prose — the UI hiding a
+    /// button must not be the only enforcement.
+    #[error("{0}")]
+    NeedsLocalKey(String),
     /// Anything that went wrong inside sonar-core (relay I/O, MLS, MDK...).
     #[error("{0}")]
     Core(String),
@@ -46,7 +52,10 @@ pub enum SonarFfiError {
 
 impl From<sonar_core::Error> for SonarFfiError {
     fn from(err: sonar_core::Error) -> Self {
-        Self::Core(err.to_string())
+        match err {
+            sonar_core::Error::NeedsLocalKey(_) => Self::NeedsLocalKey(err.to_string()),
+            _ => Self::Core(err.to_string()),
+        }
     }
 }
 
@@ -161,7 +170,7 @@ pub fn backup_account_to_blossom(
     let server = blossom_server.unwrap_or_default();
     let runtime = backup_runtime()?;
     let uploaded = runtime.block_on(sonar_core::account_backup::backup_account_files(
-        identity.keys(),
+        identity.local_keys()?,
         Path::new(&db_path),
         &db_key_hex,
         &server,
@@ -190,7 +199,7 @@ pub fn restore_account_from_blossom(
     let server = blossom_server.unwrap_or_default();
     let runtime = backup_runtime()?;
     match runtime.block_on(sonar_core::account_backup::restore_account_files(
-        identity.keys(),
+        identity.local_keys()?,
         Path::new(&db_path),
         &server,
     )) {
@@ -278,7 +287,264 @@ pub fn default_handle_domain() -> String {
     sonar_core::handles::DEFAULT_HANDLE_DOMAIN.to_owned()
 }
 
-/// A Nostr identity (secp256k1 keypair). Wraps `sonar_core::identity::Identity`.
+/// One external-signer call outcome. The permanent/transient split drives the
+/// core's retry policy: a `Rejected` welcome is dropped like a genuine decrypt
+/// failure, while an `Unavailable` one stays in the sync window and is
+/// retried on a later drain (see `sonar_core::signer_failure`).
+#[derive(uniffi::Enum)]
+pub enum ForeignSignerResult {
+    /// The signer produced the requested value. For `sign_event` this is the
+    /// FULL signed event JSON, or a bare 128-hex schnorr signature (the
+    /// adapter assembles the event from the request in that case).
+    Ok { value: String },
+    /// The user explicitly rejected this request — permanent; do not retry.
+    Rejected,
+    /// The signer answered definitively that it CANNOT fulfil the request:
+    /// a NIP-44 decrypt of a corrupt ciphertext or one addressed to a key it
+    /// does not hold. Permanent — retrying re-prompts the user for something
+    /// that can never succeed, and (for gift wraps) pins the sync watermark
+    /// forever. Classified terminal, matching how a local-key account's own
+    /// `nip44::decrypt` failure is treated.
+    Failed { reason: String },
+    /// The signer could not be reached right now (no foreground UI, approval
+    /// timeout, signer app busy/uninstalled) — transient; retry later.
+    Unavailable { reason: String },
+}
+
+/// Host-implemented external Nostr signer (NIP-55, e.g. Amber on Android).
+///
+/// The host bridges each call to the signer app. Methods are BLOCKING from the
+/// core's point of view (the host may show approval UI and wait); the core
+/// always invokes them from a blocking-safe thread, never a runtime worker.
+#[uniffi::export(callback_interface)]
+pub trait ForeignNostrSigner: Send + Sync {
+    /// Sign `unsigned_event_json` (NIP-01 unsigned event JSON, `id` included).
+    fn sign_event(&self, unsigned_event_json: String) -> ForeignSignerResult;
+    /// NIP-44 encrypt `plaintext` to `peer_pubkey_hex`.
+    fn nip44_encrypt(&self, peer_pubkey_hex: String, plaintext: String) -> ForeignSignerResult;
+    /// NIP-44 decrypt `ciphertext` from `peer_pubkey_hex`.
+    fn nip44_decrypt(&self, peer_pubkey_hex: String, ciphertext: String) -> ForeignSignerResult;
+}
+
+/// Adapts a host [`ForeignNostrSigner`] to `nostr::NostrSigner`.
+///
+/// Every foreign call runs on `spawn_blocking` so a slow approval UI can never
+/// stall a tokio runtime worker. Signed events coming back from the host are
+/// UNTRUSTED input: the adapter verifies the schnorr signature, the author,
+/// and that the signer returned the same event it was asked to sign.
+struct RemoteSignerAdapter {
+    foreign: Arc<dyn ForeignNostrSigner>,
+    public_key: PublicKey,
+}
+
+impl std::fmt::Debug for RemoteSignerAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteSignerAdapter")
+            .field("public_key", &self.public_key)
+            .finish()
+    }
+}
+
+impl RemoteSignerAdapter {
+    /// Run one foreign signer call off the async runtime. Panics in the host
+    /// callback surface as signer errors instead of poisoning the runtime.
+    async fn call_foreign<F>(&self, op: &'static str, f: F) -> Result<String, SignerError>
+    where
+        F: FnOnce(Arc<dyn ForeignNostrSigner>) -> ForeignSignerResult + Send + 'static,
+    {
+        let foreign = self.foreign.clone();
+        let result = tokio::task::spawn_blocking(move || f(foreign))
+            .await
+            .map_err(|e| {
+                SignerError::backend(FfiSignerFailure::transient(op, format!("join: {e}")))
+            })?;
+        match result {
+            ForeignSignerResult::Ok { value } => Ok(value),
+            ForeignSignerResult::Rejected => Err(SignerError::backend(
+                FfiSignerFailure::permanent(op, "rejected by user".into()),
+            )),
+            ForeignSignerResult::Failed { reason } => {
+                Err(SignerError::backend(FfiSignerFailure::permanent(op, reason)))
+            }
+            ForeignSignerResult::Unavailable { reason } => {
+                Err(SignerError::backend(FfiSignerFailure::transient(op, reason)))
+            }
+        }
+    }
+}
+
+/// Error surfaced when the external signer rejects or fails a request. The
+/// Display embeds the core-owned permanence marker
+/// (`sonar_core::signer_failure`) — `SignerError` erases everything but the
+/// message string, so the marker is how the core's retry policy classifies
+/// the failure downstream.
+#[derive(Debug)]
+struct FfiSignerFailure {
+    op: &'static str,
+    detail: String,
+    permanent: bool,
+}
+
+impl FfiSignerFailure {
+    fn permanent(op: &'static str, detail: String) -> Self {
+        Self {
+            op,
+            detail,
+            permanent: true,
+        }
+    }
+
+    fn transient(op: &'static str, detail: String) -> Self {
+        Self {
+            op,
+            detail,
+            permanent: false,
+        }
+    }
+}
+
+impl std::fmt::Display for FfiSignerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let marker = if self.permanent {
+            sonar_core::signer_failure::PERMANENT_MARKER
+        } else {
+            sonar_core::signer_failure::TRANSIENT_MARKER
+        };
+        write!(f, "external signer {}{}: {}", marker, self.op, self.detail)
+    }
+}
+
+impl std::error::Error for FfiSignerFailure {}
+
+impl NostrSigner for RemoteSignerAdapter {
+    fn backend(&self) -> SignerBackend<'_> {
+        SignerBackend::Custom("nip55".into())
+    }
+
+    fn get_public_key(&self) -> BoxedFuture<'_, Result<PublicKey, SignerError>> {
+        Box::pin(async move { Ok(self.public_key) })
+    }
+
+    fn sign_event(&self, unsigned: UnsignedEvent) -> BoxedFuture<'_, Result<Event, SignerError>> {
+        Box::pin(async move {
+            let mut unsigned = unsigned;
+            unsigned.ensure_id();
+            let expected_id = unsigned.id;
+            let json = unsigned.as_json();
+            let response = self
+                .call_foreign("sign_event", move |foreign| foreign.sign_event(json))
+                .await?;
+            // Some NIP-55 signers return only the schnorr signature: assemble
+            // the event HERE (event construction is NIP-01 protocol logic and
+            // belongs in the core, not per-platform shells) — we hold the
+            // exact unsigned event we asked to sign.
+            let response = response.trim();
+            let event = if response.len() == 128 && response.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                let sig = response.parse::<nostr::secp256k1::schnorr::Signature>().map_err(|e| {
+                    SignerError::backend(FfiSignerFailure::permanent(
+                        "sign_event",
+                        format!("unparseable signature: {e}"),
+                    ))
+                })?;
+                unsigned.clone().add_signature(sig).map_err(|e| {
+                    SignerError::backend(FfiSignerFailure::permanent(
+                        "sign_event",
+                        format!("signature does not match the requested event: {e}"),
+                    ))
+                })?
+            } else {
+                Event::from_json(response).map_err(|e| {
+                    SignerError::backend(FfiSignerFailure::permanent(
+                        "sign_event",
+                        format!("unparseable signed event: {e}"),
+                    ))
+                })?
+            };
+            // The signed event must be exactly what we asked for: same id
+            // (which commits to pubkey/kind/tags/content/created_at) and a
+            // valid signature by our account key.
+            if Some(event.id) != expected_id {
+                return Err(SignerError::backend(FfiSignerFailure::permanent(
+                    "sign_event",
+                    "signer returned a different event".into(),
+                )));
+            }
+            if event.pubkey != self.public_key {
+                return Err(SignerError::backend(FfiSignerFailure::permanent(
+                    "sign_event",
+                    "signer returned an event from a different account".into(),
+                )));
+            }
+            event.verify().map_err(|e| {
+                SignerError::backend(FfiSignerFailure::permanent(
+                    "sign_event",
+                    format!("invalid signature: {e}"),
+                ))
+            })?;
+            Ok(event)
+        })
+    }
+
+    fn nip04_encrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(FfiSignerFailure::permanent(
+                "nip04_encrypt",
+                "NIP-04 is not supported by the Sonar external signer bridge".into(),
+            )))
+        })
+    }
+
+    fn nip04_decrypt<'a>(
+        &'a self,
+        _public_key: &'a PublicKey,
+        _content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            Err(SignerError::backend(FfiSignerFailure::permanent(
+                "nip04_decrypt",
+                "NIP-04 is not supported by the Sonar external signer bridge".into(),
+            )))
+        })
+    }
+
+    fn nip44_encrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            let peer = public_key.to_hex();
+            let plaintext = content.to_owned();
+            self.call_foreign("nip44_encrypt", move |foreign| {
+                foreign.nip44_encrypt(peer, plaintext)
+            })
+            .await
+        })
+    }
+
+    fn nip44_decrypt<'a>(
+        &'a self,
+        public_key: &'a PublicKey,
+        content: &'a str,
+    ) -> BoxedFuture<'a, Result<String, SignerError>> {
+        Box::pin(async move {
+            let peer = public_key.to_hex();
+            let ciphertext = content.to_owned();
+            self.call_foreign("nip44_decrypt", move |foreign| {
+                foreign.nip44_decrypt(peer, ciphertext)
+            })
+            .await
+        })
+    }
+}
+
+/// A Nostr identity (secp256k1 keypair, or an external NIP-55 signer).
+/// Wraps `sonar_core::identity::Identity`.
 #[derive(uniffi::Object)]
 pub struct SonarIdentity {
     inner: Identity,
@@ -302,20 +568,96 @@ impl SonarIdentity {
         Ok(Arc::new(Self { inner }))
     }
 
+    /// An identity whose secret lives in an external NIP-55 signer app
+    /// (e.g. Amber). `pubkey` is the account public key (hex or `npub1...`)
+    /// as returned by the signer's `get_public_key`. `kdf_root_hex` is a
+    /// host-generated, device-local random 32-byte hex root for deterministic
+    /// sub-key derivations (geohash/call identities) — it is NOT the account
+    /// secret and must be persisted alongside the signer choice.
+    #[uniffi::constructor]
+    pub fn remote(
+        pubkey: String,
+        kdf_root_hex: String,
+        signer: Box<dyn ForeignNostrSigner>,
+    ) -> FfiResult<Arc<Self>> {
+        let public_key = PublicKey::parse(pubkey.trim())
+            .map_err(|e| SonarFfiError::InvalidInput(format!("signer pubkey: {e}")))?;
+        let root: [u8; 32] = parse_hex32(&kdf_root_hex)
+            .ok_or_else(|| SonarFfiError::InvalidInput("kdf_root_hex: want 64 hex chars".into()))?;
+        let adapter = RemoteSignerAdapter {
+            foreign: Arc::from(signer),
+            public_key,
+        };
+        Ok(Arc::new(Self {
+            inner: Identity::with_remote_signer(public_key, Arc::new(adapter), root),
+        }))
+    }
+
     /// `npub1...` form of the public key.
     pub fn npub(&self) -> String {
         self.inner.npub()
     }
 
-    /// `nsec1...` secret key export (user-driven backup only).
+    /// `nsec1...` secret key export (user-driven backup only). Empty string
+    /// for external-signer identities — the secret is not in this process.
+    /// (Not throwing: existing hosts treat "" as "no local key", and the
+    /// signature must stay stable for the iOS bindings.)
     pub fn nsec(&self) -> String {
-        self.inner.export_nsec()
+        self.inner.export_nsec().unwrap_or_default()
+    }
+
+    /// True when the secret key is held in-process (nsec export possible).
+    pub fn has_local_key(&self) -> bool {
+        self.inner.has_local_keys()
+    }
+
+    /// Prove the signer actually controls this identity's key: request a
+    /// signature over a throwaway kind-22242 event and verify it (author, id,
+    /// schnorr) through the same untrusted-host checks every real signature
+    /// gets. Hosts MUST call this before durably adopting an external-signer
+    /// account — the NIP-55 login intent is implicit, so any installed app
+    /// can answer it with an arbitrary (e.g. a victim's) pubkey; without this
+    /// probe the account wedges into an identity it can never sign for.
+    /// Local-key identities trivially pass. Blocking (one signer round-trip).
+    pub fn verify_signer(&self) -> FfiResult<()> {
+        let unsigned = EventBuilder::new(Kind::Custom(22242), "sonar signer ownership probe")
+            .build(self.inner.public_key());
+        let signer = self.inner.signer();
+        let runtime = backup_runtime()?;
+        runtime
+            .block_on(signer.sign_event(unsigned))
+            .map_err(|e| SonarFfiError::Core(format!("signer verification failed: {e}")))?;
+        Ok(())
     }
 
     /// 64-char lowercase hex public key.
     pub fn pubkey_hex(&self) -> String {
         self.inner.public_key().to_hex()
     }
+}
+
+/// Every Nostr kind the core signs with the ACCOUNT identity key. NIP-55
+/// hosts build the signer's login permission batch from this list — a kind
+/// missing here means a surprise approval screen (or a silent background
+/// failure) the first time that event type is signed. Core-owned so the
+/// Kotlin/Swift mirrors can be pinned against it by cross-boundary tests.
+#[uniffi::export]
+pub fn identity_signed_kinds() -> Vec<u16> {
+    sonar_core::signer_kinds::IDENTITY_SIGNED_KINDS.to_vec()
+}
+
+/// Parse exactly 32 bytes of hex.
+fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let s = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// FFI-friendly group summary.
@@ -1885,8 +2227,8 @@ impl SonarNode {
         {
             return Ok(());
         }
-        let nostr_secret = self.client.identity().keys().secret_key().to_secret_bytes();
-        let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&nostr_secret);
+        let kdf_root = *self.client.identity().kdf_root();
+        let iroh_secret = sonar_core::call::identity::derive_iroh_secret(&kdf_root);
         let engine = self
             .runtime
             .block_on(sonar_core::call::engine::CallEngine::start(iroh_secret))
@@ -3564,5 +3906,357 @@ mod tests {
         assert!(mesh_parse_sticker_content("hello world".into()).is_none());
         assert!(mesh_parse_sticker_content("".into()).is_none());
         assert!(mesh_parse_sticker_content("sticker:fake".into()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod signer_tests {
+    use super::*;
+
+    /// Keys-backed [`ForeignNostrSigner`] test double with hostile modes —
+    /// the adapter must treat everything the host returns as untrusted.
+    enum SignerMode {
+        Honest,
+        /// Returns only the 128-hex schnorr signature, no event JSON.
+        SignatureOnly,
+        /// Signs a *valid* event with a different account's key.
+        WrongAccount(Keys),
+        /// Signs different content than requested (id mismatch).
+        Tampered,
+        /// User explicitly rejected (permanent).
+        Reject,
+        /// Signer decrypted and definitively failed (permanent).
+        DecryptFailed,
+        /// Signer unreachable right now (transient).
+        Unavailable,
+    }
+
+    struct TestForeignSigner {
+        keys: Keys,
+        mode: SignerMode,
+    }
+
+    fn ok(value: String) -> ForeignSignerResult {
+        ForeignSignerResult::Ok { value }
+    }
+
+    impl TestForeignSigner {
+        fn sign(&self, unsigned_event_json: &str) -> Option<String> {
+            let unsigned = UnsignedEvent::from_json(unsigned_event_json.as_bytes()).ok()?;
+            match &self.mode {
+                SignerMode::Honest => Some(unsigned.sign_with_keys(&self.keys).ok()?.as_json()),
+                SignerMode::SignatureOnly => Some(
+                    unsigned
+                        .sign_with_keys(&self.keys)
+                        .ok()?
+                        .sig
+                        .to_string(),
+                ),
+                SignerMode::WrongAccount(other) => {
+                    let forged = EventBuilder::new(unsigned.kind, unsigned.content.clone())
+                        .tags(unsigned.tags.to_vec())
+                        .custom_created_at(unsigned.created_at)
+                        .build(other.public_key());
+                    Some(forged.sign_with_keys(other).ok()?.as_json())
+                }
+                SignerMode::Tampered => {
+                    let forged = EventBuilder::new(unsigned.kind, "tampered content")
+                        .tags(unsigned.tags.to_vec())
+                        .custom_created_at(unsigned.created_at)
+                        .build(self.keys.public_key());
+                    Some(forged.sign_with_keys(&self.keys).ok()?.as_json())
+                }
+                SignerMode::Reject | SignerMode::Unavailable | SignerMode::DecryptFailed => None,
+            }
+        }
+    }
+
+    impl ForeignNostrSigner for TestForeignSigner {
+        fn sign_event(&self, unsigned_event_json: String) -> ForeignSignerResult {
+            match &self.mode {
+                SignerMode::Reject => ForeignSignerResult::Rejected,
+                SignerMode::Unavailable => ForeignSignerResult::Unavailable {
+                    reason: "backgrounded".into(),
+                },
+                _ => match self.sign(&unsigned_event_json) {
+                    Some(value) => ok(value),
+                    None => ForeignSignerResult::Unavailable {
+                        reason: "sign failed".into(),
+                    },
+                },
+            }
+        }
+
+        fn nip44_encrypt(&self, peer_pubkey_hex: String, plaintext: String) -> ForeignSignerResult {
+            match &self.mode {
+                SignerMode::Reject => return ForeignSignerResult::Rejected,
+                SignerMode::Unavailable => {
+                    return ForeignSignerResult::Unavailable {
+                        reason: "backgrounded".into(),
+                    }
+                }
+                _ => {}
+            }
+            let Ok(peer) = PublicKey::parse(&peer_pubkey_hex) else {
+                return ForeignSignerResult::Unavailable {
+                    reason: "bad peer".into(),
+                };
+            };
+            match nostr::nips::nip44::encrypt(
+                self.keys.secret_key(),
+                &peer,
+                plaintext,
+                nostr::nips::nip44::Version::default(),
+            ) {
+                Ok(ciphertext) => ok(ciphertext),
+                Err(e) => ForeignSignerResult::Unavailable {
+                    reason: e.to_string(),
+                },
+            }
+        }
+
+        fn nip44_decrypt(&self, peer_pubkey_hex: String, ciphertext: String) -> ForeignSignerResult {
+            match &self.mode {
+                SignerMode::DecryptFailed => {
+                    return ForeignSignerResult::Failed {
+                        reason: "signer could not decrypt the payload".into(),
+                    }
+                }
+                SignerMode::Reject => return ForeignSignerResult::Rejected,
+                SignerMode::Unavailable => {
+                    return ForeignSignerResult::Unavailable {
+                        reason: "backgrounded".into(),
+                    }
+                }
+                _ => {}
+            }
+            let Ok(peer) = PublicKey::parse(&peer_pubkey_hex) else {
+                return ForeignSignerResult::Unavailable {
+                    reason: "bad peer".into(),
+                };
+            };
+            match nostr::nips::nip44::decrypt(self.keys.secret_key(), &peer, ciphertext) {
+                Ok(plain) => ok(plain),
+                Err(e) => ForeignSignerResult::Unavailable {
+                    reason: e.to_string(),
+                },
+            }
+        }
+    }
+
+    fn adapter(mode: SignerMode) -> (RemoteSignerAdapter, Keys) {
+        let keys = Keys::generate();
+        let adapter = RemoteSignerAdapter {
+            foreign: Arc::new(TestForeignSigner {
+                keys: keys.clone(),
+                mode,
+            }),
+            public_key: keys.public_key(),
+        };
+        (adapter, keys)
+    }
+
+    fn unsigned_note(author: PublicKey) -> UnsignedEvent {
+        EventBuilder::new(Kind::TextNote, "hello from sonar").build(author)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_signs_and_verifies_honest_events() {
+        let (adapter, keys) = adapter(SignerMode::Honest);
+        let mut unsigned = unsigned_note(keys.public_key());
+        unsigned.ensure_id();
+        let expected_id = unsigned.id;
+        let event = adapter.sign_event(unsigned).await.expect("signed");
+        assert_eq!(Some(event.id), expected_id);
+        assert_eq!(event.pubkey, keys.public_key());
+        event.verify().expect("valid signature");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_rejects_wrong_account_events() {
+        let other = Keys::generate();
+        let (adapter, keys) = adapter(SignerMode::WrongAccount(other));
+        let err = adapter
+            .sign_event(unsigned_note(keys.public_key()))
+            .await
+            .expect_err("wrong-account event must be rejected");
+        // A different author changes the event id too, so the id check fires
+        // first — what matters is that the forged event never comes back Ok.
+        assert!(err.to_string().contains("sign_event"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_rejects_tampered_events() {
+        let (adapter, keys) = adapter(SignerMode::Tampered);
+        let err = adapter
+            .sign_event(unsigned_note(keys.public_key()))
+            .await
+            .expect_err("tampered event must be rejected");
+        assert!(err.to_string().contains("different event"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_maps_rejection_to_permanent_error() {
+        let (adapter, keys) = adapter(SignerMode::Reject);
+        let err = adapter
+            .sign_event(unsigned_note(keys.public_key()))
+            .await
+            .expect_err("rejection must surface as an error");
+        // Permanent marker → NOT classified as retryable by the core.
+        let msg = err.to_string();
+        assert!(msg.contains(sonar_core::signer_failure::PERMANENT_MARKER), "{msg}");
+        assert!(!sonar_core::signer_failure::is_transient_signer_failure(&msg));
+    }
+
+    /// A signer that answered "I cannot decrypt this" is PERMANENT: retrying
+    /// re-prompts for something that can never succeed and would pin the sync
+    /// watermark forever (the local-key path drops such a wrap after one try).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_maps_definitive_failure_to_permanent_error() {
+        let (adapter, _keys) = adapter(SignerMode::DecryptFailed);
+        let peer = Keys::generate().public_key();
+        let err = adapter
+            .nip44_decrypt(&peer, "garbage")
+            .await
+            .expect_err("definitive decrypt failure must surface as an error");
+        let msg = err.to_string();
+        assert!(msg.contains(sonar_core::signer_failure::PERMANENT_MARKER), "{msg}");
+        assert!(!sonar_core::signer_failure::is_transient_signer_failure(&msg));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_maps_unavailability_to_transient_error() {
+        let (adapter, keys) = adapter(SignerMode::Unavailable);
+        let err = adapter
+            .sign_event(unsigned_note(keys.public_key()))
+            .await
+            .expect_err("unavailability must surface as an error");
+        // Transient marker → the sync layer keeps the event retryable
+        // instead of durably dropping an undecrypted welcome/DM.
+        assert!(sonar_core::signer_failure::is_transient_signer_failure(
+            &err.to_string()
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_assembles_signature_only_responses() {
+        let (adapter, keys) = adapter(SignerMode::SignatureOnly);
+        let mut unsigned = unsigned_note(keys.public_key());
+        unsigned.ensure_id();
+        let expected_id = unsigned.id;
+        let event = adapter
+            .sign_event(unsigned)
+            .await
+            .expect("assembled from bare signature");
+        assert_eq!(Some(event.id), expected_id);
+        assert_eq!(event.pubkey, keys.public_key());
+        event.verify().expect("valid signature");
+    }
+
+    // Plain #[test]: verify_signer owns its runtime (it is a blocking host
+    // entry point) and must not run inside an outer tokio context.
+    #[test]
+    fn verify_signer_accepts_owner_and_rejects_imposter() {
+        let keys = Keys::generate();
+        let honest = SonarIdentity::remote(
+            keys.public_key().to_hex(),
+            "ab".repeat(32),
+            Box::new(TestForeignSigner {
+                keys: keys.clone(),
+                mode: SignerMode::Honest,
+            }),
+        )
+        .expect("remote identity");
+        honest.verify_signer().expect("owner passes the probe");
+
+        // A signer that answered the implicit login intent with someone
+        // ELSE's pubkey cannot produce a valid signature for it.
+        let imposter = SonarIdentity::remote(
+            Keys::generate().public_key().to_hex(),
+            "ab".repeat(32),
+            Box::new(TestForeignSigner {
+                keys,
+                mode: SignerMode::Honest,
+            }),
+        )
+        .expect("remote identity");
+        assert!(imposter.verify_signer().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_nip44_roundtrips_against_local_keys() {
+        let (adapter, keys) = adapter(SignerMode::Honest);
+        let peer = Keys::generate();
+        let ciphertext = adapter
+            .nip44_encrypt(&peer.public_key(), "sealed for peer")
+            .await
+            .expect("encrypt");
+        let plain = nostr::nips::nip44::decrypt(peer.secret_key(), &keys.public_key(), &ciphertext)
+            .expect("peer decrypts");
+        assert_eq!(plain, "sealed for peer");
+
+        let ciphertext_from_peer = nostr::nips::nip44::encrypt(
+            peer.secret_key(),
+            &keys.public_key(),
+            "reply",
+            nostr::nips::nip44::Version::default(),
+        )
+        .expect("peer encrypts");
+        let decrypted = adapter
+            .nip44_decrypt(&peer.public_key(), &ciphertext_from_peer)
+            .await
+            .expect("decrypt");
+        assert_eq!(decrypted, "reply");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn adapter_reports_nip04_unsupported() {
+        let (adapter, _keys) = adapter(SignerMode::Honest);
+        let peer = Keys::generate().public_key();
+        assert!(adapter.nip04_encrypt(&peer, "x").await.is_err());
+        assert!(adapter.nip04_decrypt(&peer, "x").await.is_err());
+    }
+
+    #[test]
+    fn remote_identity_constructor_validates_inputs() {
+        let keys = Keys::generate();
+        let foreign = || -> Box<dyn ForeignNostrSigner> {
+            Box::new(TestForeignSigner {
+                keys: keys.clone(),
+                mode: SignerMode::Honest,
+            })
+        };
+        let root = "ab".repeat(32);
+
+        let id = SonarIdentity::remote(keys.public_key().to_hex(), root.clone(), foreign())
+            .expect("valid remote identity");
+        assert_eq!(id.pubkey_hex(), keys.public_key().to_hex());
+        assert!(!id.has_local_key());
+        assert_eq!(id.nsec(), "");
+        assert!(id.npub().starts_with("npub1"));
+
+        // npub input form is accepted too (Amber may return either).
+        let npub = keys.public_key().to_bech32().unwrap();
+        SonarIdentity::remote(npub, root.clone(), foreign()).expect("npub accepted");
+
+        assert!(SonarIdentity::remote("nonsense".into(), root.clone(), foreign()).is_err());
+        assert!(
+            SonarIdentity::remote(keys.public_key().to_hex(), "ab".into(), foreign()).is_err()
+        );
+        assert!(SonarIdentity::remote(
+            keys.public_key().to_hex(),
+            "zz".repeat(32),
+            foreign()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn parse_hex32_shapes() {
+        assert!(parse_hex32(&"ab".repeat(32)).is_some());
+        assert!(parse_hex32(&"AB".repeat(32)).is_some());
+        assert!(parse_hex32("ab").is_none());
+        assert!(parse_hex32(&"zz".repeat(32)).is_none());
+        assert_eq!(parse_hex32(&"ff".repeat(32)), Some([0xffu8; 32]));
     }
 }

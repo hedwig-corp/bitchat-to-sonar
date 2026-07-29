@@ -418,14 +418,19 @@ impl MarmotEngine {
 
     /// Build a signed kind-30443 KeyPackage event, ready to publish to
     /// `relays` (which are also advertised inside the event tags).
-    pub fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
-        let _mls = self.mls_write();
-        let kp = dispatch!(&self.storage, |mdk| mdk
-            .create_key_package_for_event(&self.identity.public_key(), relays))?;
-        let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
+    pub async fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
+        // MLS mutation under the write guard; the (possibly remote) envelope
+        // signature happens after the guard is dropped — the lock must never
+        // span an await.
+        let kp = {
+            let _mls = self.mls_write();
+            dispatch!(&self.storage, |mdk| mdk
+                .create_key_package_for_event(&self.identity.public_key(), relays))?
+        };
+        let unsigned = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
             .tags(kp.tags_30443)
-            .build(self.identity.public_key())
-            .sign_with_keys(self.identity.keys())?;
+            .build(self.identity.public_key());
+        let event = self.identity.signer().sign_event(unsigned).await?;
         Ok(event)
     }
 
@@ -551,10 +556,10 @@ impl MarmotEngine {
         // outside its window and the welcome is NEVER fetched — Sonar->White Noise
         // group invites silently failed. A recent timestamp keeps them in the window.
         // (We don't filter by `since`, which is why White Noise->Sonar worked.)
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+        let signer = self.identity.signer();
+        let seal: Event = EventBuilder::seal(&signer, receiver, rumor)
             .await?
-            .sign(keys)
+            .sign(&signer)
             .await?;
         let ephemeral = Keys::generate();
         let content = nip44::encrypt(
@@ -775,6 +780,59 @@ impl MarmotEngine {
         })
     }
 
+    /// Unwrap an account-level kind-1059 gift wrap with signer-aware error
+    /// classification: a TRANSIENT external-signer failure (backgrounded, no
+    /// remembered grant, approval timeout) surfaces as [`Error::Signer`] so
+    /// the sync layer keeps the event retryable, while genuine decrypt
+    /// failures (and explicit user rejections) keep the terminal
+    /// [`Error::Nip59`] shape — see [`crate::signer_failure`].
+    pub async fn unwrap_gift(&self, event: &Event) -> Result<UnwrappedGift> {
+        match UnwrappedGift::from_gift_wrap(&self.identity.signer(), event).await {
+            Ok(unwrapped) => Ok(unwrapped),
+            Err(nostr::nips::nip59::Error::Signer(se))
+                if crate::signer_failure::is_transient_signer_failure(&se.to_string()) =>
+            {
+                Err(Error::Signer(se))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Process an ALREADY-unwrapped gift wrap. Split from
+    /// [`Self::process_incoming`] so the relay drain — which must peek at the
+    /// rumor to intercept non-Marmot account gift wraps (push-token shares,
+    /// NIP-17 DMs) — can unwrap each event exactly once. On an external-signer
+    /// account every unwrap is two cross-process NIP-44 IPC calls, so a second
+    /// unwrap per event doubles the cost of the first-paint drain path.
+    pub fn process_unwrapped_gift(&self, event: &Event, unwrapped: &UnwrappedGift) -> Result<Incoming> {
+        if unwrapped.rumor.kind == Kind::Custom(crate::invite_link::JOIN_REQUEST_RUMOR_KIND) {
+            return self.handle_join_request_rumor(&unwrapped.sender, &unwrapped.rumor);
+        }
+        if unwrapped.rumor.kind != Kind::MlsWelcome {
+            return Ok(Incoming::None);
+        }
+        // Taken after the gift-wrap unwrap await: the lock must never
+        // span an await, only the synchronous MLS mutation below.
+        let _mls = self.mls_write();
+        let welcome = dispatch!(&self.storage, |mdk| mdk
+            .process_welcome(&event.id, &unwrapped.rumor))?;
+        if welcome.member_count <= 2 {
+            dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
+            return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
+        }
+        match welcome.state {
+            welcome_types::WelcomeState::Pending => {
+                Ok(Incoming::GroupInvitePending(welcome.mls_group_id))
+            }
+            welcome_types::WelcomeState::Accepted => {
+                Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+            }
+            welcome_types::WelcomeState::Declined | welcome_types::WelcomeState::Ignored => {
+                Ok(Incoming::None)
+            }
+        }
+    }
+
     /// Process any incoming Marmot-relevant event:
     /// - kind 1059 gift wrap → unwrap; if it holds a kind-444 welcome, direct
     ///   1:1 welcomes are auto-accepted for compatibility and group welcomes are
@@ -783,33 +841,8 @@ impl MarmotEngine {
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
         match event.kind {
             Kind::GiftWrap => {
-                let unwrapped = UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
-                if unwrapped.rumor.kind == Kind::Custom(crate::invite_link::JOIN_REQUEST_RUMOR_KIND)
-                {
-                    return self.handle_join_request_rumor(&unwrapped.sender, &unwrapped.rumor);
-                }
-                if unwrapped.rumor.kind != Kind::MlsWelcome {
-                    return Ok(Incoming::None);
-                }
-                // Taken after the gift-wrap unwrap await: the lock must never
-                // span an await, only the synchronous MLS mutation below.
-                let _mls = self.mls_write();
-                let welcome = dispatch!(&self.storage, |mdk| mdk
-                    .process_welcome(&event.id, &unwrapped.rumor))?;
-                if welcome.member_count <= 2 {
-                    dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
-                    return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
-                }
-                match welcome.state {
-                    welcome_types::WelcomeState::Pending => {
-                        Ok(Incoming::GroupInvitePending(welcome.mls_group_id))
-                    }
-                    welcome_types::WelcomeState::Accepted => {
-                        Ok(Incoming::GroupUpdated(welcome.mls_group_id))
-                    }
-                    welcome_types::WelcomeState::Declined
-                    | welcome_types::WelcomeState::Ignored => Ok(Incoming::None),
-                }
+                let unwrapped = self.unwrap_gift(event).await?;
+                self.process_unwrapped_gift(event, &unwrapped)
             }
             Kind::MlsGroupMessage => {
                 let _mls = self.mls_write();
@@ -965,10 +998,10 @@ impl MarmotEngine {
         receiver: &PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<Event> {
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+        let signer = self.identity.signer();
+        let seal: Event = EventBuilder::seal(&signer, receiver, rumor)
             .await?
-            .sign(keys)
+            .sign(&signer)
             .await?;
         let ephemeral = Keys::generate();
         let content = nip44::encrypt(

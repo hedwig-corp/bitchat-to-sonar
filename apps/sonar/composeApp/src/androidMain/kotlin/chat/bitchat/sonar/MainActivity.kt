@@ -20,6 +20,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
+import chat.bitchat.sonar.signer.AmberSignerClient
+import chat.bitchat.sonar.signer.ExternalSignerBridge
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -119,6 +121,14 @@ class MainActivity : ComponentActivity() {
             unlockCb = null
         }
 
+    /** NIP-55 external signer (Amber): every signer approval round-trips
+     *  through this one launcher; responses are correlated by request id (and
+     *  may arrive batched) inside [AmberSignerClient.onSignerResult]. */
+    private val externalSignerLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { res ->
+            AmberSignerClient.onSignerResult(res.resultCode, res.data)
+        }
+
     /** Launch the device-credential (PIN/pattern/biometric) confirm screen. */
     private fun confirmDeviceCredential(onResult: (Boolean) -> Unit) {
         val km = getSystemService(android.app.KeyguardManager::class.java)
@@ -164,6 +174,16 @@ class MainActivity : ComponentActivity() {
             IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
         )
         ActivityBridge.requestUnlock = { cb -> confirmDeviceCredential(cb) }
+        ExternalSignerBridge.launchSignerIntent = { intent ->
+            runOnUiThread {
+                // This runs on a later main-looper turn, OUTSIDE the caller's
+                // try — an unguarded throw here (signer uninstalled
+                // mid-session → ActivityNotFoundException, recreated activity
+                // → unregistered launcher) would crash the process.
+                runCatching { externalSignerLauncher.launch(intent) }
+                    .onFailure { AmberSignerClient.onLaunchFailed(intent, it) }
+            }
+        }
         setContent {
             App(
                 onFirstLocalStateReady = { firstLocalStateReady = true },
@@ -629,6 +649,9 @@ class MainActivity : ComponentActivity() {
         debugMeshGeneration++
         debugHandler.removeCallbacksAndMessages(null)
         runCatching { unregisterReceiver(adapterStateReceiver) }
+        // Drop the signer launcher: a destroyed activity can never deliver a
+        // result. On recreation onCreate installs the fresh one.
+        ExternalSignerBridge.launchSignerIntent = null
         MeshRadio.stop()
         super.onDestroy()
     }

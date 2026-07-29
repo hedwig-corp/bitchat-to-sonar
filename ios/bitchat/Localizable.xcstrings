@@ -7,6 +7,21 @@
     "Restore account" : {
 
     },
+    "Sign in with Amber" : {
+
+    },
+    "Or keep your key in the Amber signer app — Sonar asks it to sign and never sees your secret." : {
+
+    },
+    "Amber sign-in didn't complete. Approve the request in Amber and try again." : {
+
+    },
+    "External signer" : {
+
+    },
+    "Managed by Amber — your key never leaves the signer app, so there is no nsec to export here." : {
+
+    },
     "Account restored — chats recovered from backup" : {
 
     },

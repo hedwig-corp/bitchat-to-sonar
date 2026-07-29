@@ -244,7 +244,7 @@ async fn upload_baseline(
         encrypted.push(upload);
     }
 
-    let keys = client.identity().keys().clone();
+    let keys = client.identity().signer();
     let futs = encrypted.into_iter().enumerate().map(|(index, upload)| {
         let blossom = blossom.to_string();
         let keys = keys.clone();
@@ -285,12 +285,13 @@ async fn upload_improved(
     items: &[(Vec<u8>, &str, String)],
     blossom: &str,
 ) -> Result<(), String> {
-    let keys = client.identity().keys();
+    let keys = client.identity().signer();
     // Borrowing async blocks (no `move`) so workers share `&client` / `&group`.
     let results = stream::iter(0..items.len())
         .map(|index| {
             let (data, mime, filename) = &items[index];
             let item_index = index;
+            let keys = keys.clone();
             async move {
                 let upload = client
                     .engine()
@@ -303,7 +304,7 @@ async fn upload_improved(
                         upload.encrypted_data,
                         Some("application/octet-stream".into()),
                         None,
-                        Some(keys),
+                        Some(&keys),
                     )
                     .await
                     .map_err(|e| format!("improved put[{item_index}]: {e}"))?;

@@ -6,6 +6,7 @@
     <string name="account_restored_chats_start_empty">Account restored — chats start empty until you back up</string>
     <string name="active">%1$s active</string>
     <string name="adds_debug_detail_to_captured_logs">Adds debug detail to captured logs. Never includes your private key.</string>
+    <string name="amber_sign_in_didn_t_complete_approve">Amber sign-in didn't complete. Approve the request in Amber and try again.</string>
     <string name="anyone_with_this_key_controls_your">Anyone with this key controls your account and wallet. Only restore from your own backup.</string>
     <string name="app_info_app_name">Sonar</string>
     <string name="app_info_close">close</string>
@@ -144,6 +145,7 @@
     <string name="end_to_end_encrypted_groups_over_the">End-to-end encrypted groups over the internet</string>
     <string name="end_to_end_encrypted_only_group_members">End-to-end encrypted — only group members can read this</string>
     <string name="esc">esc</string>
+    <string name="external_signer">External signer</string>
     <string name="far_internet">far · internet</string>
     <string name="find_by_username">Find by username</string>
     <string name="find_someone">Find someone</string>
@@ -215,6 +217,7 @@
     <string name="location_notes_relays_paused">geo relays unavailable; notes paused</string>
     <string name="location_notes_relays_retry_hint">notes rely on geo relays. check connection and try again.</string>
     <string name="logs_stay_on_this_device_until_you">Logs stay on this device until you share them. They contain relay and sync events — no message text and no keys.</string>
+    <string name="managed_by_amber_your_key_never_leaves">Managed by Amber — your key never leaves the signer app, so there is no nsec to export here.</string>
     <string name="mesh_peers_tooltip_new_messages">new messages</string>
     <string name="messages_travel_encrypted_over_the_open">Messages travel encrypted over the open internet instead.</string>
     <string name="more_places_nearby">More places nearby</string>
@@ -234,6 +237,7 @@
     <string name="nsec1">nsec1...</string>
     <string name="offline">Offline</string>
     <string name="online">Online</string>
+    <string name="or_keep_your_key_in_the_amber_signer">Or keep your key in the Amber signer app — Sonar asks it to sign and never sees your secret.</string>
     <string name="out_of_range_still_reachable">Out of range? Still reachable</string>
     <string name="paste_a_friend_s_npub_above_or_have">Paste a friend's npub above — or have them message yours from White Noise.</string>
     <string name="paste_from_clipboard">Paste from clipboard</string>
@@ -270,6 +274,7 @@
     <string name="set_up_your_wallet_to_choose_a_currency">Set up your wallet to choose a currency.</string>
     <string name="setting_up_secure_chat">Setting up secure chat…</string>
     <string name="settings">Settings</string>
+    <string name="sign_in_with_amber">Sign in with Amber</string>
     <string name="sonar">Sonar</string>
     <string name="sonar_2">sonar</string>
     <string name="sonar_connects_phones_directly_no_phone">Sonar connects phones directly — no phone number, no account, no servers.</string>

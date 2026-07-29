@@ -845,6 +845,21 @@ actual object SonarCore {
 
     actual fun identityNsec(): String = DesktopSecrets.get("nsec") ?: ""
 
+    /** Desktop always uses a local key — NIP-55 is an Android-only protocol
+     *  (NIP-46 remote signing is the tracked desktop follow-up). */
+    actual fun usesExternalSigner(): Boolean = false
+
+    actual suspend fun adoptExternalSigner(pubkey: String, packageName: String?): String =
+        throw UnsupportedOperationException("External signers are not supported on desktop")
+
+    /** No-op: desktop never has a signer binding to abandon. */
+    actual suspend fun abandonPendingExternalSigner() = Unit
+
+    actual fun walletSecretHex(): String {
+        val nsec = DesktopSecrets.get("nsec") ?: return ""
+        return chat.bitchat.sonar.crypto.Bech32.nsecToSecretHex(nsec) ?: ""
+    }
+
     actual fun hasIdentity(): Boolean =
         runCatching {
             SonarNativeLoader.ensureLoaded()

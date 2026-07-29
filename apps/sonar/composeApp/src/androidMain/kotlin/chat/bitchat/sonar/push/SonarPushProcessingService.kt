@@ -561,9 +561,11 @@ class SonarPushProcessingService : Service() {
                 }
 
                 // Account Key Durability: a push path must never mint an
-                // identity — bail silently when none exists yet.
-                val nsec = SonarCore.identityNsec()
-                if (nsec.isBlank()) {
+                // identity — bail silently when none exists yet. External-signer
+                // accounts have no nsec; their wallet opens from the persisted
+                // device-local entropy, no signer round-trip needed.
+                val walletSecret = SonarCore.walletSecretHex()
+                if (walletSecret.isBlank()) {
                     Log.d(TAG, "Breez wakeup skipped: no identity")
                     // Should be unreachable — no identity means no wallet, no
                     // offer and no NDS registration, so no invoice_request for
@@ -581,7 +583,7 @@ class SonarPushProcessingService : Service() {
                 // handles cold-start (no SDK) and a Doze-stale reused handle,
                 // and serializes overlapping wakes onto one connection.
                 val live = withTimeoutOrNull(WALLET_SETUP_TIMEOUT_MS) {
-                    WalletBridge.ensureLiveConnection(nsec)
+                    WalletBridge.ensureLiveConnection(walletSecret)
                 } ?: false
                 if (!live || WalletBridge.state() !is WalletState.Ready) {
                     // No usable SDK — nothing can settle; don't burn the budget.

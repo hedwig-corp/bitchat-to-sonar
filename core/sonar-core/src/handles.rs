@@ -290,10 +290,10 @@ pub(crate) struct ClaimResponse {
 }
 
 /// Build and sign the kind-23353 registration event. Signed with the identity
-/// key — handle ownership is the account key, so restoring the nsec restores
-/// the handle (re-claims from the same key are idempotent server-side).
-pub(crate) fn build_claim_event(
-    keys: &Keys,
+/// key — handle ownership is the account key, so restoring the nsec (or the
+/// external-signer account) re-claims the same name idempotently server-side.
+pub(crate) async fn build_claim_event<T: NostrSigner>(
+    signer: &T,
     handle: &ParsedHandle,
     offer: Option<&str>,
 ) -> Result<Event> {
@@ -304,7 +304,8 @@ pub(crate) fn build_claim_event(
     })
     .map_err(|e| Error::InvalidInput(format!("claim content serialize: {e}")))?;
     EventBuilder::new(Kind::Custom(HANDLE_REGISTRATION_KIND), content)
-        .sign_with_keys(keys)
+        .sign(signer)
+        .await
         .map_err(Error::from)
 }
 
@@ -440,11 +441,11 @@ mod tests {
         assert!(parse_nip05_response(b"{}", "a").is_err());
     }
 
-    #[test]
-    fn claim_event_signed_and_shaped() {
+    #[tokio::test]
+    async fn claim_event_signed_and_shaped() {
         let keys = Keys::generate();
         let h = parse_handle_input("vincenzo", DEFAULT_HANDLE_DOMAIN).unwrap();
-        let ev = build_claim_event(&keys, &h, Some("lno1test")).unwrap();
+        let ev = build_claim_event(&keys, &h, Some("lno1test")).await.unwrap();
         assert_eq!(ev.kind, Kind::Custom(HANDLE_REGISTRATION_KIND));
         assert_eq!(ev.pubkey, keys.public_key());
         ev.verify().unwrap();
@@ -454,11 +455,11 @@ mod tests {
         assert_eq!(content.offer.as_deref(), Some("lno1test"));
     }
 
-    #[test]
-    fn claim_event_omits_absent_offer() {
+    #[tokio::test]
+    async fn claim_event_omits_absent_offer() {
         let keys = Keys::generate();
         let h = parse_handle_input("vincenzo", DEFAULT_HANDLE_DOMAIN).unwrap();
-        let ev = build_claim_event(&keys, &h, None).unwrap();
+        let ev = build_claim_event(&keys, &h, None).await.unwrap();
         assert!(!ev.content.contains("offer"));
     }
 
