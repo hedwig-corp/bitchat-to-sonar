@@ -422,6 +422,9 @@ final class MarmotChatModel: ObservableObject {
     /// Groups with a bounded blank-transcript recovery in flight (R-018/#450).
     private var blankTranscriptRecoveryGroups: Set<String> = []
     private var blankTranscriptRecoveryTasks: [String: Task<Void, Never>] = [:]
+    /// Ownership token per group so a cancelled task's `defer` cannot clear a
+    /// newer recovery's bookkeeping (mirrors `directChatSetupTasks`).
+    private var blankTranscriptRecoveryTokens: [String: UUID] = [:]
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
@@ -1825,25 +1828,55 @@ final class MarmotChatModel: ObservableObject {
         ) else { return }
         guard blankTranscriptRecoveryGroups.insert(groupId).inserted else { return }
 
+        // Account generation, like every other long-running operation here:
+        // `quiesceAccountWork` cancels these but cannot join them, so without
+        // this a recovery parked in `Task.sleep` can resume after the DB has
+        // been wiped and read against a replaced account.
+        let generation = sendGeneration
+        let token = UUID()
         blankTranscriptRecoveryTasks[groupId] = Task { [weak self] in
             defer {
-                self?.blankTranscriptRecoveryGroups.remove(groupId)
-                self?.blankTranscriptRecoveryTasks[groupId] = nil
+                // Only clean up if we still own the slot: a cancelled task's
+                // `defer` runs AFTER `cancelBlankTranscriptRecovery` has
+                // cleared the maps, so without the token it would clobber a
+                // newer recovery's bookkeeping and let two run concurrently.
+                if let self, self.blankTranscriptRecoveryTokens[groupId] == token {
+                    self.blankTranscriptRecoveryGroups.remove(groupId)
+                    self.blankTranscriptRecoveryTasks[groupId] = nil
+                    self.blankTranscriptRecoveryTokens[groupId] = nil
+                }
             }
             for delay in SonarTranscriptRecoveryPolicy.recoveryDelays {
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                guard let self, !Task.isCancelled else { return }
+                guard let self, !Task.isCancelled,
+                      self.isCurrentAccountWork(generation) else { return }
                 // Rows arrived by any route (sync, drain, another load): done.
                 if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
-                _ = await self.loadLocalPage(groupId: groupId, mode: .newestPage)
+                // Transcript-only: the metadata hydrate must not run ten times.
+                _ = await self.loadLocalPage(
+                    groupId: groupId,
+                    mode: .newestPage,
+                    hydrateMetadata: false
+                )
                 if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
+                // Stop once the conversation is provably readable AND empty —
+                // otherwise a genuinely empty chat burns the whole budget on
+                // every open.
+                let summary = self.conversationSummariesByGroup[groupId]
+                if !SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
+                    knownNonEmpty: (summary?.messageCount ?? 0) > 0,
+                    storeReadable: true,
+                    sourcesResolved: self.groups.contains { $0.id == groupId }
+                ) { return }
             }
         }
+        blankTranscriptRecoveryTokens[groupId] = token
     }
 
     private func cancelBlankTranscriptRecovery(groupId: String) {
         blankTranscriptRecoveryTasks[groupId]?.cancel()
         blankTranscriptRecoveryTasks[groupId] = nil
+        blankTranscriptRecoveryTokens[groupId] = nil
         blankTranscriptRecoveryGroups.remove(groupId)
     }
 
@@ -1899,7 +1932,8 @@ final class MarmotChatModel: ObservableObject {
     @discardableResult
     func loadLocalPage(
         groupId: String,
-        mode: LocalTranscriptLoadMode
+        mode: LocalTranscriptLoadMode,
+        hydrateMetadata: Bool = true
     ) async -> Bool {
         guard localTranscriptLoadingGroups.insert(groupId).inserted else { return false }
         defer { localTranscriptLoadingGroups.remove(groupId) }
@@ -1960,6 +1994,13 @@ final class MarmotChatModel: ObservableObject {
                 freshRowsByGroup: [groupId: page]
             )
             transcriptLoaded = true
+            // The blank-transcript recovery (#450) re-reads up to ten times;
+            // running the metadata hydrate on each pass would mean 3 extra FFI
+            // round-trips, three @Published republishes (full chat-list +
+            // transcript invalidation), a UserDefaults snapshot write and a
+            // per-member profile/descriptor sweep — ten times over — which is
+            // exactly the churn the Signal-Comparable Performance Rule forbids.
+            guard hydrateMetadata else { return true }
             let groups = try await service.groups()
             let invites = try await service.pendingGroupInvites()
             let summaries = await service.conversationSummaries()
@@ -4316,6 +4357,7 @@ final class MarmotChatModel: ObservableObject {
         directChatSetupTasks = [:]
         for (_, task) in blankTranscriptRecoveryTasks { task.cancel() }
         blankTranscriptRecoveryTasks.removeAll()
+        blankTranscriptRecoveryTokens.removeAll()
         blankTranscriptRecoveryGroups.removeAll()
         pendingDirectChats = [:]
         setups.forEach { $0.cancel() }

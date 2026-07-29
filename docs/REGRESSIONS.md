@@ -812,7 +812,7 @@ whose Marmot group had not resolved yet) left the transcript black until an
 unrelated sync event published rows. `SonarTranscriptRecoveryPolicy`
 (`shouldRecoverBlankTranscript`, same three inputs as the Compose gate) plus
 `MarmotChatModel.scheduleBlankTranscriptRecovery`, wired into
-`loadLocalWindow`, re-read local storage on a bounded backoff (~5.5s,
+`loadLocalWindow`, re-read local storage on a bounded backoff (~6.3s,
 100ms → 800ms) without ever blocking first paint.
 
 **Apple call sites:** `SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript`

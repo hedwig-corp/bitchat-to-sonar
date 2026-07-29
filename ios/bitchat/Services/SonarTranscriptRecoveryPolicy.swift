@@ -50,8 +50,9 @@ enum SonarTranscriptRecoveryPolicy {
 
     /// Backoff schedule for the recovery re-reads, in seconds. Bounded on
     /// purpose: this is a safety net for a first paint that lost a race with
-    /// store readiness, not a polling loop. Mirrors the Compose budget
-    /// (~8s total, 100ms → 800ms).
+    /// store readiness, not a polling loop. Sums to ~6.3s (100ms → 800ms),
+    /// close to the Compose budget of 8s — stated exactly because three
+    /// different numbers were previously written for it.
     static let recoveryDelays: [Double] = [0.1, 0.2, 0.4, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8]
 
     /// Total wall-clock ceiling of [`recoveryDelays`], for tests and docs.
