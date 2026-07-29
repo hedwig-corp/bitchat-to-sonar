@@ -51,6 +51,16 @@ internal object SonarMarmotWakeSync {
      *  owners would reconnect concurrently again. */
     private var ownerGeneration = 0L
 
+    /** Ceiling on rerun passes for ONE owner.
+     *
+     *  A service-hosted owner used to die with the service; an inline-hosted
+     *  one runs on a process-scoped scope nothing cancels, and every joining
+     *  delivery sets [needsRerun] — so without a cap, one push per attempt
+     *  keeps invalidating and rebuilding the relay node forever. Push
+     *  frequency is attacker-influenced, and background relay-node rebuild
+     *  churn is a regression this repo has already shipped once. */
+    private const val MAX_OWNER_RERUNS = 3
+
     /**
      * Join the in-flight wake or become its owner. [scope] hosts the owner
      * job; a follower only awaits. [timeoutMs] bounds ONE owner attempt.
@@ -83,6 +93,7 @@ internal object SonarMarmotWakeSync {
         }
 
     private suspend fun runOwnerLocked(generation: Long, timeoutMs: Long): Boolean {
+        var reruns = 0
         try {
             while (true) {
                 lock.withLock { needsRerun = false }
@@ -111,7 +122,8 @@ internal object SonarMarmotWakeSync {
                 // unfetched while it inherits synced=true and skips the fallback
                 // notification.
                 val retired = lock.withLock {
-                    if (needsRerun) {
+                    if (needsRerun && reruns < MAX_OWNER_RERUNS) {
+                        reruns++
                         false
                     } else {
                         retire(generation)

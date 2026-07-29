@@ -107,13 +107,26 @@ internal object SonarPushInlineFallback {
     /** Whole-answer bound for the Breez path (orphan-awaited, so it holds). */
     const val INVOICE_BUDGET_MS = 8_000L
 
+    /** Reserved out of [INVOICE_BUDGET_MS] for producing + POSTing the reply,
+     *  so a cold wallet still gets an error to the payer instead of nothing.
+     *  `ensureLiveConnection` blocks up to 30s (probe + connect) and a
+     *  denied-FGS wake means a cold wallet by definition, so without this the
+     *  advertised "a fast error beats a 60s payer timeout" never happens. */
+    const val INVOICE_POST_RESERVE_MS = 3_000L
+
     /** Orphan scope for blocking UniFFI/SDK calls: a timeout child cannot
      *  cancel them, so the AWAIT is bounded instead and stragglers finish
      *  harmlessly in the background. */
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     fun run(context: Context, pushType: String, notificationType: String, payload: String) {
-        run(inlineFallbackPlan(pushType, notificationType), payload, realEffects(context))
+        // applicationContext: the effects are captured by jobs on a
+        // process-scoped scope that by design outlive the Service instance.
+        run(
+            inlineFallbackPlan(pushType, notificationType),
+            payload,
+            realEffects(context.applicationContext),
+        )
     }
 
     /** Testable core: dispatch + degrade policy over injected effects. */
@@ -206,8 +219,16 @@ internal object SonarPushInlineFallback {
                         JsonLite.encodeObject("error", "wallet unavailable"),
                     )
                 }
-                val live = runCatching { WalletBridge.ensureLiveConnection(nsec) }
-                    .getOrDefault(false)
+                // Bound the CONNECT on a nested orphan: the outer job still
+                // owns the reply slot, so this cannot produce a second POST —
+                // it only stops a 30s blocking connect from eating the whole
+                // budget and leaving the payer with no answer at all.
+                val connect = scope.async {
+                    runCatching { WalletBridge.ensureLiveConnection(nsec) }.getOrDefault(false)
+                }
+                val live = withTimeoutOrNull(INVOICE_BUDGET_MS - INVOICE_POST_RESERVE_MS) {
+                    connect.await()
+                } ?: false
                 if (!live || WalletBridge.state() !is WalletState.Ready) {
                     return@async postNdsReply(
                         req.replyUrl,
