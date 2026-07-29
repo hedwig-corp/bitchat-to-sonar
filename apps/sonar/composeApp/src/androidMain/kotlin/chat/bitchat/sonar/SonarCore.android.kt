@@ -1,6 +1,8 @@
 package chat.bitchat.sonar
 
 import android.content.Context
+import chat.bitchat.sonar.crypto.Bech32
+import chat.bitchat.sonar.signer.AmberSignerClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -29,6 +31,22 @@ import kotlin.concurrent.write
  * [AndroidSecrets] so private material is encrypted with Android Keystore.
  */
 actual object SonarCore {
+
+    // ── AndroidSecrets keys for the external-signer (NIP-55 / Amber) account ──
+    // Mode invariant: an account has EITHER "nsec" OR SIGNER_PUBKEY, never
+    // both. importIdentity()/wipe() clear the signer keys; adoptExternalSigner
+    // refuses to run over an existing local key.
+    private const val SIGNER_PUBKEY = "signer.pubkey"
+    private const val SIGNER_PACKAGE = "signer.package"
+
+    /** Device-local random root for geohash/call derivations (NOT the account
+     *  secret — those derivations read the nsec bytes on local accounts). */
+    private const val SIGNER_KDF_ROOT = "signer.kdfRoot"
+
+    /** Device-local random wallet entropy for signer accounts: NIP-55 cannot
+     *  export secret bytes, so the wallet seed cannot derive from the account
+     *  key and is NOT restorable from it (documented gap). */
+    private const val WALLET_ENTROPY = "wallet.entropyHex"
 
     // Must match the iOS MarmotService relays so the two interop.
     private val relayUrls = listOf(
@@ -851,6 +869,10 @@ actual object SonarCore {
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)
             if (saved != null) hex = runCatching { SonarIdentity.import(saved).pubkeyHex() }.getOrDefault("")
         }
+        if (hex.isEmpty()) {
+            // External-signer account: the pubkey is the persisted identity.
+            hex = AndroidSecrets.get(SIGNER_PUBKEY) ?: ""
+        }
         if (hex.isEmpty()) return ""
         // First 32 hex chars grouped in 4s, uppercase — a stable key fingerprint.
         return hex.take(32).uppercase().chunked(4).joinToString(" ")
@@ -861,17 +883,70 @@ actual object SonarCore {
     actual fun hasIdentity(): Boolean =
         runCatching {
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)?.trim()
-                ?: return@runCatching false
-            SonarIdentity.import(saved)
-            true
+            if (saved != null) {
+                SonarIdentity.import(saved)
+                return@runCatching true
+            }
+            !AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank()
         }
             .getOrDefault(false)
+
+    actual fun usesExternalSigner(): Boolean =
+        AndroidSecrets.getMigrating("nsec", durable = true) == null &&
+            !AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank()
+
+    actual suspend fun adoptExternalSigner(pubkey: String, packageName: String?): String =
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                // A locally-keyed account must never be silently replaced by a
+                // signer login (Account Key Durability rule) — restore/wipe are
+                // the only paths that change an existing account.
+                check(AndroidSecrets.getMigrating("nsec", durable = true) == null) {
+                    "This device already has a local account key"
+                }
+                val kdfRoot = AndroidSecrets.get(SIGNER_KDF_ROOT) ?: randomHex32()
+                // Validate + normalize (hex or npub input) through the core.
+                val identity = SonarIdentity.remote(pubkey.trim(), kdfRoot, AmberSignerClient)
+                // Update-in-place, durable commit — never delete-then-add.
+                AndroidSecrets.put(SIGNER_KDF_ROOT, kdfRoot, durable = true)
+                AndroidSecrets.put(SIGNER_PUBKEY, identity.pubkeyHex(), durable = true)
+                packageName?.takeIf(String::isNotBlank)?.let {
+                    AndroidSecrets.put(SIGNER_PACKAGE, it, durable = true)
+                }
+                // The wallet entropy is minted here so a later killed-app push
+                // wake can open the wallet without any signer round-trip.
+                if (AndroidSecrets.get(WALLET_ENTROPY).isNullOrBlank()) {
+                    AndroidSecrets.put(WALLET_ENTROPY, randomHex32(), durable = true)
+                }
+                AmberSignerClient.currentUserHex = identity.pubkeyHex()
+                AmberSignerClient.signerPackage = AndroidSecrets.get(SIGNER_PACKAGE)
+                npub = identity.npub()
+                pubkeyHex = identity.pubkeyHex()
+                npub
+            }
+        }
+
+    actual fun walletSecretHex(): String {
+        val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+        if (nsec != null) return Bech32.nsecToSecretHex(nsec) ?: ""
+        if (AndroidSecrets.get(SIGNER_PUBKEY).isNullOrBlank()) return ""
+        AndroidSecrets.get(WALLET_ENTROPY)?.takeIf(String::isNotBlank)?.let { return it }
+        // Self-heal a missing entropy (e.g. interrupted adopt): mint one now.
+        val entropy = randomHex32()
+        AndroidSecrets.put(WALLET_ENTROPY, entropy, durable = true)
+        return entropy
+    }
 
     actual suspend fun prepareIdentityForOnboarding(): String = withContext(Dispatchers.IO) {
         lock.withLock {
             if (npub.isNotBlank()) return@withLock npub
             val saved = AndroidSecrets.getMigrating("nsec", durable = true)
             if (saved != null) return@withLock SonarIdentity.import(saved).npub()
+            // Signer-backed onboarding: the account already exists in the
+            // signer app — never mint a local key next to it.
+            AndroidSecrets.get(SIGNER_PUBKEY)?.takeIf(String::isNotBlank)?.let {
+                return@withLock remoteIdentity(it).npub()
+            }
             val identity = SonarIdentity.generate()
             AndroidSecrets.put("nsec", identity.nsec(), durable = true)
             identity.npub()
@@ -894,6 +969,13 @@ actual object SonarCore {
                 try {
                     wipeMarmotStorage(marmotDir)
                     AndroidSecrets.put("nsec", identity.nsec(), durable = true)
+                    // Restoring an nsec switches the account to a local key —
+                    // drop any previous external-signer binding (mode invariant).
+                    AndroidSecrets.remove(SIGNER_PUBKEY, durable = true)
+                    AndroidSecrets.remove(SIGNER_PACKAGE, durable = true)
+                    AndroidSecrets.remove(SIGNER_KDF_ROOT, durable = true)
+                    AndroidSecrets.remove(WALLET_ENTROPY, durable = true)
+                    AmberSignerClient.reset()
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
                     tryRestoreAccountBackupLocked(identity, marmotDir).also {
@@ -1018,6 +1100,7 @@ actual object SonarCore {
                     ?.forEach { it.delete() }
                 AndroidSecrets.clear()
                 prefs().edit().clear().apply()
+                AmberSignerClient.reset()
                 wipeFailure?.let { throw it }
                 Unit
             }
@@ -1151,12 +1234,34 @@ actual object SonarCore {
         if (saved != null) {
             return SonarIdentity.import(saved)
         }
+        AndroidSecrets.get(SIGNER_PUBKEY)?.takeIf(String::isNotBlank)?.let {
+            return remoteIdentity(it)
+        }
         if (onboardingComplete()) {
             throw IllegalStateException("Account key missing. Restore from your backup key.")
         }
         val id = SonarIdentity.generate()
         AndroidSecrets.put("nsec", id.nsec(), durable = true)
         return id
+    }
+
+    /**
+     * Build the external-signer identity for `pubkey` and (re)wire the Amber
+     * client statics so ContentResolver calls carry the right account/package.
+     * Self-heals a missing kdf root (interrupted adopt): the root is
+     * device-local derivation material, not the account secret.
+     */
+    private fun remoteIdentity(pubkey: String): SonarIdentity {
+        val kdfRoot = AndroidSecrets.get(SIGNER_KDF_ROOT)?.takeIf(String::isNotBlank)
+            ?: randomHex32().also { AndroidSecrets.put(SIGNER_KDF_ROOT, it, durable = true) }
+        AmberSignerClient.currentUserHex = pubkey
+        AmberSignerClient.signerPackage = AndroidSecrets.get(SIGNER_PACKAGE)
+        return SonarIdentity.remote(pubkey, kdfRoot, AmberSignerClient)
+    }
+
+    private fun randomHex32(): String {
+        val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
+        return bytes.joinToString("") { b -> "%02x".format(b) }
     }
 
     private fun loadOrCreateDbKey(): String {

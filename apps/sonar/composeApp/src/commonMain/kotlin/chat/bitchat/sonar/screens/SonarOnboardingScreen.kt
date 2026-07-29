@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.resources.Res
+import chat.bitchat.sonar.resources.amber_sign_in_didn_t_complete_approve
 import chat.bitchat.sonar.resources.anyone_with_this_key_controls_your
 import chat.bitchat.sonar.resources.bluetooth_finds_people_around_you_even
 import chat.bitchat.sonar.resources.continue_
@@ -58,6 +59,7 @@ import chat.bitchat.sonar.resources.nickname
 import chat.bitchat.sonar.resources.no_account_was_created_anywhere_your
 import chat.bitchat.sonar.resources.no_signup_your_identity_is_a_private
 import chat.bitchat.sonar.resources.nsec1
+import chat.bitchat.sonar.resources.or_keep_your_key_in_the_amber_signer
 import chat.bitchat.sonar.resources.out_of_range_still_reachable
 import chat.bitchat.sonar.resources.paste_key
 import chat.bitchat.sonar.resources.paste_your_nsec_private_key_to_bring
@@ -66,6 +68,7 @@ import chat.bitchat.sonar.resources.private_by_design
 import chat.bitchat.sonar.resources.restore_account
 import chat.bitchat.sonar.resources.restoring
 import chat.bitchat.sonar.resources.sense_who_s_nearby_before_you_see_them
+import chat.bitchat.sonar.resources.sign_in_with_amber
 import chat.bitchat.sonar.resources.sonar_connects_phones_directly_no_phone
 import chat.bitchat.sonar.resources.start_chatting
 import chat.bitchat.sonar.resources.surprise_me
@@ -79,6 +82,7 @@ import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconButton
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNPrimaryButton
+import chat.bitchat.sonar.signer.ExternalSigner
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
 import org.jetbrains.compose.resources.stringResource
@@ -96,12 +100,15 @@ fun SonarOnboardingScreen(state: SonarAppState) {
     var nsec by remember { mutableStateOf("") }
     var restoreError by remember { mutableStateOf<String?>(null) }
     var restoreInFlight by remember { mutableStateOf(false) }
+    var amberInFlight by remember { mutableStateOf(false) }
     val trimmed = nick.trim()
     val can = trimmed.length >= 2
     val nsecOk = nsec.trim().matches(Regex("^nsec1[0-9a-z]{20,}$"))
     val clipboard = LocalClipboardManager.current
     val restoreFailureFallback =
         stringResource(Res.string.that_key_couldn_t_be_imported_check_you)
+    val amberAvailable = remember { ExternalSigner.isAvailable() }
+    val amberFailureFallback = stringResource(Res.string.amber_sign_in_didn_t_complete_approve)
 
     Column(
         Modifier.fillMaxSize().background(s.bg)
@@ -130,6 +137,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                 -1 -> StepRestore(
                     nsec = nsec,
                     error = restoreError,
+                    amberAvailable = amberAvailable,
                     onChange = { nsec = it },
                     onPaste = { clipboard.getText()?.text?.let { nsec = it.trim() } },
                 )
@@ -155,7 +163,7 @@ fun SonarOnboardingScreen(state: SonarAppState) {
             if (restoring) {
                 SNPrimaryButton(
                     if (restoreInFlight) stringResource(Res.string.restoring) else stringResource(Res.string.restore_account),
-                    disabled = !nsecOk || restoreInFlight,
+                    disabled = !nsecOk || restoreInFlight || amberInFlight,
                 ) {
                     val key = nsec.trim()
                     restoreInFlight = true
@@ -165,6 +173,27 @@ fun SonarOnboardingScreen(state: SonarAppState) {
                         result.exceptionOrNull()?.let { failure ->
                             restoreError = (failure as? SonarAccountRestoreException)?.message
                                 ?: restoreFailureFallback
+                        }
+                    }
+                }
+                if (amberAvailable) {
+                    // NIP-55 path: the key stays in the signer app; onboarding
+                    // continues to the nickname step on success.
+                    SNGhostButton(stringResource(Res.string.sign_in_with_amber)) {
+                        if (!amberInFlight && !restoreInFlight) {
+                            amberInFlight = true
+                            restoreError = null
+                            state.loginWithExternalSigner { result ->
+                                amberInFlight = false
+                                if (result.isSuccess) {
+                                    restoring = false
+                                    restoreError = null
+                                    nsec = ""
+                                    step = 1
+                                } else {
+                                    restoreError = amberFailureFallback
+                                }
+                            }
                         }
                     }
                 }
@@ -301,6 +330,7 @@ private fun StepNickname(nick: String, trimmed: String, onChange: (String) -> Un
 private fun StepRestore(
     nsec: String,
     error: String?,
+    amberAvailable: Boolean,
     onChange: (String) -> Unit,
     onPaste: () -> Unit,
 ) {
@@ -338,6 +368,13 @@ private fun StepRestore(
         }
         Spacer(Modifier.height(18.dp))
         Text(stringResource(Res.string.anyone_with_this_key_controls_your), color = s.text3, fontSize = 13.sp, lineHeight = 17.sp)
+        if (amberAvailable) {
+            Spacer(Modifier.height(14.dp))
+            Text(
+                stringResource(Res.string.or_keep_your_key_in_the_amber_signer),
+                color = s.text3, fontSize = 13.sp, lineHeight = 17.sp,
+            )
+        }
         if (error != null) {
             Spacer(Modifier.height(14.dp))
             Text(error, color = s.danger, fontSize = 13.sp, lineHeight = 17.sp)

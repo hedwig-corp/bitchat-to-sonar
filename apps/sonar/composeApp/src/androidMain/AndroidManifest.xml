@@ -33,6 +33,18 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
 
+    <!-- NIP-55 external signer (Amber): package visibility on Android 11+ for
+         both the nostrsigner: intent flow and the signer's ContentProvider
+         (background signing). Without this, queryIntentActivities and
+         contentResolver.query silently return nothing. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="nostrsigner" />
+        </intent>
+    </queries>
+
     <application
         android:name=".SonarApp"
         android:allowBackup="false"

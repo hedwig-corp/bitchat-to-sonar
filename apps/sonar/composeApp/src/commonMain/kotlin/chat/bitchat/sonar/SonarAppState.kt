@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import chat.bitchat.sonar.crypto.Bech32
+import chat.bitchat.sonar.signer.ExternalSigner
 import chat.bitchat.sonar.store.MessageMerge
 import chat.bitchat.sonar.store.MessageStore
 import chat.bitchat.sonar.unify.UnifyBIP321
@@ -2791,7 +2792,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
         }
         scope.launch {
-            WalletBridge.setupIfNeeded(SonarCore.identityNsec())
+            WalletBridge.setupIfNeeded(SonarCore.walletSecretHex())
             walletState = WalletBridge.state()
             WalletBridge.fetchRates()
             rate = WalletBridge.cachedRate(currency)
@@ -3754,6 +3755,29 @@ class SonarAppState(private val scope: CoroutineScope) {
     }
 
     fun exportNsec(): String = SonarCore.identityNsec()
+
+    /** True when the account key lives in an external NIP-55 signer (Amber):
+     *  key export / Blossom account backup / nsec restore are gated off. */
+    fun usesExternalSigner(): Boolean = SonarCore.usesExternalSigner()
+
+    /**
+     * Onboarding path: sign in with an installed NIP-55 signer app (Amber).
+     * Runs the signer's get_public_key approval, persists the signer binding
+     * durably, and reports success — the caller then continues the normal
+     * nickname → [completeOnboarding] flow (which sets the onboarding flag
+     * only after the identity is durably persisted, per the Account Key
+     * Durability rule).
+     */
+    fun loginWithExternalSigner(onResult: (Result<Unit>) -> Unit) {
+        scope.launch {
+            val result = runCatching {
+                val login = ExternalSigner.login()
+                npub = SonarCore.adoptExternalSigner(login.pubkeyHex, login.packageName)
+                Unit
+            }
+            onResult(result)
+        }
+    }
 
     fun restoreAccount(nsec: String, onResult: (Result<Unit>) -> Unit) {
         scope.launch {

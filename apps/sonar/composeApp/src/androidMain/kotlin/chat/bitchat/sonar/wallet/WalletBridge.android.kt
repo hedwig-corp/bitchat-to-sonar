@@ -23,7 +23,6 @@ import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.AppContextHolder
 import chat.bitchat.sonar.BuildConfig
 import chat.bitchat.sonar.SonarLifecycle
-import chat.bitchat.sonar.crypto.Bech32
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -104,11 +103,11 @@ actual object WalletBridge {
 
     actual fun state(): WalletState = current
 
-    actual suspend fun setupIfNeeded(nsec: String): Unit = withContext(Dispatchers.IO) {
+    actual suspend fun setupIfNeeded(walletSecretHex: String): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
             recoverPendingCleanupLocked()
             if (sdk != null) return@withContext
-            connectLocked(nsec)
+            connectLocked(walletSecretHex)
         }
     }
 
@@ -117,10 +116,10 @@ actual object WalletBridge {
      * Factored out of [setupIfNeeded] so [ensureLiveConnection] can reuse it
      * inside the same lock acquisition (kotlinx `Mutex` is non-reentrant).
      */
-    private suspend fun connectLocked(nsec: String) {
+    private suspend fun connectLocked(walletSecretHex: String) {
         val key = apiKey()
         if (key.isEmpty()) { current = WalletState.NotConfigured; return }
-        val secretHex = Bech32.nsecToSecretHex(nsec)
+        val secretHex = walletSecretHex.takeIf { it.matches(Regex("^[0-9a-fA-F]{64}$")) }
         if (secretHex == null) { current = WalletState.Failed("no identity"); return }
         current = WalletState.SettingUp
         // The Breez connect()/getInfo() are blocking native calls — a plain
@@ -189,7 +188,7 @@ actual object WalletBridge {
      * other's freshly-built node. Doing the whole probe+reconnect in one lock
      * acquisition serializes overlapping wakes onto a single connection.
      */
-    suspend fun ensureLiveConnection(nsec: String): Boolean = withContext(Dispatchers.IO) {
+    suspend fun ensureLiveConnection(walletSecretHex: String): Boolean = withContext(Dispatchers.IO) {
         lock.withLock {
             // Same guard setupIfNeeded runs, for the same reason: an interrupted
             // wipeLocalStorage() must finish before ANY seed is opened. Without
@@ -229,7 +228,7 @@ actual object WalletBridge {
                 runCatching { existing.disconnect() }
                 sdk = null
             }
-            connectLocked(nsec)
+            connectLocked(walletSecretHex)
             sdk != null
         }
     }

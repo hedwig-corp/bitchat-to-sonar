@@ -17,9 +17,10 @@ async fn multi_member_welcomes_wait_for_accept_or_decline() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
@@ -102,9 +103,10 @@ async fn unpublished_group_creation_can_be_discarded() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
@@ -141,7 +143,7 @@ async fn staged_add_member_commit_can_be_rolled_back() {
     let charlie = MarmotEngine::in_memory(Identity::generate());
     let charlie_pubkey = charlie.identity().public_key();
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let creation = alice
         .create_group("alice and bob", vec![bob_kp], relays.clone())
         .expect("alice creates group");
@@ -150,7 +152,7 @@ async fn staged_add_member_commit_can_be_rolled_back() {
         .merge_pending_commit(&group_id)
         .expect("merge initial group");
 
-    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let charlie_kp = charlie.key_package_event(relays).await.expect("charlie kp");
     let update = alice
         .add_members(&group_id, vec![charlie_kp])
         .expect("stage add charlie");
@@ -185,9 +187,10 @@ async fn partially_published_group_creation_can_still_be_merged() {
     let bob = MarmotEngine::in_memory(Identity::generate());
     let charlie = MarmotEngine::in_memory(Identity::generate());
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let charlie_kp = charlie
         .key_package_event(relays.clone())
+        .await
         .expect("charlie kp");
 
     let creation = alice
@@ -220,7 +223,7 @@ async fn published_add_member_commit_remains_mergeable_after_welcome_failure() {
     let charlie = MarmotEngine::in_memory(Identity::generate());
     let charlie_pubkey = charlie.identity().public_key();
 
-    let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+    let bob_kp = bob.key_package_event(relays.clone()).await.expect("bob kp");
     let creation = alice
         .create_group("alice and bob", vec![bob_kp], relays.clone())
         .expect("alice creates group");
@@ -229,7 +232,7 @@ async fn published_add_member_commit_remains_mergeable_after_welcome_failure() {
         .merge_pending_commit(&group_id)
         .expect("merge initial group");
 
-    let charlie_kp = charlie.key_package_event(relays).expect("charlie kp");
+    let charlie_kp = charlie.key_package_event(relays).await.expect("charlie kp");
     let update = alice
         .add_members(&group_id, vec![charlie_kp])
         .expect("stage add charlie");
@@ -273,7 +276,7 @@ async fn join_request_naming_a_third_party_is_rejected() {
     // id the engine actually holds rather than a synthetic one.
     let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
     let member = MarmotEngine::in_memory(Identity::generate());
-    let member_kp = member.key_package_event(relays.clone()).expect("member kp");
+    let member_kp = member.key_package_event(relays.clone()).await.expect("member kp");
     let group_id = admin
         .create_group("crew", vec![member_kp], relays)
         .expect("admin creates group")
@@ -323,7 +326,7 @@ async fn join_request_naming_itself_is_accepted_with_seal_identity() {
     // id the engine actually holds rather than a synthetic one.
     let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
     let member = MarmotEngine::in_memory(Identity::generate());
-    let member_kp = member.key_package_event(relays.clone()).expect("member kp");
+    let member_kp = member.key_package_event(relays.clone()).await.expect("member kp");
     let group_id = admin
         .create_group("crew", vec![member_kp], relays)
         .expect("admin creates group")

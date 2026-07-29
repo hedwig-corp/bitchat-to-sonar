@@ -418,14 +418,19 @@ impl MarmotEngine {
 
     /// Build a signed kind-30443 KeyPackage event, ready to publish to
     /// `relays` (which are also advertised inside the event tags).
-    pub fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
-        let _mls = self.mls_write();
-        let kp = dispatch!(&self.storage, |mdk| mdk
-            .create_key_package_for_event(&self.identity.public_key(), relays))?;
-        let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
+    pub async fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
+        // MLS mutation under the write guard; the (possibly remote) envelope
+        // signature happens after the guard is dropped — the lock must never
+        // span an await.
+        let kp = {
+            let _mls = self.mls_write();
+            dispatch!(&self.storage, |mdk| mdk
+                .create_key_package_for_event(&self.identity.public_key(), relays))?
+        };
+        let unsigned = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
             .tags(kp.tags_30443)
-            .build(self.identity.public_key())
-            .sign_with_keys(self.identity.keys())?;
+            .build(self.identity.public_key());
+        let event = self.identity.signer().sign_event(unsigned).await?;
         Ok(event)
     }
 
@@ -551,10 +556,10 @@ impl MarmotEngine {
         // outside its window and the welcome is NEVER fetched — Sonar->White Noise
         // group invites silently failed. A recent timestamp keeps them in the window.
         // (We don't filter by `since`, which is why White Noise->Sonar worked.)
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+        let signer = self.identity.signer();
+        let seal: Event = EventBuilder::seal(&signer, receiver, rumor)
             .await?
-            .sign(keys)
+            .sign(&signer)
             .await?;
         let ephemeral = Keys::generate();
         let content = nip44::encrypt(
@@ -783,7 +788,8 @@ impl MarmotEngine {
     pub async fn process_incoming(&self, event: &Event) -> Result<Incoming> {
         match event.kind {
             Kind::GiftWrap => {
-                let unwrapped = UnwrappedGift::from_gift_wrap(self.identity.keys(), event).await?;
+                let unwrapped =
+                    UnwrappedGift::from_gift_wrap(&self.identity.signer(), event).await?;
                 if unwrapped.rumor.kind == Kind::Custom(crate::invite_link::JOIN_REQUEST_RUMOR_KIND)
                 {
                     return self.handle_join_request_rumor(&unwrapped.sender, &unwrapped.rumor);
@@ -965,10 +971,10 @@ impl MarmotEngine {
         receiver: &PublicKey,
         rumor: UnsignedEvent,
     ) -> Result<Event> {
-        let keys = self.identity.keys();
-        let seal: Event = EventBuilder::seal(keys, receiver, rumor)
+        let signer = self.identity.signer();
+        let seal: Event = EventBuilder::seal(&signer, receiver, rumor)
             .await?
-            .sign(keys)
+            .sign(&signer)
             .await?;
         let ephemeral = Keys::generate();
         let content = nip44::encrypt(

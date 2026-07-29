@@ -75,7 +75,9 @@ import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.backup_chats
 import chat.bitchat.sonar.resources.cancel
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
+import chat.bitchat.sonar.resources.external_signer
 import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
+import chat.bitchat.sonar.resources.managed_by_amber_your_key_never_leaves
 import chat.bitchat.sonar.resources.paste_from_clipboard
 import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
 import chat.bitchat.sonar.resources.restore_account
@@ -221,24 +223,35 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = SNIconName.ShieldCheck, tone = SNTone.Cyan, label = "Verified people",
                     value = state.verifiedCount().toString(),
                 ) { state.push(Screen.Nearby) }
-                SNXSettingsRow(
-                    label = "Export private key",
-                    sub = "Back up your nsec — needed to restore on another phone",
-                    chevron = true,
-                    icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
-                ) { exportKey = true }
-                SNXSettingsRow(
-                    label = stringResource(Res.string.backup_chats),
-                    sub = stringResource(Res.string.encrypted_cloud_backup_recover_chats),
-                    chevron = true,
-                    icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
-                ) { state.backupAccountNow() }
-                SNXSettingsRow(
-                    label = stringResource(Res.string.restore_account),
-                    sub = stringResource(Res.string.replace_this_account_with_an_nsec_from),
-                    chevron = true,
-                    icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
-                ) { restoreKey = true }
+                if (state.usesExternalSigner()) {
+                    // NIP-55 account: there is no local nsec to export, and the
+                    // Blossom account backup/restore is keyed on the nsec —
+                    // both are unavailable by design (documented gap).
+                    SNXSettingsRow(
+                        label = stringResource(Res.string.external_signer),
+                        sub = stringResource(Res.string.managed_by_amber_your_key_never_leaves),
+                        icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
+                    ) {}
+                } else {
+                    SNXSettingsRow(
+                        label = "Export private key",
+                        sub = "Back up your nsec — needed to restore on another phone",
+                        chevron = true,
+                        icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
+                    ) { exportKey = true }
+                    SNXSettingsRow(
+                        label = stringResource(Res.string.backup_chats),
+                        sub = stringResource(Res.string.encrypted_cloud_backup_recover_chats),
+                        chevron = true,
+                        icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
+                    ) { state.backupAccountNow() }
+                    SNXSettingsRow(
+                        label = stringResource(Res.string.restore_account),
+                        sub = stringResource(Res.string.replace_this_account_with_an_nsec_from),
+                        chevron = true,
+                        icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
+                    ) { restoreKey = true }
+                }
                 SNSettingsRow(
                     icon = SNIconName.Trash, tone = SNTone.Cyan, label = "Erase all chats",
                     sub = "Clears conversations — keeps your identity",

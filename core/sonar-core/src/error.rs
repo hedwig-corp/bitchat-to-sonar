@@ -84,4 +84,13 @@ pub enum Error {
 
     #[error("rng error: {0}")]
     Rng(#[from] getrandom::Error),
+
+    #[error("signer error: {0}")]
+    Signer(#[from] nostr::signer::SignerError),
+
+    /// The account uses an external signer (NIP-55) and the requested
+    /// operation needs the raw local secret key. Hosts gate these features in
+    /// the UI; hitting this at runtime means a gate is missing.
+    #[error("operation requires the local secret key, but this account uses an external signer: {0}")]
+    NeedsLocalKey(&'static str),
 }

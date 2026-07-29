@@ -65,8 +65,11 @@ expect object WalletBridge {
     /** Current snapshot state. */
     fun state(): WalletState
 
-    /** Connect the SDK (idempotent). [nsec] is the Nostr secret to derive the seed. */
-    suspend fun setupIfNeeded(nsec: String)
+    /** Connect the SDK (idempotent). [walletSecretHex] is the 32-byte hex the
+     *  Breez seed derives from — `SonarCore.walletSecretHex()`: the nsec's raw
+     *  bytes for local-key accounts (unchanged historical derivation), or the
+     *  device-local wallet entropy for external-signer accounts. */
+    suspend fun setupIfNeeded(walletSecretHex: String)
 
     /** Refresh + return the spendable balance in sats (0 if not ready). */
     suspend fun refreshBalance(): Long

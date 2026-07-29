@@ -27,7 +27,7 @@ async fn group_and_message_survive_reopen() {
 
     // Bob: throwaway engine, only used to produce a KeyPackage.
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
 
     let alice_identity = Identity::generate();
     let alice_pubkey = alice_identity.public_key();
@@ -72,6 +72,7 @@ async fn group_and_message_survive_reopen() {
         let charlie = MarmotEngine::in_memory(Identity::generate());
         let charlie_kp = charlie
             .key_package_event(relays())
+            .await
             .expect("charlie key package");
         let update = alice
             .add_members(&group_id, vec![charlie_kp])
@@ -139,7 +140,7 @@ async fn local_first_send_persists_pending_message_before_relay_publish() {
     let outbox_path = db_path.with_file_name("marmot.sqlite.sonar-outbox.json");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
 
     let alice_identity = Identity::generate();
     let group_id = {
@@ -187,7 +188,7 @@ async fn restart_watermark_ignores_later_local_messages() {
     let db_path = dir.path().join("marmot.sqlite");
 
     let bob = MarmotEngine::in_memory(Identity::generate());
-    let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+    let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
 
     let alice_identity = Identity::generate();
     let (bob_message_secs, alice_later_secs) = {
@@ -280,7 +281,7 @@ async fn recent_message_pages_returns_newest_groups_with_bounded_windows() {
 
     for idx in 0..6 {
         let bob = MarmotEngine::in_memory(Identity::generate());
-        let bob_kp = bob.key_package_event(relays()).expect("bob key package");
+        let bob_kp = bob.key_package_event(relays()).await.expect("bob key package");
         let creation = alice
             .create_group(&format!("chat {idx}"), vec![bob_kp], relays())
             .expect("create group");
@@ -328,7 +329,7 @@ async fn wrong_key_cannot_open_existing_db() {
         let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
             .expect("open persistent engine");
         // Force the DB to materialize.
-        let _ = alice.key_package_event(relays()).expect("key package");
+        let _ = alice.key_package_event(relays()).await.expect("key package");
     }
 
     // A different key must fail to open the encrypted database.
@@ -363,6 +364,7 @@ async fn self_heals_an_unencrypted_legacy_database() {
     // The recreated database is a working encrypted store.
     let _ = alice
         .key_package_event(relays())
+        .await
         .expect("usable after self-heal");
     assert_eq!(
         alice.groups().expect("groups").len(),
@@ -385,7 +387,7 @@ async fn wipe_removes_the_database() {
     {
         let alice = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
             .expect("open persistent engine");
-        let _ = alice.key_package_event(relays()).expect("key package");
+        let _ = alice.key_package_event(relays()).await.expect("key package");
     }
     let sync_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json");
     let sync_tmp_path = db_path.with_file_name("marmot.sqlite.sonar-sync.json.tmp");

@@ -17,7 +17,6 @@ import breez_sdk_liquid.SendPaymentRequest
 import breez_sdk_liquid.connect
 import breez_sdk_liquid.defaultConfig
 import chat.bitchat.sonar.DesktopEnv
-import chat.bitchat.sonar.crypto.Bech32
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -86,13 +85,13 @@ actual object WalletBridge {
 
     actual fun state(): WalletState = current
 
-    actual suspend fun setupIfNeeded(nsec: String): Unit = withContext(Dispatchers.IO) {
+    actual suspend fun setupIfNeeded(walletSecretHex: String): Unit = withContext(Dispatchers.IO) {
         lock.withLock {
             recoverPendingCleanupLocked()
             if (sdk != null) return@withContext
             val key = apiKey
             if (key.isEmpty()) { current = WalletState.NotConfigured; return@withContext }
-            val secretHex = Bech32.nsecToSecretHex(nsec)
+            val secretHex = walletSecretHex.takeIf { it.matches(Regex("^[0-9a-fA-F]{64}$")) }
             if (secretHex == null) { current = WalletState.Failed("no identity"); return@withContext }
             current = WalletState.SettingUp
             // Breez connect()/getInfo() are blocking native calls — a plain
