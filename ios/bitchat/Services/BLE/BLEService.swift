@@ -997,13 +997,20 @@ final class BLEService: NSObject {
                 version: 2
             )
 
-            let senderHex = packet.senderID.hexEncodedString()
-            let dedupID = "\(senderHex)-\(packet.timestamp)-\(packet.type)"
+            // Sign public files like `sendFilePrivate` already does. Receivers
+            // can only hold a sender to its pinned key if the sender actually
+            // signs; an unsigned broadcast is unverifiable by construction.
+            // Signing failure is not fatal — send unsigned rather than drop
+            // the user's media.
+            let signedPacket = self.noiseService.signPacket(packet) ?? packet
+
+            let senderHex = signedPacket.senderID.hexEncodedString()
+            let dedupID = "\(senderHex)-\(signedPacket.timestamp)-\(signedPacket.type)"
             self.messageDeduplicator.markProcessed(dedupID)
 
             SecureLogger.debug("📁 Broadcasting file transfer payload bytes=\(payload.count)", category: .session)
-            self.broadcastPacket(packet, transferId: transferId)
-            self.gossipSyncManager?.onPublicPacketSeen(packet)
+            self.broadcastPacket(signedPacket, transferId: transferId)
+            self.gossipSyncManager?.onPublicPacketSeen(signedPacket)
         }
     }
 
@@ -1411,9 +1418,9 @@ final class BLEService: NSObject {
     /// there is nothing to hold the packet against, and nothing to steal —
     /// the attribution is only ever as strong as the pin. A verified announce
     /// always records the signing key, so the no-pin arm is unreachable for
-    /// production verified peers (it keeps test preseeds and any legacy row
-    /// on their pre-#425 behavior). With a pin: missing signature or failed
-    /// verification rejects.
+    /// production verified peers (it keeps test preseeds on their pre-#425
+    /// behavior). With a pin: missing signature or failed verification
+    /// rejects.
     private func pinnedSenderSignatureValid(_ packet: BitchatPacket, info: PeerInfo) -> Bool {
         guard let signingKey = info.signingPublicKey else { return true }
         guard let signature = packet.signature,
@@ -1421,6 +1428,24 @@ final class BLEService: NSObject {
             return false
         }
         return noiseService.verifySignature(signature, for: packetData, publicKey: signingKey)
+    }
+
+    /// Weaker sibling of `pinnedSenderSignatureValid` for FILE packets.
+    ///
+    /// The Rust gate this mirrors covers text broadcasts only — `mesh_engine`
+    /// has no file-transfer arm — and public files are not signed by every
+    /// sender on the network (this app only started signing them alongside
+    /// this change; stock bitchat may not). Requiring a signature here would
+    /// drop every public image/video from an older or third-party sender, so
+    /// an UNSIGNED file keeps its pre-#425 treatment while a file that DOES
+    /// carry a signature must verify under the pin — which closes the forgery
+    /// case without breaking interop.
+    ///
+    /// Tracked gap: once both platforms sign public files, this should become
+    /// `pinnedSenderSignatureValid`.
+    private func pinnedSenderFileSignatureAcceptable(_ packet: BitchatPacket, info: PeerInfo) -> Bool {
+        guard packet.signature != nil else { return true }
+        return pinnedSenderSignatureValid(packet, info: info)
     }
 
     /// Returns true when this exact (sender, wire message id) file was already
@@ -1457,7 +1482,7 @@ final class BLEService: NSObject {
             // previously-weaker `isConnected` arm too: mere connection is
             // even less evidence of identity than a verified nickname, so
             // that arm is folded into this signature-gated one.
-            guard pinnedSenderSignatureValid(packet, info: info) else {
+            guard pinnedSenderFileSignatureAcceptable(packet, info: info) else {
                 SecureLogger.warning("🚫 Dropping file transfer failing pinned-key signature for \(peerID.id.prefix(8))…", category: .security)
                 #if DEBUG
                 appendBleDebugReport("file rejected peer=\(peerID.id) reason=pinned-signature")
