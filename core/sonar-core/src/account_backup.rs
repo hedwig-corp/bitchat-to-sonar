@@ -51,6 +51,11 @@ const LEGACY_BACKUP_BLOSSOM_SERVERS: &[&str] = &["https://nostr.download"];
 /// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
 /// guards memory against a malicious Blossom response.
 const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
+/// Buffer hint for a backup download. Deliberately small and independent of
+/// anything the server says — see `download_blob_capped_to`.
+const INITIAL_DOWNLOAD_CAPACITY: usize = 1024 * 1024;
+/// Prefix for dry-run scratch dirs, so a leftover can be recognised and reaped.
+const PREVIEW_SCRATCH_PREFIX: &str = ".sonar-backup-preview-";
 /// Sidecar next to the Marmot DB: `{db_filename}.sonar-backup-policy.json`.
 const BACKUP_POLICY_SUFFIX: &str = ".sonar-backup-policy.json";
 /// Default opportunistic debounce after a dirty mark (30 minutes).
@@ -1102,6 +1107,18 @@ fn backup_blob_url(base: &Url, sha256: &Sha256Hash) -> Result<Url> {
     Ok(url)
 }
 
+/// How much to reserve up front for a backup download.
+///
+/// `Content-Length` is the server's claim about a body it has not sent yet, so
+/// it must never size the allocation. Bounding the hint by `MAX_BACKUP_BYTES`
+/// is not enough: a hostile host can advertise 200 MiB and then send nothing,
+/// and the phone is out of memory before the first byte arrives. Reserve a
+/// small fixed amount instead and let the `Vec` grow — growth is amortized, and
+/// the streaming check in `download_blob_capped_to` is the real bound.
+fn download_buffer_capacity(content_length: Option<u64>) -> usize {
+    content_length.unwrap_or(0).min(INITIAL_DOWNLOAD_CAPACITY as u64) as usize
+}
+
 /// Download a blob, refusing to buffer more than `MAX_BACKUP_BYTES`.
 ///
 /// `BlossomClient::get_blob` calls `Response::bytes()`, which buffers the whole
@@ -1152,10 +1169,7 @@ async fn download_blob_capped_to(
     if !status.is_success() {
         return Err(Error::Blossom(format!("blossom get http {status}")));
     }
-    // Trust the advertised length only as a pre-allocation hint, never as a bound.
-    let mut body = Vec::with_capacity(
-        response.content_length().unwrap_or(0).min(limit as u64) as usize,
-    );
+    let mut body = Vec::with_capacity(download_buffer_capacity(response.content_length()));
     while let Some(chunk) = response
         .chunk()
         .await
@@ -1238,10 +1252,33 @@ fn preview_scratch_dir(db_path: &Path) -> Result<tempfile::TempDir> {
     let parent = db_path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|e| Error::Storage(format!("backup preview scratch parent: {e}")))?;
+    reap_stale_preview_scratch(parent);
     tempfile::Builder::new()
-        .prefix(".sonar-backup-preview-")
+        .prefix(PREVIEW_SCRATCH_PREFIX)
         .tempdir_in(parent)
         .map_err(|e| Error::Storage(format!("backup preview scratch dir: {e}")))
+}
+
+/// Remove scratch dirs a previous preview could not clean up itself.
+///
+/// [`tempfile::TempDir`] reaps on drop, which covers errors and panics but not
+/// the process being killed mid-preview — and the account dir is exactly where
+/// a leftover is most expensive, because `account_storage_bytes` counts it and
+/// one accumulates per kill.
+fn reap_stale_preview_scratch(parent: &Path) {
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(PREVIEW_SCRATCH_PREFIX) {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Same, against already-validated hosts. Split out so tests can drive the real
@@ -2299,6 +2336,31 @@ mod tests {
         }
     }
 
+    /// A server's `Content-Length` must never drive the allocation. Bounding
+    /// the hint by `MAX_BACKUP_BYTES` looks safe and is not: a hostile host can
+    /// advertise 200 MiB, send nothing, and the phone is out of memory before
+    /// the first byte — on the restore path, which the user only reaches after
+    /// they have already wiped.
+    #[test]
+    fn a_lying_content_length_cannot_size_the_download_buffer() {
+        assert_eq!(download_buffer_capacity(None), 0);
+        assert_eq!(download_buffer_capacity(Some(4096)), 4096, "honest small body");
+        assert_eq!(
+            download_buffer_capacity(Some(MAX_BACKUP_BYTES as u64)),
+            INITIAL_DOWNLOAD_CAPACITY,
+            "a body claiming the whole cap must not reserve the whole cap"
+        );
+        assert_eq!(
+            download_buffer_capacity(Some(u64::MAX)),
+            INITIAL_DOWNLOAD_CAPACITY,
+            "an absurd claim must clamp, not overflow"
+        );
+        assert!(
+            INITIAL_DOWNLOAD_CAPACITY < MAX_BACKUP_BYTES,
+            "the hint must stay well under the hard cap"
+        );
+    }
+
     /// A restore must not be able to OOM the app. The advertised blob size is
     /// the server's own claim, so the ceiling has to bind the body itself:
     /// stop reading mid-stream rather than buffering whatever arrives.
@@ -2360,6 +2422,27 @@ mod tests {
         assert!(path.is_dir(), "scratch dir was not created (parent unmade?)");
         drop(scratch);
         assert!(!path.exists(), "scratch dir must be reaped on drop");
+    }
+
+    /// `TempDir` reaps on drop, which does not cover the process being killed
+    /// mid-preview. A leftover sits in the account dir forever and is counted
+    /// by `account_storage_bytes`, so one accumulates per kill.
+    #[test]
+    fn a_preview_reaps_scratch_left_by_a_killed_process() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        // Debris from a previous run that never got to drop its TempDir.
+        let orphan = dir.path().join(format!("{PREVIEW_SCRATCH_PREFIX}dead"));
+        fs::create_dir_all(&orphan).unwrap();
+        fs::write(orphan.join("preview-index.db"), b"leftover").unwrap();
+        // A real store file beside it must survive the sweep.
+        fs::write(&db_path, b"live").unwrap();
+
+        let scratch = preview_scratch_dir(&db_path).unwrap();
+
+        assert!(!orphan.exists(), "stale scratch must be reaped");
+        assert!(db_path.is_file(), "the sweep must not touch the account");
+        assert!(scratch.path().is_dir(), "the fresh scratch still exists");
     }
 
     #[test]
