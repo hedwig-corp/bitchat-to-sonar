@@ -803,11 +803,29 @@ not treat "we cannot tell yet" as "genuinely empty" (the mesh snapshot is keyed
 by group id, so a cold-launch mesh route knows of no history until `chats` /
 `npubRawFor` resolve). Both were live in the first cut of this fix.
 
-**Platform gap:** iOS is untouched and has the same class of hole — the
-cold-launch first-open hydrate can show blank there too (noted while landing
-#303). The Apple read path needs the same "unreadable ≠ empty" distinction; not
-implemented here because this fix is Compose/Android-side, and the report was an
-Android device.
+**Apple half (#450):** landed after the Compose half. The Apple read path
+already had the first half right — `MarmotService`'s lanes THROW when no node
+is leased, so an unreadable store can never answer with an empty page that
+gets committed as a conversation's window. The missing half was the recovery:
+an open that lost the race with store readiness (or one on a conversation
+whose Marmot group had not resolved yet) left the transcript black until an
+unrelated sync event published rows. `SonarTranscriptRecoveryPolicy`
+(`shouldRecoverBlankTranscript`, same three inputs as the Compose gate) plus
+`MarmotChatModel.scheduleBlankTranscriptRecovery`, wired into
+`loadLocalWindow`, re-read local storage on a bounded backoff (~5.5s,
+100ms → 800ms) without ever blocking first paint.
+
+**Apple call sites:** `SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript`
+consumed by `MarmotChatModel.scheduleBlankTranscriptRecovery`, called from
+`loadLocalWindow` (the chat-open hydrate) and cancelled per group when a
+conversation is dropped and wholesale on account reset.
+
+**Also guarded by (Apple):** `SonarTranscriptRecoveryPolicyTests.recoveryRunsWhenLocalMetadataKnowsMessages`, `SonarTranscriptRecoveryPolicyTests.recoveryRunsWhenEmptinessCannotBeProven`, `SonarTranscriptRecoveryPolicyTests.recoverySkipsAConversationProvenEmpty`
+
+**Not guarded (Apple):** same shape as the Compose half — the tests pin the
+pure gate and the budget, not that `loadLocalWindow` consults it, that the
+retry loop stops on the first non-empty read, or the cancellation paths. iOS
+tests also do not run in CI.
 
 **History:** Reported with screenshots: chat open on a black transcript, rows
 appearing "after a while". Distinct from R-017 (which mis-*places* the divider

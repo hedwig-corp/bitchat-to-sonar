@@ -419,6 +419,9 @@ final class MarmotChatModel: ObservableObject {
     @Published var pendingDirectChats: [String: Date] = [:]
     private var directChatSetupTasks: [String: (token: UUID, task: Task<String?, Never>)] = [:]
     @Published var messagesByGroup: [String: [MarmotService.MarmotMessage]] = [:]
+    /// Groups with a bounded blank-transcript recovery in flight (R-018/#450).
+    private var blankTranscriptRecoveryGroups: Set<String> = []
+    private var blankTranscriptRecoveryTasks: [String: Task<Void, Never>] = [:]
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
@@ -1789,10 +1792,59 @@ final class MarmotChatModel: ObservableObject {
         mode: LocalTranscriptLoadMode
     ) async {
         if let groupId {
-            await loadLocalPage(groupId: groupId, mode: mode)
+            let readable = await loadLocalPage(groupId: groupId, mode: mode)
+            scheduleBlankTranscriptRecovery(groupId: groupId, storeReadable: readable)
         } else {
             await loadLocalSummaries()
         }
+    }
+
+    /// R-018 / #450 — bounded local re-read after an open that painted blank.
+    ///
+    /// The Apple read path already refuses to answer an unreadable store with
+    /// an empty page (`MarmotService`'s lanes throw when no node is leased),
+    /// so an empty window is never *committed* as a conversation's contents.
+    /// What was missing is the recovery: a first open that lost the race with
+    /// store readiness — or one on a conversation whose Marmot group has not
+    /// resolved yet — left the transcript black until an unrelated sync event
+    /// happened to publish rows. Retrying local reads on a short bounded
+    /// backoff costs a handful of local page reads and closes that window.
+    ///
+    /// Never blocks first paint (XChat-Style Chat Startup Rule): the chat is
+    /// already open and typable while this runs in the background.
+    func scheduleBlankTranscriptRecovery(groupId: String, storeReadable: Bool) {
+        let rendered = (messagesByGroup[groupId] ?? []).isEmpty == false
+        if rendered { return }
+        let summary = conversationSummariesByGroup[groupId]
+        let knownNonEmpty = (summary?.messageCount ?? 0) > 0
+        let sourcesResolved = groups.contains { $0.id == groupId }
+        guard SonarTranscriptRecoveryPolicy.shouldRecoverBlankTranscript(
+            knownNonEmpty: knownNonEmpty,
+            storeReadable: storeReadable,
+            sourcesResolved: sourcesResolved
+        ) else { return }
+        guard blankTranscriptRecoveryGroups.insert(groupId).inserted else { return }
+
+        blankTranscriptRecoveryTasks[groupId] = Task { [weak self] in
+            defer {
+                self?.blankTranscriptRecoveryGroups.remove(groupId)
+                self?.blankTranscriptRecoveryTasks[groupId] = nil
+            }
+            for delay in SonarTranscriptRecoveryPolicy.recoveryDelays {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                // Rows arrived by any route (sync, drain, another load): done.
+                if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
+                _ = await self.loadLocalPage(groupId: groupId, mode: .newestPage)
+                if (self.messagesByGroup[groupId] ?? []).isEmpty == false { return }
+            }
+        }
+    }
+
+    private func cancelBlankTranscriptRecovery(groupId: String) {
+        blankTranscriptRecoveryTasks[groupId]?.cancel()
+        blankTranscriptRecoveryTasks[groupId] = nil
+        blankTranscriptRecoveryGroups.remove(groupId)
     }
 
     /// Load groups + messages from the LOCAL encrypted DB only (no relay I/O),
@@ -4200,6 +4252,7 @@ final class MarmotChatModel: ObservableObject {
     func dropGroupFromLocalState(_ groupId: String) {
         groups.removeAll { $0.id == groupId }
         messagesByGroup[groupId] = nil
+        cancelBlankTranscriptRecovery(groupId: groupId)
         conversationSummariesByGroup[groupId] = nil
         discardOptimistic(for: groupId)
         localTranscriptCursorByGroup[groupId] = nil
@@ -4261,6 +4314,9 @@ final class MarmotChatModel: ObservableObject {
 
         let setups = directChatSetupTasks.values.map(\.task)
         directChatSetupTasks = [:]
+        for (_, task) in blankTranscriptRecoveryTasks { task.cancel() }
+        blankTranscriptRecoveryTasks.removeAll()
+        blankTranscriptRecoveryGroups.removeAll()
         pendingDirectChats = [:]
         setups.forEach { $0.cancel() }
 
