@@ -949,15 +949,31 @@ actual object SonarCore {
                 // A locally-keyed account must never be silently replaced by a
                 // signer login (Account Key Durability rule) — restore/wipe are
                 // the only paths that change an existing account.
-                check(storedAccount() !is StoredAccount.LocalKey) {
+                val existing = storedAccount()
+                check(existing !is StoredAccount.LocalKey) {
                     "This device already has a local account key"
                 }
-                val kdfRoot = AndroidSecrets.get(SIGNER_KDF_ROOT) ?: randomHex32()
-                // Normalize (hex or npub input) through the core, then bind
-                // the client to the normalized hex.
+                // A COMPLETED signer account is equally an account: only nsec
+                // restore or a wipe replaces it. Only a PENDING login (the
+                // user is still in onboarding) may be superseded.
+                check(existing !is StoredAccount.Signer || existing.pendingLogin) {
+                    "This device already has an external-signer account"
+                }
+                // Normalize (hex or npub input) through the core; the throwaway
+                // root here is never persisted.
                 val raw = pubkey.trim()
-                val hex = SonarIdentity.remote(raw, kdfRoot, AmberSignerClient(raw, packageName))
+                val hex = SonarIdentity
+                    .remote(raw, "00".repeat(32), AmberSignerClient(raw, packageName))
                     .pubkeyHex()
+                // Rotate the derivation root when superseding a pending login
+                // for a DIFFERENT identity (onboarding allows: sign in as A →
+                // back → restore → sign in as B). Reusing A's root would give
+                // two Nostr identities the same geohash ephemeral keys — which
+                // links them publicly — and the same wallet seed.
+                val previousPubkey = (existing as? StoredAccount.Signer)?.pubkeyHex
+                val kdfRoot = AndroidSecrets.get(SIGNER_KDF_ROOT)
+                    ?.takeIf { it.isNotBlank() && previousPubkey == hex }
+                    ?: randomHex32()
                 val identity =
                     SonarIdentity.remote(hex, kdfRoot, AmberSignerClient(hex, packageName))
                 // The login intent is implicit — ANY installed app may have
@@ -971,8 +987,13 @@ actual object SonarCore {
                 // Update-in-place, durable commit — never delete-then-add.
                 AndroidSecrets.put(SIGNER_KDF_ROOT, kdfRoot, durable = true)
                 AndroidSecrets.put(SIGNER_PUBKEY, hex, durable = true)
-                packageName?.takeIf(String::isNotBlank)?.let {
-                    AndroidSecrets.put(SIGNER_PACKAGE, it, durable = true)
+                val newPackage = packageName?.takeIf(String::isNotBlank)
+                if (newPackage != null) {
+                    AndroidSecrets.put(SIGNER_PACKAGE, newPackage, durable = true)
+                } else if (previousPubkey != hex) {
+                    // Superseding a different identity: never leave the old
+                    // account's signer package bound to the new pubkey.
+                    AndroidSecrets.remove(SIGNER_PACKAGE, durable = true)
                 }
                 npub = identity.npub()
                 pubkeyHex = hex
