@@ -1200,11 +1200,20 @@ final class MarmotChatModel: ObservableObject {
 
     /// Host executor: if core policy says due, run seal→reconnect→upload quietly.
     func runAutoBackupIfDue() async {
-        guard !busy, !accountBackupInFlight else { return }
+        guard !busy, !accountBackupInFlight else {
+            SecureLogger.info(
+                "Auto-backup executor: skipped (busy=\(busy) inFlight=\(accountBackupInFlight))",
+                category: .session
+            )
+            return
+        }
         // Upgrade / silent path: never upload until Settings or onboarding disclosed.
         #if os(iOS) || os(macOS)
         let disclosed = UserDefaults.standard.bool(forKey: "sonar.auto_backup_disclosed")
-        guard disclosed else { return }
+        guard disclosed else {
+            SecureLogger.info("Auto-backup executor: skipped (not disclosed)", category: .session)
+            return
+        }
         #endif
         let due: Bool
         do {
@@ -1216,7 +1225,10 @@ final class MarmotChatModel: ObservableObject {
             )
             return
         }
-        guard due else { return }
+        guard due else {
+            SecureLogger.info("Auto-backup executor: not due", category: .session)
+            return
+        }
         do {
             try await backupAccount(respectOptOut: true)
             SecureLogger.info("Auto account backup uploaded", category: .session)

@@ -17,6 +17,15 @@ final class AutoBackupBackgroundScheduler {
 
     weak var store: SonarAppStore?
 
+    /// `submit` before `register` does not fail with a catchable NSError — it
+    /// throws an ObjC NSInternalInconsistencyException that Swift's `try`
+    /// cannot catch, and the app dies at launch. Proven on the simulator:
+    /// `BitchatApp.init()` schedules (disclosure already persisted) before
+    /// `didFinishLaunching` registers, and every cold start crashed. So a
+    /// schedule that arrives early is remembered and flushed by `register()`.
+    private var registered = false
+    private var wantsSchedule = false
+
     private init() {}
 
     func register() {
@@ -32,9 +41,18 @@ final class AutoBackupBackgroundScheduler {
                 await self?.handle(refresh)
             }
         }
+        registered = true
+        if wantsSchedule {
+            wantsSchedule = false
+            schedule()
+        }
     }
 
     func schedule() {
+        guard registered else {
+            wantsSchedule = true
+            return
+        }
         let request = BGAppRefreshTaskRequest(identifier: Self.taskIdentifier)
         request.earliestBeginDate = Date(timeIntervalSinceNow: 12 * 60 * 60)
         do {
