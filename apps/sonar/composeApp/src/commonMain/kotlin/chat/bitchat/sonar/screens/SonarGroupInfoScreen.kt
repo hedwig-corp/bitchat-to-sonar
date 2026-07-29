@@ -41,6 +41,7 @@ import chat.bitchat.sonar.SNQrCode
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAppState
 import chat.bitchat.sonar.SonarJoinRequest
+import chat.bitchat.sonar.TransientBackHandler
 import chat.bitchat.sonar.inviteLinkPreview
 import chat.bitchat.sonar.inviteUniversalLink
 import chat.bitchat.sonar.shareInviteText
@@ -339,6 +340,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
 
         // ── Leave group confirmation sheet ──
         if (showLeaveSheet) {
+            TransientBackHandler { showLeaveSheet = false }
             Box(
                 Modifier.fillMaxSize().background(s.scrim)
                     .clickable(onClick = { showLeaveSheet = false }),
