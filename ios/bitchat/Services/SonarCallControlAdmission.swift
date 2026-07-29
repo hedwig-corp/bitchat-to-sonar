@@ -66,9 +66,17 @@ enum SonarCallControlAdmission {
             // call state — not even a decline reply, which would leak
             // presence to every member.
             guard peers.count == 1, let peer = peers.first else { return false }
-            // The line must come FROM that peer when we can see who sent it.
-            // Membership alone is what made the group hijack work.
-            if !senderKey.isEmpty && senderKey != peer { return false }
+            // The line must come FROM that peer. Membership alone is what made
+            // the group hijack work.
+            //
+            // A BLANK sender is a refusal, not a pass. "when we can see who
+            // sent it" was a fail-open: a roster-backed (Marmot) message whose
+            // author we cannot canonicalize proves nothing about who authored
+            // it, and admitting it hands the supplied endpoint control of the
+            // call — mic and camera — under the peer's name. Missing sender
+            // identity is only safe for `structurallyDirect` mesh messages,
+            // which carry no roster and take the branch above.
+            guard !senderKey.isEmpty, senderKey == peer else { return false }
         }
         switch kind {
         case .offer:

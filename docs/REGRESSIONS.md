@@ -1377,7 +1377,10 @@ way when touched.
 **Invariant:** A `☎CALL` control line may drive call state only when it
 arrives in a conversation with exactly one other member, FROM that member —
 and for `ANSWER`/`CANCEL`/`END`, only in the same conversation as the call in
-progress.
+progress. Where a roster exists, an author we cannot canonicalize is a
+REFUSAL: a blank sender must never satisfy "FROM that member". Missing sender
+identity is acceptable only for `structurallyDirect` mesh messages, which
+carry no roster at all.
 
 **Breaks as:** A group member rings you with a spoofed caller name and your
 accept sends live mic/camera to them (the OFFER carries the attacker's own
@@ -1405,7 +1408,14 @@ both dispatch loops.
 
 **Guarded by:** `CallControlAdmissionTest.groupMemberCannotRingYou`
 
-**Also guarded by:** `CallControlAdmissionTest.groupMemberCannotAnswerYourCall`, `CallControlAdmissionTest.meshDmsStayCallableWithoutARoster`, `CallControlAdmissionTest.answerFromAnotherConversationCannotSteerTheActiveCall` — Apple mirror: `SonarCallControlAdmissionTests.groupMemberCannotRingYou`, `SonarCallControlAdmissionTests.groupMemberCannotAnswerYourCall`, `SonarCallControlAdmissionTests.meshDmsStayCallableWithoutARoster`
+**Also guarded by:** `CallControlAdmissionTest.groupMemberCannotAnswerYourCall`, `CallControlAdmissionTest.meshDmsStayCallableWithoutARoster`, `CallControlAdmissionTest.answerFromAnotherConversationCannotSteerTheActiveCall`, `CallControlAdmissionTest.aRosterBackedControlWithNoSenderIsNotAdmissible`, `CallControlAdmissionTest.aRosterBackedControlWithABlankSenderIsNotAdmissible` — Apple mirror: `SonarCallControlAdmissionTests.groupMemberCannotRingYou`, `SonarCallControlAdmissionTests.groupMemberCannotAnswerYourCall`, `SonarCallControlAdmissionTests.meshDmsStayCallableWithoutARoster`, `SonarCallControlAdmissionTests.aRosterBackedControlWithNoSenderIsNotAdmissible`, `SonarCallControlAdmissionTests.aRosterBackedControlWithNoSenderIsNotAdmissibleEvenWhenStructurallyDirect`
+
+**Rejected:** binding the sender only "when we can see who sent it"
+(`if senderKey.isNotBlank() && senderKey != peer`). That shipped in the first
+version of this fix and is a fail-open — a roster-backed Marmot control whose
+`senderNpub` is empty or does not canonicalize skipped the author binding
+entirely, which is the same "membership is enough" hole the entry exists for.
+Both hosts now refuse a blank sender whenever a roster exists.
 
 **Not guarded:** the call-site wiring itself on either platform (neither
 `SonarAppState` nor `SonarAppStore` is constructible in a test), so a

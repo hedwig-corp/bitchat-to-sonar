@@ -168,4 +168,42 @@ class CallControlAdmissionTest {
             )
         )
     }
+    /**
+     * #420 review round 2: a roster-backed control whose author we cannot
+     * canonicalize must be REFUSED, not admitted. The first version checked the
+     * sender only `if (senderKey.isNotBlank())`, so a Marmot message with an
+     * empty/unresolvable senderNpub skipped the only author binding and the
+     * attacker-supplied endpoint could drive the call under the peer's name.
+     *
+     * Missing sender identity stays acceptable only for structurally-direct
+     * mesh messages, which carry no roster — covered by the rosterless tests.
+     */
+    @Test
+    fun aRosterBackedControlWithNoSenderIsNotAdmissible() {
+        assertFalse(
+            CallControlAdmission.isAdmissible(
+                kind = Kind.Offer,
+                otherMemberKeys = listOf(peer),
+                structurallyDirect = false,
+                senderKey = "",
+                activeCallConversationId = null,
+                conversationId = "marmot:dm",
+            )
+        )
+    }
+
+    /** Same hole, reached with a blank-but-not-empty sender. */
+    @Test
+    fun aRosterBackedControlWithABlankSenderIsNotAdmissible() {
+        assertFalse(
+            CallControlAdmission.isAdmissible(
+                kind = Kind.Offer,
+                otherMemberKeys = listOf(peer),
+                structurallyDirect = true,
+                senderKey = "   ",
+                activeCallConversationId = null,
+                conversationId = "marmot:dm",
+            )
+        )
+    }
 }

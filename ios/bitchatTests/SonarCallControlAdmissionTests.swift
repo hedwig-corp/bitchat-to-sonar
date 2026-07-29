@@ -132,4 +132,35 @@ struct SonarCallControlAdmissionTests {
             activeCallConversationId: nil,
             conversationId: "marmot:dm"))
     }
+    /// #420 review round 2, mirror of the Compose
+    /// `aRosterBackedControlWithNoSenderIsNotAdmissible`: a roster-backed
+    /// control whose author we cannot canonicalize must be REFUSED. The first
+    /// version checked the sender only `if !senderKey.isEmpty`, so a Marmot
+    /// message with an empty/unresolvable senderNpub skipped the only author
+    /// binding and the attacker-supplied endpoint could drive the call under
+    /// the peer's name. Missing sender identity stays acceptable only for
+    /// structurally-direct mesh messages, which carry no roster.
+    @Test
+    func aRosterBackedControlWithNoSenderIsNotAdmissible() {
+        #expect(!SonarCallControlAdmission.isAdmissible(
+            kind: .offer,
+            otherMemberKeys: [peer],
+            structurallyDirect: false,
+            senderKey: "",
+            activeCallConversationId: nil,
+            conversationId: "marmot:dm"))
+    }
+
+    /// Same hole, with the transport claiming to be direct: a roster still
+    /// exists, so the author binding still has to hold.
+    @Test
+    func aRosterBackedControlWithNoSenderIsNotAdmissibleEvenWhenStructurallyDirect() {
+        #expect(!SonarCallControlAdmission.isAdmissible(
+            kind: .offer,
+            otherMemberKeys: [peer],
+            structurallyDirect: true,
+            senderKey: "",
+            activeCallConversationId: nil,
+            conversationId: "marmot:dm"))
+    }
 }

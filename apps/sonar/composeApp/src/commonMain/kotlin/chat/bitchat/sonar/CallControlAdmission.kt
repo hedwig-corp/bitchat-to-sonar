@@ -55,10 +55,17 @@ object CallControlAdmission {
             // state — not even a decline reply, which would leak presence to
             // every member.
             val peer = peers.singleOrNull() ?: return false
-            // The line must come FROM that peer when we can see who sent it.
-            // Membership alone is what made the group hijack work: the
-            // attacker was a legitimate member.
-            if (senderKey.isNotBlank() && senderKey != peer) return false
+            // The line must come FROM that peer. Membership alone is what made
+            // the group hijack work: the attacker was a legitimate member.
+            //
+            // A BLANK sender is a refusal, not a pass. "when we can see who
+            // sent it" was a fail-open: a roster-backed (Marmot) message whose
+            // author we cannot canonicalize proves nothing about who authored
+            // it, and admitting it hands the supplied endpoint control of the
+            // call — mic and camera — under the peer's name. Missing sender
+            // identity is only safe for `structurallyDirect` mesh messages,
+            // which have no roster and take the branch above.
+            if (senderKey.isBlank() || senderKey != peer) return false
         }
         // Answer/Cancel/End act on an in-progress call, which callId alone
         // used to gate. Require the line to arrive in the SAME conversation as
