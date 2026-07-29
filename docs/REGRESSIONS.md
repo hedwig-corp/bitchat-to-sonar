@@ -1770,7 +1770,7 @@ upstream change to its TLV handling will not show up. A scheduled job that
 compiles the real `BitchatFilePacket.kt` and decodes captured
 `Engine::send_file` bytes would close that permanently; kwsantiago ran exactly
 that by hand while reviewing #471, reproducing both the pre-fix `null` and the
-post-fix decode.
+post-fix decode. Tracked as #512.
 
 **History:** Introduced with the media delivery receipt in #312 on the stated
 premise that unknown tags are skipped. R-015 (same TLV) named this exact hole in
