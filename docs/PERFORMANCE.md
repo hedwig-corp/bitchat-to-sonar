@@ -311,7 +311,12 @@ post-connect relay path after the PR.
 
 > **Baseline comparability note (2026-07):** `t3a_published` was REDEFINED when
 > the publishes moved to the background (`publish_*_background`): it now marks
-> publish enqueue (event created/persisted), not relay OK acks. `t3→t3a`
+> publish enqueue (event created/persisted), not relay OK acks. **#265 then
+> redefined it a second time**: `t3a_published` is now the DISPATCH of a
+> detached chain and is expected to be ~0, so the figures in the tables below
+> are not comparable to it — compare against `t3→t3a_publish_done`, which runs
+> concurrently with the drain and therefore is not on the critical path at
+> all. `t3→t3a`
 > numbers in the tables above measure the OLD blocking semantics and are not
 > directly comparable with newer runs; `startPolling()` also no longer waits
 > for t3a, so first-drain timings improved independently of publish latency.
@@ -586,7 +591,7 @@ backed by Signal's
   of each other. Worth confirming whether that staging still applies.
 
 When a change touches conversation open/send/sync or the startup path, re-run the
-faithful benchmark and compare `launch→t4`/`t0→t4`, `t2→t4`, `t3→t3a`, and
+faithful benchmark and compare `launch→t4`/`t0→t4`, `t2→t4`, `t3→t3a_publish_done`, and
 `t3b→t4` against this baseline; a regression there means sync moved onto the
 critical path.
 
