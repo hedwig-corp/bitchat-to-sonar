@@ -34,7 +34,7 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     /// apply that carries a real row change (the send/echo-swap pass). The
     /// stale snapshot keeps a dead row id that renders as a blank band and
     /// collapses on scroll until the next forced apply. Callers must use
-    /// `contentVersion(afterSyncing:showAuthors:)`.
+    /// `contentVersion(afterSyncing:showAuthors:peerName:)`.
     private var contentRevision: UInt64 = 0
 
     /// The revision `sync` WILL hold after syncing these inputs — safe to read
