@@ -4255,7 +4255,12 @@ struct SNComposer: View {
                         .font(SonarTheme.uiFont(size: 12))
                         .foregroundColor(cancelArmed ? SonarTheme.danger : SonarTheme.text3)
                 }
-                .opacity(1 + dragX / 110)
+                // Spelled with explicit `CGFloat`s: the literal form
+                // (`1 + dragX / 110`) is ambiguous to Swift 5 in Xcode 16.4,
+                // which is what CI builds with, while newer toolchains resolve
+                // it. It compiled locally for everyone and broke the first time
+                // anything built the app on the CI toolchain.
+                .opacity(CGFloat(1) + dragX / CGFloat(110))
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 12)
