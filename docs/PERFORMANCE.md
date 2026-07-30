@@ -240,6 +240,14 @@ Marmot group · live relays · `woke=1` every run:
 Median of 4–5 cold starts · iPhone 14 Pro Max · **real account with 24 Marmot
 groups** · live relays · every run `woke=1 notif=0`:
 
+> **Marker semantics changed in #265 — do not compare `t3 → t3a` across that
+> boundary.** In every table below, `t3 → t3a` measures the OLD meaning: the
+> publish ran inline on the connect path, so the row is the publish latency.
+> Since #265 the publish is dispatched to its own lane and `t3 → t3a` is just
+> the hand-off (expected ~0). The row comparable to these historical numbers is
+> **`t3 → t3a_publish_done`**. Reading a fresh `t3 → t3a` against the ~57 s
+> below shows a redefinition, not a speed-up.
+
 | phase | median |
 |---|---|
 | t0 → t1 (open DB + local paint, 24 groups) | ~1.3 s |
