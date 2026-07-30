@@ -27,7 +27,24 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     /// O(1) transcript content revision: bumped only when rows or row-affecting
     /// inputs change. The collection host skips its O(n) snapshot rebuild while
     /// this is unchanged (composer keystrokes, unrelated store publishes).
-    private(set) var contentRevision: UInt64 = 0
+    ///
+    /// Private on purpose: SwiftUI `body` runs BEFORE `prepareForUpdate`'s
+    /// `sync`, so a raw read here ships the revision of the PREVIOUS msgs next
+    /// to the NEW entries, and `shouldSkipUnchangedApply` then swallows the
+    /// apply that carries a real row change (the send/echo-swap pass). The
+    /// stale snapshot keeps a dead row id that renders as a blank band and
+    /// collapses on scroll until the next forced apply. Callers must use
+    /// `contentVersion(afterSyncing:showAuthors:)`.
+    private var contentRevision: UInt64 = 0
+
+    /// The revision `sync` WILL hold after syncing these inputs — safe to read
+    /// from `body` (pure). Must mirror `sync`'s bump condition exactly so the
+    /// version shipped with `entries` describes the same snapshot.
+    func contentVersion(afterSyncing msgs: [SNMessage], showAuthors: Bool) -> UInt64 {
+        (msgs != self.msgs || showAuthors != self.showAuthors)
+            ? contentRevision &+ 1
+            : contentRevision
+    }
     private var sizingHost: UIHostingController<AnyView>?
 
     func sync(
@@ -256,7 +273,13 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                 )
             },
             onJumpSettled: onJumpSettled,
-            contentVersion: renderContext.contentRevision,
+            // Post-sync revision, predicted from the same `msgs` snapshot as
+            // `entries` above — a raw pre-sync read is one bump stale and lets
+            // the host skip the apply that carries this pass's row change.
+            contentVersion: renderContext.contentVersion(
+                afterSyncing: msgs,
+                showAuthors: showAuthors
+            ),
             composer: composer
         )
     }
