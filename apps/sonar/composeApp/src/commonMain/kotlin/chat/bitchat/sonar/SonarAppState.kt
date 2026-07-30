@@ -1320,6 +1320,13 @@ class SonarAppState(private val scope: CoroutineScope) {
         openChatJumpMessageId = emptyMap()
         hydratedTranscripts = emptySet()
         unreadSuppressGroupIds.clear()
+        // Every caller is a full teardown (account wipe, eraseAllChats,
+        // restoreAccount). Echoes now outlive their first reconcile (R-022),
+        // so a ledger that survives the wipe would render a pre-erase
+        // "Sending" bubble forever: its canonical row is gone, nothing can
+        // fulfil or retire it.
+        pendingSendEchoes.clear()
+        previouslyPublishedMessageIdsByEcho.clear()
     }
 
     /** Optimistically clear badges and ask core to zero unread for [groupIds]. */
@@ -8128,6 +8135,13 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // the session is still current) published. Clearing before the
                 // read left a window where a concurrent republish painted the
                 // transcript with neither the echo nor the sticker row.
+                //
+                // Deliberately NOT gated like the text send's clear: a
+                // canonical sticker row has EMPTY content (the sticker rides a
+                // tag — see core `create_sticker_event_inner`), so the
+                // content-matching echo plan can never fulfil or retire a
+                // sticker echo. The hard clear is this echo's only end of
+                // life; gating it would ghost a "Sending" sticker forever.
                 clearSendEcho(chatId, echo.id)
             } catch (e: Throwable) {
                 failSendEcho(chatId, echo.id)
