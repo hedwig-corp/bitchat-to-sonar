@@ -1,0 +1,38 @@
+name: SwiftUI lifecycle guard
+
+# `BitchatApp.init()` read `_sonarStore.wrappedValue`, which forces the
+# @StateObject's autoclosure before SwiftUI installs the storage. The work then
+# happened on a throwaway instance while the view observed a different one: the
+# app compiled, logged a healthy `t1_local_paint`, and sat on the splash screen
+# forever. It reached a real phone that way.
+#
+# iOS tests do not run in CI (#476), so an Xcode-level guard would never
+# execute. This scans the source instead — pure shell, seconds, any runner.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'ios/**/*.swift'
+      - 'scripts/check-stateobject-init.sh'
+      - '.github/workflows/swiftui-lifecycle.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'ios/**/*.swift'
+      - 'scripts/check-stateobject-init.sh'
+      - '.github/workflows/swiftui-lifecycle.yml'
+
+jobs:
+  check:
+    name: No @StateObject reads in init()
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check no @StateObject wrappedValue is read from init()
+        run: ./scripts/check-stateobject-init.sh
