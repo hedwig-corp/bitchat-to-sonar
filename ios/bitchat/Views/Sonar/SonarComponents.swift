@@ -4255,7 +4255,10 @@ struct SNComposer: View {
                         .font(SonarTheme.uiFont(size: 12))
                         .foregroundColor(cancelArmed ? SonarTheme.danger : SonarTheme.text3)
                 }
-                .opacity(1 + dragX / 110)
+                // Double-typed on purpose: mixed CGFloat/Double literal
+                // arithmetic is ambiguous on the CI Xcode (same overload-set
+                // difference as the SonarIcons trig calls).
+                .opacity(1 + Double(dragX) / 110)
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 12)
