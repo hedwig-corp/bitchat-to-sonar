@@ -1118,11 +1118,32 @@ click handler. `ChatScreen`'s emoji tray is the same class and worse: `onEmoji`
 did `draft + it`, a read-modify-write, so a stale base *deleted* everything typed
 since the last frame instead of truncating the send. It reads the stored draft
 now. That one is not desktop-only — the tray plus a soft keyboard is the mobile
-path. Apple is not affected in the same shape: SwiftUI `SNMessageComposerField`
-sends through a `@Binding` that `.onKeyPress(.return)` reads at event time, not
-a per-frame capture.
+path.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`
+**Apple — same symptom reported, different mechanism, unresolved.** This entry
+previously claimed Apple was "not affected". That was an overclaim: what is
+actually true is that Apple has no *closure-capture* stale read. SwiftUI reads
+`@State`/`@Binding` through live storage rather than a per-frame snapshot, and
+the macOS composer is already bound to the store
+(`SNComposer(text: store.composerDraftBinding(for: id))`, whose getter calls
+`composerDraft(for:)`), so `SNComposer.send()` reads the same always-current copy
+the Compose fix now reads. The Compose bug cannot exist there in that form.
+
+It does **not** follow that macOS is free of the symptom, and it has since been
+reported truncating. The candidate mechanism is different and lives one layer
+down: whether SwiftUI has flushed the keystrokes into the binding by the time
+`.onKeyPress(keys: [.return])` fires. That handler runs during key-event dispatch
+in the AppKit responder chain, ahead of the text system, and SwiftUI applies text
+edits as state updates rather than synchronously — so a Return can be serviced
+against a binding that is one or more characters behind. Note this would be a
+*systematic* lag, not the load-dependent race Compose had, which is worth knowing
+when reproducing: it would not need a stalled frame.
+
+Unverified either way — nobody has instrumented it. Do not treat the Compose fix
+as covering macOS, and do not treat "Apple reads a live binding" as evidence the
+symptom is absent; those are answers to different questions.
+
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`
 
 All three of the first group fail when the handler is pointed back at the
 composed value (`onSend?.invoke(value)`, which is the old behaviour under the new
@@ -1136,21 +1157,32 @@ as good as the store behind it. All three call sites write straight into
 `SonarAppState.composerDrafts`; a debounced or async draft store would put the
 truncation straight back, and no test here would catch it.
 
-**Known gap — a keystroke *after* the Enter in the same batch.** The value-based
-`BasicTextField` keeps its own internal `TextFieldValue`, which still holds the
-sent text until the caller's clear is composed. For the batch `[h, i, Enter, !]`
-the `!` edits that buffer, so `onValueChange` reports `"hi!"` and the composer
-comes back holding the message it just sent, prefixed to the next one. Before
-this change the same batch sent nothing at all (Enter saw a blank stale draft and
-the caller's guard returned), so making the send work is what put this in reach.
-It is one frame wide and the user sees the wrong text in the composer *before*
-sending it — unlike the truncation, which was silent. The real fix is for the
-composer to own a `TextFieldValue` so the field can be blanked synchronously at
-send (that also covers the mid-caret variant, where the leftover is not even a
-prefix, so no prefix-stripping hack helps). Deliberately **not** in this change:
-it rewrites the field's state ownership and moves soft-keyboard/IME behaviour,
-which is the exact surface R-007 exists to protect and which has already
-regressed twice.
+**A keystroke *after* the Enter in the same batch — closed.** The value-based
+`BasicTextField` kept its own internal `TextFieldValue`, which still held the
+sent text until the caller's clear was composed. For the batch `[h, i, Enter, !]`
+the `!` edited that buffer, so `onValueChange` reported `"hi!"` and the composer
+came back holding the message it had just sent, glued to the next one. Making the
+send work is what put this in reach: the same batch previously sent nothing at
+all (Enter saw a blank stale draft and the caller's guard returned).
+
+The composer now owns its `TextFieldValue` and the Enter handler blanks it before
+invoking `onSend`, so anything still queued in that batch edits an empty field.
+This also covers the mid-caret variant, where the leftover is not even a prefix —
+which is why no prefix-stripping hack was viable. If the caller keeps the draft
+rather than clearing it, the next `SideEffect` restores it, so the blank is only
+optimistic.
+
+**Not verifiable in the harness, and unverified on Android.** The interleaving
+this closes cannot be staged: `runComposeUiTest` idles — and so recomposes —
+between injected key events, which is the interleaving itself. What *is* pinned
+is a side effect of owning the value: `caretFollowsADraftTheCallerRewrote` fails
+under the old `copy(text = value)` sync, which kept a stale selection and spliced
+the next keystroke into the middle of a completion. Owning `TextFieldValue` moves
+IME and selection behaviour, and R-007 records two regressions on exactly that
+surface — both on the mobile Return path. No Android instrumented test touches a
+text field (`androidInstrumentedTest` is `SystemBack`, `RelayBenchmark`,
+`RelayDiagnostics`), so CI's device job proves nothing here. Treat Android
+soft-keyboard behaviour as unverified until someone types into a real device.
 
 **Coverage (honest):** the tests pin the shared field. The three send *buttons*
 and the emoji append are **not** covered — they live inside large screen

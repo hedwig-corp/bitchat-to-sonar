@@ -183,6 +183,38 @@ class MessageComposerFieldUiTest {
         runOnIdle { assertEquals("/fav ", sent) }
     }
 
+    /**
+     * When the caller rewrites the draft — slash-hint completion, emoji append —
+     * typing continues at the end of the new text. The field owns its
+     * [androidx.compose.ui.text.input.TextFieldValue] now, so the caret moves
+     * with the rewrite instead of staying wherever it was in the old text and
+     * splicing the next keystroke into the middle.
+     */
+    @Test
+    fun caretFollowsADraftTheCallerRewrote() = runComposeUiTest {
+        var store by mutableStateOf("/f")
+        setContent {
+            MessageComposerTextField(
+                value = store,
+                onValueChange = { store = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { store },
+                modifier = Modifier.testTag("message-composer"),
+                onSend = null,
+            )
+        }
+
+        // Put the caret somewhere inside the existing text.
+        onNodeWithTag("message-composer").performClick()
+        // The hint was clicked; the caller replaced the whole draft.
+        store = "/fav "
+        waitForIdle()
+        onNodeWithTag("message-composer").performTextInput("bob")
+
+        runOnIdle { assertEquals("/fav bob", store) }
+    }
+
     @Test
     fun returnKeyInsertsNewlineWhenDesktopSendDisabled() = runComposeUiTest {
         var text by mutableStateOf("")
