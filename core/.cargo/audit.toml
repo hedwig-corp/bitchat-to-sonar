@@ -1,0 +1,37 @@
+# cargo-audit configuration. Read automatically when cargo-audit runs from
+# `core/` (its config lookup is relative to the working directory), so:
+#
+#     cd core && cargo audit
+#
+# Every ignore below is justified by a reachability analysis in
+# docs/SECURITY-ADVISORIES.md. Ignores are per-advisory-ID, so a NEW advisory
+# against the same crate still fails the audit — do not widen these to crate
+# level. Re-validate whenever the MDK/openmls/hpke-rs or iroh pins move.
+
+[advisories]
+ignore = [
+    # --- Not compiled into any shipped binary -------------------------------
+    # libcrux-aead is unreachable from every workspace member, and its AEAD
+    # backends sit behind disabled optional features. Verified against the built
+    # artifact, not just the manifest.
+    "RUSTSEC-2026-0124", # libcrux-chacha20poly1305: panic on overlong ciphertext
+    "RUSTSEC-2026-0209", # libcrux-aesgcm: AAD length limit not enforced
+    "RUSTSEC-2026-0211", # libcrux-aesgcm: non-constant-time tag check
+
+    # quick-xml enters only through plist (via netdev/netwatch/iroh) and does not
+    # resolve for any shipped target — iOS, Android, or macOS.
+    "RUSTSEC-2026-0194", # quick-xml: patched in >= 0.41.0
+    "RUSTSEC-2026-0195", # quick-xml: patched in >= 0.41.0
+
+    # --- Compiled, but the vulnerable API is never called -------------------
+    "RUSTSEC-2026-0207", # libcrux-sha3: incremental SHAKE multi-squeeze; hpke-rs
+                         # only uses the one-shot shake256::<N>() form
+    "RUSTSEC-2026-0212", # libcrux-secrets: aarch64 ct swap/select; libcrux-sha3
+                         # never calls ct_swap/ct_select
+
+    # --- Residual, accepted for this release --------------------------------
+    # AVX2 is x86_64-only, so no mobile artifact can reach it. Availability-only
+    # (panic) on the x86_64 desktop build. Closed by the MDK bump, which is gated
+    # on the Marmot protocol migration.
+    "RUSTSEC-2026-0208", # libcrux-sha3: potential panic in AVX2 SHAKE-256
+]
