@@ -3783,7 +3783,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // database itself — and for the current account it would trade
                 // live chats for whatever Blossom last held, or for nothing at
                 // all if this user never enabled backup.
-                if (npub.isNotBlank() && npub == expectedNpub) {
+                if (!shouldReplaceAccount(currentNpub = npub, incomingNpub = expectedNpub)) {
                     sonarLog("Identity", "restore: key matches the signed-in account — nothing to do")
                     return@runCatching
                 }

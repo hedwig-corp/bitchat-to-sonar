@@ -1027,7 +1027,7 @@ final class MarmotChatModel: ObservableObject {
         // also holds before the first connect.
         let currentNpub = await service.currentNpub()
             ?? previousNsec.flatMap { try? SonarIdentity.import(nsec: $0).npub() }
-        if let currentNpub, currentNpub == incoming.npub() {
+        if !shouldReplaceAccount(currentNpub: currentNpub, incomingNpub: incoming.npub()) {
             SecureLogger.info(
                 "ℹ️ Identity import is the current account — keeping the local database",
                 category: .session

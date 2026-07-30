@@ -2226,7 +2226,7 @@ final class SonarAppStore: ObservableObject {
         // clear, Marmot store wipe — and for the current account it would trade
         // a live database for whatever was last uploaded, or for nothing at all
         // if this user never enabled backup. Bail before the first wipe.
-        if let current = marmot.npub, current == incoming.npub() {
+        if !shouldReplaceAccount(currentNpub: marmot.npub, incomingNpub: incoming.npub()) {
             SecureLogger.info(
                 "ℹ️ Restore account: key matches the signed-in account — nothing to do",
                 category: .session

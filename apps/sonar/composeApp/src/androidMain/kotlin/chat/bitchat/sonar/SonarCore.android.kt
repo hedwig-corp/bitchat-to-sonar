@@ -894,7 +894,7 @@ actual object SonarCore {
                 // Blossom: for the same account that trades a live database for
                 // whatever was last uploaded, and for anyone who never enabled
                 // backup it destroys every chat with nothing to restore.
-                if (previousIdentity != null && previousIdentity.npub() == identity.npub()) {
+                if (!shouldReplaceAccount(previousIdentity?.npub(), identity.npub())) {
                     sonarLog("Identity", "import matches the current account — keeping local data")
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()

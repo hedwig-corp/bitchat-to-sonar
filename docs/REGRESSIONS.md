@@ -1147,6 +1147,50 @@ run by CI. Nothing pins that restored chats *render*: the Android leg was
 verified at the file level, and the synthetic backup used has no MLS groups
 behind its conversation summaries.
 
+## R-023 — Re-pasting your own key is never an account replacement
+
+**Invariant:** Importing an `nsec` replaces the account only when it is a
+*different* account. The key already signed in is a no-op, and a blank incoming
+key never authorises a wipe.
+
+**Breaks as:** Every chat gone, unrecoverably. Import wipes wallet storage, host
+caches and the Marmot store, then restores from Blossom. For the current account
+that trades a live database for whatever was last uploaded — and for anyone who
+never opened the backup screen, the disclosure gate means nothing was ever
+uploaded, so there is nothing to restore.
+
+**Why:** `restoreAccount` reads as "replace this account", so the same-key call
+looks like the harmless case and is in fact the most destructive input it
+accepts. The wipe happens before any comparison the old code made, and the user
+who triggers it is usually doing something they believe is safe — re-entering
+their own key to "re-sync".
+
+**Call sites:** Compose `SonarAppState.kt::restoreAccount`,
+`SonarCore.android.kt::importIdentity`, `SonarCore.jvm.kt::importIdentity`; iOS
+`SonarAppStore.swift::restoreAccount`, `MarmotChatView.swift::restoreIdentity`.
+All five route through the shared predicate rather than comparing inline.
+
+**Guarded by:** `AccountReplacementTest.rePastingYourOwnKeyIsNotAReplacement`,
+`AccountReplacementTest.anEmptyIncomingKeyNeverReplaces`,
+`AccountReplacementTest.surroundingWhitespaceDoesNotDefeatTheGuard`,
+`AccountReplacementTests.testRePastingYourOwnKeyIsNotAReplacement`,
+`AccountReplacementTests.testAnEmptyIncomingKeyNeverReplaces`
+
+**History:** #368, #519.
+
+**Rejected:** Comparing raw `nsec` strings — encodings differ and the comparison
+would silently fail open on the destructive side. Also rejected: leaving the
+comparison inline at each of the five call sites, which is how it shipped
+originally; five copies of a data-loss guard is five chances to drop one, and
+the pure predicate is the only part reachable from a test.
+
+**Not guarded:** The call sites themselves. No test proves each of the five
+actually consults the predicate before wiping — that needs a constructible
+`SonarAppState` / `SonarAppStore` (see Unguarded). A caller that skipped the
+check entirely would still pass every test here. R-001 regressed exactly this
+way: a missing argument at a call site while every helper-level test stayed
+green.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -1154,6 +1198,7 @@ entry once a test exists. Listing a gap is the point — an entry that overclaim
 its coverage is worse than an honest hole, because it stops people looking.
 
 - **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". The merge lives in `SonarAppState.duplicateDirectMarmotChats` (private, needs an instance); `dedupeDirectMarmotChats` — the pure seam the tests use — only covers the chat-list half. Closing it means extracting the transcript-source selection into a pure function, or an injectable `SonarCore`.
+- **R-023's five call sites.** The predicate is pinned on both platforms, but nothing proves each of the five import paths actually consults it before wiping. Same root cause as the entries below: neither app object can be constructed in a test. Until then this is a helper-level guard on a data-loss path, which is precisely the shape R-001 regressed through.
 - **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
 - **R-013, host push-tap / catching-up chip.** The iOS local-banner marker is pinned as a pure seam; the real `NotificationDelegate` → `refreshAfterForeground` call, full sync-lifetime indicator, and Compose notification-open → `forcedCatchupSync` route still need constructible app stores. Real-device APNs/FCM validation remains #262.
 - **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.

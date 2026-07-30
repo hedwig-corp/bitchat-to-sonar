@@ -881,7 +881,7 @@ actual object SonarCore {
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
                 // Same guard as Android: re-pasting the signed-in key must not
                 // wipe the store and fall back to whatever Blossom last held.
-                if (previousIdentity != null && previousIdentity.npub() == identity.npub()) {
+                if (!shouldReplaceAccount(previousIdentity?.npub(), identity.npub())) {
                     sonarLog("Identity", "import matches the current account — keeping local data")
                     npub = identity.npub()
                     pubkeyHex = identity.pubkeyHex()
