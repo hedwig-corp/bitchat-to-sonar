@@ -393,7 +393,7 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
 
 /** Warning shown when secrets are not protected by an OS keystore. */
 @Composable
-private fun SecretsAtRiskBanner(reason: String) {
+internal fun SecretsAtRiskBanner(reason: String) {
     val s = sonar
     Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp)) {
         Column(
