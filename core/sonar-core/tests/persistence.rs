@@ -502,11 +502,35 @@ async fn malformed_stored_slot_is_replaced_not_fatal() {
     let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
     std::fs::write(&slot_path, "not-a-valid-d-tag").expect("write slot");
 
-    let engine =
-        MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY).expect("engine");
+    let identity = Identity::generate();
+    let pubkey_hex = identity.public_key().to_hex();
+    let engine = MarmotEngine::persistent(identity, &db_path, DB_KEY).expect("engine");
     let d = d_tag_of(&engine.key_package_event(relays()).expect("kp"));
     assert_eq!(d.len(), 64, "expected a freshly minted 32-byte hex slot");
     assert!(d.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // 64 hex chars is also the shape of the identity-derived slot, so the checks
+    // above cannot tell a fresh mint from the substitution this test exists to
+    // rule out. Recovering from a corrupt sidecar by falling back to the derived
+    // slot would collapse every install of an identity onto one coordinate.
+    let mut input = b"sonar-keypackage-slot-v1:".to_vec();
+    input.extend_from_slice(pubkey_hex.as_bytes());
+    let derived = {
+        use nostr::hashes::{sha256::Hash as Sha256Hash, Hash as _};
+        Sha256Hash::hash(&input).to_string()
+    };
+    assert_ne!(
+        d, derived,
+        "a malformed slot must be re-minted, not replaced with the derived slot"
+    );
+
+    // And it must be rewritten to disk. Without this, "replaced" could silently
+    // mean "re-minted on every launch" while this test stays green.
+    assert_eq!(
+        std::fs::read_to_string(&slot_path).expect("slot rewritten").trim(),
+        d,
+        "the malformed slot must be replaced on disk, not just bypassed"
+    );
 }
 
 /// The `d` tag of a kind-30443 KeyPackage event.
@@ -635,5 +659,106 @@ async fn a_persistent_install_does_not_use_the_derived_slot() {
     assert_ne!(
         slot, derived,
         "a persistent install must own a random slot, not the identity-derived one"
+    );
+}
+
+/// A FAILED restore rename must leave the live install's slot alone.
+///
+/// `committing_a_staged_restore_drops_the_previous_slot` only exercises a
+/// successful rename, where the file is deleted either way, so moving the
+/// unlinks back above `fs::rename` keeps it green. This pins the ordering: on a
+/// failed rename the old database is still the live install, and dropping its
+/// slot would leave it holding key material with no coordinate, so its next
+/// publish mints a second one while the relays still carry the first.
+///
+/// The rename is failed by making the destination a NON-EMPTY DIRECTORY, not by
+/// making the parent read-only: a read-only parent also blocks the unlink, so
+/// the slot would survive either way and the test would pass against the bug it
+/// exists to catch. The parent stays writable so the unlink is possible.
+#[tokio::test]
+async fn a_failed_restore_rename_keeps_the_live_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+
+    // Destination is a non-empty directory, so rename(file -> dir) fails while
+    // everything around it stays writable.
+    std::fs::create_dir(&db_path).expect("db path as dir");
+    std::fs::write(db_path.join("occupied"), b"x").expect("make it non-empty");
+
+    let original = "a".repeat(64);
+    std::fs::write(&slot_path, &original).expect("live slot");
+    let staged = db_path.with_file_name("marmot.sqlite.sonar-restore-staging");
+    std::fs::write(&staged, b"restored db bytes").expect("stage");
+
+    let result = sonar_core::account_backup::commit_staged_account_restore(&db_path);
+
+    assert!(result.is_err(), "a failed rename must surface as an error");
+    assert_eq!(
+        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        original,
+        "the still-live install must keep its coordinate when the rename fails"
+    );
+}
+
+/// A commit that dies after the rename but before cleanup must still drop the
+/// outgoing slot when retried.
+///
+/// `commit_staged_account_restore` is documented as retry-safe, but on retry
+/// staging is gone, so the early-return arm is the only code left that can
+/// finish the job. Without the intent-gated cleanup there, the previous
+/// install's coordinate sits beside the restored database permanently and no
+/// later call can heal it.
+#[tokio::test]
+async fn a_retried_commit_finishes_dropping_the_outgoing_slot() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+    let intent_path = db_path.with_file_name("marmot.sqlite.sonar-restore-intent");
+
+    {
+        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+            .expect("engine");
+        engine.key_package_event(relays()).expect("kp");
+    }
+    assert!(slot_path.exists(), "precondition: outgoing slot exists");
+
+    // The state a crash between rename and cleanup leaves behind: staging gone
+    // (the rename won), intent still set (cleanup never finished).
+    std::fs::write(&intent_path, "1").expect("mark intent");
+
+    sonar_core::account_backup::commit_staged_account_restore(&db_path).expect("retry commit");
+
+    assert!(
+        !slot_path.exists(),
+        "the retry must finish dropping the outgoing slot"
+    );
+    assert!(!intent_path.exists(), "and clear the intent");
+}
+
+/// The inverse: with no restore in flight, the commit must NOT touch the slot.
+///
+/// The retry cleanup is gated on the intent marker precisely so an ordinary
+/// no-op commit cannot strand a healthy install's coordinate.
+#[tokio::test]
+async fn a_commit_with_no_restore_in_flight_leaves_the_slot_alone() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let slot_path = db_path.with_file_name("marmot.sqlite.sonar-keypackage-slot");
+
+    {
+        let engine = MarmotEngine::persistent(Identity::generate(), &db_path, DB_KEY)
+            .expect("engine");
+        engine.key_package_event(relays()).expect("kp");
+    }
+    let original = std::fs::read_to_string(&slot_path).expect("slot exists");
+
+    // No staging file, no intent marker: nothing to promote.
+    sonar_core::account_backup::commit_staged_account_restore(&db_path).expect("no-op commit");
+
+    assert_eq!(
+        std::fs::read_to_string(&slot_path).expect("slot must survive").trim(),
+        original.trim(),
+        "a healthy install must keep its coordinate"
     );
 }

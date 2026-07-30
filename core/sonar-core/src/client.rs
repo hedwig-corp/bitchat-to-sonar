@@ -2475,9 +2475,17 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
-    /// several under different `d` tags — e.g. multiple devices, or a stale slot
-    /// from an old install). Newest first.
+    /// Fetch `author`'s KeyPackage events from the relays, newest first (a peer
+    /// may have several under different `d` tags: multiple devices, or stale
+    /// slots from old installs).
+    ///
+    /// Bounded by [`KEY_PACKAGE_FETCH_LIMIT`], so this is the newest N rather
+    /// than literally all. One consequence matters for the multi-device fan-out
+    /// this enables: pre-fix orphan events are permanent, since nothing deletes
+    /// them, so an account carrying more than the limit in orphans NEWER than a
+    /// dormant device's last republish would hide that device's slot from this
+    /// query. Fan-out will need a higher bound, pagination, or an explicit
+    /// decision that devices dormant past the orphan horizon are out of scope.
     pub async fn fetch_all_key_packages(&self, author: PublicKey) -> Result<Vec<Event>> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
