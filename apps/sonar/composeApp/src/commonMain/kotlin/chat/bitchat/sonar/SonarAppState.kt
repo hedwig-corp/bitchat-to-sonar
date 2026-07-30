@@ -6039,6 +6039,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             failedChangedPageReads.remove(id)
             discardRetainedTranscript(id)
         }
+        // Delete must also drop this chat's in-flight send state (R-022
+        // sibling of the "/clear" scoped ledger clear): a surviving echo
+        // would ghost as a phantom bubble nothing can fulfil.
+        (deleteIds + chatId).toSet().forEach { id ->
+            pendingSendEchoes.remove(id)?.forEach { echo ->
+                previouslyPublishedMessageIdsByEcho.remove(echo.id)
+            }
+        }
         if (wasOpen && stack.size > 1) {
             endTranscriptSession()
             stack = stack.dropLast(1) // pop WITHOUT refresh
@@ -6094,6 +6102,21 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
             persistGroupFolds()
             clearChatSnapshot()
+        }
+        // Delete must also drop this conversation's in-flight send state: an
+        // echo or a queued out-of-range send surviving the delete would either
+        // ghost as a phantom bubble or — worse — be DELIVERED by
+        // flushPendingMarmot after the user removed the conversation (R-022
+        // sibling of the "/clear" scoped ledger clear).
+        val deletedChatIds = (aliases.map(::meshChatId) + chatId + foldedGroupIdsToDelete).toSet()
+        deletedChatIds.forEach { id ->
+            pendingSendEchoes.remove(id)?.forEach { echo ->
+                previouslyPublishedMessageIdsByEcho.remove(echo.id)
+            }
+        }
+        for ((npubHex, sends) in pendingMarmotSends.toList()) {
+            sends.removeAll { it.meshChatId in deletedChatIds }
+            if (sends.isEmpty()) pendingMarmotSends.remove(npubHex)
         }
         updateBleDiscoveryPolicy()
         if (wasOpen && stack.size > 1) {
