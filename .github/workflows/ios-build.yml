@@ -1,0 +1,75 @@
+name: iOS build
+
+# The iOS app has no automated floor: nothing in CI compiles
+# `ios/bitchat.xcodeproj`, so a Swift-only break merges green. That is not
+# hypothetical — #368 shipped a commit where the iOS half had never compiled
+# (missing `import BitLogger`) and another where an FFI signature change broke
+# the Apple build; both were found by hand, days apart.
+#
+# This job only proves the app COMPILES. It cannot catch runtime bugs — the
+# launch-surface hang in #368 compiled perfectly. Catching that class needs a
+# smoke launch (boot a simulator, install, assert the launch surface goes away),
+# which wants a UI test target and is deliberately left as a follow-up.
+
+on:
+  pull_request:
+    paths:
+      - 'ios/**'
+      - 'core/**'
+      - '.github/workflows/ios-build.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'ios/**'
+      - 'core/**'
+
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-build:
+    name: iOS app builds
+    runs-on: macos-15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Add the iOS Rust targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      # The Rust core dominates this job; without a warm target dir every run
+      # rebuilds the whole dependency graph for two Apple triples.
+      - name: Cache the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            core/target
+          key: ios-core-${{ runner.os }}-${{ hashFiles('core/**/Cargo.toml') }}
+          restore-keys: |
+            ios-core-${{ runner.os }}-
+
+      # Produces sonarffi.xcframework + the generated SonarFFI.swift the app
+      # links. Regenerating in CI is the point: a stale checked-in binding is
+      # exactly how an FFI signature change reaches main unnoticed.
+      - name: Build the Rust core for iOS
+        run: ./core/build-ios.sh
+
+      # `CODE_SIGNING_ALLOWED=NO` keeps this credential-free — a compile check
+      # must not need the signing identity or any gitignored secret. The app
+      # builds without `Local.xcconfig` / `GoogleService-Info.plist`; both are
+      # optional at build time and only change runtime behaviour.
+      - name: xcodebuild (iOS Simulator)
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project ios/bitchat.xcodeproj \
+            -scheme 'bitchat (iOS)' \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO
