@@ -11,6 +11,7 @@
 // For more information, see <https://unlicense.org>
 //
 
+import Darwin
 import SwiftUI
 
 // MARK: - Icon definitions (icons.jsx, verbatim path data)
@@ -370,10 +371,15 @@ private struct SNPathParser {
             return
         }
         let phi = rotationDeg * .pi / 180
+        // Darwin-qualified trig throughout this helper: some toolchains expose
+        // additional cos/sin overloads that make the bare calls ambiguous (the
+        // CI Xcode fails with "ambiguous use of 'cos'" and Duration cascades).
+        let cosPhi = Darwin.cos(phi)
+        let sinPhi = Darwin.sin(phi)
         let dx2 = (current.x - end.x) / 2
         let dy2 = (current.y - end.y) / 2
-        let x1p = cos(phi) * dx2 + sin(phi) * dy2
-        let y1p = -sin(phi) * dx2 + cos(phi) * dy2
+        let x1p = cosPhi * dx2 + sinPhi * dy2
+        let y1p = -sinPhi * dx2 + cosPhi * dy2
         let lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
         if lambda > 1 {
             let s = sqrt(lambda)
@@ -386,14 +392,14 @@ private struct SNPathParser {
         if largeArc == sweep { coef = -coef }
         let cxp = coef * rx * y1p / ry
         let cyp = -coef * ry * x1p / rx
-        let cx = cos(phi) * cxp - sin(phi) * cyp + (current.x + end.x) / 2
-        let cy = sin(phi) * cxp + cos(phi) * cyp + (current.y + end.y) / 2
+        let cx = cosPhi * cxp - sinPhi * cyp + (current.x + end.x) / 2
+        let cy = sinPhi * cxp + cosPhi * cyp + (current.y + end.y) / 2
 
         func angle(_ ux: Double, _ uy: Double, _ vx: Double, _ vy: Double) -> Double {
             let dot = ux * vx + uy * vy
             let len = sqrt((ux * ux + uy * uy) * (vx * vx + vy * vy))
             guard len > 0 else { return 0 }
-            var a = acos(max(-1, min(1, dot / len)))
+            var a = Darwin.acos(max(-1, min(1, dot / len)))
             if ux * vy - uy * vx < 0 { a = -a }
             return a
         }
@@ -404,18 +410,18 @@ private struct SNPathParser {
 
         let segments = max(1, Int(ceil(abs(delta) / (.pi / 2))))
         let segDelta = delta / Double(segments)
-        let t = 4.0 / 3.0 * tan(segDelta / 4)
+        let t = 4.0 / 3.0 * Darwin.tan(segDelta / 4)
 
         func pointAt(_ a: Double) -> CGPoint {
             CGPoint(
-                x: cx + rx * cos(a) * cos(phi) - ry * sin(a) * sin(phi),
-                y: cy + rx * cos(a) * sin(phi) + ry * sin(a) * cos(phi)
+                x: cx + rx * Darwin.cos(a) * cosPhi - ry * Darwin.sin(a) * sinPhi,
+                y: cy + rx * Darwin.cos(a) * sinPhi + ry * Darwin.sin(a) * cosPhi
             )
         }
         func derivativeAt(_ a: Double) -> CGPoint {
             CGPoint(
-                x: -rx * sin(a) * cos(phi) - ry * cos(a) * sin(phi),
-                y: -rx * sin(a) * sin(phi) + ry * cos(a) * cos(phi)
+                x: -rx * Darwin.sin(a) * cosPhi - ry * Darwin.cos(a) * sinPhi,
+                y: -rx * Darwin.sin(a) * sinPhi + ry * Darwin.cos(a) * cosPhi
             )
         }
 
