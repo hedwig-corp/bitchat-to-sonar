@@ -1373,6 +1373,58 @@ gate; a retry/first-send whose canonical row lands out-of-window can drop until
 the newest-edge reload. Same shape, separate call sites — gate them the same
 way when touched.
 
+
+## R-027 — Return must commit an open IME composition before it sends
+
+**Invariant:** On macOS the composer claims bare Return to send. It must only do
+so when no IME composition is open. While text is marked (uncommitted), Return
+belongs to the text system: it commits the composition, and the *next* Return
+sends.
+
+**Breaks as:** the sent message is missing its last character(s), and so is the
+composer — the text simply vanishes. It reads as "the message I sent got cut",
+with no error and nothing to retry.
+
+**Why:** `.onKeyPress(keys: [.return])` runs during AppKit key dispatch, ahead of
+the text system, and returning `.handled` consumes the event. If marked text is
+pending, nothing ever commits it: the composition is discarded. This is not the
+R-026 race — Apple reads the draft from the store at send time and has no stale
+capture — it is data that never reached the store at all.
+
+**Who hits it:** anyone whose input goes through a composition — dead-key accents
+(`option+e`, `e` → `é`), press-and-hold accent menus, macOS inline predictive
+text, and every CJK IME. Latin-alphabet ASCII typing never composes, which is why
+this hid for so long and why an ASCII-only reproduction shows nothing.
+
+**Call sites:** Apple `SNMessageComposerField` (macOS branch only — iOS has no
+Return handler; the send button owns sending). Compose is unaffected: its desktop
+Enter path does not consume keys ahead of an IME commit, and Android Return is a
+newline.
+
+**Guarded by:** `SNComposerReturnMarkedTextTests.bareReturnSendsWhenNothingIsComposing`, `SNComposerReturnMarkedTextTests.returnDuringCompositionDoesNotSend`, `SNComposerReturnMarkedTextTests.modifiedReturnNeverSends`
+
+**Coverage (honest):** the tests pin the pure predicate
+`snReturnSendsComposerDraft`, not the wiring — nothing asserts that the call site
+actually asks `NSTextView.hasMarkedText()`, and iOS/macOS tests do not run in CI
+at all. The behaviour was verified by hand instead, in an isolated SwiftUI app
+reproducing the composer (store → `Binding` → `TextField(axis: .vertical)` →
+`.onKeyPress`): the same keystrokes gave `read=5 "perch"` before the fix and
+`read=6 "perch´"` after. That reproduction is the evidence; the unit tests only
+stop the predicate from being rewritten.
+
+**Rejected:**
+- *Deferring the send by a runloop turn* (`Task { onSend() }`) so the commit
+  lands first. It would paper over this case, but Return would still be consumed,
+  so a composition that needs a second key (CJK candidate selection) would still
+  lose it — and it adds a reorder hazard to every send.
+- *Reading the field's text at commit time instead.* Nothing to read: the marked
+  character never reaches the binding, so no amount of care on the read side
+  recovers it.
+- *Blaming the SwiftUI binding flush.* Measured and ruled out first: with ASCII
+  input the binding was complete at Return in every trial, including with the
+  main thread blocked 120 ms per keystroke. The composition state was the
+  difference, not timing.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

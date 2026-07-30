@@ -4290,6 +4290,24 @@ struct SNLiveWave: View {
     }
 }
 
+/// Whether a bare Return should commit the draft, given the composer's state.
+///
+/// Returns `false` while an IME composition is open. Claiming Return in that
+/// state stops the text system from committing the marked text, so the pending
+/// character is dropped from the field *and* from the message that goes out —
+/// which is how accented input (dead keys, press-and-hold) and every IME lose
+/// their last character on macOS. Letting the key through commits the
+/// composition; the next Return sends. Shift/Option stay reserved for newline
+/// (#334).
+func snReturnSendsComposerDraft(
+    hasMarkedText: Bool,
+    isShiftPressed: Bool,
+    isOptionPressed: Bool
+) -> Bool {
+    if isShiftPressed || isOptionPressed { return false }
+    return !hasMarkedText
+}
+
 /// Shared Apple message field.
 ///
 /// - iOS: Return inserts a newline; the adjacent send button owns sending.
@@ -4314,7 +4332,14 @@ struct SNMessageComposerField: View {
             // and did not compile — the unnoticed macOS break).
             .onKeyPress(keys: [.return]) { press in
                 // Shift/Option+Return stay available for newline until #334.
-                if press.modifiers.contains(.shift) || press.modifiers.contains(.option) {
+                // A Return arriving mid-IME-composition must reach the text
+                // system so the marked text is committed, not dropped.
+                let editor = NSApp.keyWindow?.firstResponder as? NSTextView
+                guard snReturnSendsComposerDraft(
+                    hasMarkedText: editor?.hasMarkedText() ?? false,
+                    isShiftPressed: press.modifiers.contains(.shift),
+                    isOptionPressed: press.modifiers.contains(.option)
+                ) else {
                     return .ignored
                 }
                 onSend?()
