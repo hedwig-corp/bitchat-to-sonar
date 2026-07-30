@@ -1150,6 +1150,23 @@ send *buttons* are not covered either — they live inside large screen
 composables needing a constructed `SonarAppState`, so the fresh read there is by
 inspection only. Nothing pins the Apple side.
 
+**Known gap this fix newly exposes — a keystroke *after* the Enter in the same
+batch.** `onSent()` clears our holder, but the value-based `BasicTextField`
+keeps its own internal `TextFieldValue`, which still holds the sent text until
+the caller's clear is composed. For the batch `[h, i, Enter, !]` the `!` edits
+that buffer, so `onValueChange` reports `"hi!"` and the composer comes back
+holding the message it just sent, prefixed to the next one. Before this change
+the same batch sent nothing at all (Enter saw a blank stale draft and the
+caller's guard returned), so making the send work is what put this in reach. It
+is one frame wide, and the user sees the wrong text in the composer *before*
+sending it — unlike the truncation, which was silent. The real fix is for the
+composer to own a `TextFieldValue` so the field can be blanked synchronously at
+send (also fixes the mid-caret variant, where the leftover is not even a
+prefix). That is deliberately **not** in this change: it rewrites the field's
+state ownership and moves soft-keyboard/IME behaviour, which is the exact
+surface R-007 exists to protect and which has already regressed twice. It wants
+its own PR with device testing on both platforms.
+
 **The call sites are the hole, and they are where the bug lived.** Everything
 above pins the shared field; the original defect was in the *callers*, which
 closed over `draft`. They are correct now because they use the lambda parameter,
@@ -1172,7 +1189,15 @@ against a constructed `SonarAppState`.
   field actually kept.
 - *Keeping a UI-level test for the same-batch second Enter.* It passed with and
   without the guard, because the harness recomposes between injected events. A
-  test that cannot fail is worse than an admitted gap.
+  test that cannot fail is worse than an admitted gap. Note for anyone tempted
+  to retry it: pressing Enter twice inside a single `performKeyInput` block is
+  the obvious idea and it does **not** work — the harness still recomposes
+  between the two presses, which is how the vacuity was caught. Pinning this
+  needs a fake frame clock, not a tighter injection block.
+- *Rewriting the composer onto `TextFieldValue` in this change.* It is the right
+  end state and would close the post-Enter-keystroke gap above, but it moves
+  IME/selection behaviour on both mobile platforms — see R-007's history — so it
+  does not belong in a truncation fix.
 
 ## Unguarded
 
