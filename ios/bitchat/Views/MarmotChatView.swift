@@ -989,6 +989,21 @@ final class MarmotChatModel: ObservableObject {
     /// `nsec1…` backup of the connected identity, for the "Export private key"
     /// self-custody escape hatch. Prefers keychain (Compose secrets parity)
     /// so callers never wait on Marmot `workQueue` sync/connect.
+    /// The signed-in npub, resolved from the live node **or** the durable
+    /// keychain entry.
+    ///
+    /// The distinction is load-bearing: `service.currentNpub()` is nil before
+    /// the first connect, and a caller that treats nil as "no account" will
+    /// wipe an account that exists on disk. Anything gating a destructive
+    /// account replacement must ask this, not the live value.
+    func resolvedCurrentNpub() async -> String? {
+        if let live = await service.currentNpub() { return live }
+        let stored = await service.exportNsec()
+            ?? keychain.getIdentityKey(forKey: Self.nsecKeychainKey)
+                .flatMap { String(data: $0, encoding: .utf8) }
+        return stored.flatMap { try? SonarIdentity.import(nsec: $0).npub() }
+    }
+
     func exportNsec() async -> String? {
         await SonarAccountKeyExport.exportNsec(keychain: keychain) {
             await service.exportNsec()
@@ -1025,9 +1040,7 @@ final class MarmotChatModel: ObservableObject {
         // chat with nothing to restore. Compare derived npubs, not raw strings,
         // and read the stored key (not just the connected node) so the guard
         // also holds before the first connect.
-        let currentNpub = await service.currentNpub()
-            ?? previousNsec.flatMap { try? SonarIdentity.import(nsec: $0).npub() }
-        if !shouldReplaceAccount(currentNpub: currentNpub, incomingNpub: incoming.npub()) {
+        if !shouldReplaceAccount(currentNpub: await resolvedCurrentNpub(), incomingNpub: incoming.npub()) {
             SecureLogger.info(
                 "ℹ️ Identity import is the current account — keeping the local database",
                 category: .session

@@ -3783,7 +3783,20 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // database itself — and for the current account it would trade
                 // live chats for whatever Blossom last held, or for nothing at
                 // all if this user never enabled backup.
-                if (!shouldReplaceAccount(currentNpub = npub, incomingNpub = expectedNpub)) {
+                // `npub` is blank until boot completes, and treating that as
+                // "no account" would run every wipe below on an account that
+                // exists on disk. The core-level guard in importIdentity would
+                // still spare the chat database, but wallet storage, the
+                // message store and the media cache would already be gone.
+                // Fall back to the durable key, which does not need the node.
+                val currentNpub = npub.ifBlank {
+                    runCatching { SonarCore.identityNsec() }
+                        .getOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { stored -> runCatching { SonarCore.validateIdentity(stored) }.getOrNull() }
+                        .orEmpty()
+                }
+                if (!shouldReplaceAccount(currentNpub = currentNpub, incomingNpub = expectedNpub)) {
                     sonarLog("Identity", "restore: key matches the signed-in account — nothing to do")
                     return@runCatching
                 }

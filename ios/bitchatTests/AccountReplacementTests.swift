@@ -58,4 +58,22 @@ final class AccountReplacementTests: XCTestCase {
         XCTAssertFalse(shouldReplaceAccount(currentNpub: mine, incomingNpub: "   "))
         XCTAssertFalse(shouldReplaceAccount(currentNpub: nil, incomingNpub: ""))
     }
+
+    /// bech32 is case-insensitive: `NPUB1…` and `npub1…` decode to the same
+    /// key. Comparing raw strings failed open on the destructive side.
+    /// Flagged independently by three review models.
+    func testCaseDoesNotMakeItADifferentAccount() {
+        XCTAssertFalse(shouldReplaceAccount(currentNpub: mine, incomingNpub: mine.uppercased()))
+        XCTAssertFalse(shouldReplaceAccount(currentNpub: mine.uppercased(), incomingNpub: mine))
+    }
+
+    /// The two platforms must agree on what "same account" means. Kotlin's
+    /// `trim()` and Swift's `.whitespacesAndNewlines` disagreed on U+00A0, so a
+    /// non-breaking space was a no-op here and a wipe on Android. Both now trim
+    /// an explicit ASCII set, so neither strips it — agreeing matters more than
+    /// which answer, and refusing to guess is the safer one.
+    func testExoticWhitespaceIsTreatedIdenticallyOnBothPlatforms() {
+        let nbsp = "\u{00A0}"
+        XCTAssertTrue(shouldReplaceAccount(currentNpub: mine, incomingNpub: nbsp + mine))
+    }
 }

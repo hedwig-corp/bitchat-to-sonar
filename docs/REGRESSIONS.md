@@ -1170,15 +1170,29 @@ their own key to "re-sync".
 `SonarAppStore.swift::restoreAccount`, `MarmotChatView.swift::restoreIdentity`.
 All five route through the shared predicate rather than comparing inline.
 
-**Guarded by:** `AccountReplacementTest.rePastingYourOwnKeyIsNotAReplacement`,
-`AccountReplacementTest.anEmptyIncomingKeyNeverReplaces`,
-`AccountReplacementTest.surroundingWhitespaceDoesNotDefeatTheGuard`,
-`AccountReplacementTests.testRePastingYourOwnKeyIsNotAReplacement`,
-`AccountReplacementTests.testAnEmptyIncomingKeyNeverReplaces`
+**Guarded by:** the whole `AccountReplacementTest` (Compose) and
+`AccountReplacementTests` (iOS) pair —
+`rePastingYourOwnKeyIsNotAReplacement`,
+`anEmptyIncomingKeyNeverReplaces`,
+`surroundingWhitespaceDoesNotDefeatTheGuard`,
+`caseDoesNotMakeItADifferentAccount`,
+`exoticWhitespaceIsTreatedIdenticallyOnBothPlatforms`,
+`aDifferentKeyReplacesTheAccount`, `noCurrentAccountReplaces`,
+`aPrefixOrTruncationIsNotTheSameAccount`, and the iOS `test`-prefixed twins
+(`AccountReplacementTests.testRePastingYourOwnKeyIsNotAReplacement`,
+`AccountReplacementTests.testAnEmptyIncomingKeyNeverReplaces`,
+`AccountReplacementTests.testCaseDoesNotMakeItADifferentAccount`)
 
 **History:** #368, #519.
 
-**Rejected:** Comparing raw `nsec` strings — encodings differ and the comparison
+**Rejected:** Comparing raw npub strings without normalizing — bech32 is
+case-insensitive, so `NPUB1…` and `npub1…` are the same account, and a raw
+comparison fails open on the destructive side. Also rejected: each platform
+using its own idiomatic trim (`String.trim` vs `.whitespacesAndNewlines`),
+which disagree on U+00A0 — a non-breaking space around a pasted key was a
+no-op on iOS and a wipe on Android. Both now trim an identical ASCII set;
+agreeing matters more than which answer, and refusing to strip exotic
+whitespace is the safer of the two. Also rejected: comparing raw `nsec` strings — encodings differ and the comparison
 would silently fail open on the destructive side. Also rejected: leaving the
 comparison inline at each of the five call sites, which is how it shipped
 originally; five copies of a data-loss guard is five chances to drop one, and

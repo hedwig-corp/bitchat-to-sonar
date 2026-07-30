@@ -25,9 +25,25 @@ import Foundation
 ///   one answer that can never be right, so it is refused explicitly rather
 ///   than left to the comparison below.
 func shouldReplaceAccount(currentNpub: String?, incomingNpub: String) -> Bool {
-    let current = (currentNpub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    let incoming = incomingNpub.trimmingCharacters(in: .whitespacesAndNewlines)
+    let current = normalizeNpub(currentNpub)
+    let incoming = normalizeNpub(incomingNpub)
     if incoming.isEmpty { return false }
     if current.isEmpty { return true }
     return current != incoming
+}
+
+/// Normalize for comparison. Must stay byte-identical to the Compose mirror:
+/// the two platforms disagreeing on what "same account" means is itself the
+/// bug.
+///
+/// Trims an explicit ASCII set rather than `.whitespacesAndNewlines`, which
+/// strips U+00A0 and friends where Kotlin's `trim` does not — a non-breaking
+/// space around a pasted key would be a no-op here and a wipe on Android.
+/// Lowercases because bech32 is case-insensitive: `NPUB1…` and `npub1…` decode
+/// to the same key, and treating them as different accounts fails open on the
+/// destructive side.
+private func normalizeNpub(_ value: String?) -> String {
+    (value ?? "")
+        .trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n"))
+        .lowercased()
 }

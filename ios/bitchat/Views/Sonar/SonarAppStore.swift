@@ -2226,7 +2226,12 @@ final class SonarAppStore: ObservableObject {
         // clear, Marmot store wipe — and for the current account it would trade
         // a live database for whatever was last uploaded, or for nothing at all
         // if this user never enabled backup. Bail before the first wipe.
-        if !shouldReplaceAccount(currentNpub: marmot.npub, incomingNpub: incoming.npub()) {
+        // `marmot.npub` is nil until the first connect, and treating that as
+        // "no account" would run every wipe below on an account that exists on
+        // disk. The core-level guard would still spare the chat database, but
+        // wallet storage and the host caches would already be gone. Ask the
+        // resolver, which falls back to the durable keychain entry.
+        if !shouldReplaceAccount(currentNpub: await marmot.resolvedCurrentNpub(), incomingNpub: incoming.npub()) {
             SecureLogger.info(
                 "ℹ️ Restore account: key matches the signed-in account — nothing to do",
                 category: .session

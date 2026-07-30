@@ -24,9 +24,23 @@ package chat.bitchat.sonar
  *   than left to the comparison below.
  */
 fun shouldReplaceAccount(currentNpub: String?, incomingNpub: String): Boolean {
-    val current = currentNpub?.trim().orEmpty()
-    val incoming = incomingNpub.trim()
+    val current = normalizeNpub(currentNpub)
+    val incoming = normalizeNpub(incomingNpub)
     if (incoming.isEmpty()) return false
     if (current.isEmpty()) return true
     return current != incoming
 }
+
+/**
+ * Normalize for comparison. Must stay byte-identical to the Swift mirror: the
+ * two platforms disagreeing on what "same account" means is itself the bug.
+ *
+ * Trims an explicit ASCII set rather than [String.trim], whose `isWhitespace`
+ * differs from Swift's `.whitespacesAndNewlines` on U+00A0 and friends — a
+ * non-breaking space around a pasted key would be a no-op on iOS and a wipe on
+ * Android. Lowercases because bech32 is case-insensitive: `NPUB1…` and
+ * `npub1…` decode to the same key, and treating them as different accounts
+ * fails open on the destructive side.
+ */
+private fun normalizeNpub(value: String?): String =
+    value.orEmpty().trim { it == ' ' || it == '\t' || it == '\r' || it == '\n' }.lowercase()
