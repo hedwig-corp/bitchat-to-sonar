@@ -77,26 +77,7 @@ internal class MessageComposerState(initial: String = "") {
         field = TextFieldValue(value, TextRange(value.length))
         pushed = value
     }
-
-    /**
-     * A send committed the draft: blank the field now, so anything still queued
-     * in this input batch edits an empty field rather than the message that just
-     * went out.
-     *
-     * **Every** send path must call this, not just the composer's own Enter
-     * handler — the send buttons clear the stored draft themselves, and on
-     * Android the button is the only send path there is (Return inserts a
-     * newline). If the caller keeps the draft instead of clearing it, the next
-     * composition adopts it straight back.
-     */
-    fun committed() {
-        adopt("")
-    }
 }
-
-@Composable
-internal fun rememberMessageComposerState(initial: String): MessageComposerState =
-    remember { MessageComposerState(initial) }
 
 /**
  * The shared message composer text field.
@@ -123,7 +104,6 @@ internal fun rememberMessageComposerState(initial: String): MessageComposerState
  */
 @Composable
 internal fun MessageComposerTextField(
-    state: MessageComposerState,
     value: String,
     onValueChange: (String) -> Unit,
     textStyle: TextStyle,
@@ -133,6 +113,7 @@ internal fun MessageComposerTextField(
     onSend: ((String) -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
+    val state = remember { MessageComposerState(value) }
 
     // Adopt draft changes the caller made itself.
     SideEffect {
@@ -158,13 +139,7 @@ internal fun MessageComposerTextField(
                         isEnter &&
                         !event.isShiftPressed
                     ) {
-                        // Blank before the callback so anything still queued in
-                        // this input batch edits an empty field, not the message
-                        // being sent. If the caller keeps the draft rather than
-                        // clearing it, the next SideEffect restores it.
-                        val outgoing = currentDraft()
-                        state.committed()
-                        onSend?.invoke(outgoing)
+                        onSend?.invoke(currentDraft())
                         true
                     } else {
                         false

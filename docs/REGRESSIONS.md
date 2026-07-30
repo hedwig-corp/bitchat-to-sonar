@@ -1143,7 +1143,7 @@ Unverified either way — nobody has instrumented it. Do not treat the Compose f
 as covering macOS, and do not treat "Apple reads a live binding" as evidence the
 symptom is absent; those are answers to different questions.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`, `MessageComposerStateTest.committedBlanksTheFieldImmediately`, `MessageComposerStateTest.aKeystrokeAfterCommitStartsFromEmpty`, `MessageComposerStateTest.selectionOnlyMovesDoNotWakeTheStore`, `MessageComposerStateTest.adoptPutsTheCaretAtTheEnd`, `MessageComposerStateTest.adoptTakesAnotherConversationsDraft`
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`, `MessageComposerStateTest.selectionOnlyMovesDoNotWakeTheStore`, `MessageComposerStateTest.adoptPutsTheCaretAtTheEnd`, `MessageComposerStateTest.adoptTakesAnotherConversationsDraft`
 
 All three of the first group fail when the handler is pointed back at the
 composed value (`onSend?.invoke(value)`, which is the old behaviour under the new
@@ -1157,27 +1157,41 @@ as good as the store behind it. All three call sites write straight into
 `SonarAppState.composerDrafts`; a debounced or async draft store would put the
 truncation straight back, and no test here would catch it.
 
-**A keystroke *after* the Enter in the same batch — closed.** The value-based
-`BasicTextField` kept its own internal `TextFieldValue`, which still held the
-sent text until the caller's clear was composed. For the batch `[h, i, Enter, !]`
-the `!` edited that buffer, so `onValueChange` reported `"hi!"` and the composer
-came back holding the message it had just sent, glued to the next one. Making the
-send work is what put this in reach: the same batch previously sent nothing at
-all (Enter saw a blank stale draft and the caller's guard returned).
+**A keystroke *after* the Enter in the same batch — still open.** The
+`BasicTextField` editing buffer still holds the sent text until the caller's
+clear is composed, so a keystroke from that same batch edits it: `[h, i, Enter,
+!]` leaves the composer holding `"hi!"`, the message it just sent glued to the
+next one. Making the send work is what put this in reach — the same batch
+previously sent nothing at all (Enter saw a blank stale draft and the caller's
+guard returned). It is one frame wide, and the user sees the wrong text in the
+composer *before* sending it, unlike the truncation, which was silent.
 
-The composer now owns its `TextFieldValue` (`MessageComposerState`) and blanks it
-before invoking `onSend`, so anything still queued in that batch edits an empty
-field. This also covers the mid-caret variant, where the leftover is not even a
-prefix — which is why no prefix-stripping hack was viable. If the caller keeps
-the draft rather than clearing it, the next `SideEffect` restores it, so the
-blank is only optimistic.
+**Owning the `TextFieldValue` does not close it — verified, not assumed.** The
+obvious fix is for the composer to own its value and blank it in the Enter
+handler. That was written, and it does not work: `CoreTextField` reconciles the
+`EditProcessor` buffer from the hoisted value by calling
+`processor.reset(value, inputSession)` as **straight-line code in the composable
+body** (confirmed by disassembling `CoreTextFieldKt` from
+`foundation-desktop-1.7.3.jar`: `LegacyTextFieldState.update(...)` then
+`EditProcessor.reset(...)`, inside the method taking a `Composer`, not in any
+lambda). So writing the hoisted value mid-burst schedules a recomposition and
+nothing more — the buffer is reset at exactly the same moment the old
+value-based overload would have reset it. A blank-on-send is a no-op for the one
+interleaving it was written for.
 
-**Every send path must blank it, not just Enter.** The first cut wired this into
-the composer's own key handler alone, which left the *buttons* — which clear the
-stored draft themselves — editing a stale buffer, i.e. the whole bug still open
-on the path that matters most: on Android the button is the only way to send,
-since Return inserts a newline. `MessageComposerState.committed()` is the shared
-call, made by the Enter handler and by all three send buttons.
+The real fix is the newer `BasicTextField(state: TextFieldState)` API, where
+edits go through a buffer the caller owns and `clearText()` mutates it
+synchronously. That is a larger migration (no `onValueChange`, different
+IME/selection surface) and belongs in its own change with device testing.
+
+*Rejected: repairing the stale edit after the fact* — remember the committed
+text, and when the next edit arrives before any recomposition, diff it against
+that text to recover what the user actually typed. It would work, but it encodes
+a model of exactly what `BasicTextField` emits, and if that model is wrong it
+**mangles** the user's text rather than merely resurrecting the sent message.
+A visible, one-frame wrong draft the user can see and fix beats silent
+corruption, and there is no test that can stage the interleaving to tell us
+which we shipped.
 
 **Not verifiable in the harness, and unverified on Android.** The interleaving
 this closes cannot be staged: `runComposeUiTest` idles — and so recomposes —
