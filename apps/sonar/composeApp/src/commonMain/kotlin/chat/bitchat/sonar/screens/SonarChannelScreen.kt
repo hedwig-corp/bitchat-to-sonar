@@ -153,6 +153,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             ) {
                 if (draft.isEmpty()) Text("Message $name", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
+                    conversationKey = draftKey,
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),

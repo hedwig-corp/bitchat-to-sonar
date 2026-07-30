@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.platform.testTag
@@ -12,6 +13,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.click
+import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.pressKey
 import androidx.compose.ui.test.runComposeUiTest
 import androidx.compose.ui.text.TextStyle
@@ -30,6 +33,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -61,6 +65,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -101,6 +106,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -134,6 +140,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -165,6 +172,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -195,6 +203,7 @@ class MessageComposerFieldUiTest {
         var store by mutableStateOf("/f")
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = store,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -215,11 +224,48 @@ class MessageComposerFieldUiTest {
         runOnIdle { assertEquals("/fav bob", store) }
     }
 
+    /**
+     * The screens dispatch every conversation from one call site, so the
+     * composer's state survives a chat switch. When the two chats happen to hold
+     * equal drafts the adopt path does not fire — the text matches — and an
+     * unkeyed state carried the previous chat's caret into the new one, splicing
+     * the next keystroke into the middle of it.
+     */
+    @Test
+    fun switchingConversationsWithEqualDraftsDoesNotCarryTheCaret() = runComposeUiTest {
+        var conversation by mutableStateOf("chat-a")
+        var store by mutableStateOf("hello")
+        setContent {
+            MessageComposerTextField(
+                conversationKey = conversation,
+                value = store,
+                onValueChange = { store = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { store },
+                modifier = Modifier.testTag("message-composer"),
+                onSend = null,
+            )
+        }
+
+        // Land the caret INSIDE chat A's draft. A plain performClick hits the
+        // centre of the full-width field, which is past the end of a short
+        // draft and would put the caret at the end anyway — proving nothing.
+        onNodeWithTag("message-composer").performTouchInput { click(Offset(6f, centerY)) }
+        // Same draft text, different conversation.
+        conversation = "chat-b"
+        waitForIdle()
+        onNodeWithTag("message-composer").performTextInput("x")
+
+        runOnIdle { assertEquals("hellox", store) }
+    }
+
     @Test
     fun returnKeyInsertsNewlineWhenDesktopSendDisabled() = runComposeUiTest {
         var text by mutableStateOf("")
         setContent {
             MessageComposerTextField(
+                conversationKey = "chat",
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),

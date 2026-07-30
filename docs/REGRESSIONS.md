@@ -1143,7 +1143,7 @@ Unverified either way — nobody has instrumented it. Do not treat the Compose f
 as covering macOS, and do not treat "Apple reads a live binding" as evidence the
 symptom is absent; those are answers to different questions.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`, `MessageComposerStateTest.selectionOnlyMovesDoNotWakeTheStore`, `MessageComposerStateTest.adoptPutsTheCaretAtTheEnd`, `MessageComposerStateTest.adoptTakesAnotherConversationsDraft`
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`, `MessageComposerFieldUiTest.switchingConversationsWithEqualDraftsDoesNotCarryTheCaret`, `MessageComposerStateTest.selectionOnlyMovesDoNotWakeTheStore`, `MessageComposerStateTest.adoptPutsTheCaretAtTheEnd`, `MessageComposerStateTest.adoptReplacesTextAndPushed`
 
 All three of the first group fail when the handler is pointed back at the
 composed value (`onSend?.invoke(value)`, which is the old behaviour under the new
@@ -1165,6 +1165,16 @@ next one. Making the send work is what put this in reach — the same batch
 previously sent nothing at all (Enter saw a blank stale draft and the caller's
 guard returned). It is one frame wide, and the user sees the wrong text in the
 composer *before* sending it, unlike the truncation, which was silent.
+
+**It is not an Enter-only gap.** The mechanism is the editing buffer holding
+pre-commit text until the caller's write composes, so every path that mutates
+the draft from outside the field has a same-frame variant. A send *button* click
+clears the store, and a keystroke landing before the next frame edits the buffer
+that still holds the sent text — `onValueChange` then writes `"sent!"` back. An
+emoji tap writes `"hi😀"` to the store, and a keystroke in that frame edits the
+buffer holding `"hi"`, so the store becomes `"hi!"` and **the emoji silently
+disappears** — the one variant with no visible warning, since the others at least
+show the wrong text before you send it.
 
 **Owning the `TextFieldValue` does not close it — verified, not assumed.** The
 obvious fix is for the composer to own its value and blank it in the Enter
@@ -1192,6 +1202,25 @@ a model of exactly what `BasicTextField` emits, and if that model is wrong it
 A visible, one-frame wrong draft the user can see and fix beats silent
 corruption, and there is no test that can stage the interleaving to tell us
 which we shipped.
+
+**One composer slot serves every conversation.** The screens dispatch from a
+fixed call site with no `key(screen.id)`, so the field's state survives a chat
+switch. `MessageComposerState` is therefore `remember`ed **keyed by the
+conversation**; unkeyed, the first frame after a switch renders the previous
+chat's text while `currentDraft` already reads the new one (Enter there commits a
+draft the field is not showing), and two chats holding equal drafts skip the
+adopt entirely and keep the old caret forever — typing then splices into the
+middle. Pinned by
+`MessageComposerFieldUiTest.switchingConversationsWithEqualDraftsDoesNotCarryTheCaret`,
+which needs a click *inside* the text: a plain `performClick` lands past the end
+of a short draft, puts the caret at the end anyway, and passes either way.
+
+**Send chrome still lags by a frame.** `sendEnabled`, mic-vs-send and the
+placeholder all read the composed `draft`, while the click commits the store. In
+the same stalled frame the button can look disabled (or the mic can still be
+showing) while Enter would already send the stored text. It self-corrects on the
+next frame and cannot send the wrong thing — only refuse for a moment — so it is
+recorded, not fixed.
 
 **Not verifiable in the harness, and unverified on Android.** The interleaving
 this closes cannot be staged: `runComposeUiTest` idles — and so recomposes —
@@ -1251,10 +1280,10 @@ send buttons were already doing.
   obvious idea and it does **not** work — the harness still recomposes between
   the two presses, which is how the vacuity was caught. Pinning it needs a fake
   frame clock.
-- *Rewriting the composer onto `TextFieldValue` in this change.* It is the right
-  end state and would close the post-Enter-keystroke gap above, but it moves
-  IME/selection behaviour on both mobile platforms — see R-007's history — so it
-  does not belong in a truncation fix.
+- *Blanking the composer's own `TextFieldValue` on send.* Written, then removed:
+  it does not close the gap (see above), and it moves IME/selection behaviour on
+  both mobile platforms for nothing — see R-007's history. The composer still
+  owns its value, but only so an adopted rewrite can place the caret.
 
 ## Unguarded
 

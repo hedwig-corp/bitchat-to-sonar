@@ -33,11 +33,13 @@ class MessageComposerStateTest {
     }
 
     /**
-     * Same composable slot, different conversation: the field must take the new
-     * chat's draft rather than keep the previous one.
+     * Only the mechanics of [MessageComposerState.adopt]. It does **not** cover
+     * the chat-switch case: production skips adopt entirely when two chats hold
+     * equal drafts, which is the interesting half and needs the composable —
+     * `MessageComposerFieldUiTest.switchingConversationsWithEqualDraftsDoesNotCarryTheCaret`.
      */
     @Test
-    fun adoptTakesAnotherConversationsDraft() {
+    fun adoptReplacesTextAndPushed() {
         val state = MessageComposerState("for alice")
 
         state.adopt("for bob")

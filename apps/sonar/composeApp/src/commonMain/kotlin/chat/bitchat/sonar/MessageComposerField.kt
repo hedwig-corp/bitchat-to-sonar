@@ -38,8 +38,7 @@ internal expect val messageComposerEnterSends: Boolean
 internal val messageComposerKeyboardOptions = KeyboardOptions(imeAction = ImeAction.None)
 
 /**
- * The composer's own text, owned so a send can blank it *now* instead of waiting
- * for the caller's clear to compose.
+ * The composer's own text.
  *
  * [pushed] is the last text handed to the caller. The caller owns the draft too —
  * it clears it after a send, completes a slash hint, appends an emoji — and those
@@ -72,7 +71,14 @@ internal class MessageComposerState(initial: String = "") {
         return true
     }
 
-    /** Take the caller's text. Caret to the end — that is where typing resumes. */
+    /**
+     * Take the caller's text, caret to the end.
+     *
+     * Right for every caller rewrite today — a completion or an emoji append
+     * both continue at the end — but it does discard a mid-field caret, so a
+     * tray tap while editing the middle of a draft moves the insertion point.
+     * Placing it properly would need the caller to say *where* it edited.
+     */
     internal fun adopt(value: String) {
         field = TextFieldValue(value, TextRange(value.length))
         pushed = value
@@ -96,14 +102,20 @@ internal class MessageComposerState(initial: String = "") {
  * Enter from the same input batch reads the cleared draft and sends nothing,
  * instead of sending the message again.
  *
- * The field owns its [TextFieldValue] so a send can blank it *now* rather than
- * waiting for the caller's clear to compose. Otherwise a keystroke from the same
- * input batch edits a buffer that still holds the sent message — `[h, i, Enter,
- * !]` would leave the composer holding `"hi!"`, the message it just sent glued
- * to the next one.
+ * [conversationKey] scopes the field's state to one chat; changing it starts the
+ * field over from that conversation's own draft.
+ *
+ * The field owns its [TextFieldValue] so that adopting a draft the caller
+ * rewrote (slash-hint completion, emoji append) can put the caret at the end
+ * instead of leaving it stale mid-text. It does **not** make a send blank the
+ * field synchronously: `CoreTextField` reconciles its editing buffer from the
+ * hoisted value during composition, so a keystroke arriving in the same input
+ * batch as the send still edits a buffer holding the sent text. R-022 records
+ * that gap as open and names the real fix.
  */
 @Composable
 internal fun MessageComposerTextField(
+    conversationKey: Any,
     value: String,
     onValueChange: (String) -> Unit,
     textStyle: TextStyle,
@@ -113,7 +125,11 @@ internal fun MessageComposerTextField(
     onSend: ((String) -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
-    val state = remember { MessageComposerState(value) }
+    // Keyed per conversation: the screens dispatch from one call site, so an
+    // unkeyed remember carries the previous chat's caret into the next one
+    // whenever the two drafts happen to be equal (the adopt below only fires on
+    // differing text).
+    val state = remember(conversationKey) { MessageComposerState(value) }
 
     // Adopt draft changes the caller made itself.
     SideEffect {

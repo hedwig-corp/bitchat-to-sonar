@@ -1855,6 +1855,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                         MessageComposerTextField(
+                            conversationKey = screen.id,
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
@@ -2563,6 +2564,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             ) {
                 if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
+                    conversationKey = draftKey,
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
