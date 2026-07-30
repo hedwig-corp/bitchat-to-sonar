@@ -51,6 +51,39 @@ const LEGACY_BACKUP_BLOSSOM_SERVERS: &[&str] = &["https://nostr.download"];
 /// Soft ceiling for a downloaded backup (DB + index). Far above typical chats;
 /// guards memory against a malicious Blossom response.
 const MAX_BACKUP_BYTES: usize = 200 * 1024 * 1024;
+
+/// Cap on the BUD-03 listing body. The listing is descriptors only — one small
+/// JSON object per blob — so even a pathological account fits far under this,
+/// while a hostile server streaming gigabytes of JSON fails fast. Without it
+/// `response.json()` buffers whatever the server sends: the blob download is
+/// capped, but the listing that precedes it was not.
+const MAX_LIST_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fixed allowance for connect + auth + server think-time, before the
+/// size-scaled transfer budget is added.
+const TRANSFER_DEADLINE_BASE: Duration = Duration::from_secs(60);
+/// Ceiling. Even a max-size backup on a bad uplink must fail eventually rather
+/// than hang forever.
+const TRANSFER_DEADLINE_MAX: Duration = Duration::from_secs(20 * 60);
+/// Worst-case sustained throughput assumed when scaling the deadline to a
+/// payload size (slow cellular), matching the media path's assumption.
+const MIN_THROUGHPUT_BYTES_PER_SEC: u64 = 100 * 1024;
+
+/// Deadline for a transfer of `bytes`: a fixed allowance plus what `bytes`
+/// would take on a slow link, clamped to [`TRANSFER_DEADLINE_MAX`].
+///
+/// This bounds TIME, where the byte caps bound MEMORY — a server that accepts
+/// the connection and then never replies is not a large transfer, and no size
+/// cap can catch it. That matters most on the upload half: iOS closes the
+/// Marmot node before sealing and only clears `accountBackupInFlight` once the
+/// upload returns, so a hung request leaves the user with no chat and no relay
+/// for the session AND latches the fence, blocking every later backup attempt.
+fn transfer_deadline(bytes: usize) -> Duration {
+    let scaled = Duration::from_secs(bytes as u64 / MIN_THROUGHPUT_BYTES_PER_SEC);
+    TRANSFER_DEADLINE_BASE
+        .saturating_add(scaled)
+        .min(TRANSFER_DEADLINE_MAX)
+}
 /// Buffer hint for a backup download. Deliberately small and independent of
 /// anything the server says — see `download_blob_capped_to`.
 const INITIAL_DOWNLOAD_CAPACITY: usize = 1024 * 1024;
@@ -1003,15 +1036,23 @@ pub async fn upload_sealed_backup(
         )));
     }
     let base = blossom_base(server_url)?;
-    let descriptor = BlossomClient::new(base)
-        .upload_blob(
+    // Bound TIME as well as size. The caps above stop a large body; they do
+    // nothing about a server that accepts the connection and never answers,
+    // which on this path leaves iOS with the Marmot node closed and
+    // `accountBackupInFlight` latched for the rest of the session.
+    let deadline = transfer_deadline(sealed.len());
+    let descriptor = tokio::time::timeout(
+        deadline,
+        BlossomClient::new(base).upload_blob(
             sealed,
             Some(ACCOUNT_BACKUP_MIME.to_string()),
             None,
             Some(keys),
-        )
-        .await
-        .map_err(|e| Error::Blossom(e.to_string()))?;
+        ),
+    )
+    .await
+    .map_err(|_| Error::Blossom("backup upload timed out".into()))?
+    .map_err(|e| Error::Blossom(e.to_string()))?;
     Ok(AccountBackupUpload {
         url: descriptor.url.to_string(),
         sha256_hex: descriptor.sha256.to_string(),
@@ -1088,10 +1129,36 @@ async fn list_account_backup_blobs(keys: &Keys, base: &Url) -> Result<Vec<BlobDe
     if !status.is_success() {
         return Err(Error::Blossom(format!("blossom list http {status}")));
     }
-    response
-        .json::<Vec<BlobDescriptor>>()
+    read_body_capped(response, MAX_LIST_BODY_BYTES, "blossom list")
         .await
-        .map_err(|e| Error::Blossom(format!("blossom list decode: {e}")))
+        .and_then(|body| {
+            serde_json::from_slice::<Vec<BlobDescriptor>>(&body)
+                .map_err(|e| Error::Blossom(format!("blossom list decode: {e}")))
+        })
+}
+
+/// Read a response body chunk-by-chunk, failing as soon as the bytes actually
+/// RECEIVED exceed `limit`.
+///
+/// Enforcing on received bytes rather than `Content-Length` is the whole point:
+/// the header is attacker-controlled and may be absent, small, or a lie.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+    what: &str,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(download_buffer_capacity(response.content_length()));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Blossom(format!("{what} body: {e}")))?
+    {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(Error::Blossom(format!("{what} body exceeds size cap")));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// BUD-01 blob endpoint for `sha256`: `{base}/{sha256}`.
@@ -1408,7 +1475,15 @@ async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Resul
 /// real list → download → verify path against a loopback mock without
 /// loosening the https requirement in [`blossom_base`].
 async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec<u8>> {
-    let mut blobs = list_account_backup_blobs(keys, base).await?;
+    // The listing carries no payload to scale on, so it gets the fixed
+    // allowance. Same reasoning as the transfers: a server that accepts and
+    // stalls here would hang restore just as effectively.
+    let mut blobs = tokio::time::timeout(
+        TRANSFER_DEADLINE_BASE,
+        list_account_backup_blobs(keys, base),
+    )
+    .await
+    .map_err(|_| Error::Blossom("blossom list timed out".into()))??;
     blobs.retain(|b| b.mime_type.as_deref() == Some(ACCOUNT_BACKUP_MIME));
     if blobs.is_empty() {
         return Err(Error::AccountBackupMissing);
@@ -1421,7 +1496,14 @@ async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec
             latest.size
         )));
     }
-    let data = download_blob_capped(keys, base, latest.sha256).await?;
+    // Scale the deadline off the descriptor, but clamp with the same ceiling
+    // the cap uses: `latest.size` is attacker-controlled, so inflating it can
+    // only ever buy the fixed `TRANSFER_DEADLINE_MAX`, never an unbounded wait.
+    // (The guard above has already rejected anything over the cap.)
+    let deadline = transfer_deadline((latest.size as usize).min(MAX_BACKUP_BYTES));
+    let data = tokio::time::timeout(deadline, download_blob_capped(keys, base, latest.sha256))
+        .await
+        .map_err(|_| Error::Blossom("backup download timed out".into()))??;
     let hash = Sha256Hash::hash(&data);
     if hash != latest.sha256 {
         return Err(Error::Blossom("backup sha256 mismatch".into()));
@@ -1815,6 +1897,100 @@ mod tests {
     /// Minimal BUD-01/03 server: `GET /list/<owner>` lists one account-backup
     /// descriptor, `GET /<sha>` serves it, everything else 404s — including the
     /// `/<pubkey>` route the upstream client's URL join would hit.
+    /// A hostile listing endpoint that answers `/list/<pubkey>` with an
+    /// unbounded body: no `Content-Length`, so the client reads until the
+    /// server closes, and the server does not intend to stop.
+    ///
+    /// This is the shape a size guard on the descriptor cannot catch — there is
+    /// no descriptor yet, the flood IS the listing.
+    fn spawn_flooding_list_blossom(owner: PublicKey, total: usize) -> Url {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind flooding blossom");
+        let port = listener.local_addr().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        std::thread::spawn(move || {
+            let list_path = format!("/list/{}", owner.to_hex());
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let Ok(n) = stream.read(&mut buf) else { continue };
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                if path != list_path {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                // No Content-Length: body runs until close. Deliberately valid
+                // JSON at the front so a decode error cannot be mistaken for
+                // the cap firing.
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n[",
+                );
+                let chunk = vec![b'x'; 64 * 1024];
+                let mut sent = 0usize;
+                while sent < total {
+                    if stream.write_all(&chunk).is_err() {
+                        break; // client hung up at the cap — the expected path
+                    }
+                    sent += chunk.len();
+                }
+                let _ = stream.flush();
+            }
+        });
+        Url::parse(&base).unwrap()
+    }
+
+    /// The blob download was capped, but the listing that precedes it was
+    /// decoded with `response.json()` — unbounded. A hostile server could flood
+    /// the restore path before any descriptor existed to check.
+    #[tokio::test]
+    async fn hostile_listing_fails_at_the_cap_instead_of_buffering() {
+        let keys = Keys::generate();
+        // Twice the cap: enough to prove the client stops early, small enough
+        // to stay fast on loopback.
+        let base = spawn_flooding_list_blossom(keys.public_key(), MAX_LIST_BODY_BYTES * 2);
+
+        let err = download_latest_sealed_backup_at(&keys, &base)
+            .await
+            .expect_err("a flooding listing must fail, not buffer");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds size cap"),
+            "expected the cap to fire, got: {msg}"
+        );
+    }
+
+    /// The caps bound memory; this bounds time. Pinned as arithmetic because
+    /// the failure it prevents — a server that accepts and never answers — is
+    /// a wall-clock hang, and a test that actually waited out the deadline
+    /// would be too slow to keep.
+    #[test]
+    fn transfer_deadline_scales_with_size_and_clamps() {
+        // Small payload: essentially the fixed allowance.
+        assert_eq!(transfer_deadline(0), TRANSFER_DEADLINE_BASE);
+
+        // 10 MiB at the assumed 100 KiB/s floor is ~102s of transfer budget,
+        // on top of the base allowance.
+        let ten_mib = transfer_deadline(10 * 1024 * 1024);
+        assert!(ten_mib > TRANSFER_DEADLINE_BASE, "{ten_mib:?}");
+        assert!(ten_mib < TRANSFER_DEADLINE_MAX, "{ten_mib:?}");
+
+        // A max-size backup must clamp rather than scale without bound — this
+        // is what stops an inflated descriptor from buying a long wait.
+        assert_eq!(transfer_deadline(MAX_BACKUP_BYTES), TRANSFER_DEADLINE_MAX);
+        assert_eq!(transfer_deadline(usize::MAX), TRANSFER_DEADLINE_MAX);
+    }
+
     fn spawn_mock_blossom_list(owner: PublicKey, blob: Vec<u8>) -> (Url, SeenAuthorization) {
         use sha2::Digest;
         use std::io::{Read, Write};
