@@ -87,6 +87,10 @@ final class BLEService: NSObject {
         var lastSeen: Date
     }
     private var peers: [PeerID: PeerInfo] = [:]
+    /// Consecutive Noise decrypt failures per peer, guarded by its own lock so
+    /// the inbound decrypt path does not contend with `collectionsQueue`.
+    private var decryptFailures = NoiseDecryptFailureTracker()
+    private let decryptFailuresLock = NSLock()
     /// False while the radio is unusable (`.poweredOff` / `.unauthorized` / `.resetting`).
     ///
     /// Announces are processed on `messageQueue`, so one received a few ms before
@@ -704,7 +708,7 @@ final class BLEService: NSObject {
     
     func stopServices() {
         // Send leave message synchronously to ensure delivery
-        let leavePacket = BitchatPacket(
+        let unsignedLeavePacket = BitchatPacket(
             type: MessageType.leave.rawValue,
             senderID: myPeerIDData,
             recipientID: nil,
@@ -713,9 +717,17 @@ final class BLEService: NSObject {
             signature: nil,
             ttl: messageTTL
         )
+        // Receivers drop leaves they cannot attribute to the claimed sender, so
+        // an unsigned departure would simply be ignored. A signing failure only
+        // skips the announcement (peers then time us out); the teardown below
+        // must still run.
+        let leavePacket = noiseService.signPacket(unsignedLeavePacket)
+        if leavePacket == nil {
+            SecureLogger.warning("Could not sign leave packet; peers will time us out instead", category: .session)
+        }
 
         // Send immediately to all connected peers (synchronized access to BLE state)
-        if let data = leavePacket.toBinaryData(padding: false) {
+        if let leavePacket, let data = leavePacket.toBinaryData(padding: false) {
             let leavePriority = priority(for: leavePacket, data: data)
 
             // Snapshot BLE state under bleQueue to avoid races with delegate callbacks
@@ -789,6 +801,9 @@ final class BLEService: NSObject {
 
         // Clear processed messages
         messageDeduplicator.reset()
+
+        // Every session these runs described is gone, so the runs must go too.
+        resetDecryptFailureTracking()
 
         // Clear peripheral references (synchronized access to avoid races with BLE callbacks)
         bleQueue.sync {
@@ -1658,7 +1673,52 @@ final class BLEService: NSObject {
         }
     }
 
-    private func handleLeave(_ packet: BitchatPacket, from peerID: PeerID) {
+    /// Accept a leave only when the claimed sender proves possession of the
+    /// signing key bound by a verified announce. The persisted identity cache
+    /// keeps delayed or relayed leaves verifiable after the live registry entry
+    /// has aged out.
+    ///
+    /// This is only as strong as the signing-key pin behind it, and that pin is
+    /// trust-on-first-use: `handleAnnounce` checks the announced signing key
+    /// against the live `peers` registry, so on a node where the entry is
+    /// missing (fresh start, sender out of range) an announce carrying the
+    /// sender's public noise key with an attacker signing key still verifies
+    /// against itself and rebinds the pin. Closing that is a change to the
+    /// announce path, not this one; until then a leave proves possession of
+    /// whatever key is currently pinned, not of the original identity.
+    ///
+    /// Returns whether the leave was accepted, so the caller can withhold the
+    /// relay: an unverifiable leave must not be amplified across the mesh.
+    /// A peer running an older build sends its leave unsigned, so its departure
+    /// is now noticed by the stale-peer timeout instead of immediately. That is
+    /// the fail-safe direction: the cost is a peer lingering in the list, and
+    /// the alternative is letting anyone evict anyone.
+    private func handleLeave(_ packet: BitchatPacket, from peerID: PeerID) -> Bool {
+        let registrySigningKey: Data? = collectionsQueue
+            .sync { peers[peerID] }
+            .flatMap { $0.signingPublicKey }
+        let verifiedViaRegistry = registrySigningKey.map {
+            noiseService.verifyPacketSignature(packet, publicKey: $0)
+        } ?? false
+        let verifiedViaPersistedIdentity = !verifiedViaRegistry
+            && identityManager.getCryptoIdentitiesByPeerIDPrefix(peerID).contains { identity in
+                PeerID(publicKey: identity.publicKey) == peerID
+                    && identity.signingPublicKey.map {
+                        noiseService.verifyPacketSignature(packet, publicKey: $0)
+                    } == true
+            }
+
+        guard verifiedViaRegistry || verifiedViaPersistedIdentity else {
+            SecureLogger.warning("🚫 Dropping leave with missing/invalid signature for claimed sender \(peerID.id.prefix(8))…", category: .security)
+            return false
+        }
+
+        // A valid departure retires transport state too; otherwise the Noise
+        // session could stay usable for a peer we just removed. The failure run
+        // goes with it: it counted against the session being dropped here.
+        noiseService.clearSession(for: peerID)
+        clearDecryptFailures(for: peerID)
+
         _ = collectionsQueue.sync(flags: .barrier) {
             // Remove the peer when they leave
             peers.removeValue(forKey: peerID)
@@ -1675,8 +1735,9 @@ final class BLEService: NSObject {
             self.delegate?.didDisconnectFromPeer(peerID)
             self.delegate?.didUpdatePeerList(currentPeerIDs)
         }
+        return true
     }
-    
+
     // MARK: - Helper Functions
 
     private func applicationFilesDirectory() throws -> URL {
@@ -3345,6 +3406,10 @@ extension BLEService {
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID), fingerprint: \(fingerprint.prefix(16))...")
+            // A new session starts with a clean slate. This covers every route
+            // to one — rehandshake, peer restart, reconnect after a leave — so
+            // no earlier session's partial failure run can be spent against it.
+            self?.clearDecryptFailures(for: peerID)
             self?.messageQueue.async { [weak self] in
                 self?.sendPendingMessagesAfterHandshake(for: peerID)
                 self?.sendPendingNoisePayloadsAfterHandshake(for: peerID)
@@ -4359,7 +4424,9 @@ extension BLEService {
             handleFileTransfer(packet, from: senderID)
             
         case .leave:
-            handleLeave(packet, from: senderID)
+            // A forged leave must neither evict the claimed peer nor spread
+            // through the mesh on our relay.
+            guard handleLeave(packet, from: senderID) else { return }
             
         case .none:
             if packet.type != SonarAnnouncePacket.packetType {
@@ -4846,6 +4913,11 @@ extension BLEService {
                 
                 // Session establishment will trigger onPeerAuthenticated callback
                 // which will send any pending messages at the right time
+            } catch NoiseSessionError.peerIdentityMismatch {
+                // The candidate was already discarded by the session manager.
+                // Do not let a spoofed claimed ID trigger a fresh outbound
+                // handshake and recreate state for the attacker-chosen ID.
+                SecureLogger.warning("🚫 Rejected Noise handshake whose static key does not match claimed sender \(peerID.id.prefix(8))…", category: .security)
             } catch {
                 SecureLogger.error("Failed to process handshake: \(error)")
                 // Try initiating a new handshake
@@ -4874,8 +4946,9 @@ extension BLEService {
         
         do {
             let decrypted = try noiseService.decrypt(packet.payload, from: peerID)
+            noteDecryptSucceeded(for: peerID)
             guard decrypted.count > 0 else { return }
-            
+
             // First byte indicates the payload type
             let payloadType = decrypted[0]
             let payloadData = decrypted.dropFirst()
@@ -4916,13 +4989,86 @@ extension BLEService {
             if !noiseService.hasSession(with: peerID) {
                 initiateNoiseHandshake(with: peerID)
             }
+        } catch NoiseSecurityError.messageTooLarge, NoiseSecurityError.rateLimitExceeded {
+            // These two, and only these two, are policy rejections that
+            // `NoiseEncryptionService.decrypt` raises *before* it consults the
+            // session: `messageTooLarge` ahead of both the rate limiter and the
+            // `hasEstablishedSession` guard, `rateLimitExceeded` ahead of the
+            // guard. Neither says anything about session health and neither
+            // needs a session to provoke, so counting them would hand back the
+            // teardown primitive this method exists to remove — three oversized
+            // frames under a victim's claimed sender ID, at zero rate-limit
+            // cost, would otherwise evict that victim's session.
+            //
+            // Enumerate them rather than catching `NoiseSecurityError` whole.
+            // The enum also carries session-originated cases — `sessionExpired`
+            // is thrown from inside `SecureNoiseSession.decrypt`, after the
+            // established-session guard has passed — and those are exactly the
+            // evidence the counting path below exists to act on. A broad catch
+            // swallows any such case silently; listing the pre-session two makes
+            // a newly added case a visible decision instead.
+            SecureLogger.warning("🚫 Rejected decrypt from \(peerID.id.prefix(8))… before the session was consulted; keeping any established session", category: .security)
         } catch {
-            // Decryption failed - clear the corrupted session and re-initiate handshake
-            // This handles cases where session state got out of sync (nonce mismatch, etc.)
-            SecureLogger.error("❌ Failed to decrypt message from \(peerID): \(error) - clearing session and re-initiating handshake")
+            // Decryption failed against the session itself. Anyone can emit a
+            // packet under any claimed sender ID, so a single AEAD failure is not
+            // evidence that our session is out of sync, and tearing it down on one
+            // packet is the same denial of service this file now refuses on the
+            // handshake path. Only a run of consecutive failures indicates real
+            // desync (nonce mismatch, peer restart), and any successful decrypt
+            // resets the run.
+            //
+            // `NoiseSecurityError.sessionExpired` reaches here deliberately: it is
+            // raised by the session, past the established-session guard, and is
+            // the session reporting that it is finished. This is its only
+            // decrypt-side recovery — nothing else clears an aged-out session
+            // promptly, since `needsRenegotiation()` keys off `lastActivityTime`,
+            // which stops advancing once decrypt starts throwing.
+            guard noteDecryptFailed(for: peerID) else {
+                SecureLogger.warning("❌ Failed to decrypt message from \(peerID.id.prefix(8))…; keeping the session: \(error)", category: .security)
+                return
+            }
+            SecureLogger.error("❌ \(TransportConfig.noiseDecryptFailuresBeforeSessionReset) consecutive decrypt failures from \(peerID) - clearing session and re-initiating handshake")
             noiseService.clearSession(for: peerID)
             initiateNoiseHandshake(with: peerID)
         }
+    }
+
+    /// Records a decrypt failure, returning whether the run has reached the
+    /// threshold at which the session is treated as desynchronized.
+    private func noteDecryptFailed(for peerID: PeerID) -> Bool {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        return decryptFailures.recordFailure(for: peerID)
+    }
+
+    /// Runs on every successful inbound decrypt, so it takes the tracker's own
+    /// lock rather than a `collectionsQueue` barrier: serialising the hot DM
+    /// path against the peer map, relays and fragment assembly to clear a key
+    /// that is absent in the common case would be a needless cost on exactly
+    /// the path the Signal-Comparable Performance Rule protects.
+    private func noteDecryptSucceeded(for peerID: PeerID) {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.recordSuccess(for: peerID)
+    }
+
+    /// Drops all decrypt-failure runs. Used on panic/teardown so a stale run
+    /// cannot outlive the sessions it described.
+    private func resetDecryptFailureTracking() {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.removeAll()
+    }
+
+    /// Drops one peer's run. A run counts failures against a *particular*
+    /// session, so it must not survive that session: carrying two failures into
+    /// a freshly established session would make its first failure the third,
+    /// collapsing the tolerance this path exists to provide down to one packet
+    /// for that peer.
+    private func clearDecryptFailures(for peerID: PeerID) {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.recordSuccess(for: peerID)
     }
 
     // MARK: Helper Functions
