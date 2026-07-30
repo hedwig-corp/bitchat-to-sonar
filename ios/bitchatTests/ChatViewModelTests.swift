@@ -143,6 +143,16 @@ struct ChatViewModelTimelineCapTests {
         let (viewModel, _) = makeTestableViewModel()
         let total = TransportConfig.meshTimelineCap + 5
 
+        // The mesh timeline is persisted and survives this view model, so a test
+        // that deliberately fills it to the cap hands the next test a saturated
+        // timeline in which a newly received message is immediately trimmed away.
+        // Put the store back the way we found it.
+        defer {
+            viewModel.messages.removeAll()
+            viewModel.timelineStore.clear(channel: .mesh)
+            MessageStore.shared.saveChannel(ChannelID.mesh.storeID, messages: [])
+        }
+
         for i in 0..<total {
             viewModel.sendMessage("cap-msg-\(i)")
         }
@@ -187,17 +197,28 @@ struct ChatViewModelReceivingTests {
     func didReceivePublicMessage_addsToTimeline() async {
         let (viewModel, transport) = makeTestableViewModel()
 
+        // Establish the precondition instead of inheriting it: the geohash
+        // channel selection is persisted, so a test that switched to a location
+        // channel earlier in the process leaves later view models booting into
+        // it — and a public mesh message never reaches `messages`.
+        viewModel.switchLocationChannel(to: .mesh)
+
+        // Unique per run: the dedup cache persists across the test process, so a
+        // fixed `messageID` is dropped as already-seen when another test (or an
+        // earlier run in the same process) used it, and the wait times out.
+        let unique = UUID().uuidString.prefix(8)
+        let content = "Public hello from Bob \(unique)"
         transport.simulateIncomingPublicMessage(
             from: PeerID(str: "PEER002"),
             nickname: "Bob",
-            content: "Public hello from Bob",
+            content: content,
             timestamp: Date(),
-            messageID: "pub-001"
+            messageID: "pub-\(unique)"
         )
 
         let found = await TestHelpers.waitUntil({
             viewModel.publicMessagePipeline.flushIfNeeded()
-            return viewModel.messages.contains { $0.content == "Public hello from Bob" }
+            return viewModel.messages.contains { $0.content == content }
         }, timeout: TestConstants.defaultTimeout)
 
         #expect(found)

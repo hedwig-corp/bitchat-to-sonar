@@ -35,20 +35,36 @@ struct ChatViewModelTorTests {
 
     // MARK: - handleTorWillStart Tests
 
+    /// Tor is disabled product-wide — `TorManager.torEnforced` is a hardcoded
+    /// `false` (Sonar decision 2026-06-13), so `handleTorWillStart` cannot
+    /// announce. This pins that: the announce must stay silent while Tor is
+    /// off, or users get "Tor is starting" system messages for a Tor that never
+    /// starts.
+    ///
+    /// This test previously asserted the opposite, with the comment
+    /// "torEnforced is true in tests". It had been failing since Tor was
+    /// disabled, unnoticed because the iOS suite does not run in CI (#476).
+    /// Coverage of the *enforced* path returns when Tor does — it needs
+    /// `torEnforced` injectable, tracked in #476.
     @Test @MainActor
-    func handleTorWillStart_whenEnforced_setsAnnouncedFlag() async {
+    func handleTorWillStart_whileTorDisabled_announcesNothingNew() async {
         let (viewModel, _) = makeTestableViewModel()
 
-        // Precondition: flag should start false
-        #expect(!viewModel.torStatusAnnounced)
+        // Startup already consumed the announce: with Tor disabled,
+        // `ChatViewModel` init takes the `else if !torEnforced` branch and sets
+        // the flag without posting a message (ChatViewModel.swift:502).
+        #expect(viewModel.torStatusAnnounced)
 
-        // Action: simulate Tor starting notification
+        viewModel.switchLocationChannel(to: .location(GeohashChannel(level: .city, geohash: "u4pruydq")))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let before = viewModel.messages.count
+
         viewModel.handleTorWillStart()
-
-        // Wait for Task to complete
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        // Assert: flag should be set (torEnforced is true in tests)
+        // The handler must stay silent — no "Tor is starting" for a Tor that
+        // never starts.
+        #expect(viewModel.messages.count == before)
         #expect(viewModel.torStatusAnnounced)
     }
 
@@ -120,7 +136,7 @@ struct ChatViewModelTorTests {
     }
 
     @Test @MainActor
-    func handleTorDidBecomeReady_initialStart_setsAnnouncedFlag() async {
+    func handleTorDidBecomeReady_whileTorDisabled_doesNotAnnounce() async {
         let (viewModel, _) = makeTestableViewModel()
 
         // Setup: not restarting, but initial ready not announced yet
@@ -131,8 +147,11 @@ struct ChatViewModelTorTests {
         viewModel.handleTorDidBecomeReady()
         try? await Task.sleep(nanoseconds: 100_000_000)
 
-        // Assert: should set flag (torEnforced is true in tests)
-        #expect(viewModel.torInitialReadyAnnounced)
+        // Tor is disabled (`torEnforced == false`, Sonar decision 2026-06-13),
+        // so the initial-ready announce must stay silent. This asserted the
+        // opposite until now; see the note on
+        // `handleTorWillStart_whileTorDisabled_announcesNothingNew`.
+        #expect(!viewModel.torInitialReadyAnnounced)
     }
 
     @Test @MainActor

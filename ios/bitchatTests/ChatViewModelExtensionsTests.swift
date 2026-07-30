@@ -454,10 +454,19 @@ struct ChatViewModelNostrExtensionTests {
             senderIdentity: sender
         )
 
+        let sendersBefore = Set(viewModel.privateChats.keys)
+
         viewModel.subscribeGiftWrap(giftWrap, id: recipient)
 
         try? await Task.sleep(nanoseconds: 100_000_000)
-        #expect(viewModel.privateChats.isEmpty)
+
+        // Assert the invariant, not global emptiness: `privateChats` is loaded
+        // from persisted storage shared across the test process, so asserting
+        // it is empty measures whatever ran earlier rather than this packet.
+        // What matters is that the oversized packet produced no conversation —
+        // `decodeEmbeddedBitChatPacket` rejects it on the base64 length bound
+        // and `subscribeGiftWrap` returns without recording anything.
+        #expect(Set(viewModel.privateChats.keys) == sendersBefore)
     }
 
     @Test @MainActor
@@ -500,8 +509,12 @@ struct ChatViewModelGeoDMTests {
     func handlePrivateMessage_geohash_dedupsAndTracksAck() async throws {
         let (viewModel, _) = makeTestableViewModel()
         let geohash = "u4pruydq"
-        let senderPubkey = "0000000000000000000000000000000000000000000000000000000000000001"
-        let messageID = "pm-1"
+        // Unique per run: `privateChats` and `sentGeoDeliveryAcks` persist
+        // across the test process, so fixed ids collide with rows another test
+        // already wrote and the dedup count becomes whatever ran earlier.
+        let unique = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let senderPubkey = String((unique + unique).prefix(64))
+        let messageID = "pm-\(unique.prefix(8))"
 
         viewModel.switchLocationChannel(to: .location(GeohashChannel(level: .city, geohash: geohash)))
         let identity = try viewModel.idBridge.deriveIdentity(forGeohash: geohash)

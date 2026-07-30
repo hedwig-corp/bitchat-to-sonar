@@ -106,6 +106,26 @@ final class SonarWalletDerivationTests: XCTestCase {
         let seed = Data((0..<32).map(UInt8.init))
         defer { storage.remove(key) }
 
+        // This exercises the REAL keychain on purpose — a durability test that
+        // swaps in a mock store proves nothing. But an unsigned simulator build
+        // has no keychain entitlement, so every write fails with `-34018` and
+        // the test reports a product failure that is really a missing
+        // capability. Probe first and say so, rather than assert into a
+        // keychain that cannot exist.
+        //
+        // The skip is deliberately narrow: it fires only when the very first
+        // write fails, so a signed build (local dev, or CI once the test job is
+        // signed) still runs the assertions below in full.
+        let probeKey = "pr268-keychain-probe-\(UUID().uuidString)"
+        defer { storage.remove(probeKey) }
+        guard storage.putData(probeKey, Data([0x01])) else {
+            throw XCTSkip(
+                "Keychain is unavailable in this build (unsigned simulator builds "
+                + "hit errSecMissingEntitlement / -34018). Run on a signed build to "
+                + "cover wallet-seed durability."
+            )
+        }
+
         XCTAssertTrue(storage.putData(key, seed))
         XCTAssertEqual(storage.getData(key), seed)
     }
