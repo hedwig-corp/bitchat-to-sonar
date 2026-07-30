@@ -640,7 +640,9 @@ struct ContentView: View {
                         String(localized: "content.input.message_placeholder", comment: "Placeholder shown in the chat composer")
                     )
                     .foregroundColor(secondaryTextColor.opacity(0.6)),
-                    onSend: sendMessage
+                    // The field hands over what it actually holds; `messageText`
+                    // can be several keystrokes behind it (R-029).
+                    onSend: { sendMessage(live: $0) }
                 )
                 .textFieldStyle(.plain)
                 .font(.bitchatSystem(size: 15, design: .monospaced))
@@ -788,8 +790,11 @@ struct ContentView: View {
     }
     // MARK: - Actions
     
-    private func sendMessage() {
-        let trimmed = trimmedMessageText
+    /// - Parameter live: the draft the composer field actually held, when the
+    ///   send came from the field itself. Falls back to `messageText` for the
+    ///   send button, which has no field editor to consult.
+    private func sendMessage(live: String? = nil) {
+        let trimmed = (live ?? messageText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
         // Clear input immediately for instant feedback
@@ -1838,7 +1843,7 @@ private extension ContentView {
 
     private func sendButtonView(enabled: Bool) -> some View {
         let activeColor = composerAccentColor
-        return Button(action: sendMessage) {
+        return Button(action: { sendMessage() }) {
             Image(systemName: "arrow.up.circle.fill")
                 .font(.bitchatSystem(size: 24))
                 .foregroundColor(enabled ? activeColor : SonarTheme.text3)

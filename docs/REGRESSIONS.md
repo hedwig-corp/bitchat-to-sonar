@@ -1585,6 +1585,73 @@ slow or unreachable.
   `.greatestFiniteMagnitude` until a background task is active, which is exactly
   the situation during `didReceiveRemoteNotification`, so it would read as
   "unlimited" precisely when the budget matters.
+## R-029 — Send the draft the field holds, not the one the view graph remembers
+
+**Invariant:** on Apple, the text a send puts on the wire comes from the field
+editor — the storage backing the composer — never from a `@Binding` read inside
+the composer view. The binding is only a mirror, and nothing guarantees it is
+current at the moment a send fires.
+
+**Breaks as:** type quickly, press Return, and the message that goes out is a
+*prefix* of what was typed — very often just the first character. The composer
+clears as if everything was sent. No error, nothing to retry. Reported (again)
+as "the text gets cut when I type fast and press enter".
+
+**Why:** a `@Binding` read inside a SwiftUI view is served from the view graph
+and only refreshes when that view re-renders. `SonarAppStore.composerDrafts` is
+deliberately **not** `@Published` — publishing per keystroke would re-enter the
+UIKit transcript host while typing — so typing invalidates nothing and the
+composer does not re-render. Meanwhile SwiftUI's macOS `TextField` is backed by
+an `NSTextView` whose storage advances on every keystroke. The two diverge for
+as long as no unrelated publish happens to re-render the composer, and `.onKeyPress`
+then sends whatever prefix the graph last saw. The usual last refresh is the
+`composerDraftHasText` boundary publish on the *first* character — which is
+exactly why the truncation so often lands at one character.
+
+This is **not** R-027. R-027 was data that never reached the store (an IME
+composition discarded by a consumed Return); this is data that reached the store
+fine and was not read. R-027's own notes ruled out "the binding lags" — correctly
+for that bug, and only for ASCII in an isolated app whose store *was* published.
+
+**Call sites:** Apple — `SNMessageComposerField.commitAndSend` (Return and
+`onSubmit`), which now hands the resolved text to `onSend`, plus every caller of
+that callback: `SNComposer.send` (whose send button reads `liveDraft`),
+`MarmotChatView`, `ContentView.sendMessage`. Compose is **structurally immune**,
+not merely unaffected: `composerDrafts` is a `mutableStateMapOf` and
+`BasicTextField(value:onValueChange:)` renders that state directly, so the field
+cannot display text the state does not hold. Do not "optimise" that into an
+unpublished draft map without re-reading this entry.
+
+**Guarded by:** `SNComposerLiveDraftTests.fieldEditorWinsOverAStaleBinding`, `SNComposerLiveDraftTests.anEmptyFieldEditorIsNotAMissingOne`, `SNComposerLiveDraftTests.bindingIsUsedWhenThereIsNoFieldEditor`
+
+**Coverage (honest):** the tests pin the pure resolver `snLiveComposerDraft`,
+not the wiring — nothing asserts that the call sites actually consult the field
+editor rather than their binding, and iOS/macOS tests do not run in CI at all.
+That is the R-001 shape, so the hazard was reduced structurally instead: `onSend`
+now *takes* the text, so a caller cannot silently keep reading its own stale
+binding. The behaviour was measured in a harness reproducing the exact wiring
+(unpublished store → closure `Binding` → `TextField(axis: .vertical)` →
+`.onKeyPress`), driven by `NSApp.postEvent` bursts: before, 3/3 sends read a
+**0-character** binding while the field editor held the full word; after, 6/6
+sends matched the field across both burst and paced typing. What is **not**
+pinned: the `NSApp.keyWindow?.firstResponder as? NSTextView` lookup itself, and
+the focus gate on `SNComposer.liveDraft`.
+
+**Rejected:**
+- *Publishing `composerDrafts`.* Fixes the staleness at the source and is what
+  Compose does, but it re-enters `updateUIViewController` → `applySnapshot` on
+  every keystroke — the exact cost the unpublished map exists to avoid, and a
+  Signal-Comparable Performance Rule violation.
+- *Reading the field editor and leaving `onSend: () -> Void` alone.* Writing the
+  live text back through the binding does not refresh the *caller's* binding
+  either — `SNComposer.send()` would still read its own stale copy. The text has
+  to be passed, not just committed.
+- *Deferring the send a runloop turn so the binding catches up.* Same objection
+  R-027 raised: it reorders every send to paper over a read bug.
+- *Trusting the field editor unconditionally in `SNComposer.liveDraft`.* The send
+  button can be clicked while another text view (the sidebar search) is first
+  responder, which would send that field's text. Gated on `composerFocused`;
+  losing focus re-renders the composer, so the binding is fresh in that case.
 
 ## Unguarded
 
