@@ -40,8 +40,12 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     /// The revision `sync` WILL hold after syncing these inputs — safe to read
     /// from `body` (pure). Must mirror `sync`'s bump condition exactly so the
     /// version shipped with `entries` describes the same snapshot.
-    func contentVersion(afterSyncing msgs: [SNMessage], showAuthors: Bool) -> UInt64 {
-        (msgs != self.msgs || showAuthors != self.showAuthors)
+    func contentVersion(
+        afterSyncing msgs: [SNMessage],
+        showAuthors: Bool,
+        peerName: String
+    ) -> UInt64 {
+        (msgs != self.msgs || showAuthors != self.showAuthors || peerName != self.peerName)
             ? contentRevision &+ 1
             : contentRevision
     }
@@ -63,7 +67,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     ) {
         // Bump only on real row-content change: composer keystrokes republish
         // the store with an identical transcript and must stay O(1) here.
-        if msgs != self.msgs || showAuthors != self.showAuthors {
+        // peerName is row content too: nudge and pay bubbles render it, so a
+        // name resolving after open (notification-tap before contact metadata
+        // loads) must not be swallowed by the skip path.
+        if msgs != self.msgs || showAuthors != self.showAuthors || peerName != self.peerName {
             contentRevision &+= 1
         }
         self.msgs = msgs
@@ -97,7 +104,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             let bits = "\(flags.cont ? 1 : 0)\(flags.showAuthor ? 1 : 0)\(flags.showState ? 1 : 0)"
                 + "\(expandedMessageIDs.contains(id) ? 1 : 0)"
             let mediaKey = snCollectionHostMediaHeightFingerprint(m.media)
-            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)"
+            // Nudge and pay rows render (and wrap on) the peer's display name;
+            // a resolved name must re-measure and reconfigure exactly those.
+            let nameKey = (m.trill || m.pay != nil) ? "|\(peerName)" : ""
+            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)"
         }
     }
 
@@ -278,7 +288,8 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
             // the host skip the apply that carries this pass's row change.
             contentVersion: renderContext.contentVersion(
                 afterSyncing: msgs,
-                showAuthors: showAuthors
+                showAuthors: showAuthors,
+                peerName: peerName
             ),
             composer: composer
         )

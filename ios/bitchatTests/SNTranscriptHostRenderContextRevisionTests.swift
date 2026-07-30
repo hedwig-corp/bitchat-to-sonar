@@ -33,12 +33,13 @@ struct SNTranscriptHostRenderContextRevisionTests {
     private func sync(
         _ context: SNTranscriptHostRenderContext,
         msgs: [SNMessage],
-        showAuthors: Bool = false
+        showAuthors: Bool = false,
+        peerName: String = "Peer"
     ) {
         context.sync(
             msgs: msgs,
             showAuthors: showAuthors,
-            peerName: "Peer",
+            peerName: peerName,
             money: { _ in "" },
             fiatText: { _ in nil },
             onTapAuthor: nil,
@@ -59,24 +60,42 @@ struct SNTranscriptHostRenderContextRevisionTests {
         let context = SNTranscriptHostRenderContext()
         let msgsA = [makeMessage(id: "a", text: "hi")]
 
-        let openVersion = context.contentVersion(afterSyncing: msgsA, showAuthors: false)
+        let openVersion = context.contentVersion(afterSyncing: msgsA, showAuthors: false, peerName: "Peer")
         sync(context, msgs: msgsA)
-        #expect(context.contentVersion(afterSyncing: msgsA, showAuthors: false) == openVersion)
+        #expect(context.contentVersion(afterSyncing: msgsA, showAuthors: false, peerName: "Peer") == openVersion)
 
         let msgsB = msgsA + [makeMessage(id: "optimistic-1", text: "new send")]
-        let sendVersion = context.contentVersion(afterSyncing: msgsB, showAuthors: false)
+        let sendVersion = context.contentVersion(afterSyncing: msgsB, showAuthors: false, peerName: "Peer")
         #expect(sendVersion == openVersion &+ 1)
         sync(context, msgs: msgsB)
-        #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: false) == sendVersion)
+        #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: false, peerName: "Peer") == sendVersion)
 
         // A showAuthors flip with an identical transcript (group membership
         // resolving after open) is a row-affecting change too: the prediction
         // must bump exactly as sync will, or the flip pass gets skipped and
         // author labels never appear until the next row change.
-        let flipVersion = context.contentVersion(afterSyncing: msgsB, showAuthors: true)
+        let flipVersion = context.contentVersion(afterSyncing: msgsB, showAuthors: true, peerName: "Peer")
         #expect(flipVersion == sendVersion &+ 1)
         sync(context, msgs: msgsB, showAuthors: true)
-        #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: true) == flipVersion)
+        #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: true, peerName: "Peer") == flipVersion)
+    }
+
+    /// A peer display name resolving after open (notification-tap open before
+    /// contact metadata loads) is row content for nudge/pay bubbles: the
+    /// prediction must bump exactly as sync will, or the rename pass is
+    /// skipped and those rows keep the stale/empty name.
+    @Test
+    func peerNameChangeBumpsRevision() {
+        let context = SNTranscriptHostRenderContext()
+        let msgs = [makeMessage(id: "a", text: "hi")]
+
+        let openVersion = context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "")
+        sync(context, msgs: msgs, peerName: "")
+
+        let renamed = context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "Alice")
+        #expect(renamed == openVersion &+ 1)
+        sync(context, msgs: msgs, peerName: "Alice")
+        #expect(context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "Alice") == renamed)
     }
 
     /// The bug's exact pass sequence: open → idle publish (keystroke) → send.
@@ -89,7 +108,7 @@ struct SNTranscriptHostRenderContextRevisionTests {
         var lastApplied: UInt64?
 
         func passes(msgs: [SNMessage]) -> Bool {
-            let version = context.contentVersion(afterSyncing: msgs, showAuthors: false)
+            let version = context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "Peer")
             sync(context, msgs: msgs)
             let skipped = TranscriptScrollPolicy.shouldSkipUnchangedApply(
                 contentVersion: version,
@@ -127,10 +146,10 @@ struct SNTranscriptHostRenderContextRevisionTests {
         let context = SNTranscriptHostRenderContext()
         let msgs = [makeMessage(id: "a", text: "hi")]
 
-        let openVersion = context.contentVersion(afterSyncing: msgs, showAuthors: false)
+        let openVersion = context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "Peer")
         sync(context, msgs: msgs)
 
-        let idleVersion = context.contentVersion(afterSyncing: msgs, showAuthors: false)
+        let idleVersion = context.contentVersion(afterSyncing: msgs, showAuthors: false, peerName: "Peer")
         sync(context, msgs: msgs)
         let skipped = TranscriptScrollPolicy.shouldSkipUnchangedApply(
             contentVersion: idleVersion,
