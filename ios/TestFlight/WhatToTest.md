@@ -1,19 +1,13 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.4 (32)** · Apple hotfix on **v0.1-alpha.12** (+ #441–#461 stack)
+Build: **Sonar 1.12.5 (33)** · release tag **v0.1-alpha.12.1** (pre-alpha.13)
 
-Hotfix over 1.12.3: chat open/unread divider (#441), bitcoin payment option
-(#442), nearby peer flapping (#444), share-sheet recipient pick (#447), keep
-backgrounded Marmot store closed (#459), username claim UI (#460), and calm the
-relay-connect banner when chat already works (#461). Opening a chat should
-still paint from local storage first; missed messages catch up in the
-background; payments and notifications should stay stable when the phone is
-locked or the app is killed.
-
-If something crashes on launch, while locked, or right after sending a message,
-photo, or payment — that is the highest-priority report. If sync feels slow or
-a message is missing, use **Settings → Diagnostics → Share** and send us the
-log.
+Cautious cut after alpha.12 + Apple hotfixes through 1.12.4. Focus: no blank
+transcripts on open, no vanishing sends, 0xdead10cc stability on background
+wake, payments still available, nearby peers not flapping, share-sheet picks a
+recipient. Opening a chat should paint from local storage first; missed
+messages catch up in the background; payments and notifications should stay
+stable when the phone is locked or the app is killed.
 
 ## 1. Sync speed & catching up (headline)
 
