@@ -38,6 +38,18 @@ class ConversationFoldTest {
         assertFalse(peerNpubHexMatchesLinkedPeer(sara, null))
     }
 
+    /** Cross-person fold must fail closed: Sara's WN group must never attach to
+     *  Vincenzo's mesh peer (R-003 / CHAT-TYPES hard rule). */
+    @Test
+    fun saraMarmotGroupCannotFoldOntoVincenzoMeshPeer() {
+        val sara = "ab".repeat(32)
+        val vincenzo = "cd".repeat(32)
+
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, vincenzo))
+        assertFalse(peerNpubHexMatchesLinkedPeer(sara, null))
+        assertTrue(peerNpubHexMatchesLinkedPeer(sara, sara))
+    }
+
     @Test
     fun rotatedMeshAliasesStillMatchTheActiveConversation() {
         val npub = "ab".repeat(32)

@@ -163,7 +163,7 @@ struct SonarDMScreenContent: View {
                         store.push(.contactProfile(peerId, peer.name))
                     }
                 } label: {
-                    SonarAvatar(name: peer.name, size: 36, presence: peer.inRange)
+                    SonarAvatar(name: peer.name, size: 36, presence: transport == .mesh)
                     SNHeaderTitle(name: peer.name, verified: verified) {
                         SNIcon(name: .lock, size: 11, weight: 2.4)
                         Text(verbatim: (verified ? "Verified · " : "") + subTransport)
@@ -618,7 +618,10 @@ struct SonarDMScreenContent: View {
 
     @ViewBuilder
     private var banner: some View {
-        if !isMarmot && !peer.inRange {
+        // Prefer the send-path transport over radar `inRange` so a Sonar peer
+        // that is only mesh-relayed (or a stale Noise alias after wipe) shows
+        // the White Noise banner instead of claiming Bluetooth delivery.
+        if !isMarmot && transport == .internet {
             outOfRangeBanner
         } else if verified {
             SNBanner(

@@ -114,9 +114,9 @@ roughly halves it. The ranking is stable across all three.)
 
 ## R-003 — One person is one conversation
 
-**Invariant:** A peer discovered over different transports, or holding duplicate direct Marmot groups, renders as exactly one chat row and one transcript, keyed by stable Noise fingerprint / npub identity.
+**Invariant:** A peer discovered over different transports, or holding duplicate direct Marmot groups, renders as exactly one chat row and one transcript, keyed by stable Noise fingerprint / **matching** npub identity. Folding two transports is allowed only when decoded Nostr pubkeys match; a mesh peer linked to npub A must never absorb a White Noise group whose counterparty is npub B.
 
-**Breaks as:** The same person appears as two chats; messages route into the wrong conversation; duplicate transcripts.
+**Breaks as:** The same person appears as two chats; messages route into the wrong conversation; duplicate transcripts; **another user's BLE history appears inside this chat** (cross-person fold).
 
 **Call sites:** iOS `SonarAppStore.swift` (`dmRows` + `snCollapseMeshDMRowsByIdentity` / `sonarPeerKey`); Compose `SonarAppState.duplicateDirectMarmotChats` / `preferredDirectMarmotChat` / `peerIdForMarmotGroup` / `meshConversationAliasGroups`
 
@@ -124,11 +124,21 @@ roughly halves it. The ranking is stable across all three.)
 
 **Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sameNpubMeshFingerprintsCollapseToOneHomeRow`, `SonarConversationFoldTests.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `SonarConversationFoldTests.liveMeshRoutePrefersConnectedAliasOverCanonical`, `SonarConversationFoldTests.rekeyAlignsLiveMeshRowWithFullPeerKeysCanonical`, `SonarConversationFoldTests.filterPeerKeysDropsConflictingFavoriteClaim`
 
-**Partly guarded:** the cited tests pin *chat-list* dedup and identity routing. The "one transcript" half is not pinned: if duplicate groups still collapse to one row but transcript loading stopped merging every duplicate group's messages, all of them stay green. See Unguarded.
+**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sonarPresenceRequiresDirectConnectionNotMeshReachable`
 
-**History:** #164 deduped direct Marmot chats by peer; re-asserted by the "Fix What We Break Rule" in `CLAUDE.md`.
+**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sonarPresenceRequiresDirectConnectionNotMeshReachable`, `SonarConversationFoldTests.saraMarmotGroupCannotPersistFoldOntoVincenzoMeshPeer`
 
-**Rejected:** *Splitting per transport.* This is the bug, not a feature — see the Fix What We Break Rule.
+**Call sites:** iOS `SonarAppStore.swift` (`dmRows` fold writes, `rememberMarmotGroupIfLinked`, `shouldMergeMeshTranscript`, `openedDM`); Compose `SonarAppState.duplicateDirectMarmotChats` / `preferredDirectMarmotChat` / `peerIdForMarmotGroup` / `peerLinkMatchesGroup`
+
+**Guarded by:** `ConversationRegressionSmokeTest.duplicateSaraGroupsKeepOneNewestTranscript`
+
+**Also guarded by:** `ConversationRegressionSmokeTest.saraMessageCannotRouteIntoVincenzoConversation`, `ConversationRegressionSmokeTest.rotatingVincenzoAliasesCollapseWithoutAbsorbingSara`, `ConversationFoldTest.foldIdentityRequiresMatchingNpub`, `ConversationFoldTest.saraMarmotGroupCannotFoldOntoVincenzoMeshPeer`, `SonarConversationFoldTests.foldIdentityRequiresMatchingNpub`, `SonarConversationFoldTests.sonarPresenceRequiresDirectConnectionNotMeshReachable`, `SonarConversationFoldTests.saraMarmotGroupCannotPersistFoldOntoVincenzoMeshPeer`
+
+**Partly guarded:** the cited tests pin *chat-list* dedup, identity routing, and the **fold-persist / mesh-merge gate helpers**. A full in-process `SonarAppStore.dmMsgs` integration test (wrong map ⇒ Sara BLE absent from Vincenzo WN open) is still missing — helpers fail closed if someone reintroduces ungated `rememberMarmotGroup` only when wired through `snShouldPersistMarmotFold`. Presence/transport chrome is helper-pinned, not an in-process send. See Unguarded / `docs/CHAT-TYPES.md` (“Hard rule: fold only on matching Nostr account”).
+
+**History:** #164 deduped direct Marmot chats by peer; re-asserted by the "Fix What We Break Rule" in `CLAUDE.md`. #340 fixed iOS ungated fold writes that painted person A's mesh transcript under person B's White Noise chat after wipe/new pubkey.
+
+**Rejected:** *Splitting per transport.* This is the bug, not a feature — see the Fix What We Break Rule. *Folding on display name / live peer-id string equality.* That is how cross-person contamination returned.
 
 ---
 

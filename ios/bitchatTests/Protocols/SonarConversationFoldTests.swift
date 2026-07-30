@@ -223,4 +223,19 @@ struct SonarConversationFoldTests {
         #expect(aligned[staleCanonical]?.preview == "Ok it is receiving notifica")
         #expect(aligned[staleCanonical]?.unread == true)
     }
+
+    @Test
+    func saraMarmotGroupCannotPersistFoldOntoVincenzoMeshPeer() {
+        let sara = Data(repeating: 0xAB, count: 32)
+        let vincenzo = Data(repeating: 0xCD, count: 32)
+
+        #expect(snShouldPersistMarmotFold(groupPubkey: sara, peerPubkey: sara))
+        #expect(snShouldPersistMarmotFold(groupPubkey: sara, peerPubkey: vincenzo) == false)
+        #expect(snShouldPersistMarmotFold(groupPubkey: sara, peerPubkey: nil) == false)
+        #expect(snShouldPersistMarmotFold(groupPubkey: nil, peerPubkey: vincenzo) == false)
+        #expect(
+            snShouldMergeMeshTranscriptIntoMarmotFold(groupPubkey: sara, peerPubkey: vincenzo)
+                == false
+        )
+    }
 }

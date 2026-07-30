@@ -32,6 +32,36 @@ a mesh peer and later learn their npub (from the 0x53 announce), the Bluetooth
 leg and the White Noise leg *fold* into a single thread. The reverse never
 happens — a pure Marmot contact with no BLE discovery stays a plain Marmot chat.
 
+### Hard rule: fold only on matching Nostr account
+
+Folding is **not** “merge whatever looks nearby.” It is allowed only when both
+legs name the **same Nostr pubkey** (decoded bytes — hex and `npub1…` are the
+same account). If that gate is skipped, Mac/iOS can attach person B’s White
+Noise group onto person A’s mesh conversation id; opening the chat then paints
+**A’s Bluetooth history inside B’s thread** (often under B’s profile title).
+That is cross-person transcript contamination — a correctness bug, not “same
+person kept history after wipe.”
+
+**Why it happened (2026-07-18, PR #340):** iOS `dmRows` persisted
+`conversationId → marmotGroupId` from a live `sonarProfiles` **string** hit
+(`npub ==`) and ungated `rememberMarmotGroup`, then `dmMsgs` always merged
+`privateChats[conversationId]` with that group. After wipe / new pubkey /
+stale maps, B’s group could land on A’s mesh id. Compose already required
+`peerLinkMatchesGroup` before keeping a fold; iOS did not on the write path.
+
+**Prevention (must hold on both apps):**
+
+1. Persist a fold only when decoded counterparty npub == mesh peer’s linked npub
+   (`rememberMarmotGroupIfLinked` / `canFoldMarmotGroup` on iOS;
+   `peerLinkMatchesGroup` on Compose).
+2. Never use display name, radar nickname, or unordered `Dictionary.first` string
+   equality as fold identity.
+3. When rendering a folded transcript, merge BLE rows only after the same npub
+   gate (`shouldMergeMeshTranscript` on iOS).
+4. Pin with a test that **fails** if Sara’s Marmot group can fold onto
+   Vincenzo’s mesh peer (`SonarConversationFoldTests.saraMarmotGroupCannotPersistFoldOntoVincenzoMeshPeer`,
+   `ConversationFoldTest.foldIdentityRequiresMatchingNpub`). See R-003.
+
 That gives the two kinds:
 
 | | **Pure Marmot chat** | **Mesh-folded chat** |
@@ -201,6 +231,10 @@ the read-marking uses, or the two will disagree for one of the two chat kinds.
 7. **Both platforms.** The Compose and SwiftUI stores mirror each other
    (`SonarAppState.kt` ↔ `SonarAppStore.swift`); a fix landing on one side is
    the most common way conversation bugs return (see `docs/REGRESSIONS.md`).
+8. **Never merge BLE into a Marmot leg without an npub-byte match.** If you add
+   a new fold write (`rememberMarmotGroup`, `groupFoldMap`, open-time remap),
+   gate it. Cross-person history in one thread is worse than briefly showing two
+   rows for the same person.
 
 ## Code map
 

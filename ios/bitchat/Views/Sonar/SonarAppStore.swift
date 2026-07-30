@@ -227,6 +227,41 @@ func snFoldedDirectMarmotHomeTitle(
     isDirectGroup ? marmotProfileTitle : peerDerivedTitle
 }
 
+/// Presence "in range" for the DM header must match the send path.
+/// Sonar peers only route over BLE while directly connected; mesh-relayed
+/// reachability already falls through to White Noise (`dmTransport` /
+/// `meshReachable`). Plain bitchat can still treat relayed peers as nearby.
+func snMeshInRangeForPresence(isSonarPeer: Bool, isConnected: Bool, isReachable: Bool) -> Bool {
+    if isSonarPeer { return isConnected }
+    return isConnected || isReachable
+}
+
+/// Fold a White Noise leg onto a mesh row only when both sides name the same
+/// Nostr account. Mirrors Compose `peerNpubHexMatchesLinkedPeer`.
+func snPeerNpubMatchesLinkedPeer(groupCounterpartyNpub: String?, linkedPeerNpub: String?) -> Bool {
+    guard let groupCounterpartyNpub, let linkedPeerNpub else { return false }
+    let group = groupCounterpartyNpub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    let linked = linkedPeerNpub.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !group.isEmpty, !linked.isEmpty else { return false }
+    return group == linked
+}
+
+/// Persist / merge a Marmot↔mesh fold only when decoded pubkey bytes match.
+/// Rejects nil on either side so an unverified mesh peer cannot absorb another
+/// person's White Noise transcript (and vice versa).
+func snShouldPersistMarmotFold(groupPubkey: Data?, peerPubkey: Data?) -> Bool {
+    guard let groupPubkey, let peerPubkey, !groupPubkey.isEmpty, groupPubkey.count == peerPubkey.count
+    else { return false }
+    return groupPubkey == peerPubkey
+}
+
+/// Merge BLE `privateChats` into a folded DM only when the mesh row and Marmot
+/// group name the same account. Without this, a bad conversation→group map
+/// paints person A's mesh history inside person B's White Noise chat.
+func snShouldMergeMeshTranscriptIntoMarmotFold(groupPubkey: Data?, peerPubkey: Data?) -> Bool {
+    snShouldPersistMarmotFold(groupPubkey: groupPubkey, peerPubkey: peerPubkey)
+}
+
 /// A stored call record: its timeline `date` (used to merge it
 /// chronologically into the transcript) plus the prebuilt CallLog message.
 struct SNCallRecord: Identifiable, Equatable {
@@ -3190,8 +3225,8 @@ final class SonarAppStore: ObservableObject {
             persistSonarProfiles()
         }
         if let group = marmotGroup(forNpub: profile.npub) {
-            rememberMarmotGroup(group.id, forConversationId: peerID)
-            rememberMarmotGroup(group.id, forConversationId: key)
+            rememberMarmotGroupIfLinked(group.id, forConversationId: peerID)
+            rememberMarmotGroupIfLinked(group.id, forConversationId: key)
         }
         refreshBleKnownContactSnapshot()
         applyBLEDiscoveryPolicy()
@@ -3257,6 +3292,33 @@ final class SonarAppStore: ObservableObject {
         if marmotGroupIdsByConversationId[id] == groupId { return }
         marmotGroupIdsByConversationId[id] = groupId
         persistMarmotConversationGroups()
+    }
+
+    /// Only persist a fold when the conversation's linked Nostr account matches
+    /// the direct Marmot group's counterparty. Never write from a live peer-id
+    /// string hit alone — that path contaminated other users' mesh transcripts.
+    @discardableResult
+    private func rememberMarmotGroupIfLinked(_ groupId: String, forConversationId id: String) -> Bool {
+        guard canFoldMarmotGroup(groupId, ontoConversationId: id) else { return false }
+        rememberMarmotGroup(groupId, forConversationId: id)
+        return true
+    }
+
+    private func canFoldMarmotGroup(_ groupId: String, ontoConversationId id: String) -> Bool {
+        guard let group = marmotGroup(byId: groupId) else { return false }
+        guard marmot.isDirectGroup(group) else { return false }
+        guard let groupNpub = directOtherNpub(in: group),
+              let groupKey = Self.nostrPubkeyData(groupNpub)
+        else { return false }
+        if let linkedNpub = resolvedSonarProfile(id)?.npub,
+           let linkedKey = Self.nostrPubkeyData(linkedNpub) {
+            return snShouldPersistMarmotFold(groupPubkey: groupKey, peerPubkey: linkedKey)
+        }
+        // Favorites-only noise↔nostr: allow when this conversation is still the
+        // deterministic fold target for the group's counterparty.
+        guard let foldKey = sonarPeerKey(forNpub: groupNpub) else { return false }
+        let canon = canonicalPeerKey(PeerID(str: id))
+        return foldKey == id || foldKey == canon || canonicalPeerKey(PeerID(str: foldKey)) == canon
     }
 
     private func forgetMarmotGroupMappings(forGroupId groupId: String) {
@@ -4055,17 +4117,25 @@ final class SonarAppStore: ObservableObject {
             // network line ("Sonar · reaches anywhere" etc.).
             let network = networkLabel(sonar: sonar, mutualFavorite: peer.isMutualFavorite)
             let displayName = peerDisplayName(peer.peerID.id)
+            let inRange = snMeshInRangeForPresence(
+                isSonarPeer: sonar,
+                isConnected: peer.isConnected,
+                isReachable: peer.isReachable
+            )
             if peer.isConnected {
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: displayName, inRange: true, bars: 3,
+                    id: peer.peerID.id, name: displayName, inRange: inRange, bars: 3,
                     hint: "Right here", detail: "Direct connection · " + network,
                     angle: angle, r: 66 + jitter, sonar: sonar
                 ))
             } else if peer.isReachable {
+                // Sonar: relayed ≠ in-range for DMs (White Noise takes over).
+                // Plain bitchat: still show as nearby on the middle radar ring.
                 items.append(SNPeerItem(
-                    id: peer.peerID.id, name: displayName, inRange: true, bars: 2,
-                    hint: "Nearby", detail: "Relayed through the mesh · " + network,
-                    angle: angle, r: 118 + jitter, sonar: sonar
+                    id: peer.peerID.id, name: displayName, inRange: inRange, bars: sonar ? 0 : 2,
+                    hint: inRange ? "Nearby" : "Out of range",
+                    detail: inRange ? ("Relayed through the mesh · " + network) : network,
+                    angle: angle, r: inRange ? (118 + jitter) : (162 + jitter), sonar: sonar
                 ))
             } else if peer.isMutualFavorite || sonar {
                 items.append(SNPeerItem(
@@ -4169,9 +4239,15 @@ final class SonarAppStore: ObservableObject {
 
     private func nearbyPeerItem(forConversationId id: String) -> SNPeerItem? {
         let peers = nearbyPeers
-        if let exact = peers.first(where: { $0.id == id }) { return exact }
-        guard !id.hasPrefix(Self.marmotIDPrefix),
-              let targetFingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)),
+        if let exact = peers.first(where: { $0.id == id }) {
+            return presenceAlignedPeerItem(exact, conversationId: id)
+        }
+        guard !id.hasPrefix(Self.marmotIDPrefix) else { return nil }
+        let aliases = Set(meshPeerAliasIDs(for: id))
+        if let byAlias = peers.first(where: { !$0.unify && aliases.contains($0.id) }) {
+            return presenceAlignedPeerItem(byAlias, conversationId: id)
+        }
+        guard let targetFingerprint = chatViewModel.getFingerprint(for: PeerID(str: id)),
               let live = peers.first(where: { item in
                   guard !item.unify,
                         let fingerprint = chatViewModel.getFingerprint(for: PeerID(str: item.id))
@@ -4179,16 +4255,23 @@ final class SonarAppStore: ObservableObject {
                   return fingerprint == targetFingerprint
               })
         else { return nil }
+        return presenceAlignedPeerItem(live, conversationId: id)
+    }
+
+    /// Re-key a live radar hit onto the conversation id and force Sonar
+    /// `inRange` to follow `meshReachable` / `dmTransport` (direct BLE only).
+    private func presenceAlignedPeerItem(_ live: SNPeerItem, conversationId id: String) -> SNPeerItem {
+        let inRange = meshReachable(id)
         return SNPeerItem(
             id: id,
             name: live.name,
-            inRange: live.inRange,
-            bars: live.bars,
-            hint: live.hint,
-            detail: live.detail,
+            inRange: inRange,
+            bars: inRange ? max(live.bars, 1) : 0,
+            hint: inRange ? live.hint : "Out of range",
+            detail: inRange ? live.detail : networkLabel(forPeer: id),
             angle: live.angle,
             r: live.r,
-            sonar: live.sonar,
+            sonar: live.sonar || resolvedSonarProfile(id) != nil,
             unify: live.unify,
             avatarSeed: live.avatarSeed
         )
@@ -4239,20 +4322,62 @@ final class SonarAppStore: ObservableObject {
             return String(id.dropFirst(Self.marmotIDPrefix.count))
         }
         if let mapped = marmotGroupIdsByConversationId[id] {
-            return mapped
+            // Unloaded group → do not trust the mapping for transcript merge
+            // (stale cross-person folds must not paint until verified).
+            if marmotGroup(byId: mapped) == nil { return nil }
+            if acceptMappedMarmotGroup(mapped, forConversationId: id) {
+                return mapped
+            }
         }
         if let fp = chatViewModel.getFingerprint(for: PeerID(str: id)),
            let mapped = marmotGroupIdsByConversationId[fp] {
-            rememberMarmotGroup(mapped, forConversationId: id)
-            return mapped
+            if marmotGroup(byId: mapped) == nil { return nil }
+            if acceptMappedMarmotGroup(mapped, forConversationId: fp) {
+                rememberMarmotGroupIfLinked(mapped, forConversationId: id)
+                return mapped
+            }
         }
         guard let profile = resolvedSonarProfile(id),
               let group = marmotGroup(forNpub: profile.npub)
         else { return nil }
-        rememberMarmotGroup(group.id, forConversationId: id)
+        rememberMarmotGroupIfLinked(group.id, forConversationId: id)
         let fp = chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-        rememberMarmotGroup(group.id, forConversationId: fp)
+        rememberMarmotGroupIfLinked(group.id, forConversationId: fp)
         return group.id
+    }
+
+    /// Drop persisted conversation→group folds whose counterparty npub no longer
+    /// matches the mesh peer's Sonar link (Compose `peerLinkMatchesGroup` /
+    /// `pruneStaleGroupFold` parity). Compare via decoded pubkey bytes so hex
+    /// vs bech32 forms of the same account still match.
+    private func acceptMappedMarmotGroup(_ groupId: String, forConversationId id: String) -> Bool {
+        if canFoldMarmotGroup(groupId, ontoConversationId: id) { return true }
+        forgetMarmotGroupMapping(conversationId: id)
+        return false
+    }
+
+    private func forgetMarmotGroupMapping(conversationId id: String) {
+        guard marmotGroupIdsByConversationId.removeValue(forKey: id) != nil else { return }
+        persistMarmotConversationGroups()
+    }
+
+    /// BLE history may join a Marmot transcript only for the same Nostr account.
+    private func shouldMergeMeshTranscript(conversationId id: String, marmotGroupId groupId: String) -> Bool {
+        guard let group = marmotGroup(byId: groupId),
+              marmot.isDirectGroup(group),
+              let groupNpub = directOtherNpub(in: group),
+              let groupKey = Self.nostrPubkeyData(groupNpub)
+        else { return false }
+        if let linkedNpub = resolvedSonarProfile(id)?.npub,
+           let linkedKey = Self.nostrPubkeyData(linkedNpub) {
+            return snShouldMergeMeshTranscriptIntoMarmotFold(
+                groupPubkey: groupKey,
+                peerPubkey: linkedKey
+            )
+        }
+        guard let foldKey = sonarPeerKey(forNpub: groupNpub) else { return false }
+        let canon = canonicalPeerKey(PeerID(str: id))
+        return foldKey == id || foldKey == canon || canonicalPeerKey(PeerID(str: foldKey)) == canon
     }
 
     private func marmotGroup(byId groupId: String) -> MarmotService.MarmotGroup? {
@@ -4591,14 +4716,10 @@ final class SonarAppStore: ObservableObject {
             // the same way a blocked mesh peer never surfaces a row. `peerKey`
             // is already reserved above so no duplicate row can slip through.
             if let otherNpub, isMarmotSenderBlocked(otherNpub) { continue }
-            // Live peer id (when currently discovered over 0x53) gives us mesh
-            // presence; the persisted fingerprint still lets us build the SAME
-            // Sonar row when BLE is down / after restart.
-            let liveSonarPeerId = otherNpub.flatMap { np in
-                sonarProfiles.first(where: { $0.value.npub == np })?.key
-            }
-            // Identity is cryptographic: never create a persisted peer↔npub link
-            // from a display-title match, even when that title is unique.
+            // Identity is cryptographic: fold only through `sonarPeerKey` (byte
+            // compare + deterministic preference). Never persist a fold from a
+            // live `sonarProfiles` string hit — that attached person B's White
+            // Noise group onto person A's mesh conversation id.
             let foldKey = otherNpub.flatMap { sonarPeerKey(forNpub: $0) }
             if let liveSonarPeerId {
                 rememberMarmotGroup(rowGroupId, forConversationId: liveSonarPeerId)
@@ -4616,7 +4737,9 @@ final class SonarAppStore: ObservableObject {
             if let foldKey, let existing = byKey[foldKey] {
                 // Same person as a mesh/bitchat chat → merge the White Noise leg
                 // into that one row instead of showing a duplicate conversation.
-                rememberMarmotGroup(rowGroupId, forConversationId: existing.id)
+                // Map `existing.id` only when it also passes the npub gate (it may
+                // be a live short id alias of the same fold key).
+                _ = rememberMarmotGroupIfLinked(rowGroupId, forConversationId: existing.id)
                 let rowTitle = snFoldedDirectMarmotHomeTitle(
                     isDirectGroup: marmot.isDirectGroup(rowGroup),
                     marmotProfileTitle: marmot.title(for: rowGroup),
@@ -4651,12 +4774,12 @@ final class SonarAppStore: ObservableObject {
                 }
                 continue
             }
-            if let foldKey {
+            if let foldKey, rememberMarmotGroupIfLinked(rowGroupId, forConversationId: foldKey) {
                 // Discovered Sonar peer with no mesh transcript yet, or a persisted
                 // Sonar peer now out of range → one folded row, not a White Noise
-                // duplicate.
-                let rowId = liveSonarPeerId ?? foldKey
-                rememberMarmotGroup(rowGroupId, forConversationId: rowId)
+                // duplicate. Row id stays on the fold key so we never open another
+                // peer's `privateChats` under this title.
+                let rowId = foldKey
                 let rowTitle = snFoldedDirectMarmotHomeTitle(
                     isDirectGroup: marmot.isDirectGroup(rowGroup),
                     marmotProfileTitle: marmot.title(for: rowGroup),
@@ -4668,7 +4791,7 @@ final class SonarAppStore: ObservableObject {
                     preview: rowLast.map { Self.previewText($0.content, stickerRef: $0.stickerRef, media: $0.media) } ?? networkLabel(forPeer: rowId),
                     time: rowLast.map { Self.listTime($0.createdAt) } ?? "",
                     unread: hasUnreadMarmotMessage(in: groupSet),
-                    presence: liveSonarPeerId != nil && meshReachable(rowId),
+                    presence: meshReachable(rowId),
                     verified: isVerified(rowId) || hasVerifiedMarmotGroup(in: groupSet),
                     isMarmot: false,
                     lastDate: rowLast?.createdAt,
@@ -6464,17 +6587,20 @@ final class SonarAppStore: ObservableObject {
             guard let groupId = await marmot.startChatReturningId(with: npub) else {
                 return .failed
             }
-            rememberMarmotGroup(groupId, forConversationId: id)
+            rememberMarmotGroupIfLinked(groupId, forConversationId: id)
             if resolvedSonarProfile(id) != nil {
-                rememberMarmotGroup(groupId, forConversationId: canonicalPeerKey(PeerID(str: id)))
+                rememberMarmotGroupIfLinked(groupId, forConversationId: canonicalPeerKey(PeerID(str: id)))
             }
             return .ready
         }
     }
 
     /// True for a non-geo private peer reachable over the BLE mesh right now.
-    /// Sonar peers require a direct connection; retained mesh reachability is
-    /// still useful for plain bitchat relay but should not hold Sonar on BLE.
+    /// Sonar peers require a direct connection on any Noise alias for the same
+    /// npub (so a wipe/reinstall that rotates the fingerprint still counts as
+    /// nearby). Retained mesh reachability is useful for plain bitchat relay
+    /// but must not hold Sonar on BLE — that path already continues over White
+    /// Noise.
     private func meshReachable(_ id: String) -> Bool {
         guard !id.hasPrefix(Self.marmotIDPrefix) else { return false }
         guard !PeerID(str: id).isGeoDM else { return false }
@@ -7261,8 +7387,11 @@ final class SonarAppStore: ObservableObject {
 
     func openedDM(_ id: String, marmotGroupId knownMarmotGroupId: String? = nil) {
         if let knownMarmotGroupId {
-            rememberMarmotGroup(knownMarmotGroupId, forConversationId: id)
-            markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
+            // UI-supplied group ids must still pass the npub gate — otherwise a
+            // stale home-row `marmotGroupId` re-contaminates this conversation.
+            if rememberMarmotGroupIfLinked(knownMarmotGroupId, forConversationId: id) {
+                markMarmotGroupsRead(matchingGroupId: knownMarmotGroupId)
+            }
         }
         // Bind badge suppression as soon as the DM is considered open — even
         // when navigation used a custom `present` path that skipped `push`.
@@ -7326,9 +7455,9 @@ final class SonarAppStore: ObservableObject {
                     }
                     self.marmot.markConversationRead(groupId: group.id)
                 }
-                self.rememberMarmotGroup(hydratedGroupId, forConversationId: id)
+                self.rememberMarmotGroupIfLinked(hydratedGroupId, forConversationId: id)
                 let fp = self.chatViewModel.getFingerprint(for: PeerID(str: id)) ?? id
-                self.rememberMarmotGroup(hydratedGroupId, forConversationId: fp)
+                self.rememberMarmotGroupIfLinked(hydratedGroupId, forConversationId: fp)
             }
             // P2: service cold-start catch-up for the conversation the user opened.
             if let hydratedGroupId {
