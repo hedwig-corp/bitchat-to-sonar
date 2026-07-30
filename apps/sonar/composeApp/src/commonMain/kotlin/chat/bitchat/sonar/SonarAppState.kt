@@ -6673,6 +6673,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                     meshChats[alias] = emptyList()
                     persistMesh(alias)
                 }
+                // "/clear" wipes this chat's local rows; an echo (or a queued
+                // out-of-range send) surviving the wipe would re-render as a
+                // phantom "Sending" bubble nothing can fulfil or retire — its
+                // carriers are gone. Same rationale as the full-teardown
+                // ledger clear (R-022), scoped to this one chat.
+                pendingSendEchoes.remove(chatId)?.forEach { echo ->
+                    previouslyPublishedMessageIdsByEcho.remove(echo.id)
+                }
+                for ((npubHex, sends) in pendingMarmotSends.toList()) {
+                    sends.removeAll { it.meshChatId == chatId }
+                    if (sends.isEmpty()) pendingMarmotSends.remove(npubHex)
+                }
                 messages = emptyList()
                 refreshMeshDmRows()
                 toast = "Cleared this chat on this device"
