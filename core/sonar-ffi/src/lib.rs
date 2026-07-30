@@ -2959,6 +2959,10 @@ pub fn mesh_fragment(
 #[derive(uniffi::Object)]
 pub struct MeshReassembler {
     inner: Mutex<mesh::fragment::Reassembler>,
+    /// Monotonic epoch for stream idle expiry (#416). Hosts never supply a
+    /// clock through this wrapper, so age is measured against construction
+    /// time; the exported API is unchanged.
+    epoch: std::time::Instant,
 }
 
 #[uniffi::export]
@@ -2967,6 +2971,7 @@ impl MeshReassembler {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(mesh::fragment::Reassembler::new()),
+            epoch: std::time::Instant::now(),
         })
     }
 
@@ -2985,11 +2990,19 @@ impl MeshReassembler {
             Some(f) => f,
             None => return Ok(None),
         };
-        Ok(self
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        let mut inner = self
             .inner
             .lock()
-            .expect("fragment assembler lock not poisoned")
-            .add(sender, &frag))
+            .expect("fragment assembler lock not poisoned");
+        // `Reassembler::add` only sweeps when a NEW key arrives at capacity, so
+        // a table that never fills would retain idle and over-lifetime buckets
+        // for as long as this object lives. `MeshEngine` gets its sweep from
+        // `on_tick`; this wrapper has no tick, so it sweeps here — otherwise a
+        // host driving fragments through this API alone inherits none of the
+        // expiry bounds (#416). Sweeping is O(buckets) with a ≤256 cap.
+        inner.sweep(now_ms);
+        Ok(inner.add(sender, &frag, now_ms))
     }
 }
 

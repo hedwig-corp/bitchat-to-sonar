@@ -242,7 +242,7 @@ fn large_file_packet_fragments_and_reassembles() {
     let mut whole = None;
     for f in frags.iter().rev() {
         let decoded = Fragment::decode_payload(&f.encode_payload()).expect("decode frag");
-        if let Some(done) = reasm.add(sender, &decoded) {
+        if let Some(done) = reasm.add(sender, &decoded, 0) {
             whole = Some(done);
         }
     }
@@ -268,7 +268,7 @@ fn reassembler_and_fragment_reject_abusive_inputs() {
         original_type: msg_type::FILE_TRANSFER,
         chunk: vec![0u8; 4],
     };
-    assert!(reasm.add([1u8; 8], &evil).is_none());
+    assert!(reasm.add([1u8; 8], &evil, 0).is_none());
 
     // fragment() never panics: chunk_size 0 and too-many-fragments both → None.
     assert!(fragment(b"data", [1u8; 8], msg_type::FILE_TRANSFER, 0).is_none());
@@ -317,7 +317,7 @@ fn file_survives_noise_and_fragmentation_over_the_mesh() {
     let mut got = None;
     for f in frags.iter().rev() {
         let d = Fragment::decode_payload(&f.encode_payload()).unwrap();
-        if let Some(done) = reasm.add([1u8; 8], &d) {
+        if let Some(done) = reasm.add([1u8; 8], &d, 0) {
             got = Some(done);
         }
     }

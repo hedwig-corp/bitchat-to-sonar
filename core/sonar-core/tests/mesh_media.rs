@@ -60,7 +60,7 @@ fn media_survives_noise_and_fragmentation_over_the_mesh() {
         // Round-trip each fragment through its on-wire 0x20 payload form.
         let decoded = Fragment::decode_payload(&frag.encode_payload()).expect("decode fragment");
         assert_eq!(&decoded, frag);
-        if let Some(done) = reasm.add(sender_id, &decoded) {
+        if let Some(done) = reasm.add(sender_id, &decoded, 0) {
             reassembled = Some(done);
         }
     }
