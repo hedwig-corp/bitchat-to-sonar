@@ -1263,6 +1263,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val s = sonar
     val scope = rememberCoroutineScope()
     val draft = state.composerDraft(screen.id)
+    val composer = rememberMessageComposerState(draft)
     var emojiTray by remember { mutableStateOf(false) }
     var stickerPacks by remember { mutableStateOf(state.cachedStickerPacks()) }
     var paySheet by remember { mutableStateOf(false) }
@@ -1855,6 +1856,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             color = s.text3, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                         MessageComposerTextField(
+                            state = composer,
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
@@ -1962,6 +1964,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                 // recomposes, so `draft` here can miss the tail.
                                 val d = state.composerDraft(screen.id)
                                 state.setComposerDraft(screen.id, "")
+                                composer.committed()
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
                                     state.send(screen.id, d)
@@ -2490,6 +2493,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
     val s = sonar
     val draftKey = composerDraftKeyForGeoDm(screen.geohash, screen.peerHex)
     val draft = state.composerDraft(draftKey)
+    val composer = rememberMessageComposerState(draft)
     val blocked = state.isGeoDmBlocked(screen.peerHex)
     // Open pinned at the newest row and snap (not animate) the first local fill,
     // exactly like ChatScreen: the transcript must not open at old history and
@@ -2563,6 +2567,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             ) {
                 if (draft.isEmpty()) Text("Message", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
+                    state = composer,
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
@@ -2581,6 +2586,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     .clickable(enabled = draft.isNotBlank()) {
                         val d = state.composerDraft(draftKey)
                         state.setComposerDraft(draftKey, "")
+                        composer.committed()
                         state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
                     },
                 contentAlignment = Alignment.Center

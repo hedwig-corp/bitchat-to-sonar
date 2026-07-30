@@ -30,6 +30,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -61,6 +62,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -101,6 +103,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -134,6 +137,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -165,6 +169,7 @@ class MessageComposerFieldUiTest {
         var sent: String? = null
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = composed,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -195,6 +200,7 @@ class MessageComposerFieldUiTest {
         var store by mutableStateOf("/f")
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = store,
                 onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
@@ -220,6 +226,7 @@ class MessageComposerFieldUiTest {
         var text by mutableStateOf("")
         setContent {
             MessageComposerTextField(
+                state = rememberMessageComposerState(""),
                 value = text,
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),

@@ -4,6 +4,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -37,23 +38,65 @@ internal expect val messageComposerEnterSends: Boolean
 internal val messageComposerKeyboardOptions = KeyboardOptions(imeAction = ImeAction.None)
 
 /**
- * Tracks the last text this field handed to the caller.
+ * The composer's own text, owned so a send can blank it *now* instead of waiting
+ * for the caller's clear to compose.
  *
- * The caller owns the draft too — it clears it after a send, completes a slash
- * hint, appends an emoji — and those changes arrive as a [value] that differs
- * from what we pushed. Anything else is the caller's copy still catching up and
- * must not be pulled back over what the user has typed since.
+ * [pushed] is the last text handed to the caller. The caller owns the draft too —
+ * it clears it after a send, completes a slash hint, appends an emoji — and those
+ * changes arrive as a `value` that differs from [pushed]. Anything equal to
+ * [pushed] is the caller's copy still catching up and must not be pulled back
+ * over what the user has typed since.
  *
- * Deliberately **not** snapshot state: nothing reads it during composition, and
- * making it observable would invalidate the composer on every keystroke for a
- * value only the sync path cares about.
+ * [pushed] is deliberately **not** snapshot state: nothing reads it during
+ * composition, and making it observable would invalidate the composer on every
+ * keystroke for a value only the sync path cares about.
  *
- * Note this decides what the field *shows*, never what a send *commits* — that
+ * All of this decides what the field *shows*, never what a send *commits* — that
  * is `currentDraft`, read straight from the caller's store. A wrong guess here
  * shows stale text for one frame, which the user can see and fix; the same guess
  * on the send path was what R-022 is about.
  */
-private class ComposerPushedText(var value: String)
+@Stable
+internal class MessageComposerState(initial: String = "") {
+    internal var field by mutableStateOf(TextFieldValue(initial, TextRange(initial.length)))
+        private set
+    internal var pushed: String = initial
+        private set
+
+    /** An edit from the field. Returns true when the draft text actually moved. */
+    internal fun onEdited(edited: TextFieldValue): Boolean {
+        field = edited
+        // Selection-only moves are not draft changes; do not wake the store.
+        if (edited.text == pushed) return false
+        pushed = edited.text
+        return true
+    }
+
+    /** Take the caller's text. Caret to the end — that is where typing resumes. */
+    internal fun adopt(value: String) {
+        field = TextFieldValue(value, TextRange(value.length))
+        pushed = value
+    }
+
+    /**
+     * A send committed the draft: blank the field now, so anything still queued
+     * in this input batch edits an empty field rather than the message that just
+     * went out.
+     *
+     * **Every** send path must call this, not just the composer's own Enter
+     * handler — the send buttons clear the stored draft themselves, and on
+     * Android the button is the only send path there is (Return inserts a
+     * newline). If the caller keeps the draft instead of clearing it, the next
+     * composition adopts it straight back.
+     */
+    fun committed() {
+        adopt("")
+    }
+}
+
+@Composable
+internal fun rememberMessageComposerState(initial: String): MessageComposerState =
+    remember { MessageComposerState(initial) }
 
 /**
  * The shared message composer text field.
@@ -80,6 +123,7 @@ private class ComposerPushedText(var value: String)
  */
 @Composable
 internal fun MessageComposerTextField(
+    state: MessageComposerState,
     value: String,
     onValueChange: (String) -> Unit,
     textStyle: TextStyle,
@@ -89,28 +133,16 @@ internal fun MessageComposerTextField(
     onSend: ((String) -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
-    var field by remember { mutableStateOf(TextFieldValue(value, TextRange(value.length))) }
-    val pushed = remember { ComposerPushedText(value) }
 
-    // Adopt draft changes the caller made itself. Caret goes to the end: every
-    // such change either empties the draft or rewrites it wholesale (completion,
-    // emoji append), and the end is where typing continues from.
+    // Adopt draft changes the caller made itself.
     SideEffect {
-        if (value != pushed.value) {
-            field = TextFieldValue(value, TextRange(value.length))
-            pushed.value = value
-        }
+        if (value != state.pushed) state.adopt(value)
     }
 
     BasicTextField(
-        value = field,
+        value = state.field,
         onValueChange = { edited ->
-            field = edited
-            // Selection-only moves are not draft changes; do not wake the store.
-            if (edited.text != pushed.value) {
-                pushed.value = edited.text
-                onValueChange(edited.text)
-            }
+            if (state.onEdited(edited)) onValueChange(edited.text)
         },
         textStyle = textStyle,
         cursorBrush = cursorBrush,
@@ -130,9 +162,9 @@ internal fun MessageComposerTextField(
                         // this input batch edits an empty field, not the message
                         // being sent. If the caller keeps the draft rather than
                         // clearing it, the next SideEffect restores it.
-                        field = TextFieldValue("")
-                        pushed.value = ""
-                        onSend?.invoke(currentDraft())
+                        val outgoing = currentDraft()
+                        state.committed()
+                        onSend?.invoke(outgoing)
                         true
                     } else {
                         false

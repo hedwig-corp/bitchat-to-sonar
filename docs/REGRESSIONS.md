@@ -1143,7 +1143,7 @@ Unverified either way — nobody has instrumented it. Do not treat the Compose f
 as covering macOS, and do not treat "Apple reads a live binding" as evidence the
 symptom is absent; those are answers to different questions.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`, `MessageComposerFieldUiTest.caretFollowsADraftTheCallerRewrote`, `MessageComposerStateTest.committedBlanksTheFieldImmediately`, `MessageComposerStateTest.aKeystrokeAfterCommitStartsFromEmpty`, `MessageComposerStateTest.selectionOnlyMovesDoNotWakeTheStore`, `MessageComposerStateTest.adoptPutsTheCaretAtTheEnd`, `MessageComposerStateTest.adoptTakesAnotherConversationsDraft`
 
 All three of the first group fail when the handler is pointed back at the
 composed value (`onSend?.invoke(value)`, which is the old behaviour under the new
@@ -1165,12 +1165,19 @@ came back holding the message it had just sent, glued to the next one. Making th
 send work is what put this in reach: the same batch previously sent nothing at
 all (Enter saw a blank stale draft and the caller's guard returned).
 
-The composer now owns its `TextFieldValue` and the Enter handler blanks it before
-invoking `onSend`, so anything still queued in that batch edits an empty field.
-This also covers the mid-caret variant, where the leftover is not even a prefix —
-which is why no prefix-stripping hack was viable. If the caller keeps the draft
-rather than clearing it, the next `SideEffect` restores it, so the blank is only
-optimistic.
+The composer now owns its `TextFieldValue` (`MessageComposerState`) and blanks it
+before invoking `onSend`, so anything still queued in that batch edits an empty
+field. This also covers the mid-caret variant, where the leftover is not even a
+prefix — which is why no prefix-stripping hack was viable. If the caller keeps
+the draft rather than clearing it, the next `SideEffect` restores it, so the
+blank is only optimistic.
+
+**Every send path must blank it, not just Enter.** The first cut wired this into
+the composer's own key handler alone, which left the *buttons* — which clear the
+stored draft themselves — editing a stale buffer, i.e. the whole bug still open
+on the path that matters most: on Android the button is the only way to send,
+since Return inserts a newline. `MessageComposerState.committed()` is the shared
+call, made by the Enter handler and by all three send buttons.
 
 **Not verifiable in the harness, and unverified on Android.** The interleaving
 this closes cannot be staged: `runComposeUiTest` idles — and so recomposes —

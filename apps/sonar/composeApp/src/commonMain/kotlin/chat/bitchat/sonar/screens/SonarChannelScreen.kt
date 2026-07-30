@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.MessageComposerTextField
+import chat.bitchat.sonar.rememberMessageComposerState
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SlashHints
 import chat.bitchat.sonar.SonarAppState
@@ -59,6 +60,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
     val s = sonar
     val draftKey = composerDraftKeyForChannel(screen.geohash)
     val draft = state.composerDraft(draftKey)
+    val composer = rememberMessageComposerState(draft)
     var authorSheet by remember { mutableStateOf<SonarChannelMsg?>(null) }
     val listState = rememberLazyListState()
     LaunchedEffect(state.channelMsgs.size) {
@@ -153,6 +155,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             ) {
                 if (draft.isEmpty()) Text("Message $name", color = s.text3, fontSize = 16.sp)
                 MessageComposerTextField(
+                    state = composer,
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
@@ -173,6 +176,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                     .clickable {
                         val d = state.composerDraft(draftKey)
                         state.setComposerDraft(draftKey, "")
+                        composer.committed()
                         if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
                             state.sendChannelMsg(screen.geohash, d)
                         }
