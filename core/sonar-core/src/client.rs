@@ -884,6 +884,14 @@ fn retryable_media_http_error(error: &Error) -> bool {
 }
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Relay-side cap when pulling ALL of an author's KeyPackages. `author` can be
+/// attacker-chosen, and this query is unbounded otherwise. Note it bounds the
+/// relay query only: nostr-sdk's `Events` capacity does not apply, because the
+/// relay pool inserts with `force_insert`, which deliberately grows past it.
+/// Generous next to any real install's slot count (one per device, plus orphans
+/// from builds before the slot was stable).
+const KEY_PACKAGE_FETCH_LIMIT: usize = 32;
 /// Bound leave/membership publish so Delete/Leave cannot park the host's serial
 /// Marmot queue behind a stuck relay `send_event` (pool waits for every relay).
 const MEMBERSHIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -2451,9 +2459,10 @@ impl SonarClient {
     /// awaited: each `send_event` waits up to the per-relay OK timeout, and on
     /// cold start that wait sat on the host's serialized engine queue ahead of
     /// the first message drain (measured ~50s of `t3→t3a` on device). The
-    /// KeyPackage is a replaceable event republished on every relay connect,
-    /// so a lost send self-heals on the next connect; failures are logged,
-    /// not returned. Event creation (MLS key material persistence) still
+    /// KeyPackage is published into this install's stable addressable slot and
+    /// republished on every relay connect, so a lost send self-heals on the next
+    /// connect (it replaces the slot rather than adding another); failures are
+    /// logged, not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
         let event = self.engine.key_package_event(self.relays.clone())?;
@@ -2466,13 +2475,22 @@ impl SonarClient {
         Ok(())
     }
 
-    /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
-    /// several under different `d` tags — e.g. multiple devices, or a stale slot
-    /// from an old install). Newest first.
+    /// Fetch `author`'s KeyPackage events from the relays, newest first (a peer
+    /// may have several under different `d` tags: multiple devices, or stale
+    /// slots from old installs).
+    ///
+    /// Bounded by [`KEY_PACKAGE_FETCH_LIMIT`], so this is the newest N rather
+    /// than literally all. One consequence matters for the multi-device fan-out
+    /// this enables: pre-fix orphan events are permanent, since nothing deletes
+    /// them, so an account carrying more than the limit in orphans NEWER than a
+    /// dormant device's last republish would hide that device's slot from this
+    /// query. Fan-out will need a higher bound, pagination, or an explicit
+    /// decision that devices dormant past the orphan horizon are out of scope.
     pub async fn fetch_all_key_packages(&self, author: PublicKey) -> Result<Vec<Event>> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
-            .author(author);
+            .author(author)
+            .limit(KEY_PACKAGE_FETCH_LIMIT);
         let mut events: Vec<Event> = self
             .nostr
             .fetch_events(filter, FETCH_TIMEOUT)
@@ -2526,6 +2544,18 @@ impl SonarClient {
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
+    ///
+    /// `max_by_key` rather than taking the first element: `Events` happens to be
+    /// a descending-sorted set (`Ord for Event` orders `created_at` descending),
+    /// so the first element is already the newest across the merged pool, but
+    /// that is an invariant of a dependency's collection type rather than
+    /// anything this call states. Selecting explicitly costs nothing and does
+    /// not silently change meaning if that ordering ever does.
+    ///
+    /// The `limit` is a relay-side bound and must stay: `author` is
+    /// attacker-chosen on the join-request path. One event per relay is enough,
+    /// because the globally newest event is by definition the newest on whatever
+    /// relay carries it.
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
@@ -2534,7 +2564,7 @@ impl SonarClient {
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
         events
             .into_iter()
-            .next()
+            .max_by_key(|e| e.created_at)
             .ok_or(Error::KeyPackageNotFound(author))
     }
 

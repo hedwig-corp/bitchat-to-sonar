@@ -886,6 +886,16 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     if !staged.is_file() {
         // Already promoted (or never staged). Finish any leftover staged index.
         promote_staged_index_best_effort(db_path);
+        // Staging gone AND intent still set means a previous call renamed but
+        // died before finishing cleanup, so the slot below may still be the
+        // OUTGOING install's. Finish it here, gated on the intent marker: called
+        // with no restore in flight (intent absent) this must not run, or it
+        // would strand a healthy live install with key material and no
+        // coordinate. This arm is the only chance to heal it, because the
+        // clear below makes every later call take the no-intent path.
+        if restore_intent_path(db_path).is_file() {
+            drop_outgoing_key_package_slot(db_path);
+        }
         clear_restore_intent(db_path);
         return Ok(());
     }
@@ -895,7 +905,21 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
         sync_file(&staged_index)?;
     }
     remove_wal_sidecars(db_path);
+    // Drop the OUTGOING install's KeyPackage slot id. It addresses MLS key
+    // material in the database we are about to replace, so letting it survive
+    // the promotion would make the restored install republish into the previous
+    // install's addressable coordinate while holding different key material:
+    // two installs, one `(kind, pubkey, d)`, which is precisely what the stable
+    // slot exists to prevent. This has to be tied to the rename rather than to
+    // the host wiping first, because nothing enforces that ordering.
     fs::rename(&staged, db_path).map_err(|e| Error::Storage(format!("commit db rename: {e}")))?;
+    // AFTER the rename, not before: `fs::rename` can fail (cross-device,
+    // permissions), and on that path the old database is still the live install.
+    // Dropping its slot first would leave that still-live install with key
+    // material and no coordinate, so the next publish would mint a second one
+    // while the relays still carry the first: one install, two coordinates,
+    // which is the narrower form of the bug this cleanup exists to prevent.
+    drop_outgoing_key_package_slot(db_path);
     promote_staged_index_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
@@ -908,6 +932,35 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // like an unrequested staging file and get aborted.
     clear_restore_intent(db_path);
     Ok(())
+}
+
+/// Remove the outgoing install's KeyPackage slot id after its database has been
+/// replaced by a restore.
+///
+/// Called from both arms of [`commit_staged_account_restore`] so the function's
+/// retry contract cannot leak the slot: the commit can die between the rename
+/// and this cleanup, and on retry staging is gone, so only the early-return arm
+/// is left to finish the job.
+///
+/// Failures are logged rather than returned. Failing the commit here would push
+/// hosts to clear `db_key` and orphan already-live restored ciphertext, which is
+/// far worse than a stale coordinate. But they must not be silent: this is the
+/// one path where a failed unlink is also unrecoverable, since the intent marker
+/// is cleared immediately afterwards.
+fn drop_outgoing_key_package_slot(db_path: &Path) {
+    let live_slot = crate::marmot::key_package_slot_path_for(db_path);
+    for path in [crate::marmot::key_package_slot_tmp_path(&live_slot), live_slot] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                %e,
+                path = %path.display(),
+                "account restore: could not drop the outgoing KeyPackage slot; \
+                 the restored install may republish into the previous coordinate"
+            ),
+        }
+    }
 }
 
 fn promote_staged_index_best_effort(db_path: &Path) {

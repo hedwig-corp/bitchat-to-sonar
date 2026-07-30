@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use std::path::Path;
 
 use mdk_core::encrypted_media::{EncryptedMediaUpload, MediaReference};
+use mdk_core::key_packages::{validate_existing_d_tag, KeyPackageOptions};
 use mdk_core::prelude::*;
 use mdk_memory_storage::MdkMemoryStorage;
 use mdk_sqlite_storage::{EncryptionConfig, MdkSqliteStorage};
@@ -41,6 +42,11 @@ pub const KEY_PACKAGE_KIND: u16 = 30443;
 
 /// Sidecar file suffix for Sonar's relay-sync cursor beside the MDK database.
 pub(crate) const SYNC_STATE_FILE_SUFFIX: &str = ".sonar-sync.json";
+
+/// Sidecar file holding this install's kind-30443 KeyPackage slot id (the `d`
+/// tag). Kept beside the MDK database so it shares the database's lifetime: a
+/// wipe drops the slot along with the MLS key material it addresses.
+pub(crate) const KEY_PACKAGE_SLOT_FILE_SUFFIX: &str = ".sonar-keypackage-slot";
 
 /// Maximum raw MDK rows to scan while building a chat-only page. MDK stores
 /// commits/proposals alongside application chat rows, so a single raw page can
@@ -325,6 +331,13 @@ pub struct MarmotEngine {
     /// is never held across an await, so a concurrent send waits for at most
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
+    /// Where to persist this install's KeyPackage slot id (the kind-30443 `d`
+    /// tag). `None` for in-memory engines, which keep the slot in
+    /// [`Self::key_package_slot_memo`] for the life of the process instead.
+    db_path: Option<std::path::PathBuf>,
+    /// In-process cache of the slot id. Also the only storage for an in-memory
+    /// engine, so tests that publish twice see one stable slot.
+    key_package_slot_memo: std::sync::Mutex<Option<String>>,
 }
 
 impl MarmotEngine {
@@ -335,6 +348,8 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            db_path: None,
+            key_package_slot_memo: std::sync::Mutex::new(None),
         }
     }
 
@@ -383,6 +398,8 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            db_path: Some(path.to_path_buf()),
+            key_package_slot_memo: std::sync::Mutex::new(None),
         })
     }
 
@@ -416,12 +433,131 @@ impl MarmotEngine {
         Ok(())
     }
 
+    /// Path of the file holding this install's KeyPackage slot id.
+    fn key_package_slot_path(&self) -> Option<std::path::PathBuf> {
+        Some(key_package_slot_path_for(self.db_path.as_ref()?))
+    }
+
+    /// This install's stable KeyPackage slot id, or `None` if we have never
+    /// published one. Memo first, then disk. A stored value that does not satisfy
+    /// MIP-00's `d` tag rules is discarded rather than fed back to MDK, which
+    /// would reject it and leave us unable to publish at all.
+    /// `Ok(Some(d))` reuse that slot, `Ok(None)` mint a fresh one, `Err` do not
+    /// publish at all this cycle.
+    ///
+    /// The error case matters: `key_package_event` persists whatever slot it
+    /// ends up using, so silently substituting a value here would write that
+    /// substitute to disk permanently. In particular it must never fall back to
+    /// the identity-derived slot, which is a pure function of the npub: two
+    /// installs of one identity that each hit a transient read error would then
+    /// share one `(kind, pubkey, d)` coordinate and start replacing each other's
+    /// KeyPackage. That is the exact failure this change exists to remove, and
+    /// the iOS "container locked" case that triggers it would hit both of a
+    /// user's devices. Failing the publish is safe instead: hosts republish on
+    /// every relay connect and `publish_key_package_background` logs and
+    /// continues, so it self-heals on the next connect.
+    fn load_key_package_slot(&self) -> Result<Option<String>> {
+        if let Ok(memo) = self.key_package_slot_memo.lock() {
+            if let Some(d) = memo.as_ref() {
+                return Ok(Some(d.clone()));
+            }
+        }
+        let Some(path) = self.key_package_slot_path() else {
+            // No database to persist beside (in-memory engine). Derive the slot
+            // from the identity: with no disk, a random slot would mean a NEW
+            // permanent addressable event on every process start. The headless
+            // status probe runs one-shot per poll under a fixed nsec and would
+            // otherwise accumulate a slot per poll forever. Safe here precisely
+            // because an in-memory engine has no persistent install to collide
+            // with.
+            return Ok(Some(self.derived_key_package_slot()));
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                tracing::warn!(%e, "marmot: cannot read KeyPackage slot, skipping publish");
+                return Err(Error::Storage(format!("read KeyPackage slot: {e}")));
+            }
+        };
+        let d = raw.trim().to_string();
+        if validate_existing_d_tag(&d).is_err() {
+            tracing::warn!("marmot: stored KeyPackage slot id is malformed, minting a new slot");
+            return Ok(None);
+        }
+        if let Ok(mut memo) = self.key_package_slot_memo.lock() {
+            *memo = Some(d.clone());
+        }
+        Ok(Some(d))
+    }
+
+    /// Deterministic per-identity slot id, for engines with nowhere durable to
+    /// remember a random one. Stable across process restarts by construction.
+    ///
+    /// Only ever used when there is no database, so it cannot collide with a
+    /// persistent install: it is a pure function of the npub, so two callers
+    /// that used it would share one addressable coordinate.
+    ///
+    /// This is an addressing label, not key material: it is published in clear
+    /// in the `d` tag and only ever appears alongside the npub that already
+    /// identifies the event, so deriving it from the public key leaks nothing
+    /// the event does not already carry.
+    fn derived_key_package_slot(&self) -> String {
+        use nostr::hashes::{sha256::Hash as Sha256Hash, Hash as _};
+        let mut input = b"sonar-keypackage-slot-v1:".to_vec();
+        input.extend_from_slice(self.identity.public_key().to_hex().as_bytes());
+        Sha256Hash::hash(&input).to_string()
+    }
+
+    /// Persist the slot id so the NEXT publish replaces this addressable event
+    /// instead of creating another one. Best effort: a write failure costs us a
+    /// duplicate slot on the relays, never a failed publish.
+    fn store_key_package_slot(&self, d: &str) {
+        if let Ok(mut memo) = self.key_package_slot_memo.lock() {
+            *memo = Some(d.to_string());
+        }
+        let Some(path) = self.key_package_slot_path() else {
+            return;
+        };
+        // with_file_name, NOT with_extension: the slot file already contains
+        // dots, so with_extension would REPLACE the last component and yield
+        // `marmot.sqlite.tmp`. That name is absent from `sidecar_paths` (so a
+        // crashed rename would survive a wipe) and, for a db path ending in
+        // `.tmp`, would alias the database itself and truncate it. Matches the
+        // `{file_name}.tmp` form every other sidecar in this crate uses.
+        let tmp = key_package_slot_tmp_path(&path);
+        if std::fs::write(&tmp, d).is_ok() {
+            if std::fs::rename(&tmp, &path).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+    }
+
     /// Build a signed kind-30443 KeyPackage event, ready to publish to
     /// `relays` (which are also advertised inside the event tags).
+    ///
+    /// The `d` tag is this install's STABLE slot id, reused across publishes.
+    /// MDK mints a fresh random `d` whenever `existing_d_tag` is `None`, and
+    /// hosts republish on every relay connect, so without this each launch left
+    /// another addressable KeyPackage on the relays forever. That is not just
+    /// litter: a peer starting a DM fetches one of them, and with several live
+    /// slots (worse, several DEVICES sharing one npub) the welcome can be
+    /// addressed to key material that lives in a different install's database,
+    /// where it can never be decrypted. One slot per install keeps "which device
+    /// gets invited" answerable.
     pub fn key_package_event(&self, relays: Vec<RelayUrl>) -> Result<Event> {
         let _mls = self.mls_write();
+        let options = KeyPackageOptions {
+            existing_d_tag: self.load_key_package_slot()?,
+            ..Default::default()
+        };
         let kp = dispatch!(&self.storage, |mdk| mdk
-            .create_key_package_for_event(&self.identity.public_key(), relays))?;
+            .create_key_package_for_event_with_options(
+                &self.identity.public_key(),
+                relays.clone(),
+                options.clone()
+            ))?;
+        self.store_key_package_slot(&kp.d_tag);
         let event = EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), kp.content)
             .tags(kp.tags_30443)
             .build(self.identity.public_key())
@@ -1458,6 +1594,21 @@ fn is_unusable_db_error(message: &str) -> bool {
     m.contains("without encryption") || m.contains("unencrypted database")
 }
 
+/// The KeyPackage slot file beside the database at `db`. Single source of truth
+/// so callers outside this module cannot re-derive it slightly differently.
+pub(crate) fn key_package_slot_path_for(db: &Path) -> std::path::PathBuf {
+    let name = db.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    db.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}"))
+}
+
+/// `<file>.tmp` beside `path`, the atomic-write staging name every sidecar in
+/// this crate uses. Kept as a function so the writer and `sidecar_paths` cannot
+/// disagree about what a wipe has to remove.
+pub(crate) fn key_package_slot_tmp_path(path: &Path) -> std::path::PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    path.with_file_name(format!("{name}.tmp"))
+}
+
 fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     let name = base
         .file_name()
@@ -1470,12 +1621,14 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
+        KEY_PACKAGE_SLOT_FILE_SUFFIX,
     ]
     .iter()
     .map(|suffix| base.with_file_name(format!("{name}{suffix}")))
     .collect();
     paths.push(base.with_file_name(format!("{name}{SYNC_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
+    paths.push(base.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}.tmp")));
     paths
 }
 

@@ -563,3 +563,177 @@ async fn direct_nip17_bitchat_dm_drains_from_account_gift_wraps() {
         "acknowledged direct DMs are not duplicated by the gift-wrap lookback"
     );
 }
+
+/// Republishing a KeyPackage must REPLACE the addressable event at the relay,
+/// not add a second one, and a peer must resolve to the newest.
+///
+/// This is the relay-visible half of the stable-slot change. The unit tests in
+/// `persistence.rs` only prove the `d` tag is reused; whether a relay actually
+/// treats that as a NIP-33 replacement, and whether `fetch_key_package` picks
+/// the newest of what comes back, can only be shown against a real relay. This
+/// runs in CI, unlike the live-relay example harness.
+#[tokio::test]
+async fn republished_key_package_replaces_the_slot_and_newest_wins() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let alice_identity = Identity::generate();
+    let alice_pubkey = alice_identity.public_key();
+
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![relay_url.clone()],
+        &db_path,
+        [0x24; 32],
+    )
+    .await
+    .expect("alice connects");
+
+    alice.publish_key_package().await.expect("publish 1");
+    // created_at has 1s resolution, so separate the two publishes or "newest"
+    // is ambiguous and the assertion below would be luck rather than logic.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    alice.publish_key_package().await.expect("publish 2");
+
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
+        .await
+        .expect("bob connects");
+
+    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch all key packages");
+    assert_eq!(
+        all.len(),
+        1,
+        "two publishes must occupy ONE addressable slot, got {} events",
+        all.len()
+    );
+
+    let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch key package");
+    assert_eq!(
+        picked.id, all[0].id,
+        "fetch_key_package must resolve to the surviving newest event"
+    );
+}
+
+/// A one-shot in-memory client with a DURABLE identity must not mint a new slot
+/// on every run.
+///
+/// The headless status probe (`sonar-status`) imports a fixed nsec, connects
+/// in-memory, publishes a KeyPackage and exits, once per poll. With a random
+/// slot per process that accumulated one permanent addressable event per poll
+/// forever under a stable npub, and the probe then fetched all of them inside
+/// its own degraded threshold. Two independent clients sharing one identity
+/// stand in for two polls here.
+#[tokio::test]
+async fn in_memory_clients_sharing_an_identity_reuse_one_slot() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let identity = Identity::generate();
+    let pubkey = identity.public_key();
+
+    for _ in 0..2 {
+        let probe = SonarClient::connect_in_memory(identity.clone(), vec![relay_url.clone()])
+            .await
+            .expect("probe connects");
+        probe.publish_key_package().await.expect("probe publishes");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let observer = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url])
+        .await
+        .expect("observer connects");
+    let all = timeout(Duration::from_secs(10), observer.fetch_all_key_packages(pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch all key packages");
+
+    assert_eq!(
+        all.len(),
+        1,
+        "repeat one-shot probes must reuse one slot, got {} events",
+        all.len()
+    );
+}
+
+/// With a candidate on EACH relay, `fetch_key_package` must return the newest.
+///
+/// This needs two relays. `fetch_key_package` sends `limit(1)`, so a single
+/// relay returns only its own newest and the selection is done by the relay, not
+/// by us: against one relay `max_by_key` is a choice over one element and a
+/// regression to `min_by_key` still passes (verified). The real multi-candidate
+/// case is the cross-relay merge, where each relay contributes its newest and
+/// the client picks between them.
+///
+/// The older candidate is published as a raw event under a different `d`, not
+/// through the engine, so the stable-slot logic stays out of the way and it
+/// behaves like a pre-fix orphan that only one relay retained.
+#[tokio::test]
+async fn fetch_key_package_picks_the_newest_across_relays() {
+    use nostr::{EventBuilder, Kind, Tag, Timestamp};
+
+    let relay_new = MockRelay::run().await.expect("relay A starts");
+    let relay_old = MockRelay::run().await.expect("relay B starts");
+    let url_new = relay_new.url().await;
+    let url_old = relay_old.url().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let alice_identity = Identity::generate();
+    let alice_pubkey = alice_identity.public_key();
+    let alice_keys = alice_identity.keys().clone();
+
+    // Current slot lives on relay A only.
+    let alice = SonarClient::connect(
+        alice_identity,
+        vec![url_new.clone()],
+        &dir.path().join("marmot.sqlite"),
+        [0x51; 32],
+    )
+    .await
+    .expect("alice connects");
+    alice.publish_key_package().await.expect("publish current");
+
+    // An orphan from a hypothetical older install, on relay B only, with an
+    // explicitly OLDER created_at so "newest" is unambiguous.
+    let stale = EventBuilder::new(Kind::Custom(30443), "stale-key-package")
+        .tags([Tag::identifier("f".repeat(64))])
+        .custom_created_at(Timestamp::now() - 3600u64)
+        .build(alice_pubkey)
+        .sign_with_keys(&alice_keys)
+        .expect("sign stale key package");
+    let stale_id = stale.id;
+
+    let publisher = nostr_sdk::Client::default();
+    publisher.add_relay(url_old.clone()).await.expect("add relay B");
+    publisher.connect().await;
+    publisher.send_event(&stale).await.expect("publish stale");
+
+    // Bob sees both relays, so the pool merges one candidate from each.
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![url_new, url_old])
+        .await
+        .expect("bob connects");
+
+    let all = timeout(Duration::from_secs(10), bob.fetch_all_key_packages(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch all");
+    assert_eq!(all.len(), 2, "expected one candidate from each relay");
+
+    let picked = timeout(Duration::from_secs(10), bob.fetch_key_package(alice_pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch one");
+    assert_ne!(
+        picked.id, stale_id,
+        "must not resolve to the older orphan from the other relay"
+    );
+    let newest = all.iter().max_by_key(|e| e.created_at).expect("nonempty");
+    assert_eq!(picked.id, newest.id, "must resolve to the newest candidate");
+}
