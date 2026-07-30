@@ -1714,8 +1714,10 @@ final class BLEService: NSObject {
         }
 
         // A valid departure retires transport state too; otherwise the Noise
-        // session could stay usable for a peer we just removed.
+        // session could stay usable for a peer we just removed. The failure run
+        // goes with it: it counted against the session being dropped here.
         noiseService.clearSession(for: peerID)
+        clearDecryptFailures(for: peerID)
 
         _ = collectionsQueue.sync(flags: .barrier) {
             // Remove the peer when they leave
@@ -3404,6 +3406,10 @@ extension BLEService {
     private func configureNoiseServiceCallbacks(for service: NoiseEncryptionService) {
         service.onPeerAuthenticated = { [weak self] peerID, fingerprint in
             SecureLogger.debug("🔐 Noise session authenticated with \(peerID), fingerprint: \(fingerprint.prefix(16))...")
+            // A new session starts with a clean slate. This covers every route
+            // to one — rehandshake, peer restart, reconnect after a leave — so
+            // no earlier session's partial failure run can be spent against it.
+            self?.clearDecryptFailures(for: peerID)
             self?.messageQueue.async { [weak self] in
                 self?.sendPendingMessagesAfterHandshake(for: peerID)
                 self?.sendPendingNoisePayloadsAfterHandshake(for: peerID)
@@ -5052,6 +5058,17 @@ extension BLEService {
         decryptFailuresLock.lock()
         defer { decryptFailuresLock.unlock() }
         decryptFailures.removeAll()
+    }
+
+    /// Drops one peer's run. A run counts failures against a *particular*
+    /// session, so it must not survive that session: carrying two failures into
+    /// a freshly established session would make its first failure the third,
+    /// collapsing the tolerance this path exists to provide down to one packet
+    /// for that peer.
+    private func clearDecryptFailures(for peerID: PeerID) {
+        decryptFailuresLock.lock()
+        defer { decryptFailuresLock.unlock() }
+        decryptFailures.recordSuccess(for: peerID)
     }
 
     // MARK: Helper Functions
