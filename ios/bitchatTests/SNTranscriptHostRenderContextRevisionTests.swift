@@ -68,6 +68,15 @@ struct SNTranscriptHostRenderContextRevisionTests {
         #expect(sendVersion == openVersion &+ 1)
         sync(context, msgs: msgsB)
         #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: false) == sendVersion)
+
+        // A showAuthors flip with an identical transcript (group membership
+        // resolving after open) is a row-affecting change too: the prediction
+        // must bump exactly as sync will, or the flip pass gets skipped and
+        // author labels never appear until the next row change.
+        let flipVersion = context.contentVersion(afterSyncing: msgsB, showAuthors: true)
+        #expect(flipVersion == sendVersion &+ 1)
+        sync(context, msgs: msgsB, showAuthors: true)
+        #expect(context.contentVersion(afterSyncing: msgsB, showAuthors: true) == flipVersion)
     }
 
     /// The bug's exact pass sequence: open → idle publish (keystroke) → send.
