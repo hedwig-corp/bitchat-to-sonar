@@ -200,7 +200,11 @@ PHASES = [
     ("t2 → t4   (relay path)          ", "t2_relay_connect_begin", "t4_first_drain"),
     ("TOTAL t1 → t4 (paint → synced)  ", "t1_local_paint", "t4_first_drain"),
     ("TOTAL t0 → t4 (in-app → synced) ", "t0_launch", "t4_first_drain"),
-    ("t3 → t3a  (publish+hydrate off-path)", "t3_relay_connected", "t3a_published"),
+    ("t3 → t3a  (publish dispatch)    ", "t3_relay_connected", "t3a_published"),
+    # Publish latency itself, now CONCURRENT with the drain (#265): a large
+    # value here is no longer a cold-start regression on its own — judge the
+    # drain by t3b → t4.
+    ("t3 → t3a-done (publish latency) ", "t3_relay_connected", "t3a_publish_done"),
 ]
 def fmt(x): return "    n/a" if x is None else f"{x:8.0f}"
 

@@ -425,6 +425,11 @@ final class MarmotChatModel: ObservableObject {
     /// Ownership token per group so a cancelled task's `defer` cannot clear a
     /// newer recovery's bookkeeping (mirrors `directChatSetupTasks`).
     private var blankTranscriptRecoveryTokens: [String: UUID] = [:]
+    /// Newest dispatched identity-publish chain (#265). The chain is detached
+    /// so it cannot hold the cold-start path, which also means nothing else
+    /// cancels it — an account switch must invalidate it explicitly.
+    private var identityPublishTask: Task<Void, Never>?
+    private var identityPublishGeneration: UInt64 = 0
     /// Core-owned row metadata for every conversation. Kept separate from
     /// transcript pages so summary placeholders never render as chat bubbles.
     @Published private(set) var conversationSummariesByGroup: [String: MarmotService.ConversationSummary] = [:]
@@ -1518,29 +1523,32 @@ final class MarmotChatModel: ObservableObject {
                 // disconnect). Does not block cold start; Blossom itself does
                 // not need the relay, but publish still uses the outbox.
                 self.scheduleResumePendingMediaUploads()
-                try? await self.service.publishKeyPackageBackground()
+                // Identity publishes are relay I/O that nothing on the
+                // cold-start path waits for, so they run detached on their own
+                // lane: awaiting them here kept this Task — and, before the
+                // dedicated lane, the serial engine queue — busy between
+                // relay-connect and first drain (#265: 25-57s t3→t3a on a
+                // 43-group account). Receive was already unblocked by starting
+                // the drain above; this stops the publish chain from competing
+                // with it at all.
+                identityPublishTask?.cancel()
+                identityPublishGeneration &+= 1
+                let publishGeneration = identityPublishGeneration
+                identityPublishTask = Task { [weak self] in
+                    await self?.publishIdentityAfterConnect(generation: publishGeneration)
+                }
                 // After nsec restore the local nick/handle sidecars are empty.
                 // Fetch our own kind-0 first so the host can adopt name + nip05
                 // before any republish — publishing blank/stale metadata would
                 // replace the durable relay profile.
-                let safeToPublish = await self.hydrateOwnProfileFromRelays()
-                // Republish our kind-0 profile here too (not just on the npub
-                // signal / rename): the KeyPackage lands reliably on every relay
-                // connect, but the profile previously did not, so peers saw our
-                // raw npub when the opportunistic publish lost the relay /
-                // onboarding race. Keep them in lockstep. Never publish a blank
-                // name or before the handle sidecar is seeded (would wipe
-                // relay metadata / nip05).
-                if safeToPublish,
-                   let name = self.profileNameProvider?()
-                    .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
-                    try? await self.service.publishProfileBackground(name: name)
-                }
                 #if DEBUG
-                // SONAR_BENCH: KeyPackage + profile publish ENQUEUED (T3a). The
-                // relay sends complete in the background inside the core; this
-                // marker now measures event creation, not relay OK acks (see
-                // docs/PERFORMANCE.md).
+                // SONAR_BENCH: the publish chain is DISPATCHED (T3a). Since
+                // #265 the chain runs detached on the publish lane, so this
+                // marker measures the connect path handing it off, not the
+                // relay round trips — t3→t3a is now the cost the cold start
+                // actually pays. `publishIdentityAfterConnect` logs its own
+                // completion (t3a_publish_done) for the publish latency
+                // itself; see docs/PERFORMANCE.md.
                 SecureLogger.info("SONAR_BENCH t3a_published", category: .session)
                 self.startSendBenchmarkIfRequested()
                 self.startStickerBenchmarkIfRequested()
@@ -2707,6 +2715,52 @@ final class MarmotChatModel: ObservableObject {
         Task { try? await service.publishProfileBackground(name: trimmed) }
     }
 
+    /// KeyPackage + profile publish, detached from the cold-start connect
+    /// path (#265). Ordering inside the chain still matters: fetch our own
+    /// kind-0 BEFORE republishing, or a blank/stale local name would replace
+    /// the durable relay profile after an nsec restore.
+    ///
+    /// `generation` is the account generation at dispatch.
+    ///
+    /// Do NOT remove this guard on the theory that the caller cancels us.
+    /// Before #265 the chain ran inline in `connectRelaysIfNeeded`'s
+    /// unstructured `Task {}` — which is never stored in `relayConnectTask`
+    /// (that field is only ever assigned in `scheduleRelayConnect`), so it was
+    /// never cancelled either. The chain has therefore NEVER had caller
+    /// cancellation; this guard fixes a latent bug rather than restoring
+    /// something the detach took away. Without it the chain can park in
+    /// `fetchOwnProfile(npub: <old npub>)` across an account switch and then
+    /// hand the PREVIOUS account's name/nip05 to the host and republish it
+    /// under the new key — the hazard `descriptorCacheGeneration` already
+    /// guards for contacts.
+    func publishIdentityAfterConnect(generation: UInt64) async {
+        guard isCurrentIdentityPublish(generation) else { return }
+        try? await service.publishKeyPackageBackground()
+        guard isCurrentIdentityPublish(generation) else { return }
+        let safeToPublish = await hydrateOwnProfileFromRelays()
+        guard isCurrentIdentityPublish(generation) else { return }
+        // Republish our kind-0 profile here too (not just on the npub signal /
+        // rename): the KeyPackage lands reliably on every relay connect, but
+        // the profile previously did not, so peers saw our raw npub when the
+        // opportunistic publish lost the relay / onboarding race. Keep them in
+        // lockstep. Never publish a blank name or before the handle sidecar is
+        // seeded (would wipe relay metadata / nip05).
+        if safeToPublish,
+           let name = profileNameProvider?()
+            .trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            try? await service.publishProfileBackground(name: name)
+        }
+        #if DEBUG
+        SecureLogger.info("SONAR_BENCH t3a_publish_done", category: .session)
+        #endif
+    }
+
+    /// True while `generation` is still the newest dispatched identity publish
+    /// and the task has not been cancelled.
+    private func isCurrentIdentityPublish(_ generation: UInt64) -> Bool {
+        !Task.isCancelled && generation == identityPublishGeneration
+    }
+
     /// Fetch our own kind-0, cache it, let the host adopt name/NIP-05, and
     /// re-claim the handle when the core sidecar is empty so later publishes
     /// cannot drop `nip05`. Returns whether it is safe to republish kind-0.
@@ -2750,7 +2804,9 @@ final class MarmotChatModel: ObservableObject {
                 coreClaimedHandle: claimedNow
             )
         }
-        guard let profile = try? await service.fetchProfile(npub: me) else {
+        // Own kind-0 on the publish lane: it gates the republish below, so it
+        // must not park the serial engine queue the first drain needs (#265).
+        guard let profile = try? await service.fetchOwnProfile(npub: me) else {
             // Do not set didFetchOwnProfileThisSession — a miss should retry.
             return !localNick.isEmpty && OwnProfileHydration.canPublishOwnProfile(
                 localBip353: localBip,
@@ -4613,6 +4669,13 @@ final class MarmotChatModel: ObservableObject {
         defer { resumeAccountWork(ifOwned: mutationLease) }
         stopPolling()
         invalidateGapRecovery()
+        // The detached identity-publish chain is not covered by
+        // `quiesceAccountWork` (it is unstructured), so invalidate it
+        // explicitly or it can republish the OLD account's kind-0 under the
+        // new key after the wipe.
+        identityPublishTask?.cancel()
+        identityPublishTask = nil
+        identityPublishGeneration &+= 1
         clearIdentityScopedState()
         clearAccountContactDescriptors()
         try await wipeDatabase()
