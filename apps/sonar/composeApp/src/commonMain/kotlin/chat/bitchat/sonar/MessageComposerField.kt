@@ -29,14 +29,32 @@ internal expect val messageComposerEnterSends: Boolean
  */
 internal val messageComposerKeyboardOptions = KeyboardOptions(imeAction = ImeAction.None)
 
+/**
+ * The shared message composer text field.
+ *
+ * [currentDraft] is read when Enter is pressed and is what gets sent — never the
+ * [value] this composition was passed. Key events are dispatched as they arrive
+ * while recomposition waits for the next frame, so [value] is only a snapshot of
+ * the last completed frame: a laggy frame queues a burst of key events plus the
+ * Enter behind them, and sending [value] drops everything typed since. It must
+ * return the caller's stored draft, which every keystroke updates synchronously
+ * through [onValueChange].
+ *
+ * Reading the store rather than tracking the text here also means anything else
+ * that owns the draft is seen immediately: a send button that just committed and
+ * cleared it, a slash-hint completion, an emoji appended by the tray. A second
+ * Enter from the same input batch reads the cleared draft and sends nothing,
+ * instead of sending the message again.
+ */
 @Composable
 internal fun MessageComposerTextField(
     value: String,
     onValueChange: (String) -> Unit,
     textStyle: TextStyle,
     cursorBrush: Brush,
+    currentDraft: () -> String,
     modifier: Modifier = Modifier,
-    onSend: (() -> Unit)? = null,
+    onSend: ((String) -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
     BasicTextField(
@@ -56,7 +74,7 @@ internal fun MessageComposerTextField(
                         isEnter &&
                         !event.isShiftPressed
                     ) {
-                        onSend?.invoke()
+                        onSend?.invoke(currentDraft())
                         true
                     } else {
                         false

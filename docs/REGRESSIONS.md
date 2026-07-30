@@ -1373,6 +1373,115 @@ gate; a retry/first-send whose canonical row lands out-of-window can drop until
 the newest-edge reload. Same shape, separate call sites — gate them the same
 way when touched.
 
+## R-026 — A send commits the stored draft, never the one it last composed
+
+**Invariant:** Whatever commits a message — desktop Enter or a send button — uses
+`SonarAppState.composerDraft(chatId)` read at event time. The draft a composition
+captured is a snapshot of the last completed frame and must never be what gets
+sent, appended to, or tested for emptiness at commit time.
+
+**Breaks as:** The sent message is truncated. The composer shows the full text
+right up to the keypress, the bubble is missing its tail, and how much is cut
+varies with load — which reads as random corruption rather than a race.
+
+**Why:** key events are dispatched as they arrive; recomposition happens on the
+next frame. A lambda that closed over the composed `draft` cannot see keystrokes
+that landed after the last recomposition, and a laggy frame queues a whole burst
+of them plus the Enter behind it. The *store* is never stale — every keystroke
+writes it synchronously through `onValueChange` — so the fix is to read the one
+copy that is always current, which also makes every other owner of the draft
+visible at once (a button that just cleared it, a completion, an emoji append).
+
+**Call sites:** `MessageComposerTextField` takes `currentDraft: () -> String` and
+sends *that*, never `value`. The three send buttons in `ChatScreen`,
+`GeoDmScreen` and `SonarChannelScreen` read `state.composerDraft(key)` in the
+click handler. `ChatScreen`'s `onEmoji` was the same class and worse — `draft + it`
+is a read-modify-write, so a stale base *deleted* everything typed since the last
+frame instead of truncating a send; it reads the store now. That one is not
+desktop-only: the tray plus a soft keyboard is the mobile path.
+
+**Callers must forward `onValueChange` synchronously.** `currentDraft` is only as
+good as the store behind it; a debounced or async draft store would put the
+truncation straight back and no test here would catch it.
+
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`
+
+The first three fail when the handler is pointed back at the composed value
+(`onSend?.invoke(value)` — the old behaviour under the new signature; a literal
+revert does not compile, since `onSend` changed from `(() -> Unit)?` to
+`((String) -> Unit)?`). They stage the divergence with a call site that never
+recomposes, which is what a stalled frame produces: the store moves, `value` does
+not.
+
+**Still open — a keystroke *after* the commit, in the same batch.** The
+`BasicTextField` editing buffer holds the pre-commit text until the caller's
+write composes, so a keystroke from that batch edits it. After Enter,
+`[h, i, Enter, !]` leaves the composer holding `"hi!"` — the message just sent,
+glued to the next. It is not Enter-only: a button click has the same variant, and
+an emoji tap is the worst of them, because the keystroke edits a buffer holding
+the pre-emoji text and **the emoji silently vanishes** from the store, with no
+wrong text shown first. Making the send work is what put this in reach — the same
+batch previously sent nothing at all.
+
+*Do not try to fix it by owning the `TextFieldValue` and blanking on send.* That
+was written and reverted (#521): `CoreTextField` reconciles the `EditProcessor`
+buffer from the hoisted value by calling `processor.reset(value, inputSession)` as
+**straight-line code in the composable body** — confirmed by disassembling
+`CoreTextFieldKt` from `foundation-desktop-1.7.3.jar` (`LegacyTextFieldState.update(...)`
+then `EditProcessor.reset(...)`, in the method taking a `Composer`, not in any
+lambda). Writing the hoisted value mid-burst only schedules a recomposition; the
+buffer resets at exactly the moment the value-based overload would have. The real
+fix is `BasicTextField(state: TextFieldState)`, where `clearText()` mutates a
+buffer the caller owns — a migration that moves IME/selection behaviour on both
+mobile platforms (see R-007) and needs device testing.
+
+**Coverage (honest):** the tests pin the shared field only. The three send
+buttons and the emoji append are **not** covered — they live in large screen
+composables needing a constructed `SonarAppState`, so the fresh read there is by
+inspection. The same-batch interleaving cannot be staged at all: `runComposeUiTest`
+idles — and so recomposes — between injected key events, which is the
+interleaving itself. A UI test written for it passed either way and was deleted
+rather than left as false coverage; pressing Enter twice inside one
+`performKeyInput` block does not work either, and pinning it needs a fake frame
+clock. Send chrome (`sendEnabled`, mic-vs-send, placeholder) still reads the
+composed `draft` and lags a frame: it can briefly refuse a click, never send the
+wrong thing.
+
+**The call sites are the hole, and they are where the bug lived.** Everything
+above pins the shared field; the original defect was in the *callers*, which
+closed over `draft`. They are correct now because they use `currentDraft` and the
+lambda parameter, but nothing stops a future `onSend = { state.send(chatId, draft) }`
+from reintroducing it verbatim. This is the R-001 shape — helper-level tests
+green while a call site regressed.
+
+**Apple — same symptom reported, different mechanism, unresolved.** An earlier
+draft of this entry claimed Apple was "not affected". That was an overclaim: what
+is true is that Apple has no *closure-capture* stale read — SwiftUI reads
+`@State`/`@Binding` through live storage, and the macOS composer is already bound
+to the store (`SNComposer(text: store.composerDraftBinding(for: id))`), so
+`SNComposer.send()` reads the always-current copy. macOS has since been reported
+truncating anyway. The candidate mechanism is one layer down: whether SwiftUI has
+flushed keystrokes into the binding by the time `.onKeyPress(keys: [.return])`
+fires, since that runs during AppKit key dispatch ahead of the text system. That
+would be a *systematic* lag rather than a load-dependent race — useful when
+reproducing, because it would not need a stalled frame. Unverified; do not treat
+the Compose fix as covering macOS.
+
+**Rejected:**
+- *Reading the hoisted `value` in the key handler.* Same composition-time
+  snapshot the call site captured, stale in exactly the same window.
+- *Tracking the field's own text in a holder.* Shipped first, then removed: a
+  second source of truth disagreed with the store whenever anything other than a
+  keystroke changed the draft — button send, slash hint, emoji append — and each
+  disagreement was its own bug (a duplicate send, and a completion sent as the
+  text it replaced).
+- *Fixing only the `onSend` call sites and leaving the field alone.* Works, but
+  leaves the footgun for the next composer; the field should not be able to send
+  something the store does not have.
+- *`SlashHints` reading the composed value.* Left deliberately — the user picks a
+  completion from what is on screen.
+
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
