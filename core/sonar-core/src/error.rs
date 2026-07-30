@@ -45,6 +45,13 @@ pub enum Error {
     #[error("no key package found on relays for {0}")]
     KeyPackageNotFound(PublicKey),
 
+    #[error(
+        "this contact's app uses a newer Marmot protocol than this build supports \
+         (for example the new White Noise iOS app); a Sonar update is required to \
+         chat with them"
+    )]
+    PeerProtocolTooNew(PublicKey),
+
     #[error("encrypted media error: {0}")]
     Media(String),
 
