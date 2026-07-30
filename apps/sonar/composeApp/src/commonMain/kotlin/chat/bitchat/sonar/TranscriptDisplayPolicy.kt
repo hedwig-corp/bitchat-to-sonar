@@ -225,6 +225,12 @@ internal fun eligibleCanonicalRowsForSendEcho(
     it.id !in excludedPublishedIds &&
         it.mine &&
         it.content == echo.content &&
+        // iOS parity (`serverMessage(_:matchesOptimistic:)`): sticker rows
+        // carry EMPTY content on both the echo and the canonical row (the
+        // sticker rides a tag), so content equality alone would let a
+        // different sticker — or an own media row, also empty-content —
+        // falsely consume a sticker echo.
+        it.stickerRef == echo.stickerRef &&
         it.viaInternet == echo.viaInternet &&
         it.tsSecs >= echo.tsSecs
 }

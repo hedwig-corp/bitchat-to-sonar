@@ -8123,26 +8123,32 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 sendMarmotStickerOrdered(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
+                markSendEchoAccepted(chatId, echo.id)
                 val generation = transcriptGeneration
-                val local = withSendEchoes(
+                val published = mergePendingMediaUploads(
                     chatId,
-                    mergePendingMediaUploads(chatId, marmotMessagesPageForChat(chatId, generation)),
+                    marmotMessagesPageForChat(chatId, generation),
                 )
-                if (isCurrentTranscriptSession(chatId, generation)) {
+                val hasCanonicalRow = reserveSuccessfulEchoCanonicalRows(chatId, echo, published)
+                val local = withSendEchoes(chatId, published)
+                val publishedToOpenChat = isCurrentTranscriptSession(chatId, generation)
+                if (publishedToOpenChat) {
                     setCurrentVisibleMessages(chatId, local, processCalls = true)
                 }
-                // Clear only after the canonical page has been read and (when
-                // the session is still current) published. Clearing before the
-                // read left a window where a concurrent republish painted the
-                // transcript with neither the echo nor the sticker row.
-                //
-                // Deliberately NOT gated like the text send's clear: a
-                // canonical sticker row has EMPTY content (the sticker rides a
-                // tag — see core `create_sticker_event_inner`), so the
-                // content-matching echo plan can never fulfil or retire a
-                // sticker echo. The hard clear is this echo's only end of
-                // life; gating it would ghost a "Sending" sticker forever.
-                clearSendEcho(chatId, echo.id)
+                // Same gate as the text send. A sticker echo and its canonical
+                // row both carry empty content plus the sticker ref (the
+                // privateDmMessage marker parse mirrors iOS sendSticker), so
+                // the plan fulfils and window-retires it like any text echo —
+                // the matcher compares stickerRef so an own media row or a
+                // different sticker cannot consume it. An unconditional clear
+                // here deleted an out-of-window row's only carrier (R-022) and
+                // erased the visible bubble when the publish was dropped by a
+                // rolled session (R-011 shape).
+                if (hasCanonicalRow &&
+                    (publishedToOpenChat || (screen as? Screen.Chat)?.id != chatId)
+                ) {
+                    clearSendEcho(chatId, echo.id)
+                }
             } catch (e: Throwable) {
                 failSendEcho(chatId, echo.id)
                 toast = "send failed: ${e.message}"

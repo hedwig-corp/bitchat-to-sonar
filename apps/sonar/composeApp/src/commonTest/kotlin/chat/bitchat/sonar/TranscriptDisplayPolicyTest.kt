@@ -13,6 +13,7 @@ class TranscriptDisplayPolicyTest {
         mine: Boolean = false,
         viaInternet: Boolean = false,
         state: String? = null,
+        stickerRef: SonarStickerRef? = null,
     ) = SonarMsg(
         id = id,
         senderNpub = "npub",
@@ -21,6 +22,13 @@ class TranscriptDisplayPolicyTest {
         tsSecs = ts,
         viaInternet = viaInternet,
         state = state,
+        stickerRef = stickerRef,
+    )
+
+    private fun stickerRef(shortcode: String) = SonarStickerRef(
+        packCoordinate = "30031:abcdef1234:pack",
+        shortcode = shortcode,
+        plaintextSha256 = "aa".repeat(32),
     )
 
     @Test
@@ -670,6 +678,67 @@ class TranscriptDisplayPolicyTest {
         // row must now be carried by the window itself.
         val (rendered4, _) = publish(pending3, pinnedWindow + canonical)
         assertTrue(rendered4.any { it.id == canonical.id })
+    }
+
+    // ── Sticker echoes (empty content on both sides; ref must disambiguate) ──
+    // A sticker echo and its canonical row both carry content "" — the sticker
+    // rides a tag (iOS parity: privateDmMessage / core create_sticker_event_
+    // inner). Content equality alone would let an own media row or a DIFFERENT
+    // sticker consume the echo; the matcher must compare stickerRef.
+
+    @Test
+    fun stickerEchoIsFulfilledOnlyByItsOwnStickerRow() {
+        val echo = message(
+            "echo-1", 100, content = "", mine = true, viaInternet = true,
+            state = "Sending", stickerRef = stickerRef("wave"),
+        )
+        val otherSticker = message(
+            "event-1", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("fire"),
+        )
+        val mediaRow = message("event-2", 100, content = "", mine = true, viaInternet = true)
+        val matching = message(
+            "event-3", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("wave"),
+        )
+
+        val wrongOnly = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(otherSticker, mediaRow),
+            freshCanonical = emptyList(),
+        )
+        assertTrue(wrongOnly.fulfilledEchoIds.isEmpty(), "different sticker/media row must not consume the echo")
+
+        val withMatch = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(otherSticker, mediaRow, matching),
+            freshCanonical = emptyList(),
+        )
+        assertEquals(setOf("echo-1"), withMatch.fulfilledEchoIds)
+        assertEquals(setOf("echo-1"), withMatch.windowedFulfilledEchoIds)
+    }
+
+    @Test
+    fun outOfWindowStickerRowIsAdmittedAndDoesNotRetireTheEcho() {
+        val echo = message(
+            "echo-1", 100, content = "", mine = true, viaInternet = true,
+            state = "Accepted", stickerRef = stickerRef("wave"),
+        )
+        val canonical = message(
+            "event-1", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("wave"),
+        )
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = listOf(message("old-1", 50, "older row")),
+            excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(listOf(canonical), plan.admittedCanonical)
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty(), "out-of-window sticker row must not retire its echo")
     }
 
     // ── firstUnreadTranscriptIndex (Signal-style unread anchoring) ──
