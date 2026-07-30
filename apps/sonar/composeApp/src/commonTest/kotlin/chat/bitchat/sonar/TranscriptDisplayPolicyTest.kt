@@ -593,6 +593,85 @@ class TranscriptDisplayPolicyTest {
         assertEquals(listOf(canonical), plan.admittedCanonical)
     }
 
+    // ── Echo lifetime across publishes (the vanishing-sent-row regression) ──
+    // An echo fulfilled by an OUT-of-window canonical row is that row's only
+    // carrier: `withSendEchoes` short-circuits once the echo is retired, and a
+    // scroll-up (`loadOlderMessages`-shaped) publish can never re-introduce a
+    // newer row. Retiring on the first fulfilled call therefore made the sent
+    // message vanish until delivery flipped to Sent. The sequence below is the
+    // real `withSendEchoes` contract driven across three publishes.
+
+    @Test
+    fun acceptedEchoFulfilledOutOfWindowIsNotRetired() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Accepted")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+        val pinnedWindow = listOf(message("old-1", 50, "older row"))
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = pinnedWindow,
+            excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(listOf(canonical), plan.admittedCanonical)
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun sentRowStaysVisibleAcrossScrollShapedPublishesUntilWindowed() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Accepted")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+        val pinnedWindow = listOf(message("old-1", 50, "older row"))
+
+        // withSendEchoes contract: plan, retire terminal echoes, then render
+        // published(non-echo) + admittedCanonical + visibleEchoes.
+        fun publish(
+            pending: List<SonarMsg>,
+            window: List<SonarMsg>,
+        ): Pair<List<SonarMsg>, List<SonarMsg>> {
+            if (pending.isEmpty()) return window to pending
+            val plan = planSendEchoDisplay(
+                echoes = pending,
+                published = window,
+                excludedPublishedIdsByEcho = emptyMap(),
+                freshCanonical = listOf(canonical),
+            )
+            val remaining = pending.filterNot { it.id in plan.terminalAcceptedEchoIds }
+            val rendered = (
+                window.filterNot { it.id.startsWith(SEND_ECHO_ID_PREFIX) } +
+                    plan.admittedCanonical +
+                    plan.visibleEchoes
+                ).distinctBy { it.id }.sortedBy { it.tsSecs }
+            return rendered to remaining
+        }
+
+        // Publish 1: send-reconcile shaped — canonical row only in freshCanonical.
+        val (rendered1, pending1) = publish(listOf(echo), pinnedWindow)
+        assertTrue(rendered1.any { it.id == canonical.id }, "send publish must show the sent row")
+
+        // Publish 2: loadOlderMessages shaped — the prepended window still
+        // excludes the canonical row. Before the fix the echo was already
+        // retired, so this publish dropped the sent message entirely.
+        val (rendered2, pending2) = publish(pending1, pinnedWindow)
+        assertTrue(
+            rendered2.any { it.id == canonical.id },
+            "scroll-up publish must keep the sent row visible",
+        )
+
+        // Publish 3: the newest-page merge finally admits the row into the
+        // window — NOW the echo retires and the row survives on its own.
+        val (rendered3, pending3) = publish(pending2, pinnedWindow + canonical)
+        assertTrue(rendered3.any { it.id == canonical.id })
+        assertTrue(pending3.isEmpty(), "windowed canonical row must retire the echo")
+
+        // Publish 4: with the echo gone, withSendEchoes short-circuits — the
+        // row must now be carried by the window itself.
+        val (rendered4, _) = publish(pending3, pinnedWindow + canonical)
+        assertTrue(rendered4.any { it.id == canonical.id })
+    }
+
     // ── firstUnreadTranscriptIndex (Signal-style unread anchoring) ──
 
     @Test

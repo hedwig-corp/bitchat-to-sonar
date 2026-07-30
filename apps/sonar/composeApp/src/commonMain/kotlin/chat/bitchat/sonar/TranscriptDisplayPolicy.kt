@@ -269,6 +269,15 @@ internal fun fulfilledSendEchoIds(
 internal data class SendEchoReconciliation(
     val fulfilledEchoIds: Set<String>,
     val admittedCanonical: List<SonarMsg>,
+    /**
+     * Echoes whose fulfilling row is already inside the published window.
+     * Only these are safe to retire permanently: an echo fulfilled by an
+     * out-of-window row is that row's ONLY carrier ([admittedCanonical] is
+     * recomputed per publish from live echoes), so retiring it makes the
+     * sent message vanish on the next publish that excludes the row —
+     * e.g. `loadOlderMessages`' prepend-only page.
+     */
+    val windowedFulfilledEchoIds: Set<String> = emptySet(),
 )
 
 /**
@@ -299,6 +308,7 @@ internal fun reconcileSendEchoes(
     }
     val candidates = published.filterNot { it.id.startsWith(SEND_ECHO_ID_PREFIX) } + outOfWindow
     val fulfilled = mutableSetOf<String>()
+    val windowedFulfilled = mutableSetOf<String>()
     val admitted = mutableListOf<SonarMsg>()
     val consumedPublished = mutableSetOf<String>()
     val ownCandidates = candidates.filter { it.mine }.groupBy { it.content }
@@ -314,10 +324,14 @@ internal fun reconcileSendEchoes(
         if (match != null) {
             fulfilled.add(echo.id)
             consumedPublished.add(match.id)
-            if (match.id !in windowedIds) admitted.add(match)
+            if (match.id in windowedIds) {
+                windowedFulfilled.add(echo.id)
+            } else {
+                admitted.add(match)
+            }
         }
     }
-    return SendEchoReconciliation(fulfilled, admitted)
+    return SendEchoReconciliation(fulfilled, admitted, windowedFulfilled)
 }
 
 private fun newlinePrefixEnd(source: String, maxNewlines: Int): Int {

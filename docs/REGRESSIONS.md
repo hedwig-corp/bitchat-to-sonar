@@ -1233,6 +1233,59 @@ Also not guarded: the expired-session recovery this entry's decrypt path depends
 - *Resetting the Rust link's Noise session when an announce names a different fingerprint.* This looks like the natural recovery path for a rotated identity, but announces are replayable, so it hands an attacker the same one-packet teardown by replaying any victim's announce onto a healthy link. The link is demoted to non-direct instead, which keeps the peer visible in the radar as relayed while refusing to move the route.
 - *Dropping only `noise` and leaving `bind` on a rejected Rust handshake.* `bind_allowed` consults `bind.fingerprint` without requiring an established session, so the attacker's link would keep counting as the victim for allowlist fan-out and keep announcing as that peer. The whole binding is cleared.
 
+## R-025 — A fulfilled echo must not retire before its canonical row is windowed
+
+**Invariant:** A send echo fulfilled by a canonical row that is OUTSIDE the
+published render window stays pending (hidden — the admitted row renders in its
+place) until the row is inside the window. Only a windowed canonical row may
+permanently retire its echo.
+
+**Breaks as:** A just-sent message vanishes from the open chat — typically when
+the user scrolls during "Sending" — and reappears only when delivery flips to
+Sent and the newest-page merge re-admits the row.
+
+**Why:** On Compose the echo is the out-of-window row's ONLY carrier:
+`withSendEchoes` short-circuits once `pendingSendEchoes` is empty, and
+`admittedCanonical` is recomputed per publish from live echoes, never persisted.
+`loadOlderMessages` publishes through `prependConversationRows`, which by
+construction cannot introduce a row newer than the pre-scroll window — so after
+a one-shot retire (#273's `terminalAcceptedEchoIds` + #290's out-of-window
+fulfilment) a scroll-up publish contains neither the echo nor the canonical row.
+The same shape hid behind hard `clearSendEcho` calls whose replacing publish is
+gated stricter than the clear (`isCurrentTranscriptSession` / `refreshOpenDm`
+early-returns) — R-011's mechanism recurring past the first send.
+
+**Call sites:** Compose `SonarAppState.planSendEchoDisplay` /
+`TranscriptDisplayPolicy.reconcileSendEchoes` (`windowedFulfilledEchoIds`), and
+the clear gates in `SonarAppState.send` (reconcile), `reconcileMeshMarmotSendEcho`,
+`sendSticker`. iOS does not share the bug: `reconciledOptimisticMessages` merges
+the admitted row into `messagesByGroup` (the retained model), so it survives
+without the echo — but any port of the Compose recompute-per-publish shape
+reintroduces it.
+
+**Guarded by:** `TranscriptDisplayPolicyTest.sentRowStaysVisibleAcrossScrollShapedPublishesUntilWindowed`
+
+**Also guarded by:** `TranscriptDisplayPolicyTest.acceptedEchoFulfilledOutOfWindowIsNotRetired`,
+`TranscriptDisplayPolicyTest.delayedCanonicalRowFulfillsTerminalAcceptedEchoAndPermitsCleanup`
+(windowed retire still happens — the #273 cleanup is preserved)
+
+**History:** #215 → #273 (`terminalAcceptedEchoIds`) + #290 (out-of-window
+fulfilment) composed into the one-shot → this fix.
+
+**Rejected:**
+- *Persisting `admittedCanonical` rows in per-chat state.* More lifecycle to
+  invalidate on session begin/end/erase; the echo already IS that state.
+- *Dropping the hard `clearSendEcho` calls entirely (plan-only retire).* An
+  echo whose canonical row never re-enters the newest window (30+ newer rows
+  arrive while the chat is closed) would ghost as "Sending" forever; the hard
+  clear stays for the not-on-screen case where nothing visible can be erased.
+
+**Not guarded:** The real `withSendEchoes` / `clearSendEcho` call sites — both
+need a constructible `SonarAppState` (the standing gap below). The sequence test
+drives the documented `withSendEchoes` contract, not the member itself; a future
+edit to `withSendEchoes` that diverges from that contract (e.g. reordering the
+retire before the render-list build) would not be caught.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

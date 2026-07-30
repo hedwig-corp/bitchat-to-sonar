@@ -285,9 +285,17 @@ internal fun planSendEchoDisplay(
     val fulfilled = reconciliation.fulfilledEchoIds
     return SendEchoDisplayPlan(
         visibleEchoes = echoes.filterNot { it.id in fulfilled },
+        // Retire only echoes whose canonical row is INSIDE the published
+        // window. An echo fulfilled by an out-of-window row is that row's
+        // only carrier: `withSendEchoes` short-circuits once the echo is
+        // gone, so retiring here made the sent message vanish on the next
+        // publish that excluded the row (a scroll-up `loadOlderMessages`
+        // page) until delivery flipped to Sent and the newest-page merge
+        // re-admitted it. Keep such echoes pending (hidden — the admitted
+        // row renders instead) until the row lands in the window.
         terminalAcceptedEchoIds = echoes
             .asSequence()
-            .filter { it.state == "Accepted" && it.id in fulfilled }
+            .filter { it.state == "Accepted" && it.id in reconciliation.windowedFulfilledEchoIds }
             .mapTo(mutableSetOf()) { it.id },
         admittedCanonical = reconciliation.admittedCanonical,
     )
@@ -6744,12 +6752,21 @@ class SonarAppState(private val scope: CoroutineScope) {
                         markSendEchoAccepted(chatId, echo.id)
                     }
                     val local = withSendEchoes(chatId, published)
-                    if (isCurrentTranscriptSession(chatId, refreshGeneration)) {
+                    val publishedToOpenChat = isCurrentTranscriptSession(chatId, refreshGeneration)
+                    if (publishedToOpenChat) {
                         setCurrentVisibleMessages(chatId, local, processCalls = true)
                     }
-                    if (hasCanonicalRow) {
+                    if (hasCanonicalRow &&
+                        (publishedToOpenChat || (screen as? Screen.Chat)?.id != chatId)
+                    ) {
                         clearSendEcho(chatId, echo.id)
                     }
+                    // else: the transcript session rolled mid-flight while this
+                    // chat is still on screen — the publish carrying the
+                    // canonical row was dropped, so deleting the echo would
+                    // erase the visible bubble with nothing to replace it
+                    // (R-011 shape). Keep it Accepted; planSendEchoDisplay
+                    // retires it once the row is inside the published window.
                 },
                 onSendFailure = { error ->
                     failSendEcho(chatId, echo.id)
@@ -8099,7 +8116,6 @@ class SonarAppState(private val scope: CoroutineScope) {
         scope.launch {
             try {
                 sendMarmotStickerOrdered(groupId, packCoordinate, sticker.shortcode, sticker.sha256)
-                clearSendEcho(chatId, echo.id)
                 val generation = transcriptGeneration
                 val local = withSendEchoes(
                     chatId,
@@ -8108,6 +8124,11 @@ class SonarAppState(private val scope: CoroutineScope) {
                 if (isCurrentTranscriptSession(chatId, generation)) {
                     setCurrentVisibleMessages(chatId, local, processCalls = true)
                 }
+                // Clear only after the canonical page has been read and (when
+                // the session is still current) published. Clearing before the
+                // read left a window where a concurrent republish painted the
+                // transcript with neither the echo nor the sticker row.
+                clearSendEcho(chatId, echo.id)
             } catch (e: Throwable) {
                 failSendEcho(chatId, echo.id)
                 toast = "send failed: ${e.message}"
@@ -9348,9 +9369,20 @@ class SonarAppState(private val scope: CoroutineScope) {
             markSendEchoAccepted(chatId, echo.id)
         }
         refreshOpenDm(peerId)
-        if (shouldClearMeshMarmotSendEcho(hasCanonicalRow)) {
+        // [hasCanonicalRow] proves the row exists in the folded GROUP window,
+        // not in the published render window. While the chat is on screen the
+        // refresh above owns the echo's end of life: its withSendEchoes plan
+        // retires the echo exactly when the canonical row is inside the
+        // published window, and keeps re-admitting the row until then. A hard
+        // clear here while the row is not yet windowed deleted the echo — the
+        // row's only carrier — and the sent message vanished on the next
+        // publish (R-011 shape). Clear directly only when the chat is not
+        // open: nothing is visible to erase, and the next open reads the
+        // canonical row from local storage.
+        if (shouldClearMeshMarmotSendEcho(hasCanonicalRow) &&
+            (screen as? Screen.Chat)?.id != chatId
+        ) {
             clearSendEcho(chatId, echo.id)
-            refreshOpenDm(peerId)
         }
         processPayLines(chatId, messages)
     }
