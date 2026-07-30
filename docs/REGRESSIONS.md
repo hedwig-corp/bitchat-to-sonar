@@ -1110,15 +1110,35 @@ and `SonarChannelScreen`, which read the draft back from
 shape: SwiftUI `SNMessageComposerField` sends through a `@Binding` that the
 `.onKeyPress(.return)` handler reads at event time, not a per-frame capture.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTypedTextWhenCallSiteHasNotRecomposed`
-(fails without the fix: `onSend` receives `""`), with
-`returnKeyDoesNotResendDraftClearedByCaller` pinning the other half — a caller
-that owns the draft again (cleared after send, slash-hint completion) still wins.
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTypedTextWhenCallSiteHasNotRecomposed`, `MessageComposerFieldUiTest.returnKeyDoesNotResendDraftClearedByCaller`, `ComposerLiveTextTest.keystrokesAreVisibleBeforeTheCallerRecomposes`, `ComposerLiveTextTest.sendDoesNotHandOutTheSameTextTwice`, `ComposerLiveTextTest.aLateHoistedValueWouldWin`, `ComposerLiveTextTest.draftTheCallerKeptComesBackAfterSend`, `ComposerLiveTextTest.clearedDraftStaysCleared`, `ComposerLiveTextTest.switchingChatsAdoptsTheNewConversationsDraft`
 
-**Coverage (honest):** The tests pin the shared field. The three send *buttons*
-are not covered — they live inside large screen composables with a constructed
-`SonarAppState`, so the fresh-read at those call sites is by inspection only.
-Nothing pins the Apple side.
+The first fails without the fix (`onSend` receives `""`); the second pins the
+other half — a caller that owns the draft again (cleared after send, slash-hint
+completion) still wins. The rest pin the holder's state machine.
+
+**Same batch, second Enter:** the stalled frame that swallows keystrokes also
+swallows the *first* Enter's feedback, so the user presses it again and both
+land before the caller's clear is composed. `ComposerLiveText.onSent()` drops
+the text at hand-off (`sendDoesNotHandOutTheSameTextTwice`); a caller that keeps
+the draft instead of clearing gets it back on the next composition
+(`draftTheCallerKeptComesBackAfterSend`).
+
+**Callers must forward `onValueChange` synchronously.** A hoisted value that
+differs from what the field last reported is treated as caller-owned and wins,
+so a debounced or async draft store would trail the field, win anyway, and
+resurrect the truncation. All three call sites write straight into
+`SonarAppState.composerDrafts`. Pinned as `ComposerLiveTextTest.aLateHoistedValueWouldWin`,
+which asserts the sharp edge rather than pretending it is handled.
+
+**Coverage (honest):** `ComposerLiveTextTest` pins the state machine, not the
+wiring; the UI test pins the wiring for the single-Enter case. The second-Enter
+case is **not** pinned end-to-end: `runComposeUiTest` idles — and so recomposes
+— between injected key events, which is precisely the interleaving that makes
+the bug possible, so the harness cannot stage it. A UI-level test written for it
+passes either way and was dropped rather than left as false coverage. The three
+send *buttons* are not covered either — they live inside large screen
+composables needing a constructed `SonarAppState`, so the fresh read there is by
+inspection only. Nothing pins the Apple side.
 
 **Rejected:**
 - *Reading the hoisted `value` inside the key handler.* It is the same
@@ -1131,6 +1151,9 @@ Nothing pins the Apple side.
 - *Mutating the live-text holder during composition instead of in `SideEffect`.*
   A discarded composition would leave the holder advanced past the text the
   field actually kept.
+- *Keeping a UI-level test for the same-batch second Enter.* It passed with and
+  without the guard, because the harness recomposes between injected events. A
+  test that cannot fail is worse than an admitted gap.
 
 ## Unguarded
 

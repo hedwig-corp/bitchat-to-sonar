@@ -43,12 +43,19 @@ internal val messageComposerKeyboardOptions = KeyboardOptions(imeAction = ImeAct
  * Keystrokes are recorded here synchronously. A hoisted value that differs from
  * what we last reported means the caller changed the draft itself (cleared it
  * after a send, completed a slash hint) and wins.
+ *
+ * That last rule is why callers **must** forward `onValueChange` to their draft
+ * store synchronously, as all three do today. A debounced or async store would
+ * make the hoisted value trail the field, and a trailing value is
+ * indistinguishable here from a caller-owned edit — it would win, and the
+ * truncation this class exists to prevent would come back.
  */
-private class ComposerLiveText(initial: String) {
+internal class ComposerLiveText(initial: String) {
     var text: String = initial
         private set
     private var reported: String = initial
 
+    /** The caller's draft for this composition. It wins whenever it differs. */
     fun onHoistedValue(value: String) {
         if (value != reported) {
             text = value
@@ -56,9 +63,21 @@ private class ComposerLiveText(initial: String) {
         }
     }
 
+    /** A keystroke the field just produced. */
     fun onFieldValue(value: String) {
         text = value
         reported = value
+    }
+
+    /**
+     * The text was handed to a send. Drop it immediately so a second Enter from
+     * the same input batch — the user pressing again because the stalled frame
+     * showed nothing — cannot send it twice. If the caller keeps the draft
+     * instead of clearing it, the next [onHoistedValue] brings it straight back.
+     */
+    fun onSent() {
+        text = ""
+        reported = ""
     }
 }
 
@@ -100,7 +119,9 @@ internal fun MessageComposerTextField(
                         isEnter &&
                         !event.isShiftPressed
                     ) {
-                        onSend?.invoke(live.text)
+                        val outgoing = live.text
+                        live.onSent()
+                        onSend?.invoke(outgoing)
                         true
                     } else {
                         false
