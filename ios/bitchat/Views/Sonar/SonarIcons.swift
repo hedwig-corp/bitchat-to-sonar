@@ -369,9 +369,17 @@ private struct SNPathParser {
             path.addLine(to: end)
             return
         }
-        let phi = rotationDeg * .pi / 180
-        let dx2 = (current.x - end.x) / 2
-        let dy2 = (current.y - end.y) / 2
+        // Every value below is `Double`, converted once at the boundary. The
+        // arc math mixes `Double` radii with `CGFloat` point components, and
+        // leaning on the implicit CGFloat<->Double bridge left the Swift 5 type
+        // checker in Xcode 16.4 (what CI builds with) exploring `Duration`
+        // arithmetic overloads and failing. Newer toolchains resolve it, so
+        // this compiled on every dev machine and broke only in CI.
+        let phi: Double = rotationDeg * Double.pi / 180
+        let curX = Double(current.x), curY = Double(current.y)
+        let endX = Double(end.x), endY = Double(end.y)
+        let dx2: Double = (curX - endX) / 2
+        let dy2: Double = (curY - endY) / 2
         let x1p = cos(phi) * dx2 + sin(phi) * dy2
         let y1p = -sin(phi) * dx2 + cos(phi) * dy2
         let lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
@@ -386,8 +394,8 @@ private struct SNPathParser {
         if largeArc == sweep { coef = -coef }
         let cxp = coef * rx * y1p / ry
         let cyp = -coef * ry * x1p / rx
-        let cx = cos(phi) * cxp - sin(phi) * cyp + (current.x + end.x) / 2
-        let cy = sin(phi) * cxp + cos(phi) * cyp + (current.y + end.y) / 2
+        let cx: Double = cos(phi) * cxp - sin(phi) * cyp + (curX + endX) / 2
+        let cy: Double = sin(phi) * cxp + cos(phi) * cyp + (curY + endY) / 2
 
         func angle(_ ux: Double, _ uy: Double, _ vx: Double, _ vy: Double) -> Double {
             let dot = ux * vx + uy * vy
@@ -399,23 +407,23 @@ private struct SNPathParser {
         }
         let theta1 = angle(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry)
         var delta = angle((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry)
-        if !sweep, delta > 0 { delta -= 2 * .pi }
-        if sweep, delta < 0 { delta += 2 * .pi }
+        if !sweep, delta > 0 { delta -= 2 * Double.pi }
+        if sweep, delta < 0 { delta += 2 * Double.pi }
 
-        let segments = max(1, Int(ceil(abs(delta) / (.pi / 2))))
+        let segments = max(1, Int(ceil(abs(delta) / (Double.pi / 2))))
         let segDelta = delta / Double(segments)
         let t = 4.0 / 3.0 * tan(segDelta / 4)
 
         func pointAt(_ a: Double) -> CGPoint {
             CGPoint(
-                x: cx + rx * cos(a) * cos(phi) - ry * sin(a) * sin(phi),
-                y: cy + rx * cos(a) * sin(phi) + ry * sin(a) * cos(phi)
+                x: CGFloat(cx + rx * cos(a) * cos(phi) - ry * sin(a) * sin(phi)),
+                y: CGFloat(cy + rx * cos(a) * sin(phi) + ry * sin(a) * cos(phi))
             )
         }
         func derivativeAt(_ a: Double) -> CGPoint {
             CGPoint(
-                x: -rx * sin(a) * cos(phi) - ry * cos(a) * sin(phi),
-                y: -rx * sin(a) * sin(phi) + ry * cos(a) * cos(phi)
+                x: CGFloat(-rx * sin(a) * cos(phi) - ry * cos(a) * sin(phi)),
+                y: CGFloat(-rx * sin(a) * sin(phi) + ry * cos(a) * cos(phi))
             )
         }
 
