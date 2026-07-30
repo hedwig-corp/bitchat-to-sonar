@@ -27,7 +27,28 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     /// O(1) transcript content revision: bumped only when rows or row-affecting
     /// inputs change. The collection host skips its O(n) snapshot rebuild while
     /// this is unchanged (composer keystrokes, unrelated store publishes).
-    private(set) var contentRevision: UInt64 = 0
+    ///
+    /// Private on purpose: SwiftUI `body` runs BEFORE `prepareForUpdate`'s
+    /// `sync`, so a raw read here ships the revision of the PREVIOUS msgs next
+    /// to the NEW entries, and `shouldSkipUnchangedApply` then swallows the
+    /// apply that carries a real row change (the send/echo-swap pass). The
+    /// stale snapshot keeps a dead row id that renders as a blank band and
+    /// collapses on scroll until the next forced apply. Callers must use
+    /// `contentVersion(afterSyncing:showAuthors:peerName:)`.
+    private var contentRevision: UInt64 = 0
+
+    /// The revision `sync` WILL hold after syncing these inputs — safe to read
+    /// from `body` (pure). Must mirror `sync`'s bump condition exactly so the
+    /// version shipped with `entries` describes the same snapshot.
+    func contentVersion(
+        afterSyncing msgs: [SNMessage],
+        showAuthors: Bool,
+        peerName: String
+    ) -> UInt64 {
+        (msgs != self.msgs || showAuthors != self.showAuthors || peerName != self.peerName)
+            ? contentRevision &+ 1
+            : contentRevision
+    }
     private var sizingHost: UIHostingController<AnyView>?
 
     func sync(
@@ -46,7 +67,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
     ) {
         // Bump only on real row-content change: composer keystrokes republish
         // the store with an identical transcript and must stay O(1) here.
-        if msgs != self.msgs || showAuthors != self.showAuthors {
+        // peerName is row content too: nudge and pay bubbles render it, so a
+        // name resolving after open (notification-tap before contact metadata
+        // loads) must not be swallowed by the skip path.
+        if msgs != self.msgs || showAuthors != self.showAuthors || peerName != self.peerName {
             contentRevision &+= 1
         }
         self.msgs = msgs
@@ -80,7 +104,10 @@ final class SNTranscriptHostRenderContext: ObservableObject {
             let bits = "\(flags.cont ? 1 : 0)\(flags.showAuthor ? 1 : 0)\(flags.showState ? 1 : 0)"
                 + "\(expandedMessageIDs.contains(id) ? 1 : 0)"
             let mediaKey = snCollectionHostMediaHeightFingerprint(m.media)
-            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)"
+            // Nudge and pay rows render (and wrap on) the peer's display name;
+            // a resolved name must re-measure and reconfigure exactly those.
+            let nameKey = (m.trill || m.pay != nil) ? "|\(peerName)" : ""
+            return "m|\(id)|\(m.text)|\(m.state ?? "")|\(mediaKey)|\(bits)\(nameKey)"
         }
     }
 
@@ -256,7 +283,14 @@ struct SNTranscriptCollectionRepresentable<Composer: View>: View {
                 )
             },
             onJumpSettled: onJumpSettled,
-            contentVersion: renderContext.contentRevision,
+            // Post-sync revision, predicted from the same `msgs` snapshot as
+            // `entries` above — a raw pre-sync read is one bump stale and lets
+            // the host skip the apply that carries this pass's row change.
+            contentVersion: renderContext.contentVersion(
+                afterSyncing: msgs,
+                showAuthors: showAuthors,
+                peerName: peerName
+            ),
             composer: composer
         )
     }
