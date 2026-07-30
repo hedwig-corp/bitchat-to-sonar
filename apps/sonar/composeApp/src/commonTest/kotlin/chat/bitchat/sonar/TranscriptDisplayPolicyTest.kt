@@ -13,6 +13,7 @@ class TranscriptDisplayPolicyTest {
         mine: Boolean = false,
         viaInternet: Boolean = false,
         state: String? = null,
+        stickerRef: SonarStickerRef? = null,
     ) = SonarMsg(
         id = id,
         senderNpub = "npub",
@@ -21,6 +22,13 @@ class TranscriptDisplayPolicyTest {
         tsSecs = ts,
         viaInternet = viaInternet,
         state = state,
+        stickerRef = stickerRef,
+    )
+
+    private fun stickerRef(shortcode: String) = SonarStickerRef(
+        packCoordinate = "30031:abcdef1234:pack",
+        shortcode = shortcode,
+        plaintextSha256 = "aa".repeat(32),
     )
 
     @Test
@@ -591,6 +599,146 @@ class TranscriptDisplayPolicyTest {
 
         assertTrue(plan.visibleEchoes.isEmpty())
         assertEquals(listOf(canonical), plan.admittedCanonical)
+    }
+
+    // ── Echo lifetime across publishes (the vanishing-sent-row regression) ──
+    // An echo fulfilled by an OUT-of-window canonical row is that row's only
+    // carrier: `withSendEchoes` short-circuits once the echo is retired, and a
+    // scroll-up (`loadOlderMessages`-shaped) publish can never re-introduce a
+    // newer row. Retiring on the first fulfilled call therefore made the sent
+    // message vanish until delivery flipped to Sent. The sequence below is the
+    // real `withSendEchoes` contract driven across three publishes.
+
+    @Test
+    fun acceptedEchoFulfilledOutOfWindowIsNotRetired() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Accepted")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+        val pinnedWindow = listOf(message("old-1", 50, "older row"))
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = pinnedWindow,
+            excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(listOf(canonical), plan.admittedCanonical)
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty())
+    }
+
+    @Test
+    fun sentRowStaysVisibleAcrossScrollShapedPublishesUntilWindowed() {
+        val echo = message("echo-1", 100, "ciao", mine = true, viaInternet = true, state = "Accepted")
+        val canonical = message("event-1", 100, "ciao", mine = true, viaInternet = true)
+        val pinnedWindow = listOf(message("old-1", 50, "older row"))
+
+        // withSendEchoes contract: plan, retire terminal echoes, then render
+        // published(non-echo) + admittedCanonical + visibleEchoes.
+        fun publish(
+            pending: List<SonarMsg>,
+            window: List<SonarMsg>,
+        ): Pair<List<SonarMsg>, List<SonarMsg>> {
+            if (pending.isEmpty()) return window to pending
+            val plan = planSendEchoDisplay(
+                echoes = pending,
+                published = window,
+                excludedPublishedIdsByEcho = emptyMap(),
+                freshCanonical = listOf(canonical),
+            )
+            val remaining = pending.filterNot { it.id in plan.terminalAcceptedEchoIds }
+            val rendered = (
+                window.filterNot { it.id.startsWith(SEND_ECHO_ID_PREFIX) } +
+                    plan.admittedCanonical +
+                    plan.visibleEchoes
+                ).distinctBy { it.id }.sortedBy { it.tsSecs }
+            return rendered to remaining
+        }
+
+        // Publish 1: send-reconcile shaped — canonical row only in freshCanonical.
+        val (rendered1, pending1) = publish(listOf(echo), pinnedWindow)
+        assertTrue(rendered1.any { it.id == canonical.id }, "send publish must show the sent row")
+
+        // Publish 2: loadOlderMessages shaped — the prepended window still
+        // excludes the canonical row. Before the fix the echo was already
+        // retired, so this publish dropped the sent message entirely.
+        val (rendered2, pending2) = publish(pending1, pinnedWindow)
+        assertTrue(
+            rendered2.any { it.id == canonical.id },
+            "scroll-up publish must keep the sent row visible",
+        )
+
+        // Publish 3: the newest-page merge finally admits the row into the
+        // window — NOW the echo retires and the row survives on its own.
+        val (rendered3, pending3) = publish(pending2, pinnedWindow + canonical)
+        assertTrue(rendered3.any { it.id == canonical.id })
+        assertTrue(pending3.isEmpty(), "windowed canonical row must retire the echo")
+
+        // Publish 4: with the echo gone, withSendEchoes short-circuits — the
+        // row must now be carried by the window itself.
+        val (rendered4, _) = publish(pending3, pinnedWindow + canonical)
+        assertTrue(rendered4.any { it.id == canonical.id })
+    }
+
+    // ── Sticker echoes (empty content on both sides; ref must disambiguate) ──
+    // A sticker echo and its canonical row both carry content "" — the sticker
+    // rides a tag (iOS parity: privateDmMessage / core create_sticker_event_
+    // inner). Content equality alone would let an own media row or a DIFFERENT
+    // sticker consume the echo; the matcher must compare stickerRef.
+
+    @Test
+    fun stickerEchoIsFulfilledOnlyByItsOwnStickerRow() {
+        val echo = message(
+            "echo-1", 100, content = "", mine = true, viaInternet = true,
+            state = "Sending", stickerRef = stickerRef("wave"),
+        )
+        val otherSticker = message(
+            "event-1", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("fire"),
+        )
+        val mediaRow = message("event-2", 100, content = "", mine = true, viaInternet = true)
+        val matching = message(
+            "event-3", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("wave"),
+        )
+
+        val wrongOnly = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(otherSticker, mediaRow),
+            freshCanonical = emptyList(),
+        )
+        assertTrue(wrongOnly.fulfilledEchoIds.isEmpty(), "different sticker/media row must not consume the echo")
+
+        val withMatch = reconcileSendEchoes(
+            echoes = listOf(echo),
+            published = listOf(otherSticker, mediaRow, matching),
+            freshCanonical = emptyList(),
+        )
+        assertEquals(setOf("echo-1"), withMatch.fulfilledEchoIds)
+        assertEquals(setOf("echo-1"), withMatch.windowedFulfilledEchoIds)
+    }
+
+    @Test
+    fun outOfWindowStickerRowIsAdmittedAndDoesNotRetireTheEcho() {
+        val echo = message(
+            "echo-1", 100, content = "", mine = true, viaInternet = true,
+            state = "Accepted", stickerRef = stickerRef("wave"),
+        )
+        val canonical = message(
+            "event-1", 100, content = "", mine = true, viaInternet = true,
+            stickerRef = stickerRef("wave"),
+        )
+
+        val plan = planSendEchoDisplay(
+            echoes = listOf(echo),
+            published = listOf(message("old-1", 50, "older row")),
+            excludedPublishedIdsByEcho = emptyMap(),
+            freshCanonical = listOf(canonical),
+        )
+
+        assertEquals(listOf(canonical), plan.admittedCanonical)
+        assertTrue(plan.visibleEchoes.isEmpty())
+        assertTrue(plan.terminalAcceptedEchoIds.isEmpty(), "out-of-window sticker row must not retire its echo")
     }
 
     // ── firstUnreadTranscriptIndex (Signal-style unread anchoring) ──
