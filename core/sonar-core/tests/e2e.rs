@@ -4,7 +4,9 @@
 //! This is the M1 acceptance test: KeyPackage publication → group creation →
 //! gift-wrapped welcome → bidirectional encrypted messages.
 
+use nostr::prelude::{EventBuilder, Filter, Kind, RelayMetadata, Tag};
 use nostr_relay_builder::MockRelay;
+use nostr_sdk::Client;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
 use tokio::time::{timeout, Duration};
@@ -110,6 +112,151 @@ async fn two_instances_exchange_dms_through_a_relay() {
     // Both sides agree on membership.
     let members = bob.groups().unwrap()[0].clone();
     assert_eq!(members.mls_group_id, *bob_group);
+}
+
+#[tokio::test]
+async fn key_package_publish_bootstraps_standard_account_relay_lists() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+    let bob = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("bob connects");
+
+    timeout(Duration::from_secs(15), bob.publish_key_package())
+        .await
+        .expect("account bootstrap remains bounded")
+        .expect("account bootstrap publishes");
+
+    let reader = Client::default();
+    reader
+        .add_relay(relay_url.clone())
+        .await
+        .expect("reader adds relay");
+    reader.connect().await;
+    let author = bob.identity().public_key();
+    let nip65 = reader
+        .fetch_events(
+            Filter::new().kind(Kind::RelayList).author(author),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("NIP-65 fetch succeeds")
+        .into_iter()
+        .next()
+        .expect("NIP-65 list is published");
+    let inbox = reader
+        .fetch_events(
+            Filter::new().kind(Kind::InboxRelays).author(author),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("inbox fetch succeeds")
+        .into_iter()
+        .next()
+        .expect("inbox list is published");
+    reader.shutdown().await;
+
+    assert!(nostr::nips::nip65::extract_relay_list(&nip65)
+        .any(|(relay, metadata)| relay == &relay_url && *metadata == Some(RelayMetadata::Write)));
+    assert!(nostr::nips::nip17::extract_relay_list(&inbox).any(|relay| relay == &relay_url));
+}
+
+#[tokio::test]
+async fn start_dm_publishes_welcome_to_peer_inbox_relay() {
+    let directory = MockRelay::run().await.expect("directory relay starts");
+    let directory_url = directory.url().await;
+    let inbox = MockRelay::run().await.expect("inbox relay starts");
+    let inbox_url = inbox.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![directory_url.clone()])
+        .await
+        .expect("alice connects to directory");
+    let bob_identity = Identity::generate();
+    let bob = SonarClient::connect_in_memory(bob_identity.clone(), vec![inbox_url.clone()])
+        .await
+        .expect("bob listens on his inbox relay");
+
+    // Bob's directory state lives on Alice's relay, while his account-directed
+    // gift wraps belong on a distinct inbox relay. This is the White Noise
+    // topology that the old sender-relay-only path could not deliver.
+    let publisher = Client::new(bob_identity.keys().clone());
+    publisher
+        .add_relay(directory_url.clone())
+        .await
+        .expect("publisher adds directory");
+    publisher.connect().await;
+    let key_package = bob
+        .engine()
+        .key_package_event(vec![directory_url])
+        .expect("bob creates directory KeyPackage");
+    let inbox_list = EventBuilder::new(Kind::InboxRelays, "")
+        .tag(Tag::relay(inbox_url))
+        .sign_with_keys(bob_identity.keys())
+        .expect("bob signs inbox list");
+    for event in [&key_package, &inbox_list] {
+        let output = publisher
+            .send_event(event)
+            .await
+            .expect("directory accepts account metadata");
+        assert!(!output.success.is_empty());
+    }
+    publisher.shutdown().await;
+
+    alice
+        .start_dm(bob.identity().public_key(), "alice & bob")
+        .await
+        .expect("alice routes the welcome to Bob's inbox");
+    bob.sync_force().await.expect("bob fetches his inbox");
+    assert_eq!(bob.groups().expect("bob groups").len(), 1);
+}
+
+#[tokio::test]
+async fn start_dm_discovers_key_package_on_peer_nip65_relay() {
+    let discovery_relay = MockRelay::run().await.expect("discovery relay starts");
+    let discovery_url = discovery_relay.url().await;
+    let key_package_relay = MockRelay::run().await.expect("KeyPackage relay starts");
+    let key_package_url = key_package_relay.url().await;
+
+    let alice = SonarClient::connect_in_memory(Identity::generate(), vec![discovery_url.clone()])
+        .await
+        .expect("alice connects to the discovery relay");
+    let bob_identity = Identity::generate();
+    let bob = SonarClient::connect_in_memory(bob_identity.clone(), vec![key_package_url.clone()])
+        .await
+        .expect("bob connects to his NIP-65 relay");
+    bob.publish_key_package()
+        .await
+        .expect("bob publishes only on his NIP-65 relay");
+
+    let directory = Client::new(bob_identity.keys().clone());
+    directory
+        .add_relay(discovery_url)
+        .await
+        .expect("directory relay is valid");
+    directory.connect().await;
+    let relay_list = EventBuilder::relay_list([(key_package_url, Some(RelayMetadata::Write))])
+        .sign_with_keys(bob_identity.keys())
+        .expect("bob signs his NIP-65 list");
+    let published = directory
+        .send_event(&relay_list)
+        .await
+        .expect("bob publishes his NIP-65 list");
+    assert!(
+        !published.success.is_empty(),
+        "the discovery relay must accept Bob's NIP-65 list"
+    );
+    directory.shutdown().await;
+
+    let group = timeout(
+        Duration::from_secs(10),
+        alice.start_dm(bob.identity().public_key(), "alice & bob"),
+    )
+    .await
+    .expect("NIP-65 fallback remains bounded")
+    .expect("alice finds Bob's KeyPackage through his NIP-65 relay");
+
+    assert_eq!(alice.groups().expect("alice groups").len(), 1);
+    assert_eq!(alice.groups().expect("alice groups")[0].mls_group_id, group);
 }
 
 #[tokio::test]

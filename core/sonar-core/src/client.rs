@@ -2438,9 +2438,16 @@ impl SonarClient {
     /// Waits for the relay OK acks — callers that need durability (a peer is
     /// about to fetch the KeyPackage) use this.
     pub async fn publish_key_package(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
-        self.nostr.send_event(&event).await?;
-        Ok(())
+        let (nip65, inbox, key_package) = self.key_package_publish_events()?;
+        // The relay-pool acknowledgement tracker is event-id keyed; serialize
+        // these three replaceable publishes so concurrent OK waits cannot
+        // contend on SDK relay state.
+        let nip65_output = self.nostr.send_event(&nip65).await?;
+        require_relay_success(&nip65_output, "NIP-65 relay-list publish")?;
+        let inbox_output = self.nostr.send_event(&inbox).await?;
+        require_relay_success(&inbox_output, "inbox relay-list publish")?;
+        let key_package_output = self.nostr.send_event(&key_package).await?;
+        require_relay_success(&key_package_output, "KeyPackage publish")
     }
 
     /// Like [`Self::publish_key_package`], but the relay send is spawned, not
@@ -2452,14 +2459,43 @@ impl SonarClient {
     /// not returned. Event creation (MLS key material persistence) still
     /// happens synchronously before this returns.
     pub async fn publish_key_package_background(&self) -> Result<()> {
-        let event = self.engine.key_package_event(self.relays.clone())?;
+        let (nip65, inbox, key_package) = self.key_package_publish_events()?;
         let nostr = self.nostr.clone();
         tokio::spawn(async move {
-            if let Err(err) = nostr.send_event(&event).await {
-                tracing::warn!(%err, "background KeyPackage publish failed");
+            for (event, context) in [
+                (nip65, "background NIP-65 relay-list publish"),
+                (inbox, "background inbox relay-list publish"),
+                (key_package, "background KeyPackage publish"),
+            ] {
+                let result = match nostr.send_event(&event).await {
+                    Ok(output) => require_relay_success(&output, context),
+                    Err(err) => Err(err.into()),
+                };
+                if let Err(err) = result {
+                    tracing::warn!(%err, event_id = %event.id, context, "background account publish failed");
+                }
             }
         });
         Ok(())
+    }
+
+    /// Marmot account bootstrap requires both standard relay lists before the
+    /// account can reliably discover KeyPackages or receive gift-wrapped
+    /// welcomes. Keep all three events on the same publish path so native apps
+    /// and the agent CLI cannot accidentally initialize only part of an account.
+    fn key_package_publish_events(&self) -> Result<(Event, Event, Event)> {
+        let nip65 = EventBuilder::relay_list(
+            self.relays
+                .iter()
+                .cloned()
+                .map(|relay| (relay, Some(RelayMetadata::Write))),
+        )
+        .sign_with_keys(self.identity().keys())?;
+        let inbox = EventBuilder::new(Kind::InboxRelays, "")
+            .tags(self.relays.iter().cloned().map(Tag::relay))
+            .sign_with_keys(self.identity().keys())?;
+        let key_package = self.engine.key_package_event(self.relays.clone())?;
+        Ok((nip65, inbox, key_package))
     }
 
     /// Fetch ALL of `author`'s KeyPackage events from the relays (a peer may have
@@ -2522,16 +2558,73 @@ impl SonarClient {
     }
 
     /// Fetch the freshest KeyPackage event for `author` from the relays.
+    ///
+    /// Current White Noise clients publish KeyPackages to their NIP-65 write
+    /// relays, which need not overlap with our account relays. Preserve the
+    /// common fast path first; only after that misses do a bounded two-hop
+    /// lookup via the peer's kind-10002 relay list.
     pub async fn fetch_key_package(&self, author: PublicKey) -> Result<Event> {
         let filter = Filter::new()
             .kind(Kind::Custom(KEY_PACKAGE_KIND))
             .author(author)
             .limit(1);
         let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
-        events
-            .into_iter()
-            .next()
-            .ok_or(Error::KeyPackageNotFound(author))
+        if let Some(event) = newest_event(events) {
+            return Ok(event);
+        }
+
+        if let Some(event) = self.fetch_key_package_from_nip65(author).await? {
+            return Ok(event);
+        }
+
+        Err(Error::KeyPackageNotFound(author))
+    }
+
+    async fn fetch_key_package_from_nip65(&self, author: PublicKey) -> Result<Option<Event>> {
+        let relay_lists = self
+            .nostr
+            .fetch_events(
+                Filter::new().kind(Kind::RelayList).author(author).limit(1),
+                FETCH_TIMEOUT,
+            )
+            .await?;
+        let peer_relays = peer_key_package_relays(relay_lists, &self.relays);
+        if peer_relays.is_empty() {
+            return Ok(None);
+        }
+
+        tracing::debug!(
+            relay_count = peer_relays.len(),
+            "retrying KeyPackage fetch on peer NIP-65 relays"
+        );
+        // Carry our signer so NIP-42-protected peer relays can authenticate the
+        // bounded lookup; the client is still short-lived and fetch-only.
+        let peer_client = Client::new(self.identity().keys().clone());
+        let mut added_relays = 0usize;
+        for relay in peer_relays {
+            match peer_client.add_relay(relay).await {
+                Ok(true) => added_relays += 1,
+                Ok(false) => {}
+                Err(err) => tracing::debug!(%err, "skipping unusable peer NIP-65 relay"),
+            }
+        }
+        if added_relays == 0 {
+            return Ok(None);
+        }
+        peer_client.connect().await;
+
+        let events = peer_client
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::Custom(KEY_PACKAGE_KIND))
+                    .author(author)
+                    .limit(1),
+                FETCH_TIMEOUT,
+            )
+            .await;
+        peer_client.shutdown().await;
+        let events = events?;
+        Ok(newest_event(events))
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
@@ -2860,7 +2953,7 @@ impl SonarClient {
 
         for (member, rumor) in creation.welcomes {
             match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Ok(wrapped) => wrapped_welcomes.push((member, wrapped)),
                 Err(err) => {
                     self.discard_unpublished_group_creation(&group_id);
                     return Err(err);
@@ -2868,9 +2961,11 @@ impl SonarClient {
             }
         }
 
-        let mut published_welcomes = 0usize;
-        for wrapped in wrapped_welcomes {
-            if let Err(err) = self.publish_marmot_event(&wrapped, "group welcome").await {
+        for (published_welcomes, (member, wrapped)) in wrapped_welcomes.into_iter().enumerate() {
+            if let Err(err) = self
+                .publish_welcome(&member, &wrapped, "group welcome")
+                .await
+            {
                 if published_welcomes == 0 {
                     self.discard_unpublished_group_creation(&group_id);
                 } else {
@@ -2881,9 +2976,8 @@ impl SonarClient {
                         "marmot group creation welcome publish partially failed; keeping pending group state"
                     );
                 }
-                return Err(err.into());
+                return Err(err);
             }
-            published_welcomes += 1;
         }
 
         self.engine.merge_pending_commit(&group_id)?;
@@ -2918,7 +3012,7 @@ impl SonarClient {
 
         for (member, rumor) in update.welcomes {
             match self.engine.gift_wrap_welcome(&member, rumor).await {
-                Ok(wrapped) => wrapped_welcomes.push(wrapped),
+                Ok(wrapped) => wrapped_welcomes.push((member, wrapped)),
                 Err(err) => {
                     if requires_commit_merge {
                         let _ = self.engine.clear_pending_commit(&group_id);
@@ -2935,12 +3029,12 @@ impl SonarClient {
             if requires_commit_merge {
                 let _ = self.engine.clear_pending_commit(&group_id);
             }
-            return Err(err.into());
+            return Err(err);
         }
 
-        for wrapped in wrapped_welcomes {
+        for (member, wrapped) in wrapped_welcomes {
             if let Err(err) = self
-                .publish_marmot_event(&wrapped, "membership welcome")
+                .publish_welcome(&member, &wrapped, "membership welcome")
                 .await
             {
                 tracing::debug!(
@@ -2948,7 +3042,7 @@ impl SonarClient {
                     ?group_id,
                     "marmot membership welcome publish failed after commit publish; keeping pending commit"
                 );
-                return Err(err.into());
+                return Err(err);
             }
         }
 
@@ -2964,6 +3058,76 @@ impl SonarClient {
     async fn publish_marmot_event(&self, event: &Event, context: &'static str) -> Result<()> {
         let output = self.nostr.send_event(event).await?;
         require_relay_success(&output, context)
+    }
+
+    /// Publish an account-directed Welcome to the recipient's standard NIP-17
+    /// inbox relays. If the directory lookup is unavailable, retain the legacy
+    /// contextual-hint behavior by falling back to this account's relays.
+    async fn publish_welcome(
+        &self,
+        recipient: &PublicKey,
+        event: &Event,
+        context: &'static str,
+    ) -> Result<()> {
+        let relays = self.recipient_inbox_relays(recipient).await;
+        if relays.iter().all(|relay| self.relays.contains(relay)) {
+            let output = self.nostr.send_event_to(relays, event).await?;
+            return require_relay_success(&output, context);
+        }
+
+        // Do not add arbitrary peer relays to the long-lived app pool: that
+        // would grow every account's subscription/connection set without a
+        // bound. A short-lived, account-authenticated client confines this
+        // recipient-directed fanout to the Welcome publish.
+        let peer_client = Client::new(self.identity().keys().clone());
+        let mut added_relays = 0usize;
+        for relay in &relays {
+            match peer_client.add_relay(relay.clone()).await {
+                Ok(true) => added_relays += 1,
+                Ok(false) => {}
+                Err(err) => tracing::debug!(%err, %relay, "skipping unusable peer inbox relay"),
+            }
+        }
+        if added_relays == 0 {
+            return Err(Error::NostrPublish(format!(
+                "{context}: no usable recipient inbox relay"
+            )));
+        }
+        peer_client.connect().await;
+        let output = peer_client.send_event_to(relays, event).await;
+        peer_client.shutdown().await;
+        require_relay_success(&output?, context)
+    }
+
+    async fn recipient_inbox_relays(&self, recipient: &PublicKey) -> Vec<RelayUrl> {
+        let events = self
+            .nostr
+            .fetch_events(
+                Filter::new()
+                    .kind(Kind::InboxRelays)
+                    .author(*recipient)
+                    .limit(1),
+                FETCH_TIMEOUT,
+            )
+            .await;
+        let mut seen = HashSet::new();
+        let relays: Vec<RelayUrl> = match events {
+            Ok(events) => newest_event(events)
+                .into_iter()
+                .flat_map(nostr::nips::nip17::extract_owned_relay_list)
+                .filter(|relay| seen.insert(relay.clone()))
+                .take(MAX_PEER_INBOX_RELAYS)
+                .collect(),
+            Err(err) => {
+                tracing::debug!(%err, %recipient, "recipient inbox relay lookup failed; using contextual relays");
+                Vec::new()
+            }
+        };
+        if relays.is_empty() {
+            self.relays.clone()
+        } else {
+            relays
+        }
     }
 
     async fn ensure_relays_connected(&self, relays: &[RelayUrl]) -> Result<()> {
@@ -7609,6 +7773,42 @@ fn sort_marmot_events_in_place(events: &mut [Event]) {
     });
 }
 
+fn newest_event(events: impl IntoIterator<Item = Event>) -> Option<Event> {
+    events.into_iter().max_by(|a, b| {
+        a.created_at
+            .cmp(&b.created_at)
+            .then_with(|| a.id.to_hex().cmp(&b.id.to_hex()))
+    })
+}
+
+fn peer_key_package_relays(
+    relay_lists: impl IntoIterator<Item = Event>,
+    already_tried: &[RelayUrl],
+) -> Vec<RelayUrl> {
+    let Some(latest) = newest_event(relay_lists) else {
+        return Vec::new();
+    };
+    if latest.kind != Kind::RelayList {
+        return Vec::new();
+    }
+
+    let already_tried: HashSet<&RelayUrl> = already_tried.iter().collect();
+    let mut seen = HashSet::new();
+    nostr::nips::nip65::extract_owned_relay_list(latest)
+        .filter_map(|(relay, metadata)| {
+            if metadata == Some(nostr::nips::nip65::RelayMetadata::Read)
+                || already_tried.contains(&relay)
+                || !seen.insert(relay.clone())
+            {
+                None
+            } else {
+                Some(relay)
+            }
+        })
+        .take(MAX_PEER_KEY_PACKAGE_RELAYS)
+        .collect()
+}
+
 fn require_relay_success(
     output: &nostr_sdk::pool::Output<EventId>,
     context: &'static str,
@@ -9659,6 +9859,67 @@ mod tests {
         assert!(err
             .to_string()
             .contains("test publish: no relay accepted event"));
+
+        let second_relay = RelayUrl::parse("wss://second.example.com").expect("relay url");
+        let partially_accepted = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::from([second_relay]),
+            failed: HashMap::from([(
+                RelayUrl::parse("wss://failed.example.com").expect("relay url"),
+                "blocked".to_string(),
+            )]),
+        };
+        assert!(require_relay_success(&partially_accepted, "test publish").is_ok());
+
+        let no_responses = nostr_sdk::pool::Output {
+            val: EventId::all_zeros(),
+            success: HashSet::new(),
+            failed: HashMap::new(),
+        };
+        let err = require_relay_success(&no_responses, "test publish")
+            .expect_err("an empty relay response must fail");
+        assert!(err.to_string().contains("no relay accepted the event"));
+    }
+
+    #[test]
+    fn peer_key_package_relays_use_latest_nip65_write_relays_with_a_cap() {
+        let keys = Keys::generate();
+        let old = EventBuilder::relay_list([(
+            RelayUrl::parse("wss://old.example.com").expect("relay url"),
+            Some(nostr::nips::nip65::RelayMetadata::Write),
+        )])
+        .custom_created_at(Timestamp::from(100))
+        .sign_with_keys(&keys)
+        .expect("sign old relay list");
+        let already_tried = RelayUrl::parse("wss://local.example.com").expect("relay url");
+        let accepted: Vec<RelayUrl> = (0..7)
+            .map(|index| {
+                RelayUrl::parse(&format!("wss://write-{index}.example.com")).expect("relay url")
+            })
+            .collect();
+        let latest = EventBuilder::relay_list(
+            [
+                vec![(
+                    RelayUrl::parse("wss://read-only.example.com").expect("relay url"),
+                    Some(nostr::nips::nip65::RelayMetadata::Read),
+                )],
+                vec![(already_tried.clone(), None)],
+                accepted
+                    .iter()
+                    .cloned()
+                    .map(|relay| (relay, Some(nostr::nips::nip65::RelayMetadata::Write)))
+                    .collect(),
+                vec![(accepted[0].clone(), None)],
+            ]
+            .concat(),
+        )
+        .custom_created_at(Timestamp::from(200))
+        .sign_with_keys(&keys)
+        .expect("sign latest relay list");
+
+        let relays = peer_key_package_relays([old, latest], &[already_tried]);
+
+        assert_eq!(relays, accepted[..MAX_PEER_KEY_PACKAGE_RELAYS]);
     }
 
     #[tokio::test]

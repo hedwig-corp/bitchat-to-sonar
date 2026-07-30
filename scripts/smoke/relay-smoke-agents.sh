@@ -22,6 +22,7 @@
 #   scripts/smoke/relay-smoke-agents.sh                              # Hermes-driven, defaults
 #   AGENT_REPLY_CMD='printf ack' scripts/smoke/relay-smoke-agents.sh  # dummy, no Hermes (test plumbing)
 #   IDENTITIES=3 FANOUT=1 ROUNDS=3 scripts/smoke/relay-smoke-agents.sh
+#   WITH_WHITENOISE=1 AGENT_REPLY_CMD='printf ack' scripts/smoke/relay-smoke-agents.sh
 #
 # The reply command receives the prompt in $AGENT_PROMPT and must print the reply
 # text on stdout. Default: hermes chat -q "$AGENT_PROMPT" --yolo
@@ -42,13 +43,77 @@ ROUNDS="${ROUNDS:-3}"                # conversation rounds (seed = round 0)
 SEED_DELAY="${SEED_DELAY:-3}"        # secs to let relay propagate between rounds
 RECEIVE_TIMEOUT_SECS="${RECEIVE_TIMEOUT_SECS:-15}"
 MAX_REPLY_CHARS="${MAX_REPLY_CHARS:-300}"
+WITH_WHITENOISE="${WITH_WHITENOISE:-0}"
+WHITENOISE_PREFLIGHT="${WHITENOISE_PREFLIGHT:-1}"
+INTEROP_CONNECT_DELAY_SECS="${INTEROP_CONNECT_DELAY_SECS:-3}"
+KEYPACKAGE_SEND_ATTEMPTS="${KEYPACKAGE_SEND_ATTEMPTS:-6}"
+KEEP_WORK="${KEEP_WORK:-0}"
 # reply generator: prompt in $AGENT_PROMPT, reply text on stdout
 AGENT_REPLY_CMD="${AGENT_REPLY_CMD:-hermes chat -q \"\$AGENT_PROMPT\" --yolo}"
 SONAR_CLI="${SONAR_CLI:-$ROOT/core/target/release/sonar-cli}"
 METRICS_JSON="${METRICS_JSON:-}"
+WN_BIN="${WN_BIN:-$(command -v wn 2>/dev/null || true)}"
+WND_BIN="${WND_BIN:-$(command -v wnd 2>/dev/null || true)}"
+WN_RELAYS="${WN_RELAYS:-$TARGET_RELAY,wss://relay.damus.io,wss://nos.lol}"
+SONAR_RELAYS="${SONAR_RELAYS:-}"
+if [[ -z "$SONAR_RELAYS" ]]; then
+  if [[ "$WITH_WHITENOISE" == "1" ]]; then
+    # Use the same bounded relay set on both sides so each account advertises
+    # redundant KeyPackage/inbox routes. Hedwig remains the primary target.
+    SONAR_RELAYS="$WN_RELAYS"
+  else
+    SONAR_RELAYS="$TARGET_RELAY"
+  fi
+fi
 
 [[ -x "$SONAR_CLI" ]] || { echo "sonar-cli not found at $SONAR_CLI." >&2; \
   echo "Build it: cargo build -p sonar-cli --release (from $ROOT/core)" >&2; exit 2; }
+
+case "$WITH_WHITENOISE" in 0|1) ;; *) echo "WITH_WHITENOISE must be 0 or 1" >&2; exit 2 ;; esac
+case "$WHITENOISE_PREFLIGHT" in 0|1) ;; *) echo "WHITENOISE_PREFLIGHT must be 0 or 1" >&2; exit 2 ;; esac
+case "$KEEP_WORK" in 0|1) ;; *) echo "KEEP_WORK must be 0 or 1" >&2; exit 2 ;; esac
+
+require_uint() {
+  local name="$1" value="$2" minimum="$3"
+  [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$minimum" ]] || {
+    echo "$name must be an integer >= $minimum" >&2
+    exit 2
+  }
+}
+require_uint IDENTITIES "$IDENTITIES" 2
+require_uint FANOUT "$FANOUT" 0
+require_uint ROUNDS "$ROUNDS" 0
+require_uint SEED_DELAY "$SEED_DELAY" 0
+require_uint RECEIVE_TIMEOUT_SECS "$RECEIVE_TIMEOUT_SECS" 1
+require_uint MAX_REPLY_CHARS "$MAX_REPLY_CHARS" 1
+require_uint INTEROP_CONNECT_DELAY_SECS "$INTEROP_CONNECT_DELAY_SECS" 0
+require_uint KEYPACKAGE_SEND_ATTEMPTS "$KEYPACKAGE_SEND_ATTEMPTS" 1
+
+SONAR_RELAY_VALUES=()
+SONAR_RELAY_ARGS=()
+IFS=',' read -r -a SONAR_RELAY_VALUES <<< "$SONAR_RELAYS"
+for relay in "${SONAR_RELAY_VALUES[@]}"; do
+  [[ "$relay" == wss://* ]] || {
+    echo "SONAR_RELAYS entries must use wss://: $relay" >&2
+    exit 2
+  }
+  SONAR_RELAY_ARGS+=(--relay "$relay")
+done
+(( ${#SONAR_RELAY_VALUES[@]} > 0 )) || { echo "SONAR_RELAYS must not be empty" >&2; exit 2; }
+
+if [[ "$WITH_WHITENOISE" == "1" ]]; then
+  # shellcheck source=scripts/smoke/lib/wn-peer.sh
+  source "$SCRIPT_DIR/lib/wn-peer.sh"
+  wn_require_bins
+  wn_validate_relays "$WN_RELAYS"
+  WN_RELAY_CONNECT_TIMEOUT_SECS="${WN_RELAY_CONNECT_TIMEOUT_SECS:-20}"
+  WN_SUBSCRIPTION_SETTLE_SECS="${WN_SUBSCRIPTION_SETTLE_SECS:-2}"
+  require_uint WN_READY_TIMEOUT_SECS "$WN_READY_TIMEOUT_SECS" 1
+  require_uint WN_KEYPACKAGE_TIMEOUT_SECS "$WN_KEYPACKAGE_TIMEOUT_SECS" 1
+  require_uint WN_MESSAGE_TIMEOUT_SECS "$WN_MESSAGE_TIMEOUT_SECS" 1
+  require_uint WN_RELAY_CONNECT_TIMEOUT_SECS "$WN_RELAY_CONNECT_TIMEOUT_SECS" 1
+  require_uint WN_SUBSCRIPTION_SETTLE_SECS "$WN_SUBSCRIPTION_SETTLE_SECS" 0
+fi
 
 # ---- portable wall-clock millis ----
 if [[ "$(date +%s%N 2>/dev/null)" =~ ^[0-9]{13,}$ ]]; then
@@ -72,31 +137,86 @@ persona() { printf '%s' "${PERSONAS[$(( $1 % ${#PERSONAS[@]} ))]}"; }
 
 # ---- run state ----
 WORK="$(mktemp -d /tmp/relay-smoke-agents.XXXXXX)"
+chmod 700 "$WORK"
 CONVO_LOG="$WORK/convo.log"; : > "$CONVO_LOG"
 [[ -n "$METRICS_JSON" ]] || METRICS_JSON="$WORK/metrics.json"
-trap 'rm -rf "$WORK"' EXIT
+WN_HOME=""
+# Bash 3.2 + `set -u` treats an expanded zero-length array as unbound. Keep a
+# harmless sentinel so early provisioning failures still run cleanup safely.
+CHILD_PIDS=("")
 
-HOMES=(); NPUBS=()
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM
+  local child_pid
+  for child_pid in "${CHILD_PIDS[@]}"; do
+    [[ -n "$child_pid" ]] || continue
+    kill -TERM "$child_pid" 2>/dev/null || true
+  done
+  for child_pid in "${CHILD_PIDS[@]}"; do
+    [[ -n "$child_pid" ]] || continue
+    wait "$child_pid" 2>/dev/null || true
+  done
+  if [[ -n "$WN_HOME" && -f "$WN_HOME/wnd.pid" ]]; then
+    wn_stop_daemon "$WN_HOME" || true
+  fi
+  if [[ "$KEEP_WORK" == "1" || "$rc" -ne 0 ]]; then
+    log "work dir kept: $WORK"
+  else
+    case "$WORK" in
+      /tmp/relay-smoke-agents.*) rm -rf -- "$WORK" ;;
+      *) log "refusing to remove unexpected work path: $WORK" ;;
+    esac
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+HOMES=(); NPUBS=(); TRANSPORTS=()
+TOTAL_IDENTITIES="$IDENTITIES"
+PREFLIGHT_JSON="$WORK/whitenoise-preflight.json"
+if [[ "$WITH_WHITENOISE" == "1" && "$WHITENOISE_PREFLIGHT" == "1" ]]; then
+  printf '{"enabled":true,"status":"pending"}\n' > "$PREFLIGHT_JSON"
+elif [[ "$WITH_WHITENOISE" == "1" ]]; then
+  printf '{"enabled":true,"status":"skipped"}\n' > "$PREFLIGHT_JSON"
+else
+  printf '{"enabled":false,"status":"not_requested"}\n' > "$PREFLIGHT_JSON"
+fi
 messages_sent=0; messages_received=0; replies_generated=0; reply_errors=0; reply_empty=0
 lat_sum=0; lat_max=0; lat_n=0
 
 provision() {
-  local i home npub
+  local i home npub out
   for ((i = 0; i < IDENTITIES; i++)); do
     home="$WORK/agent-$i"; mkdir -p "$home"
-    "$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" init >/dev/null 2>&1
-    "$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" publish >/dev/null 2>&1
-    npub=$("$SONAR_CLI" --home "$home" --relay "$TARGET_RELAY" identity | jq -r '.npub // empty')
+    chmod 700 "$home"
+    "$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" init \
+      >"$WORK/agent-$i.init.out" 2>"$WORK/agent-$i.init.err"
+    "$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" publish \
+      >"$WORK/agent-$i.publish.out" 2>"$WORK/agent-$i.publish.err"
+    out=$("$SONAR_CLI" --home "$home" "${SONAR_RELAY_ARGS[@]}" identity \
+      2>"$WORK/agent-$i.identity.err")
+    npub=$(printf '%s' "$out" | jq -r '.npub // empty')
     [[ -n "$npub" ]] || { log "empty npub for agent-$i"; exit 1; }
-    HOMES[i]="$home"; NPUBS[i]="$npub"
+    HOMES[i]="$home"; NPUBS[i]="$npub"; TRANSPORTS[i]="sonar"
   done
-  log "provisioned $IDENTITIES identities on $TARGET_RELAY"
+  if [[ "$WITH_WHITENOISE" == "1" ]]; then
+    i="$IDENTITIES"
+    WN_HOME="$WORK/agent-$i-whitenoise"
+    wn_provision_identity "$WN_HOME" "$WN_RELAYS" "$TARGET_RELAY" >/dev/null
+    npub=$(cat "$WN_HOME/npub.txt")
+    HOMES[i]="$WN_HOME"; NPUBS[i]="$npub"; TRANSPORTS[i]="whitenoise"
+    TOTAL_IDENTITIES=$((IDENTITIES + 1))
+  fi
+  log "provisioned $TOTAL_IDENTITIES identities (primary=$TARGET_RELAY, Sonar relays=$SONAR_RELAYS, White Noise=$WITH_WHITENOISE)"
 }
 
 build_graph() {
   GRAPH="$WORK/graph.tsv"
-  local seed="${SEED:-$(date +%s)}"
-  awk -v n="$IDENTITIES" -v fanout="$FANOUT" -v seed="$seed" '
+  local seed="${1:-${SEED:-$(date +%s)}}"
+  awk -v n="$TOTAL_IDENTITIES" -v fanout="$FANOUT" -v seed="$seed" '
   BEGIN {
     srand(seed)
     for (a = 0; a < n; a++) {
@@ -111,6 +231,17 @@ build_graph() {
       }
     }
   }' > "$GRAPH"
+  if [[ "$WITH_WHITENOISE" == "1" ]]; then
+    local wn_index="$IDENTITIES"
+    if ! awk -F '\t' -v from=0 -v to="$wn_index" \
+      '$1 == from && $2 == to { found=1 } END { exit !found }' "$GRAPH"; then
+      printf '0\t%s\n' "$wn_index" >> "$GRAPH"
+    fi
+    if ! awk -F '\t' -v from="$wn_index" -v to=0 \
+      '$1 == from && $2 == to { found=1 } END { exit !found }' "$GRAPH"; then
+      printf '%s\t0\n' "$wn_index" >> "$GRAPH"
+    fi
+  fi
   log "graph: $(wc -l < "$GRAPH" | tr -d ' ') edges (seed=$seed)"
 }
 
@@ -130,14 +261,25 @@ hist_file() {
 }
 
 send_msg() { # from_idx to_idx text
-  "$SONAR_CLI" --home "${HOMES[$1]}" --relay "$TARGET_RELAY" \
-    send --to "${NPUBS[$2]}" --text "$3" >/dev/null 2>&1
+  local from="$1" to="$2" text="$3" err="$WORK/send-$1-$2.err"
+  if [[ "${TRANSPORTS[$from]}" == "whitenoise" ]]; then
+    wn_send_to "${HOMES[$from]}" "${NPUBS[$to]}" "$text" 2>"$err"
+  else
+    "$SONAR_CLI" --home "${HOMES[$from]}" "${SONAR_RELAY_ARGS[@]}" \
+      send --to "${NPUBS[$to]}" --text "$text" >/dev/null 2>"$err"
+  fi
 }
 
 # drain new inbound for agent r -> json lines on stdout
 drain_new() {
-  "$SONAR_CLI" --home "${HOMES[$1]}" --relay "$TARGET_RELAY" \
-    listen --timeout-secs "$RECEIVE_TIMEOUT_SECS" --poll-secs 2 --no-publish 2>/dev/null || true
+  local index="$1"
+  if [[ "${TRANSPORTS[$index]}" == "whitenoise" ]]; then
+    wn_drain_new "${HOMES[$index]}" 2>>"$WORK/drain-$index.err" || true
+  else
+    "$SONAR_CLI" --home "${HOMES[$index]}" "${SONAR_RELAY_ARGS[@]}" \
+      listen --timeout-secs "$RECEIVE_TIMEOUT_SECS" --poll-secs 2 --no-publish \
+      2>>"$WORK/drain-$index.err" || true
+  fi
 }
 
 # generate a reply: prompt in $AGENT_PROMPT -> reply on stdout
@@ -147,13 +289,168 @@ generate_reply() {
 
 trim_to() { awk -v n="$MAX_REPLY_CHARS" '{print substr($0,1,n)}'; }
 
+write_preflight_result() {
+  local status="$1" sonar_status="$2" sonar_class="$3" sonar_attempts="$4"
+  local sonar_ms="$5" sonar_error="$6" wn_status="$7" wn_class="$8"
+  local wn_ms="$9" wn_error="${10}"
+  jq -n \
+    --arg status "$status" \
+    --arg sonar_status "$sonar_status" --arg sonar_class "$sonar_class" \
+    --argjson sonar_attempts "$sonar_attempts" --argjson sonar_ms "$sonar_ms" \
+    --arg sonar_error "$sonar_error" --arg wn_status "$wn_status" \
+    --arg wn_class "$wn_class" --argjson wn_ms "$wn_ms" --arg wn_error "$wn_error" \
+    '{enabled:true, status:$status,
+      sonar_to_whitenoise:{status:$sonar_status,
+        failure_class:(if $sonar_class == "" then null else $sonar_class end),
+        attempts:$sonar_attempts, duration_ms:$sonar_ms,
+        error:(if $sonar_error == "" then null else $sonar_error end)},
+      whitenoise_to_sonar:{status:$wn_status,
+        failure_class:(if $wn_class == "" then null else $wn_class end),
+        duration_ms:$wn_ms,
+        error:(if $wn_error == "" then null else $wn_error end)}}' \
+    > "$PREFLIGHT_JSON"
+}
+
+run_whitenoise_preflight() {
+  local wn_index="$IDENTITIES" sonar_sender=0 sonar_receiver=1
+  local run_id
+  run_id="preflight:$(date +%Y%m%d%H%M%S):${SEED:-rnd}"
+  local sonar_payload="$run_id:sonar-to-whitenoise"
+  local wn_payload="$run_id:whitenoise-to-sonar"
+  local attempts=0 sent=0 first_error="" t0 t1 sonar_ms=0 wn_ms=0
+  local attempt_err received listener_pid listener_out listener_err
+  local sonar_status="failed" sonar_class="" sonar_error=""
+  local wn_status="failed" wn_class="" wn_error="" overall="failed"
+  local notification_out="$WORK/preflight-wn-notifications.jsonl"
+  local notification_err="$WORK/preflight-wn-notifications.err"
+  local receive_err="$WORK/preflight-sonar-to-wn-receive.err"
+  local deadline found=0 listener_timeout listener_slot=""
+
+  if ! wn_start_notifications "${HOMES[$wn_index]}" "$notification_out" "$notification_err"; then
+    sonar_class="whitenoise_relay_or_subscription"
+    wn_class="whitenoise_relay_or_subscription"
+    sonar_error=$(tr '\n' ' ' < "$notification_err" | cut -c1-500)
+    wn_error="$sonar_error"
+    write_preflight_result "$overall" "$sonar_status" "$sonar_class" 0 0 "$sonar_error" \
+      "$wn_status" "$wn_class" 0 "$wn_error"
+    log "White Noise preflight blocked: notification subscription was not ready"
+    return 1
+  fi
+  CHILD_PIDS[${#CHILD_PIDS[@]}]="$WN_NOTIFICATION_PID"
+
+  log "White Noise preflight: Sonar agent-$sonar_sender -> White Noise agent-$wn_index"
+  t0=$(now_ms)
+  while (( attempts < KEYPACKAGE_SEND_ATTEMPTS )); do
+    attempts=$((attempts + 1))
+    attempt_err="$WORK/preflight-sonar-to-wn-attempt-$attempts.err"
+    if "$SONAR_CLI" --home "${HOMES[$sonar_sender]}" "${SONAR_RELAY_ARGS[@]}" \
+      send --to "${NPUBS[$wn_index]}" --text "$sonar_payload" \
+      >"$WORK/preflight-sonar-to-wn-attempt-$attempts.out" 2>"$attempt_err"; then
+      sent=1
+      break
+    fi
+    if [[ -z "$first_error" ]]; then
+      first_error=$(tr '\n' ' ' < "$attempt_err" | cut -c1-500)
+    fi
+    sleep 2
+  done
+  [[ -z "$first_error" ]] || sonar_error="$first_error"
+  if [[ "$sent" != "1" ]]; then
+    if printf '%s' "$first_error" | grep -qi 'no key package found'; then
+      sonar_class="sonar_key_package_fetch"
+    else
+      sonar_class="sonar_group_or_send"
+    fi
+    log "White Noise preflight direction failed: Sonar could not send"
+  elif received=$(wn_wait_for_message "${HOMES[$wn_index]}" "$sonar_payload" \
+    "$notification_out" 2>>"$receive_err"); then
+    printf '%s\n' "$received" > "$WORK/preflight-sonar-to-wn-received.json"
+    sonar_status="passed"
+  else
+    sonar_error=$(tr '\n' ' ' < "$receive_err" | cut -c1-500)
+    if printf '%s' "$sonar_error" | grep -q 'did not receive expected message'; then
+      sonar_class="whitenoise_welcome_or_message_not_seen"
+    else
+      sonar_class="whitenoise_adapter_or_daemon"
+    fi
+    log "White Noise preflight direction failed: White Noise did not surface the message"
+  fi
+  t1=$(now_ms); sonar_ms=$((t1 - t0))
+
+  log "White Noise preflight: White Noise agent-$wn_index -> fresh Sonar agent-$sonar_receiver"
+  t0=$(now_ms)
+  if ! wn_wait_key_package "${HOMES[$wn_index]}" "${NPUBS[$sonar_receiver]}" \
+    2>"$WORK/preflight-wn-peer-keypackage.err"; then
+    wn_class="whitenoise_key_package_fetch"
+    wn_error=$(tr '\n' ' ' < "$WORK/preflight-wn-peer-keypackage.err" | cut -c1-500)
+    log "White Noise preflight direction failed: White Noise did not find the Sonar KeyPackage"
+  else
+    listener_out="$WORK/preflight-wn-to-sonar-received.jsonl"
+    listener_err="$WORK/preflight-wn-to-sonar-listen.err"
+    listener_timeout=$((WN_MESSAGE_TIMEOUT_SECS + INTEROP_CONNECT_DELAY_SECS + 15))
+    "$SONAR_CLI" --home "${HOMES[$sonar_receiver]}" "${SONAR_RELAY_ARGS[@]}" \
+      listen --timeout-secs "$listener_timeout" --poll-secs 2 --no-publish \
+      >"$listener_out" 2>"$listener_err" &
+    listener_pid=$!
+    listener_slot="${#CHILD_PIDS[@]}"
+    CHILD_PIDS[listener_slot]="$listener_pid"
+    sleep "$INTEROP_CONNECT_DELAY_SECS"
+    if ! kill -0 "$listener_pid" 2>/dev/null; then
+      wn_class="sonar_listener_not_ready"
+      wn_error=$(tr '\n' ' ' < "$listener_err" | cut -c1-500)
+    elif ! wn_send_to "${HOMES[$wn_index]}" "${NPUBS[$sonar_receiver]}" "$wn_payload" \
+      2>"$WORK/preflight-wn-to-sonar-send.err"; then
+      wn_class="whitenoise_group_or_send"
+      wn_error=$(tr '\n' ' ' < "$WORK/preflight-wn-to-sonar-send.err" | cut -c1-500)
+    else
+      deadline=$(( $(date +%s) + WN_MESSAGE_TIMEOUT_SECS ))
+      while (( $(date +%s) < deadline )); do
+        if jq -e --arg expected "$wn_payload" 'select(.content == $expected)' \
+          "$listener_out" >/dev/null 2>&1; then
+          found=1
+          break
+        fi
+        kill -0 "$listener_pid" 2>/dev/null || break
+        sleep 1
+      done
+      if [[ "$found" == "1" ]]; then
+        wn_status="passed"
+      else
+        wn_class="sonar_welcome_or_message_not_seen"
+        wn_error=$(tr '\n' ' ' < "$listener_err" | cut -c1-500)
+      fi
+    fi
+    kill -TERM "$listener_pid" 2>/dev/null || true
+    wait "$listener_pid" 2>/dev/null || true
+    CHILD_PIDS[listener_slot]=""
+  fi
+  t1=$(now_ms); wn_ms=$((t1 - t0))
+
+  if [[ "$sonar_status" == "passed" && "$wn_status" == "passed" ]]; then
+    overall="passed"
+  fi
+  write_preflight_result "$overall" "$sonar_status" "$sonar_class" "$attempts" "$sonar_ms" \
+    "$sonar_error" "$wn_status" "$wn_class" "$wn_ms" "$wn_error"
+  if [[ "$overall" == "passed" ]]; then
+    log "White Noise preflight passed in both directions (Sonar attempts=$attempts)"
+    return 0
+  fi
+  log "White Noise preflight finished with one or more failed directions"
+  return 1
+}
+
 main() {
-  local started_at ended_at seed
+  local started_at ended_at seed preflight_rc=0
   started_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   seed="${SEED:-$(date +%s)}"
-  log "identities=$IDENTITIES fanout=$FANOUT rounds=$ROUNDS relay=$TARGET_RELAY seed=$seed"
+  log "identities=$IDENTITIES fanout=$FANOUT rounds=$ROUNDS primary_relay=$TARGET_RELAY sonar_relays=$SONAR_RELAYS seed=$seed"
   provision
-  build_graph
+  if [[ "$WITH_WHITENOISE" == "1" && "$WHITENOISE_PREFLIGHT" == "1" ]]; then
+    if ! run_whitenoise_preflight; then
+      preflight_rc=1
+    fi
+  fi
+  build_graph "$seed"
 
   # round 0: seed a static opening line on each edge (no LLM cost for openers)
   local a b opener
@@ -172,7 +469,7 @@ main() {
   local round r line sender content sidx hf recent prompt t0 t1 reply lat
   for ((round = 1; round <= ROUNDS; round++)); do
     log "round $round/$ROUNDS"
-    for ((r = 0; r < IDENTITIES; r++)); do
+    for ((r = 0; r < TOTAL_IDENTITIES; r++)); do
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         sender=$(printf '%s' "$line" | jq -r '.sender // empty' 2>/dev/null)
@@ -213,27 +510,37 @@ main() {
   ended_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   local avg_lat=0; (( lat_n > 0 )) && avg_lat=$((lat_sum / lat_n))
 
+  local preflight
+  preflight=$(cat "$PREFLIGHT_JSON")
   jq -n \
     --arg started_at "$started_at" --arg ended_at "$ended_at" \
-    --arg relay "$TARGET_RELAY" --arg reply_cmd "$AGENT_REPLY_CMD" \
+    --arg relay "$TARGET_RELAY" --arg sonar_relays "$SONAR_RELAYS" \
+    --arg reply_cmd "$AGENT_REPLY_CMD" \
     --argjson identities "$IDENTITIES" --argjson fanout "$FANOUT" \
+    --argjson total_identities "$TOTAL_IDENTITIES" \
+    --argjson with_whitenoise "$WITH_WHITENOISE" \
     --argjson rounds "$ROUNDS" --argjson seed "$seed" \
     --argjson messages_sent "$messages_sent" --argjson messages_received "$messages_received" \
     --argjson replies_generated "$replies_generated" \
     --argjson reply_errors "$reply_errors" --argjson reply_empty "$reply_empty" \
     --argjson avg_lat "$avg_lat" --argjson max_lat "$lat_max" --argjson lat_n "$lat_n" \
+    --argjson preflight "$preflight" \
     '{kind:"ai-agents-chat", started_at:$started_at, ended_at:$ended_at,
-      config:{relay:$relay, identities:$identities, fanout:$fanout, rounds:$rounds, seed:$seed,
+      config:{relay:$relay, sonar_relays:($sonar_relays | split(",")),
+              identities:$identities, total_identities:$total_identities,
+              with_whitenoise:($with_whitenoise == 1), fanout:$fanout, rounds:$rounds, seed:$seed,
                reply_cmd:$reply_cmd},
       metrics:{messages_sent:$messages_sent, messages_received:$messages_received,
                replies_generated:$replies_generated, reply_errors:$reply_errors,
                reply_empty:$reply_empty,
-               reply_latency_ms:{avg:$avg_lat, max:$max_lat, samples:$lat_n}}}' \
+               reply_latency_ms:{avg:$avg_lat, max:$max_lat, samples:$lat_n}},
+      whitenoise_preflight:$preflight}' \
     > "$METRICS_JSON"
 
   cat "$METRICS_JSON"
   log "conversation log: $CONVO_LOG"
   log "sample:"; tail -n 12 "$CONVO_LOG" >&2 2>/dev/null || true
+  return "$preflight_rc"
 }
 
 main "$@"

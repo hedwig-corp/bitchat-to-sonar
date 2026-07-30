@@ -820,7 +820,11 @@ async fn listen(loaded: LoadedConfig, args: ListenArgs) -> Result<()> {
     let mut seen = load_seen(&seen_path)?;
     let start = Instant::now();
     loop {
-        client.sync().await?;
+        // `listen` is a polling surface as well as a live subscriber. Force a
+        // bounded relay catch-up each interval so a dropped subscription event
+        // is recovered from relay storage instead of remaining invisible until
+        // this identity reconnects in another command.
+        client.sync_force().await?;
         emit_unseen_messages(&client, &seen_path, &mut seen)?;
         if args.once {
             return Ok(());
