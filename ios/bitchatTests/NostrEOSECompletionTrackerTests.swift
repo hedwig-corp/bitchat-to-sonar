@@ -45,12 +45,17 @@ struct NostrEOSECompletionTrackerTests {
 
         let first = tracker.recordEOSE(from: "wss://relay-a.test")
         let duplicate = tracker.recordEOSE(from: "wss://relay-a.test")
+        // Capture here, not after `second`: the whole point is that the
+        // duplicate did not advance the count, and reading it at the end
+        // measures the state after relay-b has also reported.
+        let countAfterDuplicate = tracker.completedRelayCount
         let second = tracker.recordEOSE(from: "wss://relay-b.test")
 
         #expect(!first)
         #expect(!duplicate)
-        #expect(tracker.completedRelayCount == 1)
+        #expect(countAfterDuplicate == 1)
         #expect(second)
+        #expect(tracker.completedRelayCount == 2)
     }
 
     @Test func explicitRequiredRelayCountIsClampedToRelaySet() {
