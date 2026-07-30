@@ -1731,6 +1731,36 @@ recording, so the peer read as Sonar in the UI while `send_file` treated it as
 stock bitchat — in exactly the ordering `pending_sonar` exists to handle. Both
 Rust sites now go through `record_sonar_capability`.
 
+**The parked queue is part of the invariant.** `pending_sonar` (Rust) /
+`pendingSonarAnnounces` (iOS) hold a `0x53` whose signing key has not arrived
+yet, and `handle_announce`'s replay is one of the capability sites — so flushing
+that queue defeats "every verification site records" by keeping the verification
+from ever happening, and parking runs BEFORE verification, so a flood needs no
+keypairs. Both platforms now evict only an entry older than the protection window
+and otherwise refuse the newcomer (`park_pending_sonar` /
+`queuePendingSonarAnnounce`). FIFO is not sufficient: a flood arriving *after* the
+victim still pushes it out. iOS additionally keyed eviction on `packet.timestamp`,
+which the sender chooses, and the `0x53` staleness check only rejects *old*
+timestamps — so a future-dated flood was never the eviction candidate and the
+victim's real parked packet always was. Eviction now keys on our own monotonic
+arrival time.
+
+**Capability is recorded on the signature, not the payload.** Both platforms
+record straight after signature verification and before any attempt to parse the
+`0x53` body. Having sent a signed `0x53` is the proof; whether the local build can
+read that body is a separate question. iOS first recorded *after* its
+`SonarAnnouncePacket.decode` guard, so one wire input — a correctly signed but
+undecodable `0x53`, e.g. a newer capability encoding — marked a peer capable on
+Android/desktop and not on iOS, which is precisely the cross-platform split this
+entry exists to remove.
+
+**Clocks:** every window here is measured on a **monotonic** clock
+(`now_ms` in the core, `ProcessInfo.systemUptime` on iOS). These windows are flood
+defences, and on the wall clock a forward NTP step larger than the window makes
+every live entry look stale, re-enabling the eviction the fix removed — on iOS
+only, which is also an undocumented divergence from the core. Peer-supplied
+timestamps are never used for any of it.
+
 **Eviction and lifetime:** the marking set is recency-tracked and evicts the
 single stalest entry only when it is outside a 5-minute protection window,
 refusing new markings while every one is live — `record_sonar_capability` /
@@ -1751,7 +1781,7 @@ ordinary BLE stop/restart — clearing it would send the first transfer after ev
 radio cycle out unmarked for no security gain, since forgetting can only make the
 gate more conservative.
 
-**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `mesh_engine.rs::out_of_order_sonar_announce_still_grants_capability`, `mesh_engine.rs::unverified_sonar_announce_grants_no_capability`, `mesh_engine.rs::a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one`, `BLEServiceCoreTests.fileTransferToNonSonarPeer_carriesNoUnknownTLV`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`, `BLEServiceCoreTests.sonarCapability_survivesAFloodOfThrowawayPeers`
+**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `mesh_engine.rs::out_of_order_sonar_announce_still_grants_capability`, `mesh_engine.rs::unverified_sonar_announce_grants_no_capability`, `mesh_engine.rs::a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one`, `mesh_engine.rs::a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`, `BLEServiceCoreTests.wireFilePacket_stripsTheSonarTLVForANonSonarRecipient`, `BLEServiceCoreTests.parkedSonarAnnounce_survivesAFloodOfUnknownSenders`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`, `BLEServiceCoreTests.sonarCapability_survivesAFloodOfThrowawayPeers`
 
 The Rust tests pin the real call site: they drive two engines through
 `Engine::send_file` and run bitchat-android's decoder, transcribed, over the bytes
@@ -1761,7 +1791,19 @@ hoisting the record above the signature guard, and restoring the wholesale
 
 **Not guarded:** the iOS *wiring* — `wireFilePacket`, `isSonarCapable` and the
 recorder are each pinned, but nothing exercises `sendFilePrivate` end-to-end,
-which needs a live BLE route. The iOS flood test drives the recorder through a
+which needs a live BLE route. That gap is why
+`wireFilePacket_stripsTheSonarTLVForANonSonarRecipient` carries that name and not
+the `fileTransferToNonSonarPeer…` it had first: it calls the pure helper with a
+literal, so reverting the one load-bearing line in `sendFilePrivate` leaves every
+iOS test green. The Rust suite has no equivalent hole — its tests drive
+`Engine::send_file`. `parkedSonarAnnounce_survivesAFloodOfUnknownSenders` drives
+the parking policy through a `_test_` hook for the same reason the flood test
+does: pushing 128+ unknown-sender `0x53`s through `_test_handlePacket` schedules
+an announce-back per packet against a simulator with no CoreBluetooth and hangs
+the suite (observed, not theorised). iOS therefore has no end-to-end test of the
+parked replay; the Rust
+`a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one` does drive
+real packets through it. The iOS flood test drives the recorder through a
 `_test_` hook rather than signed announces, because flooding past the cap that
 way needs hundreds of keypairs; the packet-level path is covered separately.
 iOS tests also do not run in CI. Nothing here runs against a real

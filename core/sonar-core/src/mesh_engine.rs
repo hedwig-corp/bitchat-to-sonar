@@ -282,7 +282,10 @@ pub struct Engine {
     /// with different data, instead of a different constant.
     identity_map_cap: usize,
     /// A 0x53 can arrive before its 0x01 announce supplies the signing key.
-    pending_sonar: HashMap<String, Vec<u8>>,
+    /// Keyed by sender, valued `(arrival_ms, raw packet)` — the arrival time is
+    /// ours, not the sender's, so eviction cannot be steered by a peer-supplied
+    /// timestamp. See `park_pending_sonar`.
+    pending_sonar: HashMap<String, (u64, Vec<u8>)>,
     /// Fingerprints that proved they run Sonar by sending a *verified* 0x53
     /// Sonar announce, mapped to when that proof last arrived. Only these peers
     /// may receive the optional file-transfer TLVs Sonar adds on top of
@@ -1039,6 +1042,41 @@ impl Engine {
         true
     }
 
+    /// Park a 0x53 whose signing key has not arrived yet.
+    ///
+    /// Bounded the same way the identity pin map and `sonar_peers` are, and for
+    /// the same reason: this queue feeds `handle_announce`'s replay, which is one
+    /// of the two sites that can record Sonar capability, so flushing it defeats
+    /// that record just as effectively as clearing `sonar_peers` would. The old
+    /// wholesale `clear()` let a flood of `MAX_PENDING_SONAR` unknown-sender
+    /// 0x53s drop a victim's parked packet, costing that peer its media receipts
+    /// for an announce cycle.
+    ///
+    /// Note FIFO would not fix it — an attacker flooding *after* the victim
+    /// still pushes it out. So, like `evict_stalest_identity`, evict only an
+    /// entry older than the protection window and otherwise refuse the new one.
+    /// Refusing is cheap here: a parked packet only waits for the peer's 0x01,
+    /// which follows in the same discovery burst, so a protected entry is one
+    /// that is still plausibly waiting.
+    fn park_pending_sonar(&mut self, sender_key: String, raw: &[u8], now_ms: u64) {
+        if self.pending_sonar.len() >= MAX_PENDING_SONAR
+            && !self.pending_sonar.contains_key(&sender_key)
+        {
+            let stalest = self
+                .pending_sonar
+                .iter()
+                .min_by_key(|(_, (arrived, _))| *arrived)
+                .map(|(k, (arrived, _))| (k.clone(), *arrived));
+            match stalest {
+                Some((key, arrived)) if now_ms.saturating_sub(arrived) >= IDENTITY_PROTECT_MS => {
+                    self.pending_sonar.remove(&key);
+                }
+                _ => return,
+            }
+        }
+        self.pending_sonar.insert(sender_key, (now_ms, raw.to_vec()));
+    }
+
     /// The ONLY way a fingerprint earns the Sonar file-TLV extension. Every
     /// site that verifies a 0x53 must call this — the direct one in
     /// `handle_sonar` and the replay in `handle_announce` of a 0x53 that beat
@@ -1529,7 +1567,7 @@ impl Engine {
             direct,
         });
         // A 0x53 that arrived before this announce can be verified now.
-        if let Some(pending) = self.pending_sonar.remove(&sender_key) {
+        if let Some((_, pending)) = self.pending_sonar.remove(&sender_key) {
             if let Some(p) = mesh::Packet::decode(&pending) {
                 if p.type_ == msg_type::SONAR_ANNOUNCE
                     && mesh::verify_packet(&p, &announce.signing_public_key)
@@ -2111,10 +2149,7 @@ impl Engine {
         ) else {
             // Packet order is not guaranteed: cache the full signed packet by
             // sender until its verified announce supplies the signing key.
-            if self.pending_sonar.len() >= MAX_PENDING_SONAR {
-                self.pending_sonar.clear();
-            }
-            self.pending_sonar.insert(sender_key, raw.to_vec());
+            self.park_pending_sonar(sender_key, raw, now_ms);
             return;
         };
         let Ok(signing_key) = hex::decode(&signing_hex) else {
@@ -2500,6 +2535,69 @@ mod tests {
                 .as_deref(),
             Some("media-mid"),
             "a peer that proved Sonar via an out-of-order 0x53 must still get the receipt id",
+        );
+    }
+
+    /// The parked-0x53 queue feeds `handle_announce`'s replay, which is one of
+    /// the two sites that can record Sonar capability — so flushing that queue
+    /// defeats the out-of-order fix just as effectively as clearing
+    /// `sonar_peers` would, and every entry is as cheap to mint. Parking happens
+    /// BEFORE verification (the signing key is exactly what is missing), so the
+    /// flood needs no keypairs at all.
+    #[test]
+    fn a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one() {
+        let mut a = engine(1, "sonar-a");
+        let mut victim = engine(9, "victim");
+        let _ = victim.set_sonar_payload(Some(b"sonar-victim".to_vec()), 900);
+
+        let conn = "84:2F";
+        let instance = 34;
+        let now = 1_000u64;
+        a.on_dial_request(conn, now);
+        a.on_client_connected(conn, now);
+        victim.on_server_connected("droid", now);
+        let _ = a.on_instances_discovered(conn, &[instance], now);
+        let sub = a.on_subscribe_result(conn, instance, true, now);
+        let link = LinkId {
+            conn: conn.to_string(),
+            instance,
+        };
+
+        // The victim's 0x53 arrives first and parks: no 0x01 yet.
+        let victim_sonar = victim.sonar_bytes(now).expect("victim 0x53");
+        let _ = a.on_client_rx(conn, instance, &victim_sonar, now);
+        assert_eq!(a.pending_sonar.len(), 1, "victim 0x53 must be parked");
+
+        // Flood past the cap from unique fabricated senders. Unsigned and with
+        // absurd future timestamps — neither matters, because parking precedes
+        // verification and eviction keys on OUR arrival time, not theirs.
+        for i in 0..(MAX_PENDING_SONAR * 2) {
+            let mut sender = [0u8; 8];
+            sender[..2].copy_from_slice(&(i as u16 + 1).to_be_bytes());
+            sender[7] = 0xAA;
+            let mut p = mesh::Packet::new(msg_type::SONAR_ANNOUNCE, DEFAULT_TTL, u64::MAX - 1, sender);
+            p.payload = b"flood".to_vec();
+            let bytes = p.encode().expect("flood packet");
+            let _ = a.on_client_rx(conn, instance, &bytes, now);
+        }
+        assert!(
+            a.pending_sonar.len() <= MAX_PENDING_SONAR,
+            "the parking lot must stay bounded, got {}",
+            a.pending_sonar.len(),
+        );
+
+        // The victim's 0x01 finally lands and the replay must still find its
+        // 0x53 and grant capability.
+        let victim_ann = victim.announce_bytes(now).expect("victim announce");
+        let ann_out = a.on_client_rx(conn, instance, &victim_ann, now);
+        let mut first = Output::default();
+        first.merge(sub);
+        first.merge(ann_out);
+        let _ = pump(&mut a, &link, &mut victim, "droid", first, now);
+
+        assert!(
+            a.sonar_peers.contains_key(&fp_of(&victim)),
+            "a flood of parked 0x53s must not cost the victim its capability",
         );
     }
 

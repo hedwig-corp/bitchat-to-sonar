@@ -174,7 +174,12 @@ final class BLEService: NSObject {
     // 0x53 can beat the corresponding 0x01 announce on a fresh BLE link.
     // Cache it briefly by peerID, then verify it after the announce installs
     // the peer's signing key.
-    private var pendingSonarAnnounces: [PeerID: BitchatPacket] = [:]
+    // Valued `(queuedAt, packet)` on a monotonic clock. `queuedAt` is OUR arrival
+    // time: evicting by `packet.timestamp` let a sender pick its own eviction
+    // order, and the 0x53 staleness check only rejects OLD timestamps, so a
+    // future-dated flood was never the eviction candidate and the victim's real
+    // parked packet always was.
+    private var pendingSonarAnnounces: [PeerID: (queuedAt: TimeInterval, packet: BitchatPacket)] = [:]
     private let pendingSonarAnnounceCap = 128
 
     // Peers that proved they run Sonar by sending a *verified* 0x53. Only these
@@ -188,7 +193,12 @@ final class BLEService: NSObject {
     // Losing a real peer's marking costs more than a receipt — with no message
     // id `handleFileTransfer` skips its duplicate check, so a re-send lands as a
     // second row plus a second stored file against the media quota.
-    private var sonarCapablePeers: [PeerID: Date] = [:]
+    // Stamped with a MONOTONIC clock (`ProcessInfo.systemUptime`), not `Date()`:
+    // the window this feeds is a flood defence, and on the wall clock a forward
+    // NTP step of more than the window makes every live marking look stale, so a
+    // flood could evict again — on iOS only, since the core measures against its
+    // monotonic `now_ms`.
+    private var sonarCapablePeers: [PeerID: TimeInterval] = [:]
     // Matches the core's `SONAR_PEER_CAP` so both platforms forget together.
     private let sonarCapablePeerCap = 256
     // Mirrors the core's `IDENTITY_PROTECT_MS`.
@@ -2557,6 +2567,26 @@ extension BLEService {
 
     var _test_sonarCapablePeerCap: Int { sonarCapablePeerCap }
 
+    /// Exercises the real parked-announce eviction policy. Driving this through
+    /// `_test_handlePacket` instead would put 128+ unknown-sender 0x53s through
+    /// the full receive pipeline, each scheduling an announce-back against a
+    /// simulator with no CoreBluetooth — which hangs, rather than testing
+    /// anything. The end-to-end replay is covered on the Rust side by
+    /// `a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`.
+    func _test_queuePendingSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {
+        queuePendingSonarAnnounce(packet, from: peerID)
+    }
+
+    func _test_hasPendingSonarAnnounce(for peerID: PeerID) -> Bool {
+        collectionsQueue.sync { pendingSonarAnnounces[peerID] != nil }
+    }
+
+    var _test_pendingSonarAnnounceCount: Int {
+        collectionsQueue.sync { pendingSonarAnnounces.count }
+    }
+
+    var _test_pendingSonarAnnounceCap: Int { pendingSonarAnnounceCap }
+
     func _test_handlePacket(_ packet: BitchatPacket, fromPeerID: PeerID, preseedPeer: Bool = true) {
         if preseedPeer {
             // Ensure the synthetic peer is known and marked verified for public-message tests
@@ -4792,15 +4822,24 @@ extension BLEService {
             return
         }
 
+        // A verified 0x53 is the only proof the peer speaks Sonar, and so the
+        // only licence to put Sonar's optional file TLV on the wire for it.
+        //
+        // Recorded on the SIGNATURE, before the payload is parsed, because that
+        // is what the core does (`handle_sonar` / `handle_announce`'s replay call
+        // `record_sonar_capability` straight after `verify_packet`, and never
+        // decode the payload at all). Having sent a signed 0x53 is the proof;
+        // whether this build can read its body is a separate question. Deciding
+        // it after the decode guard made one wire input mark a peer capable on
+        // Android and not on iOS — the exact cross-platform split this gate
+        // exists to remove. See R-022.
+        collectionsQueue.sync(flags: .barrier) {
+            recordSonarCapabilityLocked(peerID)
+        }
+
         guard let announce = SonarAnnouncePacket.decode(from: packet.payload) else {
             SecureLogger.warning("⚠️ Failed to decode Sonar announce from \(peerID.id.prefix(8))…", category: .session)
             return
-        }
-
-        // A verified 0x53 is the only proof the peer speaks Sonar, and so the
-        // only licence to put Sonar's optional file TLV on the wire for it.
-        collectionsQueue.sync(flags: .barrier) {
-            recordSonarCapabilityLocked(peerID)
         }
 
         NotificationCenter.default.post(
@@ -4829,7 +4868,7 @@ extension BLEService {
     /// `removeAll()` let roughly `sonarCapablePeerCap` throwaway identities
     /// flush the real peers' markings, sustainably rather than once.
     private func recordSonarCapabilityLocked(_ peerID: PeerID) {
-        let now = Date()
+        let now = ProcessInfo.processInfo.systemUptime
         // A re-announce refreshes recency, so a concurrent flood cannot evict a
         // peer we are actively talking to.
         if sonarCapablePeers[peerID] != nil {
@@ -4838,7 +4877,7 @@ extension BLEService {
         }
         if sonarCapablePeers.count >= sonarCapablePeerCap {
             guard let stalest = sonarCapablePeers.min(by: { $0.value < $1.value }),
-                  now.timeIntervalSince(stalest.value) >= sonarCapableProtectWindow else {
+                  now - stalest.value >= sonarCapableProtectWindow else {
                 return
             }
             sonarCapablePeers.removeValue(forKey: stalest.key)
@@ -4865,19 +4904,32 @@ extension BLEService {
         return filePacket
     }
 
+    /// Parks a 0x53 whose signing key has not arrived yet.
+    ///
+    /// This queue feeds `handleSonarAnnounce`'s replay, which is where a
+    /// 0x53-before-0x01 peer earns its capability, so flushing it defeats that
+    /// record just as effectively as clearing `sonarCapablePeers` would. FIFO
+    /// would not be enough — a flood arriving *after* the victim still pushes it
+    /// out — so, like the core's `park_pending_sonar`, evict only an entry older
+    /// than the protection window and otherwise refuse the newcomer.
     private func queuePendingSonarAnnounce(_ packet: BitchatPacket, from peerID: PeerID) {
         collectionsQueue.sync(flags: .barrier) {
+            let now = ProcessInfo.processInfo.systemUptime
             if pendingSonarAnnounces.count >= pendingSonarAnnounceCap,
-               let oldest = pendingSonarAnnounces.min(by: { $0.value.timestamp < $1.value.timestamp })?.key {
-                pendingSonarAnnounces.removeValue(forKey: oldest)
+               pendingSonarAnnounces[peerID] == nil {
+                guard let stalest = pendingSonarAnnounces.min(by: { $0.value.queuedAt < $1.value.queuedAt }),
+                      now - stalest.value.queuedAt >= sonarCapableProtectWindow else {
+                    return
+                }
+                pendingSonarAnnounces.removeValue(forKey: stalest.key)
             }
-            pendingSonarAnnounces[peerID] = packet
+            pendingSonarAnnounces[peerID] = (queuedAt: now, packet: packet)
         }
     }
 
     private func takePendingSonarAnnounce(for peerID: PeerID) -> BitchatPacket? {
         collectionsQueue.sync(flags: .barrier) {
-            pendingSonarAnnounces.removeValue(forKey: peerID)
+            pendingSonarAnnounces.removeValue(forKey: peerID)?.packet
         }
     }
 

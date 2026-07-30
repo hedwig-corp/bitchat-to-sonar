@@ -278,7 +278,7 @@ struct BLEServiceCoreTests {
     /// extra TLV made every image, voice note and file a Sonar user sent to an
     /// Android bitchat user vanish — no row, no error, on either side.
     @Test
-    func fileTransferToNonSonarPeer_carriesNoUnknownTLV() throws {
+    func wireFilePacket_stripsTheSonarTLVForANonSonarRecipient() throws {
         let packet = BitchatFilePacket(
             fileName: "photo.jpg",
             fileSize: 3,
@@ -393,6 +393,58 @@ struct BLEServiceCoreTests {
         let becameCapable = await TestHelpers.waitUntil({ ble.isSonarCapable(peerID) },
                                                         timeout: TestConstants.shortTimeout)
         #expect(becameCapable)
+    }
+
+    /// The parked-0x53 queue feeds `handleSonarAnnounce`'s replay, which is where
+    /// a 0x53-before-0x01 peer earns its capability — so flushing that queue
+    /// defeats the record just as effectively as clearing the capability map.
+    /// Parking happens BEFORE verification (the signing key is exactly what is
+    /// missing), so a flood needs no keypairs, and the old policy evicted by
+    /// `packet.timestamp`, which the flooder chooses.
+    ///
+    /// Drives the parking policy directly. Pushing 128+ unknown-sender 0x53s
+    /// through `_test_handlePacket` hangs: each schedules an announce-back
+    /// against a simulator with no CoreBluetooth. The end-to-end replay is
+    /// covered on the Rust side by
+    /// `a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`.
+    @Test
+    func parkedSonarAnnounce_survivesAFloodOfUnknownSenders() {
+        let ble = makeService()
+        let victim = PeerID(str: "0011223344556677")
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        func announce(from peerID: PeerID, timestamp: UInt64) -> BitchatPacket {
+            BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: timestamp,
+                payload: Data(repeating: 0x01, count: 8),
+                signature: Data(repeating: 0xAB, count: 64),
+                ttl: 7
+            )
+        }
+
+        // The victim parks first, with an honest current timestamp.
+        ble._test_queuePendingSonarAnnounce(announce(from: victim, timestamp: now), from: victim)
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim))
+
+        // Flood past the cap. Timestamps are far in the FUTURE, which is what
+        // defeated the old `min(by: packet.timestamp)` policy: the flooder's
+        // entries were never the eviction candidate, so the victim's always was.
+        // The 0x53 staleness check only rejects old timestamps, so future dates
+        // pass it.
+        for i in 0..<(ble._test_pendingSonarAnnounceCap * 2) {
+            let flooder = PeerID(str: String(format: "%016x", i + 1))
+            ble._test_queuePendingSonarAnnounce(
+                announce(from: flooder, timestamp: now + 600_000),
+                from: flooder
+            )
+        }
+
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim),
+                "a flood of parked 0x53s must not evict the victim's parked packet")
+        #expect(ble._test_pendingSonarAnnounceCount <= ble._test_pendingSonarAnnounceCap)
     }
 
     /// Every marking is cheap to mint — one keypair, one TOFU announce, one
