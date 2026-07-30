@@ -1528,6 +1528,13 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
 
     func conversationSummaries()  -> [ConversationSummaryInfo]
 
+    /**
+     * On the NEW device: create + publish a fresh KeyPackage and return its
+     * full `d` tag. Hosts display a prefix (see core `DEVICE_LINK_CODE_LEN`,
+     * 12 chars) as the link code the user types on the old device.
+     */
+    func createDeviceLinkCode() throws  -> String
+
     func createInviteLink(groupIdHex: String, groupName: String) throws  -> String
 
     /**
@@ -1645,6 +1652,14 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * Leave a group and delete its local state after the leave proposal is sent.
      */
     func leaveGroup(groupIdHex: String) throws
+
+    /**
+     * On the OLD device: add the account's other device (selected by its
+     * link code, a KeyPackage `d`-tag prefix) as a second leaf to every
+     * group where we are an admin. Safe to re-run; per-group failures are
+     * reported, not fatal.
+     */
+    func linkDevice(code: String) throws  -> DeviceLinkReportInfo
 
     func markConversationRead(groupIdHex: String)
 
@@ -2249,6 +2264,19 @@ open func conversationSummaries() -> [ConversationSummaryInfo]  {
 })
 }
 
+    /**
+     * On the NEW device: create + publish a fresh KeyPackage and return its
+     * full `d` tag. Hosts display a prefix (see core `DEVICE_LINK_CODE_LEN`,
+     * 12 chars) as the link code the user types on the old device.
+     */
+open func createDeviceLinkCode()throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_create_device_link_code(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
 open func createInviteLink(groupIdHex: String, groupName: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_method_sonarnode_create_invite_link(
@@ -2510,6 +2538,21 @@ open func leaveGroup(groupIdHex: String)throws   {try rustCallWithError(FfiConve
         FfiConverterString.lower(groupIdHex),$0
     )
 }
+}
+
+    /**
+     * On the OLD device: add the account's other device (selected by its
+     * link code, a KeyPackage `d`-tag prefix) as a second leaf to every
+     * group where we are an admin. Safe to re-run; per-group failures are
+     * reported, not fatal.
+     */
+open func linkDevice(code: String)throws  -> DeviceLinkReportInfo  {
+    return try  FfiConverterTypeDeviceLinkReportInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_method_sonarnode_link_device(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(code),$0
+    )
+})
 }
 
 open func markConversationRead(groupIdHex: String)  {try! rustCall() {
@@ -3590,6 +3633,125 @@ public func FfiConverterTypeConversationSummaryInfo_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeConversationSummaryInfo_lower(_ value: ConversationSummaryInfo) -> RustBuffer {
     return FfiConverterTypeConversationSummaryInfo.lower(value)
+}
+
+
+/**
+ * Per-group outcome of a device-link pass.
+ */
+public struct DeviceLinkGroupOutcomeInfo: Equatable, Hashable {
+    public var groupIdHex: String
+    public var groupName: String
+    public var status: DeviceLinkGroupStatusInfo
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupIdHex: String, groupName: String, status: DeviceLinkGroupStatusInfo) {
+        self.groupIdHex = groupIdHex
+        self.groupName = groupName
+        self.status = status
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DeviceLinkGroupOutcomeInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceLinkGroupOutcomeInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceLinkGroupOutcomeInfo {
+        return
+            try DeviceLinkGroupOutcomeInfo(
+                groupIdHex: FfiConverterString.read(from: &buf), 
+                groupName: FfiConverterString.read(from: &buf), 
+                status: FfiConverterTypeDeviceLinkGroupStatusInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeviceLinkGroupOutcomeInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupIdHex, into: &buf)
+        FfiConverterString.write(value.groupName, into: &buf)
+        FfiConverterTypeDeviceLinkGroupStatusInfo.write(value.status, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupOutcomeInfo_lift(_ buf: RustBuffer) throws -> DeviceLinkGroupOutcomeInfo {
+    return try FfiConverterTypeDeviceLinkGroupOutcomeInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupOutcomeInfo_lower(_ value: DeviceLinkGroupOutcomeInfo) -> RustBuffer {
+    return FfiConverterTypeDeviceLinkGroupOutcomeInfo.lower(value)
+}
+
+
+/**
+ * Result of linking another device of this account: which KeyPackage slot
+ * (`d` tag) was linked and what happened per group.
+ */
+public struct DeviceLinkReportInfo: Equatable, Hashable {
+    public var dTag: String
+    public var outcomes: [DeviceLinkGroupOutcomeInfo]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(dTag: String, outcomes: [DeviceLinkGroupOutcomeInfo]) {
+        self.dTag = dTag
+        self.outcomes = outcomes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension DeviceLinkReportInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceLinkReportInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceLinkReportInfo {
+        return
+            try DeviceLinkReportInfo(
+                dTag: FfiConverterString.read(from: &buf), 
+                outcomes: FfiConverterSequenceTypeDeviceLinkGroupOutcomeInfo.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DeviceLinkReportInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.dTag, into: &buf)
+        FfiConverterSequenceTypeDeviceLinkGroupOutcomeInfo.write(value.outcomes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkReportInfo_lift(_ buf: RustBuffer) throws -> DeviceLinkReportInfo {
+    return try FfiConverterTypeDeviceLinkReportInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkReportInfo_lower(_ value: DeviceLinkReportInfo) -> RustBuffer {
+    return FfiConverterTypeDeviceLinkReportInfo.lower(value)
 }
 
 
@@ -5953,6 +6115,94 @@ public func FfiConverterTypeMeshEngineEvent_lower(_ value: MeshEngineEvent) -> R
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Typed per-group status of a device-link pass, so hosts get exhaustive
+ * switches instead of matching on strings.
+ */
+
+public enum DeviceLinkGroupStatusInfo: Equatable, Hashable {
+    
+    case linked
+    case skippedNotAdmin
+    case alreadyLinked
+    case failed(error: String
+    )
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension DeviceLinkGroupStatusInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDeviceLinkGroupStatusInfo: FfiConverterRustBuffer {
+    typealias SwiftType = DeviceLinkGroupStatusInfo
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DeviceLinkGroupStatusInfo {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .linked
+        
+        case 2: return .skippedNotAdmin
+        
+        case 3: return .alreadyLinked
+        
+        case 4: return .failed(error: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: DeviceLinkGroupStatusInfo, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .linked:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .skippedNotAdmin:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .alreadyLinked:
+            writeInt(&buf, Int32(3))
+        
+        
+        case let .failed(error):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(error, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupStatusInfo_lift(_ buf: RustBuffer) throws -> DeviceLinkGroupStatusInfo {
+    return try FfiConverterTypeDeviceLinkGroupStatusInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDeviceLinkGroupStatusInfo_lower(_ value: DeviceLinkGroupStatusInfo) -> RustBuffer {
+    return FfiConverterTypeDeviceLinkGroupStatusInfo.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Transcript-level classification of a chat message, computed once in core
  * so hosts never re-parse `content` on the UI render path. Malformed control
  * lines classify as `Text` (a parse failure never hides a message).
@@ -7253,6 +7503,31 @@ fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverter
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeDeviceLinkGroupOutcomeInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [DeviceLinkGroupOutcomeInfo]
+
+    public static func write(_ value: [DeviceLinkGroupOutcomeInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeDeviceLinkGroupOutcomeInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [DeviceLinkGroupOutcomeInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [DeviceLinkGroupOutcomeInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeDeviceLinkGroupOutcomeInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeDirectDmInfo: FfiConverterRustBuffer {
     typealias SwiftType = [DirectDmInfo]
 
@@ -8351,6 +8626,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_conversation_summaries() != 56244) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_create_device_link_code() != 13347) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_create_invite_link() != 21411) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8412,6 +8690,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_link_device() != 9254) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_mark_conversation_read() != 18250) {

@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import uniffi.sonar_ffi.DeviceLinkGroupStatusInfo
 import uniffi.sonar_ffi.SonarIdentity
 import uniffi.sonar_ffi.MediaDownloadListener as FfiMediaDownloadListener
 import uniffi.sonar_ffi.MediaUploadListener as FfiMediaUploadListener
@@ -558,6 +559,29 @@ actual object SonarCore {
             "sent" -> "Sent"
             else -> "Sent"
         }
+    }
+
+    // Device linking propagates errors (no runCatching): the sheet shows them.
+    actual suspend fun createDeviceLinkCode(): String = withContext(Dispatchers.IO) {
+        requireNode().createDeviceLinkCode().take(SONAR_DEVICE_LINK_CODE_LEN)
+    }
+
+    actual suspend fun linkDevice(code: String): SonarDeviceLinkResult = withContext(Dispatchers.IO) {
+        val report = requireNode().linkDevice(code)
+        SonarDeviceLinkResult(
+            dTag = report.dTag,
+            outcomes = report.outcomes.map {
+                // Exhaustive when at the FFI boundary: a new core status is a
+                // compile error here, not a silently dropped report row.
+                val (status, error) = when (val st = it.status) {
+                    is DeviceLinkGroupStatusInfo.Linked -> "linked" to null
+                    is DeviceLinkGroupStatusInfo.SkippedNotAdmin -> "skipped_not_admin" to null
+                    is DeviceLinkGroupStatusInfo.AlreadyLinked -> "already_linked" to null
+                    is DeviceLinkGroupStatusInfo.Failed -> "failed" to st.error
+                }
+                SonarDeviceLinkOutcome(it.groupIdHex, it.groupName, status, error)
+            },
+        )
     }
 
     actual suspend fun publishProfile(name: String, about: String?, picture: String?) = withContext(Dispatchers.IO) {

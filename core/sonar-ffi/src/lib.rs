@@ -341,6 +341,32 @@ pub struct GroupInviteInfo {
     pub relay_urls: Vec<String>,
 }
 
+/// Typed per-group status of a device-link pass, so hosts get exhaustive
+/// switches instead of matching on strings.
+#[derive(uniffi::Enum)]
+pub enum DeviceLinkGroupStatusInfo {
+    Linked,
+    SkippedNotAdmin,
+    AlreadyLinked,
+    Failed { error: String },
+}
+
+/// Per-group outcome of a device-link pass.
+#[derive(uniffi::Record)]
+pub struct DeviceLinkGroupOutcomeInfo {
+    pub group_id_hex: String,
+    pub group_name: String,
+    pub status: DeviceLinkGroupStatusInfo,
+}
+
+/// Result of linking another device of this account: which KeyPackage slot
+/// (`d` tag) was linked and what happened per group.
+#[derive(uniffi::Record)]
+pub struct DeviceLinkReportInfo {
+    pub d_tag: String,
+    pub outcomes: Vec<DeviceLinkGroupOutcomeInfo>,
+}
+
 #[derive(uniffi::Record)]
 pub struct JoinRequestInfo {
     pub requester_npub: String,
@@ -1004,6 +1030,50 @@ impl SonarNode {
         let invite_id = parse_event_id(&invite_id_hex)?;
         self.client.decline_group_invite(&invite_id)?;
         Ok(())
+    }
+
+    // ── Device linking (second MLS leaf for this account) ─────────────
+
+    /// On the NEW device: create + publish a fresh KeyPackage and return its
+    /// full `d` tag. Hosts display a prefix (see core `DEVICE_LINK_CODE_LEN`,
+    /// 12 chars) as the link code the user types on the old device.
+    pub fn create_device_link_code(&self) -> FfiResult<String> {
+        Ok(self
+            .runtime
+            .block_on(self.client.create_device_link_code())?)
+    }
+
+    /// On the OLD device: add the account's other device (selected by its
+    /// link code, a KeyPackage `d`-tag prefix) as a second leaf to every
+    /// group where we are an admin. Safe to re-run; per-group failures are
+    /// reported, not fatal.
+    pub fn link_device(&self, code: String) -> FfiResult<DeviceLinkReportInfo> {
+        let report = self.runtime.block_on(self.client.link_device(&code))?;
+        Ok(DeviceLinkReportInfo {
+            d_tag: report.d_tag,
+            outcomes: report
+                .outcomes
+                .into_iter()
+                .map(|outcome| DeviceLinkGroupOutcomeInfo {
+                    group_id_hex: outcome.group_id_hex,
+                    group_name: outcome.name,
+                    status: match outcome.status {
+                        sonar_core::client::DeviceLinkGroupStatus::Linked => {
+                            DeviceLinkGroupStatusInfo::Linked
+                        }
+                        sonar_core::client::DeviceLinkGroupStatus::SkippedNotAdmin => {
+                            DeviceLinkGroupStatusInfo::SkippedNotAdmin
+                        }
+                        sonar_core::client::DeviceLinkGroupStatus::AlreadyLinked => {
+                            DeviceLinkGroupStatusInfo::AlreadyLinked
+                        }
+                        sonar_core::client::DeviceLinkGroupStatus::Failed(error) => {
+                            DeviceLinkGroupStatusInfo::Failed { error }
+                        }
+                    },
+                })
+                .collect(),
+        })
     }
 
     // ── Invite links ──────────────────────────────────────────────────

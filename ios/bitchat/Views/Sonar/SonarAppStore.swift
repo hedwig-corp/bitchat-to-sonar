@@ -2181,6 +2181,24 @@ final class SonarAppStore: ObservableObject {
         }
     }
 
+    // MARK: - Device linking (Settings → Linked devices)
+
+    /// NEW device side: publish a fresh KeyPackage and return the short link
+    /// code (a `d`-tag prefix) the user types on the old device.
+    func createDeviceLinkCode() async throws -> String {
+        let dTag = try await marmot.createDeviceLinkCode()
+        return String(dTag.prefix(Self.deviceLinkCodeLength))
+    }
+
+    /// OLD device side: link the device showing `code` into every admin group.
+    func linkDevice(code: String) async throws -> MarmotService.DeviceLinkReport {
+        try await marmot.linkDevice(code: code)
+    }
+
+    /// Chars of the KeyPackage `d` tag shown/typed as the link code. Must
+    /// match the core's `DEVICE_LINK_CODE_LEN`.
+    static let deviceLinkCodeLength = 12
+
     // MARK: - Diagnostics (Settings → Diagnostics)
 
     /// Relay/sync snapshot JSON for the Diagnostics sheet. Nil while the relay

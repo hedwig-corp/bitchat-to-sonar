@@ -1649,6 +1649,87 @@ pub struct DrainNotification {
     pub content_preview: String,
 }
 
+/// Chars of a KeyPackage `d` tag shown to the user as a device-link code.
+/// The `d` tag is 32 random bytes hex-encoded (MIP-00), so 12 chars are
+/// unambiguous among one account's handful of slots.
+pub const DEVICE_LINK_CODE_LEN: usize = 12;
+
+/// Shortest accepted device-link code on the entering side. Shorter prefixes
+/// risk matching a stale slot; ambiguity is rejected explicitly either way.
+const MIN_DEVICE_LINK_CODE_LEN: usize = 8;
+
+/// Outcome of [`SonarClient::link_device`] for one group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceLinkGroupStatus {
+    /// The add commit + welcome were published; the new device joins on its
+    /// next welcome drain.
+    Linked,
+    /// We are not an admin of this group, so we cannot add a member (v1 gap).
+    SkippedNotAdmin,
+    /// The key package's leaf is already in this group (safe re-run).
+    AlreadyLinked,
+    Failed(String),
+}
+
+/// Per-group result of a device-link pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLinkGroupOutcome {
+    pub group_id_hex: String,
+    pub name: String,
+    pub status: DeviceLinkGroupStatus,
+}
+
+/// Result of [`SonarClient::link_device`]: which KeyPackage slot was used and
+/// what happened per group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLinkReport {
+    /// Full `d` tag of the KeyPackage that was linked.
+    pub d_tag: String,
+    pub outcomes: Vec<DeviceLinkGroupOutcome>,
+}
+
+/// Select the unique KeyPackage event whose `d` tag starts with `code`
+/// (lowercase hex). Zero matches and ambiguous matches are both errors the
+/// user can act on (regenerate / retype the code).
+fn select_key_package_by_code<'a>(events: &'a [Event], code: &str) -> Result<&'a Event> {
+    let matches: Vec<&Event> = events
+        .iter()
+        .filter(|e| {
+            e.tags
+                .identifier()
+                .is_some_and(|d| d.to_ascii_lowercase().starts_with(code))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => Err(Error::InvalidInput(
+            "no key package found for this link code; make sure the new device is online and \
+             showing a freshly generated code"
+                .into(),
+        )),
+        [only] => Ok(only),
+        _ => Err(Error::InvalidInput(
+            "link code matches more than one key package; generate a fresh code on the new \
+             device and use that"
+                .into(),
+        )),
+    }
+}
+
+/// openmls rejects a commit re-adding a leaf whose signature/encryption/init
+/// key is already in the group. MDK flattens the error to a string, so
+/// classification is by message; `add_members_error_classification…` in the
+/// tests anchors these against the real strings so an MDK/openmls bump that
+/// rewords them fails loudly instead of misreporting link outcomes.
+fn is_duplicate_add_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("duplicate")
+}
+
+/// openmls refuses to stage a second commit while one is pending
+/// (`MlsGroupStateError::PendingCommit`). Same string-anchoring test as above.
+fn is_pending_commit_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("pending commit")
+}
+
 /// One received geohash channel event (ephemeral kind-20000), buffered from the
 /// live subscription. Geohash channels are public ephemeral events — relays do
 /// NOT store them, so we accumulate them in memory as the subscription delivers.
@@ -2532,6 +2613,199 @@ impl SonarClient {
             .into_iter()
             .next()
             .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Create AND publish a fresh KeyPackage for THIS device, returning its
+    /// `d` tag (64 hex chars, random per MIP-00). The first
+    /// [`DEVICE_LINK_CODE_LEN`] chars are shown to the user as the device-link
+    /// code; the linking device matches it against
+    /// [`Self::fetch_all_key_packages`] output. The publish is awaited (unlike
+    /// the connect-time background republish) because the user is about to
+    /// type the code on the other device and the fetch must find the event.
+    pub async fn create_device_link_code(&self) -> Result<String> {
+        let event = self.engine.key_package_event(self.relays.clone())?;
+        let d_tag = event
+            .tags
+            .identifier()
+            .ok_or_else(|| Error::InvalidInput("key package event missing d tag".into()))?
+            .to_string();
+        // Require a relay to accept it: the old device is about to look this
+        // KeyPackage up by its `d` tag, so a code for an event that reached no
+        // relay is unusable. Fail loudly instead of showing a dead code.
+        let output = self.nostr.send_event(&event).await?;
+        require_relay_success(&output, "device link key package publish")?;
+        Ok(d_tag)
+    }
+
+    /// Add another device of THIS account (identified by `code`, a `d`-tag
+    /// prefix from [`Self::create_device_link_code`]) as a second MLS leaf to
+    /// every group where we are an admin. Kind-30443 events are signed by the
+    /// account key, so only the nsec holder can mint a matching KeyPackage;
+    /// the code confirms WHICH slot is the new device, it is not a secret.
+    ///
+    /// Per-group failures do not abort the loop: the report carries one
+    /// outcome per active group (linked / skipped-not-admin / already-linked /
+    /// failed). Re-running is safe: a leaf already in a group surfaces as
+    /// [`DeviceLinkGroupStatus::AlreadyLinked`], and a pending commit left by
+    /// a previous partially-failed pass is merged and the add retried. The one
+    /// unrecoverable-with-the-same-code state — commit published but the
+    /// welcome never delivered — reports a `Failed` telling the user to
+    /// generate a FRESH code on the new device.
+    pub async fn link_device(&self, code: &str) -> Result<DeviceLinkReport> {
+        // Users copy the code from a display that groups it as `abcd efgh …`;
+        // accept any embedded whitespace.
+        let code: String = code
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if code.len() < MIN_DEVICE_LINK_CODE_LEN || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::InvalidInput(format!(
+                "device link code must be at least {MIN_DEVICE_LINK_CODE_LEN} hex characters"
+            )));
+        }
+        // Refresh local group state so admin flags and epochs reflect the
+        // latest commits before staging on top of them. First drain any events
+        // the live subscription already buffered (a peer commit sitting in
+        // `pending_marmot` would otherwise leave us staging on a superseded
+        // epoch), then `sync_force` — plain `sync()` short-circuits under live
+        // subscriptions, exactly the mode where this refresh matters. Both are
+        // best-effort: on relay failure the per-group publishes below still
+        // produce honest `Failed` outcomes rather than a false `Linked`.
+        if let Err(err) = self.drain_pending_marmot().await {
+            tracing::debug!(%err, "pre-link drain failed; linking from local state");
+        }
+        if let Err(err) = self.sync_force().await {
+            tracing::debug!(%err, "pre-link sync failed; linking from local state");
+        }
+        let own = self.identity().public_key();
+        let candidates = self.fetch_all_key_packages(own).await?;
+        let key_package = select_key_package_by_code(&candidates, &code)?.clone();
+        let d_tag = key_package
+            .tags
+            .identifier()
+            .unwrap_or_default()
+            .to_string();
+
+        let mut outcomes = Vec::new();
+        for group in self.engine.groups()? {
+            let group_id_hex = hex::encode(group.mls_group_id.as_slice());
+            let status = if group.admin_pubkeys.contains(&own) {
+                self.link_device_into_group(&group.mls_group_id, &key_package)
+                    .await
+            } else {
+                DeviceLinkGroupStatus::SkippedNotAdmin
+            };
+            outcomes.push(DeviceLinkGroupOutcome {
+                group_id_hex,
+                name: group.name,
+                status,
+            });
+        }
+        Ok(DeviceLinkReport { d_tag, outcomes })
+    }
+
+    /// One group's device-link pass: stage the add commit, publish it plus the
+    /// self-addressed welcome, merge. Errors never propagate — every path
+    /// resolves to a [`DeviceLinkGroupStatus`] for the report.
+    async fn link_device_into_group(
+        &self,
+        group_id: &GroupId,
+        key_package: &Event,
+    ) -> DeviceLinkGroupStatus {
+        match self.engine.add_members(group_id, vec![key_package.clone()]) {
+            Ok(update) => self.publish_device_link_update(group_id, update).await,
+            Err(err) => {
+                let msg = err.to_string();
+                if is_duplicate_add_error(&msg) {
+                    DeviceLinkGroupStatus::AlreadyLinked
+                } else if is_pending_commit_error(&msg) {
+                    self.recover_pending_commit_then_link(group_id, key_package)
+                        .await
+                } else {
+                    DeviceLinkGroupStatus::Failed(msg)
+                }
+            }
+        }
+    }
+
+    /// A staged commit blocked the add. It is either (a) published but
+    /// unmerged — a welcome publish or the final merge failed after the commit
+    /// event reached the relays — or (b) never published (process died between
+    /// staging and publish). Locally the two are indistinguishable, so ask the
+    /// relays: backfill the group's kind-445 history first. If (a), our own
+    /// commit comes back and MDK merges the stage (`process_message` detects
+    /// an undecryptable own commit with a pending stage and merges it); the
+    /// retried add then reports `AlreadyLinked`, which is accurate — the leaf
+    /// IS in the group. If (b), nothing arrives, the stage survives, and
+    /// clearing it is safe because no peer ever saw that epoch.
+    async fn recover_pending_commit_then_link(
+        &self,
+        group_id: &GroupId,
+        key_package: &Event,
+    ) -> DeviceLinkGroupStatus {
+        let group_id_hex = hex::encode(group_id.as_slice());
+        let report = match self.backfill_group(&group_id_hex).await {
+            Ok(report) => report,
+            Err(err) => {
+                // Cannot tell (a) from (b) without the relays; do NOT touch
+                // the stage on a guess. The next run retries the recovery.
+                return DeviceLinkGroupStatus::Failed(format!(
+                    "cannot verify an earlier attempt's pending commit against the relays: {err}"
+                ));
+            }
+        };
+        if report.oldest_retryable_secs.is_some() {
+            // Below-quorum fetch or a transient processing failure: the
+            // absence of our own commit in what DID arrive proves nothing.
+            // Leave the stage alone; the next run retries the recovery.
+            return DeviceLinkGroupStatus::Failed(
+                "cannot verify an earlier attempt's pending commit against the relays: \
+                 incomplete relay fetch — run the link again"
+                    .into(),
+            );
+        }
+        match self.engine.add_members(group_id, vec![key_package.clone()]) {
+            Ok(update) => self.publish_device_link_update(group_id, update).await,
+            Err(retry_err) => {
+                let retry_msg = retry_err.to_string();
+                if is_duplicate_add_error(&retry_msg) {
+                    DeviceLinkGroupStatus::AlreadyLinked
+                } else if is_pending_commit_error(&retry_msg) {
+                    // The stage survived a quorum-complete, cleanly processed
+                    // relay backfill → it was never published; discarding it
+                    // cannot desync anyone. (Residual risk: the commit lives
+                    // only on a relay outside the answering quorum. Accepted:
+                    // requires a partial publish followed by that exact relay
+                    // set answering.)
+                    if let Err(clear_err) = self.engine.clear_pending_commit(group_id) {
+                        return DeviceLinkGroupStatus::Failed(format!(
+                            "clearing an unpublished pending commit failed: {clear_err}"
+                        ));
+                    }
+                    match self.engine.add_members(group_id, vec![key_package.clone()]) {
+                        Ok(update) => self.publish_device_link_update(group_id, update).await,
+                        Err(final_err) => DeviceLinkGroupStatus::Failed(final_err.to_string()),
+                    }
+                } else {
+                    DeviceLinkGroupStatus::Failed(retry_msg)
+                }
+            }
+        }
+    }
+
+    async fn publish_device_link_update(
+        &self,
+        group_id: &GroupId,
+        update: GroupMembershipUpdate,
+    ) -> DeviceLinkGroupStatus {
+        match self.publish_membership_update(update).await {
+            Ok(()) => {
+                self.notify_conversation_changed(&hex::encode(group_id.as_slice()));
+                DeviceLinkGroupStatus::Linked
+            }
+            Err(err) => DeviceLinkGroupStatus::Failed(err.to_string()),
+        }
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
@@ -9795,6 +10069,327 @@ mod tests {
             vec![expected],
             "pending invite must notify the conversation listener exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn device_link_adds_second_leaf_and_messaging_flows_both_ways() {
+        // Approach-B device link: Alice's OLD device adds her NEW device's
+        // KeyPackage as a second MLS leaf to an existing >2-member group. The
+        // self-authored welcome must be auto-accepted on the new device (no
+        // pending-invite UI for your own account), after which application
+        // messages flow to and from the new leaf with correct `mine`
+        // attribution on every member.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice_id = Identity::generate();
+        let alice_old = MarmotEngine::in_memory(alice_id.clone());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let carol = MarmotEngine::in_memory(Identity::generate());
+        let alice_new = SonarClient::connect_in_memory(alice_id.clone(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let listener = Arc::new(RecordingChangeListener {
+            changed: Mutex::new(Vec::new()),
+        });
+        alice_new.set_conversation_change_listener(Some(listener.clone()));
+
+        // Existing 3-identity group: alice + bob + carol (all admins).
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let carol_kp = carol.key_package_event(relays.clone()).expect("carol kp");
+        let creation = alice_old
+            .create_group("alice, bob & carol", vec![bob_kp, carol_kp], relays.clone())
+            .expect("alice creates group");
+        let group_id = creation.group.mls_group_id.clone();
+        for (member, rumor) in creation.welcomes {
+            let wrapped = alice_old
+                .gift_wrap_welcome(&member, rumor)
+                .await
+                .expect("wrap creation welcome");
+            // Foreign multi-member welcomes go pending and need an explicit
+            // accept (unlike the self-authored device-link welcome below).
+            let joiner = if member == bob.identity().public_key() {
+                &bob
+            } else {
+                &carol
+            };
+            joiner
+                .process_incoming(&wrapped)
+                .await
+                .expect("member processes welcome");
+            let invite = joiner
+                .pending_group_invites()
+                .expect("pending invites")
+                .pop()
+                .expect("invite pending");
+            joiner
+                .accept_group_invite(&invite.id)
+                .expect("member accepts invite");
+        }
+        alice_old
+            .merge_pending_commit(&group_id)
+            .expect("alice merges creation commit");
+
+        // OLD device links the NEW device: add its KeyPackage as a new leaf.
+        let new_device_kp = alice_new
+            .engine
+            .key_package_event(relays)
+            .expect("new device kp");
+        let update = alice_old
+            .add_members(&group_id, vec![new_device_kp])
+            .expect("old device stages device-link commit");
+        assert_eq!(update.welcomes.len(), 1);
+        let (welcome_target, rumor) = update.welcomes.into_iter().next().expect("welcome");
+        assert_eq!(
+            welcome_target,
+            alice_id.public_key(),
+            "device-link welcome must be addressed to our own account"
+        );
+
+        // Existing members apply the commit; old device merges after delivery.
+        bob.process_incoming(&update.evolution_event)
+            .await
+            .expect("bob applies device-link commit");
+        carol
+            .process_incoming(&update.evolution_event)
+            .await
+            .expect("carol applies device-link commit");
+        let wrapped = alice_old
+            .gift_wrap_welcome(&welcome_target, rumor)
+            .await
+            .expect("wrap device-link welcome");
+        alice_old
+            .merge_pending_commit(&group_id)
+            .expect("old device merges device-link commit");
+
+        // NEW device: the self-authored welcome is auto-accepted even though
+        // the group has more than 2 members — no pending invite.
+        let (report, _) = alice_new
+            .process_marmot_events([wrapped], "device link welcome")
+            .await;
+        assert_eq!(report.processed, 1);
+        assert!(alice_new
+            .pending_group_invites()
+            .expect("pending invites")
+            .is_empty());
+        let new_groups = alice_new.engine.groups().expect("new device groups");
+        assert_eq!(new_groups.len(), 1);
+        assert_eq!(new_groups[0].mls_group_id, group_id);
+        let changed = listener.changed.lock().unwrap().clone();
+        assert_eq!(changed, vec![hex::encode(group_id.as_slice())]);
+
+        // Peer → new device: bob's message decrypts on the new leaf.
+        let bob_msg = bob
+            .create_text_message(&group_id, "hi from bob")
+            .expect("bob sends");
+        match alice_new
+            .engine
+            .process_incoming(&bob_msg)
+            .await
+            .expect("new device decrypts bob")
+        {
+            Incoming::Message(m) => {
+                assert_eq!(m.content, "hi from bob");
+                assert!(!m.mine);
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+
+        // New device → everyone: decrypts for bob, and the OLD device sees it
+        // as `mine` (same account identity, different leaf).
+        let new_msg = alice_new
+            .engine
+            .create_text_message(&group_id, "hi from the new phone")
+            .expect("new device sends");
+        match bob
+            .process_incoming(&new_msg)
+            .await
+            .expect("bob decrypts new device")
+        {
+            Incoming::Message(m) => {
+                assert_eq!(m.content, "hi from the new phone");
+                assert_eq!(m.sender, alice_id.public_key());
+                assert!(!m.mine);
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+        match alice_old
+            .process_incoming(&new_msg)
+            .await
+            .expect("old device decrypts new device")
+        {
+            Incoming::Message(m) => {
+                assert_eq!(m.content, "hi from the new phone");
+                assert!(m.mine, "own account's other leaf must render as mine");
+            }
+            other => panic!("expected message, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn link_recovery_clears_unpublished_pending_commit_and_retries() {
+        // Simulates a link pass that died between staging an add commit and
+        // publishing it (a stale pending commit blocks every later add). With
+        // no relays, the recovery backfill finds nothing, so the stage must be
+        // classified as never-published, cleared, and the add retried; the
+        // retried add then proceeds to the publish step, which fails offline —
+        // proving the recovery path re-staged instead of dead-ending on the
+        // pending error or blindly merging an unpublished epoch.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let device = MarmotEngine::in_memory(Identity::generate());
+
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays.clone())
+            .expect("group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .engine
+            .merge_pending_commit(&group_id)
+            .expect("merge create");
+
+        // Crash simulation: stage an add and never publish or merge it.
+        let device_kp = device.key_package_event(relays).expect("device kp");
+        alice
+            .engine
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect("stale stage");
+
+        let status = alice.link_device_into_group(&group_id, &device_kp).await;
+        match &status {
+            DeviceLinkGroupStatus::Failed(msg) => {
+                assert!(
+                    !is_pending_commit_error(msg),
+                    "recovery must not dead-end on the pending error: {msg}"
+                );
+                assert!(
+                    !msg.contains("cannot verify"),
+                    "offline backfill of a no-relay client must not abort recovery: {msg}"
+                );
+            }
+            other => panic!("offline link must fail at the publish step, got {other:?}"),
+        }
+        // The stale stage is gone: a fresh add stages cleanly.
+        alice
+            .engine
+            .add_members(&group_id, vec![device_kp])
+            .expect("stage after recovery");
+    }
+
+    #[tokio::test]
+    async fn link_recovery_reports_already_linked_after_published_commit_merges() {
+        // Case (a) of recover_pending_commit_then_link: the earlier pass DID
+        // publish its add commit before dying. The recovery backfill returns
+        // that commit, MDK merges the stage (own-commit detection), and the
+        // retried add must classify as AlreadyLinked — the leaf IS in the
+        // group. Simulated by feeding the published evolution event through
+        // the normal processing path instead of a live relay fetch.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client starts without relays");
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let device = MarmotEngine::in_memory(Identity::generate());
+
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .engine
+            .create_group("alice & bob", vec![bob_kp], relays.clone())
+            .expect("group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice
+            .engine
+            .merge_pending_commit(&group_id)
+            .expect("merge create");
+
+        // Earlier pass: stage the add and "publish" the commit, then die
+        // before welcome delivery / merge.
+        let device_kp = device.key_package_event(relays).expect("device kp");
+        let update = alice
+            .engine
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect("stage add");
+
+        // The published commit comes back from the relays (here: injected
+        // directly); MDK detects our own commit + pending stage and merges.
+        let (report, _) = alice
+            .process_marmot_events([update.evolution_event], "own commit return")
+            .await;
+        assert_eq!(report.processed, 1);
+
+        // Recovery: the add now hits the duplicate gate → AlreadyLinked.
+        let status = alice.link_device_into_group(&group_id, &device_kp).await;
+        assert_eq!(status, DeviceLinkGroupStatus::AlreadyLinked);
+    }
+
+    #[tokio::test]
+    async fn add_members_error_classification_matches_real_strings() {
+        // `link_device` classifies add_members failures by error MESSAGE
+        // (MDK flattens openmls errors to strings). This test triggers the two
+        // real failure shapes so an MDK/openmls bump that rewords them fails
+        // here instead of silently misreporting link outcomes.
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let alice = MarmotEngine::in_memory(Identity::generate());
+        let bob = MarmotEngine::in_memory(Identity::generate());
+        let device = MarmotEngine::in_memory(Identity::generate());
+
+        let bob_kp = bob.key_package_event(relays.clone()).expect("bob kp");
+        let creation = alice
+            .create_group("alice & bob", vec![bob_kp], relays.clone())
+            .expect("group");
+        let group_id = creation.group.mls_group_id.clone();
+        alice.merge_pending_commit(&group_id).expect("merge create");
+
+        // Stage an add without merging → a second add hits the pending gate.
+        let device_kp = device.key_package_event(relays.clone()).expect("device kp");
+        alice
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect("first add stages");
+        let pending_err = alice
+            .add_members(&group_id, vec![device_kp.clone()])
+            .expect_err("second add while pending must fail")
+            .to_string();
+        assert!(
+            is_pending_commit_error(&pending_err),
+            "pending-commit error no longer classified: {pending_err}"
+        );
+        assert!(!is_duplicate_add_error(&pending_err));
+
+        // Merge, then re-add the SAME KeyPackage → duplicate-key rejection.
+        alice.merge_pending_commit(&group_id).expect("merge add");
+        let duplicate_err = alice
+            .add_members(&group_id, vec![device_kp])
+            .expect_err("re-adding a present leaf must fail")
+            .to_string();
+        assert!(
+            is_duplicate_add_error(&duplicate_err),
+            "duplicate-add error no longer classified: {duplicate_err}"
+        );
+        assert!(!is_pending_commit_error(&duplicate_err));
+    }
+
+    #[test]
+    fn select_key_package_by_code_matches_unique_prefix() {
+        let relays = vec![RelayUrl::parse("wss://relay.example.com").expect("relay url")];
+        let engine = MarmotEngine::in_memory(Identity::generate());
+        let kp_a = engine.key_package_event(relays.clone()).expect("kp a");
+        let kp_b = engine.key_package_event(relays).expect("kp b");
+        let d_a = kp_a.tags.identifier().expect("kp a d tag").to_string();
+        let events = vec![kp_a.clone(), kp_b];
+
+        let selected = select_key_package_by_code(&events, &d_a[..DEVICE_LINK_CODE_LEN])
+            .expect("unique prefix selects");
+        assert_eq!(selected.id, kp_a.id);
+
+        // Zero matches → actionable error.
+        assert!(select_key_package_by_code(&[], &d_a[..DEVICE_LINK_CODE_LEN]).is_err());
+
+        // Ambiguous prefix (same slot listed twice) → actionable error.
+        let dup = vec![kp_a.clone(), kp_a];
+        assert!(select_key_package_by_code(&dup, &d_a[..DEVICE_LINK_CODE_LEN]).is_err());
     }
 }
 
