@@ -239,6 +239,20 @@ actual object WalletBridge {
                 val amount: PayAmount? =
                     if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
                 val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                // Real prepared-fee affordability check — mirror of the Android
+                // bridge; see the comment there and #141.
+                prepared.feesSat?.let { feesSat ->
+                    val fee = feesSat.toLong()
+                    val sending = (prepared.amount as? PayAmount.Bitcoin)
+                        ?.receiverAmountSat?.toLong() ?: amountSats
+                    val bal = node.getInfo().walletInfo.balanceSat.toLong()
+                    if (SpendableBalance.insufficientAfterFee(sending, fee, bal)) {
+                        return@withContext SendResult(
+                            ok = false,
+                            error = SpendableBalance.insufficientMessage(sending, fee, bal),
+                        )
+                    }
+                }
                 val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
                 val payment = resp.payment
                 val lightning = payment.details as? PaymentDetails.Lightning

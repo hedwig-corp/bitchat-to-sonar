@@ -641,6 +641,13 @@ final class WalletBridgeService: ObservableObject {
         switch error {
         case .notConfigured: return .missingAPIKey
         case .core(let message): return .core(message)
+        case let .insufficientAfterFee(amountSats, feeSats, balanceSats):
+            // Surface the explanatory sentence, not a raw SDK failure (#141).
+            return .core(SonarSpendableBalance.insufficientMessage(
+                amountSats: amountSats,
+                feeSats: feeSats,
+                balanceSats: balanceSats
+            ))
         }
     }
 }

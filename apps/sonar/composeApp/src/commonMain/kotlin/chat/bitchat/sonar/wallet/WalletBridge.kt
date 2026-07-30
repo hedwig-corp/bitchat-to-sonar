@@ -22,6 +22,13 @@ data class SendResult(
     val paymentId: String? = null,
     val feesSats: Long? = null,
     val settledAtSecs: Long? = null,
+    /**
+     * User-facing reason a send was refused, when we know one. Set by the
+     * prepared-fee preflight (#141) so the UI can say "amount plus fee exceeds
+     * your balance" instead of surfacing the raw SDK failure. Null for the
+     * generic failure path, which behaves as before.
+     */
+    val error: String? = null,
 )
 
 /**

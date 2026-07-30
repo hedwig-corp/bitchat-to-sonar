@@ -39,6 +39,7 @@ import androidx.compose.ui.unit.sp
 import chat.bitchat.sonar.ui.SNIcon
 import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.sonar
+import chat.bitchat.sonar.wallet.SpendableBalance
 
 /** Grouped sats, like the prototype's payFmt (en-US thousands separators). */
 internal fun payFmt(sats: Long): String =
@@ -80,6 +81,14 @@ fun PaySheet(
     // an invoice that already carries its amount. Stated explicitly here too so
     // the two platforms cannot drift.
     val hasAmount = fixedSats != null || v.isNotEmpty()
+    // Gate on the RAW balance. The reserve is a conservative ESTIMATE (0.5%,
+    // no route knowledge), so treating it as a hard ceiling rejects payments
+    // that are genuinely affordable: with 100k sats and a real 100-sat fee, a
+    // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
+    // invoice cannot be lowered, so that user simply could not pay at all.
+    // `Max` still proposes the reserve-adjusted amount, and the REAL prepared
+    // fee is enforced in the send pipeline before Breez is asked to pay
+    // (WalletBridge.send -> SpendableBalance.insufficientAfterFee).
     val over = sats > balanceSats
     val can = sats > 0 && !over
     fun tap(k: String) {
@@ -147,12 +156,15 @@ fun PaySheet(
                                 .clickable { v = c.toString() }.padding(horizontal = 14.dp, vertical = 7.dp)
                         ) { Text(payFmt(c), color = s.goldDeep, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
-                    // "Max" = the entire spendable balance (to drain the wallet to
-                    // this recipient). Filled gold to stand out from the presets.
-                    if (balanceSats > 0) {
+                    // "Max" = everything that can actually settle: the balance
+                    // minus a fee reserve (#141 — proposing the full balance
+                    // made the send fail locally with a raw InsufficientFunds).
+                    // A balance at or below the reserve offers no Max at all.
+                    val maxSendable = SpendableBalance.maxSendableSats(balanceSats)
+                    if (maxSendable > 0) {
                         Box(
                             Modifier.clip(RoundedCornerShape(999.dp)).background(s.goldFill)
-                                .clickable { v = balanceSats.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
+                                .clickable { v = maxSendable.toString() }.padding(horizontal = 16.dp, vertical = 7.dp)
                         ) { Text("Max", color = s.onGold, fontSize = 13.sp, fontWeight = FontWeight.Bold) }
                     }
                 }

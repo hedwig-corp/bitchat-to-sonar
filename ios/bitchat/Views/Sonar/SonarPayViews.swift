@@ -202,6 +202,13 @@ struct SNPaySheet: View {
     /// rendered "0" for an invoice that already carries its amount, even though
     /// `sats` (and the payment) were correct.
     private var hasAmount: Bool { fixedSats != nil || !v.isEmpty }
+    // Gate on the RAW balance. The reserve is a conservative ESTIMATE (0.5%, no
+    // route knowledge), so treating it as a hard ceiling rejects payments that
+    // are genuinely affordable: with 100k sats and a real 100-sat fee, a
+    // 99,600-sat invoice is payable but sat above the 99,500 estimate. A fixed
+    // invoice cannot be lowered, so that user simply could not pay at all. Max
+    // still proposes the reserve-adjusted amount, and the REAL prepared fee is
+    // enforced in `SonarWallet.send` before Breez is asked to pay.
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
     private var directNote: String {
@@ -274,11 +281,13 @@ struct SNPaySheet: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = the entire spendable balance (to drain the wallet to
-                // this recipient). Filled gold to stand out from the presets.
-                if balance > 0 {
+                // "Max" = everything that can actually settle: the balance
+                // minus a fee reserve (#141 — proposing the full balance made
+                // the send fail locally with a raw InsufficientFunds). A
+                // balance at or below the reserve offers no Max at all.
+                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
                     Button {
-                        v = String(balance)
+                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
                     } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
@@ -650,6 +659,7 @@ private struct UnifyAmountKeypad: View {
     @State private var v = ""
 
     private var sats: Int64 { Int64(v) ?? 0 }
+    // See SNPaySheet.over (#141).
     private var over: Bool { sats > balance }
     private var can: Bool { sats > 0 && !over }
 
@@ -703,10 +713,13 @@ private struct UnifyAmountKeypad: View {
                     }
                     .buttonStyle(SNScaleStyle(scale: 0.95))
                 }
-                // "Max" = the entire spendable balance — drains the wallet to
-                // this recipient (the Unify nearby-wallet send).
-                if balance > 0 {
-                    Button { v = String(balance) } label: {
+                // "Max" = everything that can actually settle: the balance
+                // minus a fee reserve (#141). Same policy as the main pay
+                // sheet — see SonarSpendableBalance.
+                if SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)) > 0 {
+                    Button {
+                        v = String(SonarSpendableBalance.maxSendable(balanceSats: Int64(balance)))
+                    } label: {
                         Text(verbatim: "Max")
                             .font(SonarTheme.uiFont(size: 13, weight: .bold))
                             .foregroundColor(SonarTheme.onGold)
