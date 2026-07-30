@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import chat.bitchat.sonar.CallScreen
@@ -70,7 +71,9 @@ import chat.bitchat.sonar.ui.SNIconName
 import chat.bitchat.sonar.ui.SNSectionLabel
 import chat.bitchat.sonar.ui.SonarAvatar
 import chat.bitchat.sonar.ui.sonar
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.withContext
 
 /**
  * Desktop application root: theme + boot + onboarding gating around
@@ -258,6 +261,22 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
             )
         }
 
+        // Secrets-at-rest warning. Shown only when this platform could not reach
+        // an OS keystore, in which case the account key lives in a local file and
+        // the user is entitled to know rather than find out later.
+        //
+        // produceState, keyed on `started`, for two reasons. The fallback flag is
+        // flipped on an IO dispatcher during SonarCore.start(), i.e. AFTER first
+        // composition, so a plain call read null on exactly the launch this
+        // exists to warn about. And the check touches the filesystem, which does
+        // not belong on the AWT event thread.
+        val secretsWarning by produceState<String?>(null, state.started, state.onboarded) {
+            value = withContext(Dispatchers.IO) {
+                chat.bitchat.sonar.SecretStorageStatus.degradedReason()
+            }
+        }
+        secretsWarning?.let { SecretsAtRiskBanner(it) }
+
         // search affordance
         Row(
             Modifier.fillMaxWidth().padding(horizontal = 14.dp)
@@ -368,6 +387,31 @@ private fun DesktopSidebar(state: SonarAppState, onRowActions: (DeleteTarget) ->
                 )
             }
             SNIconButton(SNIconName.Chevron, size = 18.dp, tint = s.text2) { state.select { push(Screen.Settings) } }
+        }
+    }
+}
+
+/** Warning shown when secrets are not protected by an OS keystore. */
+@Composable
+private fun SecretsAtRiskBanner(reason: String) {
+    val s = sonar
+    Box(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp)) {
+        Column(
+            Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                .background(s.surface2).padding(horizontal = 12.dp, vertical = 9.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                SNDot(s.accent, 9.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "Account key unprotected",
+                    color = s.text,
+                    fontSize = 12.5.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(reason, color = s.text2, fontSize = 11.5.sp, lineHeight = 15.sp)
         }
     }
 }

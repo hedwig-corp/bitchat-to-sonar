@@ -17,7 +17,33 @@ object DesktopEnv {
     /** Root data dir, e.g. ~/Library/Application Support/Sonar (macOS),
      *  $XDG_DATA_HOME/Sonar or ~/.local/share/Sonar (Linux),
      *  %APPDATA%\Sonar (Windows). Created on first use. */
-    val dataDir: File by lazy {
+    /**
+     * Test-only redirection of the data root.
+     *
+     * Without it, touching any pref from a test initializes the real
+     * `~/.local/share/Sonar`, chmods it, and loads the developer's actual nsec
+     * into the test JVM. Tests then assert against live machine state and pass
+     * vacuously on CI.
+     */
+    @Volatile
+    internal var testRootOverride: File? = null
+
+    /**
+     * Point storage at [root], or back at the real dir when null. Test use only.
+     *
+     * ALWAYS clears the prefs cache. Assigning [testRootOverride] directly left
+     * the cache holding the test's Properties while the path reverted to the
+     * real data dir, so the next write persisted test state over real prefs.
+     */
+    internal fun useTestRoot(root: File?) {
+        testRootOverride = root?.apply { mkdirs() }
+        cachedProps = null
+        permissionsUnenforceable = false
+    }
+
+    val dataDir: File get() = testRootOverride ?: defaultDataDir
+
+    private val defaultDataDir: File by lazy {
         val home = System.getProperty("user.home")
         val os = System.getProperty("os.name").lowercase()
         val base = when {
@@ -25,19 +51,66 @@ object DesktopEnv {
             os.contains("win") -> File(System.getenv("APPDATA") ?: "$home/AppData/Roaming", "Sonar")
             else -> File(System.getenv("XDG_DATA_HOME") ?: "$home/.local/share", "Sonar")
         }
-        base.apply { mkdirs() }
+        base.apply {
+            mkdirs()
+            // Owner-only: this directory holds the encrypted Marmot DB, the
+            // transcripts, and (when no OS keystore is available) the account
+            // key itself. The default umask leaves it group/world readable.
+            if (!restrictToOwner(this, ownerExecutable = true)) permissionsUnenforceable = true
+        }
     }
+
+    /**
+     * Best effort chmod 0700/0600. A failure must not be fatal: losing the data
+     * directory would lose the account, which is far worse than permissions
+     * that are merely no better than the umask gave us.
+     */
+    internal fun restrictToOwner(target: File, ownerExecutable: Boolean = false): Boolean =
+        runCatching {
+            // Each call returns false when the filesystem cannot express the mode
+            // (exFAT/NTFS/SMB, or Windows ACLs). Report that rather than claiming
+            // protection we did not get: in a change whose whole point is "do not
+            // be silent", a silently-failed chmod is the same bug again.
+            // Collect, do NOT short-circuit: with `&&` a first failure skipped
+            // the remaining clears, leaving group/other write and execute set on
+            // a directory whose contents include the account key.
+            listOf(
+                target.setReadable(false, false),
+                target.setWritable(false, false),
+                target.setExecutable(false, false),
+                target.setReadable(true, true),
+                target.setWritable(true, true),
+                if (ownerExecutable) target.setExecutable(true, true) else true,
+            ).all { it }
+        }.getOrDefault(false)
+
+    /** True when the last permission tightening could not be applied. */
+    @Volatile
+    internal var permissionsUnenforceable: Boolean = false
+        private set
 
     fun file(relative: String): File = File(dataDir, relative)
 
     // ── Preferences (a flat .properties file; thread-safe enough for the app's
     //    low write rate — every setter persists synchronously). ──
-    private val prefsFile: File by lazy { File(dataDir, "prefs.properties") }
-    private val props: Properties by lazy {
+    private val prefsFile: File get() = File(dataDir, "prefs.properties")
+
+    @Volatile
+    private var cachedProps: Properties? = null
+
+    private val props: Properties
+        get() = cachedProps ?: loadProps().also { cachedProps = it }
+
+    private fun loadProps(): Properties =
         Properties().apply {
-            if (prefsFile.exists()) prefsFile.inputStream().use { load(it) }
+            if (prefsFile.exists()) {
+                // An install that upgrades into this build may still have the
+                // world-readable file the bug shipped, and would never be
+                // tightened if it performs no write this session.
+                if (!restrictToOwner(prefsFile)) permissionsUnenforceable = true
+                prefsFile.inputStream().use { load(it) }
+            }
         }
-    }
 
     @Synchronized
     fun getString(key: String, default: String? = null): String? =
@@ -77,8 +150,23 @@ object DesktopEnv {
     // chat DB). Android's SharedPreferences writes atomically; match that.
     private fun persist() {
         runCatching {
-            val tmp = File(prefsFile.absolutePath + ".tmp")
-            tmp.outputStream().use { props.store(it, "Sonar desktop preferences") }
+            // Create EMPTY, tighten, then write. Tightening after the write left
+            // a window where a tmp file containing the nsec sat at umask perms.
+            // A unique name per call also stops two processes interleaving into
+            // one staging path.
+            val tmp = File.createTempFile("prefs", ".tmp", dataDir)
+            if (!restrictToOwner(tmp)) permissionsUnenforceable = true
+            runCatching {
+                tmp.outputStream().use { props.store(it, "Sonar desktop preferences") }
+            }.onFailure {
+                // A partial secrets file must not be left behind at umask perms.
+                tmp.delete()
+                throw it
+            }
+            // Any staging file that survived a crash or a failed move is a full
+            // plaintext copy of the prefs, including the nsec. Sweep them.
+            dataDir.listFiles { f -> f.name.startsWith("prefs") && f.name.endsWith(".tmp") }
+                ?.forEach { if (it != tmp) it.delete() }
             try {
                 Files.move(
                     tmp.toPath(), prefsFile.toPath(),

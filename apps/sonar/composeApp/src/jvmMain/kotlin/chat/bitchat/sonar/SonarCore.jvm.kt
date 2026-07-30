@@ -1095,7 +1095,15 @@ actual object SonarCore {
                 val marmotDir = marmotDir()
                 val wipeFailure = runCatching { wipeMarmotStorage(marmotDir) }.exceptionOrNull()
                 DesktopEnv.file("diagnostics").deleteRecursively()
-                DesktopSecrets.clear("nsec", "dbKeyHex")
+                // EVERY key DesktopSecrets owns, not just the account pair.
+                // The mesh Noise key and Ed25519 announce seed used to live in
+                // plain prefs, so DesktopEnv.clear() below removed them; once
+                // they moved into the keystore that stopped being true, and a
+                // surviving seed would sign the NEXT account's 0x53 discovery
+                // packet with the OLD key, linking the two accounts for any
+                // passive BLE listener. Driven off MANAGED_KEYS so adding a key
+                // cannot silently miss the wipe. (Account Key Durability Rule 5.)
+                DesktopSecrets.clear(*DesktopSecrets.MANAGED_KEYS.toTypedArray())
                 DesktopEnv.clear()
                 wipeFailure?.let { throw it }
                 Unit

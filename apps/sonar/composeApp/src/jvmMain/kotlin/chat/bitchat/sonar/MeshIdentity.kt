@@ -28,23 +28,39 @@ object MeshIdentity {
 
     /** Noise static keypair (X25519), persisted or generated + saved once. */
     private val keypair: NoiseKeypairHex by lazy {
-        val priv = DesktopEnv.getString("mesh.noise.priv")
-        val pub = DesktopEnv.getString("mesh.noise.pub")
+        // BOTH halves live in the keystore. Splitting them (private in the
+        // keystore, public in prefs) looked harmless because the public half is
+        // in every announce anyway, but the two stores fail INDEPENDENTLY: with
+        // a locked keyring the private read returns null while the public value
+        // is still on disk, the else-branch regenerates, and the new public key
+        // overwrites prefs while the old private key survives in the keystore.
+        // The next healthy launch then pairs oldPriv with newPub and every Noise
+        // handshake fails permanently. Keeping them together means they are
+        // always present or absent as a unit.
+        val priv = DesktopSecrets.get("mesh.noise.priv")
+        val pub = DesktopSecrets.get("mesh.noise.pub")
         if (priv != null && pub != null) {
             NoiseKeypairHex(priv, pub)
+        } else if (priv != null || pub != null) {
+            // Half-readable means a transient keystore fault, not a first run.
+            // Regenerating here would silently rotate peerIdHex and drop every
+            // peer's verified fingerprint, so fail loudly instead.
+            error("mesh identity is only half-readable; refusing to regenerate and rotate the mesh fingerprint")
         } else {
             noiseGenerateKeypair().also {
-                DesktopEnv.putString("mesh.noise.priv", it.privateHex)
-                DesktopEnv.putString("mesh.noise.pub", it.publicHex)
+                DesktopSecrets.put("mesh.noise.priv", it.privateHex)
+                DesktopSecrets.put("mesh.noise.pub", it.publicHex)
             }
         }
     }
 
     /** Ed25519 announce-signing seed (32 bytes hex), persisted or made once. */
     private val seedHex: String by lazy {
-        DesktopEnv.getString("mesh.ed25519.seed")
+        // Signs the 0x01 announce and the 0x53 Sonar Discovery packet, so a peer
+        // that holds it can forge either. Same storage as the Noise key.
+        DesktopSecrets.get("mesh.ed25519.seed")
             ?: hex(ByteArray(32).also { SecureRandom().nextBytes(it) })
-                .also { DesktopEnv.putString("mesh.ed25519.seed", it) }
+                .also { DesktopSecrets.put("mesh.ed25519.seed", it) }
     }
 
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */

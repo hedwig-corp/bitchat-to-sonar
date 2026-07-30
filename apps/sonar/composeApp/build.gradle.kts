@@ -3,6 +3,11 @@ import org.jetbrains.compose.desktop.application.dsl.TargetFormat
 import org.gradle.api.tasks.Exec
 import java.util.Properties
 
+// Single source of truth for the shipped version. The Android block and the
+// desktop native packagers both read it, so a .deb can be traced to a release.
+val SONAR_VERSION_CODE = 14
+val SONAR_VERSION_NAME = "0.1-alpha.12.2"
+
 plugins {
     alias(libs.plugins.multiplatform)
     alias(libs.plugins.android.application)
@@ -282,8 +287,41 @@ compose.desktop {
         nativeDistributions {
             targetFormats(TargetFormat.Dmg, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Sonar"
+            // jpackage renders the Deb maintainer as "<vendor> <debMaintainer>",
+            // so vendor must be set or it ships as literal "Unknown".
+            vendor = "Sonar"
+            copyright = "Sonar contributors"
+            // Cross-platform default. macOS/Windows packagers require MAJOR >= 1
+            // (Dmg rejects '0.1.0' outright), so the alpha version cannot live
+            // here. Debian has no such rule, so the .deb carries the real one
+            // below and stays traceable to a release.
             packageVersion = "1.0.0"
             description = "Sonar — Bluetooth mesh + Nostr secure messaging (desktop)"
+            linux {
+                // Without these the .deb ships as `Maintainer: Unknown <Unknown>`,
+                // `Categories=Unknown` and no icon in the launcher.
+                packageName = "sonar"
+                debMaintainer = "hello@hedwig.sh"
+                // The real shipped version; Debian allows the alpha suffix that
+                // Dmg/Msi reject, so this is where traceability actually lands.
+                // '~' is the Debian pre-release marker: 0.1~alpha.12 sorts
+                // BEFORE 0.1, so the real release upgrades an alpha. With a
+                // hyphen dpkg reads "alpha.12" as the debian_revision and
+                // 0.1-alpha.12 sorts NEWER than 0.1, stranding alpha users.
+                debPackageVersion = SONAR_VERSION_NAME.replace("-", "~")
+                menuGroup = "Network"
+                appCategory = "net"
+                iconFile.set(project.file("sonar.png"))
+                shortcut = true
+                // NOTE: Compose Desktop 1.7.3's linux{} DSL has no way to declare
+                // Deb dependencies (verified against LinuxPlatformSettings), and
+                // jpackage only derives them from linked native libraries. Sonar
+                // needs `libsecret-tools` at RUNTIME so DesktopSecrets can reach
+                // the Secret Service; without it the account key falls back to a
+                // local file. Until the release job patches the control file, the
+                // app surfaces that state itself (SecretStorageStatus) rather
+                // than failing silently.
+            }
             macOS {
                 bundleID = "chat.bitchat.sonar.desktop"
                 // Reuse the Android launcher icon (sonar rings on #0A1418),
@@ -327,8 +365,8 @@ android {
         minSdk = libs.versions.android.minSdk.get().toInt()
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 14
-        versionName = "0.1-alpha.12.2"
+        versionCode = SONAR_VERSION_CODE
+        versionName = SONAR_VERSION_NAME
         buildConfigField(
             "String",
             "BREEZ_API_KEY",
