@@ -1106,15 +1106,25 @@ a burst, not one character.
 **Call sites:** Compose `MessageComposerTextField` (`onSend` now receives the
 field's live text) plus the three send buttons in `ChatScreen`, `GeoDmScreen`,
 and `SonarChannelScreen`, which read the draft back from
-`SonarAppState.composerDraft` at click time. Apple is not affected in the same
+`SonarAppState.composerDraft` at click time. The emoji tray's
+`onEmoji` in `ChatScreen` is the same class and worse: `draft + it` is a
+read-modify-write, so a stale base *deletes* everything typed since the last
+frame instead of truncating the send. It reads the stored draft now. This one is
+not desktop-only — the tray plus a soft keyboard is the mobile path.
+`SlashHints` still replaces the draft wholesale from the composed value, which
+is deliberate: the user picks a completion from what is on screen. Apple is not affected in the same
 shape: SwiftUI `SNMessageComposerField` sends through a `@Binding` that the
 `.onKeyPress(.return)` handler reads at event time, not a per-frame capture.
 
 **Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTypedTextWhenCallSiteHasNotRecomposed`, `MessageComposerFieldUiTest.returnKeyDoesNotResendDraftClearedByCaller`, `ComposerLiveTextTest.keystrokesAreVisibleBeforeTheCallerRecomposes`, `ComposerLiveTextTest.sendDoesNotHandOutTheSameTextTwice`, `ComposerLiveTextTest.aLateHoistedValueWouldWin`, `ComposerLiveTextTest.draftTheCallerKeptComesBackAfterSend`, `ComposerLiveTextTest.clearedDraftStaysCleared`, `ComposerLiveTextTest.switchingChatsAdoptsTheNewConversationsDraft`
 
-The first fails without the fix (`onSend` receives `""`); the second pins the
-other half — a caller that owns the draft again (cleared after send, slash-hint
-completion) still wins. The rest pin the holder's state machine.
+The first fails when the handler is pointed back at the composed value
+(`onSend?.invoke(value)` instead of `live.text`, which is the old behaviour with
+the new signature — a literal revert does not compile, since `onSend` changed
+from `(() -> Unit)?` to `((String) -> Unit)?`): `onSend` then receives `""`. The
+second pins the other half — a caller that owns the draft again (cleared after
+send, slash-hint completion) still wins. The rest pin the holder's state
+machine.
 
 **Same batch, second Enter:** the stalled frame that swallows keystrokes also
 swallows the *first* Enter's feedback, so the user presses it again and both
@@ -1139,6 +1149,15 @@ passes either way and was dropped rather than left as false coverage. The three
 send *buttons* are not covered either — they live inside large screen
 composables needing a constructed `SonarAppState`, so the fresh read there is by
 inspection only. Nothing pins the Apple side.
+
+**The call sites are the hole, and they are where the bug lived.** Everything
+above pins the shared field; the original defect was in the *callers*, which
+closed over `draft`. They are correct now because they use the lambda parameter,
+but nothing stops a future `onSend = { state.send(chatId, draft) }` from
+reintroducing it verbatim, and no test reachable today would fail. This is
+exactly the R-001 shape — helper-level tests green while a call site regressed —
+and it is the strongest argument for eventually making these screens testable
+against a constructed `SonarAppState`.
 
 **Rejected:**
 - *Reading the hoisted `value` inside the key handler.* It is the same

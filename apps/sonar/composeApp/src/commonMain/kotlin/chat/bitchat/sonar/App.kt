@@ -1791,7 +1791,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             if (emojiTray && !recording) {
                 TransientBackHandler { emojiTray = false }
                 chat.bitchat.sonar.screens.SonarEmojiPicker(
-                    onEmoji = { state.setComposerDraft(screen.id, draft + it) },
+                    // Append to the draft as stored, not as composed: this is a
+                    // read-modify-write, so a stale base would delete whatever
+                    // was typed since the last frame rather than just truncate.
+                    onEmoji = { state.setComposerDraft(screen.id, state.composerDraft(screen.id) + it) },
                     onGif = { item ->
                         emojiTray = false
                         state.sendGifItem(screen.id, item)
