@@ -3,8 +3,6 @@ package chat.bitchat.sonar
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.SideEffect
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.key.Key
@@ -32,60 +30,21 @@ internal expect val messageComposerEnterSends: Boolean
 internal val messageComposerKeyboardOptions = KeyboardOptions(imeAction = ImeAction.None)
 
 /**
- * The newest draft text the field itself produced.
- *
- * Key events are dispatched as they arrive, but the hoisted `value` only catches
- * up on the next recomposition. A hardware Enter that lands in the same input
- * batch as the keystrokes before it — routine when a laggy frame queues a burst
- * of AWT key events — would otherwise send whatever the last completed
- * composition held and silently drop the tail of the message.
- *
- * Keystrokes are recorded here synchronously. A hoisted value that differs from
- * what we last reported means the caller changed the draft itself (cleared it
- * after a send, completed a slash hint) and wins.
- *
- * That last rule is why callers **must** forward `onValueChange` to their draft
- * store synchronously, as all three do today. A debounced or async store would
- * make the hoisted value trail the field, and a trailing value is
- * indistinguishable here from a caller-owned edit — it would win, and the
- * truncation this class exists to prevent would come back.
- */
-internal class ComposerLiveText(initial: String) {
-    var text: String = initial
-        private set
-    private var reported: String = initial
-
-    /** The caller's draft for this composition. It wins whenever it differs. */
-    fun onHoistedValue(value: String) {
-        if (value != reported) {
-            text = value
-            reported = value
-        }
-    }
-
-    /** A keystroke the field just produced. */
-    fun onFieldValue(value: String) {
-        text = value
-        reported = value
-    }
-
-    /**
-     * The text was handed to a send. Drop it immediately so a second Enter from
-     * the same input batch — the user pressing again because the stalled frame
-     * showed nothing — cannot send it twice. If the caller keeps the draft
-     * instead of clearing it, the next [onHoistedValue] brings it straight back.
-     */
-    fun onSent() {
-        text = ""
-        reported = ""
-    }
-}
-
-/**
  * The shared message composer text field.
  *
- * [onSend] receives the draft as the field currently holds it, which is not
- * necessarily the [value] this composition was passed — see [ComposerLiveText].
+ * [currentDraft] is read when Enter is pressed and is what gets sent — never the
+ * [value] this composition was passed. Key events are dispatched as they arrive
+ * while recomposition waits for the next frame, so [value] is only a snapshot of
+ * the last completed frame: a laggy frame queues a burst of key events plus the
+ * Enter behind them, and sending [value] drops everything typed since. It must
+ * return the caller's stored draft, which every keystroke updates synchronously
+ * through [onValueChange].
+ *
+ * Reading the store rather than tracking the text here also means anything else
+ * that owns the draft is seen immediately: a send button that just committed and
+ * cleared it, a slash-hint completion, an emoji appended by the tray. A second
+ * Enter from the same input batch reads the cleared draft and sends nothing,
+ * instead of sending the message again.
  */
 @Composable
 internal fun MessageComposerTextField(
@@ -93,18 +52,14 @@ internal fun MessageComposerTextField(
     onValueChange: (String) -> Unit,
     textStyle: TextStyle,
     cursorBrush: Brush,
+    currentDraft: () -> String,
     modifier: Modifier = Modifier,
     onSend: ((String) -> Unit)? = null,
 ) {
     val enterSends = messageComposerEnterSends && onSend != null
-    val live = remember { ComposerLiveText(value) }
-    SideEffect { live.onHoistedValue(value) }
     BasicTextField(
         value = value,
-        onValueChange = { typed ->
-            live.onFieldValue(typed)
-            onValueChange(typed)
-        },
+        onValueChange = onValueChange,
         textStyle = textStyle,
         cursorBrush = cursorBrush,
         singleLine = false,
@@ -119,9 +74,7 @@ internal fun MessageComposerTextField(
                         isEnter &&
                         !event.isShiftPressed
                     ) {
-                        val outgoing = live.text
-                        live.onSent()
-                        onSend?.invoke(outgoing)
+                        onSend?.invoke(currentDraft())
                         true
                     } else {
                         false

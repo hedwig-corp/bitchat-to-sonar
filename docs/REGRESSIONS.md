@@ -1086,12 +1086,13 @@ amount for a BOLT11 — that needs a wallet double — and the amountless refusa
 divergence would not be caught. Nothing here is exercised end-to-end against a
 real wallet.
 
-## R-022 — A send reads the draft the composer holds, not the one it last composed
+## R-022 — A send commits the stored draft, never the one it last composed
 
 **Invariant:** Whatever commits a message — desktop Enter or the send button —
-sends the text the field currently holds. The hoisted draft a composition
-captured is only a snapshot of the last completed frame and must never be the
-value that gets sent.
+sends `SonarAppState.composerDraft(chatId)` read at event time. The draft a
+composition captured is only a snapshot of the last completed frame and must
+never be the value that gets sent, appended to, or tested for emptiness at
+commit time.
 
 **Breaks as:** The message arrives truncated. The composer shows the full text
 right up to the keypress, the sent bubble is missing its tail, and the amount cut
@@ -1103,97 +1104,100 @@ is invisible to a lambda that closed over the composed `draft`. A laggy frame
 queues a whole burst of AWT key events plus the Enter behind it, so the loss is
 a burst, not one character.
 
-**Call sites:** Compose `MessageComposerTextField` (`onSend` now receives the
-field's live text) plus the three send buttons in `ChatScreen`, `GeoDmScreen`,
-and `SonarChannelScreen`, which read the draft back from
-`SonarAppState.composerDraft` at click time. The emoji tray's
-`onEmoji` in `ChatScreen` is the same class and worse: `draft + it` is a
-read-modify-write, so a stale base *deletes* everything typed since the last
-frame instead of truncating the send. It reads the stored draft now. This one is
-not desktop-only — the tray plus a soft keyboard is the mobile path.
-`SlashHints` still replaces the draft wholesale from the composed value, which
-is deliberate: the user picks a completion from what is on screen. Apple is not affected in the same
-shape: SwiftUI `SNMessageComposerField` sends through a `@Binding` that the
-`.onKeyPress(.return)` handler reads at event time, not a per-frame capture.
+**Why the store is the answer:** the *store* is never stale — every keystroke
+writes it synchronously through `onValueChange`. Only the composed `value`
+trails. So the fix is not to track the text a second time; it is to read the one
+copy that is always current. That also makes every other owner of the draft
+visible at once: a send button that just committed and cleared it, a slash-hint
+completion, an emoji appended by the tray.
 
-**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTypedTextWhenCallSiteHasNotRecomposed`, `MessageComposerFieldUiTest.returnKeyDoesNotResendDraftClearedByCaller`, `ComposerLiveTextTest.keystrokesAreVisibleBeforeTheCallerRecomposes`, `ComposerLiveTextTest.sendDoesNotHandOutTheSameTextTwice`, `ComposerLiveTextTest.aLateHoistedValueWouldWin`, `ComposerLiveTextTest.draftTheCallerKeptComesBackAfterSend`, `ComposerLiveTextTest.clearedDraftStaysCleared`, `ComposerLiveTextTest.switchingChatsAdoptsTheNewConversationsDraft`
+**Call sites:** Compose `MessageComposerTextField` takes a `currentDraft: () -> String`
+and sends *that*, not `value`; the three send buttons in `ChatScreen`,
+`GeoDmScreen`, and `SonarChannelScreen` read `state.composerDraft(key)` in the
+click handler. `ChatScreen`'s emoji tray is the same class and worse: `onEmoji`
+did `draft + it`, a read-modify-write, so a stale base *deleted* everything typed
+since the last frame instead of truncating the send. It reads the stored draft
+now. That one is not desktop-only — the tray plus a soft keyboard is the mobile
+path. Apple is not affected in the same shape: SwiftUI `SNMessageComposerField`
+sends through a `@Binding` that `.onKeyPress(.return)` reads at event time, not
+a per-frame capture.
 
-The first fails when the handler is pointed back at the composed value
-(`onSend?.invoke(value)` instead of `live.text`, which is the old behaviour with
-the new signature — a literal revert does not compile, since `onSend` changed
-from `(() -> Unit)?` to `((String) -> Unit)?`): `onSend` then receives `""`. The
-second pins the other half — a caller that owns the draft again (cleared after
-send, slash-hint completion) still wins. The rest pin the holder's state
-machine.
+**Guarded by:** `MessageComposerFieldUiTest.returnKeySendsTheStoredDraftNotTheComposedOne`, `MessageComposerFieldUiTest.returnKeyDoesNotResendADraftAlreadyCommittedElsewhere`, `MessageComposerFieldUiTest.returnKeySendsACompletionTheCallerApplied`, `MessageComposerFieldUiTest.returnKeySendsDraftOnDesktopComposer`, `MessageComposerFieldUiTest.returnKeyInsertsNewlineWhenDesktopSendDisabled`
 
-**Same batch, second Enter:** the stalled frame that swallows keystrokes also
-swallows the *first* Enter's feedback, so the user presses it again and both
-land before the caller's clear is composed. `ComposerLiveText.onSent()` drops
-the text at hand-off (`sendDoesNotHandOutTheSameTextTwice`); a caller that keeps
-the draft instead of clearing gets it back on the next composition
-(`draftTheCallerKeptComesBackAfterSend`).
+All three of the first group fail when the handler is pointed back at the
+composed value (`onSend?.invoke(value)`, which is the old behaviour under the new
+signature — a literal revert does not compile, since `onSend` changed from
+`(() -> Unit)?` to `((String) -> Unit)?`). They stage the divergence with a call
+site that never recomposes, which is what a stalled frame produces: the store
+moves, `value` does not.
 
-**Callers must forward `onValueChange` synchronously.** A hoisted value that
-differs from what the field last reported is treated as caller-owned and wins,
-so a debounced or async draft store would trail the field, win anyway, and
-resurrect the truncation. All three call sites write straight into
-`SonarAppState.composerDrafts`. Pinned as `ComposerLiveTextTest.aLateHoistedValueWouldWin`,
-which asserts the sharp edge rather than pretending it is handled.
+**Callers must forward `onValueChange` synchronously.** `currentDraft` is only
+as good as the store behind it. All three call sites write straight into
+`SonarAppState.composerDrafts`; a debounced or async draft store would put the
+truncation straight back, and no test here would catch it.
 
-**Coverage (honest):** `ComposerLiveTextTest` pins the state machine, not the
-wiring; the UI test pins the wiring for the single-Enter case. The second-Enter
-case is **not** pinned end-to-end: `runComposeUiTest` idles — and so recomposes
-— between injected key events, which is precisely the interleaving that makes
-the bug possible, so the harness cannot stage it. A UI-level test written for it
-passes either way and was dropped rather than left as false coverage. The three
-send *buttons* are not covered either — they live inside large screen
-composables needing a constructed `SonarAppState`, so the fresh read there is by
-inspection only. Nothing pins the Apple side.
-
-**Known gap this fix newly exposes — a keystroke *after* the Enter in the same
-batch.** `onSent()` clears our holder, but the value-based `BasicTextField`
-keeps its own internal `TextFieldValue`, which still holds the sent text until
-the caller's clear is composed. For the batch `[h, i, Enter, !]` the `!` edits
-that buffer, so `onValueChange` reports `"hi!"` and the composer comes back
-holding the message it just sent, prefixed to the next one. Before this change
-the same batch sent nothing at all (Enter saw a blank stale draft and the
-caller's guard returned), so making the send work is what put this in reach. It
-is one frame wide, and the user sees the wrong text in the composer *before*
+**Known gap — a keystroke *after* the Enter in the same batch.** The value-based
+`BasicTextField` keeps its own internal `TextFieldValue`, which still holds the
+sent text until the caller's clear is composed. For the batch `[h, i, Enter, !]`
+the `!` edits that buffer, so `onValueChange` reports `"hi!"` and the composer
+comes back holding the message it just sent, prefixed to the next one. Before
+this change the same batch sent nothing at all (Enter saw a blank stale draft and
+the caller's guard returned), so making the send work is what put this in reach.
+It is one frame wide and the user sees the wrong text in the composer *before*
 sending it — unlike the truncation, which was silent. The real fix is for the
 composer to own a `TextFieldValue` so the field can be blanked synchronously at
-send (also fixes the mid-caret variant, where the leftover is not even a
-prefix). That is deliberately **not** in this change: it rewrites the field's
-state ownership and moves soft-keyboard/IME behaviour, which is the exact
-surface R-007 exists to protect and which has already regressed twice. It wants
-its own PR with device testing on both platforms.
+send (that also covers the mid-caret variant, where the leftover is not even a
+prefix, so no prefix-stripping hack helps). Deliberately **not** in this change:
+it rewrites the field's state ownership and moves soft-keyboard/IME behaviour,
+which is the exact surface R-007 exists to protect and which has already
+regressed twice.
+
+**Coverage (honest):** the tests pin the shared field. The three send *buttons*
+and the emoji append are **not** covered — they live inside large screen
+composables needing a constructed `SonarAppState`, so the fresh read at those
+call sites is by inspection only. The same-batch second Enter is covered only in
+the sense that a cleared store sends nothing; the true interleaving cannot be
+staged, because `runComposeUiTest` idles — and so recomposes — between injected
+key events, which is precisely the interleaving that makes the bug possible. A
+UI test written for it passed either way and was dropped rather than left as
+false coverage. Nothing pins the Apple side.
 
 **The call sites are the hole, and they are where the bug lived.** Everything
 above pins the shared field; the original defect was in the *callers*, which
-closed over `draft`. They are correct now because they use the lambda parameter,
-but nothing stops a future `onSend = { state.send(chatId, draft) }` from
-reintroducing it verbatim, and no test reachable today would fail. This is
+closed over `draft`. They are correct now because they use `currentDraft` and the
+lambda parameter, but nothing stops a future `onSend = { state.send(chatId, draft) }`
+from reintroducing it verbatim, and no test reachable today would fail. This is
 exactly the R-001 shape — helper-level tests green while a call site regressed —
 and it is the strongest argument for eventually making these screens testable
 against a constructed `SonarAppState`.
+
+**History:** #517 fixed the desktop Enter truncation by tracking the field's own
+text in a `ComposerLiveText` holder. Review found that a second source of truth
+was the wrong shape: it could not see a send button that had just committed
+(duplicate message), nor a slash-hint completion the caller had applied (wrong
+command sent). Replaced in the same PR by reading the store, which is what the
+send buttons were already doing.
 
 **Rejected:**
 - *Reading the hoisted `value` inside the key handler.* It is the same
   composition-time snapshot the call site captured, so it is stale in exactly
   the same window.
-- *Fixing only the three `onSend` call sites by reading `composerDraft` fresh.*
-  It works, but leaves the footgun in place for the next composer — the field
-  itself is the only thing that always knows its own text. The buttons take that
-  form because they cannot see the field's live text.
-- *Mutating the live-text holder during composition instead of in `SideEffect`.*
-  A discarded composition would leave the holder advanced past the text the
-  field actually kept.
+- *Tracking the field's own text in a holder (`ComposerLiveText`).* Shipped
+  first, then removed. It fixed truncation but created a second source of truth
+  that disagreed with the store whenever anything other than a keystroke changed
+  the draft — button send, slash hint, emoji append — and each disagreement was
+  its own bug. Reading the one always-current copy is both simpler and strictly
+  more correct.
+- *Fixing only the `onSend` call sites and leaving the field alone.* It works,
+  but leaves the footgun for the next composer; the field should not be able to
+  send something the store does not have.
 - *Keeping a UI-level test for the same-batch second Enter.* It passed with and
   without the guard, because the harness recomposes between injected events. A
-  test that cannot fail is worse than an admitted gap. Note for anyone tempted
-  to retry it: pressing Enter twice inside a single `performKeyInput` block is
-  the obvious idea and it does **not** work — the harness still recomposes
-  between the two presses, which is how the vacuity was caught. Pinning this
-  needs a fake frame clock, not a tighter injection block.
+  test that cannot fail is worse than an admitted gap. Note for anyone tempted to
+  retry it: pressing Enter twice inside a single `performKeyInput` block is the
+  obvious idea and it does **not** work — the harness still recomposes between
+  the two presses, which is how the vacuity was caught. Pinning it needs a fake
+  frame clock.
 - *Rewriting the composer onto `TextFieldValue` in this change.* It is the right
   end state and would close the post-Enter-keystroke gap above, but it moves
   IME/selection behaviour on both mobile platforms — see R-007's history — so it

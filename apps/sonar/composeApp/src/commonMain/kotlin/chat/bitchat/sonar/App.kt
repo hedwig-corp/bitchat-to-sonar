@@ -1858,6 +1858,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
+                            currentDraft = { state.composerDraft(screen.id) },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .onFocusChanged { focusState ->
@@ -2565,6 +2566,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    currentDraft = { state.composerDraft(draftKey) },
                     modifier = Modifier.fillMaxWidth(),
                     onSend = { typed ->
                         if (typed.isBlank()) return@MessageComposerTextField

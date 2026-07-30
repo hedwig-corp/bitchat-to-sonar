@@ -19,6 +19,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.sp
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 @OptIn(ExperimentalTestApi::class)
@@ -33,6 +34,7 @@ class MessageComposerFieldUiTest {
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { text },
                 modifier = Modifier.testTag("message-composer"),
                 onSend = { typed ->
                     sent = typed
@@ -63,6 +65,7 @@ class MessageComposerFieldUiTest {
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { text },
                 modifier = Modifier.testTag("message-composer"),
                 onSend = { typed ->
                     sent = typed
@@ -82,24 +85,25 @@ class MessageComposerFieldUiTest {
     }
 
     /**
-     * The truncation bug: a keystroke burst reaches the field before the call
-     * site recomposes, so the hoisted `value` the composition captured is
-     * missing the tail. Enter must send what the field holds, not that stale
-     * value — here the call site never catches up at all.
+     * The truncation bug. The call site below never recomposes, so the `value`
+     * the field was composed with stays empty while the store keeps every
+     * keystroke — the same divergence a stalled frame produces in production.
+     * Enter must send the store.
      */
     @Test
-    fun returnKeySendsTypedTextWhenCallSiteHasNotRecomposed() = runComposeUiTest {
-        val hoisted = ""
-        var reported: String? = null
+    fun returnKeySendsTheStoredDraftNotTheComposedOne() = runComposeUiTest {
+        val composed = ""
+        var store = ""
         var sent: String? = null
         setContent {
             MessageComposerTextField(
-                value = hoisted,
-                onValueChange = { reported = it },
+                value = composed,
+                onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { store },
                 modifier = Modifier.testTag("message-composer"),
-                onSend = { typed -> sent = typed },
+                onSend = { typed -> if (typed.isNotBlank()) sent = typed },
             )
         }
 
@@ -108,44 +112,70 @@ class MessageComposerFieldUiTest {
         onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
 
         runOnIdle {
-            assertEquals("hello desktop", reported)
+            assertEquals("hello desktop", store)
             assertEquals("hello desktop", sent)
         }
     }
 
     /**
-     * The other side of that rule: once the caller owns the draft again (it
-     * cleared it after the send), a second Enter must not resend the old text.
+     * Something else committed the draft and cleared it — the send button, or an
+     * earlier Enter from the same input batch. Enter must not send it again just
+     * because this composition still shows the old text.
      */
     @Test
-    fun returnKeyDoesNotResendDraftClearedByCaller() = runComposeUiTest {
-        var text by mutableStateOf("")
-        val sent = mutableListOf<String>()
+    fun returnKeyDoesNotResendADraftAlreadyCommittedElsewhere() = runComposeUiTest {
+        val composed = "already sent"
+        var store = "already sent"
+        var sent: String? = null
         setContent {
             MessageComposerTextField(
-                value = text,
-                onValueChange = { text = it },
+                value = composed,
+                onValueChange = { store = it },
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { store },
                 modifier = Modifier.testTag("message-composer"),
-                onSend = { typed ->
-                    if (typed.isNotBlank()) {
-                        sent += typed
-                        text = ""
-                    }
-                },
+                onSend = { typed -> if (typed.isNotBlank()) sent = typed },
             )
         }
 
         onNodeWithTag("message-composer").performClick()
-        onNodeWithTag("message-composer").performTextInput("only once")
-        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+        // The button's click handler ran and cleared the stored draft; this
+        // composition has not caught up.
+        store = ""
         onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
 
-        runOnIdle {
-            assertEquals(listOf("only once"), sent)
-            assertEquals("", text)
+        runOnIdle { assertNull(sent) }
+    }
+
+    /**
+     * The caller replaced the draft without the field producing the text — a
+     * slash-hint completion, or the emoji tray appending. Enter must send what
+     * the caller stored, not the text the field last showed.
+     */
+    @Test
+    fun returnKeySendsACompletionTheCallerApplied() = runComposeUiTest {
+        val composed = "/f"
+        var store = "/f"
+        var sent: String? = null
+        setContent {
+            MessageComposerTextField(
+                value = composed,
+                onValueChange = { store = it },
+                textStyle = TextStyle(fontSize = 16.sp),
+                cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { store },
+                modifier = Modifier.testTag("message-composer"),
+                onSend = { typed -> if (typed.isNotBlank()) sent = typed },
+            )
         }
+
+        onNodeWithTag("message-composer").performClick()
+        // The hint was clicked; this composition still carries "/f".
+        store = "/fav "
+        onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
+
+        runOnIdle { assertEquals("/fav ", sent) }
     }
 
     @Test
@@ -157,6 +187,7 @@ class MessageComposerFieldUiTest {
                 onValueChange = { text = it },
                 textStyle = TextStyle(fontSize = 16.sp),
                 cursorBrush = SolidColor(androidx.compose.ui.graphics.Color.Black),
+                currentDraft = { text },
                 modifier = Modifier.testTag("message-composer"),
                 onSend = null,
             )
