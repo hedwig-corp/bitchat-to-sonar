@@ -1286,6 +1286,18 @@ drives the documented `withSendEchoes` contract, not the member itself; a future
 edit to `withSendEchoes` that diverges from that contract (e.g. reordering the
 retire before the render-list build) would not be caught.
 
+**Known un-gated clears (residual, pre-existing):** `sendStickerItem`'s clear
+is deliberately unconditional — a canonical sticker row has empty content (the
+sticker rides a tag), so the content-matching plan can never fulfil or retire a
+sticker echo and the hard clear is its only end of life; the session-rolled
+race there self-heals because the new session's own newest paint contains the
+canonical row. `retrySendEcho`'s Marmot path and the pending-chat flush paths
+(`flushPendingDirectMarmot`, `flushPendingMarmotGroupSends`) also hard-clear on
+success without the publish gate; a retry/first-send whose canonical row lands
+out-of-window can still drop until the newest-edge reload. Fixing those needs
+the sticker-aware matcher first (tracked follow-up), or each clear inherits the
+sticker path's ghost trade-off.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
