@@ -1086,6 +1086,125 @@ amount for a BOLT11 — that needs a wallet double — and the amountless refusa
 divergence would not be caught. Nothing here is exercised end-to-end against a
 real wallet.
 
+## R-022 — Restore recovers the account, or leaves it exactly as it was
+
+**Invariant:** Every path into the account store either restores the backup or
+changes nothing. Staged bytes are promoted only when a restore was actually
+requested; a pasted key that matches the signed-in account wipes nothing; and a
+dry run reads a backup without touching the live store on any platform.
+
+**Breaks as:** Chats gone with no way back. Three distinct shapes, all shipped
+in the same feature:
+
+1. Boot reconcile promoted any staging file that opened under the live key. A
+   backup taken by *this* install stages a DB the live key opens, so the key
+   check cannot reject it — an interrupted restore left debris that the next
+   launch silently promoted, rolling the account back to the backup.
+2. Re-pasting your own `nsec` ran the full account-replacement path: wallet
+   storage, host caches, and the Marmot store wiped, then restore from Blossom.
+   For the current account that trades a live database for the last upload, and
+   for anyone who never opened the backup screen — where the disclosure gate
+   means nothing was ever uploaded — it destroyed everything with nothing to
+   restore.
+3. The dry run scratched the decrypted index into `env::temp_dir()`. Android app
+   processes have no `TMPDIR` and cannot write `/tmp`, so the one affordance for
+   checking a backup is real before a delete-and-reinstall failed on every
+   Android device, and users could only take the backup on faith.
+
+**Why:** All three are invisible from the code. The staging file *looks* like
+proof a restore is in flight, and the case where it is not is exactly the case
+the key check cannot detect. `restoreAccount` reads as "replace this account",
+so the same-key call looks like a no-op and is the most destructive input it
+accepts. And `tempfile::tempdir()` is correct on every platform the tests run
+on — the host suite passes because macOS `/tmp` is writable.
+
+**Call sites:** core `account_backup.rs::reconcile_staged_account_restore`,
+`::restore_account_files`, `::preview_account_backup`; Compose
+`SonarAppState.kt::restoreAccount`, `SonarCore.android.kt::importIdentity`,
+`SonarCore.jvm.kt::importIdentity`, `SonarCore.android.kt::previewAccountBackup`;
+iOS `SonarAppStore.swift::restoreAccount`,
+`MarmotChatView.swift::restoreIdentity`, `MarmotService.swift::previewBackup`
+
+**Guarded by:**
+`account_backup::tests::reconcile_discards_staging_with_no_intent_marker`,
+`account_backup::tests::preview_scratch_lives_beside_the_database`,
+`account_backup::tests::preview_leaves_the_live_account_byte_identical`
+
+**History:** #368.
+
+**Rejected:** Comparing staged and live modification times instead of an intent
+marker — mtime is not a fact about intent, it is a fact about the filesystem,
+and a restore staged before the last local write would be discarded for looking
+old. Also rejected: keeping the same-key guard only in the core import, which
+would still let the store-level path wipe wallet storage and host caches before
+the core ever sees the key.
+
+**Not guarded:** The same-key `nsec` guard has no test on either platform — both
+entry points need a constructible app object (see the Unguarded root cause), and
+verifying it by hand means typing a real account key. The intent marker is
+proven end-to-end only by the `backup_roundtrip_driver` example, which is not
+run by CI. Nothing pins that restored chats *render*: the Android leg was
+verified at the file level, and the synthetic backup used has no MLS groups
+behind its conversation summaries.
+
+## R-023 — Re-pasting your own key is never an account replacement
+
+**Invariant:** Importing an `nsec` replaces the account only when it is a
+*different* account. The key already signed in is a no-op, and a blank incoming
+key never authorises a wipe.
+
+**Breaks as:** Every chat gone, unrecoverably. Import wipes wallet storage, host
+caches and the Marmot store, then restores from Blossom. For the current account
+that trades a live database for whatever was last uploaded — and for anyone who
+never opened the backup screen, the disclosure gate means nothing was ever
+uploaded, so there is nothing to restore.
+
+**Why:** `restoreAccount` reads as "replace this account", so the same-key call
+looks like the harmless case and is in fact the most destructive input it
+accepts. The wipe happens before any comparison the old code made, and the user
+who triggers it is usually doing something they believe is safe — re-entering
+their own key to "re-sync".
+
+**Call sites:** Compose `SonarAppState.kt::restoreAccount`,
+`SonarCore.android.kt::importIdentity`, `SonarCore.jvm.kt::importIdentity`; iOS
+`SonarAppStore.swift::restoreAccount`, `MarmotChatView.swift::restoreIdentity`.
+All five route through the shared predicate rather than comparing inline.
+
+**Guarded by:** the whole `AccountReplacementTest` (Compose) and
+`AccountReplacementTests` (iOS) pair —
+`rePastingYourOwnKeyIsNotAReplacement`,
+`anEmptyIncomingKeyNeverReplaces`,
+`surroundingWhitespaceDoesNotDefeatTheGuard`,
+`caseDoesNotMakeItADifferentAccount`,
+`exoticWhitespaceIsTreatedIdenticallyOnBothPlatforms`,
+`aDifferentKeyReplacesTheAccount`, `noCurrentAccountReplaces`,
+`aPrefixOrTruncationIsNotTheSameAccount`, and the iOS `test`-prefixed twins
+(`AccountReplacementTests.testRePastingYourOwnKeyIsNotAReplacement`,
+`AccountReplacementTests.testAnEmptyIncomingKeyNeverReplaces`,
+`AccountReplacementTests.testCaseDoesNotMakeItADifferentAccount`)
+
+**History:** #368, #519.
+
+**Rejected:** Comparing raw npub strings without normalizing — bech32 is
+case-insensitive, so `NPUB1…` and `npub1…` are the same account, and a raw
+comparison fails open on the destructive side. Also rejected: each platform
+using its own idiomatic trim (`String.trim` vs `.whitespacesAndNewlines`),
+which disagree on U+00A0 — a non-breaking space around a pasted key was a
+no-op on iOS and a wipe on Android. Both now trim an identical ASCII set;
+agreeing matters more than which answer, and refusing to strip exotic
+whitespace is the safer of the two. Also rejected: comparing raw `nsec` strings — encodings differ and the comparison
+would silently fail open on the destructive side. Also rejected: leaving the
+comparison inline at each of the five call sites, which is how it shipped
+originally; five copies of a data-loss guard is five chances to drop one, and
+the pure predicate is the only part reachable from a test.
+
+**Not guarded:** The call sites themselves. No test proves each of the five
+actually consults the predicate before wiping — that needs a constructible
+`SonarAppState` / `SonarAppStore` (see Unguarded). A caller that skipped the
+check entirely would still pass every test here. R-001 regressed exactly this
+way: a missing argument at a call site while every helper-level test stayed
+green.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
@@ -1093,10 +1212,12 @@ entry once a test exists. Listing a gap is the point — an entry that overclaim
 its coverage is worse than an honest hole, because it stops people looking.
 
 - **R-003, the one-transcript half.** Cited tests pin chat-list dedup and identity routing, not "duplicate groups' messages merge into a single transcript". The merge lives in `SonarAppState.duplicateDirectMarmotChats` (private, needs an instance); `dedupeDirectMarmotChats` — the pure seam the tests use — only covers the chat-list half. Closing it means extracting the transcript-source selection into a pure function, or an injectable `SonarCore`.
+- **R-023's five call sites.** The predicate is pinned on both platforms, but nothing proves each of the five import paths actually consults it before wiping. Same root cause as the entries below: neither app object can be constructed in a test. Until then this is a helper-level guard on a data-loss path, which is precisely the shape R-001 regressed through.
 - **R-004, account wipe, both platforms.** Now implemented on iOS and Compose, but pinned by no test. The Compose path needs an injectable `SonarCore`; the iOS path needs a constructible `SonarAppStore`, and no iOS test builds one today (`MarmotOptimisticEchoTests` only exercises static functions).
 - **R-013, host push-tap / catching-up chip.** The iOS local-banner marker is pinned as a pure seam; the real `NotificationDelegate` → `refreshAfterForeground` call, full sync-lifetime indicator, and Compose notification-open → `forcedCatchupSync` route still need constructible app stores. Real-device APNs/FCM validation remains #262.
 - **Anything needing a `SonarAppState` / `SonarAppStore` instance.** The three gaps above share one root cause: neither app object can be constructed in a test, so only pure helpers are reachable. This is the single highest-leverage testing investment in the repo — see the injectable-core note in the Signal architecture notes. Until then, prefer removing a hazard (as R-001 does with a mandatory parameter) over testing for it.
 - **Out-of-range mesh DM echo dedup + Marmot reconcile (R-011 outbox half).** The outbox-flush path (`flushOutboxNow` -> `sendMesh(messageId)` + durable `removeMeshEcho` after Marmot) extends R-011's echo lifecycle to a second entry point. The O(1) dedup in `sendMesh` (`messageId == null || messageId !in meshEchoIds`) and the bounded reconcile (`removeMeshEcho` polls `marmotMessagesForPeer` up to 10x100ms before clearing the echo; on outbox eviction `failMeshEcho` marks the echo "Couldn't send") are both untested -- `SonarAppState` cannot be constructed in a test. Same root cause as the entry above. (Compose media retry is now covered by #397's `SonarMediaOutbox`/`queueMeshMediaForRetry`, so the earlier display-only media-echo gap no longer applies on Android.)
+- **A running iOS process is not a rendered UI.** `BitchatApp.init()` read `_sonarStore.wrappedValue` before SwiftUI installed the `@StateObject`, so each access built a throwaway store: the throwaway connected and opened the account while the view's store never left its launch state, and the app sat on the splash forever. It shipped because the simulator check verified the process stayed alive and read `t1_local_paint groups=137` from the log — both true, both from the wrong instance. Nothing pins this: the fix is the absence of a line, and no iOS test builds an app scene. Until one does, treat "the process is alive" and "the log looks healthy" as insufficient evidence for any launch-path change, and screenshot the screen. Found on an iPhone 14 Pro Max in #368.
 - **iOS tests do not run in CI.** No workflow invokes `xcodebuild test` / `ios/bitchatTests`, so `MarmotOptimisticEchoTests` guards R-001 only for someone running it locally. `scripts/check-regression-ledger.sh` verifies the test *exists*; nothing verifies it still *passes*. Until an iOS test job exists, treat Swift citations as weaker than Kotlin/Rust ones.
 - **Mesh-DM peer-ID rotation orphaning (PR #397 Compose + PR #405 iOS).** Messages keyed by short BLE ID (16-hex) are orphaned when the peer reconnects with a rotated RP address. Compose side fixed in #397 (`echoMeshMessage` + `enqueueOutbox`); iOS side fixed in #405 (`didDisconnectFromPeer` always migrates to stable Noise key). **Residual gap:** when `derivedStableKeyHex` is nil (Noise session never established or already torn down), messages stay under the dead short BLE ID — `consolidateMessages` does not scan for orphaned 16-hex keys. Needs orphan-recovery scan in `PrivateChatManager.consolidateMessages` or deferred migration on reconnect. **Second residual gap:** when a peer has both an outbound peripheral connection and an inbound central subscription (dual BLE leg), losing either leg triggers `didDisconnectFromPeer` unconditionally (`BLEService.swift:1573` / `:4823` / `:5032`). The migration removes the short-key transcript, but messages arriving over the surviving leg continue to be stored under that short peer ID, splitting the conversation again. `notifyPeerDisconnectedDebounced` (debounce window at `:4823`) mitigates rapid double-disconnects but does not check if the other leg is still live. Fix requires per-leg connection-count tracking in `BLEService` so `didDisconnectFromPeer` only fires when all legs are gone. Neither platform has a test for this path; iOS tests don't run in CI.
 - **Android offline BOLT12 wake: settle path and service lifecycle (PR #295).** The `invoice_request` answer path is now pinned end to end at the boundary that matters — `NdsReplyUrlTest` (androidUnitTest, 12 cases) covers the reply-URL pin, the single control between a forged NDS push and a redirected payment invoice, including the two bypasses that survived review: `java.net.URL` does **not** normalize dot-segments (only `URI.normalize()` does), and percent-encoded traversal re-appears once the far side decodes. What is **not** pinned is everything downstream of it. (1) `handleSettledReceive`'s exit signal is now pinned: the decision moved to a pure `settleWakeOutcome(settled, liveEvent, firstThisWake, alreadyNotified)` in commonMain with `SettleWakeOutcomeTest` (9 cases) naming the actual failures rather than covering a truth table — the historical-receive regression, the foreground-claimed trap, and two invariants (`PENDING` never notifies under any combination; notifying implies ending the wake). Mutation-checked: reintroducing the exact `289dda986` regression fails two of them. The **call site** is still unpinned — nothing proves the service passes the right `liveEvent` at each of its two call sites, which is precisely how R-001 escaped, so prefer extending this seam over re-inlining the logic. (2) `paymentEventOf`'s `paymentHash`-before-`txId` id stability, whose whole purpose is that a Lightning receive keeps one id across `PENDING` → `COMPLETE`; keying `txId` first double-ledgers and double-notifies. (3) The service lifecycle: `inFlightWakes` stopping the service only at zero, and the per-delivery `enterForeground()` re-arm of the shortService window. All three need either an Android `Service` driver (Robolectric) or an injectable `SonarCore`; none is reachable from `commonTest` today. The settle path has also never run on device — every captured receive settled inside a single wake, so cross-wake dedup and the `PENDING` branch are reasoning-only. This is simultaneously the most-churned and least-verified code in that PR.

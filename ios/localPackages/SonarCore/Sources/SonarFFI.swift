@@ -3363,6 +3363,71 @@ public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
 
 
 /**
+ * What restoring the latest backup would recover.
+ */
+public struct AccountBackupPreviewInfo: Equatable, Hashable {
+    public var conversations: [BackupPreviewConversationInfo]
+    public var totalMessages: UInt64
+    public var sizeBytes: UInt64
+    public var uploadedAtSecs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(conversations: [BackupPreviewConversationInfo], totalMessages: UInt64, sizeBytes: UInt64, uploadedAtSecs: UInt64) {
+        self.conversations = conversations
+        self.totalMessages = totalMessages
+        self.sizeBytes = sizeBytes
+        self.uploadedAtSecs = uploadedAtSecs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AccountBackupPreviewInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAccountBackupPreviewInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AccountBackupPreviewInfo {
+        return
+            try AccountBackupPreviewInfo(
+                conversations: FfiConverterSequenceTypeBackupPreviewConversationInfo.read(from: &buf),
+                totalMessages: FfiConverterUInt64.read(from: &buf),
+                sizeBytes: FfiConverterUInt64.read(from: &buf),
+                uploadedAtSecs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AccountBackupPreviewInfo, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeBackupPreviewConversationInfo.write(value.conversations, into: &buf)
+        FfiConverterUInt64.write(value.totalMessages, into: &buf)
+        FfiConverterUInt64.write(value.sizeBytes, into: &buf)
+        FfiConverterUInt64.write(value.uploadedAtSecs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountBackupPreviewInfo_lift(_ buf: RustBuffer) throws -> AccountBackupPreviewInfo {
+    return try FfiConverterTypeAccountBackupPreviewInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAccountBackupPreviewInfo_lower(_ value: AccountBackupPreviewInfo) -> RustBuffer {
+    return FfiConverterTypeAccountBackupPreviewInfo.lower(value)
+}
+
+
+/**
  * Result of uploading an encrypted account backup to Blossom.
  */
 public struct AccountBackupUploadInfo: Equatable, Hashable {
@@ -3420,6 +3485,170 @@ public func FfiConverterTypeAccountBackupUploadInfo_lift(_ buf: RustBuffer) thro
 #endif
 public func FfiConverterTypeAccountBackupUploadInfo_lower(_ value: AccountBackupUploadInfo) -> RustBuffer {
     return FfiConverterTypeAccountBackupUploadInfo.lower(value)
+}
+
+
+/**
+ * Auto-backup policy snapshot for Settings / host executors.
+ */
+public struct BackupPolicyInfo: Equatable, Hashable {
+    public var enabled: Bool
+    public var dirty: Bool
+    public var lastSuccessAt: UInt64?
+    public var lastAttemptAt: UInt64?
+    public var lastError: String?
+    public var opportunisticDebounceSecs: UInt64
+    public var dailyIntervalSecs: UInt64
+    /**
+     * Sealed size of the last successful upload. `None` until one succeeds —
+     * hosts render a dash, never a fabricated number.
+     */
+    public var lastSizeBytes: UInt64?
+    public var lastMessageCount: UInt64?
+    /**
+     * "manual" | "daily" | "weekly", derived from enabled + interval.
+     */
+    public var frequency: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(enabled: Bool, dirty: Bool, lastSuccessAt: UInt64?, lastAttemptAt: UInt64?, lastError: String?, opportunisticDebounceSecs: UInt64, dailyIntervalSecs: UInt64,
+        /**
+         * Sealed size of the last successful upload. `None` until one succeeds —
+         * hosts render a dash, never a fabricated number.
+         */lastSizeBytes: UInt64?, lastMessageCount: UInt64?,
+        /**
+         * "manual" | "daily" | "weekly", derived from enabled + interval.
+         */frequency: String) {
+        self.enabled = enabled
+        self.dirty = dirty
+        self.lastSuccessAt = lastSuccessAt
+        self.lastAttemptAt = lastAttemptAt
+        self.lastError = lastError
+        self.opportunisticDebounceSecs = opportunisticDebounceSecs
+        self.dailyIntervalSecs = dailyIntervalSecs
+        self.lastSizeBytes = lastSizeBytes
+        self.lastMessageCount = lastMessageCount
+        self.frequency = frequency
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension BackupPolicyInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupPolicyInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupPolicyInfo {
+        return
+            try BackupPolicyInfo(
+                enabled: FfiConverterBool.read(from: &buf),
+                dirty: FfiConverterBool.read(from: &buf),
+                lastSuccessAt: FfiConverterOptionUInt64.read(from: &buf),
+                lastAttemptAt: FfiConverterOptionUInt64.read(from: &buf),
+                lastError: FfiConverterOptionString.read(from: &buf),
+                opportunisticDebounceSecs: FfiConverterUInt64.read(from: &buf),
+                dailyIntervalSecs: FfiConverterUInt64.read(from: &buf),
+                lastSizeBytes: FfiConverterOptionUInt64.read(from: &buf),
+                lastMessageCount: FfiConverterOptionUInt64.read(from: &buf),
+                frequency: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupPolicyInfo, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.enabled, into: &buf)
+        FfiConverterBool.write(value.dirty, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastSuccessAt, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastAttemptAt, into: &buf)
+        FfiConverterOptionString.write(value.lastError, into: &buf)
+        FfiConverterUInt64.write(value.opportunisticDebounceSecs, into: &buf)
+        FfiConverterUInt64.write(value.dailyIntervalSecs, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastSizeBytes, into: &buf)
+        FfiConverterOptionUInt64.write(value.lastMessageCount, into: &buf)
+        FfiConverterString.write(value.frequency, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPolicyInfo_lift(_ buf: RustBuffer) throws -> BackupPolicyInfo {
+    return try FfiConverterTypeBackupPolicyInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPolicyInfo_lower(_ value: BackupPolicyInfo) -> RustBuffer {
+    return FfiConverterTypeBackupPolicyInfo.lower(value)
+}
+
+
+/**
+ * One conversation inside a sealed backup, for the dry-run preview.
+ */
+public struct BackupPreviewConversationInfo: Equatable, Hashable {
+    public var name: String
+    public var latestContent: String
+    public var messageCount: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, latestContent: String, messageCount: UInt64) {
+        self.name = name
+        self.latestContent = latestContent
+        self.messageCount = messageCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension BackupPreviewConversationInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeBackupPreviewConversationInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> BackupPreviewConversationInfo {
+        return
+            try BackupPreviewConversationInfo(
+                name: FfiConverterString.read(from: &buf),
+                latestContent: FfiConverterString.read(from: &buf),
+                messageCount: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: BackupPreviewConversationInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.latestContent, into: &buf)
+        FfiConverterUInt64.write(value.messageCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPreviewConversationInfo_lift(_ buf: RustBuffer) throws -> BackupPreviewConversationInfo {
+    return try FfiConverterTypeBackupPreviewConversationInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeBackupPreviewConversationInfo_lower(_ value: BackupPreviewConversationInfo) -> RustBuffer {
+    return FfiConverterTypeBackupPreviewConversationInfo.lower(value)
 }
 
 
@@ -7228,6 +7457,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeBackupPreviewConversationInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [BackupPreviewConversationInfo]
+
+    public static func write(_ value: [BackupPreviewConversationInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeBackupPreviewConversationInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [BackupPreviewConversationInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [BackupPreviewConversationInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeBackupPreviewConversationInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeConversationSummaryInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ConversationSummaryInfo]
 
@@ -7598,11 +7852,23 @@ public func accountRestoreStagingPresent(dbPath: String) -> Bool  {
 })
 }
 /**
+ * On-disk footprint of this account (DB + index + sidecars + media + stickers,
+ * excluding logs) for the Settings "Storage" row.
+ */
+public func accountStorageBytes(dbPath: String) -> UInt64  {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_account_storage_bytes(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
  * Encrypt the Marmot DB at `db_path` (plus conversation index) with a key
  * derived from `nsec`, then upload to Blossom (BUD-02).
  *
  * Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
  * Empty `blossom_server` uses the default Blossom host.
+ * Prefer seal → reconnect → [`upload_sealed_account_backup`] for auto-backup.
  */
 public func backupAccountToBlossom(nsec: String, dbPath: String, dbKeyHex: String, blossomServer: String?)throws  -> AccountBackupUploadInfo  {
     return try  FfiConverterTypeAccountBackupUploadInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -7611,6 +7877,13 @@ public func backupAccountToBlossom(nsec: String, dbPath: String, dbKeyHex: Strin
         FfiConverterString.lower(dbPath),
         FfiConverterString.lower(dbKeyHex),
         FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+public func backupIsDue(dbPath: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_backup_is_due(
+        FfiConverterString.lower(dbPath),$0
     )
 })
 }
@@ -7693,6 +7966,23 @@ public func defaultHandleDomain() -> String  {
 })
 }
 /**
+ * Persist on-by-default only when the policy sidecar is missing. Safe to call
+ * from onboarding — never overwrites an existing opt-out or fail-closed file.
+ */
+public func ensureBackupPolicyDefault(dbPath: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_ensure_backup_policy_default(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
+}
+public func getBackupPolicy(dbPath: String) -> BackupPolicyInfo  {
+    return try!  FfiConverterTypeBackupPolicyInfo_lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_func_get_backup_policy(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
  * True if `input` is plausibly a human-readable handle (`vincenzo` or
  * `alice@example.com`). Pure string check — no network, safe to call per
  * keystroke from search UIs to decide whether to offer a resolve action.
@@ -7715,6 +8005,12 @@ public func isMissingAccountBackupError(message: String) -> Bool  {
         FfiConverterString.lower(message),$0
     )
 })
+}
+public func markBackupDirty(dbPath: String)  {try! rustCall() {
+    uniffi_sonar_ffi_fn_func_mark_backup_dirty(
+        FfiConverterString.lower(dbPath),$0
+    )
+}
 }
 /**
  * Largest media attachment (plaintext bytes) a receiver will download.
@@ -7977,6 +8273,26 @@ public func noiseGenerateKeypair()throws  -> NoiseKeypairHex  {
 })
 }
 /**
+ * Dry run: report what a restore would bring back, changing nothing.
+ *
+ * Never stages or commits, and never opens the live store — it decrypts in
+ * memory and reads only the conversation index from a scratch copy that is
+ * deleted before returning. Safe to call with the node open.
+ *
+ * `db_path` is neither read nor written; its directory is the scratch parent.
+ * Hosts must pass the real DB path — the process temp dir is unusable on
+ * Android, so a preview scratched there fails on every device.
+ */
+public func previewAccountBackup(nsec: String, dbPath: String, blossomServer: String?)throws  -> AccountBackupPreviewInfo  {
+    return try  FfiConverterTypeAccountBackupPreviewInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_preview_account_backup(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
+        FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+/**
  * Boot-time recovery for interrupted stage→persist→commit. Returns `true` if
  * leftover staging was committed under `db_key_hex`.
  */
@@ -7987,6 +8303,21 @@ public func reconcileAccountRestore(dbPath: String, dbKeyHex: String)throws  -> 
         FfiConverterString.lower(dbKeyHex),$0
     )
 })
+}
+public func recordBackupFailure(dbPath: String, error: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_record_backup_failure(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(error),$0
+    )
+}
+}
+public func recordBackupSuccess(dbPath: String, sizeBytes: UInt64?, dbKeyHex: String?)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_record_backup_success(
+        FfiConverterString.lower(dbPath),
+        FfiConverterOptionUInt64.lower(sizeBytes),
+        FfiConverterOptionString.lower(dbKeyHex),$0
+    )
+}
 }
 /**
  * Download this identity's latest account backup from Blossom, decrypt with
@@ -8005,6 +8336,37 @@ public func restoreAccountFromBlossom(nsec: String, dbPath: String, blossomServe
         FfiConverterOptionString.lower(blossomServer),$0
     )
 })
+}
+/**
+ * Seal only (exclusive DB access). Hosts should reopen the node, then call
+ * [`upload_sealed_account_backup`] so chat is not blocked on Blossom upload.
+ */
+public func sealAccountBackup(nsec: String, dbPath: String, dbKeyHex: String)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_seal_account_backup(
+        FfiConverterString.lower(nsec),
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(dbKeyHex),$0
+    )
+})
+}
+public func setBackupEnabled(dbPath: String, enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_set_backup_enabled(
+        FfiConverterString.lower(dbPath),
+        FfiConverterBool.lower(enabled),$0
+    )
+}
+}
+/**
+ * Settings cadence: "manual" | "daily" | "weekly". Unknown values are refused
+ * rather than silently defaulting — a typo must not quietly disable backups.
+ */
+public func setBackupFrequency(dbPath: String, frequency: String)throws   {try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_set_backup_frequency(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(frequency),$0
+    )
+}
 }
 /**
  * Install (or re-configure) the on-device diagnostics log sink: a bounded,
@@ -8046,6 +8408,18 @@ public func sonarRenderNotification(input: SonarNotificationRenderInputInfo) -> 
 })
 }
 /**
+ * Upload already-sealed ciphertext. Does **not** need a closed SonarNode.
+ */
+public func uploadSealedAccountBackup(nsec: String, sealed: Data, blossomServer: String?)throws  -> AccountBackupUploadInfo  {
+    return try  FfiConverterTypeAccountBackupUploadInfo_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
+    uniffi_sonar_ffi_fn_func_upload_sealed_account_backup(
+        FfiConverterString.lower(nsec),
+        FfiConverterData.lower(sealed),
+        FfiConverterOptionString.lower(blossomServer),$0
+    )
+})
+}
+/**
  * Erase the persistent Marmot database at `db_path`, its SQLite sidecars
  * (`-wal`, `-shm`, `-journal`), and the conversation-index sidecar database.
  *
@@ -8081,7 +8455,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_account_restore_staging_present() != 58444) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_backup_account_to_blossom() != 15464) {
+    if (uniffi_sonar_ffi_checksum_func_account_storage_bytes() != 38156) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_backup_account_to_blossom() != 54340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_backup_is_due() != 64676) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_call_encode_answer() != 19224) {
@@ -8105,10 +8485,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_default_handle_domain() != 45849) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_ensure_backup_policy_default() != 1407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_get_backup_policy() != 28707) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_handle_looks_valid() != 39625) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_is_missing_account_backup_error() != 20301) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_mark_backup_dirty() != 39321) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_max_media_plaintext_bytes() != 26928) {
@@ -8171,10 +8560,28 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_noise_generate_keypair() != 35056) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_preview_account_backup() != 26257) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_reconcile_account_restore() != 25360) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_func_record_backup_failure() != 3997) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_record_backup_success() != 38947) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_func_restore_account_from_blossom() != 16615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_seal_account_backup() != 2091) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_set_backup_enabled() != 3327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_set_backup_frequency() != 6119) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_setup_logging() != 6013) {
@@ -8187,6 +8594,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_sonar_render_notification() != 13744) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_func_upload_sealed_account_backup() != 33559) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_wipe_marmot_database() != 46581) {

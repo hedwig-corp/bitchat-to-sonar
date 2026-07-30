@@ -58,6 +58,14 @@ struct BitchatApp: App {
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
         // Warm up georelay directory and refresh if stale (once/day)
         GeoRelayDirectory.shared.prefetchIfNeeded()
+        // Do NOT touch `sonarStore` here. Reading `_sonarStore.wrappedValue`
+        // before SwiftUI installs the `@StateObject` builds a throwaway store
+        // on every access, and the one the view later observes is a different
+        // instance — so the throwaway connects (the log even shows it opening
+        // the account) while the view's store never leaves its launch state and
+        // the app sits on the splash forever. Proven on an iPhone 14 Pro Max.
+        // The scheduler is wired from the scene's task below, where the real
+        // store exists; its handler already tolerates a nil store.
     }
 
     private var chatViewModel: ChatViewModel { sonarStore.chatViewModel }
@@ -88,6 +96,15 @@ struct BitchatApp: App {
                     appDelegate.chatViewModel = chatViewModel
                     #if os(iOS)
                     appDelegate.sonarStore = sonarStore
+                    AutoBackupBackgroundScheduler.shared.store = sonarStore
+                    // An account that upgraded into this feature has never been
+                    // disclosed, so it would never back up at all. Do it before
+                    // the disclosure check below so the first backup is
+                    // scheduled on this launch rather than the next one.
+                    sonarStore.discloseAutoBackupForExistingAccountIfNeeded()
+                    if sonarStore.isAutoBackupDisclosed() {
+                        AutoBackupBackgroundScheduler.shared.schedule()
+                    }
                     #endif
 
                     // Initialize network activation policy; will start Tor/Nostr only when allowed
@@ -117,6 +134,13 @@ struct BitchatApp: App {
                         // local name and restricts service-UUID advertising in the
                         // background, so receiving payments is foreground-only.
                         sonarStore.setForeground(false)
+                        AutoBackupBackgroundScheduler.shared.store = sonarStore
+                        AutoBackupBackgroundScheduler.shared.schedule()
+                        // Near-term retry as well as the floor: the opportunistic
+                        // run below bails when the background window is too short,
+                        // and without this that session's chats would wait 12 hours.
+                        AutoBackupBackgroundScheduler.shared.scheduleSoon()
+                        AutoBackupBackgroundScheduler.shared.runOpportunisticBackgroundBackupIfDue()
                         // Always send Tor to dormant on background for a clean restart later.
                         TorManager.shared.setAppForeground(false)
                         TorManager.shared.goDormantOnBackground()
@@ -257,6 +281,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, MessagingDelegate {
             Self.pushLog.warning("GoogleService-Info.plist missing; Breez NDS offline receive disabled")
         }
         application.registerForRemoteNotifications()
+        AutoBackupBackgroundScheduler.shared.register()
         return true
     }
 

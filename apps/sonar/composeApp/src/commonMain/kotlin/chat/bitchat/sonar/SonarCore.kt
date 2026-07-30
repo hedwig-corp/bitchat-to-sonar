@@ -538,7 +538,14 @@ data class SonarChannelMsg(
 enum class SonarCallState { Ringing, Connecting, Connected, Ended, Failed, Declined, Busy, Missed }
 
 /** Result of soft-trying a Blossom Marmot backup during nsec import. */
-enum class AccountBackupRestoreOutcome { Restored, Missing, Failed }
+/**
+ * Result of an identity import.
+ *
+ * [Unchanged] means the pasted key is the account already signed in: nothing
+ * was wiped, downloaded, or replaced. It is deliberately distinct from
+ * [Restored] — no backup was involved, so there is nothing to report.
+ */
+enum class AccountBackupRestoreOutcome { Restored, Missing, Failed, Unchanged }
 
 /** A call state change emitted by the engine (drained via [SonarCore.callWaitEvent]). */
 data class SonarCallEvent(
@@ -568,6 +575,36 @@ data class AlbumUpload(
     val bytes: ByteArray,
     val filename: String,
     val mime: String,
+)
+
+/** Core-owned auto-backup policy snapshot for Settings / host executors. */
+data class BackupPolicySnapshot(
+    val enabled: Boolean,
+    val dirty: Boolean,
+    val lastSuccessAt: Long?,
+    val lastAttemptAt: Long?,
+    val lastError: String?,
+    /** Sealed size of the last successful upload; null until one succeeds. */
+    val lastSizeBytes: Long? = null,
+    /** Messages that upload covered, counted at success time. */
+    val lastMessageCount: Long? = null,
+    /** "manual" | "daily" | "weekly" — derived by core from enabled + interval. */
+    val frequency: String = "daily",
+)
+
+/** One conversation inside a sealed backup, for the dry-run preview. */
+data class BackupPreviewConversation(
+    val name: String,
+    val latestContent: String,
+    val messageCount: Long,
+)
+
+/** What restoring the latest backup would recover. Changes nothing. */
+data class AccountBackupPreview(
+    val conversations: List<BackupPreviewConversation>,
+    val totalMessages: Long,
+    val sizeBytes: Long,
+    val uploadedAtSecs: Long,
 )
 
 /**
@@ -941,8 +978,41 @@ expect object SonarCore {
      * Encrypt the local Marmot DB + SQLCipher key with the account nsec and
      * upload to Blossom. Drops the live node first; caller should `start()` /
      * reconnect afterward. Returns a short status line for toasts.
+     *
+     * Prefer [sealAccountBackup] → reconnect → [uploadSealedAccountBackup] so
+     * chat is not blocked on the Blossom RTT (auto-backup path).
+     *
+     * When [requireNoLiveUiSession] is true (Android WorkManager), abort if the
+     * Compose UI owns / is booting Marmot.
      */
-    suspend fun backupAccountToBlossom(): String
+    suspend fun backupAccountToBlossom(requireNoLiveUiSession: Boolean = false): String
+
+    /**
+     * Close node + seal only. Caller reconnects, then [uploadSealedAccountBackup].
+     * See [backupAccountToBlossom] for [requireNoLiveUiSession].
+     */
+    suspend fun sealAccountBackup(requireNoLiveUiSession: Boolean = false): ByteArray
+
+    /** Upload already-sealed ciphertext; does not need exclusive DB access. */
+    suspend fun uploadSealedAccountBackup(sealed: ByteArray): String
+
+    fun getBackupPolicy(): BackupPolicySnapshot
+    fun setBackupEnabled(enabled: Boolean)
+
+    /** Settings cadence: "manual" | "daily" | "weekly". */
+    fun setBackupFrequency(frequency: String)
+
+    /** On-disk footprint of this account, excluding logs. */
+    fun accountStorageBytes(): Long
+
+    /**
+     * Dry run: what a restore would bring back. Never stages, commits, or opens
+     * the live store, so it is safe to call while chatting.
+     */
+    suspend fun previewAccountBackup(): AccountBackupPreview
+    fun backupIsDue(): Boolean
+    fun recordBackupSuccess(sizeBytes: Long?)
+    fun recordBackupFailure(error: String)
 
     /**
      * After [importIdentity] wipe (or before first connect on restore): try to

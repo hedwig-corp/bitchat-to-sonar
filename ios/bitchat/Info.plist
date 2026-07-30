@@ -72,6 +72,15 @@
 		<string>audio</string>
 		<string>voip</string>
 		<string>remote-notification</string>
+		<string>fetch</string>
+		<!-- BGProcessingTask for the account-backup floor: seal + reconnect +
+		     upload needs more runtime than `fetch` budgets. -->
+		<string>processing</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>sh.hedwig.sonar.auto-backup</string>
+		<string>sh.hedwig.sonar.auto-backup-long</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>

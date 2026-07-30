@@ -4255,7 +4255,12 @@ struct SNComposer: View {
                         .font(SonarTheme.uiFont(size: 12))
                         .foregroundColor(cancelArmed ? SonarTheme.danger : SonarTheme.text3)
                 }
-                .opacity(1 + dragX / 110)
+                // Spelled with explicit `CGFloat`s: the literal form
+                // (`1 + dragX / 110`) is ambiguous to Swift 5 in Xcode 16.4,
+                // which is what CI builds with, while newer toolchains resolve
+                // it. It compiled locally for everyone and broke the first time
+                // anything built the app on the CI toolchain.
+                .opacity(CGFloat(1) + dragX / CGFloat(110))
             }
             .padding(.vertical, 7)
             .padding(.horizontal, 12)
@@ -4605,6 +4610,8 @@ enum SNSettingsTrail {
     case chevron
     case arrowOut
     case toggle(Bool)
+    /// Selected item in a picker sheet (design: `trail="check"`).
+    case check
     case none
 }
 
@@ -4655,6 +4662,9 @@ struct SNSettingsRow: View {
                         .foregroundColor(SonarTheme.text3)
                 case .toggle(let on):
                     SNSwitch(on: on)
+                case .check:
+                    SNIcon(name: .check, size: 16, weight: 2.2)
+                        .foregroundColor(SonarTheme.accent)
                 case .none:
                     EmptyView()
                 }

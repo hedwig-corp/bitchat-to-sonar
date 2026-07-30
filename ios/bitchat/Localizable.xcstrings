@@ -25,6 +25,50 @@
     "Backup chats" : {
 
     },
+    "Chat backup is on \u2014 encrypted backups upload automatically. Manage in Settings." : {
+
+    },
+    "Chat backup" : {
+
+    },
+    "Backing up chats…" : {
+
+    },
+    "Sanity check" : {
+
+    },
+    "Last backup ok" : {
+
+    },
+    "Auto-backup" : {
+
+    },
+    "Encrypted cloud backup when chats change" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Encrypted Marmot backup to Blossom — recovers chats after reinstall with your nsec"
+          }
+        }
+      }
+    },
+    "Last backup %@" : {
+
+    },
+    "Last backup failed" : {
+
+    },
+    "No backup yet" : {
+
+    },
+    "Could not reopen chats after backup — please restart Sonar" : {
+
+    },
+    "Could not update auto-backup setting" : {
+
+    },
     "I understand chats on this phone will be erased" : {
 
     },

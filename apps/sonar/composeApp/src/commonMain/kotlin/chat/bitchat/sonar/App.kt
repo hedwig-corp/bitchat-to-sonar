@@ -382,6 +382,7 @@ internal fun SonarScreenHost(state: SonarAppState) {
             is Screen.SendPayment -> chat.bitchat.sonar.screens.SonarSendPaymentScreen(state)
             is Screen.PaymentStatus ->
                 chat.bitchat.sonar.screens.SonarPaymentStatusScreen(state, sc.activityId)
+            is Screen.Backup -> chat.bitchat.sonar.screens.SonarBackupScreen(state)
         }
         state.toast?.let { ToastBar(it) { state.toast = null } }
     }

@@ -879,6 +879,15 @@ actual object SonarCore {
                 val previousIdentity = DesktopSecrets
                     .get("nsec")
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                // Same guard as Android: re-pasting the signed-in key must not
+                // wipe the store and fall back to whatever Blossom last held.
+                if (!shouldReplaceAccount(previousIdentity?.npub(), identity.npub())) {
+                    sonarLog("Identity", "import matches the current account — keeping local data")
+                    npub = identity.npub()
+                    pubkeyHex = identity.pubkeyHex()
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write npub
+                }
                 closeNode()
                 val marmotDir = marmotDir()
                 try {
@@ -909,19 +918,105 @@ actual object SonarCore {
     }
 
 
-    actual suspend fun backupAccountToBlossom(): String = withContext(Dispatchers.IO) {
-        SonarNativeLoader.ensureLoaded()
-        lock.withLock {
-            stickerOperationLock.write {
-                val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
-                val dir = marmotDir()
-                val dbPath = File(dir, "marmot.sqlite").absolutePath
-                val dbKeyHex = loadOrCreateDbKey()
-                closeNode()
-                val info = uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
-                "uploaded ${info.size} bytes"
+    actual suspend fun backupAccountToBlossom(requireNoLiveUiSession: Boolean): String =
+        withContext(Dispatchers.IO) {
+            try {
+                val sealed = sealAccountBackup(requireNoLiveUiSession)
+                val status = uploadSealedAccountBackup(sealed)
+                runCatching { recordBackupSuccess(sealed.size.toLong()) }
+                status
+            } catch (t: Throwable) {
+                runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                throw t
             }
         }
+
+    actual suspend fun sealAccountBackup(requireNoLiveUiSession: Boolean): ByteArray =
+        withContext(Dispatchers.IO) {
+            // Desktop has no WorkManager UI-session gate; param is ignored.
+            SonarNativeLoader.ensureLoaded()
+            lock.withLock {
+                stickerOperationLock.write {
+                    val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
+                    val dir = marmotDir()
+                    val dbPath = File(dir, "marmot.sqlite").absolutePath
+                    val dbKeyHex = loadOrCreateDbKey()
+                    closeNode()
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
+                }
+            }
+        }
+
+    actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        val nsec = DesktopSecrets.get("nsec") ?: error("no identity to back up")
+        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        "uploaded ${info.size} bytes"
+    }
+
+    private fun marmotDbPath(): String =
+        File(marmotDir(), "marmot.sqlite").absolutePath
+
+    actual fun getBackupPolicy(): BackupPolicySnapshot {
+        SonarNativeLoader.ensureLoaded()
+        val p = uniffi.sonar_ffi.getBackupPolicy(marmotDbPath())
+        return BackupPolicySnapshot(
+            enabled = p.enabled,
+            dirty = p.dirty,
+            lastSuccessAt = p.lastSuccessAt?.toLong(),
+            lastAttemptAt = p.lastAttemptAt?.toLong(),
+            lastError = p.lastError,
+            lastSizeBytes = p.lastSizeBytes?.toLong(),
+            lastMessageCount = p.lastMessageCount?.toLong(),
+            frequency = p.frequency,
+        )
+    }
+
+    actual fun setBackupFrequency(frequency: String) {
+        SonarNativeLoader.ensureLoaded()
+        uniffi.sonar_ffi.setBackupFrequency(marmotDbPath(), frequency)
+    }
+
+    actual fun accountStorageBytes(): Long {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.accountStorageBytes(marmotDbPath()).toLong()
+    }
+
+    actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
+        SonarNativeLoader.ensureLoaded()
+        val nsec = DesktopSecrets.get("nsec") ?: error("no identity to preview")
+        // No lock, no closeNode: the preview never touches the live store. The
+        // DB path only places the scratch copy beside the account data.
+        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, marmotDbPath(), null)
+        AccountBackupPreview(
+            conversations = info.conversations.map {
+                BackupPreviewConversation(it.name, it.latestContent, it.messageCount.toLong())
+            },
+            totalMessages = info.totalMessages.toLong(),
+            sizeBytes = info.sizeBytes.toLong(),
+            uploadedAtSecs = info.uploadedAtSecs.toLong(),
+        )
+    }
+
+    actual fun setBackupEnabled(enabled: Boolean) {
+        SonarNativeLoader.ensureLoaded()
+        uniffi.sonar_ffi.setBackupEnabled(marmotDbPath(), enabled)
+    }
+
+    actual fun backupIsDue(): Boolean {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.backupIsDue(marmotDbPath())
+    }
+
+    actual fun recordBackupSuccess(sizeBytes: Long?) {
+        SonarNativeLoader.ensureLoaded()
+        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
+        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
+    }
+
+    actual fun recordBackupFailure(error: String) {
+        SonarNativeLoader.ensureLoaded()
+        uniffi.sonar_ffi.recordBackupFailure(marmotDbPath(), error)
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {

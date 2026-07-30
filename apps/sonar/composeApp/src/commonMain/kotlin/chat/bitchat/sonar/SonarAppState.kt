@@ -48,7 +48,9 @@ import chat.bitchat.sonar.resources.account_restored_chat_backup_restore
 import chat.bitchat.sonar.resources.account_restored_chats_recovered_from
 import chat.bitchat.sonar.resources.account_restored_chats_start_empty
 import chat.bitchat.sonar.resources.backup_failed_try_again_when_online
+import chat.bitchat.sonar.resources.chat_backup_is_on_encrypted_backups
 import chat.bitchat.sonar.resources.chat_backup_uploaded
+import chat.bitchat.sonar.resources.could_not_reopen_chats_after_backup
 import org.jetbrains.compose.resources.getString
 
 private const val SONAR_DESCRIPTOR_TTL_SECS = 15 * 60L
@@ -357,6 +359,7 @@ sealed interface Screen {
      * Direction D). External payments have no chat thread to report into.
      */
     data class PaymentStatus(val activityId: String) : Screen
+    data object Backup : Screen
 }
 
 /** A BLE-mesh DM conversation row for the home Messages list. */
@@ -982,6 +985,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Gate push invalidation before MeshRadio.stop() — stop notifies the
             // peer listener, which must not re-persist wiped mesh names/links.
             onboarded = false; started = false
+            chat.bitchat.sonar.backup.setLiveUiSessionForAutoBackup(false)
+            chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
+            // Panic wipe must not leave disclosure armed for the next account.
+            SonarCore.saveBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF", "0")
             MeshRadio.stop()
             MeshRadio.setMeshNickname("")
             MeshRadio.discardPendingDeliverySignals()
@@ -3746,6 +3753,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 nick = nickname
                 onboarded = true
                 refreshMeshIdentity()
+                ensureAutoBackupEnabledDefault()
             }
             result.exceptionOrNull()?.let {
                 toast = "Couldn't save your account key. Try again."
@@ -3767,6 +3775,30 @@ class SonarAppState(private val scope: CoroutineScope) {
                         "That key couldn't be imported. Check you pasted the full nsec1... key.",
                         error,
                     )
+                }
+
+                // Pasting the key you are already signed in with is not a
+                // restore. Everything below is destructive — wallet storage,
+                // message store, media, pay ledger, nickname, then the Marmot
+                // database itself — and for the current account it would trade
+                // live chats for whatever Blossom last held, or for nothing at
+                // all if this user never enabled backup.
+                // `npub` is blank until boot completes, and treating that as
+                // "no account" would run every wipe below on an account that
+                // exists on disk. The core-level guard in importIdentity would
+                // still spare the chat database, but wallet storage, the
+                // message store and the media cache would already be gone.
+                // Fall back to the durable key, which does not need the node.
+                val currentNpub = npub.ifBlank {
+                    runCatching { SonarCore.identityNsec() }
+                        .getOrNull()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { stored -> runCatching { SonarCore.validateIdentity(stored) }.getOrNull() }
+                        .orEmpty()
+                }
+                if (!shouldReplaceAccount(currentNpub = currentNpub, incomingNpub = expectedNpub)) {
+                    sonarLog("Identity", "restore: key matches the signed-in account — nothing to do")
+                    return@runCatching
                 }
 
                 // Unregister the old offer while its node is still available, but
@@ -3896,13 +3928,15 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // will not re-fire — boot explicitly. From onboarding, false→true
                 // triggers App.kt's LaunchedEffect; avoid a concurrent double boot.
                 if (needsExplicitBoot) boot()
-                toast = when (SonarCore.lastImportBackupOutcome()) {
+                when (SonarCore.lastImportBackupOutcome()) {
                     AccountBackupRestoreOutcome.Restored ->
-                        getString(Res.string.account_restored_chats_recovered_from)
+                        toast = getString(Res.string.account_restored_chats_recovered_from)
                     AccountBackupRestoreOutcome.Missing ->
-                        getString(Res.string.account_restored_chats_start_empty)
+                        toast = getString(Res.string.account_restored_chats_start_empty)
                     AccountBackupRestoreOutcome.Failed ->
-                        getString(Res.string.account_restored_chat_backup_restore)
+                        toast = getString(Res.string.account_restored_chat_backup_restore)
+                    // Same account re-pasted: nothing was replaced, so say nothing.
+                    AccountBackupRestoreOutcome.Unchanged -> Unit
                 }
             }
             marmotDeliveryGeneration?.let(::resumePendingMarmotPeerDelivery)
@@ -3910,34 +3944,372 @@ class SonarAppState(private val scope: CoroutineScope) {
         }
     }
 
+    var autoBackupEnabled by mutableStateOf(true)
+        private set
+    var autoBackupStatusLine by mutableStateOf("")
+        private set
+    var backupInProgress by mutableStateOf(false)
+        private set
+    private var autoBackupJob: Job? = null
+    private val backupMutex = Mutex()
+
+    companion object {
+        private const val AUTO_BACKUP_DISCLOSED_PREF = "auto_backup_disclosed"
+    }
+
+    /** Upgrades must open Settings (or finish onboarding) before any auto-upload. */
+    fun isAutoBackupDisclosed(): Boolean =
+        SonarCore.loadBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF") == "1"
+
+    fun discloseAutoBackup() {
+        if (isAutoBackupDisclosed()) {
+            chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
+            return
+        }
+        SonarCore.saveBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF", "1")
+        chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
+    }
+
+    /** Whole policy snapshot for the redesigned backup screen (stats + cadence). */
+    var backupPolicy by mutableStateOf<BackupPolicySnapshot?>(null)
+
+    /** Account footprint for Settings → Storage; null until measured. */
+    var storageBytes by mutableStateOf<Long?>(null)
+
+    /**
+     * Measure the account's on-disk size off the UI thread.
+     *
+     * Walks the account directory, so it must never run on the Compose render
+     * path — Settings calls it once on open.
+     */
+    fun refreshStorageBytes() {
+        scope.launch(Dispatchers.Default) {
+            val measured = runCatching { SonarCore.accountStorageBytes() }.getOrNull()
+            if (measured != null) storageBytes = measured
+        }
+    }
+
+    /** Settings cadence: "daily" | "weekly" | "manual". Core owns the mapping. */
+    fun updateBackupFrequency(frequency: String) {
+        discloseAutoBackup()
+        runCatching { SonarCore.setBackupFrequency(frequency) }
+            .onSuccess {
+                refreshBackupPolicy()
+                // Manual only means nothing should be scheduled at the OS level
+                // either — leaving the worker armed would contradict the row.
+                if (frequency == "manual") {
+                    chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
+                } else {
+                    chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
+                }
+            }
+            .onFailure { toast = "Could not change backup frequency" }
+    }
+
+    fun refreshBackupPolicy() {
+        runCatching {
+            val policy = SonarCore.getBackupPolicy()
+            backupPolicy = policy
+            autoBackupEnabled = policy.enabled
+            autoBackupStatusLine = when {
+                policy.lastSuccessAt != null && policy.lastSuccessAt > 0L ->
+                    "Last backup ok"
+                !policy.lastError.isNullOrBlank() -> "Last backup failed"
+                else -> "No backup yet"
+            }
+        }.onFailure {
+            autoBackupStatusLine = "Last backup failed"
+        }
+    }
+
+    fun updateAutoBackupEnabled(enabled: Boolean) {
+        discloseAutoBackup()
+        runCatching { SonarCore.setBackupEnabled(enabled) }
+            .onSuccess { refreshBackupPolicy() }
+            .onFailure { toast = "Could not update auto-backup setting" }
+    }
+
+    /**
+     * Onboarding: user has seen the product; mark disclosure and keep core
+     * default (enabled). Upgrades that skip onboarding are handled by
+     * [discloseAutoBackupForExistingAccountIfNeeded] at startup instead.
+     */
+    fun ensureAutoBackupEnabledDefault() {
+        discloseAutoBackup()
+        refreshBackupPolicy()
+    }
+
+    /**
+     * First start of an account that has never been backed up: disclose and let
+     * the executors run, so the first backup happens on its own.
+     *
+     * Disclosure was only ever marked at onboarding completion, so every
+     * install that upgraded into this feature stayed gated forever — an account
+     * with years of chats and no backup, waiting for a trip to Settings that
+     * most people never make. Finishing onboarding (on any build) is the same
+     * signal the onboarding path already treats as disclosure.
+     *
+     * Runs once: after the first success this returns early, so a user who
+     * later opts out is not re-disclosed. Opt-out lives in `policy.enabled`,
+     * which is independent of disclosure and fail-closed, so this cannot
+     * resurrect backups someone turned off.
+     */
+    fun discloseAutoBackupForExistingAccountIfNeeded() {
+        val policy = backupPolicy
+        val should = shouldDiscloseForFirstBackup(
+            onboarded = onboarded,
+            alreadyDisclosed = isAutoBackupDisclosed(),
+            // A policy we could not read must not be mistaken for "never
+            // backed up"; a readable policy with a null timestamp is exactly
+            // the case to handle.
+            policyReadable = policy != null,
+            lastSuccessAt = policy?.lastSuccessAt,
+        )
+        if (!should) return
+        sonarLog("Backup", "existing account has no backup yet — disclosing so the first one can run")
+        discloseAutoBackup()
+        // Review consensus (glm-5.2 / grok-4.5 / kimi-k3): silently starting to
+        // upload an account that predates the backup feature is a consent
+        // problem even when the payload is sealed. One visible, dismissable
+        // line; the screen it points at has the off switch.
+        scope.launch { toast = getString(Res.string.chat_backup_is_on_encrypted_backups) }
+    }
+
     fun backupAccountNow() {
         scope.launch {
-            val result = runCatching {
-                // Match wipe: cancel AND join so in-flight node FFI cannot race
-                // closeNode + wal_checkpoint(TRUNCATE) during backup.
-                val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
-                pollJob = null
-                relayConnectJob = null
-                housekeepingJob = null
-                marmotWakeJob = null
-                resetStartupFlags()
-                refreshRelayOnline()
-                toJoin.forEach { it.cancel() }
-                toJoin.forEach { job ->
-                    runCatching { withTimeoutOrNull(3_000) { job.join() } }
-                }
-                started = false
-                connecting = false
-                localCoreReady = false
-                SonarCore.backupAccountToBlossom()
+            discloseAutoBackup()
+            if (!backupMutex.tryLock()) {
+                toast = getString(Res.string.backup_failed_try_again_when_online)
+                return@launch
             }
-            // Always reboot — a failed backup must not leave Marmot unreconnected.
-            runCatching { boot() }
-            toast = if (result.isSuccess) {
+            backupInProgress = true
+            val ok = try {
+                performAccountBackupSealReconnectUpload()
+            } finally {
+                backupInProgress = false
+                backupMutex.unlock()
+            }
+            refreshBackupPolicy()
+            toast = if (ok) {
                 getString(Res.string.chat_backup_uploaded)
             } else {
                 getString(Res.string.backup_failed_try_again_when_online)
             }
+        }
+    }
+
+    /**
+     * Seal → soft-reconnect → upload. Upload failures must not re-enter
+     * [ensureMarmotAfterExclusiveSeal] (avoids cold-boot UI flash after a good reopen).
+     * @return true when Blossom upload + policy success recorded.
+     */
+    private suspend fun performAccountBackupSealReconnectUpload(): Boolean {
+        val sealed = runCatching {
+            cancelMarmotJobsForExclusiveBackup()
+            SonarCore.sealAccountBackup()
+        }.onFailure { err ->
+            reopenMarmotAfterSealOrReport()
+            runCatching {
+                SonarCore.recordBackupFailure(err.message ?: "backup failed")
+            }
+        }.getOrNull() ?: return false
+        if (!reopenMarmotAfterSealOrReport()) {
+            runCatching {
+                SonarCore.recordBackupFailure("reconnect failed")
+            }
+            return false
+        }
+        return runCatching {
+            SonarCore.uploadSealedAccountBackup(sealed)
+            SonarCore.recordBackupSuccess(sealed.size.toLong())
+        }.onFailure { err ->
+            runCatching {
+                SonarCore.recordBackupFailure(err.message ?: "backup failed")
+            }
+        }.isSuccess
+    }
+
+    private suspend fun cancelMarmotJobsForExclusiveBackup() {
+        val toJoin = listOfNotNull(pollJob, relayConnectJob, housekeepingJob, marmotWakeJob)
+        pollJob = null
+        relayConnectJob = null
+        housekeepingJob = null
+        marmotWakeJob = null
+        // Both one-shot gates: leaving `localStartupCompleted` set across the
+        // exclusive seal would skip reinstalling the conversation listener when
+        // the node reopens.
+        resetStartupFlags()
+        refreshRelayOnline()
+        toJoin.forEach { it.cancel() }
+        toJoin.forEach { job ->
+            runCatching { withTimeoutOrNull(3_000) { job.join() } }
+        }
+        // Keep `connecting = true` for the whole exclusive seal window so
+        // `boot()` cannot reopen under seal, then skip soft-reconnect.
+        connecting = true
+        started = false
+        localCoreReady = false
+        // Preserve homeMessagesHydrated — see [AccountBackupReconnect].
+        check(!AccountBackupReconnect.clearsHomeMessagesHydrated())
+        check(homeMessagesHydrated) {
+            "exclusive seal must not clear homeMessagesHydrated"
+        }
+    }
+
+    /**
+     * Re-open Marmot after exclusive seal without a cold-boot UI flash.
+     * Unlike [boot], does not clear [homeMessagesHydrated]. Always reopens —
+     * never early-return on raced session flags.
+     */
+    private suspend fun reconnectAfterAccountBackupSeal() {
+        connecting = true
+        localCoreReady = false
+        try {
+            npub = SonarCore.start()
+            SonarCore.saveBlob(NPUB_BLOB_KEY, npub)
+            localCoreReady = true
+            started = true
+            refreshChats()
+            recomputeConversations()
+            poll()
+            requestHousekeeping()
+            // Wake/drain must not wait on relay attach after exclusive seal —
+            // local Marmot usability resumes here (Signal-Comparable).
+            startMarmotWakeLoop()
+            startRelayConnection()
+        } catch (t: Throwable) {
+            toast = "local startup failed: ${t.message}"
+            throw t
+        } finally {
+            connecting = false
+        }
+    }
+
+    /**
+     * Soft-reconnect after exclusive seal; retry once; last resort [boot]
+     * (accepts LocalStateLaunchSurface flash) so the Marmot node is never left
+     * closed when both soft attempts fail.
+     */
+    /**
+     * Reopen after a seal, reporting a total failure instead of swallowing it.
+     *
+     * [ensureMarmotAfterExclusiveSeal] exhausting every attempt leaves the node
+     * closed: chat is dead until the app is restarted. Recording a backup
+     * failure alone is not enough — the user sees a silently broken app and no
+     * reason for it.
+     *
+     * @return true when the node is open again.
+     */
+    private suspend fun reopenMarmotAfterSealOrReport(): Boolean {
+        val reopened = runCatching { ensureMarmotAfterExclusiveSeal() }
+        if (reopened.isFailure) {
+            sonarLog("Backup", "reopen after seal FAILED: ${reopened.exceptionOrNull()?.message}")
+            toast = getString(Res.string.could_not_reopen_chats_after_backup)
+        }
+        return reopened.isSuccess
+    }
+
+    private suspend fun ensureMarmotAfterExclusiveSeal() {
+        try {
+            reconnectAfterAccountBackupSeal()
+            return
+        } catch (first: Throwable) {
+            sonarLog("Backup", "soft reconnect failed: ${first.message}")
+        }
+        started = false
+        connecting = false
+        localCoreReady = false
+        try {
+            reconnectAfterAccountBackupSeal()
+            return
+        } catch (second: Throwable) {
+            sonarLog(
+                "Backup",
+                "soft reconnect retry failed: ${second.message}; falling back to boot()",
+            )
+        }
+        started = false
+        connecting = false
+        localCoreReady = false
+        boot()
+        val opened = withTimeoutOrNull(45_000) {
+            while (connecting || !localCoreReady) {
+                delay(50)
+            }
+            localCoreReady
+        } == true
+        if (!opened) {
+            throw IllegalStateException("Marmot did not reopen after exclusive seal")
+        }
+    }
+
+    private fun scheduleAutoBackupExecutor() {
+        if (autoBackupJob?.isActive == true) return
+        autoBackupJob = scope.launch {
+            delay(45_000)
+            while (isActive) {
+                runAutoBackupIfDue()
+                delay(15 * 60_000L)
+            }
+        }
+    }
+
+    private suspend fun runAutoBackupIfDue() {
+        if (!started || connecting) return
+        // A backup takes the node exclusively: cancel jobs, seal the whole
+        // database, reopen, upload. That is several seconds of frozen chat on a
+        // large account, and doing it inside a session the user is sitting in
+        // reads as the app hanging. The background transition and the
+        // WorkManager jobs both run this same work off the user's path.
+        if (foreground) {
+            sonarLog("Backup", "executor: deferred (app foreground — leaving it to the background paths)")
+            return
+        }
+        // Never exclusive-seal before first local chat-list paint.
+        if (!homeMessagesHydrated) return
+        // Upgrade / silent path: never upload until Settings or onboarding disclosed.
+        if (!isAutoBackupDisclosed()) return
+        val due = runCatching { SonarCore.backupIsDue() }.getOrDefault(false)
+        if (!due) return
+        if (!backupMutex.tryLock()) return
+        try {
+            val enabledBefore = runCatching { SonarCore.getBackupPolicy().enabled }.getOrDefault(false)
+            if (!enabledBefore) return
+            val sealed = runCatching {
+                cancelMarmotJobsForExclusiveBackup()
+                SonarCore.sealAccountBackup()
+            }.onFailure { err ->
+                reopenMarmotAfterSealOrReport()
+                runCatching {
+                    SonarCore.recordBackupFailure(err.message ?: "auto-backup failed")
+                }
+            }.getOrNull() ?: return
+            if (!reopenMarmotAfterSealOrReport()) {
+                runCatching {
+                    SonarCore.recordBackupFailure("auto-backup reconnect failed")
+                }
+                refreshBackupPolicy()
+                return
+            }
+            val stillEnabled = runCatching { SonarCore.getBackupPolicy().enabled }.getOrDefault(false)
+            if (!stillEnabled) {
+                runCatching {
+                    SonarCore.recordBackupFailure("auto-backup aborted — user opted out")
+                }
+                refreshBackupPolicy()
+                return
+            }
+            runCatching {
+                SonarCore.uploadSealedAccountBackup(sealed)
+                SonarCore.recordBackupSuccess(sealed.size.toLong())
+            }.onFailure { err ->
+                runCatching {
+                    SonarCore.recordBackupFailure(err.message ?: "auto-backup failed")
+                }
+            }
+            refreshBackupPolicy()
+        } finally {
+            backupMutex.unlock()
         }
     }
 
@@ -4222,9 +4594,48 @@ class SonarAppState(private val scope: CoroutineScope) {
      * is false on JVM and the desktop root does not install the hook).
      */
     fun onProcessBackgrounded() {
-        if (!RelayConnectionPolicy.shouldInvalidateOnBackground()) return
-        SonarCore.invalidateRelayConnection()
-        refreshRelayOnline()
+        if (RelayConnectionPolicy.shouldInvalidateOnBackground()) {
+            SonarCore.invalidateRelayConnection()
+            refreshRelayOnline()
+        }
+        runOpportunisticBackupOnBackground()
+    }
+
+    /**
+     * Opportunistic backup at the background transition: fresh chats must not
+     * wait for the daily floor or the 12-hour periodic job to be safe.
+     *
+     * In-process attempt first — this session owns the gate, so the seal is as
+     * safe here as behind the manual path — plus a one-shot WorkManager
+     * fallback for the process being killed before the attempt lands. Both
+     * halves re-check `backup_is_due`, so at most one of them uploads.
+     */
+    private fun runOpportunisticBackupOnBackground() {
+        if (!isAutoBackupDisclosed() || !autoBackupEnabled) {
+            sonarLog("Backup", "opportunistic: skipped (disclosed=${isAutoBackupDisclosed()} enabled=$autoBackupEnabled)")
+            return
+        }
+        chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()
+        scope.launch {
+            val due = runCatching {
+                withContext(Dispatchers.Default) { SonarCore.backupIsDue() }
+            }.getOrElse { err ->
+                sonarLog("Backup", "opportunistic: due check failed: ${err.message}")
+                false
+            }
+            sonarLog("Backup", "opportunistic: due=$due")
+            if (!due) return@launch
+            if (!backupMutex.tryLock()) return@launch
+            backupInProgress = true
+            val ok = try {
+                performAccountBackupSealReconnectUpload()
+            } finally {
+                backupInProgress = false
+                backupMutex.unlock()
+            }
+            refreshBackupPolicy()
+            if (ok) sonarLog("Backup", "opportunistic background backup uploaded")
+        }
     }
 
     fun requestImmediateSync() {
@@ -4938,6 +5349,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun boot() {
         if (started || connecting) return
         connecting = true
+        // Raise before any suspend/`start()` so WorkManager cannot seal under
+        // a booting UI session (check-then-act TOCTOU).
+        chat.bitchat.sonar.backup.setLiveUiSessionForAutoBackup(true)
         resetStartupFlags()
         refreshRelayOnline()
         homeMessagesHydrated = false
@@ -4980,8 +5394,16 @@ class SonarAppState(private val scope: CoroutineScope) {
                 requestHousekeeping()
                 launch { ensureCallStarted() }
                 startRelayConnection()
+                scheduleAutoBackupExecutor()
+                refreshBackupPolicy()
+                discloseAutoBackupForExistingAccountIfNeeded()
+                if (isAutoBackupDisclosed()) {
+                    chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
+                }
             } catch (t: Throwable) {
                 toast = "local startup failed: ${t.message}"
+                // Boot failed — allow OS worker again; UI does not own Marmot.
+                chat.bitchat.sonar.backup.setLiveUiSessionForAutoBackup(false)
             } finally {
                 // If the encrypted DB itself failed to open, reveal the metadata
                 // snapshot instead of leaving the launch surface visible.

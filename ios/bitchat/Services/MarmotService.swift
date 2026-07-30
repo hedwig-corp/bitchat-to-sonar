@@ -30,6 +30,10 @@ enum AccountBackupRestoreOutcome: Equatable, Sendable {
     case restored
     case missing
     case failed
+    /// The pasted key is the one already signed in — nothing was wiped,
+    /// downloaded, or replaced. Distinct from `restored`: there is no backup
+    /// involved and no toast to show, because nothing happened.
+    case unchanged
 }
 
 final class MarmotService: @unchecked Sendable {
@@ -1579,16 +1583,12 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    /// Signal-style encrypted chat backup: close the node, seal DB+key with the
-    /// account nsec, upload to Blossom. Caller reconnects afterward.
-    ///
-    /// The UniFFI entrypoint is synchronous (`runtime.block_on` for seal + HTTP).
-    /// It must never run on the MainActor — Settings → Backup chats is invoked
-    /// from `@MainActor MarmotChatModel`, and parking UI for a multi‑MB upload
-    /// freezes the tap with no toast until the call returns (or the OS kills us).
-    /// Compose already hops to `Dispatchers.IO`; mirror that here.
-    @discardableResult
-    func uploadAccountBackup(blossomServer: String? = nil) async throws -> AccountBackupUploadInfo {
+    /// Close the node and seal DB+key (exclusive access). Clears the close
+    /// fence so the caller can reconnect before uploading — chat must not wait
+    /// on the Blossom RTT. Seal (checkpoint + AEAD) runs off the main actor
+    /// via `runAccountBackupHostWork` / `runAccountBackupFFI` (Compose hops to
+    /// `Dispatchers.IO`; mirror that here).
+    func prepareSealedAccountBackup() async throws -> (nsec: String, dbPath: String, sealed: Data) {
         accountBackupLock.lock()
         if accountBackupInFlight {
             accountBackupLock.unlock()
@@ -1605,27 +1605,181 @@ final class MarmotService: @unchecked Sendable {
         guard let nsec = snapshotIdentity()?.nsec() else {
             throw ServiceError.core("no identity to back up")
         }
-        // Close before databaseConfig: that path runs restore reconcile/rename
-        // and must not race a live SQLCipher handle.
+
+        // Hold the cross-process store lock across close+seal. The Notification
+        // Service Extension is a SEPARATE PROCESS that tries this same lock
+        // non-blocking and hydrates the store when it wins; if nothing holds it
+        // between `closeNode` and the end of the seal it can write the SQLCipher
+        // files while we checkpoint(TRUNCATE) + read them, capturing a torn
+        // database. Pluck the existing hold off `storeLock` (under `nodeLock`)
+        // WITHOUT releasing it so `closeNode` below sees `storeLock == nil` and
+        // leaves it alone; take a fresh one when no node was open.
+        #if os(iOS)
+        let sealStoreLock: MarmotStoreLock = try await run { service -> MarmotStoreLock in
+            service.nodeLock.lock()
+            defer { service.nodeLock.unlock() }
+            if let held = service.storeLock {
+                service.storeLock = nil
+                return held
+            }
+            return try MarmotStoreLock.acquireExclusive()
+        }
+        #endif
+
         await closeNode(keepClosed: true)
-        // Keychain/fs reconcile must not block MainActor — host hop (no mapFfi).
         do {
             let config = try await runAccountBackupHostWork {
                 try Self.databaseConfig()
             }
-            let info = try await runAccountBackupFFI {
-                try backupAccountToBlossom(
+            let sealed = try await runAccountBackupFFI {
+                try sealAccountBackup(
                     nsec: nsec,
                     dbPath: config.0,
-                    dbKeyHex: config.1,
-                    blossomServer: blossomServer
+                    dbKeyHex: config.1
                 )
             }
+            // Release BEFORE clearing the fence: once `nodeClosing` drops,
+            // reconnect runs `prepareStoreLockForConnectSync`, which on Darwin
+            // takes a second LOCK_EX on a DIFFERENT fd in this same process —
+            // that conflicts (EWOULDBLOCK) with a seal lock still held here and
+            // would leave the Marmot store permanently closed.
+            #if os(iOS)
+            sealStoreLock.release()
+            #endif
             await clearNodeClosingFence()
-            return info
+            return (nsec, config.0, sealed)
         } catch {
+            #if os(iOS)
+            sealStoreLock.release()
+            #endif
             await clearNodeClosingFence()
             throw error
+        }
+    }
+
+    /// Upload already-sealed ciphertext. Does not need a closed node.
+    /// Runs off the main queue so Blossom RTT cannot freeze SwiftUI.
+    @discardableResult
+    func pushSealedAccountBackup(
+        nsec: String,
+        sealed: Data,
+        blossomServer: String? = nil
+    ) async throws -> AccountBackupUploadInfo {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let info = try uploadSealedAccountBackup(
+                        nsec: nsec,
+                        sealed: sealed,
+                        blossomServer: blossomServer
+                    )
+                    continuation.resume(returning: info)
+                } catch let error as SonarFfiError {
+                    continuation.resume(throwing: Self.mapFfi(error))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Legacy one-shot seal+upload while the node stays closed (blocks until
+    /// Blossom returns). Prefer prepare → reconnect → push for auto-backup.
+    @discardableResult
+    func uploadAccountBackup(blossomServer: String? = nil) async throws -> AccountBackupUploadInfo {
+        let sealedBundle = try await prepareSealedAccountBackup()
+        return try await pushSealedAccountBackup(
+            nsec: sealedBundle.nsec,
+            sealed: sealedBundle.sealed,
+            blossomServer: blossomServer
+        )
+    }
+
+    func loadBackupPolicy() throws -> BackupPolicyInfo {
+        let (dbPath, _) = try Self.databaseConfig()
+        return getBackupPolicy(dbPath: dbPath)
+    }
+
+    func updateBackupEnabled(_ enabled: Bool) throws {
+        let (dbPath, _) = try Self.databaseConfig()
+        do {
+            try setBackupEnabled(dbPath: dbPath, enabled: enabled)
+        } catch let error as SonarFfiError {
+            throw Self.mapFfi(error)
+        }
+    }
+
+    /// On-disk footprint of this account (DB, index, sidecars, media, stickers;
+    /// logs excluded). Static + off-actor: it walks the directory, so it must
+    /// not run on a render pass.
+    static func accountStorageBytesOnDisk() throws -> UInt64 {
+        let (dbPath, _) = try Self.databaseConfig()
+        return accountStorageBytes(dbPath: dbPath)
+    }
+
+    /// Dry run: what a restore would bring back. The core call never stages,
+    /// commits, or opens the live store, so no lock and no closeNode here —
+    /// safe to run while chatting. Named `previewBackup` (not the FFI's
+    /// `previewAccountBackup`) so the member cannot shadow the global and
+    /// recurse.
+    func previewBackup() async throws -> AccountBackupPreviewInfo {
+        guard let nsec = snapshotIdentity()?.nsec() else {
+            throw ServiceError.core("no identity to preview")
+        }
+        // Passed only to place the scratch copy in app-private storage; the
+        // core never reads or writes this file during a preview.
+        let (dbPath, _) = try Self.databaseConfig()
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    continuation.resume(
+                        returning: try previewAccountBackup(
+                            nsec: nsec,
+                            dbPath: dbPath,
+                            blossomServer: nil
+                        )
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Settings cadence: "manual" | "daily" | "weekly".
+    func updateBackupFrequency(_ frequency: String) throws {
+        let (dbPath, _) = try Self.databaseConfig()
+        do {
+            try setBackupFrequency(dbPath: dbPath, frequency: frequency)
+        } catch let error as SonarFfiError {
+            throw Self.mapFfi(error)
+        }
+    }
+
+    func isBackupDue() throws -> Bool {
+        let (dbPath, _) = try Self.databaseConfig()
+        return backupIsDue(dbPath: dbPath)
+    }
+
+    /// Record a successful upload. [sizeBytes] is the sealed blob's size — the
+    /// Settings stats strip describes what was uploaded, so it comes from the
+    /// bytes we actually pushed rather than a later measurement of a DB that has
+    /// moved on.
+    func noteBackupSuccess(sizeBytes: UInt64? = nil) throws {
+        let (dbPath, dbKeyHex) = try Self.databaseConfig()
+        do {
+            try recordBackupSuccess(dbPath: dbPath, sizeBytes: sizeBytes, dbKeyHex: dbKeyHex)
+        } catch let error as SonarFfiError {
+            throw Self.mapFfi(error)
+        }
+    }
+
+    func noteBackupFailure(_ message: String) throws {
+        let (dbPath, _) = try Self.databaseConfig()
+        do {
+            try recordBackupFailure(dbPath: dbPath, error: message)
+        } catch let error as SonarFfiError {
+            throw Self.mapFfi(error)
         }
     }
 

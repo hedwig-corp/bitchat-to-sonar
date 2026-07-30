@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import chat.bitchat.sonar.BackupFormat
 import chat.bitchat.sonar.Screen
 import chat.bitchat.sonar.SonarAccountRestoreException
 import chat.bitchat.sonar.SonarAppState
@@ -75,7 +76,9 @@ import chat.bitchat.sonar.Notifier
 import chat.bitchat.sonar.resources.Res
 import chat.bitchat.sonar.resources.backup_chats
 import chat.bitchat.sonar.resources.cancel
+import chat.bitchat.sonar.resources.chat_backup
 import chat.bitchat.sonar.resources.encrypted_cloud_backup_recover_chats
+import chat.bitchat.sonar.resources.encrypted_cloud_backup_when_chats_change
 import chat.bitchat.sonar.resources.i_understand_chats_on_this_phone_will
 import chat.bitchat.sonar.resources.paste_from_clipboard
 import chat.bitchat.sonar.resources.replace_this_account_with_an_nsec_from
@@ -105,9 +108,14 @@ fun SonarSettingsScreen(state: SonarAppState) {
     var appicon by remember { mutableStateOf(false) }
     var requests by remember { mutableStateOf(false) }
     var diagnostics by remember { mutableStateOf(false) }
+    var dataUsage by remember { mutableStateOf(false) }
     var transcriptSpikeB by remember { mutableStateOf(false) }
     var transcriptPolicyHost by remember { mutableStateOf(false) }
     state.prefsVersion // subscribe so toggles recompose
+    LaunchedEffect(Unit) {
+        state.refreshBackupPolicy()
+        state.refreshStorageBytes()
+    }
 
     val balance = (state.walletState as? WalletState.Ready)?.balanceSats ?: 0L
     val iconLabel = when (state.prefStr("icon", "cyan")) {
@@ -229,12 +237,6 @@ fun SonarSettingsScreen(state: SonarAppState) {
                     icon = { SNXIcon(SNXIconName.ImportKey, 18.dp, it) },
                 ) { exportKey = true }
                 SNXSettingsRow(
-                    label = stringResource(Res.string.backup_chats),
-                    sub = stringResource(Res.string.encrypted_cloud_backup_recover_chats),
-                    chevron = true,
-                    icon = { SNXIcon(SNXIconName.ShieldCheck, 18.dp, it) },
-                ) { state.backupAccountNow() }
-                SNXSettingsRow(
                     label = stringResource(Res.string.restore_account),
                     sub = stringResource(Res.string.replace_this_account_with_an_nsec_from),
                     chevron = true,
@@ -254,9 +256,25 @@ fun SonarSettingsScreen(state: SonarAppState) {
 
             SNSectionLabel("Data & storage")
             SNSettingsCard {
-                SNXSettingsRow(
-                    label = "Storage", value = "Local only",
-                    icon = { SNXIcon(SNXIconName.Drive, 18.dp, it) },
+                // Design order: Chat backup, Storage, Data usage.
+                SNSettingsRow(
+                    icon = SNIconName.ShieldCheck, tone = SNTone.Cyan, label = "Chat backup",
+                    sub = if (state.autoBackupEnabled) {
+                        val last = BackupFormat.lastBackup(
+                            state.backupPolicy?.lastSuccessAt,
+                            SonarClock.nowSecs(),
+                        )
+                        if (last != null) "On · last backup $last" else "On"
+                    } else {
+                        "Off"
+                    },
+                    value = if (state.autoBackupEnabled) null else "Set up",
+                ) { state.push(Screen.Backup) }
+                SNSettingsRow(
+                    icon = SNIconName.Drive, label = "Storage",
+                    // Real measurement, not the prototype's 124 MB — a dash until
+                    // it lands rather than a confident zero.
+                    value = BackupFormat.bytes(state.storageBytes) ?: "—",
                 ) {}
                 // Desktop-only: no GPS sensor, so offer opt-in IP geolocation to
                 // populate the "Around you" geohash channels. Hidden on mobile
@@ -275,9 +293,9 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 SNXSettingsRow(
                     label = "Data usage",
                     value = if (state.prefBool("wifiOnly")) "Wi-Fi only" else "Always",
-                    toggle = state.prefBool("wifiOnly"), divider = false,
+                    chevron = true, divider = false,
                     icon = { SNXIcon(SNXIconName.Data, 18.dp, it) },
-                ) { state.togglePref("wifiOnly") }
+                ) { dataUsage = true }
             }
 
             if (sonarTranscriptSpikeBEntryVisible || sonarTranscriptPolicyHostEntryVisible) {
@@ -331,6 +349,7 @@ fun SonarSettingsScreen(state: SonarAppState) {
         onPick = { state.selectCurrency(it); currencyPick = false },
         onClose = { currencyPick = false },
     )
+    if (dataUsage) DataUsageSheet(state) { dataUsage = false }
     if (notif) NotifSheet(state) { notif = false }
     if (appicon) AppIconSheet(state) { appicon = false }
     if (requests) RequestsSheet { requests = false }
@@ -813,6 +832,32 @@ private fun DiagnosticsSheet(state: SonarAppState, onClose: () -> Unit) {
 private val CURRENCY_NAMES = mapOf(
     "EUR" to "Euro", "USD" to "US Dollar", "GBP" to "British Pound", "CHF" to "Swiss Franc",
 )
+
+/**
+ * Data usage picker. The design renders this as a value row with a chevron, so
+ * the choice lives in a sheet rather than an inline toggle.
+ */
+@Composable
+private fun DataUsageSheet(state: SonarAppState, onClose: () -> Unit) {
+    val s = sonar
+    val wifiOnly = state.prefBool("wifiOnly")
+    Sheet("Data usage", onClose) {
+        listOf(true to "Wi-Fi only", false to "Always").forEach { (value, label) ->
+            SNXSettingsRow(
+                label = label,
+                sub = if (value) "Large media waits for Wi-Fi" else "Use mobile data too",
+                divider = value,
+                trailing = if (value == wifiOnly) {
+                    { SNIcon(SNIconName.Check, 16.dp, s.accent, weight = 2.2f) }
+                } else null,
+                icon = { SNXIcon(SNXIconName.Data, 18.dp, it) },
+            ) {
+                if (value != wifiOnly) state.togglePref("wifiOnly")
+                onClose()
+            }
+        }
+    }
+}
 
 @Composable
 private fun CurrencySheet(selected: FiatCurrency, onPick: (FiatCurrency) -> Unit, onClose: () -> Unit) {

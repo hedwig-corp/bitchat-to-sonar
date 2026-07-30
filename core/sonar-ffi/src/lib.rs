@@ -145,11 +145,166 @@ fn backup_runtime() -> FfiResult<tokio::runtime::Runtime> {
         .map_err(|e| SonarFfiError::Core(format!("tokio runtime: {e}")))
 }
 
+/// Auto-backup policy snapshot for Settings / host executors.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct BackupPolicyInfo {
+    pub enabled: bool,
+    pub dirty: bool,
+    pub last_success_at: Option<u64>,
+    pub last_attempt_at: Option<u64>,
+    pub last_error: Option<String>,
+    pub opportunistic_debounce_secs: u64,
+    pub daily_interval_secs: u64,
+    /// Sealed size of the last successful upload. `None` until one succeeds —
+    /// hosts render a dash, never a fabricated number.
+    pub last_size_bytes: Option<u64>,
+    pub last_message_count: Option<u64>,
+    /// "manual" | "daily" | "weekly", derived from enabled + interval.
+    pub frequency: String,
+}
+
+fn policy_info(p: sonar_core::account_backup::BackupPolicy) -> BackupPolicyInfo {
+    // Derive before destructuring: `from_policy` borrows, and moving
+    // `last_error` out first would poison the borrow.
+    let frequency = match sonar_core::account_backup::BackupFrequency::from_policy(&p) {
+        sonar_core::account_backup::BackupFrequency::Manual => "manual".to_string(),
+        sonar_core::account_backup::BackupFrequency::Daily => "daily".to_string(),
+        sonar_core::account_backup::BackupFrequency::Weekly => "weekly".to_string(),
+    };
+    BackupPolicyInfo {
+        enabled: p.enabled,
+        dirty: p.dirty,
+        last_success_at: p.last_success_at,
+        last_attempt_at: p.last_attempt_at,
+        last_error: p.last_error,
+        opportunistic_debounce_secs: p.opportunistic_debounce_secs,
+        daily_interval_secs: p.daily_interval_secs,
+        last_size_bytes: p.last_size_bytes,
+        last_message_count: p.last_message_count,
+        frequency,
+    }
+}
+
+#[uniffi::export]
+pub fn get_backup_policy(db_path: String) -> BackupPolicyInfo {
+    policy_info(sonar_core::account_backup::load_backup_policy(Path::new(
+        &db_path,
+    )))
+}
+
+#[uniffi::export]
+pub fn set_backup_enabled(db_path: String, enabled: bool) -> FfiResult<()> {
+    sonar_core::account_backup::set_backup_enabled(Path::new(&db_path), enabled)?;
+    Ok(())
+}
+
+/// Persist on-by-default only when the policy sidecar is missing. Safe to call
+/// from onboarding — never overwrites an existing opt-out or fail-closed file.
+#[uniffi::export]
+pub fn ensure_backup_policy_default(db_path: String) -> FfiResult<()> {
+    sonar_core::account_backup::ensure_backup_policy_default(Path::new(&db_path))?;
+    Ok(())
+}
+
+#[uniffi::export]
+pub fn backup_is_due(db_path: String) -> bool {
+    sonar_core::account_backup::backup_is_due_now(Path::new(&db_path))
+}
+
+#[uniffi::export]
+pub fn mark_backup_dirty(db_path: String) {
+    sonar_core::account_backup::mark_backup_dirty(Path::new(&db_path));
+}
+
+#[uniffi::export]
+pub fn record_backup_success(
+    db_path: String,
+    size_bytes: Option<u64>,
+    db_key_hex: Option<String>,
+) -> FfiResult<()> {
+    sonar_core::account_backup::record_backup_success(
+        Path::new(&db_path),
+        size_bytes,
+        db_key_hex.as_deref(),
+    )?;
+    Ok(())
+}
+
+/// On-disk footprint of this account (DB + index + sidecars + media + stickers,
+/// excluding logs) for the Settings "Storage" row.
+#[uniffi::export]
+pub fn account_storage_bytes(db_path: String) -> u64 {
+    sonar_core::account_backup::account_storage_bytes(Path::new(&db_path))
+}
+
+/// Settings cadence: "manual" | "daily" | "weekly". Unknown values are refused
+/// rather than silently defaulting — a typo must not quietly disable backups.
+#[uniffi::export]
+pub fn set_backup_frequency(db_path: String, frequency: String) -> FfiResult<()> {
+    let parsed = match frequency.as_str() {
+        "manual" => sonar_core::account_backup::BackupFrequency::Manual,
+        "daily" => sonar_core::account_backup::BackupFrequency::Daily,
+        "weekly" => sonar_core::account_backup::BackupFrequency::Weekly,
+        other => {
+            return Err(SonarFfiError::InvalidInput(format!(
+                "unknown backup frequency: {other}"
+            )))
+        }
+    };
+    sonar_core::account_backup::set_backup_frequency(Path::new(&db_path), parsed)?;
+    Ok(())
+}
+
+#[uniffi::export]
+pub fn record_backup_failure(db_path: String, error: String) -> FfiResult<()> {
+    sonar_core::account_backup::record_backup_failure(Path::new(&db_path), &error)?;
+    Ok(())
+}
+
+/// Seal only (exclusive DB access). Hosts should reopen the node, then call
+/// [`upload_sealed_account_backup`] so chat is not blocked on Blossom upload.
+#[uniffi::export]
+pub fn seal_account_backup(
+    nsec: String,
+    db_path: String,
+    db_key_hex: String,
+) -> FfiResult<Vec<u8>> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    Ok(sonar_core::account_backup::seal_account_backup_files(
+        identity.keys(),
+        Path::new(&db_path),
+        &db_key_hex,
+    )?)
+}
+
+/// Upload already-sealed ciphertext. Does **not** need a closed SonarNode.
+#[uniffi::export]
+pub fn upload_sealed_account_backup(
+    nsec: String,
+    sealed: Vec<u8>,
+    blossom_server: Option<String>,
+) -> FfiResult<AccountBackupUploadInfo> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    let server = blossom_server.unwrap_or_default();
+    let runtime = backup_runtime()?;
+    let uploaded = runtime.block_on(sonar_core::account_backup::upload_sealed_backup(
+        identity.keys(),
+        &server,
+        sealed,
+    ))?;
+    Ok(AccountBackupUploadInfo {
+        url: uploaded.url,
+        sha256_hex: uploaded.sha256_hex,
+        size: uploaded.size,
+    })
+}
+
 /// Encrypt the Marmot DB at `db_path` (plus conversation index) with a key
 /// derived from `nsec`, then upload to Blossom (BUD-02).
 ///
 /// Call with **no** live `SonarNode` holding `db_path` (checkpoint/close first).
 /// Empty `blossom_server` uses the default Blossom host.
+/// Prefer seal → reconnect → [`upload_sealed_account_backup`] for auto-backup.
 #[uniffi::export]
 pub fn backup_account_to_blossom(
     nsec: String,
@@ -170,6 +325,62 @@ pub fn backup_account_to_blossom(
         url: uploaded.url,
         sha256_hex: uploaded.sha256_hex,
         size: uploaded.size,
+    })
+}
+
+/// One conversation inside a sealed backup, for the dry-run preview.
+#[derive(uniffi::Record)]
+pub struct BackupPreviewConversationInfo {
+    pub name: String,
+    pub latest_content: String,
+    pub message_count: u64,
+}
+
+/// What restoring the latest backup would recover.
+#[derive(uniffi::Record)]
+pub struct AccountBackupPreviewInfo {
+    pub conversations: Vec<BackupPreviewConversationInfo>,
+    pub total_messages: u64,
+    pub size_bytes: u64,
+    pub uploaded_at_secs: u64,
+}
+
+/// Dry run: report what a restore would bring back, changing nothing.
+///
+/// Never stages or commits, and never opens the live store — it decrypts in
+/// memory and reads only the conversation index from a scratch copy that is
+/// deleted before returning. Safe to call with the node open.
+///
+/// `db_path` is neither read nor written; its directory is the scratch parent.
+/// Hosts must pass the real DB path — the process temp dir is unusable on
+/// Android, so a preview scratched there fails on every device.
+#[uniffi::export]
+pub fn preview_account_backup(
+    nsec: String,
+    db_path: String,
+    blossom_server: Option<String>,
+) -> FfiResult<AccountBackupPreviewInfo> {
+    let identity = Identity::import(nsec.trim()).map_err(invalid("nsec"))?;
+    let server = blossom_server.unwrap_or_default();
+    let runtime = backup_runtime()?;
+    let preview = runtime.block_on(sonar_core::account_backup::preview_account_backup(
+        identity.keys(),
+        Path::new(&db_path),
+        &server,
+    ))?;
+    Ok(AccountBackupPreviewInfo {
+        conversations: preview
+            .conversations
+            .into_iter()
+            .map(|c| BackupPreviewConversationInfo {
+                name: c.name,
+                latest_content: c.latest_content,
+                message_count: c.message_count,
+            })
+            .collect(),
+        total_messages: preview.total_messages,
+        size_bytes: preview.size_bytes,
+        uploaded_at_secs: preview.uploaded_at_secs,
     })
 }
 

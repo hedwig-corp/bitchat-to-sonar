@@ -889,6 +889,18 @@ actual object SonarCore {
                 val previousIdentity = AndroidSecrets
                     .getMigrating("nsec", durable = true)
                     ?.let { saved -> runCatching { SonarIdentity.import(saved) }.getOrNull() }
+                // Re-pasting the key you are already signed in with must be a
+                // no-op. The path below wipes the store and restores from
+                // Blossom: for the same account that trades a live database for
+                // whatever was last uploaded, and for anyone who never enabled
+                // backup it destroys every chat with nothing to restore.
+                if (!shouldReplaceAccount(previousIdentity?.npub(), identity.npub())) {
+                    sonarLog("Identity", "import matches the current account — keeping local data")
+                    npub = identity.npub()
+                    pubkeyHex = identity.pubkeyHex()
+                    lastImportBackupOutcomeValue = AccountBackupRestoreOutcome.Unchanged
+                    return@write npub
+                }
                 closeNode()
                 val marmotDir = File(ctx.filesDir, "sonar-marmot")
                 try {
@@ -919,20 +931,113 @@ actual object SonarCore {
     }
 
 
-    actual suspend fun backupAccountToBlossom(): String = withContext(Dispatchers.IO) {
-        lock.withLock {
-            stickerOperationLock.write {
-                val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
-                    ?: error("no identity to back up")
-                val marmotDir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
-                val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
-                val dbKeyHex = loadOrCreateDbKey()
-                // UniFFI close — nulling `node` alone leaves SQLCipher open.
-                closeNode()
-                val info = uniffi.sonar_ffi.backupAccountToBlossom(nsec, dbPath, dbKeyHex, null)
-                "uploaded ${info.size} bytes"
+    actual suspend fun backupAccountToBlossom(requireNoLiveUiSession: Boolean): String =
+        withContext(Dispatchers.IO) {
+            // Symmetric with the restore path: a backup that silently fails to
+            // upload is indistinguishable from one that was never taken, and
+            // the user only learns which when they try to restore.
+            sonarLog("Backup", "upload: sealing and uploading account backup")
+            try {
+                val sealed = sealAccountBackup(requireNoLiveUiSession)
+                val status = uploadSealedAccountBackup(sealed)
+                runCatching { recordBackupSuccess(sealed.size.toLong()) }
+                status
+            } catch (t: Throwable) {
+                sonarLog("Backup", "upload FAILED: ${t.message}")
+                runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                throw t
             }
         }
+
+    actual suspend fun sealAccountBackup(requireNoLiveUiSession: Boolean): ByteArray =
+        withContext(Dispatchers.IO) {
+            lock.withLock {
+                stickerOperationLock.write {
+                    if (requireNoLiveUiSession &&
+                        chat.bitchat.sonar.backup.MarmotSessionGate.isLiveUiSession()
+                    ) {
+                        throw chat.bitchat.sonar.backup.LiveUiSessionActiveException()
+                    }
+                    val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+                        ?: error("no identity to back up")
+                    val marmotDir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
+                    val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
+                    val dbKeyHex = loadOrCreateDbKey()
+                    closeNode()
+                    uniffi.sonar_ffi.sealAccountBackup(nsec, dbPath, dbKeyHex)
+                }
+            }
+        }
+
+    actual suspend fun uploadSealedAccountBackup(sealed: ByteArray): String = withContext(Dispatchers.IO) {
+        val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+            ?: error("no identity to back up")
+        val info = uniffi.sonar_ffi.uploadSealedAccountBackup(nsec, sealed, null)
+        // Blob sha prefix, not the URL: Diagnostics → Share exports this log
+        // (#176), and the full URL is a direct fetch handle to the user's
+        // backup ciphertext.
+        sonarLog("Backup", "upload OK: ${info.size} bytes (${info.sha256Hex.take(12)}…)")
+        "uploaded ${info.size} bytes"
+    }
+
+    private fun marmotDbPath(): String {
+        val marmotDir = File(ctx.filesDir, "sonar-marmot").apply { mkdirs() }
+        return File(marmotDir, "marmot.sqlite").absolutePath
+    }
+
+    actual fun getBackupPolicy(): BackupPolicySnapshot {
+        val p = uniffi.sonar_ffi.getBackupPolicy(marmotDbPath())
+        return BackupPolicySnapshot(
+            enabled = p.enabled,
+            dirty = p.dirty,
+            lastSuccessAt = p.lastSuccessAt?.toLong(),
+            lastAttemptAt = p.lastAttemptAt?.toLong(),
+            lastError = p.lastError,
+            lastSizeBytes = p.lastSizeBytes?.toLong(),
+            lastMessageCount = p.lastMessageCount?.toLong(),
+            frequency = p.frequency,
+        )
+    }
+
+    actual fun setBackupFrequency(frequency: String) {
+        uniffi.sonar_ffi.setBackupFrequency(marmotDbPath(), frequency)
+    }
+
+    actual fun accountStorageBytes(): Long =
+        uniffi.sonar_ffi.accountStorageBytes(marmotDbPath()).toLong()
+
+    actual suspend fun previewAccountBackup(): AccountBackupPreview = withContext(Dispatchers.IO) {
+        val nsec = AndroidSecrets.getMigrating("nsec", durable = true)
+            ?: error("no identity to preview")
+        // No lock, no closeNode: the preview never touches the live store. The
+        // DB path is passed only so the scratch copy lands in app-private
+        // storage — Android app processes have no usable process temp dir.
+        val info = uniffi.sonar_ffi.previewAccountBackup(nsec, marmotDbPath(), null)
+        AccountBackupPreview(
+            conversations = info.conversations.map {
+                BackupPreviewConversation(it.name, it.latestContent, it.messageCount.toLong())
+            },
+            totalMessages = info.totalMessages.toLong(),
+            sizeBytes = info.sizeBytes.toLong(),
+            uploadedAtSecs = info.uploadedAtSecs.toLong(),
+        )
+    }
+
+    actual fun setBackupEnabled(enabled: Boolean) {
+        uniffi.sonar_ffi.setBackupEnabled(marmotDbPath(), enabled)
+    }
+
+    actual fun backupIsDue(): Boolean = uniffi.sonar_ffi.backupIsDue(marmotDbPath())
+
+    actual fun recordBackupSuccess(sizeBytes: Long?) {
+        // The key never touches disk outside the Keystore-encrypted prefs; the
+        // core needs it transiently to count messages in the SQLCipher index.
+        val dbKeyHex = runCatching { loadOrCreateDbKey() }.getOrNull()
+        uniffi.sonar_ffi.recordBackupSuccess(marmotDbPath(), sizeBytes?.toULong(), dbKeyHex)
+    }
+
+    actual fun recordBackupFailure(error: String) {
+        uniffi.sonar_ffi.recordBackupFailure(marmotDbPath(), error)
     }
 
     actual suspend fun tryRestoreAccountBackup(): AccountBackupRestoreOutcome = withContext(Dispatchers.IO) {
@@ -955,8 +1060,10 @@ actual object SonarCore {
         val dbPath = File(marmotDir, "marmot.sqlite").absolutePath
         closeNode()
         return try {
+            sonarLog("Backup", "restore: fetching account backup from Blossom")
             val dbKeyHex = uniffi.sonar_ffi.restoreAccountFromBlossom(identity.nsec(), dbPath, null)
             require(dbKeyHex.matches(Regex("^[0-9a-fA-F]{64}$"))) { "restored db key malformed" }
+            sonarLog("Backup", "restore: backup staged, committing")
             try {
                 AndroidSecrets.put("dbKeyHex", dbKeyHex, durable = true)
                 uniffi.sonar_ffi.commitAccountRestore(dbPath)
@@ -974,8 +1081,13 @@ actual object SonarCore {
             // Identity restore still proceeds with a fresh empty DB.
             val msg = e.message.orEmpty()
             if (uniffi.sonar_ffi.isMissingAccountBackupError(msg)) {
+                sonarLog("Backup", "restore: no backup on server for this account")
                 AccountBackupRestoreOutcome.Missing
             } else {
+                // Without this the host shows "chat backup restore failed" and
+                // the reason — HTTP status, decrypt failure, malformed key —
+                // is discarded, leaving a data-recovery path undebuggable.
+                sonarLog("Backup", "restore FAILED: $msg")
                 AccountBackupRestoreOutcome.Failed
             }
         }

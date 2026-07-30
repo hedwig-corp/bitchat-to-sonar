@@ -183,13 +183,11 @@ struct SonarMacRootView: View {
         case .profile:
             selection = .profile
             store.path.removeAll()
-        case .contactProfile, .groupInfo, .walletActivity, .sendPayment, .paymentStatus:
+        case .contactProfile, .groupInfo, .walletActivity, .sendPayment, .paymentStatus, .backup:
             // Pushed detail screens: they live on store.path, so the sidebar
             // selection stays where it is.
             break
         case .call:
-            break
-        case .contactProfile, .groupInfo, .walletActivity:
             break
         }
     }
@@ -512,14 +510,14 @@ private struct SonarMacMainPane: View {
             SonarSendPaymentScreen()
         case .paymentStatus(let activityId):
             SonarPaymentStatusScreen(activityId: activityId)
+        case .backup:
+            SonarBackupScreen()
         case .call(let id, let video):
             SonarCallScreen(peerId: id, video: video)
         case .contactProfile(let id, let name):
             SonarContactProfileScreen(peerId: id, peerName: name)
         case .groupInfo(let id):
             SonarGroupInfoScreen(peerId: id)
-        case .walletActivity:
-            SonarWalletActivityScreen()
         }
     }
 }
@@ -3061,10 +3059,13 @@ private struct MacSettingsModal: View {
                 SNSettingsRow(
                     icon: .shieldCheck,
                     tone: .cyan,
-                    label: String(localized: "Backup chats"),
-                    sub: String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                    label: String(localized: "Chat backup"),
+                    sub: store.autoBackupStatusLine.isEmpty
+                        ? String(localized: "Encrypted cloud backup — recover chats after reinstall")
+                        : store.autoBackupStatusLine
                 ) {
-                    Task { await store.backupAccountNow() }
+                    store.push(.backup)
+                    isPresented = false
                 }
                 SNSettingsRow(
                     icon: .importKey,
