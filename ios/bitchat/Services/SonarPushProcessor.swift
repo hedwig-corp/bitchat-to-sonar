@@ -143,7 +143,44 @@ enum SonarPushProcessor {
             // shrink the sync timeout (plus skip the cold-launch NSE yield) to
             // what remains, so the wake completes before iOS expires it.
             let wakeStart = Date()
-            var syncTimeout = TransportConfig.marmotPushSyncTimeoutSeconds
+            // Arm the close on a TIMER, not on the drain finishing.
+            //
+            // Every deadline below this point is a `withTimeout`, and this
+            // file already documents (see `closeStoreWithDeadline`) that a
+            // task-group deadline cannot bound a call parked in uncancellable
+            // Rust — it expires and then waits for the child anyway. So when
+            // `refresh()` parks in a blocking `sync_once`, the whole wake sat
+            // past the window and the close below was never *reached*: on
+            // TestFlight 1.12.5 (33) the process was killed 51s into a
+            // background launch with `sync_once` and `register_push_token`
+            // still parked and the node never latched for suspend.
+            //
+            // The only thing that can stop a parked FFI call is
+            // `closeNode()` -> `interruptNodeForSuspend()`, which runs
+            // off-queue. Arming it on a timer makes the abort reachable no
+            // matter where the drain is. The drain then fails out normally and
+            // the push syncs on the next wake/foreground — the same accepted
+            // outcome as a rerun that overruns its budget.
+            let wakeDeadlineCloser = Task.detached(priority: .userInitiated) {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.marmotWakeWindowSeconds * 1_000_000_000)
+                )
+                guard !Task.isCancelled else { return }
+                // Same gate as the close below: `.active`/`.inactive` means the
+                // user can see the app and the foreground path owns the node.
+                let state = await MainActor.run { UIApplication.shared.applicationState }
+                guard state == .background else { return }
+                log.warning("Marmot wake window expired with the drain still in flight — closing the store now")
+                await marmot.closeStoreAfterBackgroundWake()
+                await marmot.reconnectIfForegroundAfterWakeClose()
+            }
+            defer { wakeDeadlineCloser.cancel() }
+            // Budget for the whole first pass (NSE yield + connect + sync), not
+            // just its sync: the flat 25s `marmotPushSyncTimeoutSeconds` does
+            // not fit in a 28s window once the 2.5s yield and
+            // `ensureConnected()`'s 10s are paid, which is what put the close
+            // out of reach above.
+            var syncTimeout = SonarWakeBudgetPolicy.passBudget(remaining: SonarWakeBudgetPolicy.windowSeconds)
             var skipNSEYield = false
             var keepDraining = true
             while keepDraining {
@@ -228,13 +265,12 @@ enum SonarPushProcessor {
                     keepDraining = false
                 } else {
                     let remaining = Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
-                    keepDraining = marmotWakeNeedsRerun && remaining > Self.marmotWakeRerunMinSeconds
+                    keepDraining = marmotWakeNeedsRerun && SonarWakeBudgetPolicy.mayRerun(remaining: remaining)
                     if keepDraining {
                         skipNSEYield = true
-                        syncTimeout = min(
-                            TransportConfig.marmotPushSyncTimeoutSeconds,
-                            max(3, remaining - 2)
-                        )
+                        // Same close reserve as the first pass: a rerun that
+                        // spends everything but 2s leaves nothing to close with.
+                        syncTimeout = SonarWakeBudgetPolicy.passBudget(remaining: remaining)
                     } else if marmotWakeNeedsRerun {
                         log.info("Skipping coalesced Marmot rerun — \(Int(remaining))s left in wake window")
                     }
@@ -254,12 +290,9 @@ enum SonarPushProcessor {
         let shouldClearNSEPlaceholders: Bool
     }
 
-    /// iOS gives a silent-push wake ~30s of background execution
-    /// (TransportConfig documents the window); keep 2s of margin.
-    private static let marmotWakeWindowSeconds: Double = 28
-    /// Below this much remaining window a coalesced rerun cannot pay even a
-    /// shrunk sync — skip it; the push syncs on the next wake/foreground.
-    private static let marmotWakeRerunMinSeconds: Double = 8
+    /// Wake budgeting lives in `SonarWakeBudgetPolicy` so a test can pin the
+    /// arithmetic — nothing here can be unit-constructed.
+    private static let marmotWakeWindowSeconds = SonarWakeBudgetPolicy.windowSeconds
 
     @MainActor
     private static func runMarmotWakeup(
@@ -283,9 +316,20 @@ enum SonarPushProcessor {
         // content-available), but some wakes still relaunch the host — without
         // this delay the host steals the lock and NSE stays on the generic
         // placeholder.
+        //
+        // `syncTimeoutSeconds` budgets this WHOLE pass — the yield, the
+        // connect and the sync — not just the sync. Charging only the sync let
+        // the yield and `ensureConnected()` run off-budget, so the pass could
+        // outlast the wake window and strand the store open (0xdead10cc).
+        let passStart = Date()
+        func remainingPassBudget() -> Double {
+            max(3, syncTimeoutSeconds - Date().timeIntervalSince(passStart))
+        }
         let appState = UIApplication.shared.applicationState
         if !skipNSEYield && appState != .active {
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(
+                nanoseconds: UInt64(SonarWakeBudgetPolicy.nseYieldSeconds * 1_000_000_000)
+            )
         }
         // #354: invalidate the stale relay latch first — a process-alive
         // background can leave relayConnected true after sockets die, so
@@ -296,14 +340,16 @@ enum SonarPushProcessor {
         if RelayConnectionPolicy.shouldInvalidateOnPushWake(appVisible: appState != .background) {
             marmot.invalidateRelayConnection()
         }
-        _ = await marmot.ensureConnected()
+        // Bounded by what is left of the pass: the 10s default could alone eat
+        // more window than the close needs to survive it.
+        _ = await marmot.ensureConnected(timeoutSeconds: min(10, remainingPassBudget()))
         let baselineHydrated = await marmot.loadLocalSummaries()
         let beforeUnread = unreadFingerprint(marmot: marmot)
 
         var drained: [DrainNotificationInfo] = []
         var synced = false
         do {
-            drained = try await withTimeout(seconds: syncTimeoutSeconds) {
+            drained = try await withTimeout(seconds: remainingPassBudget()) {
                 await marmot.refresh()
             }
             synced = true
