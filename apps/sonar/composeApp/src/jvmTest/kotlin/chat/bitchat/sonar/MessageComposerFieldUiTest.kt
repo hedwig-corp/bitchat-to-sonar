@@ -85,10 +85,14 @@ class MessageComposerFieldUiTest {
     }
 
     /**
-     * The truncation bug. The call site below never recomposes, so the `value`
-     * the field was composed with stays empty while the store keeps every
-     * keystroke — the same divergence a stalled frame produces in production.
-     * Enter must send the store.
+     * The truncation bug. The call site never recomposes, so the `value` the
+     * field holds stays empty while the store takes every keystroke — the
+     * divergence a stalled frame produces. In production the composed value is
+     * usually a non-empty prefix and only the tail is lost; the mechanism is the
+     * same one either way (the handler reading `value` instead of the store),
+     * and an empty composed value is simply the cleanest way to stage it here —
+     * seeding a prefix puts the caret mid-text on `performClick`, which tests
+     * the harness rather than the field.
      */
     @Test
     fun returnKeySendsTheStoredDraftNotTheComposedOne() = runComposeUiTest {
@@ -108,6 +112,7 @@ class MessageComposerFieldUiTest {
         }
 
         onNodeWithTag("message-composer").performClick()
+        // The burst, none of which reached a composition.
         onNodeWithTag("message-composer").performTextInput("hello desktop")
         onNodeWithTag("message-composer").performKeyInput { pressKey(Key.Enter) }
 
