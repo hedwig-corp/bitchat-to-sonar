@@ -1321,7 +1321,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         hydratedTranscripts = emptySet()
         unreadSuppressGroupIds.clear()
         // Every caller is a full teardown (account wipe, eraseAllChats,
-        // restoreAccount). Echoes now outlive their first reconcile (R-022),
+        // restoreAccount). Echoes now outlive their first reconcile (R-025),
         // so a ledger that survives the wipe would render a pre-erase
         // "Sending" bubble forever: its canonical row is gone, nothing can
         // fulfil or retire it.
@@ -6039,7 +6039,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             failedChangedPageReads.remove(id)
             discardRetainedTranscript(id)
         }
-        // Delete must also drop this chat's in-flight send state (R-022
+        // Delete must also drop this chat's in-flight send state (R-025
         // sibling of the "/clear" scoped ledger clear): a surviving echo
         // would ghost as a phantom bubble nothing can fulfil.
         (deleteIds + chatId).toSet().forEach { id ->
@@ -6106,7 +6106,7 @@ class SonarAppState(private val scope: CoroutineScope) {
         // Delete must also drop this conversation's in-flight send state: an
         // echo or a queued out-of-range send surviving the delete would either
         // ghost as a phantom bubble or — worse — be DELIVERED by
-        // flushPendingMarmot after the user removed the conversation (R-022
+        // flushPendingMarmot after the user removed the conversation (R-025
         // sibling of the "/clear" scoped ledger clear).
         val deletedChatIds = (aliases.map(::meshChatId) + chatId + foldedGroupIdsToDelete).toSet()
         deletedChatIds.forEach { id ->
@@ -6700,7 +6700,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // out-of-range send) surviving the wipe would re-render as a
                 // phantom "Sending" bubble nothing can fulfil or retire — its
                 // carriers are gone. Same rationale as the full-teardown
-                // ledger clear (R-022), scoped to this one chat.
+                // ledger clear (R-025), scoped to this one chat.
                 pendingSendEchoes.remove(chatId)?.forEach { echo ->
                     previouslyPublishedMessageIdsByEcho.remove(echo.id)
                 }
@@ -8176,7 +8176,7 @@ class SonarAppState(private val scope: CoroutineScope) {
                 // the plan fulfils and window-retires it like any text echo —
                 // the matcher compares stickerRef so an own media row or a
                 // different sticker cannot consume it. An unconditional clear
-                // here deleted an out-of-window row's only carrier (R-022) and
+                // here deleted an out-of-window row's only carrier (R-025) and
                 // erased the visible bubble when the publish was dropped by a
                 // rolled session (R-011 shape).
                 if (hasCanonicalRow &&
