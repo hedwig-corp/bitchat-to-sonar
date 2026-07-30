@@ -40,7 +40,7 @@ When the app is foregrounded and a trill arrives, three things fire together:
 - **Bell:** two identical sine tones **160 ms apart**. Each sweeps exponentially from 880 Hz to 660 Hz over 120 ms with a gain envelope that attacks over 20 ms and decays to 240 ms. Total bell ≈ 400 ms. On device this is a bundled `sonar_trill` asset, not a synthesized tone.
 - **Haptic:** `navigator.vibrate([40, 60, 40])` — buzz 40 ms, pause 60 ms, buzz 40 ms. Maps to `VibrationEffect.createWaveform` on Android and a two-pulse `UIImpactFeedbackGenerator(.medium)` sequence on iOS.
 
-If the app is backgrounded, the trill sound still fires as part of a normal notification. Killed-app iOS is a tracked gap: the Transponder push payload is opaque to the NSE, so a trill received while the app is fully killed presents as the generic "New Sonar message" for now. Foreground and background-drain paths do classify and use the distinct sound.
+If the app is backgrounded — or fully killed on iOS — the trill still arrives as a normal notification with the distinct sound. The APNs payload itself is opaque, but the Notification Service Extension opens the shared encrypted chat database, decrypts locally, and classifies the content before the banner is presented: a killed-app trill shows the nudged-you banner with the trill sound, and the raw wire line never appears. If local decryption is unavailable (the store is busy, or the extension runs out of time), the banner falls back to the generic placeholder. Muted chats stay silent on this path too, once the app has launched at least once on the new build (that first launch is what mirrors your existing mutes to the extension).
 
 ## The rendering: centered row, chat-list preview
 

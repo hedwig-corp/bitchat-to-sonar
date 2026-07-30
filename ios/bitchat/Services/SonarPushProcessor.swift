@@ -395,11 +395,32 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute. The drain payload carries no group id, so a
-            // muted DM is matched by sender npub; muted GROUPS are only
-            // caught by the summary path below (documented gap).
-            if notif.groupName.isEmpty, !notif.senderNpub.isEmpty,
+            // Per-chat mute, DM fast path only: a DM row has no meaningful
+            // group name, so match it by sender npub and skip the name
+            // resolution below. Muted GROUPS are not handled here — they are
+            // stopped by the central gate in
+            // NotificationService.sendLocalNotification, which reads the
+            // marmot:<groupId> conversation id this loop puts in userInfo.
+            // (Drained rows DO carry a group id; core sets group_id_hex on
+            // every DrainNotification.)
+            // Directness decided by the SAME helper the NSE uses. Testing
+            // `groupName.isEmpty` here while the NSE also treats the local
+            // placeholder as direct made the two disagree: a drained direct row
+            // carrying that placeholder took the DM branch in the NSE but not in
+            // this backstop, so when the NSE's mirror was stale or missing the
+            // host posted exactly the banner this backstop exists to suppress.
+            if SonarNSEDecoratePolicy.meaningfulGroupName(notif.groupName) == nil,
+               !notif.senderNpub.isEmpty,
                SonarChatMuteStore.shared.isMuted(notif.senderNpub) {
+                // The NSE suppresses muted chats itself, but it fails open when
+                // the App Group mute mirror is missing (app updated and never
+                // launched) or undecodable. The host is the backstop: drop the
+                // banner it already delivered instead of leaving a muted chat
+                // ringing on the lock screen.
+                await removeDeliveredNSEOwnedBanners(
+                    messageIdHex: notif.messageIdHex.isEmpty ? nil : notif.messageIdHex,
+                    conversationId: notif.groupIdHex.isEmpty ? nil : "marmot:" + notif.groupIdHex
+                )
                 continue
             }
             // Receiver trill throttle: one alert per chat per window; excess
@@ -521,8 +542,15 @@ enum SonarPushProcessor {
                 }
             }()
             if kind == .call { continue }
-            // Per-chat mute: unread still accrues, no banner.
-            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) { continue }
+            // Per-chat mute: unread still accrues, no banner. Same NSE
+            // fail-open backstop as the drain path above.
+            if SonarChatMuteStore.shared.isMuted(summary.groupIdHex) {
+                await removeDeliveredNSEOwnedBanners(
+                    messageIdHex: nil,
+                    conversationId: summary.groupIdHex.isEmpty ? nil : "marmot:" + summary.groupIdHex
+                )
+                continue
+            }
             // Receiver trill throttle: excess trills stay row-only.
             var sound: SonarNotificationSound = .standard
             if kind == .trill {
@@ -677,8 +705,10 @@ enum SonarPushProcessor {
     }
 
     /// Pure filter: NSE-owned delivered ids that match tip message / conversation.
+    /// A suppressed multi-group drain stamps every covered conversation into
+    /// `conversationIds`, so the target id matching ANY of them counts too.
     static func nseOwnedIdsToRemove(
-        delivered: [(id: String, messageId: String?, conversationId: String?)],
+        delivered: [(id: String, messageId: String?, conversationId: String?, conversationIds: [String])],
         messageIdHex: String?,
         conversationId: String?
     ) -> [String] {
@@ -686,7 +716,10 @@ enum SonarPushProcessor {
         let cid = conversationId?.trimmingCharacters(in: .whitespacesAndNewlines)
         return delivered.compactMap { row in
             if let mid, !mid.isEmpty, row.messageId == mid { return row.id }
-            if let cid, !cid.isEmpty, row.conversationId == cid { return row.id }
+            if let cid, !cid.isEmpty,
+               row.conversationId == cid || row.conversationIds.contains(cid) {
+                return row.id
+            }
             return nil
         }
     }
@@ -740,12 +773,13 @@ enum SonarPushProcessor {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             let center = UNUserNotificationCenter.current()
             center.getDeliveredNotifications { notes in
-                let rows: [(id: String, messageId: String?, conversationId: String?)] = notes.compactMap { note in
+                let rows: [(id: String, messageId: String?, conversationId: String?, conversationIds: [String])] = notes.compactMap { note in
                     let content = note.request.content
                     guard isNSEOwned(content) else { return nil }
                     let mid = content.userInfo["sonar.messageId"] as? String
                     let cid = content.userInfo[SonarNotificationKeys.conversationId] as? String
-                    return (note.request.identifier, mid, cid)
+                    let cids = content.userInfo[SonarNotificationKeys.conversationIds] as? [String] ?? []
+                    return (note.request.identifier, mid, cid, cids)
                 }
                 let ids = nseOwnedIdsToRemove(
                     delivered: rows,

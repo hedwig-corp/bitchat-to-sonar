@@ -58,6 +58,29 @@ Fired together when the app is foregrounded (any screen):
 Backgrounded/killed: a normal notification with the distinct trill sound via
 `NotificationKind::Trill`. No DND/critical-alert bypass.
 
+On iOS with the app fully killed, the Transponder APNs payload is opaque, but
+the NSE (`ios/SonarNotificationService/NotificationService.swift`) opens the
+App Group chat DB, drains, and classifies the decrypted content locally:
+`SonarNSEDecoratePolicy.render` produces the nudged-you banner (never the raw
+`⚡TRILL` line) and marks `isTrill`, which selects the distinct
+`sonar_trill.wav` sound. Muted chats are honored via an App Group mirror of
+the mute map (see the mute section for the one-launch caveat). If hydrate
+fails (store busy, missing credentials, NSE time expiry) the generic
+placeholder banner and sound are delivered — never a raw line.
+
+**Any sound the NSE names must be a member of the `SonarNotificationService`
+target**, not only the app. That target has no synchronized-folder membership,
+so a file under `ios/bitchat/` (where `sonar_trill.wav` lives) never reaches
+the appex without an explicit `pbxproj` Resources entry — the same explicit
+membership `sonar_notification.wav` has always had. Naming a file the appex
+does not contain degrades the killed-app banner to the default sound with no
+error anywhere. Verify after touching sounds or target membership:
+
+```sh
+ls "$(ls -dt ~/Library/Developer/Xcode/DerivedData/bitchat-*/Build/Products/\
+Debug-iphonesimulator/Sonar.app | head -1)/PlugIns/SonarNotificationService.appex" | grep wav
+```
+
 Honor the platform reduce-motion setting: skip the shake (keep sound/haptic)
 when reduced motion is enabled, mirroring the design's
 `prefers-reduced-motion` rule.
@@ -70,10 +93,16 @@ than the chat's notification level already allows.**
 | State | Behaviour |
 |---|---|
 | Blocked peer | Dropped at ingest. No row, no alert. |
-| Muted chat | Row + unread badge only. No shake/bell/haptic/notification. |
+| Muted chat | Row + unread badge only. No shake/bell/haptic/notification. [^nse-mute] |
 | OS DND / silent | Row + notification; the OS decides presentation. |
 | Foreground | Row + shake + bell + haptic. |
 | Background/killed | Row + notification with trill sound. |
+
+[^nse-mute]: On killed-app iOS the extension cannot drop a notification, only
+blank it — a contentless, `.passive` entry is still delivered. The NSE stamps
+the conversation id on that row so the host's mute branches remove it on the
+next wake via `removeDeliveredNSEOwnedBanners`. The same blank-row shape exists
+on the notifications-disabled path, which does not yet get that cleanup.
 
 ## Abuse guards
 
@@ -90,7 +119,13 @@ Design: `MuteSheet` (sonar/components.jsx) with durations 1 hour, 8 hours,
 1 day, 1 week, until-turned-back-on. Reached from long-press on the chat row
 and from the DM/group screen. Muted rows show a bell-off icon in place of the
 unread dot. Mute state is **local to the install** (not synced across linked
-devices — tracked gap, Signal syncs it).
+devices — tracked gap, Signal syncs it). On iOS the map is write-through
+mirrored into the App Group so the killed-app NSE path honors mutes too. The
+mirror is written whenever `SonarChatMuteStore` is constructed or mutated, so
+a mute made before updating to a build with the mirror reaches the extension
+only after the app has run once; until then the NSE fails open and the host
+removes the banner on the next wake. Android has no equivalent gap — it reads
+one core blob (`mute.byChat`) from the push service process.
 
 Mute suppresses notification/sound/haptic/shake for ALL message kinds in the
 chat, not only trills. Rows and unread badges still accrue.
@@ -106,12 +141,10 @@ Public geohash channels have no nudge action.
 
 ## Known gaps
 
-- **iOS killed-app distinct sound**: the Transponder push payload is opaque to
-  the NSE (`ios/SonarNotificationService/NotificationService.swift`), which
-  cannot decrypt to classify. A killed-app trill therefore presents as the
-  generic "New Sonar message" notification. Foreground and background-drain
-  paths do classify and use the trill sound. Follow-up: NSE-side classification
-  once the payload carries a category marker.
+- **NSE-wake alert throttle**: the killed-app iOS path does not enforce the
+  receiver alert throttle across NSE wakes — each push banners independently
+  (the sender-side 8 s cooldown still bounds well-behaved clients). Follow-up:
+  persist the throttle window in the App Group.
 - Mute does not sync across linked devices (see above).
 - Old clients render the raw `⚡TRILL|1|<id>` line as text — same accepted
   wart as `⚡PAY` before it shipped.

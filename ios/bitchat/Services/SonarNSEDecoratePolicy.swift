@@ -50,6 +50,9 @@ enum SonarNSEDecoratePolicy {
     struct Output: Equatable {
         var title: String
         var body: String
+        /// Content classified as a ⚡TRILL nudge — the NSE must attach the
+        /// distinct trill sound instead of the generic message sound.
+        var isTrill: Bool = false
     }
 
     /// Drop placeholder 1:1 names so the banner title is the peer, not
@@ -58,12 +61,13 @@ enum SonarNSEDecoratePolicy {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let lowered = trimmed.lowercased()
-        let placeholders: Set<String> = [
-            "sonar agent dm",
-            "dm",
-            "direct message",
-            "new chat",
-        ]
+        // ONLY the locally-generated placeholder. `groupName` comes from the
+        // remote group, so treating generic strings as "this is a DM" lets an
+        // attacker name a group "New chat" to route it through the DM branch
+        // of the mute lookup and suppress its killed-app banner for anyone who
+        // muted a DM with the sender — and "New chat" is a name a real user
+        // would type, so it is a false positive even without an attacker.
+        let placeholders: Set<String> = ["sonar agent dm"]
         if placeholders.contains(lowered) { return nil }
         return trimmed
     }
@@ -94,6 +98,111 @@ enum SonarNSEDecoratePolicy {
     static let nseDecoratedUserInfoKey = "sonar.nseDecorated"
     /// userInfo marker: still the privacy placeholder (host may wipe).
     static let nsePlaceholderUserInfoKey = "sonar.nsePlaceholder"
+
+    /// App Group mirror key for the per-chat mute map (written by
+    /// `SonarChatMuteStore` as write-through; JSON-encoded `[String: Date]`).
+    /// Single declaration — `SonarChatMuteStore.defaultsKey` aliases this.
+    static let mutesUserDefaultsKey = "sonar.chat.mutes.v1"
+
+    /// Equivalent lookup keys for one raw conversation key, so the check
+    /// works whichever id shape a path carries (see docs/CHAT-TYPES.md):
+    /// the raw key, a 64-hex fingerprint's canonical 16-hex short form, and
+    /// a `marmot:<groupId>` route's bare group id (and vice versa).
+    ///
+    /// This is the ONE normalization both sides use — `SonarChatMuteStore`
+    /// delegates here (this file is compiled by the app target too), so the
+    /// store's writes and the appex's reads cannot drift. Keys are
+    /// lowercased: every other hex comparison in the NSE lowercases first,
+    /// and a mixed-case id must still match its mute, not fail open.
+    static func normalizedMuteCandidates(_ rawKey: String) -> [String] {
+        let raw = rawKey.lowercased()
+        var keys = [raw]
+        if raw.hasPrefix("marmot:") {
+            keys.append(String(raw.dropFirst("marmot:".count)))
+        } else if raw.count == 64, raw.allSatisfy(\.isHexDigit) {
+            keys.append(String(raw.prefix(16)))
+            keys.append("marmot:" + raw)
+        }
+        return keys
+    }
+
+    /// Lookup keys for one drained notification. The group key always
+    /// counts; the sender key counts ONLY for a direct chat. `muteKeys` for
+    /// a DM stores the peer's npub (and its 64-hex twin), so matching the
+    /// sender unconditionally would let a muted DM with Alice silence every
+    /// group message *from Alice* — the asymmetry the host refuses in
+    /// `SonarPushProcessor` (sender-keyed check gated on no group name).
+    /// Directness is judged with `meaningfulGroupName`, not `.isEmpty`,
+    /// because `enrichEmptyContentPreviews` can backfill a DM with the
+    /// "Sonar agent DM" placeholder.
+    static func mutedLookupCandidates(
+        groupIdHex: String,
+        senderNpub: String,
+        groupName: String
+    ) -> [String] {
+        var keys: [String] = []
+        if !groupIdHex.isEmpty {
+            keys += normalizedMuteCandidates(groupIdHex)
+        }
+        let isDirectChat = meaningfulGroupName(groupName) == nil
+        if isDirectChat, !senderNpub.isEmpty {
+            keys += normalizedMuteCandidates(senderNpub)
+        }
+        return keys
+    }
+
+    /// Decode the App Group mirror once per drain (not once per row).
+    /// Missing/undecodable data reads as an empty map — mute must fail
+    /// open, never suppress a wanted banner. Keys are lowercased to match
+    /// `normalizedMuteCandidates`, merging duplicates on the later expiry.
+    static func decodeMutes(_ mutesJSON: Data?) -> [String: Date] {
+        guard let mutesJSON,
+              let map = try? JSONDecoder().decode([String: Date].self, from: mutesJSON) else {
+            return [:]
+        }
+        var lowered: [String: Date] = [:]
+        lowered.reserveCapacity(map.count)
+        for (key, until) in map {
+            let k = key.lowercased()
+            lowered[k] = max(lowered[k] ?? .distantPast, until)
+        }
+        return lowered
+    }
+
+    /// Pure per-chat mute check over the decoded App Group mirror. Expired
+    /// entries read as unmuted (lazy removal stays the store's job).
+    static func isMuted(
+        groupIdHex: String,
+        senderNpub: String,
+        groupName: String,
+        mutes: [String: Date],
+        now: Date
+    ) -> Bool {
+        guard !mutes.isEmpty else { return false }
+        return mutedLookupCandidates(
+            groupIdHex: groupIdHex,
+            senderNpub: senderNpub,
+            groupName: groupName
+        )
+        .contains { key in (mutes[key] ?? .distantPast) > now }
+    }
+
+    /// Convenience overload over the raw mirror blob (tests / one-off checks).
+    static func isMuted(
+        groupIdHex: String,
+        senderNpub: String,
+        groupName: String,
+        mutesJSON: Data?,
+        now: Date
+    ) -> Bool {
+        isMuted(
+            groupIdHex: groupIdHex,
+            senderNpub: senderNpub,
+            groupName: groupName,
+            mutes: decodeMutes(mutesJSON),
+            now: now
+        )
+    }
 
     /// Pure `⚡TRILL|1|<id>` check mirroring core `parse_trill_line` —
     /// version-locked, no trailing fields, hex-or-dash id (1-64 chars).
@@ -127,7 +236,11 @@ enum SonarNSEDecoratePolicy {
             } else {
                 title = "Someone nudged you"
             }
-            return Output(title: title, body: "\u{1F44B} They want your attention.")
+            return Output(
+                title: title,
+                body: "\u{1F44B} They want your attention.",
+                isTrill: true
+            )
         }
         let body: String
         if prefs.showPreview {

@@ -27,6 +27,10 @@ enum SonarNotificationSound {
 /// tap handoff in `NotificationDelegate`.
 enum SonarNotificationKeys {
     static let conversationId = "sonarConversationId"
+    /// NSE-stamped list on a suppressed multi-group drain: every distinct
+    /// conversation the blank placeholder covered. Cleanup matches against
+    /// this too, so muting group A cannot leave group B's placeholder stuck.
+    static let conversationIds = "sonarConversationIds"
     static let peerID = "peerID"
     /// Stable local message id for Jump open-action (#372). Optional.
     static let messageId = "sonarMessageId"

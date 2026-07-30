@@ -31,6 +31,10 @@ class NotificationService: SDKNotificationService {
     private static let keychainService = "sh.hedwig.sonar"
     private static let marmotConversationPrefix = "marmot:"
     private static let conversationIdKey = "sonarConversationId"
+    /// Every distinct conversation a suppressed multi-group drain covered —
+    /// the host's banner cleanup matches against this list too, so muting
+    /// group A must not leave group B's blank placeholder stuck.
+    private static let conversationIdsKey = "sonarConversationIds"
     /// White Noise uses ~8s; leave headroom for decorate + avatar-free finish.
     private static let marmotWakeWaitMs: UInt64 = 8_000
     private static let maxAdditionalPresentations = 3
@@ -44,6 +48,14 @@ class NotificationService: SDKNotificationService {
     private static let log = OSLog(subsystem: "sh.hedwig.sonar", category: "NSE")
     private static let notificationSound = UNNotificationSound(
         named: UNNotificationSoundName(rawValue: "sonar_notification.wav")
+    )
+    /// Both sounds must be members of THIS extension target, not just the app:
+    /// the appex has no synchronized-folder membership, so a file living under
+    /// ios/bitchat/ never reaches it without an explicit pbxproj Resources
+    /// entry. Shipping a name the appex does not contain degrades the killed-app
+    /// banner to the default sound, silently. See docs/SONAR-TRILL.md.
+    private static let trillNotificationSound = UNNotificationSound(
+        named: UNNotificationSoundName(rawValue: "sonar_trill.wav")
     )
 
     private var contentHandler: ((UNNotificationContent) -> Void)?
@@ -166,9 +178,55 @@ class NotificationService: SDKNotificationService {
                     finish(with: content)
                     return
                 }
+                // Per-chat mute (App Group mirror of SonarChatMuteStore):
+                // muted rows stay row-only — no banner, no sound — matching
+                // the silence table in docs/SONAR-TRILL.md. Decode the mirror
+                // once for the whole drain, not once per row.
+                let mutes = SonarNSEDecoratePolicy.decodeMutes(
+                    UserDefaults(suiteName: Self.appGroupId)?
+                        .data(forKey: SonarNSEDecoratePolicy.mutesUserDefaultsKey)
+                )
+                let unmuted = notifications.filter {
+                    !SonarNSEDecoratePolicy.isMuted(
+                        groupIdHex: $0.groupIdHex,
+                        senderNpub: $0.senderNpub,
+                        groupName: $0.groupName,
+                        mutes: mutes,
+                        now: Date()
+                    )
+                }
+                if unmuted.isEmpty {
+                    os_log("NSE: all drained notifications muted — suppressing banner",
+                           log: Self.log, type: .info)
+                    Self.recordDiagnostic("suppressed:muted count=\(notifications.count)")
+                    // An NSE cannot drop a notification, only blank it, so a
+                    // contentless row still lands in Notification Center.
+                    // Stamp the conversation ids the host's mute branches pass
+                    // to removeDeliveredNSEOwnedBanners — a suppressed
+                    // placeholder never ran apply(), so without this it matches
+                    // nothing and the blank row sticks until the user swipes it.
+                    // The primary stamp is the TIP (newest — the row whose push
+                    // produced this banner); one wake can drain muted rows from
+                    // several groups, so every distinct id rides along too.
+                    var mutedInfo = content.userInfo
+                    if let gid = notifications.last?.groupIdHex, !gid.isEmpty {
+                        mutedInfo[Self.conversationIdKey] =
+                            Self.marmotConversationPrefix + gid
+                    }
+                    let allIds = Array(Set(
+                        notifications.map(\.groupIdHex).filter { !$0.isEmpty }
+                    )).map { Self.marmotConversationPrefix + $0 }
+                    if !allIds.isEmpty {
+                        mutedInfo[Self.conversationIdsKey] = allIds
+                    }
+                    content.userInfo = mutedInfo
+                    Self.suppressTransponderNotification(content)
+                    finish(with: content)
+                    return
+                }
                 let prefs = Self.notificationPrefs()
                 // Drain is oldest-first (sync queue + live append). Banner the tip.
-                let ordered = Array(notifications.reversed())
+                let ordered = Array(unmuted.reversed())
                 let primary = ordered[0]
                 Self.apply(
                     notification: primary,
@@ -457,7 +515,7 @@ class NotificationService: SDKNotificationService {
         )
         content.title = rendered.title
         content.body = rendered.body
-        content.sound = notificationSound
+        content.sound = rendered.isTrill ? trillNotificationSound : notificationSound
         content.categoryIdentifier = "sonar.message"
         if #available(iOS 15.0, *) {
             content.interruptionLevel = .active

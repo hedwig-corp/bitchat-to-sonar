@@ -8300,6 +8300,17 @@ final class SonarAppStore: ObservableObject {
         if let npub = resolvedSonarProfile(id)?.npub ?? pendingMarmotNpub(for: id) {
             keys.insert(npub)
         }
+        // Store BOTH encodings of every pubkey-shaped key. Group members and
+        // profiles arrive as bech32 (`to_bech32()`), but drained push rows carry
+        // the sender as 64-hex (`sender.to_string()`), and the push/NSE mute
+        // checks look up that hex — so an npub-only key can never match them.
+        // Additive by construction: each inserted hex is another encoding of a
+        // key already in the set, so it cannot widen mute to a different peer.
+        for key in Array(keys) {
+            if let data = Self.nostrPubkeyData(key) {
+                keys.insert(data.hexEncodedString())
+            }
+        }
         return keys.filter { !$0.isEmpty }
     }
 

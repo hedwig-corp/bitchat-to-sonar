@@ -154,7 +154,11 @@ final class SonarTrillThrottle {
 /// entry reads as unmuted and is dropped on the next query.
 final class SonarChatMuteStore: ObservableObject {
     static let shared = SonarChatMuteStore()
-    static let defaultsKey = "sonar.chat.mutes.v1"
+    /// Single declaration lives in `SonarNSEDecoratePolicy` (compiled into
+    /// both the app and the appex), so the writer and the NSE reader cannot
+    /// drift apart on the key string.
+    static let defaultsKey = SonarNSEDecoratePolicy.mutesUserDefaultsKey
+    static let appGroupId = "group.sh.hedwig.sonar"
 
     @Published private(set) var mutedUntil: [String: Date]
 
@@ -164,27 +168,66 @@ final class SonarChatMuteStore: ObservableObject {
     init(defaults: UserDefaults = .standard, key: String = SonarChatMuteStore.defaultsKey) {
         self.defaults = defaults
         self.key = key
+        var didMigrate = false
         if let data = defaults.data(forKey: key),
            let stored = try? JSONDecoder().decode([String: Date].self, from: data) {
-            mutedUntil = stored
+            // Legacy entries may carry mixed-case hex; normalize to the
+            // lowercase shape `normalizedCandidates` produces, keeping the
+            // later expiry when two casings collide. Entries written before
+            // both encodings were stored can be npub-only, which no push-path
+            // lookup can reach — backfill the hex twin here so an upgraded
+            // install honours mutes it already had, without the user having to
+            // mute the chat again.
+            var normalized: [String: Date] = [:]
+            normalized.reserveCapacity(stored.count)
+            for (k, until) in stored {
+                for candidate in Self.persistableCandidates(k) {
+                    normalized[candidate] = max(normalized[candidate] ?? .distantPast, until)
+                }
+            }
+            didMigrate = normalized != stored
+            mutedUntil = normalized
         } else {
             mutedUntil = [:]
+        }
+        // Mirror on init so mutes recorded before the mirror existed become
+        // visible to the NSE without waiting for the next mute/unmute. When the
+        // load actually migrated something, write the map back as well —
+        // otherwise `.standard` keeps the pre-migration shape and every launch
+        // redoes the same expansion. `persist()` mirrors too.
+        if didMigrate {
+            persist()
+        } else {
+            mirrorToAppGroup()
         }
     }
 
     /// Equivalent lookup keys for one raw conversation key, so the check
     /// works whichever id shape a notification path carries (see
-    /// docs/CHAT-TYPES.md — five strings can identify one conversation):
-    /// the raw key, a 64-hex fingerprint's canonical 16-hex short form, and
-    /// a `marmot:<groupId>` route's bare group id (and vice versa).
+    /// docs/CHAT-TYPES.md — five strings can identify one conversation).
+    /// Delegates to the NSE policy helper — one normalization for the
+    /// store's writes and the appex's reads.
     static func normalizedCandidates(_ rawKey: String) -> [String] {
-        var keys = [rawKey]
-        if rawKey.hasPrefix("marmot:") {
-            keys.append(String(rawKey.dropFirst("marmot:".count)))
-        } else if rawKey.count == 64, rawKey.allSatisfy(\.isHexDigit) {
-            keys.append(String(rawKey.prefix(16)))
-            keys.append("marmot:" + rawKey)
-        }
+        SonarNSEDecoratePolicy.normalizedMuteCandidates(rawKey)
+    }
+
+    /// Keys to persist for one raw key: the normalized shapes plus, when the
+    /// key is a bech32 `npub1…`, the same pubkey as 64-hex.
+    ///
+    /// Storage has to carry both encodings because the two sides disagree:
+    /// group members and profiles reach us as bech32 (`to_bech32()`), while a
+    /// killed-app drain row carries the sender as 64-hex
+    /// (`sender.to_string()`). The lookup cannot bridge them — it is shared
+    /// with the notification extension, which does not compile `Bech32` — so
+    /// the writer resolves it here, where `Bech32` exists.
+    static func persistableCandidates(_ rawKey: String) -> [String] {
+        var keys = normalizedCandidates(rawKey)
+        let lowered = rawKey.lowercased()
+        guard lowered.hasPrefix("npub1"),
+              let decoded = try? Bech32.decode(lowered),
+              decoded.hrp == "npub",
+              decoded.data.count == 32 else { return keys }
+        keys += normalizedCandidates(decoded.data.hexEncodedString())
         return keys
     }
 
@@ -225,9 +268,10 @@ final class SonarChatMuteStore: ObservableObject {
     func mute(keys: [String], until: Date) {
         guard !keys.isEmpty else { return }
         // Store every normalized shape too, so lookups and removals work
-        // whichever id form a path carries later.
+        // whichever id form a path carries later — including the hex twin of a
+        // bech32 peer key, which is the shape push drains look up by.
         for raw in keys where !raw.isEmpty {
-            for candidate in Self.normalizedCandidates(raw) {
+            for candidate in Self.persistableCandidates(raw) {
                 mutedUntil[candidate] = until
             }
         }
@@ -249,11 +293,43 @@ final class SonarChatMuteStore: ObservableObject {
     func wipe() {
         mutedUntil = [:]
         defaults.removeObject(forKey: key)
+        if mirrorsToAppGroup {
+            UserDefaults(suiteName: SonarChatMuteStore.appGroupId)?
+                .removeObject(forKey: key)
+        }
     }
 
     private func persist() {
         if let data = try? JSONEncoder().encode(mutedUntil) {
             defaults.set(data, forKey: key)
+        }
+        mirrorToAppGroup()
+    }
+
+    /// Only the real store mirrors — test instances with injected defaults
+    /// must never write into the shared container. `bitchatTests_iOS` runs
+    /// in-process with the app's App Group entitlement, so a test touching
+    /// `.shared` would otherwise overwrite the device's real mirror.
+    private var mirrorsToAppGroup: Bool {
+        defaults === UserDefaults.standard && !Self.isRunningTests
+    }
+
+    private static var isRunningTests: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return NSClassFromString("XCTestCase") != nil ||
+            env["XCTestConfigurationFilePath"] != nil ||
+            env["XCTestBundlePath"] != nil
+    }
+
+    /// Write-through mirror for the NSE. `.standard` stays the source of
+    /// truth (no migration risk); the App Group copy is read-only for the
+    /// appex so a muted chat's killed-app push can be silenced
+    /// (SonarNSEDecoratePolicy.isMuted).
+    private func mirrorToAppGroup() {
+        guard mirrorsToAppGroup,
+              let shared = UserDefaults(suiteName: SonarChatMuteStore.appGroupId) else { return }
+        if let data = try? JSONEncoder().encode(mutedUntil) {
+            shared.set(data, forKey: key)
         }
     }
 }

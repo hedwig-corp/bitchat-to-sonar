@@ -287,10 +287,12 @@ struct SonarNotificationPrefsTests {
 
     @Test("host replaces NSE-decorated banners by message or conversation id")
     func nseOwnedReplaceMatchesTipIdentity() {
-        let rows: [(id: String, messageId: String?, conversationId: String?)] = [
-            ("apns-1", "msg-aaa", "marmot:g1"),
-            ("apns-2", "msg-bbb", "marmot:g2"),
-            ("local-extra", nil, "marmot:g1"),
+        let rows: [(id: String, messageId: String?, conversationId: String?, conversationIds: [String])] = [
+            ("apns-1", "msg-aaa", "marmot:g1", []),
+            ("apns-2", "msg-bbb", "marmot:g2", []),
+            ("local-extra", nil, "marmot:g1", []),
+            // Suppressed multi-group drain: tip stamp is g2, list covers both.
+            ("apns-muted", nil, "marmot:g2", ["marmot:g2", "marmot:g3"]),
         ]
         #expect(
             SonarPushProcessor.nseOwnedIdsToRemove(
@@ -307,6 +309,14 @@ struct SonarNotificationPrefsTests {
                     conversationId: "marmot:g1"
                 )
             ) == Set(["apns-1", "local-extra"])
+        )
+        // The non-tip group of a suppressed drain still matches via the list.
+        #expect(
+            SonarPushProcessor.nseOwnedIdsToRemove(
+                delivered: rows,
+                messageIdHex: nil,
+                conversationId: "marmot:g3"
+            ) == ["apns-muted"]
         )
 
         let decorated = UNMutableNotificationContent()
