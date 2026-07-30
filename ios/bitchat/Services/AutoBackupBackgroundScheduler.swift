@@ -76,13 +76,38 @@ final class AutoBackupBackgroundScheduler {
         }
     }
 
-    /// Daily floor. Safe to call repeatedly — resubmitting replaces the pending
-    /// request for the same identifier rather than stacking.
+    /// Daily floor.
+    ///
+    /// Resubmitting for the same identifier replaces the pending request rather
+    /// than stacking — but replacing it also RESETS `earliestBeginDate` to
+    /// another 12 hours out. This runs on every transition to `.background`, so
+    /// blind resubmission pushed the floor forward forever and it could never
+    /// come due: any user who backgrounds the app more often than every 12
+    /// hours never got the floor at all.
+    ///
+    /// Measured on an iPhone 14 Pro Max across a 53-hour log: 18 `BGAppRefresh`
+    /// runs (the near-term path, which re-arms deliberately) and **0**
+    /// `BGProcessing` runs. No submit ever failed — iOS simply never had an
+    /// eligible request to launch.
+    ///
+    /// So only arm the floor when one is not already pending. After the handler
+    /// runs, the pending request has been consumed and this re-arms normally.
     func schedule() {
         guard registered else {
             wantsFloorSchedule = true
             return
         }
+        BGTaskScheduler.shared.getPendingTaskRequests { pending in
+            guard !pending.contains(where: { $0.identifier == Self.processingTaskIdentifier }) else {
+                return
+            }
+            Task { @MainActor [weak self] in
+                self?.submitFloorRequest()
+            }
+        }
+    }
+
+    private func submitFloorRequest() {
         let request = BGProcessingTaskRequest(identifier: Self.processingTaskIdentifier)
         request.earliestBeginDate = Date(timeIntervalSinceNow: Self.floorDelaySeconds)
         // Uploading is the point; running without a network would burn the slot
