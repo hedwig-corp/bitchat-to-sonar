@@ -1792,7 +1792,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
             if (emojiTray && !recording) {
                 TransientBackHandler { emojiTray = false }
                 chat.bitchat.sonar.screens.SonarEmojiPicker(
-                    onEmoji = { state.setComposerDraft(screen.id, draft + it) },
+                    // Append to the draft as stored, not as composed: this is a
+                    // read-modify-write, so a stale base would delete whatever
+                    // was typed since the last frame rather than just truncate.
+                    onEmoji = { state.setComposerDraft(screen.id, state.composerDraft(screen.id) + it) },
                     onGif = { item ->
                         emojiTray = false
                         state.sendGifItem(screen.id, item)
@@ -1856,6 +1859,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                             value = draft, onValueChange = { state.setComposerDraft(screen.id, it) },
                             textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                             cursorBrush = SolidColor(s.accent),
+                            currentDraft = { state.composerDraft(screen.id) },
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .onFocusChanged { focusState ->
@@ -1871,13 +1875,12 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                         emojiTray = false
                                     }
                                 },
-                            onSend = {
-                                if (draft.isBlank()) return@MessageComposerTextField
-                                val d = draft
+                            onSend = { typed ->
+                                if (typed.isBlank()) return@MessageComposerTextField
                                 state.setComposerDraft(screen.id, "")
                                 emojiTray = false
-                                if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
-                                    state.send(screen.id, d)
+                                if (!state.handleCommand(typed, peerName, channelGeohash = null, chatId = screen.id)) {
+                                    state.send(screen.id, typed)
                                 }
                             },
                         )
@@ -1955,7 +1958,10 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                     Box(
                         Modifier.size(34.dp).clip(CircleShape).background(sendBg)
                             .clickable(enabled = sendEnabled) {
-                                val d = draft
+                                // Read the draft back from state, not from this
+                                // composition: keystrokes land before the call site
+                                // recomposes, so `draft` here can miss the tail.
+                                val d = state.composerDraft(screen.id)
                                 state.setComposerDraft(screen.id, "")
                                 emojiTray = false
                                 if (!state.handleCommand(d, peerName, channelGeohash = null, chatId = screen.id)) {
@@ -2561,12 +2567,12 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    currentDraft = { state.composerDraft(draftKey) },
                     modifier = Modifier.fillMaxWidth(),
-                    onSend = {
-                        if (draft.isBlank()) return@MessageComposerTextField
-                        val d = draft
+                    onSend = { typed ->
+                        if (typed.isBlank()) return@MessageComposerTextField
                         state.setComposerDraft(draftKey, "")
-                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
+                        state.sendGeoDmMsg(screen.geohash, screen.peerHex, typed)
                     },
                 )
             }
@@ -2574,7 +2580,7 @@ private fun GeoDmScreen(state: SonarAppState, screen: Screen.GeoDm) {
             Box(
                 Modifier.size(34.dp).clip(CircleShape).background(if (draft.isBlank()) s.surface2 else s.netFill)
                     .clickable(enabled = draft.isNotBlank()) {
-                        val d = draft
+                        val d = state.composerDraft(draftKey)
                         state.setComposerDraft(draftKey, "")
                         state.sendGeoDmMsg(screen.geohash, screen.peerHex, d)
                     },

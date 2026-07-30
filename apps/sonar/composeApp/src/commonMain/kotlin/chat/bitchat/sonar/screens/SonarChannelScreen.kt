@@ -156,13 +156,13 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
                     value = draft, onValueChange = { state.setComposerDraft(draftKey, it) },
                     textStyle = TextStyle(color = s.text, fontSize = 16.sp),
                     cursorBrush = SolidColor(s.accent),
+                    currentDraft = { state.composerDraft(draftKey) },
                     modifier = Modifier.fillMaxWidth(),
-                    onSend = {
-                        if (draft.isBlank()) return@MessageComposerTextField
-                        val d = draft
+                    onSend = { typed ->
+                        if (typed.isBlank()) return@MessageComposerTextField
                         state.setComposerDraft(draftKey, "")
-                        if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
-                            state.sendChannelMsg(screen.geohash, d)
+                        if (!state.handleCommand(typed, name, channelGeohash = screen.geohash, chatId = null)) {
+                            state.sendChannelMsg(screen.geohash, typed)
                         }
                     },
                 )
@@ -171,7 +171,7 @@ fun SonarChannelScreen(state: SonarAppState, screen: Screen.Channel) {
             Box(
                 Modifier.size(46.dp).clip(CircleShape).background(s.netFill)
                     .clickable {
-                        val d = draft
+                        val d = state.composerDraft(draftKey)
                         state.setComposerDraft(draftKey, "")
                         if (!state.handleCommand(d, name, channelGeohash = screen.geohash, chatId = null)) {
                             state.sendChannelMsg(screen.geohash, d)
