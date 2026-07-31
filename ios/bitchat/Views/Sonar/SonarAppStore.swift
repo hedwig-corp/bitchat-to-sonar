@@ -1086,6 +1086,8 @@ final class SonarAppStore: ObservableObject {
     /// Built with `peerKeysIndex()` so `linkedNpub(forPeerKey:)` stays O(1) on
     /// `dmRows` instead of scanning favorites per row.
     private var npubByPeerKey: [String: String]?
+    /// 64-hex Noise key → its 16-hex short id. See `shortIdForNoiseKeyHex`.
+    private var shortIdByNoiseKeyHex: [String: String] = [:]
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
@@ -3821,11 +3823,22 @@ final class SonarAppStore: ObservableObject {
                     $0.prefix == .empty ? $0.bare : nil
                 },
                 aliases: Set(aliases),
-                shortIdForNoiseKeyHex: { hex in
-                    Data(hexString: hex).map { PeerID(publicKey: $0).bare }
-                }
+                shortIdForNoiseKeyHex: { [self] hex in shortIdForNoiseKeyHex(hex) }
             )
         )
+    }
+
+    /// `sha256` of a 64-hex Noise key, memoized. This runs per transcript
+    /// rebuild for every non-matching 64-hex bucket, and the derivation is a
+    /// pure function of an immutable string — so the cache never needs
+    /// invalidating, and it is bounded by the number of distinct peer keys the
+    /// store has ever held.
+    private func shortIdForNoiseKeyHex(_ hex: String) -> String? {
+        if let cached = shortIdByNoiseKeyHex[hex] { return cached }
+        guard let key = Data(hexString: hex) else { return nil }
+        let short = PeerID(publicKey: key).bare
+        shortIdByNoiseKeyHex[hex] = short
+        return short
     }
 
     /// Unique mesh message count across every bucket of this conversation — no

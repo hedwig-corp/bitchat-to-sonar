@@ -1709,7 +1709,10 @@ identity resolver canonicalises to the short id, so the transcript never named
 that bucket; `dmRows` did, because it folds *every* bucket through
 `canonicalPeerKey`. The two 64-hex shapes are the trap — the fingerprint is
 `sha256(noise key)` and the short id is its first 16 hex, so a raw Noise key
-shares no prefix with either. See `docs/CHAT-TYPES.md`, id shape 6.
+shares no **string prefix** with either, and only reduces to the alias by
+hashing (`canonicalPeerKey`'s `PeerID(publicKey:)` branch). Prefix-shortening a
+64-hex key — what `canonicalStoredKey` does — silently misses it. See
+`docs/CHAT-TYPES.md`, id shape 6.
 
 **Call sites:** iOS `SonarAppStore.meshPrivateChatKeys(forConversationId:)` →
 `snMeshNoiseKeyBuckets` / `snMeshPrivateChatKeys` / `snMergeMeshPrivateChats`,
