@@ -60,10 +60,18 @@ class DesktopSecretLossTest {
     }
 
     /**
-     * Identical copies are still cleaned up, so the warning banner can clear.
+     * A duplicate that MATCHES the keystore is still cleaned up, so the warning
+     * can clear.
+     *
+     * Only meaningful where a keystore actually exists. CI runners have neither
+     * `secret-tool` nor a keyring, so `put` legitimately falls back and there is
+     * no keystore copy to deduplicate against; asserting unconditionally made
+     * this fail on CI while passing locally, which is the environment-coupled
+     * shape these tests are supposed to avoid.
      */
     @Test
     fun anIdenticalPlaintextDuplicateIsStillRemoved() {
+        if (!DesktopSecrets.absenceIsTrustworthy()) return // no keystore here
         val key = "dbKeyHex"
         val value = "a".repeat(64)
         DesktopSecrets.put(key, value)
@@ -78,15 +86,25 @@ class DesktopSecretLossTest {
     }
 
     /**
-     * With a working keystore, absence is trustworthy, so first-run generation
-     * is still allowed. (The inverse — refusing to generate on a keystore fault
-     * — is enforced at the call sites in SonarCore and MeshIdentity.)
+     * The safety-critical direction, asserted without depending on whether this
+     * machine has a keystore: if absence is reported as trustworthy, a real
+     * round trip must actually succeed. Claiming trustworthiness wrongly is what
+     * lets a generate path overwrite a live account key.
+     *
+     * Where there is no keystore the function claims nothing, so there is
+     * nothing to check and the generate paths refuse instead.
      */
     @Test
-    fun absenceIsTrustworthyWhenTheKeystoreWorks() {
-        assertTrue(
-            DesktopSecrets.absenceIsTrustworthy(),
-            "a healthy keystore must allow first-run key generation",
+    fun trustworthyAbsenceImpliesTheKeystoreReallyWorks() {
+        if (!DesktopSecrets.absenceIsTrustworthy()) return // claims nothing
+        val probe = "nsec"
+        val value = "nsec1round-trip-proof"
+        DesktopSecrets.put(probe, value)
+        assertEquals(value, DesktopSecrets.get(probe), "the keystore must round-trip")
+        assertEquals(
+            emptyList(),
+            DesktopSecrets.storedInPlaintext(),
+            "a keystore reported as trustworthy must not have fallen back to plaintext",
         )
     }
 }
