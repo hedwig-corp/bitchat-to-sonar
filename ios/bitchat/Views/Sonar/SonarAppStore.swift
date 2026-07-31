@@ -697,9 +697,8 @@ func snFilterPeerKeysMatchingNpubHex(
     }.sorted()
 }
 
-/// Every `ChatViewModel.privateChats` key that can hold ONE mesh conversation's
-/// rows: its identity aliases plus, for each alias, the peer's 64-hex Noise
-/// public key.
+/// Which live `ChatViewModel.privateChats` keys hold ONE mesh conversation's
+/// rows under a 64-hex shape that no alias resolver produces.
 ///
 /// Identity/alias keys are canonical 16-hex short peer ids, but an incoming
 /// internet (NIP-17) DM is stored under the sender's **Noise public key hex**
@@ -711,25 +710,52 @@ func snFilterPeerKeysMatchingNpubHex(
 /// The chat list still shows it — `dmRows` folds every `privateChats` bucket
 /// through `canonicalPeerKey` — so a transcript reading aliases alone renders a
 /// conversation that is permanently behind its own home row.
+///
+/// Matching is derived from the STORE'S OWN KEYS, the same two derivations
+/// `canonicalPeerKey` uses (fingerprint prefix, or `PeerID(publicKey:)` over
+/// the raw Noise key). Nothing here consults favorites: a bucket must be
+/// reachable even when the peer↔npub link that once produced it is gone.
+func snMeshNoiseKeyBuckets(
+    bucketKeys: [String],
+    aliases: Set<String>,
+    shortIdForNoiseKeyHex: (String) -> String?
+) -> [String] {
+    var matched: [String] = []
+    for key in bucketKeys where key.count == 64 {
+        let hex = key.lowercased()
+        guard hex.allSatisfy(\.isHexDigit), !aliases.contains(hex) else { continue }
+        // A 64-hex key is either the peer's fingerprint (short id = its first
+        // 16 hex) or its raw Noise public key (short id = sha256 of the bytes).
+        if aliases.contains(String(hex.prefix(16)))
+            || shortIdForNoiseKeyHex(hex).map(aliases.contains) == true {
+            matched.append(hex)
+        }
+    }
+    return matched.sorted()
+}
+
+/// Every `privateChats` key that can hold this conversation's rows, aliases
+/// first. Order is the tie-break policy for `snMergeMeshPrivateChats`: the
+/// alias bucket is the one the send path appends to and updates in place
+/// (`sendPrivateMessage` marks `.sent` on a single bucket), so its copy of a
+/// row must win over a mirrored copy that may carry a staler delivery status.
 func snMeshPrivateChatKeys(
     aliases: [String],
-    noiseKeyHexByPeerKey: [String: [String]]
+    noiseKeyBuckets: [String]
 ) -> [String] {
     var keys: [String] = []
     var seen = Set<String>()
-    for alias in aliases where !alias.isEmpty {
-        if seen.insert(alias).inserted { keys.append(alias) }
-        for hex in noiseKeyHexByPeerKey[alias] ?? [] where !hex.isEmpty {
-            if seen.insert(hex).inserted { keys.append(hex) }
-        }
+    for key in aliases + noiseKeyBuckets where !key.isEmpty {
+        if seen.insert(key).inserted { keys.append(key) }
     }
     return keys
 }
 
 /// Merge the mesh rows stored under `keys` into one chronological transcript.
 /// A message can sit in several buckets at once (the live-peer mirror copies it
-/// onto the short id), so rows dedupe by message id. The single-bucket case
-/// keeps the pre-fold O(1) return — `privateChats` is already chronological.
+/// onto the short id), so rows dedupe by message id, FIRST key wins. The
+/// single-bucket case keeps the pre-fold O(1) return — `privateChats` is
+/// already chronological.
 func snMergeMeshPrivateChats(
     keys: [String],
     bucket: (String) -> [BitchatMessage]?
@@ -742,7 +768,9 @@ func snMergeMeshPrivateChats(
     if populated.count <= 1 { return populated.first ?? [] }
     var byId: [String: BitchatMessage] = [:]
     for messages in populated {
-        for message in messages { byId[message.id] = message }
+        for message in messages where byId[message.id] == nil {
+            byId[message.id] = message
+        }
     }
     // Tie-break on id: dictionary order is not stable, and same-second rows
     // would otherwise swap places between rebuilds (visible bubble jitter).
@@ -1045,11 +1073,6 @@ final class SonarAppStore: ObservableObject {
     /// Built with `peerKeysIndex()` so `linkedNpub(forPeerKey:)` stays O(1) on
     /// `dmRows` instead of scanning favorites per row.
     private var npubByPeerKey: [String: String]?
-    /// Canonical peer key → the 64-hex Noise public key(s) that key the SAME
-    /// peer's `privateChats` bucket for internet (NIP-17) DMs received while it
-    /// was out of BLE range. Built with `peerKeysIndex()` from the favorites
-    /// map — the very source `findNoiseKey(for:)` used to pick that storage key.
-    private var noiseKeyHexByPeerKey: [String: [String]]?
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
@@ -3654,14 +3677,12 @@ final class SonarAppStore: ObservableObject {
     private func invalidatePeerKeysIndex() {
         peerKeysByNpubHex = nil
         npubByPeerKey = nil
-        noiseKeyHexByPeerKey = nil
     }
 
     private func peerKeysIndex() -> [String: Set<String>] {
         if let cached = peerKeysByNpubHex { return cached }
         var index: [String: Set<String>] = [:]
         var reverse: [String: String] = [:]
-        var noiseKeyHex: [String: [String]] = [:]
         func insert(_ peerKey: String, npub: String) {
             guard !peerKey.isEmpty,
                   let data = Self.nostrPubkeyData(npub) else { return }
@@ -3675,14 +3696,8 @@ final class SonarAppStore: ObservableObject {
             insert(Self.canonicalStoredKey(key), npub: profile.npub)
         }
         for (noiseKey, rel) in FavoritesPersistenceService.shared.favorites {
-            let bare = PeerID(publicKey: noiseKey).bare
-            // Recorded for EVERY favorite, npub link or not: this is the peer's
-            // `privateChats` storage key for internet DMs received out of range.
-            let hex = noiseKey.hexEncodedString().lowercased()
-            if !bare.isEmpty, !hex.isEmpty, !(noiseKeyHex[bare] ?? []).contains(hex) {
-                noiseKeyHex[bare, default: []].append(hex)
-            }
             guard let nostr = rel.peerNostrPublicKey else { continue }
+            let bare = PeerID(publicKey: noiseKey).bare
             // Prefer Sonar 0x53 / fingerprint profile over a conflicting favorite
             // claim so the reverse index never indexes the same Noise key under
             // two npubs.
@@ -3697,7 +3712,6 @@ final class SonarAppStore: ObservableObject {
         }
         peerKeysByNpubHex = index
         npubByPeerKey = reverse
-        noiseKeyHexByPeerKey = noiseKeyHex
         return index
     }
 
@@ -3705,12 +3719,6 @@ final class SonarAppStore: ObservableObject {
     private func linkedNpubIndex() -> [String: String] {
         _ = peerKeysIndex()
         return npubByPeerKey ?? [:]
-    }
-
-    /// peerKey → 64-hex Noise public key(s), co-built with `peerKeysIndex()`.
-    private func noiseKeyHexIndex() -> [String: [String]] {
-        _ = peerKeysIndex()
-        return noiseKeyHexByPeerKey ?? [:]
     }
 
     /// Live BLE route for a conversation — may differ from the canonical fold
@@ -3788,12 +3796,22 @@ final class SonarAppStore: ObservableObject {
 
     /// Every `privateChats` bucket that can hold this conversation's mesh rows:
     /// the identity aliases, each alias's 64-hex Noise public key (where an
-    /// out-of-range internet DM lands — see `snMeshPrivateChatKeys`), and the
-    /// raw conversation id, which is what the pre-fold lookup fell back to.
+    /// out-of-range internet DM lands — see `snMeshNoiseKeyBuckets`, matched
+    /// against the store's own keys), and the raw conversation id, which is
+    /// what the pre-fold lookup fell back to.
     private func meshPrivateChatKeys(forConversationId id: String) -> [String] {
-        snMeshPrivateChatKeys(
-            aliases: meshPeerAliases(for: id) + [id],
-            noiseKeyHexByPeerKey: noiseKeyHexIndex()
+        let aliases = meshPeerAliases(for: id) + [id]
+        return snMeshPrivateChatKeys(
+            aliases: aliases,
+            noiseKeyBuckets: snMeshNoiseKeyBuckets(
+                bucketKeys: chatViewModel.privateChats.keys.compactMap {
+                    $0.prefix == .empty ? $0.bare : nil
+                },
+                aliases: Set(aliases),
+                shortIdForNoiseKeyHex: { hex in
+                    Data(hexString: hex).map { PeerID(publicKey: $0).bare }
+                }
+            )
         )
     }
 
@@ -5382,7 +5400,6 @@ final class SonarAppStore: ObservableObject {
                 }
             }
             if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
-                let via: SNVia = .mesh
                 let my = chatViewModel.meshService.myPeerID
                 dated += Self.transcriptSource(
                     meshPrivateMessages(forConversationId: id),
@@ -5390,6 +5407,11 @@ final class SonarAppStore: ObservableObject {
                     newestOffset: meshNewestOffset
                 ).compactMap { m in
                     let mine = m.senderPeerID == my
+                    // A received row carries its own transport (same rule as the
+                    // pay/call scanners). Without it, the internet replies this
+                    // source now surfaces would render as Bluetooth bubbles in a
+                    // chat whose header says the peer is out of range.
+                    let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
                         return nil
@@ -5479,7 +5501,7 @@ final class SonarAppStore: ObservableObject {
                 newestOffset: callNewestOffset
             )
         }
-        let via = dmTransport(id)
+        let conversationVia = dmTransport(id)
         let my = chatViewModel.meshService.myPeerID
         var dated: [(Date, SNMessage)] = Self.transcriptSource(
             meshPrivateMessages(forConversationId: id),
@@ -5487,6 +5509,10 @@ final class SonarAppStore: ObservableObject {
             newestOffset: meshNewestOffset
         ).compactMap { m in
             let mine = m.senderPeerID == my
+            // Additive over the conversation-level transport: a row KNOWN to
+            // have arrived over the internet says so, everything else (our own
+            // sends, BLE rows) keeps the conversation's current transport.
+            let via: SNVia = m.receivedViaInternet == true ? .internet : conversationVia
             switch payMapping(m.content, fallbackVia: via) {
             case .hidden:
                 return nil
