@@ -17,6 +17,26 @@ import java.security.SecureRandom
  * receives it shows this desktop as a real named peer.
  */
 object MeshIdentity {
+
+    /**
+     * Refuse to mint a replacement secret when a null might mean "unreadable"
+     * rather than "absent".
+     *
+     * Extracted so both mint sites share one rule and can be tested without a
+     * keystore. `keypair` was guarded and `seedHex` was not, which mattered more
+     * than it looks: `seedHex` is the LEFTMOST argument at both
+     * `meshBuildAnnounce`/`meshBuildSignedPacket` call sites, so Kotlin's
+     * left-to-right evaluation forces it BEFORE `peerIdHex` forces `keypair`.
+     * On a locked keyring it therefore minted and persisted a new seed, and only
+     * then did `keypair` throw into a `runCatching` that swallowed it. The next
+     * healthy launch saw keystore and prefs disagree, treated prefs as newer (it
+     * normally is), and made the rotation permanent.
+     */
+    internal fun requireTrustworthyAbsence(existing: String?, trustworthy: Boolean, what: String) {
+        check(existing != null || trustworthy) {
+            "$what unreadable (keystore fault); refusing to regenerate and rotate the mesh identity"
+        }
+    }
     private const val DEFAULT_TTL: UByte = 7u
     private const val TYPE_SONAR: UByte = 0x53u
 
@@ -45,6 +65,8 @@ object MeshIdentity {
             // Half-readable means a transient keystore fault, not a first run.
             error("mesh identity is only half-readable; refusing to regenerate and rotate the mesh fingerprint")
         } else if (!DesktopSecrets.absenceIsTrustworthy()) {
+            // Same rule as requireTrustworthyAbsence, kept explicit here because
+            // this branch also has to distinguish the half-readable case above.
             // BOTH halves unreadable is the COMMON keystore fault (locked
             // keyring, no D-Bus session), and it is indistinguishable from a
             // first run by the return value alone: `secret-tool lookup` exits 1
@@ -64,7 +86,13 @@ object MeshIdentity {
     private val seedHex: String by lazy {
         // Signs the 0x01 announce and the 0x53 Sonar Discovery packet, so a peer
         // that holds it can forge either. Same storage as the Noise key.
-        DesktopSecrets.get("mesh.ed25519.seed")
+        val existing = DesktopSecrets.get("mesh.ed25519.seed")
+        requireTrustworthyAbsence(
+            existing,
+            DesktopSecrets.absenceIsTrustworthy(),
+            "mesh announce seed",
+        )
+        existing
             ?: hex(ByteArray(32).also { SecureRandom().nextBytes(it) })
                 .also { DesktopSecrets.put("mesh.ed25519.seed", it) }
     }

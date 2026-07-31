@@ -5,6 +5,7 @@ import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
@@ -106,5 +107,48 @@ class DesktopSecretLossTest {
             DesktopSecrets.storedInPlaintext(),
             "a keystore reported as trustworthy must not have fallen back to plaintext",
         )
+    }
+
+    /**
+     * The mesh announce seed must not be re-minted when the keystore is merely
+     * unreadable.
+     *
+     * This is the two-launch failure the guard exists for. Launch one, keyring
+     * locked: `get` returns null, the seed is minted and (because the keystore
+     * is down) written to prefs. Launch two, keyring healthy: keystore holds the
+     * ORIGINAL seed, prefs holds the fabricated one, they differ, and the
+     * "prefs is newer" reconciliation pushes the fabricated seed into the
+     * keystore and drops the original. One locked-keyring launch permanently
+     * rotates the announce-signing identity, and peers then reject the 0x53
+     * discovery packet as unverified.
+     *
+     * The reconciliation rule itself is correct; what violated its precondition
+     * was an unguarded mint writing a FABRICATED value into prefs.
+     */
+    @Test
+    fun anUnreadableKeystoreDoesNotMintAMeshSeed() {
+        val failure = assertFailsWith<IllegalStateException> {
+            MeshIdentity.requireTrustworthyAbsence(
+                existing = null,
+                trustworthy = false,
+                what = "mesh announce seed",
+            )
+        }
+        assertTrue(
+            failure.message?.contains("refusing to regenerate") == true,
+            "the refusal must say why: ${failure.message}",
+        )
+    }
+
+    /** A readable keystore that genuinely has no seed must still allow a first run. */
+    @Test
+    fun aTrustworthyAbsenceStillAllowsFirstRunMinting() {
+        MeshIdentity.requireTrustworthyAbsence(null, trustworthy = true, what = "mesh announce seed")
+    }
+
+    /** An existing value is never blocked, whatever the keystore is doing. */
+    @Test
+    fun anExistingSeedIsNeverBlocked() {
+        MeshIdentity.requireTrustworthyAbsence("abc", trustworthy = false, what = "mesh announce seed")
     }
 }
