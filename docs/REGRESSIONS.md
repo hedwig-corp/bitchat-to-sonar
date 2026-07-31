@@ -1754,6 +1754,188 @@ store at fix time — 146 rows across 6 conversations were unreachable.
 
 ---
 
+## R-031 — A connect in flight at suspension must be abortable, not merely awaited
+
+**Invariant:** every path that can hold the SQLCipher store open must be
+reachable by the suspend hook — including the one that *opens* it.
+`SonarNode.connect` is handed a host-owned `SonarSuspendLatch`, created and
+registered **before** the constructor runs, so `interruptNodeForSuspend()` can
+abort a connect that has no node yet. And the connect's lifecycle lease spans
+its whole store-holding window — from before the App Group flock to after the
+node is installed or the flock abandoned — so `closeNode()` never returns while
+this connect still holds something.
+
+**Breaks as:** `RUNNINGBOARD 0xdead10cc`, round 6 — TestFlight **1.12.3 (31)**,
+killed **91s** after launch. Distinguishing feature versus rounds 1-5: exactly
+one thread was touching the node, and it was in `MarmotService.connectNode` →
+`SonarNode::connect` → `SonarClient::connect`, parked in a bare
+`runtime.block_on` — *not* `block_on_suspendable`. No lease loop, no `sync_once`,
+no `register_push_token`, and no drain to overrun a window. There was no node at
+all. The reporter's other symptom is the same fault seen from the UI: a connect
+that never completes opens no relay subscriptions, so a radar scan finds nobody
+over nostr ("the scan turned up no one either via bluetooth or nostr, and then
+crashed").
+
+**Why:** `SonarClient::connect` opens SQLCipher **first**
+(`MarmotEngine::persistent`) and only then awaits — the relay quorum wait, then
+`subscribe_marmot()` and `retry_outbox()` at the end of `with_engine`. Those last
+two are on R-016's *suspendable* list as standalone FFI methods, precisely
+because they park; inside the constructor they park with the store open and
+nothing to latch, because `SonarNode` — which owns the latch — is the value
+`connect` has not returned yet. `interruptNodeForSuspend()` reads `node`, sees
+nil, and no-ops. `closeNode()` then does the only thing left: parks on
+`nodeLifecycleGroup.notify` waiting for the connect's lease, the
+`beginBackgroundTask` grace expires, RunningBoard collects us.
+
+**This is the mirror image of round 3.** R-016 asked "which calls can park the
+close?" and answered with a list of methods *on a node*. The question it did not
+ask is what holds the store before there is a node to enumerate methods on. The
+latch therefore had to move out of `SonarNode` into its own object the host can
+hold first; `SonarNode` keeps the one it was passed, so `interrupt_for_suspend()`
+and a mid-connect latch are one object and one code path rather than two
+mechanisms that must agree.
+
+**Extending the lease is part of the fix, not tidying.** The lease used to be
+created inside `connectNode` and released in *its* error path, while the store
+lock was abandoned one frame later in `connect()`'s `catch`. So a failing connect
+could release the lease — letting `closeNode()` return and `endBackgroundTask()`
+fire — with the App Group flock still held: the same kill by a narrower margin.
+That window was theoretical while connects failed rarely and never at a
+correlated moment. Latching them makes "connect fails exactly as we suspend" the
+**common** case, so the fix would have manufactured its own next round.
+
+**Two ordering rules the review pass extracted, both load-bearing.** The first
+draft of this fix got each wrong, and each failure mode is a fresh instance of
+the crash it fixes:
+
+1. *The pending-latch registry is a list, not one optional.* `connect()` has no
+   single-flight guard of its own — it depends on `relayBusy` in
+   `MarmotChatView.connectRelaysIfNeeded`, a flag in another file that no test
+   pins (the R-001 shape). With a single slot, a second connect registering
+   orphans the first connect's latch while its `SonarNode.connect` still holds
+   SQLCipher open, and nothing can ever reach that orphan again. Holding every
+   in-flight latch keeps the invariant inside `MarmotService` rather than
+   resting on a caller's flag.
+2. *Register the latch BEFORE acquiring the store lock.*
+   `registerPendingConnectLatch()` throws `.cancelled` when a close has fenced
+   us, and the `catch` that calls `abandonStoreLockHold` sits below it. Taking
+   the flock first leaks it on exactly that throw — and a held App Group flock
+   with no open handle is its own 0xdead10cc ingredient, since RunningBoard
+   kills for the *lock*, not for the handle.
+
+**Why an install can never carry an already-fired latch** — the obvious next
+worry, and it is closed by construction rather than by timing.
+`interruptNodeForSuspend()` sets `nodeClosing` and snapshots the latch list in
+**one** `nodeLock` hold, and the install checks `nodeClosing` under that same
+lock before assigning `service.node`. So either the latch fired first and the
+install bails (the node is dropped, closing its handle), or the install won and
+the node is reached by the ordinary `liveNode?.interruptForSuspend()` line. The
+`nodeClosing` clear that would reopen the gap cannot overtake the install
+either: it lives below `closeNode`'s `nodeLifecycleGroup.notify`, and the
+connect holds its lease until after the install.
+
+**What the latch cannot do, stated honestly:** a dropped future stops at an
+*await* point, so the abort covers the relay quorum wait, `subscribe_marmot` and
+`retry_outbox` — the unbounded, network-shaped part, and the part the crash log
+shows. It does **not** cover the synchronous prologue: the SQLCipher open, MDK
+migrations, and `materialize_index_if_empty()`. Those have no await points, and
+no Swift-side deadline can bound them either (R-028 established that
+`withTimeout` cannot interrupt Rust). If a future round shows a thread inside
+`MarmotEngine::persistent` rather than in a relay wait, this entry does not cover
+it and the answer is to make that work interruptible in Rust, not to add another
+timer.
+
+`connectLocal` is deliberately **not** latched, and the reason is a trade, not
+that a latch is useless there. Be precise about what it would buy, because an
+earlier draft of this entry overclaimed and a review caught it: with no relays
+there is no quorum wait and `subscribe_marmot` / `retry_outbox` return
+immediately against an empty pool, so a latch could never *abort* anything on
+that path — everything it holds the store for is synchronous. What a latch would
+still buy is the `biased` select's **pre-check**: a refusal to open SQLCipher at
+all, at a checkpoint later than `connectLocal`'s own opening
+`guard !service.nodeClosing`. The gap between the two is real, mostly the
+blocking flock in `prepareStoreLockForConnectSync()`.
+
+It is declined anyway because the refusal is the expensive part.
+`suspendStoreForBackground()` fires unconditionally on background — it is not
+gated on a restore in progress — so a suspend landing in that window fails
+`performConnect()`, and `restoreIdentity`'s `guard await performConnect() else`
+rolls back through `wipeDatabase()`. That branch does protect the account key (a
+`.restored` outcome throws before the wipe; a first-time import never deletes its
+nsec), so this was never account loss. But widening a wipe path to fix a crash on
+a different path is the wrong trade, and the Account Key Durability Rule makes it
+a blocking one to get wrong. Note the trade is not latch-specific: a plain
+`nodeClosing` re-check placed there would fail `performConnect()` identically.
+
+**The residual hole this leaves, named rather than waved away:** a background
+transition landing after `connectLocal`'s guard still opens the store, and the
+close then queues behind that whole synchronous span on `workQueue`. It is
+bounded by local disk work (SQLCipher open, MDK migrations, and
+`materialize_index_if_empty` on a first run after upgrade) rather than by an
+unbounded network wait, which is why it is out of scope here and why the crash
+log shows the relay path. It is **pre-existing** — this is exactly the state
+`main` is in — and closing it needs the synchronous prologue to become
+interruptible in Rust, not another Swift checkpoint.
+
+**Call sites:** iOS `MarmotService.connect` (lease + latch registration),
+`MarmotService.pendingConnectLatches` / `registerPendingConnectLatch` /
+`clearPendingConnectLatch` (the registry),
+`MarmotService.connectNode`,
+`MarmotService.interruptNodeForSuspend` (the flip), and the `closeNode` /
+`wipeDatabase` hops (belt-and-braces flip); core
+`SonarNode::connect` / `SonarSuspendLatch` in `core/sonar-ffi/src/lib.rs`.
+`NotificationService.swift` passes `nil` deliberately — the NSE is a separate
+process with no scene-phase hook, bounded by
+`serviceExtensionTimeWillExpire` instead. **Not applicable to Compose**, for the
+same reason as R-016/R-020/R-028: no RunningBoard file-lock kill and no fixed
+suspend deadline. Android and desktop pass `null` at all three
+`SonarNode.connect` sites in `SonarCore.android.kt` / `SonarCore.jvm.kt`, each
+annotated so the asymmetry is visible from the call site rather than only here.
+
+**Guarded by:** `sonar_ffi::tests::prelatched_connect_aborts_without_opening_the_store`, `sonar_ffi::tests::latch_aborts_in_flight_connect`
+
+**Coverage (honest):** unusually good for a 0xdead10cc entry — the mechanism is
+in Rust, so it is testable, and both tests fail against the pre-fix constructor
+with `unexpected error: no relay connected within timeout` rather than by timing
+out (verified, not assumed). `latch_aborts_in_flight_connect` pins the real
+crash shape: the store is open, the connect is parked in a relay wait against an
+unroutable address, and only the latch can end it.
+
+**Not guarded — and it is the Swift half, again.** Nothing pins that
+`interruptNodeForSuspend()` flips `pendingConnectLatch`, that `connect()`
+registers one before taking the store lock, or that the lease outlives
+`abandonStoreLockHold`. Deleting any of the three leaves both Rust tests green,
+because they call the FFI directly. That is the R-001 shape and it is recorded as
+one: `MarmotService` is a singleton over live FFI, no iOS test constructs it, and
+iOS tests do not run in CI regardless ([[ios-not-built-in-ci]]). Real
+verification is a TestFlight build backgrounded during a cold relay connect with
+relays slow or unreachable — the `SecureLogger` line the connect abort produces
+(`connect interrupted for suspend`, category `.session`) is visible in a
+Settings → Diagnostics → Share capture.
+
+**History:** #446 (round 1) -> #448 (round 2) -> #449 / R-016 (round 3) ->
+R-020 (round 4, reopen after close) -> #538 / R-028 (round 5, close never
+reached) -> build 31 crash (round 6: nothing to close *yet*) -> this fix.
+
+**Rejected:**
+- *Bounding the connect from Swift with `withTimeout` / a deadline task.* R-028
+  already established that `withThrowingTaskGroup` awaits its children, so the
+  deadline expires and then waits for the Rust park anyway. The only thing that
+  can end a `block_on` is dropping the future inside it.
+- *Closing the store from the close side by releasing the flock without the
+  handle.* `closeStoreAfterBackgroundWake()` states the contract: never unlock
+  under an open handle, or the NSE opens the same store and two processes commit
+  against one MLS state. Trading a background kill for a forked group is worse.
+- *Deferring the SQLCipher open until after the relay quorum,* so the parked
+  window holds no file. It inverts the local-first ordering the whole Signal
+  Comparable Performance Rule depends on — the store open is what makes first
+  paint possible before the network — and it would leave `retry_outbox`, which
+  needs the store, holding it anyway.
+- *Making `connect` non-blocking at the FFI boundary* (return a handle, poll it).
+  A larger change with the same reachability problem: something still owns an
+  open store between "started" and "installed", and every host would need
+  rewriting for a crash that only one host can suffer.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

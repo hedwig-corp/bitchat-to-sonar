@@ -852,6 +852,44 @@ pub fn sonar_render_notification(
     core_render_notification(notification_render_input(input)).map(notification_envelope_info)
 }
 
+/// One-way "the host is about to be suspended" latch.
+///
+/// Exists as its own object — rather than living only inside `SonarNode` — so
+/// the host can hold one *before* a node exists. `SonarNode::connect` opens
+/// SQLCipher and then awaits the relay quorum, `subscribe_marmot` and
+/// `retry_outbox`; a connect still in flight when iOS suspends therefore holds
+/// the store open with no node to call `interrupt_for_suspend()` on, and the
+/// close queues behind it until RunningBoard kills the process with
+/// 0xdead10cc (`docs/REGRESSIONS.md`, R-031). Passing a latch into `connect`
+/// closes that window: the host latches it from its scene-phase suspend hook
+/// and the connect drops its future at the next await point.
+///
+/// One-way for its lifetime: a reconnect builds a fresh node and takes a fresh
+/// latch, so it never needs resetting. Non-blocking and safe from any thread.
+#[derive(uniffi::Object)]
+pub struct SonarSuspendLatch {
+    tx: tokio::sync::watch::Sender<bool>,
+}
+
+#[uniffi::export]
+impl SonarSuspendLatch {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tx: tokio::sync::watch::Sender::new(false),
+        })
+    }
+
+    /// Abort the latched work and make every later latched call fail fast.
+    pub fn interrupt(&self) {
+        let _ = self.tx.send_replace(true);
+    }
+
+    pub fn is_interrupted(&self) -> bool {
+        *self.tx.borrow()
+    }
+}
+
 /// A relay-connected Sonar node. Owns its own tokio runtime; every method is
 /// blocking — call from a background queue in Swift, never the main thread.
 #[derive(uniffi::Object)]
@@ -862,8 +900,10 @@ pub struct SonarNode {
     /// methods select against it so an imminent iOS suspension can abort them
     /// instead of holding the SQLCipher store past the background deadline
     /// (RunningBoard 0xdead10cc). Reconnect builds a fresh node, so the latch
-    /// never needs resetting.
-    suspend_interrupt: tokio::sync::watch::Sender<bool>,
+    /// never needs resetting. This is the SAME latch the host passed to
+    /// `connect`, when it passed one — so a host that latches mid-connect and a
+    /// host that latches after install use one object and one code path.
+    suspend_interrupt: Arc<SonarSuspendLatch>,
     /// Lazily-started P2P call engine (iroh + cpal/opus). Cloned out under a short
     /// lock so a long `call_wait_event` park never blocks `call_hangup` etc.
     #[cfg(feature = "calls-audio")]
@@ -894,7 +934,7 @@ impl SonarNode {
         what: &str,
         fut: impl std::future::Future<Output = Result<T, sonar_core::Error>>,
     ) -> FfiResult<T> {
-        let mut interrupted = self.suspend_interrupt.subscribe();
+        let mut interrupted = self.suspend_interrupt.tx.subscribe();
         self.runtime.block_on(async {
             tokio::select! {
                 biased;
@@ -920,12 +960,28 @@ impl SonarNode {
     /// - `db_key_hex`: 64-char hex of the 32-byte SQLCipher key. The host owns
     ///   this key (Keychain on iOS) and passes the SAME value every launch so the
     ///   existing database reopens. Marmot groups/messages persist across restarts.
+    /// - `suspend_latch`: optional host-held [`SonarSuspendLatch`], created
+    ///   BEFORE this call and registered where the host's suspend hook can reach
+    ///   it. Latching it aborts the connect at its next await point instead of
+    ///   leaving SQLCipher open for the rest of the relay quorum wait,
+    ///   `subscribe_marmot` and `retry_outbox` — the R-031 0xdead10cc window,
+    ///   which no post-hoc `interrupt_for_suspend()` can reach because the node
+    ///   it lives on does not exist yet. On abort nothing is installed: the
+    ///   half-built client (and its store handle) is dropped and the error
+    ///   carries [`SUSPEND_INTERRUPT_MARKER`]. Pass `None` on hosts with no
+    ///   suspend deadline (Android/desktop) — the node then makes its own latch.
+    ///
+    /// The abort is safe for the same reason `block_on_suspendable`'s is: a
+    /// dropped future stops at an await point, and everything before the first
+    /// one here — the SQLCipher open and MLS engine construction — either
+    /// completed or never began. No MLS commit spans an await.
     #[uniffi::constructor]
     pub fn connect(
         identity: Arc<SonarIdentity>,
         relay_urls: Vec<String>,
         db_path: String,
         db_key_hex: String,
+        suspend_latch: Option<Arc<SonarSuspendLatch>>,
     ) -> FfiResult<Arc<Self>> {
         if db_path.is_empty() {
             return Err(SonarFfiError::InvalidInput("db_path is empty".into()));
@@ -940,16 +996,30 @@ impl SonarNode {
             .enable_all()
             .build()
             .map_err(|e| SonarFfiError::Core(format!("tokio runtime: {e}")))?;
-        let client = runtime.block_on(SonarClient::connect(
-            identity.inner.clone(),
-            relays,
-            &db_path,
-            db_key,
-        ))?;
+        let suspend_interrupt = suspend_latch.unwrap_or_else(SonarSuspendLatch::new);
+        let mut interrupted = suspend_interrupt.tx.subscribe();
+        // `biased` matters: an already-latched host must never reach the
+        // SQLCipher open at all. The connect future's body does not run until
+        // it is first polled, so losing this race means the store was never
+        // touched.
+        let client = runtime.block_on(async {
+            tokio::select! {
+                biased;
+                _ = interrupted.wait_for(|suspending| *suspending) => Err(
+                    SonarFfiError::Core(format!("connect {SUSPEND_INTERRUPT_MARKER}"))
+                ),
+                result = SonarClient::connect(
+                    identity.inner.clone(),
+                    relays,
+                    &db_path,
+                    db_key,
+                ) => result.map_err(Into::into),
+            }
+        })?;
         Ok(Arc::new(Self {
             runtime,
             client,
-            suspend_interrupt: tokio::sync::watch::Sender::new(false),
+            suspend_interrupt,
             #[cfg(feature = "calls-audio")]
             call: Mutex::new(None),
         }))
@@ -964,8 +1034,12 @@ impl SonarNode {
     /// holds the SQLCipher store past that deadline and RunningBoard kills the
     /// process with 0xdead10cc. Non-blocking and safe from any thread. One-way
     /// for this node's lifetime; reconnect constructs a fresh node.
+    ///
+    /// Only reaches work running on an *installed* node. A connect still in
+    /// flight has no node to call this on — the host must pass a
+    /// [`SonarSuspendLatch`] to `connect` and latch that instead (R-031).
     pub fn interrupt_for_suspend(&self) {
-        let _ = self.suspend_interrupt.send_replace(true);
+        self.suspend_interrupt.interrupt();
     }
 
     /// Publish our kind-30443 KeyPackage so others can start groups with us.
@@ -3513,6 +3587,7 @@ mod tests {
             relay_urls,
             db_path,
             "ab".repeat(32),
+            None,
         )
         .expect("local node connects")
     }
@@ -3574,6 +3649,96 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "interrupted relay calls must not park ({}s)",
             started.elapsed().as_secs()
+        );
+    }
+
+    /// 0xdead10cc round 6 (TestFlight 1.12.3 build 31, R-031): the calls above
+    /// also run *inside* `SonarClient::connect`, where there is no node yet to
+    /// interrupt. A latch the host created BEFORE the connect must abort it —
+    /// and when the latch is already set, must do so without ever opening
+    /// SQLCipher, since an unopened store is one the close has nothing to wait
+    /// for.
+    #[test]
+    fn prelatched_connect_aborts_without_opening_the_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("marmot.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let latch = SonarSuspendLatch::new();
+        latch.interrupt();
+        assert!(latch.is_interrupted());
+
+        let started = std::time::Instant::now();
+        let err = SonarNode::connect(
+            SonarIdentity::generate(),
+            vec!["wss://relay.example".into()],
+            db_path.clone(),
+            "ab".repeat(32),
+            Some(latch),
+        )
+        .err()
+        .expect("a latched connect must not produce a node");
+        assert!(
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "latched connect must not park ({}s)",
+            started.elapsed().as_secs()
+        );
+        // The store file is the whole point: RunningBoard kills us for holding
+        // an *open* protected file, so a connect that loses the race must leave
+        // nothing behind for the close to release.
+        assert!(
+            !std::path::Path::new(&db_path).exists(),
+            "latched connect must not have opened SQLCipher"
+        );
+    }
+
+    /// The in-flight half of R-031: a connect that has already opened the store
+    /// and is parked awaiting relays must abort when the host latches, rather
+    /// than run to the end of its quorum wait. Uses an unroutable relay so the
+    /// connect is genuinely parked in the network wait when the latch fires.
+    #[test]
+    fn latch_aborts_in_flight_connect() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir
+            .path()
+            .join("marmot.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let latch = SonarSuspendLatch::new();
+        let connecting = {
+            let latch = latch.clone();
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let result = SonarNode::connect(
+                    SonarIdentity::generate(),
+                    vec!["wss://192.0.2.1:4443".into()],
+                    db_path,
+                    "ab".repeat(32),
+                    Some(latch),
+                );
+                (result, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        latch.interrupt();
+        let (result, elapsed) = connecting.join().expect("connect thread joins");
+        let err = result
+            .err()
+            .expect("interrupted connect must not produce a node");
+        assert!(
+            err.to_string().contains(SUSPEND_INTERRUPT_MARKER),
+            "unexpected error: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "in-flight connect must abort on latch ({}s)",
+            elapsed.as_secs()
         );
     }
 
@@ -3714,7 +3879,8 @@ mod tests {
                 id.clone(),
                 vec!["not-a-url".into()],
                 db.clone(),
-                key.clone()
+                key.clone(),
+                None
             ),
             Err(SonarFfiError::InvalidInput(_))
         ));
@@ -3724,13 +3890,14 @@ mod tests {
                 id.clone(),
                 vec!["wss://relay.example".into()],
                 db.clone(),
-                "abcd".into()
+                "abcd".into(),
+                None
             ),
             Err(SonarFfiError::InvalidInput(_))
         ));
         // empty db path
         assert!(matches!(
-            SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key),
+            SonarNode::connect(id, vec!["wss://relay.example".into()], String::new(), key, None),
             Err(SonarFfiError::InvalidInput(_))
         ));
     }
@@ -3747,7 +3914,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         );
-        let node = SonarNode::connect(id, vec![], db.clone(), key).unwrap();
+        let node = SonarNode::connect(id, vec![], db.clone(), key, None).unwrap();
         assert!(node.call_wait_event(0).is_none());
         let _ = wipe_marmot_database(db);
     }

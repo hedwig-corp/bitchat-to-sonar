@@ -430,18 +430,38 @@ final class MarmotService: @unchecked Sendable {
         let attachEpoch = relayEpoch
         nodeLock.unlock()
         let (dbPath, dbKeyHex) = try Self.databaseConfig()
+        // The lease and the latch are taken BEFORE the store lock, and the lease
+        // is released only when this whole function unwinds. Both boundaries
+        // matter for the close: the lease used to start inside `connectNode` and
+        // end in its error path, so a failing connect could release it — letting
+        // `closeNode()` return and `endBackgroundTask` fire — while this function
+        // had not yet reached `abandonStoreLockHold`. iOS then suspends us
+        // holding the App Group flock, which is the same kill by a narrower
+        // margin. Latching the connect makes that failure the COMMON case, so
+        // the window has to be closed in the same change.
+        let connectLatch = try registerPendingConnectLatch()
+        let connectLease = NodeLifecycleLease(group: nodeLifecycleGroup)
+        defer {
+            clearPendingConnectLatch(connectLatch)
+            connectLease.release()
+        }
         #if os(iOS)
         // Reuse connectLocal's lock when present — a second blocking flock on a
         // new fd deadlocks the same process on Darwin (EWOULDBLOCK / hang).
         let storeLockHold = try await prepareStoreLockForConnect()
         #endif
-        let (node, nodeLease): (SonarNode, NodeLifecycleLease)
+        let node: SonarNode
         do {
-            (node, nodeLease) = try await connectNode(
+            // Cheap recheck: the flock acquire above runs on `workQueue` and can
+            // itself take time, so a suspend landing during it should not go on
+            // to open SQLCipher.
+            guard !connectLatch.isInterrupted() else { throw ServiceError.cancelled }
+            node = try await connectNode(
                 identity: identity,
                 relayUrls: relayUrls,
                 dbPath: dbPath,
-                dbKeyHex: dbKeyHex
+                dbKeyHex: dbKeyHex,
+                suspendLatch: connectLatch
             )
         } catch {
             #if os(iOS)
@@ -449,7 +469,6 @@ final class MarmotService: @unchecked Sendable {
             #endif
             throw error
         }
-        defer { nodeLease.release() }
         let installed = await runNonThrowing { service in
             guard service.sessionGeneration == generation,
                   service.snapshotIdentity()?.npub() == identity.npub()
@@ -526,11 +545,21 @@ final class MarmotService: @unchecked Sendable {
             #endif
             let node: SonarNode
             do {
+                // Deliberately NOT latched — see R-031 for the full trade. With
+                // no relays there is nothing to await, so a latch could not
+                // abort anything here; it could only *refuse to start*, one
+                // checkpoint later than the `nodeClosing` guard above. That
+                // refusal is the expensive part: a suspend landing during an
+                // nsec restore would fail `performConnect()`, and
+                // `restoreIdentity`'s `guard … else` rolls back through
+                // `wipeDatabase()`. A plain `nodeClosing` re-check here would
+                // cost exactly the same, so this is not about the latch.
                 node = try SonarNode.connect(
                     identity: identity,
                     relayUrls: [],
                     dbPath: dbPath,
-                    dbKeyHex: dbKeyHex
+                    dbKeyHex: dbKeyHex,
+                    suspendLatch: nil
                 )
             } catch {
                 #if os(iOS)
@@ -1461,12 +1490,21 @@ final class MarmotService: @unchecked Sendable {
     /// `nodeClosing` is cleared again by `closeNode(keepClosed: false)` and by
     /// `wipeDatabase()`, so fencing early only widens the window in which new
     /// leases and installs are refused — which is what a close wants anyway.
+    ///
+    /// The pending-connect latch is flipped in the SAME snapshot as the node. A
+    /// connect between `registerPendingConnectLatch()` and installing its node
+    /// has an open SQLCipher store and no `node` for `interruptForSuspend()` to
+    /// reach — that is the whole of R-031 — and the `nodeClosing` fence alone
+    /// cannot help, because that connect is already past its guard and parked in
+    /// uncancellable Rust.
     private func interruptNodeForSuspend() {
         nodeLock.lock()
         nodeClosing = true
         let liveNode = node
+        let pendingLatches = pendingConnectLatches
         nodeLock.unlock()
         liveNode?.interruptForSuspend()
+        pendingLatches.forEach { $0.interrupt() }
     }
 
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
@@ -1497,6 +1535,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.nodeClosing = true
             let removedNode = service.node
+            // Not cleared: the connect that registered each one owns that.
+            // Latching a stale entry is harmless — they are one-way and their
+            // connect is gone.
+            let pendingLatches = service.pendingConnectLatches
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1510,6 +1552,7 @@ final class MarmotService: @unchecked Sendable {
             // would otherwise leave a live, un-latched node whose blocking FFI
             // keeps the SQLCipher handle open past this close. Idempotent.
             removedNode?.interruptForSuspend()
+            pendingLatches.forEach { $0.interrupt() }
             service.setIdentity(nil)
             return ()
         }
@@ -1568,6 +1611,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.nodeClosing = true
             let removedNode = service.node
+            // Not cleared: the connect that registered each one owns that.
+            // Latching a stale entry is harmless — they are one-way and their
+            // connect is gone.
+            let pendingLatches = service.pendingConnectLatches
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1581,6 +1628,7 @@ final class MarmotService: @unchecked Sendable {
             // would otherwise leave a live, un-latched node whose blocking FFI
             // keeps the SQLCipher handle open past this close. Idempotent.
             removedNode?.interruptForSuspend()
+            pendingLatches.forEach { $0.interrupt() }
             return ()
         }
         await withCheckedContinuation { continuation in
@@ -1982,12 +2030,17 @@ final class MarmotService: @unchecked Sendable {
     }
     #endif
 
+    /// The caller owns the lifecycle lease and the suspend latch — see
+    /// `connect()`. This function must not shorten either: the store is open
+    /// from inside `SonarNode.connect` until the caller has installed the node
+    /// or abandoned its store lock.
     private func connectNode(
         identity: SonarIdentity,
         relayUrls: [String],
         dbPath: String,
-        dbKeyHex: String
-    ) async throws -> (SonarNode, NodeLifecycleLease) {
+        dbKeyHex: String,
+        suspendLatch: SonarSuspendLatch
+    ) async throws -> SonarNode {
         try await withCheckedThrowingContinuation { continuation in
             nodeLock.lock()
             guard !nodeClosing else {
@@ -1995,7 +2048,6 @@ final class MarmotService: @unchecked Sendable {
                 continuation.resume(throwing: ServiceError.cancelled)
                 return
             }
-            let lease = NodeLifecycleLease(group: nodeLifecycleGroup)
             relayConnectQueue.async {
                 do {
                     // Diagnostics file sink must exist before the node spins
@@ -2005,11 +2057,11 @@ final class MarmotService: @unchecked Sendable {
                         identity: identity,
                         relayUrls: relayUrls,
                         dbPath: dbPath,
-                        dbKeyHex: dbKeyHex
+                        dbKeyHex: dbKeyHex,
+                        suspendLatch: suspendLatch
                     )
-                    continuation.resume(returning: (node, lease))
+                    continuation.resume(returning: node)
                 } catch let error as SonarFfiError {
-                    lease.release()
                     switch error {
                     case .InvalidInput(let message):
                         continuation.resume(throwing: ServiceError.invalidInput(message))
@@ -2017,7 +2069,6 @@ final class MarmotService: @unchecked Sendable {
                         continuation.resume(throwing: ServiceError.core(message))
                     }
                 } catch {
-                    lease.release()
                     continuation.resume(throwing: error)
                 }
             }
@@ -2173,6 +2224,50 @@ final class MarmotService: @unchecked Sendable {
     private let nodeLock = NSLock()
     private let nodeLifecycleGroup = DispatchGroup()
     private var nodeClosing = false
+    /// Suspend latch for a connect that has NOT installed its node yet.
+    ///
+    /// `SonarNode.connect` opens SQLCipher and then awaits the relay quorum,
+    /// `subscribe_marmot` and `retry_outbox` — the store is live for all of it,
+    /// but `node` is still nil, so `interruptNodeForSuspend()` has nothing to
+    /// latch and `closeNode()` can only park on `nodeLifecycleGroup` until the
+    /// connect returns on its own. On TestFlight 1.12.3 (31) it did not, and
+    /// RunningBoard killed the process 0xdead10cc (R-031). This holds the latch
+    /// the connect was handed, so the suspend hook can abort it in flight.
+    /// Guarded by `nodeLock`; each entry is owned and removed by the connect
+    /// that registered it, never by the close.
+    ///
+    /// A **collection**, not one optional, and that is load-bearing. `connect()`
+    /// has no single-flight guard of its own — it relies on `relayBusy` in
+    /// `MarmotChatView.connectRelaysIfNeeded`, a flag in another file that no
+    /// test pins. With one slot, a second connect registering would orphan the
+    /// first connect's latch while its `SonarNode.connect` still held SQLCipher
+    /// open, and the orphan is unreachable forever after: that is R-031 again,
+    /// reintroduced by the fix for it. Holding every in-flight latch keeps the
+    /// invariant inside this file instead of depending on a caller's flag.
+    private var pendingConnectLatches: [SonarSuspendLatch] = []
+
+    /// Register a latch for a connect that is about to open the store, atomically
+    /// with the close fence: either this sees `nodeClosing` and the connect never
+    /// starts, or `interruptNodeForSuspend()` sees the latch and aborts it.
+    /// Must be called WITHOUT `nodeLock` held.
+    private func registerPendingConnectLatch() throws -> SonarSuspendLatch {
+        let latch = SonarSuspendLatch()
+        nodeLock.lock()
+        defer { nodeLock.unlock() }
+        guard !nodeClosing else { throw ServiceError.cancelled }
+        pendingConnectLatches.append(latch)
+        return latch
+    }
+
+    /// Identity comparison, not `removeAll()`: a concurrent connect may have
+    /// registered its own latch by the time this one unwinds, and dropping that
+    /// would leave the live connect unlatchable — the hazard this list exists
+    /// to remove.
+    private func clearPendingConnectLatch(_ latch: SonarSuspendLatch) {
+        nodeLock.lock()
+        pendingConnectLatches.removeAll { $0 === latch }
+        nodeLock.unlock()
+    }
 
     private func leasedNodeOperation<T: Sendable>(
         on queue: DispatchQueue,

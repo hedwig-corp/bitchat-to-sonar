@@ -310,7 +310,11 @@ class NotificationService: SDKNotificationService {
                 identity: identity,
                 relayUrls: Self.defaultRelayUrls,
                 dbPath: dbURL.path,
-                dbKeyHex: dbKeyHex
+                dbKeyHex: dbKeyHex,
+                // No suspend latch: the NSE is not the app process, has no
+                // scene-phase suspend hook to fire one, and is torn down by its
+                // own `serviceExtensionTimeWillExpire` deadline instead.
+                suspendLatch: nil
             )
         } catch {
             storeLock.release()

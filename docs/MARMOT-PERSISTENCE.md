@@ -83,13 +83,32 @@ directives to the Xcode consumer.
 Generated into `localPackages/SonarCore/Sources/SonarFFI.swift`:
 
 ```swift
-// Connect with a persistent, encrypted store.
+// RELAY connect. The latch must be created and STORED before the call — the
+// constructor holds SQLCipher open across the relay waits and there is no node
+// yet to interrupt (docs/REGRESSIONS.md, R-031), so the suspend hook needs its
+// own reference. Passing a temporary here would compile and abort nothing.
+//
+// Registration is FALLIBLE (it throws when a close has already fenced us) and
+// must precede any fallible store-lock setup, or that lock leaks on the throw.
+// The entry is removed when the connect unwinds — on every path, or the suspend
+// hook keeps interrupting dead latches for the life of the process.
+let latch = try registerPendingConnectLatch()   // appends under the state lock
+defer { clearPendingConnectLatch(latch) }       // removes by identity
+let storeLock = try acquireStoreLock()          // AFTER the line above
+
 let node = try SonarNode.connect(
     identity: identity,            // SonarIdentity
     relayUrls: ["wss://relay…"],   // [String]
     dbPath: "<Application Support>/sonar-marmot/marmot.sqlite",  // String
-    dbKeyHex: "<64-char hex of the 32-byte Keychain key>"        // String
+    dbKeyHex: "<64-char hex of the 32-byte Keychain key>",       // String
+    suspendLatch: latch                                          // SonarSuspendLatch?
 )
+
+// LOCAL-ONLY connect (relayUrls: []) passes `suspendLatch: nil` even on iOS.
+// With no relays there is nothing to await, so a latch could only refuse to
+// start — and that refusal fails the identity-restore path into a rollback that
+// wipes the store. See R-031 before adding one. `nil` likewise on hosts with no
+// suspend deadline at all (Android/desktop).
 
 // Panic-wipe: drop the node first, then erase the DB, then clear the Keychain key.
 try wipeMarmotDatabase(dbPath: "<…>/marmot.sqlite")
