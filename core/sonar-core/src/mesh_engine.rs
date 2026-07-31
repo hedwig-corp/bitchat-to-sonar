@@ -989,7 +989,7 @@ impl Engine {
         // send the first transfer after every radio cycle out unmarked — the
         // same hole as an unrecorded out-of-order 0x53 — while buying nothing:
         // forgetting can only make the gate MORE conservative, never less.
-        // iOS keeps its set for the same reason; see R-022.
+        // iOS keeps its set for the same reason; see R-030.
         self.seen_broadcasts.clear();
         self.seen_files.clear();
         self.reassembler = mesh::fragment::Reassembler::new();

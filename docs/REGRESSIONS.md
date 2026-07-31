@@ -1690,7 +1690,7 @@ lookup itself, and the focus gate on `SNComposer.liveDraft`.
   the composer keeps focus and first responder through the click (4/4), so the
   editor is still the one consulted.
 
-## R-022 — A Sonar-only TLV must never ride a packet a stock bitchat peer will parse
+## R-030 — A Sonar-only TLV must never ride a packet a stock bitchat peer will parse
 
 **Invariant:** Anything Sonar adds on top of bitchat's wire format goes out only
 to peers that have **proven** they run Sonar (a verified `0x53` Sonar announce).
@@ -1837,8 +1837,10 @@ as "sending images between bitchat and Sonar is broken".
   the odd one out among three in that project — bitchat-iOS's file decoder skips
   unknown tags, and bitchat-android's own `IdentityAnnouncement.decode` skips
   them too, with a comment saying it does so for forward compatibility. Proposed
-  upstream in permissionlesstech/bitchat-android#826 (and pinned on the iOS side
-  in permissionlesstech/bitchat#1550). But already-installed Android builds keep
+  upstream and **merged 2026-07-31** in permissionlesstech/bitchat-android#826
+  (the iOS contract is pinned by permissionlesstech/bitchat#1550); the maintainer
+  additionally rejected truncated trailing TLV headers and dropped the
+  `values()` allocation from the tag lookup. But already-installed Android builds keep
   dropping these packets whenever that lands, so this gate is permanent
   architecture, not a stopgap.
 - *Adding a freshness window to `0x53` in the core to match iOS's 900s.* Filed

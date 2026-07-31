@@ -4832,7 +4832,7 @@ extension BLEService {
         // whether this build can read its body is a separate question. Deciding
         // it after the decode guard made one wire input mark a peer capable on
         // Android and not on iOS — the exact cross-platform split this gate
-        // exists to remove. See R-022.
+        // exists to remove. See R-030.
         collectionsQueue.sync(flags: .barrier) {
             recordSonarCapabilityLocked(peerID)
         }

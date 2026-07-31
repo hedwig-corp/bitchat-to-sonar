@@ -2832,7 +2832,7 @@ pub fn mesh_parse_public_message(packet_bytes: Vec<u8>) -> Option<MeshPublicMess
 /// runs Sonar. Unlike `Engine::send_file`, this entry point has no route and
 /// therefore no capability to gate on — it cannot make that check for you.
 /// No app calls this today (only the generated bindings expose it); prefer
-/// `Engine::send_file`, which gates on a verified 0x53. See R-022.
+/// `Engine::send_file`, which gates on a verified 0x53. See R-030.
 #[uniffi::export]
 pub fn mesh_encode_file_packet(
     file_name: Option<String>,
