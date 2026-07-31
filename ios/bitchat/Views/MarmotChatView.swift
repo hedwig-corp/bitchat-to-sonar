@@ -1240,13 +1240,21 @@ final class MarmotChatModel: ObservableObject {
 
     /// Host executor: if core policy says due, run seal→reconnect→upload quietly.
     ///
-    /// Returns whether `backupAccount()` actually ran. Background callers need
+    /// Returns whether `backupAccount()` was invoked. Background callers need
     /// this: a backup ends with the SQLCipher store REOPENED, and on a BGTask
     /// launch no scenePhase transition will ever close it (0xdead10cc, round 6 —
     /// see `AutoBackupBackgroundScheduler.closeStoreIfStillBackgrounded`). They
-    /// must close only when we reopened, never on the `false` paths: a push wake
-    /// may have legitimately opened the node for its own drain in the meantime,
-    /// and closing it out from under that drain is a different bug.
+    /// must close only when we ran, never on the `false` paths: a push wake may
+    /// have legitimately opened the node for its own drain in the meantime, and
+    /// closing it out from under that drain is a different bug.
+    ///
+    /// "Invoked", not "reopened": `backupAccount()` has two exits that touch no
+    /// node (`respectOptOut` with the policy disabled, and the
+    /// `backupAlreadyInProgress` throw). Both are unreachable from here — core's
+    /// `backup_is_due` already requires `policy.enabled`, and the in-flight
+    /// guard is same-actor — and a close on an already-closed node is an
+    /// idempotent no-op anyway, so the looser meaning costs nothing. Do not
+    /// tighten this into a "did we reopen" flag without a reason.
     ///
     /// - Parameter allowWhileActive: only the background-transition and
     ///   `BGTask` callers pass true. A backup closes the Marmot node, seals the
@@ -1313,6 +1321,8 @@ final class MarmotChatModel: ObservableObject {
         // True on the throwing path too: `backupAccount()` reopens the node in
         // its own middle (seal -> `performConnect` -> upload) and throws only
         // after, so a failed upload leaves the store just as open as a good one.
+        // A failed reopen lands here as well, where the caller's close is a
+        // harmless no-op.
         return true
     }
 
