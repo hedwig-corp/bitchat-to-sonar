@@ -9,6 +9,7 @@
 //
 
 import Foundation
+import UniformTypeIdentifiers
 
 /// One item shared into Sonar from the system share sheet.
 ///
@@ -294,6 +295,70 @@ func snShouldStageAsFile(
     if isText && hasSuggestedName { return true }
     if isText || isNonFileURL { return false }
     return isData
+}
+
+/// True for `public.url` and `public.file-url` — the identifiers whose "data" is
+/// the link itself rather than the bytes it points at.
+func snIsURLTypeIdentifier(_ identifier: String) -> Bool {
+    guard let type = UTType(identifier) else { return false }
+    return type == .url || type == .fileURL || type.conforms(to: .url)
+}
+
+/// Pick the type identifier to request the attachment's BYTES for.
+///
+/// The bug this exists for: `loadFileRepresentation(forTypeIdentifier:)` given
+/// `public.file-url` does not vend the document. It vends a temp file named
+/// `file URL` whose *contents are the `file://` path string* — so the share
+/// arrived as a ~110-byte extension-less blob holding a path, and the recipient
+/// got the path instead of the file. Photos, videos, audio and PDFs dodged it
+/// only because they matched a concrete type earlier in the probe order; every
+/// other document (csv, txt, json, zip, docx, source, calendar…) hit the
+/// `public.file-url` entry and broke.
+///
+/// So: never ask a URL identifier for bytes. Prefer the provider's own most
+/// specific registered content type, which is what actually carries the file.
+/// Returns nil when the provider registered nothing but URLs — the caller then
+/// falls back to resolving the file URL and copying the real file.
+func snStagingTypeIdentifier(registeredTypeIdentifiers: [String]) -> String? {
+    let candidates = registeredTypeIdentifiers.filter { !snIsURLTypeIdentifier($0) }
+    // Prefer something that is genuinely byte-bearing; fall back to the first
+    // non-URL identifier so a dynamic UTI (`dyn.…`, no declared conformance)
+    // still stages rather than being dropped.
+    return candidates.first { UTType($0)?.conforms(to: .data) == true } ?? candidates.first
+}
+
+/// Filename to stage an attachment under.
+///
+/// `suggestedName` is the provider's own name for the document and is what the
+/// recipient should see. The temp file that `loadFileRepresentation` writes is
+/// named after the *type* when the bytes came from a data representation
+/// ("Zip archive.zip", "comma-separated values.csv"), so it is only a fallback —
+/// but it is the better source of the extension when the suggested name has
+/// none.
+func snStagedFilename(
+    suggestedName: String?,
+    temporaryName: String,
+    fallback: String
+) -> String {
+    let temporary = snSafeSharedFilename(temporaryName, fallback: fallback)
+    guard let suggestedName, !suggestedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+        return temporary
+    }
+    let suggested = snSafeSharedFilename(suggestedName, fallback: temporary)
+    guard (suggested as NSString).pathExtension.isEmpty else { return suggested }
+    let ext = (temporary as NSString).pathExtension
+    return ext.isEmpty ? suggested : "\(suggested).\(ext)"
+}
+
+/// Where a staged attachment lives inside its payload directory.
+///
+/// One directory per index rather than an `index-name` prefix: the app sends
+/// under `url.lastPathComponent` (`snReadAttachments`), so a prefix leaked into
+/// the delivered filename and the recipient saw `0-report.csv`. A directory
+/// keeps two attachments named `IMG_0001.jpg` apart without touching the name.
+func snStagedRelativePath(index: Int, filename: String) -> String {
+    "\(index)/\(filename)"
 }
 
 /// Filenames arrive from other apps and are attacker-influenced. Keep only a
