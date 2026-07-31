@@ -187,7 +187,11 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                                 divider = index < pendingJoinRequests.lastIndex,
                                 isApproving = isApproving,
                                 onApprove = {
-                                    if (!isApproving) {
+                                    // Read the live set, not the composed
+                                    // `isApproving` snapshot: `enabled` only
+                                    // takes effect after recomposition, so two
+                                    // taps in one frame both see false.
+                                    if (request.requesterNpub !in approvingJoinRequests) {
                                         approvingJoinRequests =
                                             approvingJoinRequests + request.requesterNpub
                                         state.approveJoinRequest(

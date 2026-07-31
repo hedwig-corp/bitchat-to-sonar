@@ -44,13 +44,26 @@ test("Digital Asset Links authorizes the published Android release certificate",
     "utf8",
   );
   const assetLinks = JSON.parse(raw);
-  const fingerprints = assetLinks
-    .filter((entry) => entry.target?.package_name === "chat.bitchat.sonar")
-    .flatMap((entry) => entry.target.sha256_cert_fingerprints ?? []);
+  // Assert the whole statement, not just the fingerprint: an emptied relation
+  // or namespace breaks App Links verification while leaving the fingerprint
+  // sitting right there, which a fingerprint-only check reads as healthy.
+  const sonarTargets = assetLinks.filter(
+    (entry) =>
+      entry.target?.namespace === "android_app" &&
+      entry.target?.package_name === "chat.bitchat.sonar" &&
+      (entry.relation ?? []).includes(
+        "delegate_permission/common.handle_all_urls",
+      ),
+  );
+  assert.ok(sonarTargets.length > 0, "no delegating statement for Sonar");
 
+  const fingerprints = sonarTargets.flatMap(
+    (entry) => entry.target.sha256_cert_fingerprints ?? [],
+  );
   assert.ok(
     fingerprints.includes(
       "84:A7:FA:65:6D:E5:82:77:20:F6:A4:A2:48:93:93:C8:24:C6:73:15:B9:DE:FE:A3:41:19:C6:EE:4C:93:13:D6",
     ),
+    "sideload release certificate is not authorized",
   );
 });

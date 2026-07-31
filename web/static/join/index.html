@@ -26,6 +26,9 @@
     <a class="btn primary" id="open" href="#">Open in Sonar</a>
     <a class="btn ghost" href="https://github.com/hedwig-corp/bitchat-to-sonar/releases/latest">Get Sonar</a>
   </div>
-  <script type="module" src="./open-in-sonar.js"></script>
+  <!-- Root-absolute, not "./": invites are shared as /join#sinvite1… with no
+       trailing slash, against which a relative src resolves to /open-in-sonar.js.
+       That only works today because the host 301s /join → /join/. -->
+  <script type="module" src="/join/open-in-sonar.js"></script>
 </body>
 </html>

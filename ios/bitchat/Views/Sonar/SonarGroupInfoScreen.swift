@@ -318,6 +318,9 @@ struct SonarGroupInfoScreen: View {
             showToast("Group is still setting up")
             return
         }
+        // Latch before the Task, not via `.disabled`: that only takes effect on
+        // the next render, so two taps in one frame both get through.
+        guard !creatingInviteLink else { return }
         creatingInviteLink = true
         Task { @MainActor in
             defer { creatingInviteLink = false }
@@ -329,7 +332,7 @@ struct SonarGroupInfoScreen: View {
                 copyInviteLink(link)
                 showToast("Invite link created and copied")
             } catch {
-                showToast("Couldn't create link: \(error.localizedDescription)")
+                showToast("Couldn't create link: \(MarmotChatModel.describe(error))")
             }
         }
     }
@@ -343,7 +346,7 @@ struct SonarGroupInfoScreen: View {
         do {
             pendingJoinRequests = try await store.marmot.pendingJoinRequests(groupId: groupId)
         } catch {
-            showToast("Couldn't load join requests: \(error.localizedDescription)")
+            showToast("Couldn't load join requests: \(MarmotChatModel.describe(error))")
         }
     }
 
@@ -358,7 +361,7 @@ struct SonarGroupInfoScreen: View {
                 showToast("Member added")
                 await loadPendingJoinRequests()
             } catch {
-                showToast("Couldn't approve: \(error.localizedDescription)")
+                showToast("Couldn't approve: \(MarmotChatModel.describe(error))")
             }
         }
     }
@@ -371,7 +374,7 @@ struct SonarGroupInfoScreen: View {
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
                 showToast("Request declined")
             } catch {
-                showToast("Couldn't decline: \(error.localizedDescription)")
+                showToast("Couldn't decline: \(MarmotChatModel.describe(error))")
             }
         }
     }

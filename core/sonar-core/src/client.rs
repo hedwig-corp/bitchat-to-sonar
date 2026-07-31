@@ -2568,10 +2568,11 @@ impl SonarClient {
             .ok_or(Error::KeyPackageNotFound(author))
     }
 
-    /// Fetch the exact KeyPackage advertised by a join request. Invite joins
-    /// publish a fresh package immediately before the request, so using its
-    /// event id avoids a broad author lookup and cannot accidentally select a
-    /// newer stale/invalid package from another device slot.
+    /// Fetch the exact KeyPackage advertised by a join request.
+    ///
+    /// Only resolves while that event is still the current one in its
+    /// addressable slot — see [`Self::fetch_key_package_in_slot`], which is the
+    /// lookup that survives a republish.
     async fn fetch_key_package_by_id(&self, author: PublicKey, event_id: EventId) -> Result<Event> {
         let filter = Filter::new()
             .id(event_id)
@@ -2583,6 +2584,67 @@ impl SonarClient {
             .into_iter()
             .find(|event| event.id == event_id && event.pubkey == author)
             .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Fetch the KeyPackage currently published in `author`'s addressable slot
+    /// `d`.
+    ///
+    /// This is the lookup invite approval wants. Kind 30443 is addressable and
+    /// every install republishes into ONE persisted slot
+    /// (`Marmot::load_key_package_slot`), so an approval keyed on the join
+    /// request's event id breaks as soon as the requester reconnects and
+    /// republishes — the relay drops the replaced event and the request becomes
+    /// permanently un-approvable. Keyed on the slot instead, the lookup rolls
+    /// forward with the republish, and unlike a latest-by-author lookup it
+    /// still names the *requesting* device: a linked-device account has one
+    /// live 30443 per install, under a different slot each.
+    async fn fetch_key_package_in_slot(&self, author: PublicKey, d: &str) -> Result<Event> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KEY_PACKAGE_KIND))
+            .author(author)
+            .identifier(d)
+            .limit(1);
+        let events = self.nostr.fetch_events(filter, FETCH_TIMEOUT).await?;
+        events
+            .into_iter()
+            .filter(|event| event.pubkey == author && event.tags.identifier() == Some(d))
+            .max_by_key(|event| event.created_at)
+            .ok_or(Error::KeyPackageNotFound(author))
+    }
+
+    /// Resolve the KeyPackage to admit for a pending join request.
+    ///
+    /// Ordered most- to least-specific, so a miss degrades instead of failing:
+    /// the requester's slot (survives republish, names the right device), then
+    /// the exact event the request advertised, then the newest package by
+    /// author — which is all a request predating either field carries, and is
+    /// exactly what this path did before.
+    async fn key_package_for_join_request(
+        &self,
+        request: &crate::invite_link::JoinRequest,
+    ) -> Result<Event> {
+        if let Some(d) = request.key_package_d_tag.as_deref() {
+            match self.fetch_key_package_in_slot(request.requester, d).await {
+                Ok(event) => return Ok(event),
+                Err(e) => tracing::warn!(
+                    %e,
+                    "invite approval: KeyPackage slot empty, falling back to the advertised event"
+                ),
+            }
+        }
+        if let Some(event_id) = request.key_package_event_id {
+            match self
+                .fetch_key_package_by_id(request.requester, event_id)
+                .await
+            {
+                Ok(event) => return Ok(event),
+                Err(e) => tracing::warn!(
+                    %e,
+                    "invite approval: advertised KeyPackage gone, falling back to latest-by-author"
+                ),
+            }
+        }
+        self.fetch_key_package(request.requester).await
     }
 
     /// Publish our kind-0 profile (NIP-01 metadata) so peers can resolve our
@@ -3032,6 +3094,15 @@ impl SonarClient {
         members: Vec<PublicKey>,
     ) -> Result<()> {
         let key_packages = self.fetch_key_packages_for_members(members).await?;
+        self.commit_add_members(group_id, key_packages).await
+    }
+
+    /// Commit already-resolved KeyPackages into `group_id`.
+    ///
+    /// The gate/commit/publish sequence lives here only, so callers that
+    /// resolve their own KeyPackages (invite approval) cannot drift from
+    /// [`Self::add_group_members`] on lock discipline.
+    async fn commit_add_members(&self, group_id: &GroupId, key_packages: Vec<Event>) -> Result<()> {
         let _epoch = self.membership_gate.write().await;
         let update = self.engine.add_members(group_id, key_packages)?;
         self.publish_membership_update(update).await
@@ -3201,6 +3272,7 @@ impl SonarClient {
             &token.invite_secret,
             &self.engine.identity().public_key(),
             Some(&kp_event.id),
+            kp_event.tags.identifier(),
         );
         let wrapped = self.engine.gift_wrap_rumor(&admin, rumor).await?;
         let output = self.nostr.send_event_to(publish_relays, &wrapped).await?;
@@ -3219,21 +3291,22 @@ impl SonarClient {
         group_id: &GroupId,
         requester: &PublicKey,
     ) -> Result<()> {
+        // Same guard `fetch_key_packages_for_members` applies: our own
+        // KeyPackage must fail cleanly here rather than inside MDK, where a
+        // surprise error lands on pending-commit state.
+        if *requester == self.identity().public_key() {
+            return Err(Error::InvalidInput(
+                "cannot approve your own join request".into(),
+            ));
+        }
         let request = self
             .invite_links
             .pending_join_requests(group_id)
             .into_iter()
             .find(|request| request.requester == *requester)
             .ok_or_else(|| Error::InvalidInput("no pending join request".into()))?;
-        let key_package = match request.key_package_event_id {
-            Some(event_id) => self.fetch_key_package_by_id(*requester, event_id).await?,
-            // Backward compatibility for requests created before the event id
-            // was added to the invite payload.
-            None => self.fetch_key_package(*requester).await?,
-        };
-        let _epoch = self.membership_gate.write().await;
-        let update = self.engine.add_members(group_id, vec![key_package])?;
-        self.publish_membership_update(update).await?;
+        let key_package = self.key_package_for_join_request(&request).await?;
+        self.commit_add_members(group_id, vec![key_package]).await?;
         self.invite_links.remove_join_request(group_id, requester)?;
         Ok(())
     }

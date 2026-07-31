@@ -270,7 +270,7 @@ final class MarmotService: @unchecked Sendable {
         }
     }
 
-    enum ServiceError: LocalizedError, Equatable {
+    enum ServiceError: Error, Equatable {
         /// `connect()` has not completed successfully yet.
         case notConnected
         /// A newer session change superseded this async operation.
@@ -281,21 +281,6 @@ final class MarmotService: @unchecked Sendable {
         case invalidInput(String)
         /// Failure inside the Rust core (relay I/O, MLS, MDK...).
         case core(String)
-
-        var errorDescription: String? {
-            switch self {
-            case .notConnected:
-                return "Not connected yet — try again in a moment."
-            case .cancelled:
-                return "Operation cancelled."
-            case .backupAlreadyInProgress:
-                return "Backup already in progress."
-            case .invalidInput(let detail):
-                return "Invalid input: \(detail)"
-            case .core(let detail):
-                return detail
-            }
-        }
     }
 
     let conversationChanged = PassthroughSubject<String, Never>()
@@ -2269,8 +2254,16 @@ final class MarmotService: @unchecked Sendable {
         try await leasedNodeOperation(on: publishQueue, body)
     }
 
-    /// MLS membership changes on their own lifecycle-safe lane. The Rust core
-    /// serializes these against sends and competing membership commits.
+    /// MLS membership changes on their own lane. The Rust core serializes these
+    /// against sends and competing membership commits.
+    ///
+    /// Same lease residual as the media/send lanes (REGRESSIONS.md, R-028): the
+    /// close releases `storeLock` with the node in its first `workQueue` hop and
+    /// only then waits on `nodeLifecycleGroup`, so an approval in flight at
+    /// background holds the SQLCipher handle for the remainder of its FFI. That
+    /// window is bounded by the core's fetch timeout plus commit + Welcome
+    /// publish — far shorter than the media lane's, and shorter than the
+    /// unbounded `workQueue` block this replaces.
     private func membershipLane<T: Sendable>(_ body: @escaping @Sendable (SonarNode) throws -> T) async throws -> T {
         try await leasedNodeOperation(on: membershipQueue, body)
     }

@@ -10,9 +10,8 @@
     "fetch-blog": "node scripts/fetch-blog.mjs",
     "translate-blog": "node scripts/translate-blog.mjs",
     "build": "vite build",
-    "test:i18n": "node --test scripts/i18n-locales.test.mjs ../scripts/blog/build-event.test.mjs",
+    "test": "node --test scripts/i18n-locales.test.mjs ../scripts/blog/build-event.test.mjs tests/invite-links.test.mjs",
     "preview": "vite preview",
-    "test": "node --test",
     "check": "svelte-kit sync && svelte-check --tsconfig ./jsconfig.json"
   },
   "devDependencies": {

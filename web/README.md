@@ -82,7 +82,8 @@ After `npm run fetch-blog`, translations refresh when
 committed overlays are left untouched. Never put that key in client code.
 
 ```sh
-npm run test:i18n   # locale resolve + overlay smoke tests
+npm test   # locale resolve + overlay + blog event + invite-link smoke tests
+
 ```
 
 Docs / status incident **bodies** stay English in v1; page chrome is translated.
@@ -131,9 +132,14 @@ Status of the three activation inputs:
    auto-provisions the Associated Domains capability under automatic signing).
 3. **Android — assetlinks**: filled with both the debug keystore SHA-256 and the
    sideload release certificate used by the published alpha APKs, so App Links
-   verify for both install types. The landing page also uses a package-targeted
-   Android intent for its explicit **Open in Sonar** fallback. **Before a Play
-   release, add the Play App Signing fingerprint** to the
-   `sha256_cert_fingerprints` array
-   (`keytool -list -v -keystore <release.keystore> | grep SHA256`). The `autoVerify`
+   verify for both install types. Re-derive either with
+   `keytool -list -v -keystore <keystore> | grep SHA256`, or read the signer off
+   a published APK with `apksigner verify --print-certs <apk>`. The landing page
+   also uses a package-targeted Android intent for its explicit **Open in Sonar**
+   fallback. **Before a Play release, add the Play App Signing fingerprint** to
+   the `sha256_cert_fingerprints` array. Take that one from **Play Console → app
+   → Test and release → App integrity → App signing key certificate → SHA-256**,
+   *not* from `keytool` on the local keystore: with Play App Signing enabled that
+   keystore holds the **upload** key, which is not what devices verify against,
+   and using it leaves App Links broken for every Play install. The `autoVerify`
    intent-filter is already in `AndroidManifest.xml`.
