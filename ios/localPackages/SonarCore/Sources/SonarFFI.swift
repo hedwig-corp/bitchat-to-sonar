@@ -1638,6 +1638,10 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      * holds the SQLCipher store past that deadline and RunningBoard kills the
      * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
      * for this node's lifetime; reconnect constructs a fresh node.
+     *
+     * Only reaches work running on an *installed* node. A connect still in
+     * flight has no node to call this on — the host must pass a
+     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-030).
      */
     func interruptForSuspend()
 
@@ -1974,14 +1978,30 @@ open class SonarNode: SonarNodeProtocol, @unchecked Sendable {
      * - `db_key_hex`: 64-char hex of the 32-byte SQLCipher key. The host owns
      * this key (Keychain on iOS) and passes the SAME value every launch so the
      * existing database reopens. Marmot groups/messages persist across restarts.
+     * - `suspend_latch`: optional host-held [`SonarSuspendLatch`], created
+     * BEFORE this call and registered where the host's suspend hook can reach
+     * it. Latching it aborts the connect at its next await point instead of
+     * leaving SQLCipher open for the rest of the relay quorum wait,
+     * `subscribe_marmot` and `retry_outbox` — the R-030 0xdead10cc window,
+     * which no post-hoc `interrupt_for_suspend()` can reach because the node
+     * it lives on does not exist yet. On abort nothing is installed: the
+     * half-built client (and its store handle) is dropped and the error
+     * carries [`SUSPEND_INTERRUPT_MARKER`]. Pass `None` on hosts with no
+     * suspend deadline (Android/desktop) — the node then makes its own latch.
+     *
+     * The abort is safe for the same reason `block_on_suspendable`'s is: a
+     * dropped future stops at an await point, and everything before the first
+     * one here — the SQLCipher open and MLS engine construction — either
+     * completed or never began. No MLS commit spans an await.
      */
-public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath: String, dbKeyHex: String)throws  -> SonarNode  {
+public static func connect(identity: SonarIdentity, relayUrls: [String], dbPath: String, dbKeyHex: String, suspendLatch: SonarSuspendLatch?)throws  -> SonarNode  {
     return try  FfiConverterTypeSonarNode_lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
     uniffi_sonar_ffi_fn_constructor_sonarnode_connect(
         FfiConverterTypeSonarIdentity_lower(identity),
         FfiConverterSequenceString.lower(relayUrls),
         FfiConverterString.lower(dbPath),
-        FfiConverterString.lower(dbKeyHex),$0
+        FfiConverterString.lower(dbKeyHex),
+        FfiConverterOptionTypeSonarSuspendLatch.lower(suspendLatch),$0
     )
 })
 }
@@ -2493,6 +2513,10 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
      * holds the SQLCipher store past that deadline and RunningBoard kills the
      * process with 0xdead10cc. Non-blocking and safe from any thread. One-way
      * for this node's lifetime; reconnect constructs a fresh node.
+     *
+     * Only reaches work running on an *installed* node. A connect still in
+     * flight has no node to call this on — the host must pass a
+     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-030).
      */
 open func interruptForSuspend()  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_interrupt_for_suspend(
@@ -3357,6 +3381,176 @@ public func FfiConverterTypeSonarNoise_lift(_ handle: UInt64) throws -> SonarNoi
 #endif
 public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
     return FfiConverterTypeSonarNoise.lower(value)
+}
+
+
+
+
+
+
+/**
+ * One-way "the host is about to be suspended" latch.
+ *
+ * Exists as its own object — rather than living only inside `SonarNode` — so
+ * the host can hold one *before* a node exists. `SonarNode::connect` opens
+ * SQLCipher and then awaits the relay quorum, `subscribe_marmot` and
+ * `retry_outbox`; a connect still in flight when iOS suspends therefore holds
+ * the store open with no node to call `interrupt_for_suspend()` on, and the
+ * close queues behind it until RunningBoard kills the process with
+ * 0xdead10cc (`docs/REGRESSIONS.md`, R-030). Passing a latch into `connect`
+ * closes that window: the host latches it from its scene-phase suspend hook
+ * and the connect drops its future at the next await point.
+ *
+ * One-way for its lifetime: a reconnect builds a fresh node and takes a fresh
+ * latch, so it never needs resetting. Non-blocking and safe from any thread.
+ */
+public protocol SonarSuspendLatchProtocol: AnyObject, Sendable {
+
+    /**
+     * Abort the latched work and make every later latched call fail fast.
+     */
+    func interrupt()
+
+    func isInterrupted()  -> Bool
+
+}
+/**
+ * One-way "the host is about to be suspended" latch.
+ *
+ * Exists as its own object — rather than living only inside `SonarNode` — so
+ * the host can hold one *before* a node exists. `SonarNode::connect` opens
+ * SQLCipher and then awaits the relay quorum, `subscribe_marmot` and
+ * `retry_outbox`; a connect still in flight when iOS suspends therefore holds
+ * the store open with no node to call `interrupt_for_suspend()` on, and the
+ * close queues behind it until RunningBoard kills the process with
+ * 0xdead10cc (`docs/REGRESSIONS.md`, R-030). Passing a latch into `connect`
+ * closes that window: the host latches it from its scene-phase suspend hook
+ * and the connect drops its future at the next await point.
+ *
+ * One-way for its lifetime: a reconnect builds a fresh node and takes a fresh
+ * latch, so it never needs resetting. Non-blocking and safe from any thread.
+ */
+open class SonarSuspendLatch: SonarSuspendLatchProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sonar_ffi_fn_clone_sonarsuspendlatch(self.handle, $0) }
+    }
+public convenience init() {
+    let handle =
+        try! rustCall() {
+    uniffi_sonar_ffi_fn_constructor_sonarsuspendlatch_new($0
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sonar_ffi_fn_free_sonarsuspendlatch(handle, $0) }
+    }
+
+
+
+
+    /**
+     * Abort the latched work and make every later latched call fail fast.
+     */
+open func interrupt()  {try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarsuspendlatch_interrupt(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+
+open func isInterrupted() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_sonar_ffi_fn_method_sonarsuspendlatch_is_interrupted(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSonarSuspendLatch: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SonarSuspendLatch
+
+    public static func lift(_ handle: UInt64) throws -> SonarSuspendLatch {
+        return SonarSuspendLatch(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SonarSuspendLatch) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SonarSuspendLatch {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SonarSuspendLatch, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarSuspendLatch_lift(_ handle: UInt64) throws -> SonarSuspendLatch {
+    return try FfiConverterTypeSonarSuspendLatch.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSonarSuspendLatch_lower(_ value: SonarSuspendLatch) -> UInt64 {
+    return FfiConverterTypeSonarSuspendLatch.lower(value)
 }
 
 
@@ -7046,6 +7240,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeSonarSuspendLatch: FfiConverterRustBuffer {
+    typealias SwiftType = SonarSuspendLatch?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeSonarSuspendLatch.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeSonarSuspendLatch.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeCallEventInfo: FfiConverterRustBuffer {
     typealias SwiftType = CallEventInfo?
 
@@ -8818,7 +9036,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 28091) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 30457) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
@@ -8971,6 +9189,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnoise_write_message() != 7081) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sonar_ffi_checksum_method_sonarsuspendlatch_interrupt() != 44508) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_method_sonarsuspendlatch_is_interrupted() != 22902) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sonar_ffi_checksum_constructor_meshlinkengine_new() != 12347) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -8983,13 +9207,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_import() != 46969) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 58965) {
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 46888) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_initiator() != 18155) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_responder() != 10813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sonar_ffi_checksum_constructor_sonarsuspendlatch_new() != 52224) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_conversationchangelistener_on_conversation_changed() != 35719) {

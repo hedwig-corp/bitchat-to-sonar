@@ -86,7 +86,7 @@ actual object SonarCore {
                 // Diagnostics file sink must exist before the node spins up so
                 // relay connect/EOSE/watermark events are captured. Non-fatal.
                 installCoreLogging(diagnosticsVerbose())
-                node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex)
+                node = SonarNode.connect(identity, emptyList(), dbPath, dbKeyHex, null)
                 relayConnected = false
             }
             npub
@@ -116,7 +116,10 @@ actual object SonarCore {
 
             // Match iOS MarmotService.connect(): keep the local-only node usable
             // until the relay-backed replacement is fully connected.
-            val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex)
+            // suspendLatch = null: the iOS-only R-030 window (a connect holding SQLCipher
+            // open when RunningBoard suspends the process) has no analogue here — the
+            // Compose hosts have no file-lock kill and no fixed suspend deadline.
+            val connected = SonarNode.connect(identity, relayUrls, dbPath, dbKeyHex, null)
             val previousNode = node
             node = connected
             // A mid-attach invalidate wins: keep the latch down so the next
@@ -1243,6 +1246,7 @@ actual object SonarCore {
             emptyList(),
             File(dir, "marmot.sqlite").absolutePath,
             loadOrCreateDbKey(),
+            null,
         )
     }
 

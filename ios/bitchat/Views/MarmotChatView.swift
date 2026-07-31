@@ -972,6 +972,12 @@ final class MarmotChatModel: ObservableObject {
             }
             return true
         } catch {
+            // A background transition mid-open aborts the constructor before it
+            // returns a node (R-031), so the marker now reaches this catch too.
+            // Same terminal rule as the relay connect path: never surface it —
+            // the app is on its way to the background and nothing failed. The
+            // foreground resume re-runs this whole function.
+            if Self.isSuspendInterrupted(error) { return false }
             let desc = Self.describe(error)
             SecureLogger.warning("⚠️ Marmot local open failed: \(desc)", category: .session)
             self.errorText = desc

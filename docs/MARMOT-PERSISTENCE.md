@@ -88,7 +88,12 @@ let node = try SonarNode.connect(
     identity: identity,            // SonarIdentity
     relayUrls: ["wss://relay…"],   // [String]
     dbPath: "<Application Support>/sonar-marmot/marmot.sqlite",  // String
-    dbKeyHex: "<64-char hex of the 32-byte Keychain key>"        // String
+    dbKeyHex: "<64-char hex of the 32-byte Keychain key>",       // String
+    // Register this BEFORE the call, where the suspend hook can reach it: the
+    // constructor holds SQLCipher open across the relay waits and there is no
+    // node yet to interrupt (docs/REGRESSIONS.md, R-031). `nil` on hosts with
+    // no suspend deadline.
+    suspendLatch: SonarSuspendLatch()                            // SonarSuspendLatch?
 )
 
 // Panic-wipe: drop the node first, then erase the DB, then clear the Keychain key.
