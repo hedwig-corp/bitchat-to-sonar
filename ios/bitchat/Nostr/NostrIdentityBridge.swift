@@ -87,7 +87,12 @@ final class NostrIdentityBridge {
 
     /// Returns a stable device seed used to derive unlinkable per-geohash identities.
     /// Stored only on device keychain.
-    private func getOrCreateDeviceSeed() -> Data {
+    /// Throws rather than returning a zero seed: this seed keys the HMAC that
+    /// derives every per-geohash Nostr *private key*, and it is persisted on
+    /// first use. An unchecked `SecRandomCopyBytes` failure here would mint an
+    /// all-zeros seed, give every affected install the same geohash identities,
+    /// and then write that seed to the keychain permanently.
+    private func getOrCreateDeviceSeed() throws -> Data {
         if let cached = deviceSeedCache { return cached }
         if let existing = keychain.load(key: deviceSeedKey, service: keychainService) {
             // Migrate to AfterFirstUnlockThisDeviceOnly for stability during lock
@@ -95,10 +100,7 @@ final class NostrIdentityBridge {
             deviceSeedCache = existing
             return existing
         }
-        var seed = Data(count: 32)
-        _ = seed.withUnsafeMutableBytes { ptr in
-            SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
-        }
+        let seed = try SecureRandom.bytes(32)
         // Ensure availability after first unlock to prevent unintended rotation when locked
         keychain.save(key: deviceSeedKey, data: seed, service: keychainService, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
         deviceSeedCache = seed
@@ -117,7 +119,7 @@ final class NostrIdentityBridge {
         }
         cacheLock.unlock()
 
-        let seed = getOrCreateDeviceSeed()
+        let seed = try getOrCreateDeviceSeed()
         guard let msg = geohash.data(using: .utf8) else {
             throw NSError(domain: "NostrIdentity", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid geohash string"])
         }

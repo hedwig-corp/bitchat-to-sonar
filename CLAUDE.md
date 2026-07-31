@@ -172,6 +172,30 @@ The value must never be empty, `https:`, `http:`, or anything without a host.
 If this check fails, fix the build setting before archiving; otherwise the app
 can launch successfully while silently disabling Breez offline payment wakeups.
 
+## Randomness Rule
+
+A degraded RNG path must never succeed quietly. Nonces, IVs, salts, challenges,
+key material, and any id that goes on the wire come from the OS CSPRNG, and a
+CSPRNG failure fails the operation — it never falls back to a zeroed buffer or a
+seeded PRNG.
+
+- **Swift** — `SecRandomCopyBytes` leaves its buffer untouched on failure, and
+  every buffer here starts zero-filled, so discarding the `OSStatus` yields an
+  all-zeros "random" value. Go through `SecureRandom.bytes(_:)` /
+  `SecureRandom.optionalBytes(_:)` (`ios/bitchat/Utils/SecureRandom.swift`).
+- **Rust** — never `let _ = getrandom(..)`. Propagate with `?` or
+  `.expect("OS RNG available")`.
+- **Compose** — `kotlin.random.Random` is a clock-seeded XorWow, not a CSPRNG.
+  Use `secureRandomBytes()` / `secureRandomHex()` (`SecureRandom.kt`), which is
+  the Compose-side match for iOS's CSPRNG-backed `UUID()`.
+
+`scripts/check-rng-hygiene.sh` enforces all three in CI. It is a grep, so it
+catches the shape, not the intent: it cannot tell whether a checked call feeds
+the right thing, and it does not look at the vendored `core/vendor/` tree. Those
+stay review questions. The rule exists because this class of bug is silent by
+construction — see the script header for the COLDCARD firmware disclosure that
+motivated it.
+
 ## Regression Invariant Rule
 
 Some bugs in this repo have been fixed more than once. [`docs/REGRESSIONS.md`](docs/REGRESSIONS.md)

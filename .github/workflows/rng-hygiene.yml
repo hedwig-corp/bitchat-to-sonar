@@ -1,0 +1,42 @@
+name: RNG hygiene
+
+# A degraded RNG path must not be able to succeed quietly. See
+# scripts/check-rng-hygiene.sh for the three shapes this checks and the
+# COLDCARD disclosure that motivated them.
+#
+# Deliberately separate from the platform build workflows: this is pure shell
+# (seconds, no JDK/Rust/Xcode), and unlike the compile jobs it runs on every
+# source path that could reintroduce the pattern — including iOS, which has no
+# test job in CI.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'scripts/check-rng-hygiene.sh'
+      - '.github/workflows/rng-hygiene.yml'
+      - 'ios/**/*.swift'
+      - 'core/**/*.rs'
+      - 'apps/sonar/composeApp/src/**/*.kt'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'scripts/check-rng-hygiene.sh'
+      - '.github/workflows/rng-hygiene.yml'
+      - 'ios/**/*.swift'
+      - 'core/**/*.rs'
+      - 'apps/sonar/composeApp/src/**/*.kt'
+
+jobs:
+  check:
+    name: No predictable-RNG fallbacks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for silent RNG fallbacks
+        run: ./scripts/check-rng-hygiene.sh

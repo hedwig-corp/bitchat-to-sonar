@@ -49,8 +49,7 @@ sealed interface PayLine {
     }
 }
 
-internal fun randomPayId(): String =
-    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
+internal fun randomPayId(): String = secureRandomHex(8)
 
 /**
  * Lifecycle of a direct payment receipt, mirrored from the iOS ledger.

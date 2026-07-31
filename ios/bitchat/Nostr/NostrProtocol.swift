@@ -289,12 +289,12 @@ struct NostrProtocol {
         // Derive NIP-44 v2 symmetric key (HKDF-SHA256 with label in info)
         let key = try deriveNIP44V2Key(from: sharedSecret)
         
-        // 24-byte random nonce for XChaCha20-Poly1305
-        var nonce24 = Data(count: 24)
-        _ = nonce24.withUnsafeMutableBytes { ptr in
-            SecRandomCopyBytes(kSecRandomDefault, 24, ptr.baseAddress!)
-        }
-        
+        // 24-byte random nonce for XChaCha20-Poly1305. The conversation key is
+        // fixed per (sender, recipient) pair, so a repeated nonce reuses the
+        // keystream across every DM to that peer and leaks the Poly1305 key.
+        // Never continue with an unchecked buffer here — fail the send instead.
+        let nonce24 = try SecureRandom.bytes(24)
+
         let pt = Data(plaintext.utf8)
         let sealed = try XChaCha20Poly1305Compat.seal(plaintext: pt, key: key, nonce24: nonce24)
         
@@ -515,9 +515,20 @@ struct NostrEvent: Codable {
         
         // Sign with Schnorr (BIP-340)
         var messageBytes = [UInt8](eventIdHash)
-        var auxRand = [UInt8](repeating: 0, count: 32)
-        _ = auxRand.withUnsafeMutableBytes { ptr in
-            SecRandomCopyBytes(kSecRandomDefault, 32, ptr.baseAddress!)
+        // BIP-340 aux_rand is optional side-channel hardening, not a security
+        // requirement: an all-zero aux_rand is the spec's own "no auxiliary
+        // randomness" case and still yields a sound signature. So this is the
+        // one RNG site that may degrade — but it degrades *deliberately* and
+        // loudly, rather than by discarding an OSStatus.
+        var auxRand: [UInt8]
+        if let random = SecureRandom.optionalBytes(32) {
+            auxRand = [UInt8](random)
+        } else {
+            SecureLogger.warning(
+                "⚠️ CSPRNG unavailable for BIP-340 aux_rand — signing with the spec's zero aux_rand",
+                category: .session
+            )
+            auxRand = [UInt8](repeating: 0, count: 32)
         }
         let schnorrSignature = try key.signature(message: &messageBytes, auxiliaryRand: &auxRand)
         

@@ -568,7 +568,10 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
 
 pub(crate) fn new_media_staging_id() -> String {
     let mut buf = [0u8; 16];
-    let _ = getrandom::getrandom(&mut buf);
+    // Swallowing the error leaves `buf` zeroed, so every staged item would land
+    // on the same id and collide on disk. Match `MeshSigner::generate`: a dead
+    // OS CSPRNG is not a condition to paper over.
+    getrandom::getrandom(&mut buf).expect("OS RNG available");
     hex::encode(buf)
 }
 
