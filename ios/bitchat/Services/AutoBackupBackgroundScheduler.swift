@@ -4,6 +4,29 @@ import BitLogger
 import Foundation
 import UIKit
 
+/// Calls `setTaskCompleted` at most once for a `BGTask`.
+///
+/// Both the expiration handler and the normal completion path can reach it when
+/// expiry lands while the backup is finishing, and BGTaskScheduler treats a
+/// second `setTaskCompleted` as a programming error. Same once-only shape as
+/// `MarmotChatModel.SNBackgroundTaskBox`.
+private final class SNBackupTaskCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: BGTask?
+
+    init(_ task: BGTask) {
+        self.task = task
+    }
+
+    func complete(success: Bool) {
+        lock.lock()
+        let pending = task
+        task = nil
+        lock.unlock()
+        pending?.setTaskCompleted(success: success)
+    }
+}
+
 /// OS-scheduled auto-backup for when the UI is not in the foreground.
 ///
 /// Two requests, mirroring the Compose app's two WorkManager jobs, because one
@@ -163,9 +186,85 @@ final class AutoBackupBackgroundScheduler {
         let work = Task { @MainActor in
             await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
         }
-        task.expirationHandler = { work.cancel() }
-        await work.value
-        task.setTaskCompleted(success: true)
+        // `setTaskCompleted` is a once-only call; the expiration handler and the
+        // normal completion below can both reach it when expiry lands while
+        // `work` is finishing.
+        let completion = SNBackupTaskCompletion(task)
+        // Cancelling `work` is NOT enough to make suspension safe, and on its own
+        // it is close to a no-op here: `backupAccount()` parks in uncancellable
+        // Rust (seal, reconnect, Blossom upload), and Swift cancellation cannot
+        // end such a park — the same thing `SonarPushProcessor.closeStoreWithDeadline`
+        // documents for the push wake. See the close below for why expiry has to
+        // close the store, not just cancel.
+        // Unconditional close here, unlike the completion path below: expiry
+        // cannot know whether `backupAccount()` had reached its reopen yet, and
+        // the run is being abandoned regardless. `closeNode()` is idempotent.
+        task.expirationHandler = {
+            work.cancel()
+            completion.complete(success: false)
+            Task { @MainActor [weak self] in
+                await self?.closeStoreIfStillBackgrounded(label: "\(label) expired")
+            }
+        }
+        // The return value is the "did we reopen the store" answer the close
+        // below needs.
+        let reopenedStore = await work.value
+        // A BGTask launch never gets a scenePhase `.background` transition, so
+        // `SonarAppStore.setForeground(false)` -> `marmot.suspendStoreForBackground()`
+        // — the hook that closes the SQLCipher store before suspension — never
+        // runs for this process. And `backupAccount()` deliberately ends with the
+        // store REOPENED: it closes the node to seal, then `performConnect()` +
+        // `connectRelaysIfNeeded()` + `startPolling()` so the Blossom upload has a
+        // live node. Returning here without closing therefore hands iOS a process
+        // holding the App Group flock and the SQLCipher WAL the instant
+        // `setTaskCompleted` lets it suspend us — RunningBoard 0xdead10cc, round 6
+        // (TestFlight 1.12.6 (34), iPhone15,3: killed 28 min into a background
+        // launch with a freshly installed, never-latched node — `register_push_token`
+        // parked in `block_on_suspendable` un-aborted, which is R-028's proof that
+        // no `interruptNodeForSuspend()` ever ran, plus `wait_for_marmot_event`
+        // from the polling loop `backupAccount()` restarts).
+        //
+        // Close BEFORE `setTaskCompleted`, and on the ordinary success path — not
+        // only on expiry. The kill needs no expiry at all: a backup that finishes
+        // comfortably inside its window still leaves the store open.
+        //
+        // Only when the backup actually ran, though. On the not-due / not-
+        // disclosed / busy paths nothing of ours is open, and a Transponder push
+        // wake may have opened the node for its own drain in the meantime —
+        // closing that out from under it would trade this crash for lost messages.
+        if reopenedStore {
+            await closeStoreIfStillBackgrounded(label: label)
+        }
+        completion.complete(success: true)
+    }
+
+    /// Release the SQLCipher handle + App Group flock a background auto-backup
+    /// reopened, so iOS cannot suspend us holding them.
+    ///
+    /// Gated on `.background` like every other close path in the app: `.active`
+    /// / `.inactive` means the user can see the app and the foreground path owns
+    /// the node, so closing would just stall a visible session. `closeNode()` is
+    /// idempotent and clears its own fence, so running this after an expiry
+    /// close — or after the foreground resume already reconnected — is safe.
+    ///
+    /// Callers must have established that a backup really ran; see the
+    /// `reopenedStore` gate in `handle(_:label:)`.
+    private func closeStoreIfStillBackgrounded(label: String) async {
+        guard let store else { return }
+        guard UIApplication.shared.applicationState == .background else {
+            SecureLogger.info(
+                "Auto-backup \(label): store left open — app is foreground, that path owns the node",
+                category: .session
+            )
+            return
+        }
+        SecureLogger.info("Auto-backup \(label): closing the store before suspension", category: .session)
+        // Holds a `UIApplication` background task across the close, so iOS keeps
+        // the process alive until the handle is actually released — that is why
+        // this is also safe to start from the expiration handler, which must let
+        // `setTaskCompleted` return promptly.
+        await store.marmot.closeStoreAfterBackgroundWake()
+        SecureLogger.info("Auto-backup \(label): store closed", category: .session)
     }
 
     /// Finish an in-flight due backup when the user backgrounds the app.
@@ -212,14 +311,27 @@ final class AutoBackupBackgroundScheduler {
             return
         }
 
-        work = Task { @MainActor in
+        work = Task { @MainActor [weak self] in
             defer {
                 if lease != .invalid {
                     UIApplication.shared.endBackgroundTask(lease)
                     lease = .invalid
                 }
             }
-            await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
+            // Same reopen as the BGTask path, with an extra twist: this runs from
+            // the scenePhase `.background` case, which calls
+            // `sonarStore.setForeground(false)` -> `suspendStoreForBackground()`
+            // FIRST. So the backup's `performConnect()` reopens the store behind a
+            // close that has already been armed — a reopen-after-close (R-020)
+            // that nothing downstream closes again. The window guard above only
+            // makes it less likely to start, never safe to finish.
+            //
+            // Same `reopenedStore` gate as the BGTask path, and it matters more
+            // here: this fires on EVERY backgrounding, so closing unconditionally
+            // would race the store open for a push wake that arrived seconds after
+            // the transition.
+            guard await store.marmot.runAutoBackupIfDue(allowWhileActive: true) else { return }
+            await self?.closeStoreIfStillBackgrounded(label: "opportunistic")
         }
     }
 }

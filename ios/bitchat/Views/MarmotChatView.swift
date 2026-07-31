@@ -1239,13 +1239,23 @@ final class MarmotChatModel: ObservableObject {
     }
 
     /// Host executor: if core policy says due, run seal→reconnect→upload quietly.
+    ///
+    /// Returns whether `backupAccount()` actually ran. Background callers need
+    /// this: a backup ends with the SQLCipher store REOPENED, and on a BGTask
+    /// launch no scenePhase transition will ever close it (0xdead10cc, round 6 —
+    /// see `AutoBackupBackgroundScheduler.closeStoreIfStillBackgrounded`). They
+    /// must close only when we reopened, never on the `false` paths: a push wake
+    /// may have legitimately opened the node for its own drain in the meantime,
+    /// and closing it out from under that drain is a different bug.
+    ///
     /// - Parameter allowWhileActive: only the background-transition and
     ///   `BGTask` callers pass true. A backup closes the Marmot node, seals the
     ///   whole database, reopens it and uploads — several seconds of stalled
     ///   chat on a large account. Doing that 45s into a session the user is
     ///   sitting in reads as the app freezing, so the periodic in-app loop hands
     ///   the work to the background paths instead of doing it itself.
-    func runAutoBackupIfDue(allowWhileActive: Bool = false) async {
+    @discardableResult
+    func runAutoBackupIfDue(allowWhileActive: Bool = false) async -> Bool {
         // TRACKED GAP (macOS): this guard is iOS-only, so the macOS in-app loop
         // still seals while the app is active — the freeze this exists to
         // prevent. Deliberate: macOS has no BGTask/WorkManager equivalent and
@@ -1259,7 +1269,7 @@ final class MarmotChatModel: ObservableObject {
                 "Auto-backup executor: deferred (app active — leaving it to the background paths)",
                 category: .session
             )
-            return
+            return false
         }
         #endif
         guard !busy, !accountBackupInFlight else {
@@ -1267,14 +1277,14 @@ final class MarmotChatModel: ObservableObject {
                 "Auto-backup executor: skipped (busy=\(busy) inFlight=\(accountBackupInFlight))",
                 category: .session
             )
-            return
+            return false
         }
         // Upgrade / silent path: never upload until Settings or onboarding disclosed.
         #if os(iOS) || os(macOS)
         let disclosed = UserDefaults.standard.bool(forKey: "sonar.auto_backup_disclosed")
         guard disclosed else {
             SecureLogger.info("Auto-backup executor: skipped (not disclosed)", category: .session)
-            return
+            return false
         }
         #endif
         let due: Bool
@@ -1285,11 +1295,11 @@ final class MarmotChatModel: ObservableObject {
                 "⚠️ Backup policy check failed: \(error.localizedDescription)",
                 category: .session
             )
-            return
+            return false
         }
         guard due else {
             SecureLogger.info("Auto-backup executor: not due", category: .session)
-            return
+            return false
         }
         do {
             try await backupAccount(respectOptOut: true)
@@ -1300,6 +1310,10 @@ final class MarmotChatModel: ObservableObject {
                 category: .session
             )
         }
+        // True on the throwing path too: `backupAccount()` reopens the node in
+        // its own middle (seal -> `performConnect` -> upload) and throws only
+        // after, so a failed upload leaves the store just as open as a good one.
+        return true
     }
 
     /// Dry run passthrough — see `MarmotService.previewBackup`.
