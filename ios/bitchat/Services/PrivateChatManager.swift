@@ -273,8 +273,18 @@ final class PrivateChatManager: ObservableObject {
     
     /// Mark messages from a peer as read
     func markAsRead(from peerID: PeerID) {
-        unreadMessages.remove(peerID)
-        
+        // Only mutate when there is something to remove. `unreadMessages` is
+        // `@Published`, and a mutating access fires `objectWillChange` even for
+        // an absent element — which `SonarAppStore` republishes AND turns into
+        // `refreshBleKnownContactSnapshot()` + `processIncomingPayLines()` (a
+        // walk over every message of every private chat). Callers now mark a
+        // whole conversation by iterating its `privateChats` buckets
+        // (`markPrivateMessagesAsRead(fromKeys:)`), so the no-op keys are the
+        // common case, not the rare one.
+        if unreadMessages.contains(peerID) {
+            unreadMessages.remove(peerID)
+        }
+
         // Send read receipts for unread messages that haven't been sent yet
         if let messages = privateChats[peerID] {
             for message in messages {
