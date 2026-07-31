@@ -10,7 +10,7 @@ import java.security.SecureRandom
 
 /**
  * Desktop mesh identity — the Noise static keypair + Ed25519 announce-signing
- * seed that back this device's bitchat presence, persisted in [DesktopEnv] so the
+ * seed that back this device's bitchat presence, persisted via [DesktopSecrets] (OS keystore) so the
  * mesh peerID is STABLE across launches (the desktop twin of the Android
  * `MeshGatt` identity). Builds the signed ANNOUNCE packet via the SAME byte-exact
  * Rust core (`meshBuildAnnounce`) the Android/iOS apps use, so a phone that
@@ -43,9 +43,15 @@ object MeshIdentity {
             NoiseKeypairHex(priv, pub)
         } else if (priv != null || pub != null) {
             // Half-readable means a transient keystore fault, not a first run.
-            // Regenerating here would silently rotate peerIdHex and drop every
-            // peer's verified fingerprint, so fail loudly instead.
             error("mesh identity is only half-readable; refusing to regenerate and rotate the mesh fingerprint")
+        } else if (!DesktopSecrets.absenceIsTrustworthy()) {
+            // BOTH halves unreadable is the COMMON keystore fault (locked
+            // keyring, no D-Bus session), and it is indistinguishable from a
+            // first run by the return value alone: `secret-tool lookup` exits 1
+            // either way. Generating here would rotate peerIdHex and drop every
+            // peer's verified fingerprint. Only mint when the keystore has been
+            // proven readable, so "absent" really means absent.
+            error("mesh identity is unreadable (keystore fault); refusing to regenerate and rotate the mesh fingerprint")
         } else {
             noiseGenerateKeypair().also {
                 DesktopSecrets.put("mesh.noise.priv", it.privateHex)

@@ -1175,7 +1175,18 @@ actual object SonarCore {
             return SonarIdentity.import(saved)
         }
         if (onboardingComplete()) {
-            throw IllegalStateException("Account key missing. Restore from your backup key.")
+            // Distinguish the two cases now that we can: telling a user to
+            // restore from backup because their keyring happened to be locked
+            // would push them into an unnecessary (and lossy) recovery.
+            throw IllegalStateException(
+                if (DesktopSecrets.absenceIsTrustworthy()) {
+                    "Account key missing. Restore from your backup key."
+                } else {
+                    "Account key could not be read: " +
+                        (DesktopSecrets.keystoreUnavailableReason() ?: "keystore fault") +
+                        ". Unlock your keyring and reopen Sonar; do not restore from backup yet."
+                },
+            )
         }
         val id = SonarIdentity.generate()
         DesktopSecrets.put("nsec", id.nsec())
@@ -1189,6 +1200,16 @@ actual object SonarCore {
                 "database key malformed — refusing to overwrite (would lose history)"
             }
             return existing
+        }
+        // A null here means "no key stored" ONLY if the keystore was actually
+        // readable. On a keystore fault it means "could not read", and minting a
+        // replacement would overwrite the real SQLCipher key and leave the chat
+        // database permanently undecryptable. Same "null means absent"
+        // assumption that loadOrCreateIdentity already guards with
+        // onboardingComplete().
+        check(DesktopSecrets.absenceIsTrustworthy()) {
+            "database key unreadable (keystore fault) — refusing to generate a new one, " +
+                "which would make existing chats undecryptable"
         }
         val bytes = ByteArray(32).also { SecureRandom().nextBytes(it) }
         val hex = bytes.joinToString("") { b -> "%02x".format(b) }

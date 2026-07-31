@@ -100,12 +100,27 @@ object DesktopSecrets {
             else -> null
         }
         if (osValue != null) {
-            // A previous run may have written the keystore but failed to remove
-            // the prefs copy (persist() swallows errors). Without this the
-            // plaintext lingers forever and the banner tells the user to restart
-            // to fix something restarting cannot fix.
-            if (DesktopEnv.getString(key) != null) DesktopEnv.remove(key)
-            return osValue
+            val local = DesktopEnv.getString(key)
+            if (local == null) return osValue
+            if (local == osValue) {
+                // Identical copies: the duplicate is safe to drop, and leaving it
+                // would keep the banner up telling the user to restart to fix
+                // something restarting cannot fix.
+                DesktopEnv.remove(key)
+                return osValue
+            }
+            // They DIFFER, so the prefs copy is the newer one: it is only ever
+            // written when a keystore write failed, which leaves the older value
+            // stranded in the keystore. Deleting it here (as this did) let the
+            // stale keystore value win and destroyed the current key. Push the
+            // newer value back and only drop the local copy once the keystore
+            // confirms it.
+            if (osPut(key, local) && osGet(key) == local) {
+                DesktopEnv.remove(key)
+            } else {
+                fellBackToPlaintext = true
+            }
+            return local
         }
         if (!isMac && !isLinux) return DesktopEnv.getString(key)
         val legacy = DesktopEnv.getString(key) ?: return null
@@ -136,6 +151,37 @@ object DesktopSecrets {
         )
         DesktopEnv.putString(key, value)
     }
+
+    /**
+     * Whether a null from [get] can be trusted to mean "not stored".
+     *
+     * It cannot be inferred from the helper's exit status: `secret-tool lookup`
+     * exits 1 both when the key is absent AND when the keyring is unreachable
+     * (verified empirically; only stderr differs, which is locale-dependent and
+     * not worth parsing). So this does an authoritative round trip on a canary
+     * key in our own namespace.
+     *
+     * Callers must consult this BEFORE generating a replacement secret. Treating
+     * "unreadable" as "absent" is how an account key, a SQLCipher key or a mesh
+     * identity gets silently regenerated and the old one becomes unreachable.
+     *
+     * Cached: one probe per session, and only the generate paths pay for it.
+     */
+    fun absenceIsTrustworthy(): Boolean = canaryOk
+
+    private val canaryOk: Boolean by lazy {
+        // No OS keystore expected: prefs is the store, and it is always readable,
+        // so a null genuinely means absent.
+        if (!isMac && !isLinux) return@lazy true
+        if (!binaryAvailable()) return@lazy false
+        val probe = "__sonar_canary__"
+        val token = java.util.UUID.randomUUID().toString()
+        val ok = osPut(probe, token) && osGet(probe) == token
+        runCatching { if (isMac) keychainDelete(probe) else secretToolDelete(probe) }
+        ok
+    }
+
+    private fun binaryAvailable(): Boolean = if (isMac) macProbe else linuxProbe
 
     fun clear(vararg keys: String) {
         keys.forEach { key ->
