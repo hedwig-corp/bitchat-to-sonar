@@ -1049,6 +1049,23 @@ final class MarmotChatModel: ObservableObject {
             )
             return
         }
+        // Hold an assertion across the WHOLE tick, not just the close below.
+        // The tick starts foreground, but `backupAccount()` seals, reopens and
+        // uploads for several seconds and none of that chain is
+        // cancellation-aware — so the user can background us mid-backup and iOS
+        // can suspend the process with the store freshly REOPENED, before the
+        // close is ever reached. Cancelling `autoBackupTask` from
+        // `suspendStoreForBackground()` does not help a tick already inside
+        // that await. This is the straddle half of round 6's residual (3); the
+        // assertion is what makes the close reachable, exactly as it does in
+        // `suspendStoreForBackground()` and `closeStoreAfterBackgroundWake()`.
+        let box = SNBackgroundTaskBox()
+        box.set(
+            UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.autoBackupTick") {
+                box.endOnce()
+            }
+        )
+        defer { box.endOnce() }
         #endif
         let ran = await runAutoBackupIfDue()
         #if !os(iOS)
