@@ -952,8 +952,15 @@ pub mod file_packet {
     const T_FILE_SIZE: u8 = 0x02;
     const T_MIME_TYPE: u8 = 0x03;
     const T_CONTENT: u8 = 0x04;
-    /// Optional Sonar extension. Stock bitchat decoders skip unknown TLVs, so
-    /// adding the sender's chat message id remains wire-compatible.
+    /// Optional Sonar extension carrying the sender's chat message id.
+    ///
+    /// NOT universally wire-compatible: bitchat's Swift decoder skips unknown
+    /// tags, but bitchat-android's does `TLVType.from(tag) ?: return null` and
+    /// drops the ENTIRE packet — media included — on the first tag it does not
+    /// know. Callers must therefore only set `message_id` for peers proven to
+    /// run Sonar (`Engine::send_file` gates on a verified 0x53 announce).
+    /// Decoding stays unconditional so Sonar peers still on the old
+    /// always-emit build keep their receipts.
     const T_MESSAGE_ID: u8 = 0x05;
 
     /// A decoded file transfer payload.

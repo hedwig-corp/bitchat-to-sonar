@@ -2823,8 +2823,16 @@ pub fn mesh_parse_public_message(packet_bytes: Vec<u8>) -> Option<MeshPublicMess
 
 // ── Mesh file transfer (BitchatFilePacket, type 0x22) ─────────────────────
 
-/// Encode a `BitchatFilePacket` TLV (bitchat-compatible). The result is the
-/// payload of a 0x22 packet (private = Noise-encrypt it first, then fragment).
+/// Encode a `BitchatFilePacket` TLV. The result is the payload of a 0x22 packet
+/// (private = Noise-encrypt it first, then fragment).
+///
+/// Only bitchat-compatible while `message_id` is `None`. That field is a
+/// Sonar-only TLV and bitchat-android drops a file packet whole on the first tag
+/// it does not know, so a caller that sets it MUST already know the recipient
+/// runs Sonar. Unlike `Engine::send_file`, this entry point has no route and
+/// therefore no capability to gate on — it cannot make that check for you.
+/// No app calls this today (only the generated bindings expose it); prefer
+/// `Engine::send_file`, which gates on a verified 0x53. See R-030.
 #[uniffi::export]
 pub fn mesh_encode_file_packet(
     file_name: Option<String>,

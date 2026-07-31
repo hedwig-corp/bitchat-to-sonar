@@ -272,6 +272,293 @@ struct BLEServiceCoreTests {
         #expect(capture.profile?.npub == npub)
     }
 
+    /// The regression: Sonar's optional message-id TLV (0x05) went out to every
+    /// peer. bitchat-android's `BitchatFilePacket.decode` resolves each tag
+    /// through a four-value enum and returns null on the first miss, so that one
+    /// extra TLV made every image, voice note and file a Sonar user sent to an
+    /// Android bitchat user vanish — no row, no error, on either side.
+    @Test
+    func wireFilePacket_stripsTheSonarTLVForANonSonarRecipient() throws {
+        let packet = BitchatFilePacket(
+            fileName: "photo.jpg",
+            fileSize: 3,
+            mimeType: "image/jpeg",
+            messageID: "media-mid",
+            content: Data([0xFF, 0xD8, 0xFF])
+        )
+
+        let stock = BLEService.wireFilePacket(packet, sonarCapableRecipient: false)
+        #expect(stock.messageID == nil)
+        let stockBytes = try #require(stock.encode(), "Failed to encode stripped packet")
+        let decodedByAndroid = try #require(
+            Self.decodeLikeBitchatAndroid(stockBytes),
+            "stock bitchat must be able to decode Sonar's media"
+        )
+        #expect(decodedByAndroid.fileName == "photo.jpg")
+        #expect(decodedByAndroid.content == packet.content)
+
+        // Not removed, only gated: a peer known to speak Sonar still gets the
+        // id that earns a delivery receipt.
+        let sonar = BLEService.wireFilePacket(packet, sonarCapableRecipient: true)
+        #expect(sonar.messageID == "media-mid")
+        let sonarBytes = try #require(sonar.encode(), "Failed to encode Sonar packet")
+        #expect(Self.decodeLikeBitchatAndroid(sonarBytes) == nil,
+                "this is exactly the packet bitchat-android drops")
+        #expect(BitchatFilePacket.decode(sonarBytes)?.messageID == "media-mid")
+    }
+
+    /// Only a *verified* 0x53 may mark a peer Sonar-capable — that flag is what
+    /// unlocks the extension, so an unverified or absent announce must leave the
+    /// stock-bitchat wire format in place.
+    @Test
+    func sonarCapability_requiresAVerifiedSonarAnnounce() async throws {
+        let ble = makeService()
+
+        let signer = NoiseEncryptionService(keychain: MockKeychain())
+        let announcement = AnnouncementPacket(
+            nickname: "Sara D",
+            noisePublicKey: signer.getStaticPublicKeyData(),
+            signingPublicKey: signer.getSigningPublicKeyData(),
+            directNeighbors: nil
+        )
+        let peerID = PeerID(publicKey: announcement.noisePublicKey)
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        #expect(ble.isSonarCapable(peerID) == false)
+
+        let announcePayload = try #require(announcement.encode(), "Failed to encode announcement")
+        let announcePacket = try #require(signer.signPacket(BitchatPacket(
+            type: MessageType.announce.rawValue,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now,
+            payload: announcePayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign announce packet")
+        ble._test_handlePacket(announcePacket, fromPeerID: peerID, preseedPeer: false)
+
+        // Gate on an observable positive rather than a fixed sleep:
+        // `_test_handlePacket` dispatches to a concurrent `messageQueue`, so a
+        // timed wait would pass simply because nothing had run yet.
+        let announceLanded = await TestHelpers.waitUntil({ !ble.currentPeerSnapshots().isEmpty },
+                                                         timeout: TestConstants.shortTimeout)
+        #expect(announceLanded)
+        // A plain bitchat announce says nothing about Sonar support.
+        #expect(ble.isSonarCapable(peerID) == false)
+
+        let sonarPayload = try #require(SonarAnnouncePacket(
+            npub: Data((0..<32).map { UInt8($0) }),
+            bip353: nil,
+            capabilities: SonarCapability.marmotDM
+        ).encode(), "Failed to encode Sonar announce")
+        let sonarPacket = try #require(signer.signPacket(BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 1,
+            payload: sonarPayload,
+            signature: nil,
+            ttl: 7
+        )), "Failed to sign Sonar packet")
+
+        // "Verified" is load-bearing, not decoration: the signature guard is
+        // what stops any peer on the mesh claiming another fingerprint speaks
+        // Sonar. Same bytes, one flipped signature byte. Polled for the full
+        // window, so this cannot pass by simply outrunning the queue.
+        //
+        // The tampered copy carries a DIFFERENT timestamp from the valid one
+        // below: `messageDeduplicator` keys on (sender, timestamp, type), so
+        // reusing it would make the valid packet a duplicate and the positive
+        // control would silently never arrive.
+        var tamperedSignature = try #require(sonarPacket.signature, "Sonar packet must be signed")
+        tamperedSignature[tamperedSignature.startIndex] ^= 0xFF
+        let tamperedPacket = BitchatPacket(
+            type: SonarAnnouncePacket.packetType,
+            senderID: Data(hexString: peerID.id) ?? Data(),
+            recipientID: nil,
+            timestamp: now + 2,
+            payload: sonarPayload,
+            signature: tamperedSignature,
+            ttl: 7
+        )
+        ble._test_handlePacket(tamperedPacket, fromPeerID: peerID, preseedPeer: false)
+        let grantedByTampered = await TestHelpers.waitUntil({ ble.isSonarCapable(peerID) },
+                                                            timeout: TestConstants.shortTimeout)
+        #expect(grantedByTampered == false, "an unverified 0x53 must not grant the extension")
+
+        // Not vacuous: the same packet with its real signature does grant it,
+        // which also proves the delivery path above was live.
+        ble._test_handlePacket(sonarPacket, fromPeerID: peerID, preseedPeer: false)
+        let becameCapable = await TestHelpers.waitUntil({ ble.isSonarCapable(peerID) },
+                                                        timeout: TestConstants.shortTimeout)
+        #expect(becameCapable)
+    }
+
+    /// The parked-0x53 queue feeds `handleSonarAnnounce`'s replay, which is where
+    /// a 0x53-before-0x01 peer earns its capability — so flushing that queue
+    /// defeats the record just as effectively as clearing the capability map.
+    /// Parking happens BEFORE verification (the signing key is exactly what is
+    /// missing), so a flood needs no keypairs, and the old policy evicted by
+    /// `packet.timestamp`, which the flooder chooses.
+    ///
+    /// Drives the parking policy directly. Pushing 128+ unknown-sender 0x53s
+    /// through `_test_handlePacket` hangs: each schedules an announce-back
+    /// against a simulator with no CoreBluetooth. The end-to-end replay is
+    /// covered on the Rust side by
+    /// `a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`.
+    @Test
+    func parkedSonarAnnounce_survivesAFloodOfUnknownSenders() {
+        let ble = makeService()
+        let victim = PeerID(str: "0011223344556677")
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        func announce(from peerID: PeerID, timestamp: UInt64) -> BitchatPacket {
+            BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: timestamp,
+                payload: Data(repeating: 0x01, count: 8),
+                signature: Data(repeating: 0xAB, count: 64),
+                ttl: 7
+            )
+        }
+
+        // The victim parks first, with an honest current timestamp.
+        ble._test_queuePendingSonarAnnounce(announce(from: victim, timestamp: now), from: victim)
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim))
+
+        // Flood past the cap. Timestamps are far in the FUTURE, which is what
+        // defeated the old `min(by: packet.timestamp)` policy: the flooder's
+        // entries were never the eviction candidate, so the victim's always was.
+        // The 0x53 staleness check only rejects old timestamps, so future dates
+        // pass it.
+        for i in 0..<(ble._test_pendingSonarAnnounceCap * 2) {
+            let flooder = PeerID(str: String(format: "%016x", i + 1))
+            ble._test_queuePendingSonarAnnounce(
+                announce(from: flooder, timestamp: now + 600_000),
+                from: flooder
+            )
+        }
+
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim),
+                "a flood of parked 0x53s must not evict the victim's parked packet")
+        #expect(ble._test_pendingSonarAnnounceCount <= ble._test_pendingSonarAnnounceCap)
+    }
+
+    /// Refusing at the cap protects incumbents, which is the point — but only
+    /// if "incumbent" means a packet that has been waiting, not a sender that
+    /// keeps talking. Stamping `queuedAt` on every re-park let an attacker fill
+    /// the lot and then hold it forever by re-sending the same 0x53s inside the
+    /// window, locking every legitimate newcomer out.
+    @Test
+    func parkedSonarAnnounce_reparkingDoesNotExtendProtection() {
+        let ble = makeService()
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        func announce(from peerID: PeerID) -> BitchatPacket {
+            BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: now,
+                payload: Data(repeating: 0x01, count: 8),
+                signature: Data(repeating: 0xAB, count: 64),
+                ttl: 7
+            )
+        }
+
+        // Fill every slot, then re-send the same senders. If a re-park reset the
+        // clock, these would stay protected indefinitely.
+        let squatters = (0..<ble._test_pendingSonarAnnounceCap).map {
+            PeerID(str: String(format: "%016x", $0 + 1))
+        }
+        for p in squatters { ble._test_queuePendingSonarAnnounce(announce(from: p), from: p) }
+        var firstParkStamps: [PeerID: TimeInterval] = [:]
+        for p in squatters { firstParkStamps[p] = ble._test_pendingSonarAnnounceQueuedAt(for: p) }
+        for p in squatters { ble._test_queuePendingSonarAnnounce(announce(from: p), from: p) }
+
+        // The lot is full, so a newcomer is refused for now — intended
+        // fail-closed behaviour, not the bug.
+        #expect(ble._test_pendingSonarAnnounceCount == ble._test_pendingSonarAnnounceCap)
+        let victim = PeerID(str: "00ffffffffffff01")
+        ble._test_queuePendingSonarAnnounce(announce(from: victim), from: victim)
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim) == false)
+
+        // The bug is whether the squatters can stay protected forever. Their
+        // arrival stamps must be unchanged by the re-park — hundreds of
+        // microseconds of `systemUptime` elapse across 128 re-parks, so a stamp
+        // that reset would be measurably later.
+        for p in squatters.prefix(5) {
+            #expect(ble._test_pendingSonarAnnounceQueuedAt(for: p) == firstParkStamps[p],
+                    "re-parking must not reset the arrival stamp it is aged against")
+        }
+    }
+
+    /// Every marking is cheap to mint — one keypair, one TOFU announce, one
+    /// self-signed 0x53 — so a wholesale `removeAll()` at the cap let roughly
+    /// `sonarCapablePeerCap` throwaway identities flush a live peer's marking,
+    /// sustainably rather than once. That costs more than a receipt: with no
+    /// message id `handleFileTransfer` skips its duplicate check, so a re-send
+    /// lands as a second row and a second stored file against the media quota.
+    @Test
+    func sonarCapability_survivesAFloodOfThrowawayPeers() async throws {
+        let ble = makeService()
+        let live = PeerID(str: "0011223344556677")
+
+        ble._test_recordSonarCapability(live)
+        #expect(ble.isSonarCapable(live))
+
+        // Flood well past the cap, all inside the protection window.
+        for i in 0..<(ble._test_sonarCapablePeerCap * 3) {
+            ble._test_recordSonarCapability(PeerID(str: String(format: "%016x", i + 1)))
+        }
+
+        #expect(ble.isSonarCapable(live), "a flood must not evict a live peer's marking")
+        #expect(ble._test_sonarCapablePeerCount <= ble._test_sonarCapablePeerCap)
+    }
+
+    /// bitchat-android's `BitchatFilePacket.decode`, transcribed: every tag is
+    /// resolved through a four-value enum and an unknown one aborts the whole
+    /// packet. This is the decoder Sonar's media has to survive.
+    private static func decodeLikeBitchatAndroid(_ data: Data) -> (fileName: String, content: Data)? {
+        var offset = 0
+        var fileName: String?
+        var content: Data?
+        let bytes = [UInt8](data)
+
+        while offset + 3 <= bytes.count {
+            let tag = bytes[offset]
+            guard (0x01...0x04).contains(tag) else { return nil }
+            offset += 1
+
+            let length: Int
+            if tag == 0x04 {
+                guard offset + 4 <= bytes.count else { return nil }
+                length = bytes[offset..<offset + 4].reduce(0) { ($0 << 8) | Int($1) }
+                offset += 4
+            } else {
+                guard offset + 2 <= bytes.count else { return nil }
+                length = bytes[offset..<offset + 2].reduce(0) { ($0 << 8) | Int($1) }
+                offset += 2
+            }
+            guard offset + length <= bytes.count else { return nil }
+            let value = Data(bytes[offset..<offset + length])
+            offset += length
+
+            switch tag {
+            case 0x01: fileName = String(data: value, encoding: .utf8)
+            case 0x02: guard length == 4 else { return nil }
+            case 0x04: content = value
+            default: break
+            }
+        }
+
+        guard let name = fileName, let payload = content else { return nil }
+        return (name, payload)
+    }
+
     // The reachability retention window must survive two LOST announces,
     // which means lasting until the THIRD emission: announce emissions are
     // spaced [interval, interval + maintenance tick] apart because the
