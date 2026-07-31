@@ -895,6 +895,10 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
         // clear below makes every later call take the no-intent path.
         if restore_intent_path(db_path).is_file() {
             drop_outgoing_key_package_slot(db_path);
+            // Under the same gate: without a restore in flight, a leftover
+            // staged policy is debris, and adopting it would tell a healthy
+            // install it holds a backup that never replaced it.
+            promote_staged_backup_policy_best_effort(db_path);
         }
         clear_restore_intent(db_path);
         return Ok(());
@@ -921,6 +925,7 @@ pub fn commit_staged_account_restore(db_path: &Path) -> Result<()> {
     // which is the narrower form of the bug this cleanup exists to prevent.
     drop_outgoing_key_package_slot(db_path);
     promote_staged_index_best_effort(db_path);
+    promote_staged_backup_policy_best_effort(db_path);
     // Drop leftover staging DB sidecars (index may remain if rename failed).
     for suffix in ["-wal", "-shm", "-journal"] {
         let mut p = staging_db_path(db_path).as_os_str().to_owned();
@@ -963,6 +968,72 @@ fn drop_outgoing_key_package_slot(db_path: &Path) {
     }
 }
 
+/// Write the restored backup's facts into a policy sidecar beside the *staged*
+/// DB, for [`promote_staged_backup_policy_best_effort`] to adopt at commit.
+///
+/// The policy is a local sidecar, so it is not inside the backup and does not
+/// survive the wipe that precedes a restore. Without this, an account that just
+/// restored successfully reports "Last backup: Never" with a dashed stats strip
+/// — the one moment the user has most reason to distrust it — until the next
+/// scheduled upload happens to run, up to a day later.
+///
+/// Best-effort by construction: chats are already staged and verified at this
+/// point, and failing the restore over a stats sidecar would be a far worse
+/// trade than rendering "Never" for one more cycle.
+fn stage_restored_backup_policy(staged_db: &Path, db_key_hex: &str, meta: RestoredBackupMeta) {
+    let restored = BackupPolicy {
+        last_success_at: Some(meta.uploaded_at_secs),
+        // Also the last attempt: the uploaded blob IS this account's latest
+        // attempt, and leaving it unset would make a fresh backup due the moment
+        // the restored install marks itself dirty, seconds after the restore.
+        last_attempt_at: Some(meta.uploaded_at_secs),
+        last_size_bytes: Some(meta.size_bytes),
+        // Counted from the staged index, which is what the blob actually
+        // contains — the live index at commit time has post-restore traffic.
+        last_message_count: count_indexed_messages(staged_db, db_key_hex),
+        ..BackupPolicy::default()
+    };
+    if let Err(e) = save_backup_policy_to_disk(staged_db, &restored) {
+        tracing::warn!(%e, "account restore: could not stage the restored backup policy");
+    }
+}
+
+/// Adopt the staged restored-backup facts into the live policy.
+///
+/// Only the stats move. `enabled` and the cadence are this device's settings,
+/// not the backup's: a user who turned auto-backup off must not have it turned
+/// back on by restoring, so the live policy (or its on-by-default) still wins.
+fn promote_staged_backup_policy_best_effort(db_path: &Path) {
+    let staged_path = backup_policy_path_for_db(&staging_db_path(db_path));
+    let Ok(bytes) = fs::read(&staged_path) else {
+        return;
+    };
+    let restored = match serde_json::from_slice::<BackupPolicy>(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(%e, "account restore: staged backup policy unreadable; keeping live");
+            let _ = fs::remove_file(&staged_path);
+            return;
+        }
+    };
+    with_policy_state(|map| {
+        let mut live = cached_policy(map, db_path);
+        live.last_success_at = restored.last_success_at;
+        live.last_attempt_at = restored.last_attempt_at;
+        live.last_size_bytes = restored.last_size_bytes;
+        live.last_message_count = restored.last_message_count;
+        // The live DB is now exactly the uploaded blob, so nothing is pending
+        // and the previous install's error no longer describes anything.
+        live.dirty = false;
+        live.attempt_dirty_seq = None;
+        live.last_error = None;
+        if let Err(e) = store_policy(map, db_path, &live) {
+            tracing::warn!(%e, "account restore: could not promote the restored backup policy");
+        }
+    });
+    let _ = fs::remove_file(&staged_path);
+}
+
 fn promote_staged_index_best_effort(db_path: &Path) {
     let staged_index = index_db_path_for_db(&staging_db_path(db_path));
     if !staged_index.is_file() {
@@ -992,7 +1063,11 @@ fn promote_staged_index_best_effort(db_path: &Path) {
 /// the main DB was already promoted, clearing the host `db_key` instead of
 /// aborting staging is what orphans chats.
 pub fn abort_staged_account_restore(db_path: &Path) {
-    remove_db_tree(&staging_db_path(db_path));
+    let staged = staging_db_path(db_path);
+    // Before the DB tree, so an abort cannot leave stats behind that a later
+    // commit would adopt as if they described the restore that just failed.
+    let _ = fs::remove_file(backup_policy_path_for_db(&staged));
+    remove_db_tree(&staged);
     clear_restore_intent(db_path);
 }
 
@@ -1028,6 +1103,13 @@ pub fn reconcile_staged_account_restore(db_path: &Path, db_key_hex: &str) -> Res
     if !staged.is_file() {
         // Crash after DB rename / before index rename — finish the index only.
         promote_staged_index_best_effort(db_path);
+        // And the stats, under the same intent gate commit uses: the promotion
+        // is the last thing commit does, so this window is exactly where a
+        // restored install would otherwise keep reporting "Never" forever and
+        // leave the staged sidecar in the account dir for storage to count.
+        if restore_intent_path(db_path).is_file() {
+            promote_staged_backup_policy_best_effort(db_path);
+        }
         clear_restore_intent(db_path);
         return Ok(false);
     }
@@ -1429,7 +1511,7 @@ async fn preview_account_backup_from(
     db_path: &Path,
     hosts: &[Url],
 ) -> Result<AccountBackupPreview> {
-    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_with_meta(keys, hosts).await?;
+    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_from(keys, hosts).await?;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     let size_bytes = sealed.len() as u64;
     let Some(index_bytes) = package.index_bytes.as_ref() else {
@@ -1479,44 +1561,25 @@ async fn preview_account_backup_from(
     })
 }
 
-/// Newest account backup plus its upload timestamp, searching each host in turn.
-async fn download_latest_sealed_backup_with_meta(
-    keys: &Keys,
-    bases: &[Url],
-) -> Result<(Vec<u8>, u64)> {
-    let mut last_missing = Error::AccountBackupMissing;
-    for base in bases {
-        let mut blobs = match list_account_backup_blobs(keys, base).await {
-            Ok(b) => b,
-            Err(e) => return Err(e),
-        };
-        blobs.retain(|b| b.mime_type.as_deref() == Some(ACCOUNT_BACKUP_MIME));
-        if blobs.is_empty() {
-            last_missing = Error::AccountBackupMissing;
-            continue;
-        }
-        blobs.sort_by_key(|b| b.uploaded);
-        let latest = blobs.pop().expect("non-empty after retain");
-        let uploaded = latest.uploaded.as_secs();
-        let data = download_latest_sealed_backup_at(keys, base).await?;
-        return Ok((data, uploaded));
-    }
-    Err(last_missing)
-}
-
 /// List this pubkey's blobs and download the newest account-backup MIME.
 pub async fn download_latest_sealed_backup(keys: &Keys, server_url: &str) -> Result<Vec<u8>> {
-    download_latest_sealed_backup_from(keys, &backup_search_hosts(server_url)?).await
+    download_latest_sealed_backup_from(keys, &backup_search_hosts(server_url)?)
+        .await
+        .map(|(data, _uploaded)| data)
 }
 
 /// Try each host in order. Only a genuinely absent backup advances to the next
 /// one — a transport or decode failure is reported as-is rather than being
 /// retried elsewhere and surfacing as the misleading "no backup" outcome.
-async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Result<Vec<u8>> {
+///
+/// Returns the blob's `uploaded` timestamp alongside the bytes: it is the only
+/// record of *when* a restored backup was taken, and both the dry-run preview
+/// and the restored policy sidecar report it to the user.
+async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Result<(Vec<u8>, u64)> {
     let mut last_missing = Error::AccountBackupMissing;
     for base in bases {
         match download_latest_sealed_backup_at(keys, base).await {
-            Ok(data) => return Ok(data),
+            Ok(found) => return Ok(found),
             Err(e) if is_missing_backup_error(&e) => last_missing = e,
             Err(e) => return Err(e),
         }
@@ -1527,7 +1590,7 @@ async fn download_latest_sealed_backup_from(keys: &Keys, bases: &[Url]) -> Resul
 /// Same, against an already-validated base. Split out so tests can drive the
 /// real list → download → verify path against a loopback mock without
 /// loosening the https requirement in [`blossom_base`].
-async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec<u8>> {
+async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<(Vec<u8>, u64)> {
     // The listing carries no payload to scale on, so it gets the fixed
     // allowance. Same reasoning as the transfers: a server that accepts and
     // stalls here would hang restore just as effectively.
@@ -1543,6 +1606,7 @@ async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec
     }
     blobs.sort_by_key(|b| b.uploaded);
     let latest = blobs.pop().expect("non-empty after retain");
+    let uploaded = latest.uploaded.as_secs();
     if latest.size as usize > MAX_BACKUP_BYTES {
         return Err(Error::Blossom(format!(
             "backup blob too large ({})",
@@ -1561,7 +1625,7 @@ async fn download_latest_sealed_backup_at(keys: &Keys, base: &Url) -> Result<Vec
     if hash != latest.sha256 {
         return Err(Error::Blossom("backup sha256 mismatch".into()));
     }
-    Ok(data)
+    Ok((data, uploaded))
 }
 
 /// Checkpoint + read + AEAD seal. Requires **no** live `SonarNode` on `db_path`.
@@ -1610,10 +1674,55 @@ pub async fn fetch_account_backup_package(
     keys: &Keys,
     server_url: &str,
 ) -> Result<AccountBackupPackage> {
-    let sealed = download_latest_sealed_backup(keys, server_url).await?;
+    fetch_account_backup_package_with_meta(keys, server_url)
+        .await
+        .map(|(package, _meta)| package)
+}
+
+/// What the restored blob was, as the server described it. Carried through the
+/// restore so the promoted policy can say when the backup was taken and how big
+/// it was — the sealed bytes themselves record neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoredBackupMeta {
+    uploaded_at_secs: u64,
+    size_bytes: u64,
+}
+
+async fn fetch_account_backup_package_with_meta(
+    keys: &Keys,
+    server_url: &str,
+) -> Result<(AccountBackupPackage, RestoredBackupMeta)> {
+    fetch_account_backup_package_from(keys, &backup_search_hosts(server_url)?).await
+}
+
+async fn fetch_account_backup_package_from(
+    keys: &Keys,
+    hosts: &[Url],
+) -> Result<(AccountBackupPackage, RestoredBackupMeta)> {
+    let (sealed, uploaded_at_secs) = download_latest_sealed_backup_from(keys, hosts).await?;
+    let size_bytes = sealed.len() as u64;
     let package = open_account_backup(&secret_bytes(keys), &sealed)?;
     validate_db_key_hex(&package.db_key_hex)?;
-    Ok(package)
+    Ok((
+        package,
+        RestoredBackupMeta {
+            // The descriptor is server-supplied. A future timestamp would park
+            // `backup_is_due` forever (`now - last_success` saturates to 0), so
+            // anything ahead of the clock is treated as "just now" instead.
+            uploaded_at_secs: clamp_uploaded_at(uploaded_at_secs, now_unix_secs()),
+            size_bytes,
+        },
+    ))
+}
+
+/// A backup cannot have been uploaded in the future, and a zero timestamp is a
+/// server that did not report one. Both fall back to `now`.
+fn clamp_uploaded_at(uploaded_at_secs: u64, now_secs: u64) -> u64 {
+    if uploaded_at_secs == 0 || uploaded_at_secs > now_secs {
+        now_secs
+    } else {
+        uploaded_at_secs
+    }
 }
 
 /// Download + decrypt + stage files beside `db_path`. Returns `db_key_hex`.
@@ -1625,7 +1734,14 @@ pub async fn restore_account_files(
     db_path: &Path,
     server_url: &str,
 ) -> Result<String> {
-    let package = fetch_account_backup_package(keys, server_url).await?;
+    restore_account_files_from(keys, db_path, &backup_search_hosts(server_url)?).await
+}
+
+/// Same, against already-validated hosts. Split out for the same reason as
+/// [`preview_account_backup_from`]: tests drive the real list → download →
+/// stage path against a loopback mock without loosening [`blossom_base`].
+async fn restore_account_files_from(keys: &Keys, db_path: &Path, hosts: &[Url]) -> Result<String> {
+    let (package, meta) = fetch_account_backup_package_from(keys, hosts).await?;
     let staged = staging_db_path(db_path);
     // Replace any leftover staging from a prior interrupted restore.
     abort_staged_account_restore(db_path);
@@ -1637,6 +1753,9 @@ pub async fn restore_account_files(
     }
     // Refuse to hand hosts a key for corrupt / wrong-key empty SQLCipher bytes.
     verify_sqlcipher_opens(&staged, &package.db_key_hex)?;
+    // Record what came back, beside the staged DB rather than at the live path:
+    // an aborted restore must leave the live policy alone. Commit promotes it.
+    stage_restored_backup_policy(&staged, &package.db_key_hex, meta);
     // Only now, with verified staged bytes on disk, record that a restore was
     // genuinely requested. Boot reconcile promotes staging only against this
     // marker; written last so a crash mid-staging leaves debris that reconcile
@@ -1698,7 +1817,7 @@ mod tests {
         let keys = Keys::generate();
         let sealed = b"sealed-account-backup-bytes".to_vec();
         let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
-        let got = download_latest_sealed_backup_at(&keys, &base)
+        let (got, _uploaded) = download_latest_sealed_backup_at(&keys, &base)
             .await
             .expect("restore must find the uploaded backup");
         assert_eq!(got, sealed);
@@ -1770,10 +1889,11 @@ mod tests {
         let sealed = b"backup-on-the-old-host".to_vec();
         let (current, _a) = spawn_mock_blossom_list(Keys::generate().public_key(), b"x".to_vec());
         let (legacy, _b) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
-        let got = download_latest_sealed_backup_from(&keys, &[current, legacy])
+        let (got, uploaded) = download_latest_sealed_backup_from(&keys, &[current, legacy])
             .await
             .expect("must search the legacy host too");
         assert_eq!(got, sealed);
+        assert_eq!(uploaded, 7, "the descriptor timestamp travels with the blob");
     }
 
     /// A real error on the first host must not be retried onto the next and
@@ -2543,6 +2663,163 @@ mod tests {
         assert_eq!(maya.latest_content, "on my way");
         assert_eq!(preview.total_messages, 3);
         assert_eq!(preview.uploaded_at_secs, 7, "descriptor timestamp");
+    }
+
+    /// A restored install must be able to say what it restored.
+    ///
+    /// The policy is a local sidecar: it is not inside the backup and does not
+    /// survive the wipe a restore performs. Before this, an account whose chats
+    /// had just come back reported "Last backup · Never" over a dashed stats
+    /// strip — which reads as "nothing is backed up" at exactly the moment the
+    /// user is checking — until some later scheduled upload happened to run.
+    #[tokio::test]
+    async fn a_restore_reports_the_backup_it_just_restored() {
+        let keys = Keys::generate();
+        let (_source, _source_db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed.clone());
+
+        // Fresh install: no DB, no policy sidecar (the wipe removed it), and
+        // the host has already read the default once — Settings does that on
+        // open, so the promotion has to beat the in-process cache too.
+        let dest = tempdir().unwrap();
+        let db_path = dest.path().join("marmot.sqlite");
+        assert_eq!(load_backup_policy(&db_path).last_success_at, None);
+
+        restore_account_files_from(&keys, &db_path, &[base])
+            .await
+            .expect("restore stages the backup");
+        commit_staged_account_restore(&db_path).expect("commit promotes it");
+
+        let policy = load_backup_policy(&db_path);
+        assert_eq!(
+            policy.last_success_at,
+            Some(7),
+            "the descriptor's upload time, not 'never'"
+        );
+        assert_eq!(policy.last_size_bytes, Some(sealed.len() as u64));
+        assert_eq!(
+            policy.last_message_count,
+            Some(3),
+            "counted from the index that came back"
+        );
+        assert!(!policy.dirty, "the live DB is exactly the uploaded blob");
+        assert_eq!(policy.last_error, None);
+        assert!(
+            !backup_policy_path_for_db(&staging_db_path(&db_path)).exists(),
+            "the staged sidecar must not outlive the commit"
+        );
+    }
+
+    /// Cadence and the off switch belong to the device, not to the blob. A user
+    /// who turned auto-backup off and then restored must not find it back on.
+    #[tokio::test]
+    async fn a_restore_keeps_this_devices_backup_setting() {
+        let keys = Keys::generate();
+        let (_source, _source_db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed);
+
+        let dest = tempdir().unwrap();
+        let db_path = dest.path().join("marmot.sqlite");
+        set_backup_frequency(&db_path, BackupFrequency::Weekly).unwrap();
+        set_backup_enabled(&db_path, false).unwrap();
+
+        restore_account_files_from(&keys, &db_path, &[base])
+            .await
+            .unwrap();
+        commit_staged_account_restore(&db_path).unwrap();
+
+        let policy = load_backup_policy(&db_path);
+        assert!(!policy.enabled, "restore must not re-enable an opt-out");
+        assert_eq!(policy.daily_interval_secs, 7 * DEFAULT_DAILY_INTERVAL_SECS);
+        assert_eq!(policy.last_success_at, Some(7), "stats still adopted");
+    }
+
+    /// The upload time is server-supplied and lands in `last_success_at`, which
+    /// `backup_is_due` subtracts from. A future value would saturate that
+    /// subtraction to zero on every check — a server could park an account's
+    /// backups indefinitely with one bad timestamp.
+    #[test]
+    fn a_server_cannot_park_backups_with_a_future_upload_time() {
+        let now = 1_700_000_000;
+        assert_eq!(clamp_uploaded_at(now - 3_600, now), now - 3_600);
+        assert_eq!(clamp_uploaded_at(now + 86_400, now), now, "future ⇒ now");
+        assert_eq!(clamp_uploaded_at(u64::MAX, now), now);
+        assert_eq!(clamp_uploaded_at(0, now), now, "unreported ⇒ now");
+
+        let parked = BackupPolicy {
+            last_success_at: Some(clamp_uploaded_at(u64::MAX, now)),
+            last_attempt_at: Some(clamp_uploaded_at(u64::MAX, now)),
+            ..BackupPolicy::default()
+        };
+        assert!(
+            backup_is_due(&parked, now + DEFAULT_DAILY_INTERVAL_SECS + 1),
+            "the daily floor must still fire a day later"
+        );
+    }
+
+    /// The commit can die between the DB rename and the stats promotion — the
+    /// promotion is the last thing it does. Boot reconcile takes the "staging
+    /// already gone" arm there, so if it does not finish the job the restored
+    /// install reports "Never" forever *and* leaks the staged sidecar into the
+    /// account dir, which `account_storage_bytes` counts against the user.
+    #[tokio::test]
+    async fn reconcile_finishes_a_restore_that_died_before_the_stats_landed() {
+        let keys = Keys::generate();
+        let (_source, _source_db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed);
+
+        let dest = tempdir().unwrap();
+        let db_path = dest.path().join("marmot.sqlite");
+        let key_hex = restore_account_files_from(&keys, &db_path, &[base])
+            .await
+            .unwrap();
+
+        // Exactly the crash window: the DB is live, the intent marker still
+        // stands, the staged index and policy have not been promoted.
+        fs::rename(staging_db_path(&db_path), &db_path).unwrap();
+        assert!(restore_intent_path(&db_path).is_file());
+        let staged_policy = backup_policy_path_for_db(&staging_db_path(&db_path));
+        assert!(staged_policy.is_file(), "fixture must reproduce the window");
+
+        assert!(
+            !reconcile_staged_account_restore(&db_path, &key_hex).unwrap(),
+            "nothing left to commit — the DB is already live"
+        );
+
+        let policy = load_backup_policy(&db_path);
+        assert_eq!(
+            policy.last_success_at,
+            Some(7),
+            "boot must finish the restore's stats, not leave 'Never'"
+        );
+        assert_eq!(policy.last_message_count, Some(3));
+        assert!(!staged_policy.exists(), "no sidecar left in the account dir");
+    }
+
+    /// An abandoned restore must leave nothing a later commit could adopt: the
+    /// live account would then advertise a backup that never replaced it.
+    #[tokio::test]
+    async fn an_aborted_restore_leaves_no_stats_behind() {
+        let keys = Keys::generate();
+        let (_source, _source_db, sealed) = sealed_account_with_chats(&keys);
+        let (base, _seen) = spawn_mock_blossom_list(keys.public_key(), sealed);
+
+        let dest = tempdir().unwrap();
+        let db_path = dest.path().join("marmot.sqlite");
+        restore_account_files_from(&keys, &db_path, &[base])
+            .await
+            .unwrap();
+        assert!(backup_policy_path_for_db(&staging_db_path(&db_path)).is_file());
+
+        abort_staged_account_restore(&db_path);
+        commit_staged_account_restore(&db_path).unwrap();
+
+        let policy = load_backup_policy(&db_path);
+        assert_eq!(
+            policy.last_success_at, None,
+            "an aborted restore must not claim a backup"
+        );
+        assert_eq!(policy.last_size_bytes, None);
     }
 
     /// The whole promise of a dry run: it changes nothing. If this regresses,
