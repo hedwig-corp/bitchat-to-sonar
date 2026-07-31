@@ -176,9 +176,15 @@ final class AutoBackupBackgroundScheduler {
         // permanently closed". Trading a background kill for an unopenable
         // account database is not a trade worth making.
         //
-        // So an expiry mid-backup still leaves the store open. That is the
-        // pre-existing behaviour, not a regression, and it is recorded as a
-        // known residual in `docs/REGRESSIONS.md`.
+        // Cancel-only does NOT mean the store stays open on expiry. Nothing in
+        // the backup chain is cancellation-aware (the seal, connect and upload
+        // all park in `withCheckedContinuation` on dispatch queues), and `work`
+        // is `Task<Bool, Never>`, so `await work.value` below cannot return
+        // early either way — the close still runs, just late. What overruns on
+        // expiry is the BGTaskScheduler contract, not the store lifetime:
+        // `setTaskCompleted` sits behind that same await. That is main's shape
+        // and is recorded as a residual in `docs/REGRESSIONS.md`; fixing it
+        // needs a completion latch, NOT a close from this handler.
         task.expirationHandler = { work.cancel() }
         // Whether `backupAccount()` ran — see the close below.
         let reopenedStore = await work.value
@@ -240,6 +246,18 @@ final class AutoBackupBackgroundScheduler {
         // `nodeClosing` fence and `refreshAfterForeground`'s single-flight latch
         // will not re-kick it — leaving a visible app with no node. Every close
         // in `SonarPushProcessor` pairs with this call for the same reason.
+        //
+        // Re-check `.background` first rather than calling unconditionally, and
+        // for a reason beyond saving a no-op: `reconnectIfForegroundAfterWakeClose`
+        // opens by awaiting an in-flight `refreshTask` BEFORE its own foreground
+        // guard, and R-028 documents that a refresh can sit 25s+ in a blocking
+        // `sync_once`. On the BGTask caller that await lands between the close
+        // and `setTaskCompleted`, inside a `BGAppRefresh` window of about 30s.
+        // The sibling site `SonarPushProcessor` (the `applicationState !=
+        // .background` branch after its close) gates it exactly this way; the
+        // other two detach it. Skipping here is free — the callee would return
+        // at its own guard anyway.
+        guard UIApplication.shared.applicationState != .background else { return }
         await store.marmot.reconnectIfForegroundAfterWakeClose()
     }
 

@@ -1250,11 +1250,14 @@ final class MarmotChatModel: ObservableObject {
     ///
     /// "Invoked", not "reopened": `backupAccount()` has two exits that touch no
     /// node (`respectOptOut` with the policy disabled, and the
-    /// `backupAlreadyInProgress` throw). Both are unreachable from here — core's
-    /// `backup_is_due` already requires `policy.enabled`, and the in-flight
-    /// guard is same-actor — and a close on an already-closed node is an
-    /// idempotent no-op anyway, so the looser meaning costs nothing. Do not
-    /// tighten this into a "did we reopen" flag without a reason.
+    /// `backupAlreadyInProgress` throw), and a failed `performConnect` reopen is
+    /// a third. The in-flight throw is unreachable from here (same-actor guard),
+    /// and the opt-out exit needs core's `backup_is_due` — which already
+    /// requires `policy.enabled` — to disagree with a second policy read, which
+    /// happens only when that read THROWS and `?? false` swallows it. All three
+    /// land on a close of an already-closed node, which is an idempotent no-op,
+    /// so the looser meaning is safe rather than merely unlikely. Do not tighten
+    /// this into a "did we reopen" flag without a reason.
     ///
     /// - Parameter allowWhileActive: only the background-transition and
     ///   `BGTask` callers pass true. A backup closes the Marmot node, seals the
