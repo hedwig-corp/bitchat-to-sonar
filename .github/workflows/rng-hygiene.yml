@@ -5,29 +5,21 @@ name: RNG hygiene
 # COLDCARD disclosure that motivated them.
 #
 # Deliberately separate from the platform build workflows: this is pure shell
-# (seconds, no JDK/Rust/Xcode), and unlike the compile jobs it runs on every
-# source path that could reintroduce the pattern — including iOS, which has no
-# test job in CI.
+# (seconds, no JDK/Rust/Xcode). It also matters most for iOS, which has no test
+# job in CI at all.
+#
+# No `paths:` filter on purpose. The script scans the whole tracked tree and
+# runs in under a second, and a path-filtered job can never be a required
+# status check — PRs that touch none of the filtered globs would report nothing
+# and block forever. Cheap enough to always run.
 
 on:
   push:
     branches:
       - main
-    paths:
-      - 'scripts/check-rng-hygiene.sh'
-      - '.github/workflows/rng-hygiene.yml'
-      - 'ios/**/*.swift'
-      - 'core/**/*.rs'
-      - 'apps/sonar/composeApp/src/**/*.kt'
   pull_request:
     branches:
       - main
-    paths:
-      - 'scripts/check-rng-hygiene.sh'
-      - '.github/workflows/rng-hygiene.yml'
-      - 'ios/**/*.swift'
-      - 'core/**/*.rs'
-      - 'apps/sonar/composeApp/src/**/*.kt'
 
 jobs:
   check:

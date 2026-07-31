@@ -1,3 +1,4 @@
+import BitLogger
 import Foundation
 
 /// CSPRNG bytes with a *checked* status.
@@ -35,6 +36,16 @@ enum SecureRandom {
         var buf = [UInt8](repeating: 0, count: count)
         let status = SecRandomCopyBytes(kSecRandomDefault, count, &buf)
         guard status == errSecSuccess else {
+            // Log here rather than at each call site: most callers surface the
+            // failure as a thrown error the UI turns into a generic message, or
+            // swallow it with `try?`, so this is the only place guaranteed to
+            // see it. Without it a dead CSPRNG is undiagnosable from a log
+            // bundle — which is the failure mode this whole file exists to
+            // prevent.
+            SecureLogger.error(
+                "⚠️ system CSPRNG unavailable (OSStatus \(status)) — refusing to return predictable bytes",
+                category: .session
+            )
             throw Failure.rngUnavailable(status)
         }
         return Data(buf)
@@ -43,7 +54,8 @@ enum SecureRandom {
     /// `count` cryptographically random bytes, or `nil`.
     ///
     /// For call sites that already model failure as an optional/`false` return
-    /// rather than a thrown error.
+    /// rather than a thrown error. The failure is logged by `bytes(_:)`, so a
+    /// `nil` here is never silent even though the caller discards the reason.
     static func optionalBytes(_ count: Int) -> Data? {
         try? bytes(count)
     }

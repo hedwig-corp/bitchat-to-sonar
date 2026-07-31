@@ -189,12 +189,24 @@ seeded PRNG.
   Use `secureRandomBytes()` / `secureRandomHex()` (`SecureRandom.kt`), which is
   the Compose-side match for iOS's CSPRNG-backed `UUID()`.
 
-`scripts/check-rng-hygiene.sh` enforces all three in CI. It is a grep, so it
-catches the shape, not the intent: it cannot tell whether a checked call feeds
-the right thing, and it does not look at the vendored `core/vendor/` tree. Those
-stay review questions. The rule exists because this class of bug is silent by
-construction — see the script header for the COLDCARD firmware disclosure that
-motivated it.
+The one exception is BIP-340 `aux_rand` (`NostrProtocol.swift`): an all-zero
+`aux_rand` is the spec's own "no auxiliary randomness" case and produces a sound
+signature, so that site degrades rather than failing event signing outright. It
+degrades *deliberately and logged*. Any other zeroed-buffer fallback is a bug.
+
+Deliberate non-crypto randomness (UI jitter, backoff, sampling) is fine with an
+inline `// rng-hygiene: ok — <reason>` marker on the same line or the line above.
+
+`scripts/check-rng-hygiene.sh` enforces all three in CI. Know what it does not
+cover: it is a grep, so it catches the shape, not the intent — it cannot tell
+whether a checked call feeds the right value. It scans **tracked** files only:
+all `*.swift`, all `*.rs` outside `vendor/` and `target/`, and all `*.kt`, minus
+test source sets. `secureRandomBytes()`/`secureRandomHex()` are `internal` to
+`composeApp`, so Kotlin under `packages/` is flagged but has no seam to use yet —
+add one there if that code ever needs randomness. Intent, and whether a value is
+used correctly once generated, stay review questions. The rule exists because
+this class of bug is silent by construction — see the script header for the
+COLDCARD firmware disclosure that motivated it.
 
 ## Regression Invariant Rule
 

@@ -4709,7 +4709,7 @@ impl SonarClient {
         }
 
         let entry_id = if client_pending_id.is_empty() {
-            new_media_staging_id()
+            new_media_staging_id()?
         } else {
             client_pending_id.to_string()
         };
