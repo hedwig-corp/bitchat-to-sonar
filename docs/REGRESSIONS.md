@@ -1691,6 +1691,69 @@ lookup itself, and the focus gate on `SNComposer.liveDraft`.
   the composer keeps focus and first responder through the click (4/4), so the
   editor is still the one consulted.
 
+## R-030 — A conversation's transcript reads every bucket its chat row reads
+
+**Invariant:** the mesh transcript source resolves `ChatViewModel.privateChats`
+through the same universe of keys the chat-list row folds — identity aliases
+**plus** the 64-hex shapes (fingerprint, raw Noise public key) that
+`canonicalPeerKey` maps back onto those aliases. A row visible in a chat-list
+preview must be reachable by that chat's transcript.
+
+**Breaks as:** the chat list shows a message the open transcript does not have.
+It is not a refresh lag — the bucket is what gets persisted, so the divergence
+survives restarts. Reported as "the Sara chat is not in sync with the transcript".
+
+**Why:** an incoming NIP-17 internet DM is stored under the sender's **Noise
+public key hex** (`ChatViewModel+Nostr.processNostrMessage` →
+`PeerID(str: noiseKey.hexEncodedString())`), and is mirrored onto the 16-hex
+short id only while `unifiedPeerService` holds a live entry
+(`mirrorToEphemeralIfNeeded`). Out of BLE range there is no mirror. Every
+identity resolver canonicalises to the short id, so the transcript never named
+that bucket; `dmRows` did, because it folds *every* bucket through
+`canonicalPeerKey`. The two 64-hex shapes are the trap — the fingerprint is
+`sha256(noise key)` and the short id is its first 16 hex, so a raw Noise key
+shares no **string prefix** with either, and only reduces to the alias by
+hashing (`canonicalPeerKey`'s `PeerID(publicKey:)` branch). Prefix-shortening a
+64-hex key — what `canonicalStoredKey` does — silently misses it. See
+`docs/CHAT-TYPES.md`, id shape 6.
+
+**Call sites:** iOS `SonarAppStore.meshPrivateChatKeys(forConversationId:)` →
+`snMeshNoiseKeyBuckets` / `snMeshPrivateChatKeys` / `snMergeMeshPrivateChats`,
+feeding `meshPrivateMessages` and `meshPrivateMessageCount`. Compose does not
+apply: `SonarAppState.drainDirectDms` keys incoming direct DMs by
+`peerIdForNpubHex(...)` into `meshChats`, so no Noise-key bucket exists there.
+
+**Guarded by:** `SonarConversationFoldTests.outOfRangeInternetDmBucketIsPartOfTheTranscript`
+
+**Also guarded by:** `SonarConversationFoldTests.fingerprintShapedBucketAlsoResolves`,
+`SonarConversationFoldTests.anotherPeersNoiseKeyNeverJoinsTheTranscript`,
+`SonarConversationFoldTests.aliasBucketWinsOverAStalerMirroredCopy`,
+`SonarConversationFoldTests.mirroredRowIsNotRenderedTwice`,
+`SonarConversationFoldTests.nonHexAndAliasShapedBucketsAreNotDuplicated`,
+`SonarConversationFoldTests.receivedInternetRowOverridesTheConversationTransport`
+
+**Not guarded:** that `meshPrivateChatKeys` is what `dmMsgs` actually calls, and
+that `meshPeerAliases` yields the short id the buckets derive to — both need a
+constructible `SonarAppStore` (the standing gap below). The hazard is reduced
+instead: `meshPrivateMessages`/`meshPrivateMessageCount` have no `privateChats`
+access of their own, so the key set is the only way in. Validated against a live
+store at fix time — 146 rows across 6 conversations were unreachable.
+
+**Rejected:**
+- *Deriving the extra bucket from `FavoritesPersistenceService`* (the map
+  `findNoiseKey(for:)` uses to choose the storage key). Shipped first, then
+  replaced: the favorite can be removed after the rows land, and the bucket
+  cannot — an unfavourite would have hidden the transcript again. Matching the
+  store's own keys needs no cache and no invalidation hook.
+- *Re-keying `privateChats` at write time instead.* The 64-hex key is load-bearing
+  on the mesh side: it is what says "no live Noise session", and read receipts,
+  `startPrivateChat` and session routing all key off it.
+- *Last-write-wins dedup.* Several send paths (`sendPrivateMessage` → `.sent`,
+  its failure branches) update delivery status on ONE bucket, so a mirrored copy
+  can be staler. Merge is first-key-wins with aliases ordered first.
+
+---
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`

@@ -223,4 +223,168 @@ struct SonarConversationFoldTests {
         #expect(aligned[staleCanonical]?.preview == "Ok it is receiving notifica")
         #expect(aligned[staleCanonical]?.unread == true)
     }
+
+    // MARK: Internet DM buckets (docs/CHAT-TYPES.md — id shape 6)
+
+    /// The real shape from the bug report: the alias set is the canonical
+    /// 16-hex short id, but the peer's internet reply is stored under their
+    /// 64-hex Noise public key because they were out of BLE range.
+    private static let peerShortId = "630dcd2966c43366"
+    private static let peerNoiseKeyHex =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+
+    /// Synthetic key material, not a real contact's: the test only needs
+    /// `sha256(noiseKeyHex)[0..<16] == shortId` to hold, which any 32 bytes
+    /// give. `PeerID(publicKey:)` does that derivation for real.
+    private static let shortIdForNoiseKeyHex: (String) -> String? = { hex in
+        Data(hexString: hex).map { PeerID(publicKey: $0).bare }
+    }
+
+    private func meshRow(
+        _ id: String,
+        _ text: String,
+        at secs: TimeInterval,
+        status: DeliveryStatus? = nil
+    ) -> BitchatMessage {
+        BitchatMessage(
+            id: id,
+            sender: "Peer",
+            content: text,
+            timestamp: Date(timeIntervalSince1970: secs),
+            isRelay: false,
+            isPrivate: true,
+            deliveryStatus: status
+        )
+    }
+
+    private func peerKeys(bucketKeys: [String]) -> [String] {
+        snMeshPrivateChatKeys(
+            aliases: [Self.peerShortId],
+            noiseKeyBuckets: snMeshNoiseKeyBuckets(
+                bucketKeys: bucketKeys,
+                aliases: [Self.peerShortId],
+                shortIdForNoiseKeyHex: Self.shortIdForNoiseKeyHex
+            )
+        )
+    }
+
+    @Test
+    func outOfRangeInternetDmBucketIsPartOfTheTranscript() {
+        // Derived from the live bucket keys, not from favorites: unfavouriting
+        // the peer must not hide her transcript again.
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
+
+        // Only the Noise-key bucket holds the newest row — exactly what the
+        // chat-list preview showed while the transcript stayed a message behind.
+        let buckets: [String: [BitchatMessage]] = [
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply over the internet", at: 200)],
+        ]
+        let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
+        #expect(merged.map(\.id) == ["m1"])
+        #expect(snMeshPrivateChatCount(keys: keys) { buckets[$0] } == 1)
+    }
+
+    @Test
+    func fingerprintShapedBucketAlsoResolves() {
+        // The other 64-hex shape: the fingerprint, whose first 16 hex ARE the
+        // short id. `MessageStore` holds real buckets in both shapes.
+        let fingerprint = Self.peerShortId + String(repeating: "0", count: 48)
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, fingerprint])
+        #expect(keys == [Self.peerShortId, fingerprint])
+        // Key presence is not readability: assert the merge actually reaches
+        // that bucket in the exact string form the key list carries.
+        let buckets: [String: [BitchatMessage]] = [
+            fingerprint: [meshRow("m1", "reply over the internet", at: 200)],
+        ]
+        #expect(snMergeMeshPrivateChats(keys: keys) { buckets[$0] }.map(\.id) == ["m1"])
+    }
+
+    @Test
+    func receivedInternetRowOverridesTheConversationTransport() {
+        // The rows this fix surfaces arrived over the internet while the peer
+        // was out of BLE range; rendering them as Bluetooth bubbles would
+        // contradict the chat's own header.
+        #expect(snMeshRowVia(receivedViaInternet: true, default: .mesh) == .internet)
+        #expect(snMeshRowVia(receivedViaInternet: true, default: .internet) == .internet)
+        // Additive: nothing else changes. Our own sends carry nil.
+        #expect(snMeshRowVia(receivedViaInternet: nil, default: .mesh) == .mesh)
+        #expect(snMeshRowVia(receivedViaInternet: false, default: .mesh) == .mesh)
+        #expect(snMeshRowVia(receivedViaInternet: nil, default: .internet) == .internet)
+    }
+
+    @Test
+    func mirroredRowIsNotRenderedTwice() {
+        // `mirrorToEphemeralIfNeeded` copies the row onto the short id once the
+        // peer is live again, so both buckets can hold the same message id.
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
+        let buckets: [String: [BitchatMessage]] = [
+            Self.peerShortId: [
+                meshRow("m0", "Y", at: 100),
+                meshRow("m1", "reply over the internet", at: 200),
+            ],
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply over the internet", at: 200)],
+        ]
+        let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
+        #expect(merged.map(\.id) == ["m0", "m1"])
+        #expect(snMeshPrivateChatCount(keys: keys) { buckets[$0] } == 2)
+    }
+
+    @Test
+    func aliasBucketWinsOverAStalerMirroredCopy() {
+        // Several send paths update delivery status on ONE bucket only, so the
+        // two copies of a mirrored row can diverge. The alias bucket — the one
+        // `sendPrivateMessage` appends to and marks `.sent` — must win.
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
+        let buckets: [String: [BitchatMessage]] = [
+            Self.peerShortId: [
+                meshRow("m0", "Y", at: 100),
+                meshRow("m1", "reply", at: 200, status: .sent),
+            ],
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply", at: 200, status: .sending)],
+        ]
+        let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
+        // The losing copy must be dropped, not merely ordered behind: exactly
+        // one m1 survives, and it is the alias bucket's.
+        #expect(merged.map(\.id) == ["m0", "m1"])
+        #expect(merged.filter { $0.id == "m1" }.count == 1)
+        #expect(merged.first { $0.id == "m1" }?.deliveryStatus == .sent)
+    }
+
+    @Test
+    func unlinkedConversationKeepsSingleBucketReturn() {
+        // No Noise-key bucket ⇒ single key; the single-bucket path must stay
+        // identity-preserving (no re-sort, no dedup pass).
+        let keys = peerKeys(bucketKeys: [Self.peerShortId])
+        #expect(keys == [Self.peerShortId])
+        let rows = [meshRow("m0", "Y", at: 100), meshRow("m1", "reply over the internet", at: 200)]
+        let merged = snMergeMeshPrivateChats(keys: keys) { $0 == Self.peerShortId ? rows : nil }
+        #expect(merged.map(\.id) == ["m0", "m1"])
+    }
+
+    @Test
+    func anotherPeersNoiseKeyNeverJoinsTheTranscript() {
+        let vincenzoNoiseKeyHex = String(repeating: "ab", count: 32)
+        let keys = peerKeys(bucketKeys: [
+            Self.peerShortId,
+            Self.peerNoiseKeyHex,
+            vincenzoNoiseKeyHex,
+            "abef0238b73563e6",
+        ])
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
+        #expect(!keys.contains(vincenzoNoiseKeyHex))
+    }
+
+    @Test
+    func nonHexAndAliasShapedBucketsAreNotDuplicated() {
+        // A geohash/name-shaped 64-char key is not a Noise key, and an alias
+        // already in the key list must not be appended a second time.
+        let buckets = [
+            Self.peerShortId,
+            Self.peerNoiseKeyHex.uppercased(),
+            String(repeating: "z", count: 64),
+        ]
+        let keys = peerKeys(bucketKeys: buckets)
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
+    }
 }

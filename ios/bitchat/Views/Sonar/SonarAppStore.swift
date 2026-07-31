@@ -697,6 +697,120 @@ func snFilterPeerKeysMatchingNpubHex(
     }.sorted()
 }
 
+/// The transport a mesh-store row renders with. A row KNOWN to have arrived
+/// over the internet says so (`ChatViewModel+PrivateChat` stamps
+/// `receivedViaInternet: true` on every NIP-17 row); everything else — our own
+/// sends, BLE rows — keeps the caller's default. Same rule
+/// `processIncomingPayLines` and the call scanner already apply to these rows.
+///
+/// Additive on purpose: without it, the out-of-range internet replies the
+/// transcript now surfaces would render as Bluetooth bubbles in a chat whose
+/// header says the peer is out of range.
+func snMeshRowVia(receivedViaInternet: Bool?, default fallback: SNVia) -> SNVia {
+    receivedViaInternet == true ? .internet : fallback
+}
+
+/// Which live `ChatViewModel.privateChats` keys hold ONE mesh conversation's
+/// rows under a 64-hex shape that no alias resolver produces.
+///
+/// Identity/alias keys are canonical 16-hex short peer ids, but an incoming
+/// internet (NIP-17) DM is stored under the sender's **Noise public key hex**
+/// (`ChatViewModel+Nostr.processNostrMessage` builds its conversation key with
+/// `PeerID(str: noiseKey.hexEncodedString())`), and that bucket is only mirrored
+/// onto the short id while the peer is live over BLE
+/// (`mirrorToEphemeralIfNeeded` needs a `unifiedPeerService` entry). An
+/// out-of-range peer's internet reply therefore lands ONLY under the 64-hex key.
+/// The chat list still shows it — `dmRows` folds every `privateChats` bucket
+/// through `canonicalPeerKey` — so a transcript reading aliases alone renders a
+/// conversation that is permanently behind its own home row.
+///
+/// Matching is derived from the STORE'S OWN KEYS, the same two derivations
+/// `canonicalPeerKey` uses (fingerprint prefix, or `PeerID(publicKey:)` over
+/// the raw Noise key). Nothing here consults favorites: a bucket must be
+/// reachable even when the peer↔npub link that once produced it is gone.
+func snMeshNoiseKeyBuckets(
+    bucketKeys: [String],
+    aliases: Set<String>,
+    shortIdForNoiseKeyHex: (String) -> String?
+) -> [String] {
+    var matched: [String] = []
+    for key in bucketKeys where key.count == 64 {
+        let hex = key.lowercased()
+        guard hex.allSatisfy(\.isHexDigit), !aliases.contains(hex) else { continue }
+        // A 64-hex key is either the peer's fingerprint (short id = its first
+        // 16 hex) or its raw Noise public key (short id = sha256 of the bytes).
+        if aliases.contains(String(hex.prefix(16)))
+            || shortIdForNoiseKeyHex(hex).map(aliases.contains) == true {
+            matched.append(hex)
+        }
+    }
+    return matched.sorted()
+}
+
+/// Every `privateChats` key that can hold this conversation's rows, aliases
+/// first. Order is the tie-break policy for `snMergeMeshPrivateChats`: the
+/// alias bucket is the one the send path appends to and updates in place
+/// (`sendPrivateMessage` marks `.sent` on a single bucket), so its copy of a
+/// row must win over a mirrored copy that may carry a staler delivery status.
+func snMeshPrivateChatKeys(
+    aliases: [String],
+    noiseKeyBuckets: [String]
+) -> [String] {
+    var keys: [String] = []
+    var seen = Set<String>()
+    for key in aliases + noiseKeyBuckets where !key.isEmpty {
+        if seen.insert(key).inserted { keys.append(key) }
+    }
+    return keys
+}
+
+/// Merge the mesh rows stored under `keys` into one chronological transcript.
+/// A message can sit in several buckets at once (the live-peer mirror copies it
+/// onto the short id), so rows dedupe by message id, FIRST key wins. The
+/// single-bucket case keeps the pre-fold O(1) return — `privateChats` is
+/// already chronological.
+func snMergeMeshPrivateChats(
+    keys: [String],
+    bucket: (String) -> [BitchatMessage]?
+) -> [BitchatMessage] {
+    var populated: [[BitchatMessage]] = []
+    for key in keys {
+        guard let messages = bucket(key), !messages.isEmpty else { continue }
+        populated.append(messages)
+    }
+    if populated.count <= 1 { return populated.first ?? [] }
+    var byId: [String: BitchatMessage] = [:]
+    for messages in populated {
+        for message in messages where byId[message.id] == nil {
+            byId[message.id] = message
+        }
+    }
+    // Tie-break on id: dictionary order is not stable, and same-second rows
+    // would otherwise swap places between rebuilds (visible bubble jitter).
+    return byId.values.sorted {
+        if $0.timestamp == $1.timestamp { return $0.id < $1.id }
+        return $0.timestamp < $1.timestamp
+    }
+}
+
+/// Unique mesh row count across the same key set — no sort / no full array alloc.
+func snMeshPrivateChatCount(
+    keys: [String],
+    bucket: (String) -> [BitchatMessage]?
+) -> Int {
+    var populated: [[BitchatMessage]] = []
+    for key in keys {
+        guard let messages = bucket(key), !messages.isEmpty else { continue }
+        populated.append(messages)
+    }
+    if populated.count <= 1 { return populated.first?.count ?? 0 }
+    var seen = Set<String>()
+    for messages in populated {
+        for message in messages { seen.insert(message.id) }
+    }
+    return seen.count
+}
+
 /// Pick the live BLE route among aliases (Compose `liveMeshRoutePeerId`).
 /// Prefer a directly connected peer; optionally fall back to retained reachability
 /// for plain bitchat (not Sonar discovery peers).
@@ -972,6 +1086,8 @@ final class SonarAppStore: ObservableObject {
     /// Built with `peerKeysIndex()` so `linkedNpub(forPeerKey:)` stays O(1) on
     /// `dmRows` instead of scanning favorites per row.
     private var npubByPeerKey: [String: String]?
+    /// 64-hex Noise key → its 16-hex short id. See `shortIdForNoiseKeyHex`.
+    private var shortIdByNoiseKeyHex: [String: String] = [:]
     /// Folded DM id -> Marmot group id. DM rows often use a peer/fingerprint id,
     /// while the encrypted transcript is keyed by the Marmot MLS group id.
     private var marmotGroupIdsByConversationId: [String: String] = [:]
@@ -3693,44 +3809,51 @@ final class SonarAppStore: ObservableObject {
         return Array(Set([key, Self.canonicalStoredKey(id)].filter { !$0.isEmpty })).sorted()
     }
 
-    /// Unique mesh message count across aliases — no sort / no full array alloc.
-    /// Single-alias conversations keep the pre-fold O(1) dictionary lookup;
-    /// multi-fingerprint (same npub) merges only the alias keys (Compose-shaped).
-    private func meshPrivateMessageCount(forConversationId id: String) -> Int {
-        let aliases = meshPeerAliases(for: id)
-        let aliasSet = Set(aliases)
-        if aliasSet.count <= 1 {
-            let key = aliases.first ?? id
-            return chatViewModel.privateChats[PeerID(str: key)]?.count
-                ?? chatViewModel.privateChats[PeerID(str: id)]?.count
-                ?? 0
-        }
-        var seen = Set<String>()
-        for alias in aliases {
-            guard let msgs = chatViewModel.privateChats[PeerID(str: alias)] else { continue }
-            for message in msgs { seen.insert(message.id) }
-        }
-        return seen.count
+    /// Every `privateChats` bucket that can hold this conversation's mesh rows:
+    /// the identity aliases, each alias's 64-hex Noise public key (where an
+    /// out-of-range internet DM lands — see `snMeshNoiseKeyBuckets`, matched
+    /// against the store's own keys), and the raw conversation id, which is
+    /// what the pre-fold lookup fell back to.
+    private func meshPrivateChatKeys(forConversationId id: String) -> [String] {
+        let aliases = meshPeerAliases(for: id) + [id]
+        return snMeshPrivateChatKeys(
+            aliases: aliases,
+            noiseKeyBuckets: snMeshNoiseKeyBuckets(
+                bucketKeys: chatViewModel.privateChats.keys.compactMap {
+                    $0.prefix == .empty ? $0.bare : nil
+                },
+                aliases: Set(aliases),
+                shortIdForNoiseKeyHex: { [self] hex in shortIdForNoiseKeyHex(hex) }
+            )
+        )
     }
 
-    /// Mesh/bitchat private messages across every alias of this conversation.
-    /// Single-alias keeps the pre-fold O(1) `privateChats[peer]` return (already
-    /// chronological); multi-fingerprint merges only alias keys (Compose-shaped).
+    /// `sha256` of a 64-hex Noise key, memoized. This runs per transcript
+    /// rebuild for every non-matching 64-hex bucket, and the derivation is a
+    /// pure function of an immutable string — so the cache never needs
+    /// invalidating, and it is bounded by the number of distinct peer keys the
+    /// store has ever held.
+    private func shortIdForNoiseKeyHex(_ hex: String) -> String? {
+        if let cached = shortIdByNoiseKeyHex[hex] { return cached }
+        guard let key = Data(hexString: hex) else { return nil }
+        let short = PeerID(publicKey: key).bare
+        shortIdByNoiseKeyHex[hex] = short
+        return short
+    }
+
+    /// Unique mesh message count across every bucket of this conversation — no
+    /// sort / no full array alloc, and O(1) while only one bucket is populated.
+    private func meshPrivateMessageCount(forConversationId id: String) -> Int {
+        snMeshPrivateChatCount(keys: meshPrivateChatKeys(forConversationId: id)) {
+            chatViewModel.privateChats[PeerID(str: $0)]
+        }
+    }
+
+    /// Mesh/bitchat private messages across every bucket of this conversation.
     private func meshPrivateMessages(forConversationId id: String) -> [BitchatMessage] {
-        let aliases = meshPeerAliases(for: id)
-        let aliasSet = Set(aliases)
-        if aliasSet.count <= 1 {
-            let key = aliases.first ?? id
-            return chatViewModel.privateChats[PeerID(str: key)]
-                ?? chatViewModel.privateChats[PeerID(str: id)]
-                ?? []
+        snMergeMeshPrivateChats(keys: meshPrivateChatKeys(forConversationId: id)) {
+            chatViewModel.privateChats[PeerID(str: $0)]
         }
-        var byId: [String: BitchatMessage] = [:]
-        for alias in aliases {
-            guard let msgs = chatViewModel.privateChats[PeerID(str: alias)] else { continue }
-            for message in msgs { byId[message.id] = message }
-        }
-        return byId.values.sorted { $0.timestamp < $1.timestamp }
     }
 
     @discardableResult
@@ -5303,7 +5426,6 @@ final class SonarAppStore: ObservableObject {
                 }
             }
             if !id.hasPrefix(Self.marmotIDPrefix), pendingMarmotNpub(for: id) == nil {
-                let via: SNVia = .mesh
                 let my = chatViewModel.meshService.myPeerID
                 dated += Self.transcriptSource(
                     meshPrivateMessages(forConversationId: id),
@@ -5311,6 +5433,7 @@ final class SonarAppStore: ObservableObject {
                     newestOffset: meshNewestOffset
                 ).compactMap { m in
                     let mine = m.senderPeerID == my
+                    let via = snMeshRowVia(receivedViaInternet: m.receivedViaInternet, default: .mesh)
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
                         return nil
@@ -5400,7 +5523,7 @@ final class SonarAppStore: ObservableObject {
                 newestOffset: callNewestOffset
             )
         }
-        let via = dmTransport(id)
+        let conversationVia = dmTransport(id)
         let my = chatViewModel.meshService.myPeerID
         var dated: [(Date, SNMessage)] = Self.transcriptSource(
             meshPrivateMessages(forConversationId: id),
@@ -5408,6 +5531,7 @@ final class SonarAppStore: ObservableObject {
             newestOffset: meshNewestOffset
         ).compactMap { m in
             let mine = m.senderPeerID == my
+            let via = snMeshRowVia(receivedViaInternet: m.receivedViaInternet, default: conversationVia)
             switch payMapping(m.content, fallbackVia: via) {
             case .hidden:
                 return nil
