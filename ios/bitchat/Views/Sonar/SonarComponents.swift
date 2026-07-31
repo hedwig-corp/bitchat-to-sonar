@@ -4008,8 +4008,11 @@ struct SNComposer: View {
     /// The send button suffers the same staleness as Return did: nothing
     /// re-renders this view while the user types, so `text` can be several
     /// keystrokes behind the field. Only trust the field editor while the
-    /// composer holds focus — otherwise it belongs to some other text view
-    /// (the sidebar search, say), and losing focus has already re-rendered us.
+    /// composer holds focus — otherwise it belongs to some other text view,
+    /// such as the sidebar search. The gate does not cost anything here: the
+    /// composer keeps focus and first responder through a click on this button
+    /// (measured 4/4 with posted mouse events), so the editor is still what
+    /// gets read.
     private var liveDraft: String {
         #if os(macOS)
         snLiveComposerDraft(

@@ -1587,15 +1587,22 @@ slow or unreachable.
   "unlimited" precisely when the budget matters.
 ## R-029 — Send the draft the field holds, not the one the view graph remembers
 
-**Invariant:** on Apple, the text a send puts on the wire comes from the field
-editor — the storage backing the composer — never from a `@Binding` read inside
-the composer view. The binding is only a mirror, and nothing guarantees it is
-current at the moment a send fires.
+**Invariant:** on macOS, the text a send puts on the wire comes from the field
+editor whenever there is one — `snLiveComposerDraft` is `fieldEditor ?? binding`,
+so the binding is the *fallback*, not the source. A `@Binding` read inside the
+composer view is a mirror, and nothing guarantees it is current when a send
+fires. The resolved text is then **passed** to the send callback, so no caller
+re-reads its own binding. This is a macOS rule: iOS has no AppKit field editor,
+so the resolver there is the binding — see the iOS gap under Coverage.
 
-**Breaks as:** type quickly, press Return, and the message that goes out is a
-*prefix* of what was typed — very often just the first character. The composer
-clears as if everything was sent. No error, nothing to retry. Reported (again)
-as "the text gets cut when I type fast and press enter".
+**Breaks as:** type, press Return, and the message that goes out is a *prefix* of
+what was typed — usually **exactly the first character**. The composer clears as
+if everything was sent. No error, nothing to retry. Reported (again) as "the text
+gets cut when I type fast and press enter".
+
+Note "fast" understates it: measured at 50 ms/keystroke — ordinary typing, each
+key in its own runloop turn — `testing` sent as `t` and `abcdefg` as `a`. Bursts
+and paced typing both truncate; the burst is merely the easiest to reproduce.
 
 **Why:** a `@Binding` read inside a SwiftUI view is served from the view graph
 and only refreshes when that view re-renders. `SonarAppStore.composerDrafts` is
@@ -1613,10 +1620,23 @@ composition discarded by a consumed Return); this is data that reached the store
 fine and was not read. R-027's own notes ruled out "the binding lags" — correctly
 for that bug, and only for ASCII in an isolated app whose store *was* published.
 
+If you are about to re-derive this as "the store had not caught up with the
+`NSTextView`": it had. The harness samples all three at the same instant and the
+store tracked the field editor exactly — `binding="t"(1) store="testing"(7)
+editor="testing"(7)`, 7/7 samples. Reading `composerDraft(for:)` or the binding
+again is therefore not a fix; only the read site was wrong. (A review panel
+proposed exactly this and was refuted by that column.)
+
 **Call sites:** Apple — `SNMessageComposerField.commitAndSend` (Return and
 `onSubmit`), which now hands the resolved text to `onSend`, plus every caller of
 that callback: `SNComposer.send` (whose send button reads `liveDraft`),
-`MarmotChatView`, `ContentView.sendMessage`. Compose is **structurally immune**,
+`MarmotChatView`, `ContentView.sendMessage`. Only `SNComposer` is on a live
+screen: `SonarRootView` is the app's only scene, `ContentView` is instantiated
+nowhere, and `MarmotConversationView` is reachable only from `MarmotChatView`.
+Their Return paths take the resolved text like everyone else; their *send
+buttons* still read their own bindings, which is a real but dormant instance of
+this bug — mirror `SNComposer.liveDraft` there if either view is ever revived.
+Compose is **structurally immune**,
 not merely unaffected: `composerDrafts` is a `mutableStateMapOf` and
 `BasicTextField(value:onValueChange:)` renders that state directly, so the field
 cannot display text the state does not hold. Do not "optimise" that into an
@@ -1631,11 +1651,24 @@ That is the R-001 shape, so the hazard was reduced structurally instead: `onSend
 now *takes* the text, so a caller cannot silently keep reading its own stale
 binding. The behaviour was measured in a harness reproducing the exact wiring
 (unpublished store → closure `Binding` → `TextField(axis: .vertical)` →
-`.onKeyPress`), driven by `NSApp.postEvent` bursts: before, 3/3 sends read a
-**0-character** binding while the field editor held the full word; after, 6/6
-sends matched the field across both burst and paced typing. What is **not**
-pinned: the `NSApp.keyWindow?.firstResponder as? NSTextView` lookup itself, and
-the focus gate on `SNComposer.liveDraft`.
+`.onKeyPress`), driven by `NSApp.postEvent`: before, **7/7** sends truncated —
+0 characters under a burst, and the **first character only** at 50 ms/keystroke
+— while store and field editor both held the full word; after, 6/6 sends matched
+the field across both regimes. The send-button path was driven separately with a
+posted mouse click: the field editor stayed first responder through the click in
+4/4 trials (`focused=true`, editor readable), so `liveDraft` resolves from the
+editor there rather than falling back.
+
+**The iOS gap.** The whole mechanism is AppKit: `snFocusedFieldEditorText()` is
+`#if os(macOS)`, and `SNComposer.liveDraft` returns the plain binding on iOS. If
+UIKit's `TextField` backing store can run ahead of the binding the same way, iOS
+sends are exposed and nothing here would catch it. It has not been reproduced or
+ruled out — iOS sends via a button tap, and the press itself re-renders the
+composer, which is probably why no iOS report exists. Untested either way; do not
+read this entry as covering iOS.
+
+What is **not** pinned: the `NSApp.keyWindow?.firstResponder as? NSTextView`
+lookup itself, and the focus gate on `SNComposer.liveDraft`.
 
 **Rejected:**
 - *Publishing `composerDrafts`.* Fixes the staleness at the source and is what
@@ -1650,8 +1683,10 @@ the focus gate on `SNComposer.liveDraft`.
   R-027 raised: it reorders every send to paper over a read bug.
 - *Trusting the field editor unconditionally in `SNComposer.liveDraft`.* The send
   button can be clicked while another text view (the sidebar search) is first
-  responder, which would send that field's text. Gated on `composerFocused`;
-  losing focus re-renders the composer, so the binding is fresh in that case.
+  responder, which would send that field's text. Gated on `composerFocused`. The
+  gate does not cost anything on the normal path: a posted-click harness showed
+  the composer keeps focus and first responder through the click (4/4), so the
+  editor is still the one consulted.
 
 ## Unguarded
 

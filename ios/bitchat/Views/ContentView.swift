@@ -791,8 +791,11 @@ struct ContentView: View {
     // MARK: - Actions
     
     /// - Parameter live: the draft the composer field actually held, when the
-    ///   send came from the field itself. Falls back to `messageText` for the
-    ///   send button, which has no field editor to consult.
+    ///   send came from the field itself. The send button passes nothing and so
+    ///   falls back to `messageText`, which can lag the field (R-028). That is a
+    ///   real but dormant instance of the bug: this view is instantiated
+    ///   nowhere — `SonarRootView` is the app's only scene. If it is ever
+    ///   revived, mirror `SNComposer.liveDraft` on the button path.
     private func sendMessage(live: String? = nil) {
         let trimmed = (live ?? messageText).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
