@@ -88,6 +88,8 @@ enum Command {
     Groups,
     /// Print messages for all groups or one group.
     Messages(MessagesArgs),
+    /// Create a multi-member Marmot group.
+    Group(GroupArgs),
 }
 
 #[derive(Args, Debug)]
@@ -108,9 +110,14 @@ struct InitArgs {
 
 #[derive(Args, Debug)]
 struct SendArgs {
-    /// Recipient npub1... or 64-char hex public key.
-    #[arg(long)]
-    to: String,
+    /// Recipient npub1... or 64-char hex public key (1:1 DM).
+    /// Mutually exclusive with --group.
+    #[arg(long, conflicts_with = "group")]
+    to: Option<String>,
+    /// Existing group id hex. Send to a multi-member group instead of a 1:1 DM.
+    /// Mutually exclusive with --to.
+    #[arg(long, conflicts_with = "to")]
+    group: Option<String>,
     /// Plaintext message body. Mutually exclusive with --file/--stdin.
     #[arg(long)]
     text: Option<String>,
@@ -232,6 +239,16 @@ struct MessagesArgs {
     group: Option<String>,
 }
 
+#[derive(Args, Debug)]
+struct GroupArgs {
+    /// Group name shown to all members.
+    #[arg(long)]
+    name: String,
+    /// Member npub1... or 64-char hex public key. Repeat --members for each.
+    #[arg(long = "members", num_args = 1.., required = true)]
+    members: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentConfig {
     version: u32,
@@ -301,6 +318,10 @@ enum Output {
         id: String,
         name: String,
         members: Vec<String>,
+    },
+    GroupCreated {
+        id: String,
+        name: String,
     },
     Message {
         group_id: String,
@@ -430,17 +451,32 @@ async fn run(cli: Cli) -> Result<()> {
             let loaded = LoadedConfig::load(home, cli.relays)?;
             let client = loaded.connect().await?;
             client.sync().await?;
-            let peer = PublicKey::parse(&args.to)
-                .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))?;
-            let group_id = match find_dm_group(&client, peer)? {
-                Some(group_id) => group_id,
-                None => client.start_dm(peer, &args.group_name).await?,
+
+            // Resolve the target group: either an explicit --group <hex id>, or
+            // a 1:1 DM resolved from --to <npub> (creating a new DM if needed).
+            let (group_id, to_npub) = if let Some(group_hex) = &args.group {
+                let gid = parse_group_id_hex(group_hex)?;
+                (gid, group_hex.clone())
+            } else if let Some(to) = &args.to {
+                let peer = PublicKey::parse(to)
+                    .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))?;
+                let gid = match find_dm_group(&client, peer)? {
+                    Some(group_id) => group_id,
+                    None => client.start_dm(peer, &args.group_name).await?,
+                };
+                let npub = peer
+                    .to_bech32()
+                    .expect("valid public key encodes as npub");
+                (gid, npub)
+            } else {
+                return Err(CliError::Message(
+                    "provide either --to <npub> or --group <group_id>".to_owned(),
+                ));
             };
             let message_ids_before = args
                 .wait_for_ack
                 .then(|| outbound_message_ids(&client, &group_id))
                 .transpose()?;
-            let to_npub = peer.to_bech32().expect("valid public key encodes as npub");
             let output = if let Some(text) = args.text.as_deref() {
                 client.send_text(&group_id, text).await?;
                 Output::Sent {
@@ -586,6 +622,23 @@ async fn run(cli: Cli) -> Result<()> {
             let client = loaded.connect().await?;
             client.sync().await?;
             print_messages(&client, args.group.as_deref())?;
+            Ok(())
+        }
+        Command::Group(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let mut members = Vec::new();
+            for npub in &args.members {
+                let pk = PublicKey::parse(npub)
+                    .map_err(|e| CliError::Message(format!("member pubkey: {e}")))?;
+                members.push(pk);
+            }
+            let group_id = client.start_group(members, &args.name).await?;
+            print_json(&Output::GroupCreated {
+                id: hex::encode(group_id.as_slice()),
+                name: args.name.clone(),
+            })?;
             Ok(())
         }
     }
@@ -1501,7 +1554,8 @@ mod tests {
         mime: Option<String>,
     ) -> SendArgs {
         SendArgs {
-            to: "npub".to_owned(),
+            to: Some("npub".to_owned()),
+            group: None,
             text: None,
             file: file.into_iter().collect(),
             stdin: false,
@@ -1637,5 +1691,69 @@ mod tests {
         let emoji = short_emoji(Some("123456789"));
         assert_eq!(title.chars().count(), 80);
         assert_eq!(emoji.as_deref(), Some("12345678"));
+    }
+
+    #[test]
+    fn parse_group_id_hex_roundtrips() {
+        let raw = [7u8; 32];
+        let hex_str = hex::encode(&raw);
+        let gid = parse_group_id_hex(&hex_str).expect("parse");
+        assert_eq!(gid.as_slice(), &raw);
+    }
+
+    #[test]
+    fn parse_group_id_hex_rejects_empty() {
+        let err = parse_group_id_hex("").unwrap_err();
+        assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn parse_group_id_hex_rejects_garbage() {
+        assert!(parse_group_id_hex("not-hex!").is_err());
+    }
+
+    #[test]
+    fn group_args_require_members() {
+        use clap::Parser;
+        // `--members` is required; missing it must fail at parse time.
+        let err = Cli::try_parse_from(["sonar-cli", "group", "--name", "Test"]);
+        assert!(err.is_err(), "group without --members must fail");
+    }
+
+    #[test]
+    fn send_to_and_group_are_mutually_exclusive() {
+        use clap::Parser;
+        let err = Cli::try_parse_from([
+            "sonar-cli",
+            "send",
+            "--to",
+            "npub1test",
+            "--group",
+            "abc123",
+            "--text",
+            "hi",
+        ]);
+        assert!(err.is_err(), "--to and --group must conflict");
+    }
+
+    #[test]
+    fn send_group_alone_is_valid() {
+        use clap::Parser;
+        let parsed = Cli::try_parse_from([
+            "sonar-cli",
+            "send",
+            "--group",
+            "aabbccdd",
+            "--text",
+            "hi",
+        ])
+        .expect("valid");
+        match parsed.command {
+            Command::Send(args) => {
+                assert!(args.to.is_none());
+                assert_eq!(args.group.as_deref(), Some("aabbccdd"));
+            }
+            _ => panic!("expected Send command"),
+        }
     }
 }
