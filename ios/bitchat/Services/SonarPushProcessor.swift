@@ -19,6 +19,7 @@
 
 #if os(iOS)
 
+import BitLogger
 import Foundation
 import UIKit
 import UserNotifications
@@ -90,6 +91,13 @@ enum SonarPushProcessor {
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         log.info("Processing Marmot push wakeup")
+        // Start the wake clock at the earliest point we control. iOS's ~30s
+        // window opens at `didReceiveRemoteNotification`, not when our Task is
+        // scheduled — this used to be captured *inside* the Task and after the
+        // `deliveredNSEPlaceholderIds()` await, so part of the real window was
+        // spent before the budget began counting and the 2s margin the
+        // constants assume was thinner than it read.
+        let wakeStart = Date()
         let prefs = SonarNotificationPreferenceStore.loadMerged()
 
         guard let marmot else {
@@ -142,7 +150,6 @@ enum SonarPushProcessor {
             // iOS background window: only re-enter with enough headroom and
             // shrink the sync timeout (plus skip the cold-launch NSE yield) to
             // what remains, so the wake completes before iOS expires it.
-            let wakeStart = Date()
             func remainingWindow() -> Double {
                 SonarWakeBudgetPolicy.windowSeconds - Date().timeIntervalSince(wakeStart)
             }
@@ -164,6 +171,21 @@ enum SonarPushProcessor {
             // matter where the drain is. The drain then fails out normally and
             // the push syncs on the next wake/foreground — the same accepted
             // outcome as a rerun that overruns its budget.
+            //
+            // WAKECLOSER markers: the closer is the half of R-028 no test can
+            // reach, so it reports itself instead. They go through
+            // `SecureLogger` — NOT this file's `os.Logger` — because only the
+            // SecureLogger sink is packaged into the shareable bundle by
+            // `SonarDiagnostics`. Reading a field capture: `armed` with no
+            // `fired`/`stood-down` means the wake never returned and the timer
+            // never ran; `fired` means the drain overran and the close was
+            // forced; `stood-down` means the drain finished inside the window
+            // and the in-band close did the work.
+            SecureLogger.warning("WAKECLOSER armed", category: .session)
+            // `Task.isCancelled` cannot tell "still sleeping" from "already
+            // fired" — both read false — so the stand-down report needs its own
+            // latch. Reuses the one this file already has.
+            let closerFired = SonarWakeCloseLatch()
             // Fires when the budgeted pass was DUE to end, not at the window
             // edge — the close needs its reserve to actually land.
             let wakeDeadlineCloser = Task.detached(priority: .userInitiated) {
@@ -180,12 +202,25 @@ enum SonarPushProcessor {
                 // completing right on the boundary cancels us from its `defer`
                 // during exactly that hop. Closing then is only ever redundant
                 // work, but the drain owns the close once it has finished.
-                guard !Task.isCancelled, state == .background else { return }
-                log.warning("Marmot wake window expired with the drain still in flight — closing the store now")
+                guard !Task.isCancelled, state == .background else {
+                    SecureLogger.warning("WAKECLOSER skipped — app not backgrounded", category: .session)
+                    return
+                }
+                closerFired.complete()
+                SecureLogger.warning(
+                    "WAKECLOSER fired — drain still in flight at the deadline, closing the store",
+                    category: .session
+                )
                 await marmot.closeStoreAfterBackgroundWake()
+                SecureLogger.warning("WAKECLOSER close returned", category: .session)
                 await marmot.reconnectIfForegroundAfterWakeClose()
             }
-            defer { wakeDeadlineCloser.cancel() }
+            defer {
+                if !closerFired.isComplete {
+                    SecureLogger.warning("WAKECLOSER stood down — wake finished inside the window", category: .session)
+                }
+                wakeDeadlineCloser.cancel()
+            }
             // Budget for the whole first pass (NSE yield + connect + sync), not
             // just its sync: the flat 25s `marmotPushSyncTimeoutSeconds` does
             // not fit in a 28s window once the 2.5s yield and

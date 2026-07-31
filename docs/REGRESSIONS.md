@@ -1519,6 +1519,17 @@ that the rerun gate shuts before the deadline closer fires. That is genuinely
 the half that regressed (a constant mismatch), and it is the half that will
 regress again when someone retunes a timeout.
 
+**The watchdog reports itself instead.** Since no test can reach it, it emits
+`WAKECLOSER armed` / `fired` / `close returned` / `stood down` /
+`skipped` through `SecureLogger` (category `.session`) — deliberately NOT this
+file's `os.Logger`, because only the `SecureLogger` sink is packaged into the
+shareable bundle by `SonarDiagnostics`. That makes the untestable half
+observable in the field: in a user's Settings → Diagnostics → Share capture,
+`armed` with no terminal marker means the wake never returned and the timer
+never ran, `fired` means the drain overran and the close was forced, and
+`stood down` means the drain finished inside the window. Read those before
+theorising about a future round.
+
 Nothing tests the **watchdog itself**, which is the half that actually fixes the
 crash. `SonarPushProcessor` is `@MainActor`, takes a live `MarmotChatModel`, and
 the failure only exists against a real blocking FFI park — no unit test
