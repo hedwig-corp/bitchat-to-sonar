@@ -176,11 +176,13 @@ final class AutoBackupBackgroundScheduler {
         // permanently closed". Trading a background kill for an unopenable
         // account database is not a trade worth making.
         //
-        // Cancel-only does NOT mean the store stays open on expiry. Nothing in
-        // the backup chain is cancellation-aware (the seal, connect and upload
-        // all park in `withCheckedContinuation` on dispatch queues), and `work`
-        // is `Task<Bool, Never>`, so `await work.value` below cannot return
-        // early either way — the close still runs, just late. What overruns on
+        // Cancel-only does NOT mean the store stays open on expiry. The one
+        // cancellation-aware step is `awaitRelayIdleForBackup`, and observing it
+        // only abandons a 3s drain and logs — the seal, connect and upload all
+        // park in `withCheckedContinuation` on dispatch queues and run to
+        // completion regardless. `work` is `Task<Bool, Never>`, so `await
+        // work.value` below cannot return early either way: the close still
+        // runs, just late. What overruns on
         // expiry is the BGTaskScheduler contract, not the store lifetime:
         // `setTaskCompleted` sits behind that same await. That is main's shape
         // and is recorded as a residual in `docs/REGRESSIONS.md`; fixing it
@@ -247,18 +249,29 @@ final class AutoBackupBackgroundScheduler {
         // will not re-kick it — leaving a visible app with no node. Every close
         // in `SonarPushProcessor` pairs with this call for the same reason.
         //
-        // Re-check `.background` first rather than calling unconditionally, and
-        // for a reason beyond saving a no-op: `reconnectIfForegroundAfterWakeClose`
+        // Detached, and NOT gated on `.background` here. Two constraints have to
+        // hold at once and only this shape satisfies both.
+        //
+        // It cannot be awaited inline: `reconnectIfForegroundAfterWakeClose`
         // opens by awaiting an in-flight `refreshTask` BEFORE its own foreground
         // guard, and R-028 documents that a refresh can sit 25s+ in a blocking
-        // `sync_once`. On the BGTask caller that await lands between the close
-        // and `setTaskCompleted`, inside a `BGAppRefresh` window of about 30s.
-        // The sibling site `SonarPushProcessor` (the `applicationState !=
-        // .background` branch after its close) gates it exactly this way; the
-        // other two detach it. Skipping here is free — the callee would return
-        // at its own guard anyway.
-        guard UIApplication.shared.applicationState != .background else { return }
-        await store.marmot.reconnectIfForegroundAfterWakeClose()
+        // `sync_once`. On the BGTask caller that await would land between the
+        // close and `setTaskCompleted`, inside a `BGAppRefresh` window of ~30s.
+        //
+        // It also must not be skipped when we are still `.background`, which an
+        // inline guard here would do. The callee re-checks foreground AFTER that
+        // await, and the two checks disagree in exactly the case this call
+        // exists for: the user foregrounds while a doomed `refreshTask` — its
+        // connect rejected behind the `nodeClosing` fence — is still polling.
+        // `refreshAfterForeground()`'s single-flight latch then discards the
+        // scene resume's re-kick, that task clears `refreshTask`, and nobody
+        // retries: a visible app with a closed node. `SonarPushProcessor` can
+        // gate its in-band call precisely because the detached one inside
+        // `closeStoreWithDeadline` is the backstop for this ordering; this path
+        // has no second call, so this one has to be the ungated one.
+        Task.detached(priority: .utility) {
+            await store.marmot.reconnectIfForegroundAfterWakeClose()
+        }
     }
 
     /// Finish an in-flight due backup when the user backgrounds the app.

@@ -1254,10 +1254,12 @@ final class MarmotChatModel: ObservableObject {
     /// a third. The in-flight throw is unreachable from here (same-actor guard),
     /// and the opt-out exit needs core's `backup_is_due` — which already
     /// requires `policy.enabled` — to disagree with a second policy read, which
-    /// happens only when that read THROWS and `?? false` swallows it. All three
-    /// land on a close of an already-closed node, which is an idempotent no-op,
-    /// so the looser meaning is safe rather than merely unlikely. Do not tighten
-    /// this into a "did we reopen" flag without a reason.
+    /// happens only when that read THROWS and `?? false` swallows it. A failed
+    /// reopen closes an already-closed node, an idempotent no-op; the opt-out
+    /// exit returns before `prepareSealedAccountBackup`, so there the caller
+    /// closes a node this path never opened — the same accepted one-directional
+    /// outcome `AutoBackupBackgroundScheduler.handle` already documents, not a
+    /// no-op. Do not tighten this into a "did we reopen" flag without a reason.
     ///
     /// - Parameter allowWhileActive: only the background-transition and
     ///   `BGTask` callers pass true. A backup closes the Marmot node, seals the
