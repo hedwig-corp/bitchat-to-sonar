@@ -292,6 +292,25 @@ struct SonarConversationFoldTests {
         let fingerprint = Self.saraShortId + String(repeating: "0", count: 48)
         let keys = saraKeys(bucketKeys: [Self.saraShortId, fingerprint])
         #expect(keys == [Self.saraShortId, fingerprint])
+        // Key presence is not readability: assert the merge actually reaches
+        // that bucket in the exact string form the key list carries.
+        let buckets: [String: [BitchatMessage]] = [
+            fingerprint: [meshRow("m1", "Yoooo 🐍", at: 200)],
+        ]
+        #expect(snMergeMeshPrivateChats(keys: keys) { buckets[$0] }.map(\.id) == ["m1"])
+    }
+
+    @Test
+    func receivedInternetRowOverridesTheConversationTransport() {
+        // The rows this fix surfaces arrived over the internet while the peer
+        // was out of BLE range; rendering them as Bluetooth bubbles would
+        // contradict the chat's own header.
+        #expect(snMeshRowVia(receivedViaInternet: true, default: .mesh) == .internet)
+        #expect(snMeshRowVia(receivedViaInternet: true, default: .internet) == .internet)
+        // Additive: nothing else changes. Our own sends carry nil.
+        #expect(snMeshRowVia(receivedViaInternet: nil, default: .mesh) == .mesh)
+        #expect(snMeshRowVia(receivedViaInternet: false, default: .mesh) == .mesh)
+        #expect(snMeshRowVia(receivedViaInternet: nil, default: .internet) == .internet)
     }
 
     @Test
@@ -325,8 +344,11 @@ struct SonarConversationFoldTests {
             Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo", at: 200, status: .sending)],
         ]
         let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
-        #expect(merged.count == 2)
-        #expect(merged.last?.deliveryStatus == .sent)
+        // The losing copy must be dropped, not merely ordered behind: exactly
+        // one m1 survives, and it is the alias bucket's.
+        #expect(merged.map(\.id) == ["m0", "m1"])
+        #expect(merged.filter { $0.id == "m1" }.count == 1)
+        #expect(merged.first { $0.id == "m1" }?.deliveryStatus == .sent)
     }
 
     @Test

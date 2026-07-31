@@ -697,6 +697,19 @@ func snFilterPeerKeysMatchingNpubHex(
     }.sorted()
 }
 
+/// The transport a mesh-store row renders with. A row KNOWN to have arrived
+/// over the internet says so (`ChatViewModel+PrivateChat` stamps
+/// `receivedViaInternet: true` on every NIP-17 row); everything else — our own
+/// sends, BLE rows — keeps the caller's default. Same rule
+/// `processIncomingPayLines` and the call scanner already apply to these rows.
+///
+/// Additive on purpose: without it, the out-of-range internet replies the
+/// transcript now surfaces would render as Bluetooth bubbles in a chat whose
+/// header says the peer is out of range.
+func snMeshRowVia(receivedViaInternet: Bool?, default fallback: SNVia) -> SNVia {
+    receivedViaInternet == true ? .internet : fallback
+}
+
 /// Which live `ChatViewModel.privateChats` keys hold ONE mesh conversation's
 /// rows under a 64-hex shape that no alias resolver produces.
 ///
@@ -5407,11 +5420,7 @@ final class SonarAppStore: ObservableObject {
                     newestOffset: meshNewestOffset
                 ).compactMap { m in
                     let mine = m.senderPeerID == my
-                    // A received row carries its own transport (same rule as the
-                    // pay/call scanners). Without it, the internet replies this
-                    // source now surfaces would render as Bluetooth bubbles in a
-                    // chat whose header says the peer is out of range.
-                    let via: SNVia = m.receivedViaInternet == true ? .internet : .mesh
+                    let via = snMeshRowVia(receivedViaInternet: m.receivedViaInternet, default: .mesh)
                     switch payMapping(m.content, fallbackVia: via) {
                     case .hidden:
                         return nil
@@ -5509,10 +5518,7 @@ final class SonarAppStore: ObservableObject {
             newestOffset: meshNewestOffset
         ).compactMap { m in
             let mine = m.senderPeerID == my
-            // Additive over the conversation-level transport: a row KNOWN to
-            // have arrived over the internet says so, everything else (our own
-            // sends, BLE rows) keeps the conversation's current transport.
-            let via: SNVia = m.receivedViaInternet == true ? .internet : conversationVia
+            let via = snMeshRowVia(receivedViaInternet: m.receivedViaInternet, default: conversationVia)
             switch payMapping(m.content, fallbackVia: via) {
             case .hidden:
                 return nil
