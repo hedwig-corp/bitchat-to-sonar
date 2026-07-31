@@ -19,6 +19,7 @@
 
 #if os(iOS)
 
+import BitLogger
 import Foundation
 import UIKit
 import UserNotifications
@@ -90,6 +91,13 @@ enum SonarPushProcessor {
         completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         log.info("Processing Marmot push wakeup")
+        // Start the wake clock at the earliest point we control. iOS's ~30s
+        // window opens at `didReceiveRemoteNotification`, not when our Task is
+        // scheduled — this used to be captured *inside* the Task and after the
+        // `deliveredNSEPlaceholderIds()` await, so part of the real window was
+        // spent before the budget began counting and the 2s margin the
+        // constants assume was thinner than it read.
+        let wakeStart = Date()
         let prefs = SonarNotificationPreferenceStore.loadMerged()
 
         guard let marmot else {
@@ -142,13 +150,114 @@ enum SonarPushProcessor {
             // iOS background window: only re-enter with enough headroom and
             // shrink the sync timeout (plus skip the cold-launch NSE yield) to
             // what remains, so the wake completes before iOS expires it.
-            let wakeStart = Date()
-            var syncTimeout = TransportConfig.marmotPushSyncTimeoutSeconds
+            func remainingWindow() -> Double {
+                SonarWakeBudgetPolicy.windowSeconds - Date().timeIntervalSince(wakeStart)
+            }
+            // Arm the close on a TIMER, not on the drain finishing.
+            //
+            // Every deadline below this point is a `withTimeout`, and this
+            // file already documents (see `closeStoreWithDeadline`) that a
+            // task-group deadline cannot bound a call parked in uncancellable
+            // Rust — it expires and then waits for the child anyway. So when
+            // `refresh()` parks in a blocking `sync_once`, the whole wake sat
+            // past the window and the close below was never *reached*: on
+            // TestFlight 1.12.5 (33) the process was killed 51s into a
+            // background launch with `sync_once` and `register_push_token`
+            // still parked and the node never latched for suspend.
+            //
+            // The only thing that can stop a parked FFI call is
+            // `closeNode()` -> `interruptNodeForSuspend()`, which runs
+            // off-queue. Arming it on a timer makes the abort reachable no
+            // matter where the drain is. The drain then fails out normally and
+            // the push syncs on the next wake/foreground — the same accepted
+            // outcome as a rerun that overruns its budget.
+            //
+            // WAKECLOSER markers: the closer is the half of R-028 no test can
+            // reach, so it reports itself instead. They go through
+            // `SecureLogger` — NOT this file's `os.Logger` — because only the
+            // SecureLogger sink is packaged into the shareable bundle by
+            // `SonarDiagnostics`. Reading a field capture: `armed` with no
+            // `fired`/`stood-down` means the wake never returned and the timer
+            // never ran; `fired` means the drain overran and the close was
+            // forced; `stood-down` means the drain finished inside the window
+            // and the in-band close did the work.
+            SecureLogger.info("WAKECLOSER armed", category: .session)
+            // `Task.isCancelled` cannot tell "still sleeping" from "already
+            // run" — both read false — so the stand-down report needs its own
+            // latch. Reuses the one this file already has. Set on EVERY
+            // terminal path, so `stood down` in the wake's `defer` means
+            // strictly "the closer was still sleeping", never "it ran and
+            // declined".
+            let closerSettled = SonarWakeCloseLatch()
+            // Fires when the budgeted pass was DUE to end, not at the window
+            // edge — the close needs its reserve to actually land.
+            //
+            // Anchored to `wakeStart`, NOT to "now". This task is armed after
+            // the Task-scheduling hop and the `deliveredNSEPlaceholderIds()`
+            // await, so sleeping a flat `deadlineCloserSeconds` would fire that
+            // much *later* than every other budget here — all of which measure
+            // from `wakeStart` — and the close would start with less than its
+            // reserve. Pulling `wakeStart` back to function entry widened that
+            // drift rather than removing it.
+            let closerDeadline = wakeStart.addingTimeInterval(
+                SonarWakeBudgetPolicy.deadlineCloserSeconds
+            )
+            let wakeDeadlineCloser = Task.detached(priority: .userInitiated) {
+                let delay = max(0, closerDeadline.timeIntervalSinceNow)
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard !Task.isCancelled else {
+                    closerSettled.complete()
+                    SecureLogger.info("WAKECLOSER cancelled before the deadline", category: .session)
+                    return
+                }
+                // Same gate as the close below: `.active`/`.inactive` means the
+                // user can see the app and the foreground path owns the node.
+                let state = await MainActor.run { UIApplication.shared.applicationState }
+                // Re-check: `MainActor.run` is a suspension point, and the wake
+                // completing right on the boundary cancels us from its `defer`
+                // during exactly that hop. Closing then is only ever redundant
+                // work, but the drain owns the close once it has finished.
+                guard !Task.isCancelled else {
+                    closerSettled.complete()
+                    SecureLogger.info("WAKECLOSER cancelled during the state hop", category: .session)
+                    return
+                }
+                guard state == .background else {
+                    closerSettled.complete()
+                    SecureLogger.warning("WAKECLOSER skipped — app no longer backgrounded", category: .session)
+                    return
+                }
+                closerSettled.complete()
+                SecureLogger.warning(
+                    "WAKECLOSER fired — drain still in flight at the deadline, closing the store",
+                    category: .session
+                )
+                await marmot.closeStoreAfterBackgroundWake()
+                SecureLogger.warning("WAKECLOSER close returned", category: .session)
+                await marmot.reconnectIfForegroundAfterWakeClose()
+            }
+            defer {
+                if !closerSettled.isComplete {
+                    SecureLogger.info("WAKECLOSER stood down — wake finished inside the window", category: .session)
+                }
+                wakeDeadlineCloser.cancel()
+            }
             var skipNSEYield = false
             var keepDraining = true
             while keepDraining {
                 repeat {
                     marmotWakeNeedsRerun = false
+                    // Budget EVERY pass from the window actually left, reruns
+                    // included, and scope it to the pass — this is the ONLY
+                    // place a pass budget is decided. It used to be hoisted out
+                    // of the loop and reassigned by the outer one, so a
+                    // coalesced rerun entered late could still claim a
+                    // full-length pass and run past the window. Charges the NSE
+                    // yield and `ensureConnected()` too, not just the sync:
+                    // the flat 25s `marmotPushSyncTimeoutSeconds` does not fit
+                    // a 28s window once those are paid, which is what put the
+                    // close out of reach in 1.12.5 (33).
+                    let syncTimeout = SonarWakeBudgetPolicy.passBudget(remaining: remainingWindow())
                     let outcome: MarmotWakeOutcome
                     if skipNSEYield {
                         // Rerun: bound the WHOLE reconnect+sync to the
@@ -180,7 +289,19 @@ enum SonarPushProcessor {
                     }
                     overall = mergeFetchResult(overall, outcome.fetchResult)
                     clearNSEPlaceholders = clearNSEPlaceholders || outcome.shouldClearNSEPlaceholders
+                    // Every pass after the first is a rerun inside this wake:
+                    // the NSE flock yield only buys anything on the cold entry.
+                    skipNSEYield = true
+                    // The SAME window gate the outer loop uses. Without it this
+                    // loop is a store-reopen path: `runMarmotWakeup` begins with
+                    // `ensureConnected()`, so a push that lands while the
+                    // wake-deadline closer is shutting the store would reopen it
+                    // still backgrounded — R-020 all over again. Harmless before
+                    // the deadline closer existed (the store stayed open, so the
+                    // connect was a no-op); a real hole now that it can close
+                    // underneath us.
                 } while marmotWakeNeedsRerun
+                    && SonarWakeBudgetPolicy.mayRerun(remaining: remainingWindow())
 
                 if clearNSEPlaceholders {
                     removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: nsePlaceholderSnapshot)
@@ -209,10 +330,7 @@ enum SonarPushProcessor {
                 // budget of 0 is therefore fine and correct when the sync already
                 // burned the window; the close still completes, we just report
                 // the fetch result on time instead of overrunning it.
-                let closeBudget = max(
-                    0,
-                    Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
-                )
+                let closeBudget = max(0, remainingWindow())
                 if await closeStoreWithDeadline(marmot: marmot, seconds: closeBudget) == false {
                     log.warning("Marmot store close did not land in \(Int(closeBudget))s — continuing under a background task")
                 }
@@ -227,14 +345,12 @@ enum SonarPushProcessor {
                     await marmot.reconnectIfForegroundAfterWakeClose()
                     keepDraining = false
                 } else {
-                    let remaining = Self.marmotWakeWindowSeconds - Date().timeIntervalSince(wakeStart)
-                    keepDraining = marmotWakeNeedsRerun && remaining > Self.marmotWakeRerunMinSeconds
+                    let remaining = remainingWindow()
+                    keepDraining = marmotWakeNeedsRerun && SonarWakeBudgetPolicy.mayRerun(remaining: remaining)
                     if keepDraining {
                         skipNSEYield = true
-                        syncTimeout = min(
-                            TransportConfig.marmotPushSyncTimeoutSeconds,
-                            max(3, remaining - 2)
-                        )
+                        // The budget itself is decided per pass at the top of
+                        // the inner loop — do not set it here too.
                     } else if marmotWakeNeedsRerun {
                         log.info("Skipping coalesced Marmot rerun — \(Int(remaining))s left in wake window")
                     }
@@ -254,12 +370,9 @@ enum SonarPushProcessor {
         let shouldClearNSEPlaceholders: Bool
     }
 
-    /// iOS gives a silent-push wake ~30s of background execution
-    /// (TransportConfig documents the window); keep 2s of margin.
-    private static let marmotWakeWindowSeconds: Double = 28
-    /// Below this much remaining window a coalesced rerun cannot pay even a
-    /// shrunk sync — skip it; the push syncs on the next wake/foreground.
-    private static let marmotWakeRerunMinSeconds: Double = 8
+    /// Wake budgeting lives in `SonarWakeBudgetPolicy` so a test can pin the
+    /// arithmetic — nothing here can be unit-constructed.
+    private static let marmotWakeWindowSeconds = SonarWakeBudgetPolicy.windowSeconds
 
     @MainActor
     private static func runMarmotWakeup(
@@ -283,9 +396,20 @@ enum SonarPushProcessor {
         // content-available), but some wakes still relaunch the host — without
         // this delay the host steals the lock and NSE stays on the generic
         // placeholder.
+        //
+        // `syncTimeoutSeconds` budgets this WHOLE pass — the yield, the
+        // connect and the sync — not just the sync. Charging only the sync let
+        // the yield and `ensureConnected()` run off-budget, so the pass could
+        // outlast the wake window and strand the store open (0xdead10cc).
+        let passStart = Date()
+        func remainingPassBudget() -> Double {
+            max(3, syncTimeoutSeconds - Date().timeIntervalSince(passStart))
+        }
         let appState = UIApplication.shared.applicationState
         if !skipNSEYield && appState != .active {
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            try? await Task.sleep(
+                nanoseconds: UInt64(SonarWakeBudgetPolicy.nseYieldSeconds * 1_000_000_000)
+            )
         }
         // #354: invalidate the stale relay latch first — a process-alive
         // background can leave relayConnected true after sockets die, so
@@ -296,14 +420,16 @@ enum SonarPushProcessor {
         if RelayConnectionPolicy.shouldInvalidateOnPushWake(appVisible: appState != .background) {
             marmot.invalidateRelayConnection()
         }
-        _ = await marmot.ensureConnected()
+        // Bounded by what is left of the pass: the 10s default could alone eat
+        // more window than the close needs to survive it.
+        _ = await marmot.ensureConnected(timeoutSeconds: min(10, remainingPassBudget()))
         let baselineHydrated = await marmot.loadLocalSummaries()
         let beforeUnread = unreadFingerprint(marmot: marmot)
 
         var drained: [DrainNotificationInfo] = []
         var synced = false
         do {
-            drained = try await withTimeout(seconds: syncTimeoutSeconds) {
+            drained = try await withTimeout(seconds: remainingPassBudget()) {
                 await marmot.refresh()
             }
             synced = true

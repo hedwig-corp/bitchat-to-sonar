@@ -1425,6 +1425,167 @@ stop the predicate from being rewritten.
   main thread blocked 120 ms per keystroke. The composition state was the
   difference, not timing.
 
+## R-028 — The wake-window store close must be reachable, not merely scheduled
+
+**Invariant:** A Marmot push wake must be able to *start* `closeNode()` inside
+the iOS background window no matter where its drain is. The close cannot be the
+last statement of the drain, because the drain contains calls that no Swift
+deadline can interrupt.
+
+**Breaks as:** `RUNNINGBOARD 0xdead10cc`, round 5 — TestFlight **1.12.5 (33)**,
+the build shipping R-020. Killed **51s** into a background launch (`Role:
+unknown`, launch 00:55:21 → kill 00:56:13). Distinguishing feature versus rounds
+1-4: three node-touching threads were live at kill — `call_wait_event` under a
+`leasedNodeOperation`, `sync_once`, and `register_push_token` — and the latter
+two were parked in **`block_on_suspendable`, un-aborted**. That is the whole
+diagnosis: R-016's latch aborts exactly those two calls, so their still being
+parked proves `interruptNodeForSuspend()` never ran, i.e. `closeNode()` was
+never called at all in those 51 seconds. Rounds 1-3 asked what *blocks* the
+close and round 4 asked what *reopens* the store; this one is the close never
+being *reached*.
+
+**Why:** the close sat below the drain in `processMarmotWakeup`, and the drain
+could outlast the window on its own arithmetic. One first pass cost, against a
+`marmotWakeWindowSeconds` of **28**:
+
+| step | cost |
+| --- | --- |
+| NSE flock yield | 2.5s, charged to nothing |
+| `ensureConnected()` | up to 10s (its own default, unbudgeted) |
+| `withTimeout(marmotPushSyncTimeoutSeconds) { refresh() }` | 25s |
+
+2.5 + 10 + 25 = **37.5s of a 28s window**, before `notifyDrained` / name
+resolution and before the `guard applicationState == .background` and
+`closeStoreWithDeadline` below it. The close was not late; it was unreachable.
+Only the rerun branch was wrapped in an outer deadline — the first pass, the one
+every wake runs, had no ceiling at all.
+
+**The deadline that was already there does not bound Rust.** `withTimeout` is
+built on `withThrowingTaskGroup`, which awaits its children before it can
+rethrow. This file's own `closeStoreWithDeadline` doc comment says so. So when
+`refresh()` parks in a blocking `sync_once`, the 25s "timeout" expires and then
+waits for the park anyway. The *only* thing in the process that can end that
+park is `closeNode()` → `interruptNodeForSuspend()`, which runs off-queue — the
+very call the drain was standing in front of.
+
+**Fix shape:** arm the close on a **timer**, not on the drain finishing. A
+detached task sleeps the window and then closes if the app is still
+`.background` (the same gate the in-line close uses), so the FFI abort is
+reachable from anywhere in the drain. The drain then fails out through its
+normal error paths and the push syncs on the next wake/foreground — the outcome
+a rerun that overruns its budget already produces. Secondarily, budget the pass
+close-first: `SonarWakeBudgetPolicy.passBudget` reserves
+`closeReserveSeconds` and charges the yield and the connect against the same
+budget as the sync, so the common case closes on its own and never needs the
+timer.
+
+**The timer must not resurrect R-020 — and the first attempt did.** A rerun
+re-enters `runMarmotWakeup`, which begins with `ensureConnected()`, so any rerun
+admitted after the closer has fired reopens the store while still backgrounded.
+There are **two** rerun loops, and review only caught this by checking both:
+
+- the *outer* `while keepDraining` loop, which always had a remaining-window
+  gate, and
+- the *inner* `repeat { … } while marmotWakeNeedsRerun`, which had **none** and
+  also reused the first pass's budget.
+
+The inner loop was harmless before the deadline closer existed — the store
+stayed open for the whole wake, so its `ensureConnected()` was a no-op. Adding a
+close that can fire *underneath* the drain turned it into a live reopen path.
+Both loops now share one gate and re-budget per pass.
+
+`rerunMinSeconds` is likewise **derived, not tuned**: `closeReserveSeconds +
+minPassSeconds`. Setting it to `closeReserveSeconds` alone admitted a band
+(`remaining` in `(8, 11]`) where `passBudget`'s `minPassSeconds` clamp inflated
+a 1s slot back to 3s and the pass then ate 2s of the close's reserve.
+
+**The closer fires at `windowSeconds - closeReserveSeconds`, not at the window
+edge.** The close is not instant, so arming it at the edge would have it *start*
+when iOS is already entitled to suspend us — the same kill, a few seconds later.
+
+**Call sites:** iOS `SonarPushProcessor.processMarmotWakeup` /
+`runMarmotWakeup`, budgeting in `SonarWakeBudgetPolicy`. **Not applicable to
+Compose:** Android/RunningBoard has no file-lock kill, and the Compose Marmot
+wake runs under a foreground service rather than a fixed ~30s window, so there
+is no deadline to budget against and no flock to release before suspension.
+Deliberate platform asymmetry, not a missing mirror.
+
+**Guarded by:** `SonarWakeBudgetPolicyTests.fullWindowPassLeavesCloseReserve`, `SonarWakeBudgetPolicyTests.syncTimeoutCannotEatCloseReserve`, `SonarWakeBudgetPolicyTests.rerunRefusedWhenOnlyCloseReserveRemains`, `SonarWakeBudgetPolicyTests.admittedRerunAlwaysLeavesCloseReserve`, `SonarWakeBudgetPolicyTests.deadlineCloserFiresWithReserveLeft`
+
+**Coverage (honest):** the tests pin the **arithmetic only** — that a pass can
+never claim the close's reserve, that raising the shared
+`marmotPushSyncTimeoutSeconds` cannot push the close back out of the window, and
+that the rerun gate shuts before the deadline closer fires. That is genuinely
+the half that regressed (a constant mismatch), and it is the half that will
+regress again when someone retunes a timeout.
+
+**The watchdog reports itself instead.** Since no test can reach it, it emits
+`WAKECLOSER armed` / `fired` / `close returned` / `stood down` /
+`skipped` through `SecureLogger` (category `.session`) — deliberately NOT this
+file's `os.Logger`, because only the `SecureLogger` sink is packaged into the
+shareable bundle by `SonarDiagnostics`. That makes the untestable half
+observable in the field. Exactly one terminal marker follows each `armed`,
+because every path through the closer settles the same latch — an earlier draft
+let `skipped` fall through and emit `stood down` too, which read as a
+contradiction. In a user's Settings → Diagnostics → Share capture:
+
+| terminal marker | meaning |
+| --- | --- |
+| *(none)* | the wake never returned and the timer never ran — a different bug from this one |
+| `fired` → `close returned` | the drain overran and the close was forced: R-028 working |
+| `stood down` | the drain finished inside the window; the in-band close did the work |
+| `skipped` | the app left `.background`; the foreground path owns the node |
+| `cancelled …` | the wake finished as the closer was waking; benign |
+
+The closer's sleep is anchored to `wakeStart`, not to when the detached task
+starts running, so `fired` genuinely means "the deadline measured from the same
+origin as every other budget here". Read these before theorising about a future
+round.
+
+Nothing tests the **watchdog itself**, which is the half that actually fixes the
+crash. `SonarPushProcessor` is `@MainActor`, takes a live `MarmotChatModel`, and
+the failure only exists against a real blocking FFI park — no unit test
+constructs it, and iOS tests do not run in CI regardless
+([[ios-not-built-in-ci]]). This is an R-001-shaped hole and is recorded as one:
+deleting the `wakeDeadlineCloser` task leaves every test green. Real
+verification is a TestFlight build backgrounded through a push wake with relays
+slow or unreachable.
+
+**Rejected:**
+- *Making `call_wait_event` suspendable in Rust like R-016 did for sync.* This
+  is the obvious read of the log — `callWaitEvent` is the thread holding a
+  lease — and it is wrong for the second time (R-020 rejected it too). The Swift
+  wrapper already slices into **1s** FFI parks, so it cannot hold the close. It
+  is present in the log as *evidence the node was open*, not as a cause. Check a
+  wrapper's slicing before concluding an FFI park is long.
+- *Lowering `marmotPushSyncTimeoutSeconds` to fit the window.* It is shared with
+  foreground sync, where 25s is correct; scoping the wake's budget locally keeps
+  one constant from serving two deadlines.
+- *Bounding the first pass with another `withTimeout`, matching the rerun.* The
+  symmetry is appealing and it is what the rerun branch already does, but it
+  fixes nothing on the path that crashed: a task-group deadline cannot end a
+  park in uncancellable Rust. It would have shipped a no-op with a plausible
+  diff. The budget changes here are for tidiness of the common case; the timer
+  is the fix.
+- *Releasing the flock ahead of the node to buy time.* Already rejected in
+  `closeStoreAfterBackgroundWake` and still wrong: the NSE opens its own
+  `SonarNode` the moment it wins the flock, and two processes committing against
+  one MLS store can fork group state. A background kill is better than a
+  corrupted store.
+- *Suppressing the drain's own close once the deadline closer has fired.* The
+  two can both run — the closer aborts the parked FFI, the drain unwinds, and
+  its post-loop close then runs against an already-closed node. Traced and left
+  alone: `closeNode()` is idempotent, the `workQueue` is serial so the two hops
+  cannot interleave destructively, and a node installed by a foreground resume
+  between them is not killed (the second call's queue hop was enqueued before
+  that install). The cost is one redundant background-task begin/end; shared
+  state to dedupe it would buy nothing and add a lifetime to reason about.
+- *Deriving the window from `UIApplication.backgroundTimeRemaining`* instead of
+  a constant, the way `AutoBackupBackgroundScheduler` does. It reports
+  `.greatestFiniteMagnitude` until a background task is active, which is exactly
+  the situation during `didReceiveRemoteNotification`, so it would read as
+  "unlimited" precisely when the budget matters.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
