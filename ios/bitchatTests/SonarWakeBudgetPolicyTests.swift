@@ -93,12 +93,19 @@ struct SonarWakeBudgetPolicyTests {
         // `passBudget`'s `minPassSeconds` clamp inflated the slot back to 3s, so
         // the pass ate into the reserve (remaining=9 -> budget 3 -> 6s to close,
         // against a reserve of 8). Sweep the whole range rather than endpoints.
+        var admitted = 0
         for tenths in 0...400 {
             let remaining = Double(tenths) / 10.0
             guard SonarWakeBudgetPolicy.mayRerun(remaining: remaining) else { continue }
+            admitted += 1
             let budget = SonarWakeBudgetPolicy.passBudget(remaining: remaining)
             #expect(budget + SonarWakeBudgetPolicy.closeReserveSeconds <= remaining)
         }
+        // Liveness, so the safety sweep above cannot pass vacuously: tightening
+        // `mayRerun` to (nearly) always false would starve every coalesced
+        // rerun and otherwise sail through a loop that never reaches #expect.
+        #expect(admitted > 0)
+        #expect(SonarWakeBudgetPolicy.mayRerun(remaining: SonarWakeBudgetPolicy.windowSeconds))
     }
 
     @Test("the NSE yield and the close reserve both fit inside the window")

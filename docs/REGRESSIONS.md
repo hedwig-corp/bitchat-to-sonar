@@ -1524,11 +1524,23 @@ regress again when someone retunes a timeout.
 `skipped` through `SecureLogger` (category `.session`) — deliberately NOT this
 file's `os.Logger`, because only the `SecureLogger` sink is packaged into the
 shareable bundle by `SonarDiagnostics`. That makes the untestable half
-observable in the field: in a user's Settings → Diagnostics → Share capture,
-`armed` with no terminal marker means the wake never returned and the timer
-never ran, `fired` means the drain overran and the close was forced, and
-`stood down` means the drain finished inside the window. Read those before
-theorising about a future round.
+observable in the field. Exactly one terminal marker follows each `armed`,
+because every path through the closer settles the same latch — an earlier draft
+let `skipped` fall through and emit `stood down` too, which read as a
+contradiction. In a user's Settings → Diagnostics → Share capture:
+
+| terminal marker | meaning |
+| --- | --- |
+| *(none)* | the wake never returned and the timer never ran — a different bug from this one |
+| `fired` → `close returned` | the drain overran and the close was forced: R-028 working |
+| `stood down` | the drain finished inside the window; the in-band close did the work |
+| `skipped` | the app left `.background`; the foreground path owns the node |
+| `cancelled …` | the wake finished as the closer was waking; benign |
+
+The closer's sleep is anchored to `wakeStart`, not to when the detached task
+starts running, so `fired` genuinely means "the deadline measured from the same
+origin as every other budget here". Read these before theorising about a future
+round.
 
 Nothing tests the **watchdog itself**, which is the half that actually fixes the
 crash. `SonarPushProcessor` is `@MainActor`, takes a live `MarmotChatModel`, and
