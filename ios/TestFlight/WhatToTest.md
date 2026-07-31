@@ -1,11 +1,10 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.5 (33)** · release tag **v0.1-alpha.12.1** (pre-alpha.13)
+Build: **Sonar 1.12.6 (34)** · Apple hotfix on **v0.1-alpha.12.1** (+ #538, #539)
 
-Cautious cut after alpha.12 + Apple hotfixes through 1.12.4. Focus: no blank
-transcripts on open, no vanishing sends, 0xdead10cc stability on background
-wake, payments still available, nearby peers not flapping, share-sheet picks a
-recipient. Opening a chat should paint from local storage first; missed
+Hotfix over 1.12.5: arm the push-wake store close on a timer (0xdead10cc
+round 5), and send the draft the field actually holds — not a stale view-graph
+copy. Opening a chat should still paint from local storage first; missed
 messages catch up in the background; payments and notifications should stay
 stable when the phone is locked or the app is killed.
 
