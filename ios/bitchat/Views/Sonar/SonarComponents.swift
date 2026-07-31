@@ -4003,8 +4003,29 @@ struct SNComposer: View {
         showEmojiTray = opening
     }
 
-    private func send() {
-        guard let tx = snPrepareComposerSend(text: text) else { return }
+    /// The draft as it stands right now, not as the view graph last saw it.
+    ///
+    /// The send button suffers the same staleness as Return did: nothing
+    /// re-renders this view while the user types, so `text` can be several
+    /// keystrokes behind the field. Only trust the field editor while the
+    /// composer holds focus — otherwise it belongs to some other text view,
+    /// such as the sidebar search. The gate does not cost anything here: the
+    /// composer keeps focus and first responder through a click on this button
+    /// (measured 4/4 with posted mouse events), so the editor is still what
+    /// gets read.
+    private var liveDraft: String {
+        #if os(macOS)
+        snLiveComposerDraft(
+            binding: text,
+            fieldEditor: composerFocused ? snFocusedFieldEditorText() : nil
+        )
+        #else
+        text
+        #endif
+    }
+
+    private func send(_ live: String? = nil) {
+        guard let tx = snPrepareComposerSend(text: live ?? liveDraft) else { return }
         // Clear before the send callback (see snPrepareComposerSend).
         text = ""
         showEmojiTray = false
@@ -4115,7 +4136,7 @@ struct SNComposer: View {
                 SNMessageComposerField(
                     text: $text,
                     prompt: Text(verbatim: placeholder).foregroundColor(SonarTheme.text3),
-                    onSend: send
+                    onSend: { send($0) }
                 )
                     .textFieldStyle(.plain)
                     .font(SonarTheme.uiFont(size: 16))
@@ -4146,7 +4167,7 @@ struct SNComposer: View {
     }
 
     private var sendButton: some View {
-        Button(action: send) {
+        Button(action: { send() }) {
             Circle()
                 .fill(hasText ? (transport == .internet ? SonarTheme.netFill : SonarTheme.accentFill) : SonarTheme.surface2)
                 .frame(width: 34, height: 34)
@@ -4308,6 +4329,32 @@ func snReturnSendsComposerDraft(
     return !hasMarkedText
 }
 
+/// The composer draft to send, given the view's binding and the text the field
+/// editor actually holds.
+///
+/// A `@Binding` read inside a SwiftUI view is served from the view graph and
+/// only refreshes when that view re-renders. The draft store behind the Sonar
+/// composer is deliberately *not* `@Published` (publishing per keystroke would
+/// re-enter the transcript host while typing), so typing invalidates nothing:
+/// between two re-renders the binding keeps whatever prefix it last saw, no
+/// matter how much has been typed since. The field editor's storage is the text
+/// the user is looking at, so it wins whenever we have it — including when it is
+/// empty, which means the user cleared the field and there is nothing to send.
+/// See R-029.
+func snLiveComposerDraft(binding: String, fieldEditor: String?) -> String {
+    fieldEditor ?? binding
+}
+
+#if os(macOS)
+/// Text held by the key window's field editor, when one is editing.
+///
+/// `nil` whenever the first responder is not a text view — the caller then has
+/// nothing better than its binding. See `snLiveComposerDraft`.
+func snFocusedFieldEditorText() -> String? {
+    (NSApp.keyWindow?.firstResponder as? NSTextView)?.string
+}
+#endif
+
 /// Shared Apple message field.
 ///
 /// - iOS: Return inserts a newline; the adjacent send button owns sending.
@@ -4316,7 +4363,9 @@ func snReturnSendsComposerDraft(
 struct SNMessageComposerField: View {
     @Binding var text: String
     let prompt: Text
-    var onSend: (() -> Void)? = nil
+    /// Receives the draft that was really in the field when the send fired.
+    /// Callers must send *this* text, not their own binding — see R-029.
+    var onSend: ((String) -> Void)? = nil
 
     var body: some View {
         TextField("", text: $text, prompt: prompt, axis: .vertical)
@@ -4342,13 +4391,26 @@ struct SNMessageComposerField: View {
                 ) else {
                     return .ignored
                 }
-                onSend?()
+                commitAndSend(fieldEditor: editor?.string)
                 return .handled
             }
-            .onSubmit { onSend?() }
+            .onSubmit { commitAndSend(fieldEditor: snFocusedFieldEditorText()) }
             #endif
             .accessibilityLabel(prompt)
     }
+
+    #if os(macOS)
+    /// Send what is actually in the field, and put it back through the binding
+    /// so the draft store agrees with the message that went out.
+    ///
+    /// Reading `text` here would send whatever prefix the view graph last saw,
+    /// which is how fast typing followed by Return lost the tail of a message.
+    private func commitAndSend(fieldEditor: String?) {
+        let live = snLiveComposerDraft(binding: text, fieldEditor: fieldEditor)
+        if live != text { text = live }
+        onSend?(live)
+    }
+    #endif
 }
 
 /// m:ss like the design's fmtDur.

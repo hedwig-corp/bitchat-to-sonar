@@ -5137,9 +5137,11 @@ struct MarmotConversationView: View {
             SNMessageComposerField(
                 text: $draft,
                 prompt: Text("Message"),
-                onSend: {
-                    guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-                    model.send(draft, to: group.id)
+                // Send the text the field handed us, never `draft` — the
+                // binding lags behind fast typing (R-029).
+                onSend: { live in
+                    guard !live.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    model.send(live, to: group.id)
                     draft = ""
                 }
             )
