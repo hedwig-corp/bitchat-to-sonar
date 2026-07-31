@@ -1479,20 +1479,38 @@ close-first: `SonarWakeBudgetPolicy.passBudget` reserves
 budget as the sync, so the common case closes on its own and never needs the
 timer.
 
-**The timer must not resurrect R-020.** A rerun re-enters `runMarmotWakeup` →
-`ensureConnected()`, which would reopen the store the timer just closed. The
-rerun gate (`mayRerun`) is closed by construction once the window is spent:
-`rerunMinSeconds` equals `closeReserveSeconds`, so by the time the deadline
-closer can have fired, `remaining <= 0` and no rerun is admitted.
+**The timer must not resurrect R-020 — and the first attempt did.** A rerun
+re-enters `runMarmotWakeup`, which begins with `ensureConnected()`, so any rerun
+admitted after the closer has fired reopens the store while still backgrounded.
+There are **two** rerun loops, and review only caught this by checking both:
+
+- the *outer* `while keepDraining` loop, which always had a remaining-window
+  gate, and
+- the *inner* `repeat { … } while marmotWakeNeedsRerun`, which had **none** and
+  also reused the first pass's budget.
+
+The inner loop was harmless before the deadline closer existed — the store
+stayed open for the whole wake, so its `ensureConnected()` was a no-op. Adding a
+close that can fire *underneath* the drain turned it into a live reopen path.
+Both loops now share one gate and re-budget per pass.
+
+`rerunMinSeconds` is likewise **derived, not tuned**: `closeReserveSeconds +
+minPassSeconds`. Setting it to `closeReserveSeconds` alone admitted a band
+(`remaining` in `(8, 11]`) where `passBudget`'s `minPassSeconds` clamp inflated
+a 1s slot back to 3s and the pass then ate 2s of the close's reserve.
+
+**The closer fires at `windowSeconds - closeReserveSeconds`, not at the window
+edge.** The close is not instant, so arming it at the edge would have it *start*
+when iOS is already entitled to suspend us — the same kill, a few seconds later.
 
 **Call sites:** iOS `SonarPushProcessor.processMarmotWakeup` /
 `runMarmotWakeup`, budgeting in `SonarWakeBudgetPolicy`. **Not applicable to
-Compose:** Android/RunningBoard has no file-lock kill, and the Marmot wake there
-is a foreground service with no 30s window — see
-`android-marmot-wake-loop-gap`. Deliberate platform asymmetry, not a missing
-mirror.
+Compose:** Android/RunningBoard has no file-lock kill, and the Compose Marmot
+wake runs under a foreground service rather than a fixed ~30s window, so there
+is no deadline to budget against and no flock to release before suspension.
+Deliberate platform asymmetry, not a missing mirror.
 
-**Guarded by:** `SonarWakeBudgetPolicyTests.fullWindowPassLeavesCloseReserve`, `SonarWakeBudgetPolicyTests.syncTimeoutCannotEatCloseReserve`, `SonarWakeBudgetPolicyTests.rerunRefusedWhenOnlyCloseReserveRemains`
+**Guarded by:** `SonarWakeBudgetPolicyTests.fullWindowPassLeavesCloseReserve`, `SonarWakeBudgetPolicyTests.syncTimeoutCannotEatCloseReserve`, `SonarWakeBudgetPolicyTests.rerunRefusedWhenOnlyCloseReserveRemains`, `SonarWakeBudgetPolicyTests.admittedRerunAlwaysLeavesCloseReserve`, `SonarWakeBudgetPolicyTests.deadlineCloserFiresWithReserveLeft`
 
 **Coverage (honest):** the tests pin the **arithmetic only** — that a pass can
 never claim the close's reserve, that raising the shared
@@ -1531,6 +1549,19 @@ slow or unreachable.
   `SonarNode` the moment it wins the flock, and two processes committing against
   one MLS store can fork group state. A background kill is better than a
   corrupted store.
+- *Suppressing the drain's own close once the deadline closer has fired.* The
+  two can both run — the closer aborts the parked FFI, the drain unwinds, and
+  its post-loop close then runs against an already-closed node. Traced and left
+  alone: `closeNode()` is idempotent, the `workQueue` is serial so the two hops
+  cannot interleave destructively, and a node installed by a foreground resume
+  between them is not killed (the second call's queue hop was enqueued before
+  that install). The cost is one redundant background-task begin/end; shared
+  state to dedupe it would buy nothing and add a lifetime to reason about.
+- *Deriving the window from `UIApplication.backgroundTimeRemaining`* instead of
+  a constant, the way `AutoBackupBackgroundScheduler` does. It reports
+  `.greatestFiniteMagnitude` until a background task is active, which is exactly
+  the situation during `didReceiveRemoteNotification`, so it would read as
+  "unlimited" precisely when the budget matters.
 
 ## Unguarded
 

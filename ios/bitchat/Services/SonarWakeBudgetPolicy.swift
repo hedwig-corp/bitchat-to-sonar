@@ -35,11 +35,25 @@ enum SonarWakeBudgetPolicy {
 
     /// Below this much remaining window a coalesced rerun cannot pay even a
     /// shrunk pass — skip it; the push syncs on the next wake/foreground.
-    static let rerunMinSeconds: Double = 8
+    ///
+    /// Derived, not tuned: a rerun must afford a real pass AND leave the close
+    /// its reserve. Hardcoding this to `closeReserveSeconds` admitted a band
+    /// (`remaining` in `(8, 11]`) where `passBudget`'s `minPassSeconds` clamp
+    /// inflated a 1s slot back up to 3s and the pass then ate into the reserve.
+    static var rerunMinSeconds: Double { closeReserveSeconds + minPassSeconds }
 
     /// A pass shorter than this cannot accomplish anything, but failing fast
     /// inside the window still beats overrunning it.
     static let minPassSeconds: Double = 3
+
+    /// When the wake-deadline closer fires, measured from wake start.
+    ///
+    /// It must fire when the budgeted pass was *due to end*, not at the window
+    /// edge: the close is not instant — it aborts in-flight FFI and then hops a
+    /// serial queue — so arming it at `windowSeconds` would have it *start* at
+    /// the moment iOS is entitled to suspend us, spending the whole reserve
+    /// past the deadline and reproducing the very kill it exists to prevent.
+    static var deadlineCloserSeconds: Double { windowSeconds - closeReserveSeconds }
 
     /// Budget for one wake pass — the NSE yield, the relay connect AND the
     /// sync, not just the sync.

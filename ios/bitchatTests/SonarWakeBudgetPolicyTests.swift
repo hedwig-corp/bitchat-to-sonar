@@ -67,10 +67,46 @@ struct SonarWakeBudgetPolicyTests {
         #expect(SonarWakeBudgetPolicy.mayRerun(remaining: 20) == true)
     }
 
-    @Test("the NSE yield is charged against the window, not free")
-    func nseYieldIsChargedAgainstWindow() {
-        // It used to run before the budget started, which is how a "25s" pass
-        // actually cost 27.5s.
+    @Test("the deadline closer fires with the whole close reserve still left")
+    func deadlineCloserFiresWithReserveLeft() {
+        // Arming it at `windowSeconds` would have the close *start* at the
+        // moment iOS may suspend us — it would spend its entire reserve past
+        // the deadline and still get killed, just later. The closer must fire
+        // when the budgeted pass was due to end.
+        #expect(
+            SonarWakeBudgetPolicy.deadlineCloserSeconds
+                + SonarWakeBudgetPolicy.closeReserveSeconds
+                <= SonarWakeBudgetPolicy.windowSeconds
+        )
+        // And it must not fire before a full-budget pass could even finish, or
+        // every healthy wake gets its drain cut short.
+        #expect(
+            SonarWakeBudgetPolicy.deadlineCloserSeconds
+                >= SonarWakeBudgetPolicy.passBudget(remaining: SonarWakeBudgetPolicy.windowSeconds)
+        )
+    }
+
+    @Test("any rerun the gate admits still leaves the close its reserve")
+    func admittedRerunAlwaysLeavesCloseReserve() {
+        // The band that motivated deriving `rerunMinSeconds`: with it hardcoded
+        // to `closeReserveSeconds`, `remaining` in (8, 11] was admitted and
+        // `passBudget`'s `minPassSeconds` clamp inflated the slot back to 3s, so
+        // the pass ate into the reserve (remaining=9 -> budget 3 -> 6s to close,
+        // against a reserve of 8). Sweep the whole range rather than endpoints.
+        for tenths in 0...400 {
+            let remaining = Double(tenths) / 10.0
+            guard SonarWakeBudgetPolicy.mayRerun(remaining: remaining) else { continue }
+            let budget = SonarWakeBudgetPolicy.passBudget(remaining: remaining)
+            #expect(budget + SonarWakeBudgetPolicy.closeReserveSeconds <= remaining)
+        }
+    }
+
+    @Test("the NSE yield and the close reserve both fit inside the window")
+    func nseYieldAndCloseReserveFitInWindow() {
+        // Named for what it actually pins — a constant relationship. It does
+        // NOT prove `runMarmotWakeup` charges the yield against the pass
+        // budget; nothing here can reach that call site. See the R-028
+        // coverage note.
         #expect(SonarWakeBudgetPolicy.nseYieldSeconds > 0)
         #expect(
             SonarWakeBudgetPolicy.nseYieldSeconds

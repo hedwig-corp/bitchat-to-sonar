@@ -143,6 +143,9 @@ enum SonarPushProcessor {
             // shrink the sync timeout (plus skip the cold-launch NSE yield) to
             // what remains, so the wake completes before iOS expires it.
             let wakeStart = Date()
+            func remainingWindow() -> Double {
+                SonarWakeBudgetPolicy.windowSeconds - Date().timeIntervalSince(wakeStart)
+            }
             // Arm the close on a TIMER, not on the drain finishing.
             //
             // Every deadline below this point is a `withTimeout`, and this
@@ -161,15 +164,23 @@ enum SonarPushProcessor {
             // matter where the drain is. The drain then fails out normally and
             // the push syncs on the next wake/foreground — the same accepted
             // outcome as a rerun that overruns its budget.
+            // Fires when the budgeted pass was DUE to end, not at the window
+            // edge — the close needs its reserve to actually land.
             let wakeDeadlineCloser = Task.detached(priority: .userInitiated) {
                 try? await Task.sleep(
-                    nanoseconds: UInt64(Self.marmotWakeWindowSeconds * 1_000_000_000)
+                    nanoseconds: UInt64(
+                        SonarWakeBudgetPolicy.deadlineCloserSeconds * 1_000_000_000
+                    )
                 )
                 guard !Task.isCancelled else { return }
                 // Same gate as the close below: `.active`/`.inactive` means the
                 // user can see the app and the foreground path owns the node.
                 let state = await MainActor.run { UIApplication.shared.applicationState }
-                guard state == .background else { return }
+                // Re-check: `MainActor.run` is a suspension point, and the wake
+                // completing right on the boundary cancels us from its `defer`
+                // during exactly that hop. Closing then is only ever redundant
+                // work, but the drain owns the close once it has finished.
+                guard !Task.isCancelled, state == .background else { return }
                 log.warning("Marmot wake window expired with the drain still in flight — closing the store now")
                 await marmot.closeStoreAfterBackgroundWake()
                 await marmot.reconnectIfForegroundAfterWakeClose()
@@ -186,6 +197,11 @@ enum SonarPushProcessor {
             while keepDraining {
                 repeat {
                     marmotWakeNeedsRerun = false
+                    // Budget EVERY pass from the window actually left, reruns
+                    // included. The inner loop used to reuse the first pass's
+                    // budget, so a coalesced rerun entered late could still
+                    // claim a full-length pass and run past the window.
+                    syncTimeout = SonarWakeBudgetPolicy.passBudget(remaining: remainingWindow())
                     let outcome: MarmotWakeOutcome
                     if skipNSEYield {
                         // Rerun: bound the WHOLE reconnect+sync to the
@@ -217,7 +233,19 @@ enum SonarPushProcessor {
                     }
                     overall = mergeFetchResult(overall, outcome.fetchResult)
                     clearNSEPlaceholders = clearNSEPlaceholders || outcome.shouldClearNSEPlaceholders
+                    // Every pass after the first is a rerun inside this wake:
+                    // the NSE flock yield only buys anything on the cold entry.
+                    skipNSEYield = true
+                    // The SAME window gate the outer loop uses. Without it this
+                    // loop is a store-reopen path: `runMarmotWakeup` begins with
+                    // `ensureConnected()`, so a push that lands while the
+                    // wake-deadline closer is shutting the store would reopen it
+                    // still backgrounded — R-020 all over again. Harmless before
+                    // the deadline closer existed (the store stayed open, so the
+                    // connect was a no-op); a real hole now that it can close
+                    // underneath us.
                 } while marmotWakeNeedsRerun
+                    && SonarWakeBudgetPolicy.mayRerun(remaining: remainingWindow())
 
                 if clearNSEPlaceholders {
                     removeDeliveredNSEPlaceholderBanners(onlyIdentifiers: nsePlaceholderSnapshot)
