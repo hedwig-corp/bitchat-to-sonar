@@ -540,31 +540,25 @@ final class MarmotService: @unchecked Sendable {
             }
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             SonarDiagnostics.installCoreLoggingIfNeeded()
-            // Latched for the same reason as `connect()`, and it is reachable
-            // here despite this running on the serial `workQueue`: the close
-            // calls `interruptNodeForSuspend()` OFF-queue, before its first hop.
-            // A relay-less connect skips the quorum wait but still awaits
-            // `subscribe_marmot` and `retry_outbox` inside the constructor.
-            //
-            // Registered BEFORE the store lock, and the order is load-bearing:
-            // this throws `.cancelled` when a close fenced us, and the `catch`
-            // that abandons the hold is further down. Acquiring the flock first
-            // would leak it on exactly that throw — a held App Group flock with
-            // no open handle is its own 0xdead10cc ingredient. `connect()`
-            // orders these the same way.
-            let connectLatch = try service.registerPendingConnectLatch()
-            defer { service.clearPendingConnectLatch(connectLatch) }
             #if os(iOS)
             let storeLockHold = try service.prepareStoreLockForConnectSync()
             #endif
             let node: SonarNode
             do {
+                // Deliberately NOT latched — see R-030. With no relays there is
+                // no quorum wait, and `subscribe_marmot` / `retry_outbox` return
+                // immediately against an empty pool, so the only cost here is
+                // the SQLCipher open and the MDK migrations: synchronous work
+                // with no await point for a latch to abort. Latching would buy
+                // nothing and cost something real — a suspend landing during an
+                // nsec restore would fail `performConnect()`, and its `guard …
+                // else` rolls back through `wipeDatabase()`.
                 node = try SonarNode.connect(
                     identity: identity,
                     relayUrls: [],
                     dbPath: dbPath,
                     dbKeyHex: dbKeyHex,
-                    suspendLatch: connectLatch
+                    suspendLatch: nil
                 )
             } catch {
                 #if os(iOS)

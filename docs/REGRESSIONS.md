@@ -1816,12 +1816,12 @@ the crash it fixes:
    SQLCipher open, and nothing can ever reach that orphan again. Holding every
    in-flight latch keeps the invariant inside `MarmotService` rather than
    resting on a caller's flag.
-2. *Register the latch BEFORE acquiring the store lock, on both paths.*
+2. *Register the latch BEFORE acquiring the store lock.*
    `registerPendingConnectLatch()` throws `.cancelled` when a close has fenced
    us, and the `catch` that calls `abandonStoreLockHold` sits below it. Taking
    the flock first leaks it on exactly that throw — and a held App Group flock
    with no open handle is its own 0xdead10cc ingredient, since RunningBoard
-   kills for the *lock*, not for the handle. `connectLocal` had this inverted.
+   kills for the *lock*, not for the handle.
 
 **Why an install can never carry an already-fired latch** — the obvious next
 worry, and it is closed by construction rather than by timing.
@@ -1843,14 +1843,28 @@ no Swift-side deadline can bound them either (R-028 established that
 `withTimeout` cannot interrupt Rust). If a future round shows a thread inside
 `MarmotEngine::persistent` rather than in a relay wait, this entry does not cover
 it and the answer is to make that work interruptible in Rust, not to add another
-timer. The pre-latch check is why `connectLocal` gets a latch too even though its
-awaits are short: with the latch already set, `biased` select means the store is
-never opened at all.
+timer.
+
+`connectLocal` is deliberately **not** latched, and that is a scope decision
+rather than an oversight. With no relays there is no quorum wait and
+`subscribe_marmot` / `retry_outbox` return immediately against an empty pool, so
+everything that path holds the store for is synchronous — exactly the work a
+latch cannot abort. Latching it would buy nothing and cost something real:
+`suspendStoreForBackground()` fires unconditionally on background (it is not
+gated on a restore in progress), so a suspend landing during an nsec restore
+would fail `performConnect()`, and `restoreIdentity`'s
+`guard await performConnect() else` rolls back through `wipeDatabase()`. That
+branch does protect the account key — a `.restored` outcome throws before the
+wipe, and a first-time import never deletes its nsec — so this was never account
+loss. But widening a wipe path to fix a crash on a different path is the wrong
+trade, and the Account Key Durability Rule makes it a blocking one to get wrong.
+An earlier draft of this fix latched `connectLocal`; if you are about to add it
+back, this paragraph is why not.
 
 **Call sites:** iOS `MarmotService.connect` (lease + latch registration),
 `MarmotService.pendingConnectLatches` / `registerPendingConnectLatch` /
 `clearPendingConnectLatch` (the registry),
-`MarmotService.connectLocal`, `MarmotService.connectNode`,
+`MarmotService.connectNode`,
 `MarmotService.interruptNodeForSuspend` (the flip), and the `closeNode` /
 `wipeDatabase` hops (belt-and-braces flip); core
 `SonarNode::connect` / `SonarSuspendLatch` in `core/sonar-ffi/src/lib.rs`.
