@@ -223,4 +223,90 @@ struct SonarConversationFoldTests {
         #expect(aligned[staleCanonical]?.preview == "Ok it is receiving notifica")
         #expect(aligned[staleCanonical]?.unread == true)
     }
+
+    // MARK: Internet DM buckets (docs/CHAT-TYPES.md — id shape 6)
+
+    /// Sara's real shape: the alias set is the canonical 16-hex short id, but
+    /// her internet reply is stored under her 64-hex Noise public key because
+    /// she was out of BLE range when it arrived.
+    private static let saraShortId = "f3237e63eb468722"
+    private static let saraNoiseKeyHex =
+        "83091c3ca8de95eb6d944787c1a845a2c5216250149360841604482e50016675"
+
+    private func meshRow(_ id: String, _ text: String, at secs: TimeInterval) -> BitchatMessage {
+        BitchatMessage(
+            id: id,
+            sender: "Sara D",
+            content: text,
+            timestamp: Date(timeIntervalSince1970: secs),
+            isRelay: false,
+            isPrivate: true
+        )
+    }
+
+    @Test
+    func outOfRangeInternetDmBucketIsPartOfTheTranscript() {
+        let keys = snMeshPrivateChatKeys(
+            aliases: [Self.saraShortId],
+            noiseKeyHexByPeerKey: [Self.saraShortId: [Self.saraNoiseKeyHex]]
+        )
+        #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
+
+        // Only the Noise-key bucket holds the newest row — exactly what the
+        // chat-list preview showed while the transcript stayed a message behind.
+        let buckets: [String: [BitchatMessage]] = [
+            Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo 🐍", at: 200)],
+        ]
+        let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
+        #expect(merged.map(\.id) == ["m1"])
+        #expect(snMeshPrivateChatCount(keys: keys) { buckets[$0] } == 1)
+    }
+
+    @Test
+    func mirroredRowIsNotRenderedTwice() {
+        // `mirrorToEphemeralIfNeeded` copies the row onto the short id once the
+        // peer is live again, so both buckets can hold the same message id.
+        let keys = snMeshPrivateChatKeys(
+            aliases: [Self.saraShortId],
+            noiseKeyHexByPeerKey: [Self.saraShortId: [Self.saraNoiseKeyHex]]
+        )
+        let buckets: [String: [BitchatMessage]] = [
+            Self.saraShortId: [
+                meshRow("m0", "Y", at: 100),
+                meshRow("m1", "Yoooo 🐍", at: 200),
+            ],
+            Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo 🐍", at: 200)],
+        ]
+        let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
+        #expect(merged.map(\.id) == ["m0", "m1"])
+        #expect(snMeshPrivateChatCount(keys: keys) { buckets[$0] } == 2)
+    }
+
+    @Test
+    func unlinkedConversationKeepsSingleBucketReturn() {
+        // No favorite ⇒ no Noise-key form; the single-bucket path must stay
+        // identity-preserving (no re-sort, no dedup pass).
+        let keys = snMeshPrivateChatKeys(
+            aliases: [Self.saraShortId],
+            noiseKeyHexByPeerKey: [:]
+        )
+        #expect(keys == [Self.saraShortId])
+        let rows = [meshRow("m0", "Y", at: 100), meshRow("m1", "Yoooo 🐍", at: 200)]
+        let merged = snMergeMeshPrivateChats(keys: keys) { $0 == Self.saraShortId ? rows : nil }
+        #expect(merged.map(\.id) == ["m0", "m1"])
+    }
+
+    @Test
+    func anotherPeersNoiseKeyNeverJoinsTheTranscript() {
+        let vincenzoShortId = "abef0238b73563e6"
+        let keys = snMeshPrivateChatKeys(
+            aliases: [Self.saraShortId],
+            noiseKeyHexByPeerKey: [
+                Self.saraShortId: [Self.saraNoiseKeyHex],
+                vincenzoShortId: [String(repeating: "ab", count: 32)],
+            ]
+        )
+        #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
+        #expect(!keys.contains(String(repeating: "ab", count: 32)))
+    }
 }
