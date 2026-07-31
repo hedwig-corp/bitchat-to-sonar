@@ -71,6 +71,22 @@ impl sonar_core::conversation_index::ConversationChangeListener for ChannelChang
     }
 }
 
+/// Forwards typing-indicator changes from core threads to the FFI callback on
+/// a dedicated thread, same shape as [`ChannelChangeListener`].
+struct ChannelTypingListener {
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<(String, bool)>>,
+}
+
+impl sonar_core::typing::TypingListener for ChannelTypingListener {
+    fn on_typing_changed(&self, group_id_hex: String, typing: bool) {
+        let _ = self
+            .tx
+            .lock()
+            .expect("typing change tx not poisoned")
+            .send((group_id_hex, typing));
+    }
+}
+
 fn invalid<E: std::fmt::Display>(what: &str) -> impl FnOnce(E) -> SonarFfiError + '_ {
     move |e| SonarFfiError::InvalidInput(format!("{what}: {e}"))
 }
@@ -1583,6 +1599,12 @@ impl SonarNode {
 
     // ── Conversation index (Signal-style summary table) ──────────────────
 
+    /// Lifecycle invariant (repeat installs are leak-free): each call spawns a
+    /// fresh forwarder thread parked on `rx.recv()`. Installing a new listener
+    /// replaces the core listener Arc, which drops the previous `tx`; that
+    /// closes the old channel and the old thread exits its recv loop. Do NOT
+    /// cache the core listener Arc anywhere else — a retained `tx` would keep
+    /// the orphaned thread alive forever.
     pub fn set_conversation_change_listener(&self, listener: Box<dyn ConversationChangeListener>) {
         let (tx, rx) = std::sync::mpsc::channel::<String>();
         std::thread::Builder::new()
@@ -1603,6 +1625,51 @@ impl SonarNode {
 
     pub fn clear_conversation_change_listener(&self) {
         self.client.set_conversation_change_listener(None);
+    }
+
+    // ── Typing indicators (ephemeral; never persisted) ────────────────────
+
+    /// Same forwarder-thread lifecycle invariant as
+    /// [`Self::set_conversation_change_listener`]: the old thread exits when
+    /// its `tx` drops on listener replacement — never retain the core
+    /// listener Arc outside the client.
+    pub fn set_typing_change_listener(&self, listener: Box<dyn TypingChangeListener>) {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, bool)>();
+        std::thread::Builder::new()
+            .name("sonar-typing-fwd".into())
+            .spawn(move || {
+                while let Ok((group_id_hex, typing)) = rx.recv() {
+                    listener.on_typing_changed(group_id_hex, typing);
+                }
+            })
+            .expect("spawn typing-listener forwarder");
+        let core_listener: Arc<dyn sonar_core::typing::TypingListener> =
+            Arc::new(ChannelTypingListener {
+                tx: std::sync::Mutex::new(tx),
+            });
+        self.client.set_typing_listener(Some(core_listener));
+    }
+
+    pub fn clear_typing_change_listener(&self) {
+        self.client.set_typing_listener(None);
+    }
+
+    /// Local composer produced input for this chat. Cheap and non-blocking
+    /// (a channel send into the core typing task); safe to call per keystroke.
+    /// The core owns the Signal cadence: STARTED once, refresh every 10s,
+    /// STOPPED after 3s idle or on send.
+    pub fn notify_typing(&self, group_id_hex: String) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.client.notify_typing(&group_id);
+        Ok(())
+    }
+
+    /// Local composer cleared / chat closed. Publishes STOPPED only if a
+    /// STARTED is outstanding.
+    pub fn notify_typing_stopped(&self, group_id_hex: String) -> FfiResult<()> {
+        let group_id = parse_group_id(&group_id_hex)?;
+        self.client.notify_typing_stopped(&group_id);
+        Ok(())
     }
 
     pub fn conversation_summaries(&self) -> Vec<ConversationSummaryInfo> {

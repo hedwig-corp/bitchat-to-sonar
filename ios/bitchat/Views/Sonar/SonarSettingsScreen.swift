@@ -76,10 +76,18 @@ struct SonarSettingsScreen: View {
                             icon: .eye,
                             label: "Message preview",
                             sub: "Show message text in notifications",
-                            trail: .toggle(store.notificationShowPreview),
-                            divider: false
+                            trail: .toggle(store.notificationShowPreview)
                         ) {
                             store.toggleNotificationShowPreview()
+                        }
+                        SNSettingsRow(
+                            icon: .pencil,
+                            label: "Typing indicators",
+                            sub: "See and share when people are typing in secure chats",
+                            trail: .toggle(store.typingIndicatorsEnabled),
+                            divider: false
+                        ) {
+                            store.toggleTypingIndicators()
                         }
                     }
 

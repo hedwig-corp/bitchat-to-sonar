@@ -159,9 +159,19 @@ fun SonarSettingsScreen(state: SonarAppState) {
                 SNXSettingsRow(
                     label = "Notifications",
                     value = if (state.prefBool("notifs", true)) "On" else "Off",
-                    chevron = true, divider = false,
+                    chevron = true,
                     icon = { SNXIcon(SNXIconName.Bell, 18.dp, it) },
                 ) { notif = true }
+                SNSettingsRow(
+                    icon = SNIconName.Pencil, label = "Typing indicators",
+                    sub = "See and share when people are typing in secure chats",
+                    toggle = state.prefBool("typingIndicators"),
+                    trail = SNTrail.None, divider = false,
+                ) {
+                    state.togglePref("typingIndicators")
+                    // Reciprocal off = hide immediately, not at the next event.
+                    if (!state.prefBool("typingIndicators")) state.clearTypingIndicators()
+                }
             }
 
             SNSectionLabel("Network")

@@ -1557,6 +1557,12 @@ final class SonarAppStore: ObservableObject {
     private var scannedCallMessageIDs = Set<String>()
 
     private var cancellables = Set<AnyCancellable>()
+    /// Marmot group ids with a remote member currently composing. Fed by the
+    /// core typing listener; expiry (15s) is handled core-side. In-memory only.
+    @Published private(set) var typingGroups = Set<String>()
+    /// Per-group throttle so per-keystroke composer callbacks reach the core
+    /// at most once a second (the core owns the real 10s/3s cadence).
+    private var lastTypingSentAt: [String: Date] = [:]
     @Published private var pendingMarmotChats: [String: SNPendingMarmotChat] = [:]
     @Published private var pendingMarmotGroups: [String: SNPendingMarmotGroup] = [:]
     @Published private var pendingMarmotMessagesByChat: [String: [SNMessage]] = [:]
@@ -1810,6 +1816,21 @@ final class SonarAppStore: ObservableObject {
                 guard !self.refreshedKnownDescriptorsForRelaySession else { return }
                 self.refreshedKnownDescriptorsForRelaySession = true
                 self.refreshKnownContactDescriptors(clearMisses: true)
+            }
+            .store(in: &cancellables)
+        // Ephemeral typing indicators. Display side of the reciprocal opt-in:
+        // additions are dropped while the pref is off; removals always apply
+        // so a stale indicator clears if the user toggles it off mid-chat.
+        marmot.typingChanged
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] change in
+                guard let self else { return }
+                let (groupId, typing) = change
+                if typing, self.typingIndicatorsEnabled {
+                    self.typingGroups.insert(groupId)
+                } else {
+                    self.typingGroups.remove(groupId)
+                }
             }
             .store(in: &cancellables)
         // Messages typed to an out-of-range Sonar peer before their White
@@ -2249,6 +2270,63 @@ final class SonarAppStore: ObservableObject {
         shared.set(notificationShowNames, forKey: Keys.notificationShowNames)
         shared.set(notificationShowPreview, forKey: Keys.notificationShowPreview)
         #endif
+    }
+
+    // MARK: Typing indicators (ephemeral)
+
+    /// Reciprocal opt-in, default OFF: when disabled we neither send our
+    /// typing nor display anyone else's (Signal's model).
+    var typingIndicatorsEnabled: Bool {
+        defaults.object(forKey: Keys.typingIndicatorsEnabled) as? Bool ?? false
+    }
+
+    func toggleTypingIndicators() {
+        defaults.set(!typingIndicatorsEnabled, forKey: Keys.typingIndicatorsEnabled)
+        if !typingIndicatorsEnabled { typingGroups.removeAll() }
+        objectWillChange.send()
+    }
+
+    /// Is a remote member composing in this conversation? Named display is
+    /// the DM peer (typing events carry no sender identity); groups render an
+    /// anonymous indicator.
+    ///
+    /// PURE lookups only — this runs during SwiftUI `body` evaluation, so no
+    /// `marmotGroupId()` here (its fallback path mutates the conversation-id
+    /// cache via `rememberMarmotGroup`). Folds duplicate direct-Marmot legs so
+    /// one person reads as one conversation whichever leg they typed on
+    /// (Fix What We Break rule; parity with Compose's `isPeerTyping`).
+    func isPeerTyping(_ chatId: String) -> Bool {
+        guard !typingGroups.isEmpty else { return false }
+        let groupId: String
+        if chatId.hasPrefix(Self.marmotIDPrefix) {
+            groupId = String(chatId.dropFirst(Self.marmotIDPrefix.count))
+        } else if let mapped = marmotGroupIdsByConversationId[chatId] {
+            groupId = mapped
+        } else {
+            return false
+        }
+        if typingGroups.contains(groupId) { return true }
+        return directMarmotGroups(matchingGroupId: groupId)
+            .contains { typingGroups.contains($0.id) }
+    }
+
+    /// Composer text changed (send side of the reciprocal opt-in). Throttled
+    /// to ≤1 core call/s per group; the core owns the Signal cadence and the
+    /// actual publish happens off-main on the Marmot work queue.
+    func composerTyping(_ chatId: String) {
+        guard typingIndicatorsEnabled, let groupId = marmotGroupId(chatId) else { return }
+        let now = Date()
+        if let last = lastTypingSentAt[groupId], now.timeIntervalSince(last) < 1 { return }
+        lastTypingSentAt[groupId] = now
+        marmot.notifyTyping(groupId: groupId)
+    }
+
+    /// Composer cleared or the chat screen closed: stop immediately (the core
+    /// publishes STOPPED only if a STARTED is outstanding).
+    func composerIdle(_ chatId: String) {
+        guard let groupId = marmotGroupId(chatId) else { return }
+        lastTypingSentAt[groupId] = nil
+        marmot.notifyTypingStopped(groupId: groupId)
     }
 
     // MARK: Identity
