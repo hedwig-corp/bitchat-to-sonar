@@ -734,6 +734,19 @@
     line-height: 1.7;
     display: block;
   }
+  /* Post images (screenshots, diagrams). The renderer emits a bare <img>
+     inside the surrounding <p>, so that paragraph is what centres it. A
+     screenshot must never exceed the measure or make the body scroll
+     sideways on a phone; `height: auto` keeps the ratio when width clamps. */
+  :global(.blog .md img) {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 4px auto;
+    border: 1px solid var(--hairline);
+    border-radius: 14px;
+    background: #0a0d0f;
+  }
   :global(.blog .md blockquote) {
     margin: 24px 0;
     padding: 4px 22px;
