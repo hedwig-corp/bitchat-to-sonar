@@ -76,6 +76,17 @@ pub struct JoinRequest {
     pub group_id: GroupId,
     pub secret_hash: [u8; 32],
     pub key_package_event_id: Option<EventId>,
+    /// `d` tag of the KeyPackage the requester published for this join.
+    ///
+    /// Kind 30443 is addressable and every install republishes into ONE
+    /// persisted slot, so the event id above stops resolving the moment the
+    /// requester republishes — which happens on their next relay connect. The
+    /// slot id survives that, and unlike a latest-by-author lookup it still
+    /// names the requesting device on a linked-device account (each install
+    /// mints its own slot). Optional: requests created before this field
+    /// existed carry only the event id.
+    #[serde(default)]
+    pub key_package_d_tag: Option<String>,
     pub received_at: u64,
 }
 
@@ -111,6 +122,7 @@ impl InviteLinkState {
                 group_id,
                 secret_hash: secret_hash_from_hex(&request.secret_hash_hex)?,
                 key_package_event_id,
+                key_package_d_tag: request.key_package_d_tag,
                 received_at: request.received_at,
             };
             requests
@@ -145,6 +157,7 @@ impl InviteLinkState {
                 group_id_hex: hex::encode(request.group_id.as_slice()),
                 secret_hash_hex: hex::encode(request.secret_hash),
                 key_package_event_id_hex: request.key_package_event_id.map(|id| id.to_hex()),
+                key_package_d_tag: request.key_package_d_tag.clone(),
                 received_at: request.received_at,
             })
             .collect();
@@ -181,6 +194,9 @@ struct JoinRequestDisk {
     group_id_hex: String,
     secret_hash_hex: String,
     key_package_event_id_hex: Option<String>,
+    /// Absent in state files written before the slot id was recorded.
+    #[serde(default)]
+    key_package_d_tag: Option<String>,
     received_at: u64,
 }
 
@@ -458,6 +474,7 @@ pub fn build_join_request_rumor(
     invite_secret: &[u8],
     requester: &PublicKey,
     key_package_event_id: Option<&EventId>,
+    key_package_d_tag: Option<&str>,
 ) -> UnsignedEvent {
     let secret_hash = sha256(invite_secret);
     let content = serde_json::json!({
@@ -465,6 +482,9 @@ pub fn build_join_request_rumor(
         "invite_secret_hash": hex::encode(secret_hash),
         "requester_npub": requester.to_bech32().expect("valid pubkey"),
         "key_package_event_id": key_package_event_id.map(|id| id.to_hex()),
+        // The addressable slot the event id above lives in. See
+        // `JoinRequest::key_package_d_tag` for why the id alone is not enough.
+        "key_package_d_tag": key_package_d_tag,
     });
     EventBuilder::new(Kind::Custom(JOIN_REQUEST_RUMOR_KIND), content.to_string())
         .tag(Tag::public_key(*requester))
@@ -477,6 +497,9 @@ pub struct JoinRequestPayload {
     pub invite_secret_hash: String,
     pub requester_npub: String,
     pub key_package_event_id: Option<String>,
+    /// Absent from requests sent by clients older than this field.
+    #[serde(default)]
+    pub key_package_d_tag: Option<String>,
 }
 
 pub fn parse_join_request_rumor(rumor: &UnsignedEvent) -> Result<JoinRequestPayload> {
@@ -538,6 +561,7 @@ mod tests {
             group_id: group_id.clone(),
             secret_hash: sha256(&decoded.invite_secret),
             key_package_event_id: None,
+            key_package_d_tag: None,
             received_at: 42,
         };
         store.add_join_request(request).expect("add request");
@@ -565,6 +589,7 @@ mod tests {
                     group_id: group_id.clone(),
                     secret_hash,
                     key_package_event_id: None,
+                    key_package_d_tag: None,
                     received_at: i as u64,
                 })
                 .expect("add join request");
@@ -601,6 +626,7 @@ mod tests {
                     group_id: group_id.clone(),
                     secret_hash,
                     key_package_event_id: None,
+                    key_package_d_tag: None,
                     received_at: 0,
                 })
                 .expect("add join request");
@@ -616,6 +642,7 @@ mod tests {
                 group_id: group_id.clone(),
                 secret_hash,
                 key_package_event_id: None,
+                key_package_d_tag: None,
                 received_at: JOIN_REQUEST_PROTECT_SECS + 1,
             })
             .expect("add join request");

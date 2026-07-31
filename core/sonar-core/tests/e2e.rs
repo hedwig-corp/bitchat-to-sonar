@@ -4,9 +4,12 @@
 //! This is the M1 acceptance test: KeyPackage publication → group creation →
 //! gift-wrapped welcome → bidirectional encrypted messages.
 
+use nostr::prelude::*;
 use nostr_relay_builder::MockRelay;
+use nostr_sdk::Client as NostrClient;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
+use sonar_core::marmot::KEY_PACKAGE_KIND;
 use tokio::time::{timeout, Duration};
 
 #[tokio::test]
@@ -166,6 +169,173 @@ async fn start_dm_rejects_self_before_reusing_existing_group() {
         .to_string()
         .contains("direct message requires another member"));
     assert_eq!(alice.groups().expect("alice groups").len(), 1);
+}
+
+#[tokio::test]
+async fn invite_approval_uses_the_requesters_exact_key_package() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let admin = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("admin connects");
+    let existing_member =
+        SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+            .await
+            .expect("existing member connects");
+    let requester = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("requester connects");
+
+    existing_member
+        .publish_key_package()
+        .await
+        .expect("existing member publishes key package");
+    let group_id = admin
+        .start_group(
+            vec![existing_member.identity().public_key()],
+            "invite approval",
+        )
+        .await
+        .expect("admin creates group");
+    let token = admin
+        .create_invite_link(&group_id, "invite approval")
+        .expect("admin creates invite link");
+
+    requester
+        .request_join_via_link(&token)
+        .await
+        .expect("requester publishes join request");
+    admin.sync().await.expect("admin receives join request");
+    let pending = admin.pending_join_requests(&group_id);
+    assert_eq!(pending.len(), 1);
+    assert!(
+        pending[0].key_package_event_id.is_some(),
+        "join request identifies the fresh KeyPackage it published"
+    );
+    assert!(
+        pending[0].key_package_d_tag.is_some(),
+        "join request identifies the addressable slot that KeyPackage lives in"
+    );
+
+    // Publish a NEWER kind-30443 under a DIFFERENT addressable slot, standing
+    // in for the requester's other linked device. It must carry its own `d`
+    // tag: without one the relay rejects the event outright and the test
+    // silently stops testing anything (that is how this regression test first
+    // shipped green against the very path it was meant to pin).
+    let bad_key_package =
+        EventBuilder::new(Kind::Custom(KEY_PACKAGE_KIND), "not a Marmot KeyPackage")
+            .tags([Tag::identifier("other-device-slot")])
+            .custom_created_at(Timestamp::from_secs(Timestamp::now().as_secs() + 10))
+            .build(requester.identity().public_key())
+            .sign_with_keys(requester.identity().keys())
+            .expect("sign invalid newer key package event");
+    let raw_publisher = NostrClient::new(requester.identity().keys().clone());
+    raw_publisher
+        .add_relay(relay_url)
+        .await
+        .expect("add mock relay");
+    raw_publisher.connect().await;
+    let inject = raw_publisher
+        .send_event(&bad_key_package)
+        .await
+        .expect("publish invalid newer key package event");
+    assert!(
+        !inject.success.is_empty(),
+        "relay must ACCEPT the poison event, else this test proves nothing: {:?}",
+        inject.failed
+    );
+
+    // The premise, asserted rather than assumed: latest-by-author now resolves
+    // to the poison event, so an approval that still used it would fail.
+    assert_eq!(
+        admin
+            .fetch_key_package(requester.identity().public_key())
+            .await
+            .expect("latest-by-author lookup")
+            .id,
+        bad_key_package.id,
+        "poison event must win latest-by-author for this test to have teeth"
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        admin.approve_join_request(&group_id, &requester.identity().public_key()),
+    )
+    .await
+    .expect("approval does not stall")
+    .expect("approval uses the requested key package");
+    assert!(admin.pending_join_requests(&group_id).is_empty());
+}
+
+/// Kind 30443 is addressable and every install republishes into ONE persisted
+/// slot, so pinning approval to the join request's exact event id breaks the
+/// moment the requester reconnects — the relay drops the replaced event and the
+/// request can never be approved. Approval keys on the slot, which rolls
+/// forward.
+#[tokio::test]
+async fn invite_approval_survives_the_requester_republishing_its_key_package() {
+    let relay = MockRelay::run().await.expect("mock relay starts");
+    let relay_url = relay.url().await;
+
+    let admin = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("admin connects");
+    let existing_member =
+        SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+            .await
+            .expect("existing member connects");
+    let requester = SonarClient::connect_in_memory(Identity::generate(), vec![relay_url.clone()])
+        .await
+        .expect("requester connects");
+
+    existing_member
+        .publish_key_package()
+        .await
+        .expect("existing member publishes key package");
+    let group_id = admin
+        .start_group(
+            vec![existing_member.identity().public_key()],
+            "invite approval",
+        )
+        .await
+        .expect("admin creates group");
+    let token = admin
+        .create_invite_link(&group_id, "invite approval")
+        .expect("admin creates invite link");
+
+    requester
+        .request_join_via_link(&token)
+        .await
+        .expect("requester publishes join request");
+    admin.sync().await.expect("admin receives join request");
+    let advertised = admin.pending_join_requests(&group_id)[0]
+        .key_package_event_id
+        .expect("join request advertises a KeyPackage event");
+
+    // The requester's next relay connect republishes into the same slot. That
+    // REPLACES the advertised event; relays drop the one the request names.
+    requester
+        .publish_key_package()
+        .await
+        .expect("requester republishes its key package");
+    let current = admin
+        .fetch_key_package(requester.identity().public_key())
+        .await
+        .expect("a current key package still exists");
+    assert_ne!(
+        current.id, advertised,
+        "republish must have replaced the advertised event for this test to have teeth"
+    );
+
+    timeout(
+        Duration::from_secs(5),
+        admin.approve_join_request(&group_id, &requester.identity().public_key()),
+    )
+    .await
+    .expect("approval does not stall")
+    .expect("approval rolls forward to the current package in the requester's slot");
+    assert!(admin.pending_join_requests(&group_id).is_empty());
 }
 
 #[tokio::test]

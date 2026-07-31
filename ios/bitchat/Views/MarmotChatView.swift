@@ -4841,8 +4841,18 @@ final class MarmotChatModel: ObservableObject {
         await loadLocal()
     }
 
+    /// Waits out a cold open before failing: the store is routinely closed
+    /// behind us on background suspend (R-020), and "not connected yet" on the
+    /// first tap after foregrounding reads as a dead button. 20s rather than
+    /// the 10s default because this is an explicit, foreground, one-shot user
+    /// action with a spinner on it — not a send that has a queue to fall back
+    /// on. `ensureConnected` stays bounded and cancellable for every other
+    /// caller; do not widen it for this one.
     func createInviteLink(groupId: String, groupName: String) async throws -> String {
-        try await service.createInviteLink(groupId: groupId, groupName: groupName)
+        guard await ensureConnected(timeoutSeconds: 20) else {
+            throw MarmotService.ServiceError.notConnected
+        }
+        return try await service.createInviteLink(groupId: groupId, groupName: groupName)
     }
 
     func pendingJoinRequests(groupId: String) async throws -> [JoinRequestInfo] {
@@ -4873,7 +4883,13 @@ final class MarmotChatModel: ObservableObject {
         await loadLocal()
     }
 
-    private static func describe(_ error: Error) -> String {
+    /// Single user-facing rendering of a `ServiceError`. Internal rather than
+    /// private so views can reuse it instead of `error.localizedDescription`,
+    /// which for a bare `Error` enum renders as "The operation couldn't be
+    /// completed. (…error 0.)". `ServiceError` deliberately does NOT conform to
+    /// `LocalizedError`: that would change the text at every existing `catch`
+    /// in the app and put raw Rust strings from `.core` in front of users.
+    static func describe(_ error: Error) -> String {
         switch error {
         case MarmotService.ServiceError.notConnected:
             return "Not connected yet — try again in a moment."

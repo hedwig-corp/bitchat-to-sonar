@@ -24,18 +24,11 @@
     <p>Open this invite in the Sonar app to send a join request. If you don't have
        Sonar yet, install it first, then tap the link again.</p>
     <a class="btn primary" id="open" href="#">Open in Sonar</a>
-    <a class="btn ghost" href="https://github.com/vincenzopalazzo/bitchat">Get Sonar</a>
+    <a class="btn ghost" href="https://github.com/hedwig-corp/bitchat-to-sonar/releases/latest">Get Sonar</a>
   </div>
-  <script>
-    // The invite payload lives in the URL fragment and never reaches this server.
-    // Fall back to the custom scheme so the app opens even before Universal/App
-    // Links are verified for this domain.
-    // Extract only a well-formed sinvite1<hex> token from the fragment (mirrors
-    // the Rust normalize_invite_token) before building the scheme URL.
-    var match = /sinvite1[0-9a-fA-F]+/.exec(location.hash || "");
-    if (match) {
-      document.getElementById("open").setAttribute("href", "sonar://invite/" + match[0]);
-    }
-  </script>
+  <!-- Root-absolute, not "./": invites are shared as /join#sinvite1… with no
+       trailing slash, against which a relative src resolves to /open-in-sonar.js.
+       That only works today because the host 301s /join → /join/. -->
+  <script type="module" src="/join/open-in-sonar.js"></script>
 </body>
 </html>

@@ -330,7 +330,7 @@ async fn join_request_naming_itself_is_accepted_with_seal_identity() {
         .group
         .mls_group_id;
 
-    let rumor = build_join_request_rumor(&group_id, secret, &joiner_pubkey, None);
+    let rumor = build_join_request_rumor(&group_id, secret, &joiner_pubkey, None, None);
     let wrapped = joiner
         .gift_wrap_rumor(&admin.identity().public_key(), rumor)
         .await

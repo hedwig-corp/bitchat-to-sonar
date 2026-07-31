@@ -20,7 +20,9 @@ struct SonarGroupInfoScreen: View {
     @State private var addDraft = ""
     @State private var leaveSheet = false
     @State private var inviteLink: String? = nil
+    @State private var creatingInviteLink = false
     @State private var pendingJoinRequests: [JoinRequestInfo] = []
+    @State private var approvingJoinRequests: Set<String> = []
     @State private var toast: String? = nil
 
     private var peer: SNPeerItem { store.peerItem(peerId) }
@@ -97,24 +99,15 @@ struct SonarGroupInfoScreen: View {
                         SNSettingsCard {
                             SNSettingsRow(
                                 icon: .link, tone: .cyan,
-                                label: "Create invite link",
-                                sub: "Share a link or QR code to let people request to join",
-                                trail: .chevron, divider: false
+                                label: creatingInviteLink ? "Creating invite link…" : "Create invite link",
+                                sub: creatingInviteLink
+                                    ? "Opening your secure group locally"
+                                    : "Share a link or QR code to let people request to join",
+                                trail: creatingInviteLink ? .none : .chevron, divider: false
                             ) {
-                                guard let groupId = store.marmotGroupId(peerId) else { return }
-                                Task { @MainActor in
-                                    do {
-                                        let link = try await store.marmot.createInviteLink(
-                                            groupId: groupId, groupName: groupTitle
-                                        )
-                                        inviteLink = link
-                                        copyInviteLink(link)
-                                        showToast("Invite link created and copied")
-                                    } catch {
-                                        showToast("Couldn't create link: \(error.localizedDescription)")
-                                    }
-                                }
+                                createInviteLink()
                             }
+                            .disabled(creatingInviteLink)
                         }
                     }
 
@@ -125,6 +118,7 @@ struct SonarGroupInfoScreen: View {
                                 PendingJoinRequestRow(
                                     request: request,
                                     divider: index < pendingJoinRequests.count - 1,
+                                    isApproving: approvingJoinRequests.contains(request.requesterNpub),
                                     approve: { approveJoinRequest(request) },
                                     decline: { declineJoinRequest(request) }
                                 )
@@ -319,6 +313,30 @@ struct SonarGroupInfoScreen: View {
         #endif
     }
 
+    private func createInviteLink() {
+        guard let groupId = store.marmotGroupId(peerId) else {
+            showToast("Group is still setting up")
+            return
+        }
+        // Latch before the Task, not via `.disabled`: that only takes effect on
+        // the next render, so two taps in one frame both get through.
+        guard !creatingInviteLink else { return }
+        creatingInviteLink = true
+        Task { @MainActor in
+            defer { creatingInviteLink = false }
+            do {
+                let link = try await store.marmot.createInviteLink(
+                    groupId: groupId, groupName: groupTitle
+                )
+                inviteLink = link
+                copyInviteLink(link)
+                showToast("Invite link created and copied")
+            } catch {
+                showToast("Couldn't create link: \(MarmotChatModel.describe(error))")
+            }
+        }
+    }
+
     @MainActor
     private func loadPendingJoinRequests() async {
         guard let groupId = store.marmotGroupId(peerId) else {
@@ -328,20 +346,22 @@ struct SonarGroupInfoScreen: View {
         do {
             pendingJoinRequests = try await store.marmot.pendingJoinRequests(groupId: groupId)
         } catch {
-            showToast("Couldn't load join requests: \(error.localizedDescription)")
+            showToast("Couldn't load join requests: \(MarmotChatModel.describe(error))")
         }
     }
 
     private func approveJoinRequest(_ request: JoinRequestInfo) {
         guard let groupId = store.marmotGroupId(peerId) else { return }
+        guard approvingJoinRequests.insert(request.requesterNpub).inserted else { return }
         Task { @MainActor in
+            defer { approvingJoinRequests.remove(request.requesterNpub) }
             do {
                 try await store.marmot.approveJoinRequest(groupId: groupId, requesterNpub: request.requesterNpub)
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
                 showToast("Member added")
                 await loadPendingJoinRequests()
             } catch {
-                showToast("Couldn't approve: \(error.localizedDescription)")
+                showToast("Couldn't approve: \(MarmotChatModel.describe(error))")
             }
         }
     }
@@ -354,7 +374,7 @@ struct SonarGroupInfoScreen: View {
                 pendingJoinRequests.removeAll { $0.requesterNpub == request.requesterNpub }
                 showToast("Request declined")
             } catch {
-                showToast("Couldn't decline: \(error.localizedDescription)")
+                showToast("Couldn't decline: \(MarmotChatModel.describe(error))")
             }
         }
     }
@@ -363,6 +383,7 @@ struct SonarGroupInfoScreen: View {
 private struct PendingJoinRequestRow: View {
     let request: JoinRequestInfo
     let divider: Bool
+    let isApproving: Bool
     let approve: () -> Void
     let decline: () -> Void
 
@@ -390,7 +411,14 @@ private struct PendingJoinRequestRow: View {
 
                 HStack(spacing: 8) {
                     SNSmallButton(label: "Decline", expand: false, action: decline)
-                    SNSmallButton(label: "Approve", primary: true, expand: false, action: approve)
+                        .disabled(isApproving)
+                    SNSmallButton(
+                        label: isApproving ? "Approving…" : "Approve",
+                        primary: true,
+                        expand: false,
+                        action: approve
+                    )
+                    .disabled(isApproving)
                 }
             }
             .padding(EdgeInsets(top: 9, leading: 14, bottom: 9, trailing: 14))

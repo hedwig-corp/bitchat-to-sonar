@@ -73,6 +73,7 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
     var showLeaveSheet by remember { mutableStateOf(false) }
     var inviteLink by remember { mutableStateOf<String?>(null) }
     var pendingJoinRequests by remember(chatId) { mutableStateOf<List<SonarJoinRequest>>(emptyList()) }
+    var approvingJoinRequests by remember(chatId) { mutableStateOf<Set<String>>(emptySet()) }
     val clipboard = LocalClipboardManager.current
     fun refreshPendingJoinRequests() {
         state.loadPendingJoinRequests(chatId) { pendingJoinRequests = it }
@@ -180,12 +181,28 @@ fun SonarGroupInfoScreen(state: SonarAppState, screen: Screen.GroupInfo) {
                     SNSectionLabel("Join requests")
                     SNSettingsCard {
                         pendingJoinRequests.forEachIndexed { index, request ->
+                            val isApproving = request.requesterNpub in approvingJoinRequests
                             PendingJoinRequestRow(
                                 request = request,
                                 divider = index < pendingJoinRequests.lastIndex,
+                                isApproving = isApproving,
                                 onApprove = {
-                                    state.approveJoinRequest(chatId, request.requesterNpub) {
-                                        refreshPendingJoinRequests()
+                                    // Read the live set, not the composed
+                                    // `isApproving` snapshot: `enabled` only
+                                    // takes effect after recomposition, so two
+                                    // taps in one frame both see false.
+                                    if (request.requesterNpub !in approvingJoinRequests) {
+                                        approvingJoinRequests =
+                                            approvingJoinRequests + request.requesterNpub
+                                        state.approveJoinRequest(
+                                            chatId = chatId,
+                                            requesterNpub = request.requesterNpub,
+                                            onDone = { refreshPendingJoinRequests() },
+                                            onComplete = {
+                                                approvingJoinRequests =
+                                                    approvingJoinRequests - request.requesterNpub
+                                            },
+                                        )
                                     }
                                 },
                                 onDecline = {
@@ -389,6 +406,7 @@ private fun shortJoinRequester(value: String): String =
 private fun PendingJoinRequestRow(
     request: SonarJoinRequest,
     divider: Boolean,
+    isApproving: Boolean,
     onApprove: () -> Unit,
     onDecline: () -> Unit,
 ) {
@@ -408,8 +426,18 @@ private fun PendingJoinRequestRow(
                 Text(shortJoinRequester(request.requesterNpub), color = s.text3, fontSize = 12.5.sp, lineHeight = 16.sp)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                JoinRequestAction("Decline", danger = true, onClick = onDecline)
-                JoinRequestAction("Approve", danger = false, onClick = onApprove)
+                JoinRequestAction(
+                    "Decline",
+                    danger = true,
+                    enabled = !isApproving,
+                    onClick = onDecline,
+                )
+                JoinRequestAction(
+                    if (isApproving) "Approving…" else "Approve",
+                    danger = false,
+                    enabled = !isApproving,
+                    onClick = onApprove,
+                )
             }
         }
         if (divider) {
@@ -422,12 +450,18 @@ private fun PendingJoinRequestRow(
 }
 
 @Composable
-private fun JoinRequestAction(label: String, danger: Boolean, onClick: () -> Unit) {
+private fun JoinRequestAction(
+    label: String,
+    danger: Boolean,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     val s = sonar
     val fg = if (danger) s.danger else s.green
     val bg = if (danger) s.surface2 else s.greenSoft
     Box(
-        Modifier.clip(RoundedCornerShape(10.dp)).background(bg).clickable(onClick = onClick)
+        Modifier.clip(RoundedCornerShape(10.dp)).background(bg)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(horizontal = 10.dp, vertical = 7.dp),
         contentAlignment = Alignment.Center
     ) {

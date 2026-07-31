@@ -1089,6 +1089,11 @@ impl MarmotEngine {
             group_id,
             secret_hash,
             key_package_event_id: kp_event_id,
+            key_package_d_tag: payload
+                .key_package_d_tag
+                .as_deref()
+                .filter(|d| !d.is_empty())
+                .map(str::to_string),
             received_at: Timestamp::now().as_secs(),
         };
         Ok(Incoming::JoinRequest(request))

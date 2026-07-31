@@ -64,8 +64,8 @@ jobs:
           SONAR_BLOG_TRANSLATE_API_KEY: ${{ github.event_name != 'pull_request' && secrets.SONAR_BLOG_TRANSLATE_API_KEY || '' }}
         run: npm run fetch-blog
 
-      - name: i18n unit checks
-        run: npm run test:i18n
+      - name: Web unit checks
+        run: npm test
 
       - name: Build
         env:
