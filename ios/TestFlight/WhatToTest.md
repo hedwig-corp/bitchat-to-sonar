@@ -1,12 +1,16 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.6 (34)** · Apple hotfix on **v0.1-alpha.12.1** (+ #538, #539)
+Build: **Sonar 1.12.7 (35)** · release tag **v0.1-alpha.12.2**
 
-Hotfix over 1.12.5: arm the push-wake store close on a timer (0xdead10cc
-round 5), and send the draft the field actually holds — not a stale view-graph
-copy. Opening a chat should still paint from local storage first; missed
-messages catch up in the background; payments and notifications should stay
-stable when the phone is locked or the app is killed.
+Cut after alpha.12.1 + Apple hotfixes through 1.12.6, then 0xdead10cc round 6
+(abort a Marmot connect that holds the store when iOS suspends; close a store a
+background auto-backup reopened), restored group-invite link handoff/approval,
+backup stats carried into the live policy after a restore, short transcripts
+bottom-aligned and re-pinned on viewport shrink, and internet replies that only
+the chat list could see now surfaced in the transcript. Opening a chat should
+paint from local storage first; missed messages catch up in the background;
+payments and notifications should stay stable when the phone is locked or the
+app is killed.
 
 ## 1. Sync speed & catching up (headline)
 
