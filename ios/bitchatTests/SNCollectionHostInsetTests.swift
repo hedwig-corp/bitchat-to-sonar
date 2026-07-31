@@ -133,6 +133,46 @@ struct SNCollectionHostInsetTests {
         #expect(abs(owned - (336 + 76)) < 0.5)
     }
 
+    /// A transcript shorter than the viewport must rest ON the composer. The
+    /// SwiftUI fallback gets this from `.defaultScrollAnchor(.bottom)`; the
+    /// collection host has to inset for it, or a two-message chat opens with a
+    /// screen-tall empty band between the last bubble and the composer.
+    @Test
+    func shortFeedTopInsetBottomAlignsOnlyWhileContentUnderfillsTheViewport() {
+        // 844pt viewport, 76pt composer, 300pt of rows ⇒ 468pt to give back.
+        #expect(
+            snCollectionHostShortFeedTopContentInset(
+                collectionBoundsHeight: 844,
+                contentHeight: 300,
+                bottomInset: 76
+            ) == 468
+        )
+        // Exactly filling the visible area needs no inset…
+        #expect(
+            snCollectionHostShortFeedTopContentInset(
+                collectionBoundsHeight: 844,
+                contentHeight: 768,
+                bottomInset: 76
+            ) == 0
+        )
+        // …and a real conversation must never be pushed off its live edge.
+        #expect(
+            snCollectionHostShortFeedTopContentInset(
+                collectionBoundsHeight: 844,
+                contentHeight: 20_000,
+                bottomInset: 76
+            ) == 0
+        )
+        // Keyboard up: the same short feed now overflows, so the inset clears.
+        #expect(
+            snCollectionHostShortFeedTopContentInset(
+                collectionBoundsHeight: 844,
+                contentHeight: 600,
+                bottomInset: 76 + 336
+            ) == 0
+        )
+    }
+
     /// Pins the Phase 3 floating-composer contract: UIKit `keyboardLayoutGuide`
     /// alone owns IME geometry. If SwiftUI also keyboard-avoids the representable,
     /// the composer sits roughly one keyboard height above the IME.
