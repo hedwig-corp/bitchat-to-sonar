@@ -1065,10 +1065,13 @@ final class BLEService: NSObject {
                 SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
                 return
             }
-            guard let targetID = self.routingPeerID(for: peerID) else {
-                SecureLogger.error("❌ No routing peer for private file transfer: \(peerID)", category: .session)
-                return
-            }
+            // Address the packet to the SAME route the capability check ran
+            // against. Re-resolving here let the two disagree — and it skipped
+            // the `isPeerReachable` guard above, whose comment explains that
+            // `routingPeerID` fabricates a short ID for an undiscovered 64-hex
+            // key. A second resolution could therefore hand back a fabricated
+            // recipient that the gate never saw.
+            let targetID = targetRoute
             guard let recipientData = Data(hexString: targetID.id) else {
                 SecureLogger.error("❌ Invalid recipient peer ID for file transfer: \(peerID)", category: .session)
                 return
@@ -2586,6 +2589,12 @@ extension BLEService {
     }
 
     var _test_pendingSonarAnnounceCap: Int { pendingSonarAnnounceCap }
+
+    /// The arrival stamp a parked announce is aged against. Exposed so a test
+    /// can assert a re-park does not reset it without waiting out the window.
+    func _test_pendingSonarAnnounceQueuedAt(for peerID: PeerID) -> TimeInterval? {
+        collectionsQueue.sync { pendingSonarAnnounces[peerID]?.queuedAt }
+    }
 
     func _test_handlePacket(_ packet: BitchatPacket, fromPeerID: PeerID, preseedPeer: Bool = true) {
         if preseedPeer {
@@ -4923,7 +4932,15 @@ extension BLEService {
                 }
                 pendingSonarAnnounces.removeValue(forKey: stalest.key)
             }
-            pendingSonarAnnounces[peerID] = (queuedAt: now, packet: packet)
+            // Re-parking keeps the ORIGINAL `queuedAt` and only refreshes the
+            // packet. Stamping "now" on a re-send let an attacker hold every
+            // slot indefinitely: fill the lot with distinct senders, then
+            // re-send those same 0x53s inside the window forever, and no entry
+            // is ever stale enough to evict, so every legitimate newcomer is
+            // refused. The clock measures how long a packet has waited, not how
+            // recently its sender spoke. Mirrors `park_pending_sonar`.
+            let queuedAt = pendingSonarAnnounces[peerID]?.queuedAt ?? now
+            pendingSonarAnnounces[peerID] = (queuedAt: queuedAt, packet: packet)
         }
     }
 

@@ -1739,7 +1739,28 @@ from ever happening, and parking runs BEFORE verification, so a flood needs no
 keypairs. Both platforms now evict only an entry older than the protection window
 and otherwise refuse the newcomer (`park_pending_sonar` /
 `queuePendingSonarAnnounce`). FIFO is not sufficient: a flood arriving *after* the
-victim still pushes it out. iOS additionally keyed eviction on `packet.timestamp`,
+victim still pushes it out. **A re-park keeps the original arrival stamp and only
+refreshes the bytes** — stamping "now" on a re-send made refusal itself the
+attack: fill every slot with distinct senders, re-send those same `0x53`s inside
+the window forever, and no entry is ever stale enough to evict, so every
+legitimate newcomer is refused indefinitely. The stamp measures how long a packet
+has waited, not how recently its sender spoke.
+
+The capability map is deliberately the OTHER way: `record_sonar_capability` /
+`recordSonarCapabilityLocked` *do* refresh on a re-announce, because there the
+refresh is the protection — it is what stops a flood evicting a peer you are
+actively talking to, exactly as `note_identity_seen` does for the identity pins.
+The two maps look symmetric and are not: a parked packet does not become more
+valuable because its sender spoke again, a live capability marking does. The
+residual is the same bound the identity map already accepts — a sustained flood
+that keeps every slot fresh refuses newcomers — and it is fail-closed, costing a
+receipt and never leaking the TLV.
+
+The recipient a private send is addressed to is the same `targetRoute` the
+capability check ran against. `sendFilePrivate` used to re-resolve
+`routingPeerID(for:)` inside its async block, which could disagree with the
+checked route and skipped the `isPeerReachable` guard that exists precisely
+because `routingPeerID` fabricates a short id for an undiscovered 64-hex key. iOS additionally keyed eviction on `packet.timestamp`,
 which the sender chooses, and the `0x53` staleness check only rejects *old*
 timestamps — so a future-dated flood was never the eviction candidate and the
 victim's real parked packet always was. Eviction now keys on our own monotonic
@@ -1781,7 +1802,7 @@ ordinary BLE stop/restart — clearing it would send the first transfer after ev
 radio cycle out unmarked for no security gain, since forgetting can only make the
 gate more conservative.
 
-**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `mesh_engine.rs::out_of_order_sonar_announce_still_grants_capability`, `mesh_engine.rs::unverified_sonar_announce_grants_no_capability`, `mesh_engine.rs::a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one`, `mesh_engine.rs::a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`, `BLEServiceCoreTests.wireFilePacket_stripsTheSonarTLVForANonSonarRecipient`, `BLEServiceCoreTests.parkedSonarAnnounce_survivesAFloodOfUnknownSenders`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`, `BLEServiceCoreTests.sonarCapability_survivesAFloodOfThrowawayPeers`
+**Guarded by:** `mesh_engine.rs::media_to_a_stock_bitchat_peer_carries_no_unknown_tlv`, `mesh_engine.rs::media_to_a_sonar_peer_still_carries_the_message_id`, `mesh_engine.rs::out_of_order_sonar_announce_still_grants_capability`, `mesh_engine.rs::unverified_sonar_announce_grants_no_capability`, `mesh_engine.rs::a_flood_of_throwaway_sonar_peers_cannot_evict_a_live_one`, `mesh_engine.rs::a_flood_of_parked_sonar_announces_cannot_evict_a_victims_parked_one`, `mesh_engine.rs::reparking_does_not_extend_a_squatters_protection`, `BLEServiceCoreTests.parkedSonarAnnounce_reparkingDoesNotExtendProtection`, `BLEServiceCoreTests.wireFilePacket_stripsTheSonarTLVForANonSonarRecipient`, `BLEServiceCoreTests.parkedSonarAnnounce_survivesAFloodOfUnknownSenders`, `BLEServiceCoreTests.sonarCapability_requiresAVerifiedSonarAnnounce`, `BLEServiceCoreTests.sonarCapability_survivesAFloodOfThrowawayPeers`
 
 The Rust tests pin the real call site: they drive two engines through
 `Engine::send_file` and run bitchat-android's decoder, transcribed, over the bytes

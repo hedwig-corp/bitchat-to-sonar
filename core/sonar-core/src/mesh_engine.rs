@@ -1074,7 +1074,19 @@ impl Engine {
                 _ => return,
             }
         }
-        self.pending_sonar.insert(sender_key, (now_ms, raw.to_vec()));
+        // Re-parking keeps the ORIGINAL arrival time and only refreshes the
+        // bytes. Stamping "now" on a re-send let an attacker hold every slot
+        // indefinitely: fill the lot with distinct senders, then re-send those
+        // same 0x53s inside the window forever, and no entry is ever stale
+        // enough to evict, so every legitimate newcomer is refused. The clock
+        // has to measure how long a packet has been waiting, not how recently
+        // its sender spoke.
+        let arrived = self
+            .pending_sonar
+            .get(&sender_key)
+            .map(|(first, _)| *first)
+            .unwrap_or(now_ms);
+        self.pending_sonar.insert(sender_key, (arrived, raw.to_vec()));
     }
 
     /// The ONLY way a fingerprint earns the Sonar file-TLV extension. Every
@@ -2601,6 +2613,42 @@ mod tests {
         );
     }
 
+    /// Refusing at the cap protects incumbents, which is the point — but only
+    /// if "incumbent" means a packet that has been waiting, not a sender that
+    /// keeps talking. Stamping the arrival time on every re-park let an attacker
+    /// fill the lot with distinct senders and then hold it forever by re-sending
+    /// those same 0x53s inside the window, so no entry was ever stale enough to
+    /// evict and every legitimate newcomer was refused.
+    #[test]
+    fn reparking_does_not_extend_a_squatters_protection() {
+        let mut a = engine(1, "sonar-a");
+        let first_park = 1_000u64;
+
+        for i in 0..MAX_PENDING_SONAR {
+            a.park_pending_sonar(format!("{i:016x}"), b"x", first_park);
+        }
+        assert_eq!(a.pending_sonar.len(), MAX_PENDING_SONAR);
+
+        // The squatters keep re-sending, right up to the edge of the window.
+        for round in 1..4 {
+            let t = first_park + (IDENTITY_PROTECT_MS / 4) * round;
+            for i in 0..MAX_PENDING_SONAR {
+                a.park_pending_sonar(format!("{i:016x}"), b"x", t);
+            }
+        }
+
+        // Once the window has passed measured from the FIRST park, a newcomer
+        // must be admitted. Aged from the last re-send it would still be
+        // refused, which is the bug.
+        let victim = "victimvictim0001".to_string();
+        a.park_pending_sonar(victim.clone(), b"v", first_park + IDENTITY_PROTECT_MS + 1);
+        assert!(
+            a.pending_sonar.contains_key(&victim),
+            "re-parking must not extend protection past the original arrival",
+        );
+        assert!(a.pending_sonar.len() <= MAX_PENDING_SONAR);
+    }
+
     /// "Verified" is load-bearing, not decoration: the signature guard is what
     /// stops any peer on the mesh from claiming another fingerprint speaks
     /// Sonar. Recording capability before that guard leaves every other test
@@ -2661,10 +2709,17 @@ mod tests {
             a.sonar_peers.len(),
         );
 
-        // Once the live marking is genuinely stale it may be evicted, so the
-        // bound is enforced by recency rather than by refusing forever.
+        // Once the incumbents are genuinely stale a newcomer is ADMITTED, so the
+        // bound is enforced by recency rather than by refusing forever. The
+        // weaker `len <= CAP` this used to assert already held before the call
+        // and so could not fail.
         let stale_now = 10_000 + IDENTITY_PROTECT_MS + 1;
-        a.record_sonar_capability("f".repeat(64).as_str(), stale_now);
+        let newcomer = "f".repeat(64);
+        a.record_sonar_capability(&newcomer, stale_now);
+        assert!(
+            a.sonar_peers.contains_key(&newcomer),
+            "a stale incumbent must be evicted to admit a newcomer",
+        );
         assert!(a.sonar_peers.len() <= SONAR_PEER_CAP);
     }
 

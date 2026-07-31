@@ -447,6 +447,55 @@ struct BLEServiceCoreTests {
         #expect(ble._test_pendingSonarAnnounceCount <= ble._test_pendingSonarAnnounceCap)
     }
 
+    /// Refusing at the cap protects incumbents, which is the point — but only
+    /// if "incumbent" means a packet that has been waiting, not a sender that
+    /// keeps talking. Stamping `queuedAt` on every re-park let an attacker fill
+    /// the lot and then hold it forever by re-sending the same 0x53s inside the
+    /// window, locking every legitimate newcomer out.
+    @Test
+    func parkedSonarAnnounce_reparkingDoesNotExtendProtection() {
+        let ble = makeService()
+        let now = UInt64(Date().timeIntervalSince1970 * 1000)
+
+        func announce(from peerID: PeerID) -> BitchatPacket {
+            BitchatPacket(
+                type: SonarAnnouncePacket.packetType,
+                senderID: Data(hexString: peerID.id) ?? Data(),
+                recipientID: nil,
+                timestamp: now,
+                payload: Data(repeating: 0x01, count: 8),
+                signature: Data(repeating: 0xAB, count: 64),
+                ttl: 7
+            )
+        }
+
+        // Fill every slot, then re-send the same senders. If a re-park reset the
+        // clock, these would stay protected indefinitely.
+        let squatters = (0..<ble._test_pendingSonarAnnounceCap).map {
+            PeerID(str: String(format: "%016x", $0 + 1))
+        }
+        for p in squatters { ble._test_queuePendingSonarAnnounce(announce(from: p), from: p) }
+        var firstParkStamps: [PeerID: TimeInterval] = [:]
+        for p in squatters { firstParkStamps[p] = ble._test_pendingSonarAnnounceQueuedAt(for: p) }
+        for p in squatters { ble._test_queuePendingSonarAnnounce(announce(from: p), from: p) }
+
+        // The lot is full, so a newcomer is refused for now — intended
+        // fail-closed behaviour, not the bug.
+        #expect(ble._test_pendingSonarAnnounceCount == ble._test_pendingSonarAnnounceCap)
+        let victim = PeerID(str: "00ffffffffffff01")
+        ble._test_queuePendingSonarAnnounce(announce(from: victim), from: victim)
+        #expect(ble._test_hasPendingSonarAnnounce(for: victim) == false)
+
+        // The bug is whether the squatters can stay protected forever. Their
+        // arrival stamps must be unchanged by the re-park — hundreds of
+        // microseconds of `systemUptime` elapse across 128 re-parks, so a stamp
+        // that reset would be measurably later.
+        for p in squatters.prefix(5) {
+            #expect(ble._test_pendingSonarAnnounceQueuedAt(for: p) == firstParkStamps[p],
+                    "re-parking must not reset the arrival stamp it is aged against")
+        }
+    }
+
     /// Every marking is cheap to mint — one keypair, one TOFU announce, one
     /// self-signed 0x53 — so a wholesale `removeAll()` at the cap let roughly
     /// `sonarCapablePeerCap` throwaway identities flush a live peer's marking,

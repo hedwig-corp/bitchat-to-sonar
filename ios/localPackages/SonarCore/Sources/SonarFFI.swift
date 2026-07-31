@@ -8155,8 +8155,16 @@ public func meshDecodePrivateMessage(plaintext: Data) -> MeshPrivateMessage?  {
 })
 }
 /**
- * Encode a `BitchatFilePacket` TLV (bitchat-compatible). The result is the
- * payload of a 0x22 packet (private = Noise-encrypt it first, then fragment).
+ * Encode a `BitchatFilePacket` TLV. The result is the payload of a 0x22 packet
+ * (private = Noise-encrypt it first, then fragment).
+ *
+ * Only bitchat-compatible while `message_id` is `None`. That field is a
+ * Sonar-only TLV and bitchat-android drops a file packet whole on the first tag
+ * it does not know, so a caller that sets it MUST already know the recipient
+ * runs Sonar. Unlike `Engine::send_file`, this entry point has no route and
+ * therefore no capability to gate on — it cannot make that check for you.
+ * No app calls this today (only the generated bindings expose it); prefer
+ * `Engine::send_file`, which gates on a verified 0x53. See R-030.
  */
 public func meshEncodeFilePacket(fileName: String?, fileSize: UInt64?, mimeType: String?, messageId: String?, content: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeSonarFfiError_lift) {
@@ -8530,7 +8538,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_func_mesh_decode_private_message() != 53773) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_func_mesh_encode_file_packet() != 43342) {
+    if (uniffi_sonar_ffi_checksum_func_mesh_encode_file_packet() != 5333) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_func_mesh_encode_private_message() != 50193) {
