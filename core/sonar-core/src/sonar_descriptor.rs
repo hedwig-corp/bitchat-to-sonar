@@ -15,6 +15,45 @@ const MAX_DESCRIPTOR_CONTENT_BYTES: usize = 4096;
 const MAX_LIST_ITEMS: usize = 8;
 const MAX_BOLT12_OFFER_BYTES: usize = 2048;
 
+/// Marmot protocol version advertised in the Sonar descriptor. The value is the
+/// HIGHEST Marmot protocol version this build supports, and it implies support
+/// for every version from 1 up to it. Absent on the wire ⇒ 1 (MDK), so old
+/// descriptors and old peers keep negotiating MDK with zero changes.
+pub const SONAR_PROTOCOL_MDK: u8 = 1;
+/// Darkmatter (Marmot v2). See [`SONAR_PROTOCOL_MDK`] for the "implies 1..=N" rule.
+pub const SONAR_PROTOCOL_DARKMATTER: u8 = 2;
+
+// Serde default: a descriptor with no `sonar_protocol` on the wire (every
+// pre-Darkmatter client) parses as MDK.
+fn default_sonar_protocol() -> u8 {
+    SONAR_PROTOCOL_MDK
+}
+
+// Serde skip: protocol-1 descriptors omit the field so their wire bytes stay
+// identical to pre-Darkmatter clients (asserted by
+// `mdk_protocol_is_omitted_from_wire_but_parses_back_as_one`).
+fn is_mdk_protocol(protocol: &u8) -> bool {
+    *protocol == SONAR_PROTOCOL_MDK
+}
+
+/// Highest Marmot protocol version both peers support, given each value implies
+/// support for `1..=value`. `min` — not `max` — because the result must be a
+/// version BOTH sides speak: `max` would pick a protocol one peer does not
+/// understand and break interop. Used to pick the engine for a NEW conversation;
+/// existing conversations keep their stored backend regardless of this value.
+///
+/// Inputs are always `>= SONAR_PROTOCOL_MDK`: the parse path
+/// ([`parse_descriptor_event`]) and the local setter
+/// (`SonarClient::set_advertised_sonar_protocol`) both floor the value, so a
+/// hostile `sonar_protocol: 0` on the wire cannot flow through here.
+///
+/// This governs Sonar↔Sonar selection only — WhiteNoise/other Marmot clients do
+/// not publish a Sonar descriptor and are detected from their key-package event
+/// kinds instead.
+pub fn negotiate(local: u8, peer: u8) -> u8 {
+    local.min(peer)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SonarDescriptor {
     pub schema: u16,
@@ -25,6 +64,9 @@ pub struct SonarDescriptor {
     pub call_identity: String,
     pub bolt12_offer: Option<String>,
     pub payment_receipts: Vec<String>,
+    /// Highest Marmot protocol version the peer supports (1 = MDK, 2 = Darkmatter).
+    /// Defaults to 1 when the descriptor omits it. See [`negotiate`].
+    pub sonar_protocol: u8,
     pub published_at_secs: u64,
 }
 
@@ -37,6 +79,14 @@ struct DescriptorContent {
     signaling: Vec<String>,
     transports: Vec<String>,
     call_identity: String,
+    /// Marmot protocol capability. Omitted on the wire when MDK-only (1) so
+    /// protocol-1 descriptors stay byte-identical to pre-Darkmatter clients;
+    /// a missing field parses back as 1.
+    #[serde(
+        default = "default_sonar_protocol",
+        skip_serializing_if = "is_mdk_protocol"
+    )]
+    sonar_protocol: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     payments: Option<DescriptorPayments>,
 }
@@ -58,7 +108,7 @@ struct DescriptorPaymentReceive {
 }
 
 impl DescriptorContent {
-    fn legacy_call(calls_enabled: bool, signaling: Vec<String>) -> Self {
+    fn legacy_call(calls_enabled: bool, signaling: Vec<String>, sonar_protocol: u8) -> Self {
         Self {
             schema: CALL_SCHEMA,
             app: APP_NAME.to_string(),
@@ -75,11 +125,24 @@ impl DescriptorContent {
                 Vec::new()
             },
             call_identity: CALL_IDENTITY_V1.to_string(),
+            // The call descriptor is the ALWAYS-published one (the meta
+            // descriptor is offer-gated, see `descriptor_events`), so it must
+            // carry the protocol capability too or a wallet-less build could
+            // never advertise Darkmatter. Old clients deserialize with serde's
+            // default unknown-field tolerance and ignore it; protocol-1 builds
+            // omit it entirely (`skip_serializing_if`), keeping their wire
+            // bytes identical to pre-Darkmatter releases.
+            sonar_protocol,
             payments: None,
         }
     }
 
-    fn meta(calls_enabled: bool, signaling: Vec<String>, bolt12_offer: Option<String>) -> Self {
+    fn meta(
+        calls_enabled: bool,
+        signaling: Vec<String>,
+        bolt12_offer: Option<String>,
+        sonar_protocol: u8,
+    ) -> Self {
         let payments =
             bolt12_offer
                 .and_then(normalize_bolt12_offer)
@@ -109,6 +172,7 @@ impl DescriptorContent {
                 Vec::new()
             },
             call_identity: CALL_IDENTITY_V1.to_string(),
+            sonar_protocol,
             payments,
         }
     }
@@ -141,6 +205,12 @@ impl DescriptorContent {
             call_identity: self.call_identity,
             bolt12_offer,
             payment_receipts,
+            // Trust boundary: descriptors come from public relays. Floor a
+            // hostile/buggy `sonar_protocol: 0` to MDK so a nonsense version
+            // never reaches `negotiate`. Values above DARKMATTER are kept
+            // as-is on purpose — a future v3 peer must still parse and
+            // interop via `min()`.
+            sonar_protocol: self.sonar_protocol.max(SONAR_PROTOCOL_MDK),
             published_at_secs,
         })
     }
@@ -155,19 +225,26 @@ pub fn default_signaling_routes() -> Vec<String> {
 pub fn descriptor_content_json(
     calls_enabled: bool,
     signaling: Vec<String>,
+    sonar_protocol: u8,
 ) -> serde_json::Result<String> {
-    serde_json::to_string(&DescriptorContent::legacy_call(calls_enabled, signaling))
+    serde_json::to_string(&DescriptorContent::legacy_call(
+        calls_enabled,
+        signaling,
+        sonar_protocol,
+    ))
 }
 
 pub fn meta_descriptor_content_json(
     calls_enabled: bool,
     signaling: Vec<String>,
     bolt12_offer: Option<String>,
+    sonar_protocol: u8,
 ) -> serde_json::Result<String> {
     serde_json::to_string(&DescriptorContent::meta(
         calls_enabled,
         signaling,
         bolt12_offer,
+        sonar_protocol,
     ))
 }
 
@@ -185,15 +262,22 @@ pub fn descriptor_events(
     calls_enabled: bool,
     signaling: Vec<String>,
     bolt12_offer: Option<String>,
+    sonar_protocol: u8,
 ) -> serde_json::Result<Vec<(&'static str, String)>> {
+    // Both descriptors carry `sonar_protocol`: the call descriptor is the
+    // always-published capability carrier (so a wallet-less Darkmatter build
+    // can still advertise v2), while the meta descriptor stays gated on a
+    // valid offer so an offer-less publish never clobbers a previously
+    // published one (see #180). Fetch side: `newest_valid_sonar_descriptor`
+    // takes the freshest event, which now always carries the claim.
     let mut events = vec![(
         SONAR_CALL_DESCRIPTOR_D_TAG,
-        descriptor_content_json(calls_enabled, signaling.clone())?,
+        descriptor_content_json(calls_enabled, signaling.clone(), sonar_protocol)?,
     )];
     if let Some(offer) = bolt12_offer.and_then(normalize_bolt12_offer) {
         events.push((
             SONAR_META_DESCRIPTOR_D_TAG,
-            meta_descriptor_content_json(calls_enabled, signaling, Some(offer))?,
+            meta_descriptor_content_json(calls_enabled, signaling, Some(offer), sonar_protocol)?,
         ));
     }
     Ok(events)
@@ -290,6 +374,7 @@ mod tests {
                 "marmot".to_string(),
                 "bad route".to_string(),
             ],
+            SONAR_PROTOCOL_MDK,
         )
         .expect("descriptor json");
         let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
@@ -306,6 +391,8 @@ mod tests {
         assert_eq!(parsed.call_identity, CALL_IDENTITY_V1);
         assert_eq!(parsed.bolt12_offer, None);
         assert!(parsed.payment_receipts.is_empty());
+        // The legacy call descriptor omits the protocol field, so it parses as MDK.
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_MDK);
         assert_eq!(parsed.published_at_secs, event.created_at.as_secs());
     }
 
@@ -314,9 +401,13 @@ mod tests {
         let keys = Keys::generate();
         let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq"
             .to_string();
-        let content =
-            meta_descriptor_content_json(true, default_signaling_routes(), Some(offer.clone()))
-                .expect("descriptor json");
+        let content = meta_descriptor_content_json(
+            true,
+            default_signaling_routes(),
+            Some(offer.clone()),
+            SONAR_PROTOCOL_DARKMATTER,
+        )
+        .expect("descriptor json");
         let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
             .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
             .sign_with_keys(&keys)
@@ -325,6 +416,8 @@ mod tests {
         let parsed = parse_descriptor_event(&event).expect("valid descriptor");
         assert_eq!(parsed.schema, META_SCHEMA);
         assert_eq!(parsed.bolt12_offer, Some(offer));
+        // A Darkmatter-capable build advertises protocol 2 and it round-trips.
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_DARKMATTER);
         assert_eq!(
             parsed.payment_receipts,
             vec!["sonar.payment.receipt.v1".to_string()]
@@ -334,8 +427,13 @@ mod tests {
     #[test]
     fn meta_descriptor_without_offer_clears_payment_metadata() {
         let keys = Keys::generate();
-        let content = meta_descriptor_content_json(true, default_signaling_routes(), None)
-            .expect("descriptor json");
+        let content = meta_descriptor_content_json(
+            true,
+            default_signaling_routes(),
+            None,
+            SONAR_PROTOCOL_MDK,
+        )
+        .expect("descriptor json");
         let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
             .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
             .sign_with_keys(&keys)
@@ -345,13 +443,120 @@ mod tests {
         assert_eq!(parsed.schema, META_SCHEMA);
         assert!(parsed.bolt12_offer.is_none());
         assert!(parsed.payment_receipts.is_empty());
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_MDK);
+    }
+
+    #[test]
+    fn mdk_protocol_is_omitted_from_wire_but_parses_back_as_one() {
+        // A protocol-1 meta descriptor must be byte-identical on the wire to a
+        // pre-Darkmatter client (no `sonar_protocol` key), and parse back as 1.
+        let json = meta_descriptor_content_json(
+            false,
+            default_signaling_routes(),
+            None,
+            SONAR_PROTOCOL_MDK,
+        )
+        .expect("descriptor json");
+        assert!(
+            !json.contains("sonar_protocol"),
+            "MDK descriptor must omit the protocol field on the wire: {json}"
+        );
+
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), json)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_MDK);
+    }
+
+    #[test]
+    fn call_descriptor_carries_darkmatter_protocol_without_offer() {
+        // A wallet-less Darkmatter build must still be able to advertise v2:
+        // the always-published call descriptor carries the capability.
+        let keys = Keys::generate();
+        let content = descriptor_content_json(
+            true,
+            default_signaling_routes(),
+            SONAR_PROTOCOL_DARKMATTER,
+        )
+        .expect("descriptor json");
+        assert!(content.contains("\"sonar_protocol\":2"));
+
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
+            .tags(descriptor_tags(SONAR_CALL_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_DARKMATTER);
+    }
+
+    #[test]
+    fn hostile_zero_protocol_is_floored_to_mdk() {
+        // Descriptors come from public relays: `sonar_protocol: 0` must not
+        // survive parsing, or `negotiate(local, 0)` would select a nonsense
+        // version. Values above DARKMATTER stay as-is (forward compat).
+        let keys = Keys::generate();
+        let base = meta_descriptor_content_json(
+            true,
+            default_signaling_routes(),
+            None,
+            SONAR_PROTOCOL_DARKMATTER,
+        )
+        .expect("descriptor json");
+        let mut value: serde_json::Value = serde_json::from_str(&base).expect("valid json");
+        value["sonar_protocol"] = serde_json::json!(0);
+        let hostile = serde_json::to_string(&value).expect("json");
+
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), hostile)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.sonar_protocol, SONAR_PROTOCOL_MDK);
+
+        // Forward compat: a future v3 build's descriptor still parses as 3.
+        let mut future: serde_json::Value = serde_json::from_str(&base).expect("valid json");
+        future["sonar_protocol"] = serde_json::json!(3);
+        let future_json = serde_json::to_string(&future).expect("json");
+        let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), future_json)
+            .tags(descriptor_tags(SONAR_META_DESCRIPTOR_D_TAG))
+            .sign_with_keys(&keys)
+            .expect("sign descriptor");
+        let parsed = parse_descriptor_event(&event).expect("valid descriptor");
+        assert_eq!(parsed.sonar_protocol, 3);
+        assert_eq!(negotiate(SONAR_PROTOCOL_DARKMATTER, parsed.sonar_protocol), 2);
+    }
+
+    #[test]
+    fn negotiate_picks_highest_common_protocol() {
+        // Each value implies support for 1..=value, so min() is the highest both speak.
+        assert_eq!(
+            negotiate(SONAR_PROTOCOL_DARKMATTER, SONAR_PROTOCOL_MDK),
+            SONAR_PROTOCOL_MDK
+        );
+        assert_eq!(
+            negotiate(SONAR_PROTOCOL_MDK, SONAR_PROTOCOL_DARKMATTER),
+            SONAR_PROTOCOL_MDK
+        );
+        assert_eq!(
+            negotiate(SONAR_PROTOCOL_DARKMATTER, SONAR_PROTOCOL_DARKMATTER),
+            SONAR_PROTOCOL_DARKMATTER
+        );
+        assert_eq!(
+            negotiate(SONAR_PROTOCOL_MDK, SONAR_PROTOCOL_MDK),
+            SONAR_PROTOCOL_MDK
+        );
     }
 
     #[test]
     fn descriptor_events_omit_meta_when_offer_absent() {
         // No offer: only the call descriptor is emitted, so an offer-less /
         // not-yet-ready publish can never clobber a previously-published offer.
-        let only_call = descriptor_events(true, default_signaling_routes(), None).expect("events");
+        let only_call =
+            descriptor_events(true, default_signaling_routes(), None, SONAR_PROTOCOL_MDK)
+                .expect("events");
         assert_eq!(only_call.len(), 1);
         assert_eq!(only_call[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
 
@@ -363,14 +568,20 @@ mod tests {
                 true,
                 default_signaling_routes(),
                 Some(invalid_offer.to_string()),
+                SONAR_PROTOCOL_MDK,
             )
             .expect("events");
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
         }
         let oversized_offer = format!("lno{}", "q".repeat(MAX_BOLT12_OFFER_BYTES));
-        let events = descriptor_events(true, default_signaling_routes(), Some(oversized_offer))
-            .expect("events");
+        let events = descriptor_events(
+            true,
+            default_signaling_routes(),
+            Some(oversized_offer),
+            SONAR_PROTOCOL_MDK,
+        )
+        .expect("events");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, SONAR_CALL_DESCRIPTOR_D_TAG);
 
@@ -378,8 +589,13 @@ mod tests {
         // meta carries the offer.
         let offer = "lno1qsgqmqvgm96frzdg8m0gc6nzeqffvzsqzrxqy32afmr3jn9ggl9g2s8sugfvxn4xqzqxqsq"
             .to_string();
-        let with_offer = descriptor_events(true, default_signaling_routes(), Some(offer.clone()))
-            .expect("events");
+        let with_offer = descriptor_events(
+            true,
+            default_signaling_routes(),
+            Some(offer.clone()),
+            SONAR_PROTOCOL_DARKMATTER,
+        )
+        .expect("events");
         assert_eq!(with_offer.len(), 2);
         assert!(with_offer
             .iter()
@@ -393,13 +609,16 @@ mod tests {
             .map(|(_, c)| c)
             .expect("meta event");
         assert!(meta.contains(&offer));
+        // The advertised protocol rides the meta descriptor.
+        assert!(meta.contains("\"sonar_protocol\":2"));
     }
 
     #[test]
     fn descriptor_requires_addressable_d_tag() {
         let keys = Keys::generate();
         let content =
-            descriptor_content_json(true, default_signaling_routes()).expect("descriptor json");
+            descriptor_content_json(true, default_signaling_routes(), SONAR_PROTOCOL_MDK)
+                .expect("descriptor json");
         let event = EventBuilder::new(Kind::Custom(SONAR_DESCRIPTOR_KIND), content)
             .sign_with_keys(&keys)
             .expect("sign descriptor");
