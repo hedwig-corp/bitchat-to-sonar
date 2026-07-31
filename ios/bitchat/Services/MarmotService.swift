@@ -545,14 +545,15 @@ final class MarmotService: @unchecked Sendable {
             #endif
             let node: SonarNode
             do {
-                // Deliberately NOT latched — see R-030. With no relays there is
-                // no quorum wait, and `subscribe_marmot` / `retry_outbox` return
-                // immediately against an empty pool, so the only cost here is
-                // the SQLCipher open and the MDK migrations: synchronous work
-                // with no await point for a latch to abort. Latching would buy
-                // nothing and cost something real — a suspend landing during an
-                // nsec restore would fail `performConnect()`, and its `guard …
-                // else` rolls back through `wipeDatabase()`.
+                // Deliberately NOT latched — see R-030 for the full trade. With
+                // no relays there is nothing to await, so a latch could not
+                // abort anything here; it could only *refuse to start*, one
+                // checkpoint later than the `nodeClosing` guard above. That
+                // refusal is the expensive part: a suspend landing during an
+                // nsec restore would fail `performConnect()`, and
+                // `restoreIdentity`'s `guard … else` rolls back through
+                // `wipeDatabase()`. A plain `nodeClosing` re-check here would
+                // cost exactly the same, so this is not about the latch.
                 node = try SonarNode.connect(
                     identity: identity,
                     relayUrls: [],

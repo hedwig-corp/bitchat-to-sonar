@@ -1845,21 +1845,37 @@ no Swift-side deadline can bound them either (R-028 established that
 it and the answer is to make that work interruptible in Rust, not to add another
 timer.
 
-`connectLocal` is deliberately **not** latched, and that is a scope decision
-rather than an oversight. With no relays there is no quorum wait and
-`subscribe_marmot` / `retry_outbox` return immediately against an empty pool, so
-everything that path holds the store for is synchronous — exactly the work a
-latch cannot abort. Latching it would buy nothing and cost something real:
-`suspendStoreForBackground()` fires unconditionally on background (it is not
-gated on a restore in progress), so a suspend landing during an nsec restore
-would fail `performConnect()`, and `restoreIdentity`'s
-`guard await performConnect() else` rolls back through `wipeDatabase()`. That
-branch does protect the account key — a `.restored` outcome throws before the
-wipe, and a first-time import never deletes its nsec — so this was never account
-loss. But widening a wipe path to fix a crash on a different path is the wrong
-trade, and the Account Key Durability Rule makes it a blocking one to get wrong.
-An earlier draft of this fix latched `connectLocal`; if you are about to add it
-back, this paragraph is why not.
+`connectLocal` is deliberately **not** latched, and the reason is a trade, not
+that a latch is useless there. Be precise about what it would buy, because an
+earlier draft of this entry overclaimed and a review caught it: with no relays
+there is no quorum wait and `subscribe_marmot` / `retry_outbox` return
+immediately against an empty pool, so a latch could never *abort* anything on
+that path — everything it holds the store for is synchronous. What a latch would
+still buy is the `biased` select's **pre-check**: a refusal to open SQLCipher at
+all, at a checkpoint later than `connectLocal`'s own opening
+`guard !service.nodeClosing`. The gap between the two is real, mostly the
+blocking flock in `prepareStoreLockForConnectSync()`.
+
+It is declined anyway because the refusal is the expensive part.
+`suspendStoreForBackground()` fires unconditionally on background — it is not
+gated on a restore in progress — so a suspend landing in that window fails
+`performConnect()`, and `restoreIdentity`'s `guard await performConnect() else`
+rolls back through `wipeDatabase()`. That branch does protect the account key (a
+`.restored` outcome throws before the wipe; a first-time import never deletes its
+nsec), so this was never account loss. But widening a wipe path to fix a crash on
+a different path is the wrong trade, and the Account Key Durability Rule makes it
+a blocking one to get wrong. Note the trade is not latch-specific: a plain
+`nodeClosing` re-check placed there would fail `performConnect()` identically.
+
+**The residual hole this leaves, named rather than waved away:** a background
+transition landing after `connectLocal`'s guard still opens the store, and the
+close then queues behind that whole synchronous span on `workQueue`. It is
+bounded by local disk work (SQLCipher open, MDK migrations, and
+`materialize_index_if_empty` on a first run after upgrade) rather than by an
+unbounded network wait, which is why it is out of scope here and why the crash
+log shows the relay path. It is **pre-existing** — this is exactly the state
+`main` is in — and closing it needs the synchronous prologue to become
+interruptible in Rust, not another Swift checkpoint.
 
 **Call sites:** iOS `MarmotService.connect` (lease + latch registration),
 `MarmotService.pendingConnectLatches` / `registerPendingConnectLatch` /
