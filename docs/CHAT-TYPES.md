@@ -47,7 +47,7 @@ That gives the two kinds:
 
 ## The identity model (which id are you holding?)
 
-Five different strings can identify "the same conversation". Confusing them is
+Six different strings can identify "the same conversation". Confusing them is
 the #1 source of mesh-only bugs:
 
 1. **Mesh route id** — `"mesh:<peerId>"`. A UI/navigation key only. It is
@@ -63,6 +63,25 @@ the #1 source of mesh-only bugs:
 5. **Duplicate direct groups** — one peer can legitimately have several direct
    Marmot groups (both sides created one). `duplicateDirectMarmotChats` folds
    them into one row; per-group state must be summed/unioned across all of them.
+6. **Noise public key hex** (Apple only) — the peer's raw 64-hex Noise static
+   key. It is **not** the fingerprint (the fingerprint is its SHA-256, and the
+   short id is that fingerprint's first 16 hex), so it shares no prefix with
+   ids 1–2 and no alias resolver produces it. It is nonetheless a real key in
+   `ChatViewModel.privateChats`: an incoming internet (NIP-17) DM is stored
+   under it (`ChatViewModel+Nostr.processNostrMessage` →
+   `PeerID(str: noiseKey.hexEncodedString())`), and it is mirrored onto the
+   short id only while the peer is live over BLE
+   (`mirrorToEphemeralIfNeeded` requires a `unifiedPeerService` entry). So an
+   out-of-range peer's replies sit in a bucket the alias set never names.
+
+   That asymmetry is a shipped bug (`#537`): `dmRows` folds *every*
+   `privateChats` bucket through `canonicalPeerKey`, so the chat-list row
+   showed those replies, while the transcript read alias keys only and stayed
+   permanently behind its own home row. Read `privateChats` through
+   `meshPrivateChatKeys(forConversationId:)` / `snMeshPrivateChatKeys`, never
+   through `meshPeerAliases` alone. Compose is unaffected: `drainDirectDms`
+   keys incoming DMs by `peerIdForNpubHex(...)` (a mesh peer id) into
+   `meshChats`, so it has no Noise-key bucket.
 
 **The one safe resolver is `transcriptGroupIds(chatId)`**
 (`SonarAppState.kt`): it returns the folded group-id list for *both* kinds
