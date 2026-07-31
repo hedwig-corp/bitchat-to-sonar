@@ -185,6 +185,17 @@ data class SonarProfile(
         displayName?.takeIf { it.isNotBlank() } ?: name?.takeIf { it.isNotBlank() }
 }
 
+/** One `@mention` located inside message content by the Rust core.
+ *
+ *  [start] / [end] are UTF-16 code unit offsets, so they index a Kotlin
+ *  `String` directly — `text.substring(start, end)` is the mention as typed. */
+data class SonarMentionSpan(
+    val start: Int,
+    val end: Int,
+    val name: String,
+    val suffixHex4: String?,
+)
+
 /** A handle (`vincenzo` / `alice@example.com`) resolved to its owner via
  *  NIP-05. `address` is the canonical lowercased `name@domain` that resolved. */
 data class SonarResolvedHandle(
@@ -652,6 +663,19 @@ expect object SonarCore {
 
     /** Render the user-visible notification envelope through the Rust core. */
     fun renderNotification(input: SonarNotificationRenderInput): SonarNotificationEnvelope?
+
+    /** Locate every `@mention` in [content]. The core is the single decoder of
+     *  message content (see `Mentions.kt`); hosts memoize the result per message
+     *  and never call this per rendered frame. */
+    fun parseMentions(content: String): List<SonarMentionSpan>
+
+    /** True when [content] mentions the identity holding [pubkeyHex].
+     *  [displayName] is supplied by the host because the core caches no local
+     *  kind-0 profile; a `@name#abcd` mention matches without it. */
+    fun mentionsPubkey(content: String, pubkeyHex: String, displayName: String?): Boolean
+
+    /** The `#abcd` disambiguator for [pubkeyHex] — its last 4 hex, lowercased. */
+    fun mentionShortSuffix(pubkeyHex: String): String?
 
     /** All active Marmot chats we belong to. */
     suspend fun chats(): List<SonarChat>

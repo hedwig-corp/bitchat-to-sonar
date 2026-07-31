@@ -320,7 +320,8 @@ struct SNCollectionHostMessageRow: View {
                     showState: showState,
                     onRetry: snCanRetryFailedMessage(m) ? { onRetry?(m) } : nil,
                     maxBubbleWidth: textMax,
-                    onTapAuthor: onTapAuthor
+                    onTapAuthor: onTapAuthor,
+                    mentions: m.mentions
                 )
             }
         }

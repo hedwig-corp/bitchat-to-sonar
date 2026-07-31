@@ -2579,6 +2579,50 @@ class SonarAppState(private val scope: CoroutineScope) {
             }
     }
 
+    /**
+     * Group members the `@` picker can offer, named from the already-cached
+     * kind-0 profiles.
+     *
+     * Deliberately does NOT call [ensureProfile]: this runs while the user is
+     * typing, and kicking a relay fetch from the render path is exactly the
+     * side effect the performance rule forbids. Profiles are already warmed by
+     * opening the chat, and a member with no cached name simply does not match
+     * a typed name.
+     *
+     * The `#abcd` suffix is derived from the member's public key, so it stays
+     * correct across renames.
+     */
+    fun mentionRoster(chatId: String): List<MentionCandidate> {
+        if (!isMultiMemberChat(chatId)) return emptyList()
+        val members = pendingMarmotGroups[chatId]?.members
+            ?: chats.firstOrNull { it.id == chatId }?.let { otherMembers(it) }
+            ?: return emptyList()
+        return members.mapNotNull { member ->
+            val name = profilesByNpub[canonicalProfileKey(member)]?.bestName ?: return@mapNotNull null
+            MentionCandidate(
+                npub = member,
+                name = name,
+                suffixHex4 = canonicalNpubHex(member)?.let { SonarCore.mentionShortSuffix(it) },
+            )
+        }
+    }
+
+    /** The group member a rendered `@mention` points at, or null when the name
+     *  answers to nobody in this group (a hand-typed mention, or a member who
+     *  has since renamed). Suffix form wins: it is derived from the key. */
+    /** Best human label for a contact npub — cached profile name, else a short
+     *  npub. Used for the title of a screen opened from a tapped mention. */
+    fun contactTitle(npub: String): String =
+        profilesByNpub[canonicalProfileKey(npub)]?.bestName ?: shortNpub(npub)
+
+    fun mentionTarget(roster: List<MentionCandidate>, span: SonarMentionSpan): MentionCandidate? {
+        span.suffixHex4?.let { suffix ->
+            return roster.firstOrNull { it.suffixHex4 == suffix }
+        }
+        // An ambiguous bare name resolves to nobody rather than to a coin flip.
+        return roster.filter { it.name.equals(span.name, ignoreCase = true) }.singleOrNull()
+    }
+
     fun groupMemberNpubs(chatId: String): Set<String> =
         pendingMarmotGroups[chatId]?.members?.toSet()
             ?: chats.firstOrNull { it.id == chatId }?.members.orEmpty().toSet()
@@ -4976,6 +5020,37 @@ class SonarAppState(private val scope: CoroutineScope) {
     private fun isCallNotificationContent(content: String): Boolean =
         content.trimStart().startsWith("☎CALL") && SonarCore.callParseControl(content) != null
 
+    /**
+     * True when [content] names us — either `@name#abcd` carrying our key's
+     * suffix (rename-proof), or a bare `@name` matching our current nickname.
+     *
+     * The core owns the decode; we only supply the two things it cannot know:
+     * our public key and the nickname we currently publish.
+     */
+    /**
+     * Mention spans and self-mention verdict for one message.
+     *
+     * Both are derived purely from the message text, so callers memoize on the
+     * message id/content and this never runs per rendered frame. Keeping it
+     * text-only is also what lets the transcript keep caching row heights by
+     * text: same text ⇒ same spans ⇒ same wrap.
+     */
+    fun mentionInfo(content: String, roster: List<MentionCandidate>): MentionInfo {
+        if (!content.contains('@')) return MentionInfo.EMPTY
+        val spans = SonarCore.parseMentions(content)
+        if (spans.isEmpty()) return MentionInfo.EMPTY
+        return MentionInfo(
+            mentions = spans.map { ResolvedMention(it, mentionTarget(roster, it)?.npub) },
+            mentionsMe = mentionsMe(content),
+        )
+    }
+
+    internal fun mentionsMe(content: String): Boolean {
+        if (!content.contains('@')) return false
+        val myHex = canonicalNpubHex(npub) ?: return false
+        return SonarCore.mentionsPubkey(content, myHex, nick.takeIf { it.isNotBlank() })
+    }
+
     private fun notifyIncoming(
         idKey: String,
         conversationTitle: String?,
@@ -4990,7 +5065,18 @@ class SonarAppState(private val scope: CoroutineScope) {
         if (foreground) return
         // Muted chats never notify (any kind); rows and unread still accrue.
         if (isChatMuted(idKey)) return
-        val kind = forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
+        val classified =
+            forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
+        // A plain message that names us is promoted to Mention so the banner
+        // reads "X mentioned you". Only plain messages are eligible — a payment
+        // or call keeps its own kind. Note this runs AFTER the mute gate above:
+        // a mention does not pierce mute (R-022).
+        val kind =
+            if (classified == SonarNotificationKind.Message && mentionsMe(content)) {
+                SonarNotificationKind.Mention
+            } else {
+                classified
+            }
         val notification = SonarNotificationRouter.build(
             idKey = idKey,
             kind = kind,

@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 use nostr::prelude::*;
 use sonar_core::client::SonarClient;
 use sonar_core::identity::Identity;
+use sonar_core::mention::{
+    mentions_pubkey as core_mentions_pubkey, parse_mentions as core_parse_mentions,
+    short_suffix as core_short_suffix,
+};
 use sonar_core::noise::{NoiseHandshake, NoiseKeypair, NoiseSession};
 use sonar_core::notification::{
     classify_content as core_notification_kind, payment_amount_sats as core_payment_amount_sats,
@@ -843,6 +847,66 @@ pub fn sonar_notification_classify_content(content: String) -> SonarNotification
 #[uniffi::export]
 pub fn sonar_notification_payment_sats(content: String) -> Option<u64> {
     core_payment_amount_sats(&content)
+}
+
+/// One `@mention` found in message content.
+///
+/// `start_utf16` / `end_utf16` are **UTF-16 code unit** offsets: they index a
+/// Kotlin `String` directly and convert to a Swift `String.Index` with
+/// `String.Index(utf16Offset:in:)`. Byte offsets would land in the wrong place
+/// on both hosts as soon as the message contains an emoji.
+#[derive(uniffi::Record)]
+pub struct SonarMentionSpanInfo {
+    pub start_utf16: u32,
+    pub end_utf16: u32,
+    /// Name as typed, without the leading `@` and without any `#abcd` suffix.
+    pub name: String,
+    /// Lowercased 4-hex disambiguator, when the mention carried one.
+    pub suffix_hex4: Option<String>,
+}
+
+/// Extract every `@mention` in `content`.
+///
+/// Mentions are plain text on the wire, so this is pure parsing — it is the
+/// single decoder both hosts read rather than each re-implementing the scan
+/// (same rule as `MessageClassification`; see R-017 in `docs/REGRESSIONS.md`).
+/// Cheap and allocation-free when the content holds no `@`, but hosts should
+/// still call it at row-build time and memoize, never per rendered frame.
+#[uniffi::export]
+pub fn sonar_parse_mentions(content: String) -> Vec<SonarMentionSpanInfo> {
+    core_parse_mentions(&content)
+        .into_iter()
+        .map(|span| SonarMentionSpanInfo {
+            start_utf16: span.start_utf16,
+            end_utf16: span.end_utf16,
+            name: span.name,
+            suffix_hex4: span.suffix_hex4,
+        })
+        .collect()
+}
+
+/// True when `content` mentions the identity holding `pubkey_hex`.
+///
+/// `display_name` is supplied by the host rather than read from core state:
+/// the core deliberately caches no local kind-0 profile, and both hosts already
+/// hold the user's current nickname. A `@name#abcd` mention matches on the
+/// suffix alone and so survives a rename; a bare `@name` needs `display_name`
+/// and stops resolving if the user renames after the message was sent.
+#[uniffi::export]
+pub fn sonar_mentions_pubkey(
+    content: String,
+    pubkey_hex: String,
+    display_name: Option<String>,
+) -> bool {
+    core_mentions_pubkey(&content, &pubkey_hex, display_name.as_deref())
+}
+
+/// The `#abcd` disambiguator for a public key — its last 4 hex digits,
+/// lowercased. Hosts use it to build `@name#abcd` when two group members share
+/// a display name. `None` when `pubkey_hex` is not plausible hex.
+#[uniffi::export]
+pub fn sonar_mention_short_suffix(pubkey_hex: String) -> Option<String> {
+    core_short_suffix(&pubkey_hex)
 }
 
 #[uniffi::export]

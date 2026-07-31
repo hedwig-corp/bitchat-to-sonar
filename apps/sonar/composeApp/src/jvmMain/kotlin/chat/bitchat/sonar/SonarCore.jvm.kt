@@ -164,6 +164,29 @@ actual object SonarCore {
         return uniffi.sonar_ffi.sonarRenderNotification(input.toFfi())?.toCommon()
     }
 
+    actual fun parseMentions(content: String): List<SonarMentionSpan> {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.sonarParseMentions(content).map { it.toCommon() }
+    }
+
+    actual fun mentionsPubkey(content: String, pubkeyHex: String, displayName: String?): Boolean {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.sonarMentionsPubkey(content, pubkeyHex, displayName)
+    }
+
+    actual fun mentionShortSuffix(pubkeyHex: String): String? {
+        SonarNativeLoader.ensureLoaded()
+        return uniffi.sonar_ffi.sonarMentionShortSuffix(pubkeyHex)
+    }
+
+    private fun uniffi.sonar_ffi.SonarMentionSpanInfo.toCommon(): SonarMentionSpan =
+        SonarMentionSpan(
+            start = startUtf16.toInt(),
+            end = endUtf16.toInt(),
+            name = name,
+            suffixHex4 = suffixHex4,
+        )
+
     actual suspend fun chats(): List<SonarChat> = withContext(Dispatchers.IO) {
         val n = node ?: return@withContext emptyList()
         n.groups().map { SonarChat(id = it.idHex, name = it.name, members = it.memberNpubs) }

@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import SonarCore
 import SwiftUI
 
 // MARK: - Formatting Context Protocol
@@ -171,17 +172,23 @@ final class MessageFormattingEngine {
         )
     }
 
-    /// Extracts mentions from message content
+    /// Extracts mentions from message content.
+    ///
+    /// Delegates to the Rust core so the mesh and Sonar/Marmot transcripts read
+    /// mentions through exactly one decoder (see `SonarMentions.swift`). The
+    /// returned strings keep the shipped mesh shape — name plus any `#abcd`
+    /// suffix, without the `@` — so callers such as `ChatViewModel` are
+    /// unchanged.
+    ///
+    /// One intentional behaviour change comes with the core scanner: an `@` must
+    /// now be preceded by start-of-text or whitespace, so `alice@example.com` no
+    /// longer reports a bogus `example` mention. `MessageFormattingEngineTests`
+    /// pins that difference.
     static func extractMentions(from content: String) -> [String] {
-        let nsContent = content as NSString
-        let range = NSRange(location: 0, length: nsContent.length)
-        let matches = Patterns.mention.matches(in: content, options: [], range: range)
-
-        return matches.compactMap { match -> String? in
-            guard match.numberOfRanges > 1 else { return nil }
-            let captureRange = match.range(at: 1)
-            guard let swiftRange = Range(captureRange, in: content) else { return nil }
-            return String(content[swiftRange])
+        guard content.contains("@") else { return [] }
+        return sonarParseMentions(content: content).map { span in
+            guard let suffix = span.suffixHex4 else { return span.name }
+            return "\(span.name)#\(suffix)"
         }
     }
 

@@ -62,6 +62,11 @@ struct SonarDMScreen: View {
 
     var body: some View {
         SonarDMScreenContent(peerId: peerId, convo: store.conversationViewState(peerId))
+            // Injected here so every transcript host below renders tappable
+            // mentions without threading a closure through each one.
+            .environment(\.snMentionTap) { npub in
+                store.push(.contactProfile(npub, store.contactTitle(forNpub: npub)))
+            }
     }
 }
 
@@ -149,7 +154,13 @@ struct SonarDMScreenContent: View {
             fetchInstalledPacks: { await store.fetchInstalledPacks() },
             cachedStickerPacks: { store.cachedStickerPacks() },
             voiceEnabled: store.canSendMedia(peerId),
-            onVoice: { store.sendVoiceNote(peerId, url: $0) }
+            onVoice: { store.sendVoiceNote(peerId, url: $0) },
+            // Recomputed only while an `@token` is being typed — the store
+            // publishes `composerMentionQuery` on that boundary, so ordinary
+            // typing never rebuilds the roster.
+            mentionRoster: store.composerMentionQuery[peerId] == nil
+                ? []
+                : store.mentionRoster(forConversationId: peerId)
         )
     }
 

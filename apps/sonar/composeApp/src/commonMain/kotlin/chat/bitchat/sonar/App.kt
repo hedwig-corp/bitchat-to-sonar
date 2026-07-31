@@ -1653,6 +1653,11 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
     val currentChat = state.chats.firstOrNull { it.id == screen.id }
     val isGroup = state.isMultiMemberChat(screen.id)
     val canManageGroup = state.canManageGroup(screen.id)
+    // Hoisted out of the row loop: resolving it costs a bech32 decode per group
+    // member, which per-row would repeat for every message on the page.
+    val mentionRoster = remember(screen.id, isGroup, state.profilesByNpub, state.chats) {
+        if (isGroup) state.mentionRoster(screen.id) else emptyList()
+    }
     // Resolve a human name for the peer or group (Marmot names can be blank).
     val peerName = screen.name.ifBlank {
         currentChat?.let { state.chatTitle(it) } ?: "secure chat"
@@ -1769,6 +1774,17 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
                                         showState = m.mine && (feedIndex == feed.lastIndex || failedSend),
                                         onRetry = if (failedSend) { { state.retryMessage(screen.id, m) } } else null,
                                         maxBubbleWidth = bubbleMax,
+                                        // Decoded once per row and memoized: the
+                                        // core call must never land on a frame.
+                                        mentions = remember(m.id, m.content, mentionRoster) {
+                                            if (mentionRoster.isEmpty()) MentionInfo.EMPTY
+                                            else state.mentionInfo(m.content, mentionRoster)
+                                        },
+                                        onMentionTap = { npub ->
+                                            state.push(
+                                                Screen.ContactProfile(npub, state.contactTitle(npub))
+                                            )
+                                        },
                                     )
                                 }
                             }
@@ -1789,6 +1805,7 @@ private fun ChatScreen(state: SonarAppState, screen: Screen.Chat) {
         // in both the legacy Column shell and the Phase-2 Box host.
         Column(Modifier.fillMaxWidth()) {
             if (draft.startsWith("/")) SlashHints(draft) { state.setComposerDraft(screen.id, it) }
+            MentionHints(mentionRoster, draft) { state.setComposerDraft(screen.id, it) }
             if (emojiTray && !recording) {
                 TransientBackHandler { emojiTray = false }
                 chat.bitchat.sonar.screens.SonarEmojiPicker(
@@ -2407,6 +2424,47 @@ internal fun SlashHints(draft: String, onPick: (String) -> Unit) {
 }
 
 
+/**
+ * `@mention` picker for a group composer: the members whose Sonar name starts
+ * with what is being typed after `@`.
+ *
+ * Mirrors [SlashHints] in shape and styling. [roster] is built by the caller
+ * from already-cached profiles only ([SonarAppState.mentionRoster]) so typing
+ * never kicks a relay fetch, and the whole strip disappears the moment the
+ * token stops looking like a mention.
+ */
+@Composable
+internal fun MentionHints(
+    roster: List<MentionCandidate>,
+    draft: String,
+    onPick: (String) -> Unit,
+) {
+    val s = sonar
+    val matches = remember(draft, roster) { Mentions.matches(draft, roster) }
+    if (matches.isEmpty()) return
+    Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
+        matches.forEach { candidate ->
+            val ambiguous = Mentions.needsSuffix(candidate, roster)
+            Row(
+                Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))
+                    .clickable { onPick(Mentions.applyPick(draft, candidate, roster)) }
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("@${candidate.name}", color = s.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(10.dp))
+                // Two members can share a display name; show the npub so the
+                // sender can tell which one they are about to mention.
+                Text(
+                    if (ambiguous) shortNpub(candidate.npub) else "",
+                    color = s.text3,
+                    fontSize = 13.sp,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun VerifySheet(
     peerName: String,
@@ -2600,6 +2658,8 @@ private fun MessageBubble(
     showState: Boolean = false,
     onRetry: (() -> Unit)? = null,
     maxBubbleWidth: Dp = Dp.Infinity,
+    mentions: MentionInfo = MentionInfo.EMPTY,
+    onMentionTap: ((String) -> Unit)? = null,
 ) {
     val s = sonar
     // Own bubble is cyan over BLE mesh, indigo over Nostr/internet (the design's
@@ -2613,9 +2673,12 @@ private fun MessageBubble(
     val preview = remember(m.content) { transcriptPreview(m.content) }
     var expanded by remember(m.id) { mutableStateOf(false) }
     val visibleText = if (expanded || !preview.truncated) m.content else preview.text
-    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s) {
+    // A mention of you is called out in the accent; mentions of other people
+    // stay in the link colour so they read as references, not alerts.
+    val mentionColor = if (mentions.mentionsMe && !m.mine) s.accent else linkColor
+    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s, mentions, mentionColor) {
         buildAnnotatedString {
-            append(linkify(visibleText, linkColor))
+            append(decorateMessage(visibleText, linkColor, mentions.mentions, mentionColor))
             // bc-meta: 10.5px time + transport glyph riding the last line.
             withStyle(SpanStyle(fontSize = 10.5.sp, color = metaColor)) { append(" " + timeLabel) }
             appendInlineContent(BUBBLE_META_ICON, "·")
@@ -2671,9 +2734,16 @@ private fun MessageBubble(
                                 if (up != null && !down.isConsumed) {
                                     val offset = textLayout?.getOffsetForPosition(down.position)
                                     offset?.let {
-                                        annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
+                                        val mention = annotated
+                                            .getStringAnnotations(MENTION_ANNOTATION_TAG, it, it)
                                             .firstOrNull()
-                                            ?.let { link -> uriHandler.openUri(link.item) }
+                                        if (mention != null && onMentionTap != null) {
+                                            onMentionTap(mention.item)
+                                        } else {
+                                            annotated.getStringAnnotations(URL_ANNOTATION_TAG, it, it)
+                                                .firstOrNull()
+                                                ?.let { link -> uriHandler.openUri(link.item) }
+                                        }
                                     }
                                 }
                             }
@@ -4438,6 +4508,42 @@ data class HereItem(val geohash: String, val name: String, val tier: String, val
 
 private val URL_REGEX = Regex("""(https?://|www\.)\S+""")
 private const val URL_ANNOTATION_TAG = "url"
+internal const val MENTION_ANNOTATION_TAG = "mention"
+
+/**
+ * [linkify], plus `@mention` spans styled and annotated so a tap can resolve
+ * them back to a group member.
+ *
+ * [spans] come from the Rust core (the single decoder of message content) and
+ * are already memoized per message by the caller — nothing here re-scans the
+ * text. A mention that names *you* gets the accent treatment so it is findable
+ * by eye in a busy group, which is the whole point of being mentioned.
+ *
+ * Mentions never overlap URLs in practice, but a URL match wins if they ever do:
+ * clobbering a link's tap target is worse than losing a highlight.
+ */
+private fun decorateMessage(
+    text: String,
+    linkColor: androidx.compose.ui.graphics.Color,
+    mentions: List<ResolvedMention>,
+    mentionColor: androidx.compose.ui.graphics.Color,
+) = androidx.compose.ui.text.buildAnnotatedString {
+    append(linkify(text, linkColor))
+    if (mentions.isEmpty()) return@buildAnnotatedString
+    val urlRanges = URL_REGEX.findAll(text).map { it.range.first..it.range.last }.toList()
+    for (mention in mentions) {
+        // Core hands back UTF-16 offsets, which are Kotlin String indices — but
+        // clamp anyway rather than risk an IndexOutOfBounds on a malformed row.
+        val start = mention.span.start.coerceIn(0, text.length)
+        val end = mention.span.end.coerceIn(start, text.length)
+        if (start == end) continue
+        if (urlRanges.any { start <= it.last && it.first < end }) continue
+        addStyle(SpanStyle(color = mentionColor, fontWeight = FontWeight.Bold), start, end)
+        // Only a mention that resolves to a real member is tappable; an
+        // unresolved one still highlights, it just goes nowhere.
+        mention.npub?.let { addStringAnnotation(MENTION_ANNOTATION_TAG, it, start, end) }
+    }
+}
 
 private fun linkify(text: String, linkColor: androidx.compose.ui.graphics.Color) =
     androidx.compose.ui.text.buildAnnotatedString {
