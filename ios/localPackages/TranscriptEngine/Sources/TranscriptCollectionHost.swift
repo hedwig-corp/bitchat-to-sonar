@@ -175,7 +175,11 @@ private struct TranscriptComposerRootView<Composer: View>: View {
 final class TranscriptCollectionHostViewController<Composer: View>: UIViewController,
     UICollectionViewDelegateFlowLayout
 {
-    private let collectionView: UICollectionView
+    /// Package-internal (not private) so the SPM layout tests can assert the
+    /// real resting geometry at this call site rather than re-deriving the
+    /// inset math in a helper — R-009 has regressed through the call site
+    /// before while every helper-level test stayed green.
+    let collectionView: UICollectionView
     private let flowLayout: UICollectionViewFlowLayout
     private let composerContainer = UIView()
     private let composerStore: TranscriptComposerRootStore<Composer>
@@ -207,6 +211,7 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
     private var latch = TranscriptTailPinLatch()
     private var snapCoalescer = TranscriptTailSnapCoalescer()
     private var lastBarHeight: CGFloat = 0
+    private var lastBoundsHeight: CGFloat = 0
     private var pendingContinuity: TranscriptContinuityToken?
     private var contentSizeObservation: NSKeyValueObservation?
     private var lastContentHeight: CGFloat = 0
@@ -315,6 +320,19 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             [weak self] scrollView, _ in
             guard let self else { return }
             let height = scrollView.contentSize.height
+            // The short-feed top inset is a function of content height, so it
+            // has to be re-derived on shrink as well as growth: a removed row
+            // re-opens the empty band, and the first measured contentSize after
+            // a snapshot must clear the inset computed while it was still 0.
+            // Only reachable states matter — a tall feed that already carries no
+            // top inset keeps the hot path (every snapshot apply) free of the
+            // composer `sizeThatFits` measure.
+            if self.collectionView.contentInset.top > 0
+                || height < self.collectionView.bounds.height
+                    - self.collectionView.adjustedContentInset.bottom
+            {
+                self.updateOwnedInsetsFromChrome()
+            }
             guard height > self.lastContentHeight + 0.5 else {
                 self.lastContentHeight = height
                 return
@@ -783,9 +801,22 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
             composerBottomYInViewport: composerBottomY,
             composerHeight: barHeight
         )
-        let insetChanged = abs(collectionView.contentInset.bottom - owned) > 0.5
+        let shortFeedTop = transcriptShortFeedTopContentInset(
+            collectionBoundsHeight: collectionView.bounds.height,
+            contentHeight: collectionView.contentSize.height,
+            bottomInset: owned
+        )
+        // A viewport SHRINK is a layout change even when the owned inset is
+        // unchanged: SwiftUI keyboard avoidance can shorten the host while the
+        // keyboard layout guide moves the composer by the same amount, and
+        // rotation / Slide Over resize the host outright. Gating the re-pin on
+        // the inset alone left the tail under the composer (R-009).
+        let boundsHeight = collectionView.bounds.height
+        let layoutChanged = abs(collectionView.contentInset.bottom - owned) > 0.5
+            || abs(collectionView.contentInset.top - shortFeedTop) > 0.5
             || abs(lastBarHeight - barHeight) > 0.5
-        guard insetChanged else { return }
+            || abs(lastBoundsHeight - boundsHeight) > 0.5
+        guard layoutChanged else { return }
 
         let near = isScrolledToBottom()
         let userScrolling = isUserScrolling
@@ -810,18 +841,40 @@ final class TranscriptCollectionHostViewController<Composer: View>: UIViewContro
         }
 
         var inset = collectionView.contentInset
-        inset.top = 0
+        inset.top = shortFeedTop
         inset.bottom = owned
         let oldOffset = collectionView.contentOffset
         let oldBottom = collectionView.adjustedContentInset.bottom
         UIView.performWithoutAnimation {
             collectionView.contentInset = inset
-            collectionView.scrollIndicatorInsets = inset
+            // The short-feed top inset exists to bottom-align content, not to
+            // advertise scrollable history — keep the indicator honest.
+            collectionView.scrollIndicatorInsets = UIEdgeInsets(
+                top: 0, left: inset.left, bottom: inset.bottom, right: inset.right
+            )
             collectionView.contentOffset = oldOffset
         }
         // Mark chrome applied only after inset is committed so
         // clearLiveEdgeOpenIfSettled cannot race a stale bottom inset.
         lastBarHeight = barHeight
+        lastBoundsHeight = boundsHeight
+
+        if shortFeedTop > 0 {
+            // A feed shorter than the viewport has exactly one resting offset,
+            // so pin/lockstep/ignore — which all describe where to sit INSIDE
+            // scrollable content — have nothing to choose between. Still respect
+            // an in-flight touch: a row can arrive mid rubber-band, and yanking
+            // the offset out from under a finger is the complaint this file has
+            // collected the most often. UIScrollView bounces back to the single
+            // valid offset on release, so nothing is stranded.
+            guard !userScrolling else { return }
+            collectionView.setContentOffset(
+                CGPoint(x: collectionView.contentOffset.x, y: -shortFeedTop),
+                animated: false
+            )
+            if needsLiveEdgeOpen { clearLiveEdgeOpenIfSettled() }
+            return
+        }
 
         let delta = owned - oldBottom
         switch captured.decision {

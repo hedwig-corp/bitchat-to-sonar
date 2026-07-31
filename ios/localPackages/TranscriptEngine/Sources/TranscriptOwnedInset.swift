@@ -34,6 +34,26 @@ public func transcriptOwnedBottomContentInset(
     return max(0, collectionBoundsHeight - composerTopY)
 }
 
+/// Top content inset that bottom-aligns a feed shorter than the viewport, so a
+/// two-message conversation opens with its last row resting on the composer
+/// instead of pinned to the top of an otherwise empty screen.
+///
+/// A `UICollectionView` cannot scroll content it does not have: with no top
+/// inset, `maxContentOffsetY` clamps to `-topInset` (0) and the transcript
+/// stays top-aligned with a viewport-sized empty band above the composer. The
+/// SwiftUI fallback (`SNMsgList`) gets this from `.defaultScrollAnchor(.bottom)`;
+/// the collection host has to inset for it.
+///
+/// Zero once the content is tall enough to fill the viewport, so it never
+/// perturbs the live edge of a real conversation.
+public func transcriptShortFeedTopContentInset(
+    collectionBoundsHeight: CGFloat,
+    contentHeight: CGFloat,
+    bottomInset: CGFloat
+) -> CGFloat {
+    max(0, collectionBoundsHeight - max(0, bottomInset) - max(0, contentHeight))
+}
+
 /// Gap between the composer bottom and the keyboard top when both SwiftUI
 /// keyboard avoidance and UIKit `keyboardLayoutGuide` own the same host.
 public func transcriptFloatingComposerGap(
