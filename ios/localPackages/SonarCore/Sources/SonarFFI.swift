@@ -1641,7 +1641,7 @@ public protocol SonarNodeProtocol: AnyObject, Sendable {
      *
      * Only reaches work running on an *installed* node. A connect still in
      * flight has no node to call this on — the host must pass a
-     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-030).
+     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-031).
      */
     func interruptForSuspend()
 
@@ -1982,7 +1982,7 @@ open class SonarNode: SonarNodeProtocol, @unchecked Sendable {
      * BEFORE this call and registered where the host's suspend hook can reach
      * it. Latching it aborts the connect at its next await point instead of
      * leaving SQLCipher open for the rest of the relay quorum wait,
-     * `subscribe_marmot` and `retry_outbox` — the R-030 0xdead10cc window,
+     * `subscribe_marmot` and `retry_outbox` — the R-031 0xdead10cc window,
      * which no post-hoc `interrupt_for_suspend()` can reach because the node
      * it lives on does not exist yet. On abort nothing is installed: the
      * half-built client (and its store handle) is dropped and the error
@@ -2516,7 +2516,7 @@ open func installStickerPack(coordinate: String)throws   {try rustCallWithError(
      *
      * Only reaches work running on an *installed* node. A connect still in
      * flight has no node to call this on — the host must pass a
-     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-030).
+     * [`SonarSuspendLatch`] to `connect` and latch that instead (R-031).
      */
 open func interruptForSuspend()  {try! rustCall() {
     uniffi_sonar_ffi_fn_method_sonarnode_interrupt_for_suspend(
@@ -3397,7 +3397,7 @@ public func FfiConverterTypeSonarNoise_lower(_ value: SonarNoise) -> UInt64 {
  * `retry_outbox`; a connect still in flight when iOS suspends therefore holds
  * the store open with no node to call `interrupt_for_suspend()` on, and the
  * close queues behind it until RunningBoard kills the process with
- * 0xdead10cc (`docs/REGRESSIONS.md`, R-030). Passing a latch into `connect`
+ * 0xdead10cc (`docs/REGRESSIONS.md`, R-031). Passing a latch into `connect`
  * closes that window: the host latches it from its scene-phase suspend hook
  * and the connect drops its future at the next await point.
  *
@@ -3423,7 +3423,7 @@ public protocol SonarSuspendLatchProtocol: AnyObject, Sendable {
  * `retry_outbox`; a connect still in flight when iOS suspends therefore holds
  * the store open with no node to call `interrupt_for_suspend()` on, and the
  * close queues behind it until RunningBoard kills the process with
- * 0xdead10cc (`docs/REGRESSIONS.md`, R-030). Passing a latch into `connect`
+ * 0xdead10cc (`docs/REGRESSIONS.md`, R-031). Passing a latch into `connect`
  * closes that window: the host latches it from its scene-phase suspend hook
  * and the connect drops its future at the next await point.
  *
@@ -9036,7 +9036,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_method_sonarnode_install_sticker_pack() != 11109) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 30457) {
+    if (uniffi_sonar_ffi_checksum_method_sonarnode_interrupt_for_suspend() != 13250) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_method_sonarnode_leave_group() != 44174) {
@@ -9207,7 +9207,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sonar_ffi_checksum_constructor_sonaridentity_import() != 46969) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 46888) {
+    if (uniffi_sonar_ffi_checksum_constructor_sonarnode_connect() != 54721) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sonar_ffi_checksum_constructor_sonarnoise_initiator() != 18155) {

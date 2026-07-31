@@ -545,7 +545,7 @@ final class MarmotService: @unchecked Sendable {
             #endif
             let node: SonarNode
             do {
-                // Deliberately NOT latched — see R-030 for the full trade. With
+                // Deliberately NOT latched — see R-031 for the full trade. With
                 // no relays there is nothing to await, so a latch could not
                 // abort anything here; it could only *refuse to start*, one
                 // checkpoint later than the `nodeClosing` guard above. That
@@ -2241,7 +2241,7 @@ final class MarmotService: @unchecked Sendable {
     /// `MarmotChatView.connectRelaysIfNeeded`, a flag in another file that no
     /// test pins. With one slot, a second connect registering would orphan the
     /// first connect's latch while its `SonarNode.connect` still held SQLCipher
-    /// open, and the orphan is unreachable forever after: that is R-030 again,
+    /// open, and the orphan is unreachable forever after: that is R-031 again,
     /// reintroduced by the fix for it. Holding every in-flight latch keeps the
     /// invariant inside this file instead of depending on a caller's flag.
     private var pendingConnectLatches: [SonarSuspendLatch] = []
