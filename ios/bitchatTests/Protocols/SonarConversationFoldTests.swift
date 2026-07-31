@@ -309,4 +309,89 @@ struct SonarConversationFoldTests {
         #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
         #expect(!keys.contains(String(repeating: "ab", count: 32)))
     }
+
+    /// Reading the chat must clear the dot the chat list took from that same
+    /// bucket. `SonarAppStore.markMeshConversationRead` feeds
+    /// `markPrivateMessagesAsRead(fromKeys:)` the `snMeshPrivateChatKeys` set;
+    /// this pins the ChatViewModel half of that contract against a real view
+    /// model with no live `unifiedPeerService` entry (peer out of BLE range).
+    @Test @MainActor
+    func openingTheChatClearsUnreadFromTheOutOfRangeInternetDmBucket() {
+        let viewModel = Self.makeFoldTestViewModel()
+        let shortPeer = PeerID(str: Self.saraShortId)
+        let noiseKeyPeer = PeerID(str: Self.saraNoiseKeyHex)
+        defer {
+            viewModel.privateChats[shortPeer] = nil
+            viewModel.privateChats[noiseKeyPeer] = nil
+            viewModel.unreadPrivateMessages.remove(shortPeer)
+            viewModel.unreadPrivateMessages.remove(noiseKeyPeer)
+        }
+
+        // Sara replied over the internet while out of range: the row lands in
+        // her 64-hex Noise-key bucket and is marked unread under that key.
+        viewModel.privateChats[noiseKeyPeer] = [meshRow("m1", "Yoooo 🐍", at: 200)]
+        viewModel.unreadPrivateMessages.insert(noiseKeyPeer)
+
+        // What opening used to do: mark only the conversation's row id. Out of
+        // range nothing resolves the peer's Noise-key form, so the dot stayed.
+        // This line documents WHY the key set exists — if the single-key path
+        // ever grows a durable (favorites-backed) Noise-key resolution, delete
+        // it rather than working around it.
+        viewModel.markPrivateMessagesAsRead(from: shortPeer)
+        #expect(viewModel.unreadPrivateMessages.contains(noiseKeyPeer))
+
+        viewModel.markPrivateMessagesAsRead(
+            fromKeys: snMeshPrivateChatKeys(
+                aliases: [Self.saraShortId],
+                noiseKeyHexByPeerKey: [Self.saraShortId: [Self.saraNoiseKeyHex]]
+            ).map { PeerID(str: $0) }
+        )
+        #expect(!viewModel.unreadPrivateMessages.contains(noiseKeyPeer))
+        #expect(!viewModel.unreadPrivateMessages.contains(shortPeer))
+    }
+
+    /// Marking one conversation read must not reach into another person's
+    /// bucket — the key set is per-conversation, not a global sweep.
+    @Test @MainActor
+    func markingOneConversationReadLeavesAnotherPeersBucketUnread() {
+        let viewModel = Self.makeFoldTestViewModel()
+        let vincenzoNoiseKeyHex = String(repeating: "ab", count: 32)
+        let vincenzoPeer = PeerID(str: vincenzoNoiseKeyHex)
+        let noiseKeyPeer = PeerID(str: Self.saraNoiseKeyHex)
+        defer {
+            viewModel.privateChats[vincenzoPeer] = nil
+            viewModel.privateChats[noiseKeyPeer] = nil
+            viewModel.unreadPrivateMessages.remove(vincenzoPeer)
+            viewModel.unreadPrivateMessages.remove(noiseKeyPeer)
+        }
+
+        viewModel.privateChats[noiseKeyPeer] = [meshRow("m1", "Yoooo 🐍", at: 200)]
+        viewModel.privateChats[vincenzoPeer] = [meshRow("m2", "👀", at: 300)]
+        viewModel.unreadPrivateMessages.insert(noiseKeyPeer)
+        viewModel.unreadPrivateMessages.insert(vincenzoPeer)
+
+        viewModel.markPrivateMessagesAsRead(
+            fromKeys: snMeshPrivateChatKeys(
+                aliases: [Self.saraShortId],
+                noiseKeyHexByPeerKey: [
+                    Self.saraShortId: [Self.saraNoiseKeyHex],
+                    "abef0238b73563e6": [vincenzoNoiseKeyHex],
+                ]
+            ).map { PeerID(str: $0) }
+        )
+
+        #expect(!viewModel.unreadPrivateMessages.contains(noiseKeyPeer))
+        #expect(viewModel.unreadPrivateMessages.contains(vincenzoPeer))
+    }
+
+    @MainActor
+    private static func makeFoldTestViewModel() -> ChatViewModel {
+        let keychain = MockKeychain()
+        return ChatViewModel(
+            keychain: keychain,
+            idBridge: NostrIdentityBridge(keychain: MockKeychainHelper()),
+            identityManager: MockIdentityManager(keychain),
+            transport: MockTransport()
+        )
+    }
 }

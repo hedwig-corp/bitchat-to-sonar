@@ -3797,6 +3797,22 @@ final class SonarAppStore: ObservableObject {
         )
     }
 
+    /// Mark the mesh side of this conversation read over the SAME bucket set the
+    /// transcript renders from.
+    ///
+    /// `chatViewModel.startPrivateChat(with:)` only ever marked the row id, and
+    /// `openedDM` only called it for conversations with no Marmot group — so a
+    /// Sonar chat with a White Noise leg ran no mesh read-marking at all. Either
+    /// way the 64-hex Noise-key bucket an out-of-range internet DM lands in
+    /// (`snMeshPrivateChatKeys`) stayed unread, and `dmRows` folds that bucket
+    /// into the visible row, so its blue dot survived reading the message.
+    private func markMeshConversationRead(_ id: String) {
+        let keys = meshPrivateChatKeys(forConversationId: id)
+            .map { PeerID(str: $0) }
+        guard !keys.isEmpty else { return }
+        chatViewModel.markPrivateMessagesAsRead(fromKeys: keys)
+    }
+
     /// Unique mesh message count across every bucket of this conversation — no
     /// sort / no full array alloc, and O(1) while only one bucket is populated.
     private func meshPrivateMessageCount(forConversationId id: String) -> Int {
@@ -7537,6 +7553,10 @@ final class SonarAppStore: ObservableObject {
         // Bind badge suppression as soon as the DM is considered open — even
         // when navigation used a custom `present` path that skipped `push`.
         syncViewingUnreadGroups()
+        // Mesh read-marking runs for EVERY chat kind, before the Marmot-shaped
+        // early returns below: a folded Sonar chat has a White Noise leg AND
+        // mesh buckets, and only the Marmot leg was being marked read.
+        markMeshConversationRead(id)
         if let pendingNpub = pendingMarmotNpub(for: id) {
             marmot.connectIfNeeded()
             marmot.ensureProfile(pendingNpub)
@@ -7663,6 +7683,12 @@ final class SonarAppStore: ObservableObject {
     }
 
     func closedDM(_ id: String) {
+        // A message that arrives while the chat is open can still land unread:
+        // the mesh "am I viewing this?" check keys off
+        // `selectedPrivateChatPeer`, which a folded Sonar chat never sets (see
+        // `openedDM`). Leaving the chat closes that window instead of parking a
+        // dot on a conversation the user just read.
+        markMeshConversationRead(id)
         // Keep ConversationViewState for Signal-style reopen paint (Compose
         // retainedTranscriptByChat). Wipe/erase clears the map. Unsubscribe
         // from store invalidation would still rebuild — acceptable for smoke;

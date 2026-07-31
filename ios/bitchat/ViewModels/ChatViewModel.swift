@@ -1854,6 +1854,28 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         }
     }
     
+    /// Mark ONE conversation read across every `privateChats` bucket that can
+    /// hold its rows.
+    ///
+    /// `markPrivateMessagesAsRead(from:)` clears the bucket it is handed, plus
+    /// the peer's stable Noise key ONLY while `unifiedPeerService` resolves the
+    /// peer — i.e. while it is live over BLE. An internet (NIP-17) DM that
+    /// arrived out of range is stored, and marked unread, under the sender's
+    /// 64-hex Noise public key (`ChatViewModel+Nostr.processNostrMessage`), so
+    /// nothing cleared that key and the chat row kept its dot after the user
+    /// read the message.
+    ///
+    /// The caller owns the bucket set — `SonarAppStore.meshPrivateChatKeys`,
+    /// the same keys the transcript reads. Do NOT re-derive it here: a second
+    /// resolver is how the two halves drift apart (docs/CHAT-TYPES.md, id
+    /// shape 6).
+    @MainActor
+    func markPrivateMessagesAsRead(fromKeys keys: [PeerID]) {
+        for key in keys {
+            markPrivateMessagesAsRead(from: key)
+        }
+    }
+
     @MainActor
     func getPrivateChatMessages(for peerID: PeerID) -> [BitchatMessage] {
         var combined: [BitchatMessage] = []

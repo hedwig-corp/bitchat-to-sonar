@@ -199,6 +199,31 @@ Read-marking itself is symmetric with the resolver: `openChat` marks
 add state keyed "per conversation", clear/capture it over the **same group set**
 the read-marking uses, or the two will disagree for one of the two chat kinds.
 
+**A folded chat has two unread stores, and both must be marked.** The Marmot
+leg's counter lives in the core conversation index (`markConversationRead` +
+`setViewingUnreadGroups`); the mesh leg's lives in
+`ChatViewModel.unreadPrivateMessages`, keyed by `privateChats` bucket. Marking
+one is not marking the conversation. Two shapes of that mistake shipped
+together on Apple:
+
+- `openedDM` called `chatViewModel.startPrivateChat(with:)` **only** when the
+  conversation had no Marmot group, so a Sonar chat with a White Noise leg ran
+  no mesh read-marking at all.
+- `markPrivateMessagesAsRead(from:)` clears the bucket it is handed plus the
+  peer's stable Noise key, and only resolves that second key through
+  `unifiedPeerService` — i.e. while the peer is live over BLE. The bucket an
+  out-of-range internet DM lands in (id shape 6 above) was therefore never
+  cleared, while `dmRows` folded it into the visible row and kept its dot.
+
+So mesh read-marking runs over `meshPrivateChatKeys(forConversationId:)` — the
+same bucket set the transcript reads — via
+`SonarAppStore.markMeshConversationRead`, on **every** chat kind. It also runs
+on `closedDM`, because the mesh "am I viewing this?" test keys off
+`selectedPrivateChatPeer`, which a folded chat deliberately never sets: without
+it, a message arriving while the chat is open parks a dot the moment you leave.
+Compose is unaffected — `drainDirectDms` keys mesh DMs by mesh peer id, so its
+unread map has no unreachable bucket.
+
 ## Checklist for touching conversation code
 
 1. **Which id do I hold?** If it can be a `mesh:` route id, resolve through
