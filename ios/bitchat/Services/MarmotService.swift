@@ -540,16 +540,23 @@ final class MarmotService: @unchecked Sendable {
             }
             let (dbPath, dbKeyHex) = try Self.databaseConfig()
             SonarDiagnostics.installCoreLoggingIfNeeded()
-            #if os(iOS)
-            let storeLockHold = try service.prepareStoreLockForConnectSync()
-            #endif
             // Latched for the same reason as `connect()`, and it is reachable
             // here despite this running on the serial `workQueue`: the close
             // calls `interruptNodeForSuspend()` OFF-queue, before its first hop.
             // A relay-less connect skips the quorum wait but still awaits
             // `subscribe_marmot` and `retry_outbox` inside the constructor.
+            //
+            // Registered BEFORE the store lock, and the order is load-bearing:
+            // this throws `.cancelled` when a close fenced us, and the `catch`
+            // that abandons the hold is further down. Acquiring the flock first
+            // would leak it on exactly that throw — a held App Group flock with
+            // no open handle is its own 0xdead10cc ingredient. `connect()`
+            // orders these the same way.
             let connectLatch = try service.registerPendingConnectLatch()
             defer { service.clearPendingConnectLatch(connectLatch) }
+            #if os(iOS)
+            let storeLockHold = try service.prepareStoreLockForConnectSync()
+            #endif
             let node: SonarNode
             do {
                 node = try SonarNode.connect(
@@ -1499,10 +1506,10 @@ final class MarmotService: @unchecked Sendable {
         nodeLock.lock()
         nodeClosing = true
         let liveNode = node
-        let pendingLatch = pendingConnectLatch
+        let pendingLatches = pendingConnectLatches
         nodeLock.unlock()
         liveNode?.interruptForSuspend()
-        pendingLatch?.interrupt()
+        pendingLatches.forEach { $0.interrupt() }
     }
 
     /// Panic-wipe: drop the open node, erase the encrypted database (and its
@@ -1533,9 +1540,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.nodeClosing = true
             let removedNode = service.node
-            // Not cleared: the connect that registered it owns that. Latching a
-            // stale one is harmless (it is one-way and its connect is gone).
-            let pendingLatch = service.pendingConnectLatch
+            // Not cleared: the connect that registered each one owns that.
+            // Latching a stale entry is harmless — they are one-way and their
+            // connect is gone.
+            let pendingLatches = service.pendingConnectLatches
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1549,7 +1557,7 @@ final class MarmotService: @unchecked Sendable {
             // would otherwise leave a live, un-latched node whose blocking FFI
             // keeps the SQLCipher handle open past this close. Idempotent.
             removedNode?.interruptForSuspend()
-            pendingLatch?.interrupt()
+            pendingLatches.forEach { $0.interrupt() }
             service.setIdentity(nil)
             return ()
         }
@@ -1608,9 +1616,10 @@ final class MarmotService: @unchecked Sendable {
             service.nodeLock.lock()
             service.nodeClosing = true
             let removedNode = service.node
-            // Not cleared: the connect that registered it owns that. Latching a
-            // stale one is harmless (it is one-way and its connect is gone).
-            let pendingLatch = service.pendingConnectLatch
+            // Not cleared: the connect that registered each one owns that.
+            // Latching a stale entry is harmless — they are one-way and their
+            // connect is gone.
+            let pendingLatches = service.pendingConnectLatches
             service.node = nil
             service.relayConnected = false
             #if os(iOS)
@@ -1624,7 +1633,7 @@ final class MarmotService: @unchecked Sendable {
             // would otherwise leave a live, un-latched node whose blocking FFI
             // keeps the SQLCipher handle open past this close. Idempotent.
             removedNode?.interruptForSuspend()
-            pendingLatch?.interrupt()
+            pendingLatches.forEach { $0.interrupt() }
             return ()
         }
         await withCheckedContinuation { continuation in
@@ -2229,9 +2238,18 @@ final class MarmotService: @unchecked Sendable {
     /// connect returns on its own. On TestFlight 1.12.3 (31) it did not, and
     /// RunningBoard killed the process 0xdead10cc (R-031). This holds the latch
     /// the connect was handed, so the suspend hook can abort it in flight.
-    /// Guarded by `nodeLock`; owned and cleared by the connect that registered
-    /// it, never by the close.
-    private var pendingConnectLatch: SonarSuspendLatch?
+    /// Guarded by `nodeLock`; each entry is owned and removed by the connect
+    /// that registered it, never by the close.
+    ///
+    /// A **collection**, not one optional, and that is load-bearing. `connect()`
+    /// has no single-flight guard of its own — it relies on `relayBusy` in
+    /// `MarmotChatView.connectRelaysIfNeeded`, a flag in another file that no
+    /// test pins. With one slot, a second connect registering would orphan the
+    /// first connect's latch while its `SonarNode.connect` still held SQLCipher
+    /// open, and the orphan is unreachable forever after: that is R-030 again,
+    /// reintroduced by the fix for it. Holding every in-flight latch keeps the
+    /// invariant inside this file instead of depending on a caller's flag.
+    private var pendingConnectLatches: [SonarSuspendLatch] = []
 
     /// Register a latch for a connect that is about to open the store, atomically
     /// with the close fence: either this sees `nodeClosing` and the connect never
@@ -2242,18 +2260,17 @@ final class MarmotService: @unchecked Sendable {
         nodeLock.lock()
         defer { nodeLock.unlock() }
         guard !nodeClosing else { throw ServiceError.cancelled }
-        pendingConnectLatch = latch
+        pendingConnectLatches.append(latch)
         return latch
     }
 
-    /// Identity comparison, not just `!= nil`: a later connect may already have
-    /// registered its own latch by the time this one unwinds, and clearing that
-    /// would leave the live connect unlatchable.
+    /// Identity comparison, not `removeAll()`: a concurrent connect may have
+    /// registered its own latch by the time this one unwinds, and dropping that
+    /// would leave the live connect unlatchable — the hazard this list exists
+    /// to remove.
     private func clearPendingConnectLatch(_ latch: SonarSuspendLatch) {
         nodeLock.lock()
-        if pendingConnectLatch === latch {
-            pendingConnectLatch = nil
-        }
+        pendingConnectLatches.removeAll { $0 === latch }
         nodeLock.unlock()
     }
 

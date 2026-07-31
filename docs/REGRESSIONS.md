@@ -1804,6 +1804,36 @@ That window was theoretical while connects failed rarely and never at a
 correlated moment. Latching them makes "connect fails exactly as we suspend" the
 **common** case, so the fix would have manufactured its own next round.
 
+**Two ordering rules the review pass extracted, both load-bearing.** The first
+draft of this fix got each wrong, and each failure mode is a fresh instance of
+the crash it fixes:
+
+1. *The pending-latch registry is a list, not one optional.* `connect()` has no
+   single-flight guard of its own — it depends on `relayBusy` in
+   `MarmotChatView.connectRelaysIfNeeded`, a flag in another file that no test
+   pins (the R-001 shape). With a single slot, a second connect registering
+   orphans the first connect's latch while its `SonarNode.connect` still holds
+   SQLCipher open, and nothing can ever reach that orphan again. Holding every
+   in-flight latch keeps the invariant inside `MarmotService` rather than
+   resting on a caller's flag.
+2. *Register the latch BEFORE acquiring the store lock, on both paths.*
+   `registerPendingConnectLatch()` throws `.cancelled` when a close has fenced
+   us, and the `catch` that calls `abandonStoreLockHold` sits below it. Taking
+   the flock first leaks it on exactly that throw — and a held App Group flock
+   with no open handle is its own 0xdead10cc ingredient, since RunningBoard
+   kills for the *lock*, not for the handle. `connectLocal` had this inverted.
+
+**Why an install can never carry an already-fired latch** — the obvious next
+worry, and it is closed by construction rather than by timing.
+`interruptNodeForSuspend()` sets `nodeClosing` and snapshots the latch list in
+**one** `nodeLock` hold, and the install checks `nodeClosing` under that same
+lock before assigning `service.node`. So either the latch fired first and the
+install bails (the node is dropped, closing its handle), or the install won and
+the node is reached by the ordinary `liveNode?.interruptForSuspend()` line. The
+`nodeClosing` clear that would reopen the gap cannot overtake the install
+either: it lives below `closeNode`'s `nodeLifecycleGroup.notify`, and the
+connect holds its lease until after the install.
+
 **What the latch cannot do, stated honestly:** a dropped future stops at an
 *await* point, so the abort covers the relay quorum wait, `subscribe_marmot` and
 `retry_outbox` — the unbounded, network-shaped part, and the part the crash log
@@ -1818,6 +1848,8 @@ awaits are short: with the latch already set, `biased` select means the store is
 never opened at all.
 
 **Call sites:** iOS `MarmotService.connect` (lease + latch registration),
+`MarmotService.pendingConnectLatches` / `registerPendingConnectLatch` /
+`clearPendingConnectLatch` (the registry),
 `MarmotService.connectLocal`, `MarmotService.connectNode`,
 `MarmotService.interruptNodeForSuspend` (the flip), and the `closeNode` /
 `wipeDatabase` hops (belt-and-braces flip); core

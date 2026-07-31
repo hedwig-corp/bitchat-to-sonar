@@ -83,18 +83,21 @@ directives to the Xcode consumer.
 Generated into `localPackages/SonarCore/Sources/SonarFFI.swift`:
 
 ```swift
+// The latch must be created and STORED before the call — the constructor holds
+// SQLCipher open across the relay waits and there is no node yet to interrupt
+// (docs/REGRESSIONS.md, R-031), so the suspend hook needs its own reference.
+// Passing a temporary here would compile and abort nothing.
+let latch = SonarSuspendLatch()
+self.pendingConnectLatches.append(latch)   // read by the scene-phase suspend hook
+
 // Connect with a persistent, encrypted store.
 let node = try SonarNode.connect(
     identity: identity,            // SonarIdentity
     relayUrls: ["wss://relay…"],   // [String]
     dbPath: "<Application Support>/sonar-marmot/marmot.sqlite",  // String
     dbKeyHex: "<64-char hex of the 32-byte Keychain key>",       // String
-    // Register this BEFORE the call, where the suspend hook can reach it: the
-    // constructor holds SQLCipher open across the relay waits and there is no
-    // node yet to interrupt (docs/REGRESSIONS.md, R-031). `nil` on hosts with
-    // no suspend deadline.
-    suspendLatch: SonarSuspendLatch()                            // SonarSuspendLatch?
-)
+    suspendLatch: latch            // SonarSuspendLatch? — nil on hosts with no
+)                                  //   suspend deadline (Android/desktop)
 
 // Panic-wipe: drop the node first, then erase the DB, then clear the Keychain key.
 try wipeMarmotDatabase(dbPath: "<…>/marmot.sqlite")
