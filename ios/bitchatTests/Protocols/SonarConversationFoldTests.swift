@@ -226,16 +226,16 @@ struct SonarConversationFoldTests {
 
     // MARK: Internet DM buckets (docs/CHAT-TYPES.md — id shape 6)
 
-    /// Sara's real shape: the alias set is the canonical 16-hex short id, but
-    /// her internet reply is stored under her 64-hex Noise public key because
-    /// she was out of BLE range when it arrived.
-    private static let saraShortId = "f3237e63eb468722"
-    private static let saraNoiseKeyHex =
-        "83091c3ca8de95eb6d944787c1a845a2c5216250149360841604482e50016675"
+    /// The real shape from the bug report: the alias set is the canonical
+    /// 16-hex short id, but the peer's internet reply is stored under their
+    /// 64-hex Noise public key because they were out of BLE range.
+    private static let peerShortId = "630dcd2966c43366"
+    private static let peerNoiseKeyHex =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
 
-    /// Real `PeerID(publicKey:)`: short id = sha256(noise key)[0..<16].
-    /// `sha256(saraNoiseKeyHex) == f3237e63eb468722b197…`, so these two
-    /// constants are the same peer in her two 64-hex shapes.
+    /// Synthetic key material, not a real contact's: the test only needs
+    /// `sha256(noiseKeyHex)[0..<16] == shortId` to hold, which any 32 bytes
+    /// give. `PeerID(publicKey:)` does that derivation for real.
     private static let shortIdForNoiseKeyHex: (String) -> String? = { hex in
         Data(hexString: hex).map { PeerID(publicKey: $0).bare }
     }
@@ -248,7 +248,7 @@ struct SonarConversationFoldTests {
     ) -> BitchatMessage {
         BitchatMessage(
             id: id,
-            sender: "Sara D",
+            sender: "Peer",
             content: text,
             timestamp: Date(timeIntervalSince1970: secs),
             isRelay: false,
@@ -257,12 +257,12 @@ struct SonarConversationFoldTests {
         )
     }
 
-    private func saraKeys(bucketKeys: [String]) -> [String] {
+    private func peerKeys(bucketKeys: [String]) -> [String] {
         snMeshPrivateChatKeys(
-            aliases: [Self.saraShortId],
+            aliases: [Self.peerShortId],
             noiseKeyBuckets: snMeshNoiseKeyBuckets(
                 bucketKeys: bucketKeys,
-                aliases: [Self.saraShortId],
+                aliases: [Self.peerShortId],
                 shortIdForNoiseKeyHex: Self.shortIdForNoiseKeyHex
             )
         )
@@ -272,13 +272,13 @@ struct SonarConversationFoldTests {
     func outOfRangeInternetDmBucketIsPartOfTheTranscript() {
         // Derived from the live bucket keys, not from favorites: unfavouriting
         // the peer must not hide her transcript again.
-        let keys = saraKeys(bucketKeys: [Self.saraShortId, Self.saraNoiseKeyHex])
-        #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
 
         // Only the Noise-key bucket holds the newest row — exactly what the
         // chat-list preview showed while the transcript stayed a message behind.
         let buckets: [String: [BitchatMessage]] = [
-            Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo 🐍", at: 200)],
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply over the internet", at: 200)],
         ]
         let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
         #expect(merged.map(\.id) == ["m1"])
@@ -289,13 +289,13 @@ struct SonarConversationFoldTests {
     func fingerprintShapedBucketAlsoResolves() {
         // The other 64-hex shape: the fingerprint, whose first 16 hex ARE the
         // short id. `MessageStore` holds real buckets in both shapes.
-        let fingerprint = Self.saraShortId + String(repeating: "0", count: 48)
-        let keys = saraKeys(bucketKeys: [Self.saraShortId, fingerprint])
-        #expect(keys == [Self.saraShortId, fingerprint])
+        let fingerprint = Self.peerShortId + String(repeating: "0", count: 48)
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, fingerprint])
+        #expect(keys == [Self.peerShortId, fingerprint])
         // Key presence is not readability: assert the merge actually reaches
         // that bucket in the exact string form the key list carries.
         let buckets: [String: [BitchatMessage]] = [
-            fingerprint: [meshRow("m1", "Yoooo 🐍", at: 200)],
+            fingerprint: [meshRow("m1", "reply over the internet", at: 200)],
         ]
         #expect(snMergeMeshPrivateChats(keys: keys) { buckets[$0] }.map(\.id) == ["m1"])
     }
@@ -317,13 +317,13 @@ struct SonarConversationFoldTests {
     func mirroredRowIsNotRenderedTwice() {
         // `mirrorToEphemeralIfNeeded` copies the row onto the short id once the
         // peer is live again, so both buckets can hold the same message id.
-        let keys = saraKeys(bucketKeys: [Self.saraShortId, Self.saraNoiseKeyHex])
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
         let buckets: [String: [BitchatMessage]] = [
-            Self.saraShortId: [
+            Self.peerShortId: [
                 meshRow("m0", "Y", at: 100),
-                meshRow("m1", "Yoooo 🐍", at: 200),
+                meshRow("m1", "reply over the internet", at: 200),
             ],
-            Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo 🐍", at: 200)],
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply over the internet", at: 200)],
         ]
         let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
         #expect(merged.map(\.id) == ["m0", "m1"])
@@ -335,13 +335,13 @@ struct SonarConversationFoldTests {
         // Several send paths update delivery status on ONE bucket only, so the
         // two copies of a mirrored row can diverge. The alias bucket — the one
         // `sendPrivateMessage` appends to and marks `.sent` — must win.
-        let keys = saraKeys(bucketKeys: [Self.saraShortId, Self.saraNoiseKeyHex])
+        let keys = peerKeys(bucketKeys: [Self.peerShortId, Self.peerNoiseKeyHex])
         let buckets: [String: [BitchatMessage]] = [
-            Self.saraShortId: [
+            Self.peerShortId: [
                 meshRow("m0", "Y", at: 100),
-                meshRow("m1", "Yoooo", at: 200, status: .sent),
+                meshRow("m1", "reply", at: 200, status: .sent),
             ],
-            Self.saraNoiseKeyHex: [meshRow("m1", "Yoooo", at: 200, status: .sending)],
+            Self.peerNoiseKeyHex: [meshRow("m1", "reply", at: 200, status: .sending)],
         ]
         let merged = snMergeMeshPrivateChats(keys: keys) { buckets[$0] }
         // The losing copy must be dropped, not merely ordered behind: exactly
@@ -355,23 +355,23 @@ struct SonarConversationFoldTests {
     func unlinkedConversationKeepsSingleBucketReturn() {
         // No Noise-key bucket ⇒ single key; the single-bucket path must stay
         // identity-preserving (no re-sort, no dedup pass).
-        let keys = saraKeys(bucketKeys: [Self.saraShortId])
-        #expect(keys == [Self.saraShortId])
-        let rows = [meshRow("m0", "Y", at: 100), meshRow("m1", "Yoooo 🐍", at: 200)]
-        let merged = snMergeMeshPrivateChats(keys: keys) { $0 == Self.saraShortId ? rows : nil }
+        let keys = peerKeys(bucketKeys: [Self.peerShortId])
+        #expect(keys == [Self.peerShortId])
+        let rows = [meshRow("m0", "Y", at: 100), meshRow("m1", "reply over the internet", at: 200)]
+        let merged = snMergeMeshPrivateChats(keys: keys) { $0 == Self.peerShortId ? rows : nil }
         #expect(merged.map(\.id) == ["m0", "m1"])
     }
 
     @Test
     func anotherPeersNoiseKeyNeverJoinsTheTranscript() {
         let vincenzoNoiseKeyHex = String(repeating: "ab", count: 32)
-        let keys = saraKeys(bucketKeys: [
-            Self.saraShortId,
-            Self.saraNoiseKeyHex,
+        let keys = peerKeys(bucketKeys: [
+            Self.peerShortId,
+            Self.peerNoiseKeyHex,
             vincenzoNoiseKeyHex,
             "abef0238b73563e6",
         ])
-        #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
         #expect(!keys.contains(vincenzoNoiseKeyHex))
     }
 
@@ -380,11 +380,11 @@ struct SonarConversationFoldTests {
         // A geohash/name-shaped 64-char key is not a Noise key, and an alias
         // already in the key list must not be appended a second time.
         let buckets = [
-            Self.saraShortId,
-            Self.saraNoiseKeyHex.uppercased(),
+            Self.peerShortId,
+            Self.peerNoiseKeyHex.uppercased(),
             String(repeating: "z", count: 64),
         ]
-        let keys = saraKeys(bucketKeys: buckets)
-        #expect(keys == [Self.saraShortId, Self.saraNoiseKeyHex])
+        let keys = peerKeys(bucketKeys: buckets)
+        #expect(keys == [Self.peerShortId, Self.peerNoiseKeyHex])
     }
 }
