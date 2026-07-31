@@ -777,6 +777,17 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // The 15-min auto-backup loop is the round-7 0xdead10cc reopen engine:
+        // BLE keeps this process alive for hours in background, a tick lands
+        // there, `runAutoBackupIfDue`'s deferral guard only checks `.active`,
+        // and `backupAccount()` ends with the store REOPENED (seal ->
+        // performConnect + relays + polling) with no close scheduled — iOS then
+        // suspends us holding SQLCipher. Background backups belong to the
+        // opportunistic/BGTask executors, which hold background-task assertions
+        // and close after themselves. Foreground resume re-arms the loop via
+        // performConnect -> scheduleAutoBackupCheck.
+        autoBackupTask?.cancel()
+        autoBackupTask = nil
         let box = SNBackgroundTaskBox()
         box.set(
             UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
@@ -817,6 +828,14 @@ final class MarmotChatModel: ObservableObject {
         syncTask = nil
         relayConnectTask?.cancel()
         relayConnectTask = nil
+        // The wake's ensureConnected() -> performConnect also re-armed the
+        // 15-min auto-backup loop (45s delay). Left running, its next tick
+        // reopens the store while still backgrounded — the round-7 0xdead10cc
+        // shape suspendStoreForBackground() documents. A tick may be cancelling
+        // ITSELF here (it closes the store it reopened via this method); that
+        // just ends its loop, which is the point. Foreground re-arms it.
+        autoBackupTask?.cancel()
+        autoBackupTask = nil
         // Hold a background task across the close, exactly like
         // `suspendStoreForBackground()`. The push wake abandons its wait on this
         // call once its deadline expires so it can return the fetch completion
@@ -994,13 +1013,55 @@ final class MarmotChatModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: UInt64(delaySeconds * 1_000_000_000))
             }
             guard !Task.isCancelled else { return }
-            await runAutoBackupIfDue()
+            await runAutoBackupTimerTick()
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 15 * 60 * 1_000_000_000)
                 guard !Task.isCancelled else { return }
-                await runAutoBackupIfDue()
+                await runAutoBackupTimerTick()
             }
         }
+    }
+
+    /// One tick of the in-app 15-min loop. The loop is a FOREGROUND courtesy —
+    /// background backups belong to the opportunistic/BGTask executors, which
+    /// hold `beginBackgroundTask` assertions and close the store they reopen.
+    /// This tick has neither, and on TestFlight 1.12.7 (36) one landed on a
+    /// BLE-kept-alive backgrounded process: `runAutoBackupIfDue`'s deferral
+    /// guard only checks `.active`, the backup sealed, REOPENED the store
+    /// (`performConnect` + relays + polling) and uploaded, nobody closed, and
+    /// RunningBoard killed us 0xdead10cc (round 7).
+    ///
+    /// Two layers on top of the suspend-path cancel, because cancellation
+    /// cannot stop a tick already past its checks:
+    /// 1. never START a backup while `.background` — no assertion, so iOS may
+    ///    suspend us mid-seal even if we would close after;
+    /// 2. a run that STARTED `.active`/`.inactive` and finished backgrounded
+    ///    closes the store it reopened, mirroring
+    ///    `AutoBackupBackgroundScheduler.closeStoreIfStillBackgrounded` — the
+    ///    same one-directional `ran` gate, the same detached foreground-race
+    ///    reconnect (see that method for why detached and ungated).
+    private func runAutoBackupTimerTick() async {
+        #if os(iOS)
+        guard UIApplication.shared.applicationState != .background else {
+            SecureLogger.info(
+                "Auto-backup timer: skipped while backgrounded — background executors own it",
+                category: .session
+            )
+            return
+        }
+        #endif
+        let ran = await runAutoBackupIfDue()
+        #if !os(iOS)
+        _ = ran
+        #else
+        guard ran, UIApplication.shared.applicationState == .background else { return }
+        SecureLogger.info("Auto-backup timer: closing the store before suspension", category: .session)
+        await closeStoreAfterBackgroundWake()
+        SecureLogger.info("Auto-backup timer: store closed", category: .session)
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.reconnectIfForegroundAfterWakeClose()
+        }
+        #endif
     }
 
     /// `nsec1…` backup of the connected identity, for the "Export private key"
