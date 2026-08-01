@@ -5923,6 +5923,15 @@ impl SonarClient {
         if self.relays.is_empty() {
             return Ok(MarmotProcessReport::default());
         }
+        // Same circuit breaker as `fetch_marmot_events_from_relay_quorum`,
+        // applied BEFORE the pass claim: with zero relays connected a pass can
+        // only spin requeues, and skipping here leaves the queue and the
+        // throttle clock untouched so the first pass after reconnection runs
+        // immediately.
+        if self.connected_relay_count().await == 0 {
+            tracing::debug!("group catch-up skipped: no relay connected");
+            return Ok(MarmotProcessReport::default());
+        }
         // P0: never compete with an in-flight user send. Live drain still runs;
         // only historical catch-up yields. This cannot break MLS groups because
         // send encrypts against current local epoch and publish is network-only.
@@ -6291,6 +6300,20 @@ impl SonarClient {
         }
     }
 
+    /// How many of this client's relays currently report `Connected`.
+    /// Cheap local read of the pool's status map — no network.
+    async fn connected_relay_count(&self) -> usize {
+        let map = self.nostr.relays().await;
+        self.relays
+            .iter()
+            .filter(|url| {
+                map.get(url)
+                    .map(|handle| handle.status() == RelayStatus::Connected)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
     async fn fetch_marmot_events_from_relay_quorum(
         &self,
         filter: Filter,
@@ -6303,6 +6326,25 @@ impl SonarClient {
                 events: Vec::new(),
                 completed_relays: 0,
                 total_relays: 0,
+            });
+        }
+        // Circuit breaker: with ZERO relays connected every per-relay
+        // `fetch_events_from` fails at REQ-send time in microseconds, so a
+        // caller loop (welcome-flood drain, catch-up requeue) degenerates into
+        // a full-speed fetch storm — field-measured at ~1,100 error lines/sec
+        // for minutes, which is what iOS's CPU watchdog killed four times on
+        // 2026-08-01 (`Sonar.cpu_resource_fatal`) and what burns the 2MB core
+        // log rotation in minutes. Report zero completions instead of
+        // attempting: `completed_quorum()` is false, so callers record the
+        // work retryable and the gated/backoff paths re-run it after relays
+        // actually reconnect. Reconnection itself is owned by the pool and the
+        // host attach paths, never by hammering fetches.
+        if self.connected_relay_count().await == 0 {
+            tracing::debug!(context, total_relays, "relay fetch skipped: no relay connected");
+            return Ok(RelayFetchOutcome {
+                events: Vec::new(),
+                completed_relays: 0,
+                total_relays,
             });
         }
 
@@ -7792,6 +7834,62 @@ fn require_relay_success(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Field-measured on 2026-08-01 (iPhone 14 Pro Max): with zero relays
+    /// connected the per-relay fetch fails at REQ-send time in microseconds,
+    /// and drain/catch-up callers degenerated into a ~1,100-error/sec fetch
+    /// storm that iOS's CPU watchdog killed four times in one day
+    /// (`Sonar.cpu_resource_fatal`) — and that burns the 2MB core-log rotation
+    /// in minutes, destroying crash forensics. Worse, a DISCONNECTED relay's
+    /// `fetch_events_from` returns `Ok(empty)` (the pool only logs the error),
+    /// so the quorum helper counted dead relays as COMPLETED and callers
+    /// treated "fetched nothing" as success — silently consuming catch-up
+    /// floors. The breaker must report zero completions (→ retryable), never
+    /// attempt, and never read as success.
+    #[tokio::test]
+    async fn quorum_fetch_breaks_open_with_no_relay_connected() {
+        let relay = nostr_relay_builder::MockRelay::run()
+            .await
+            .expect("mock relay starts");
+        let url = relay.url().await;
+        let client = SonarClient::connect_in_memory(
+            crate::identity::Identity::generate(),
+            vec![url],
+        )
+        .await
+        .expect("client connects");
+
+        // Disconnect from the CLIENT side, not by killing the relay: a dead
+        // socket is only noticed on the next read/ping, so `relay.shutdown()`
+        // leaves the pool reporting `Connected` for an unbounded time and made
+        // this test flaky (3/5 failures at a 15s deadline). `disconnect()`
+        // moves the pool's own status deterministically, which is exactly the
+        // state the breaker reads.
+        relay.shutdown();
+        client.nostr.disconnect().await;
+        assert_eq!(
+            client.connected_relay_count().await,
+            0,
+            "disconnect() must leave no relay Connected"
+        );
+
+        let outcome = client
+            .fetch_marmot_events_from_relay_quorum(
+                Filter::new().kind(Kind::MlsGroupMessage),
+                Duration::from_secs(5),
+                "test",
+            )
+            .await
+            .expect("breaker returns Ok, not Err");
+        assert_eq!(
+            outcome.completed_relays, 0,
+            "dead relays must not count as completed"
+        );
+        assert!(
+            !outcome.completed_quorum(),
+            "a no-connection fetch must read as retryable, never as success"
+        );
+    }
 
     /// R: a gift wrap's outer `created_at` is unauthenticated and arbitrary per
     /// NIP-59, and four inbound paths feed it straight into the retry watermark.
