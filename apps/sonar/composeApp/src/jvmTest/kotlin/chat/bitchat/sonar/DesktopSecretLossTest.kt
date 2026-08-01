@@ -151,4 +151,34 @@ class DesktopSecretLossTest {
     fun anExistingSeedIsNeverBlocked() {
         MeshIdentity.requireTrustworthyAbsence("abc", trustworthy = false, what = "mesh announce seed")
     }
+
+    /**
+     * The REAL call site, not the helper it delegates to.
+     *
+     * `docs/REGRESSIONS.md` rule 2: prefer a test that pins the call site, because
+     * R-001 regressed through a missing argument at a call site while every
+     * helper-level test stayed green. That is exactly the gap here — deleting the
+     * `requireTrustworthyAbsence(...)` call from `seedHex` leaves the three
+     * helper tests passing.
+     *
+     * `announce()` is the real entry point and forces `seedHex` first (it is the
+     * leftmost argument), which is what made the missing guard reachable. Caches
+     * are reset so this re-enters the mint branch regardless of test order.
+     */
+    @Test
+    fun announceRefusesToMintASeedWhenTheKeystoreIsUnreadable() {
+        if (DesktopSecrets.absenceIsTrustworthy()) return // keystore works here; nothing to refuse
+        MeshIdentity.resetCachesForTest()
+        val failure = assertFailsWith<IllegalStateException> { MeshIdentity.announce("probe") }
+        // Assert WHICH guard fired, not just that something threw. Both mint
+        // sites raise "refusing to regenerate", so a laxer assertion passes even
+        // with seedHex unguarded: the seed gets minted, then `keypair` throws and
+        // the test goes green having proved nothing about the seed. Verified —
+        // that is exactly what happened before this line named the seed.
+        assertTrue(
+            failure.message?.contains("mesh announce seed") == true,
+            "the SEED guard must be the one that fired, not the keypair guard " +
+                "after the seed was already minted: ${failure.message}",
+        )
+    }
 }

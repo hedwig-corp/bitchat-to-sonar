@@ -46,8 +46,32 @@ object MeshIdentity {
     private fun unhex(s: String): ByteArray =
         ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
 
+    /**
+     * Cached rather than `by lazy` so tests can exercise the REAL call sites.
+     *
+     * An object-scoped `by lazy` is resolved once per JVM, so a test that runs
+     * after anything else has touched the identity can never re-enter the mint
+     * branch, which left the call-site guards testable only through the helper
+     * they delegate to. The regression ledger is explicit that a helper-level
+     * test is not a substitute (R-001 regressed through a missing argument at a
+     * call site while every helper test stayed green).
+     */
+    @Volatile private var keypairCache: NoiseKeypairHex? = null
+    @Volatile private var seedCache: String? = null
+
+    internal fun resetCachesForTest() {
+        keypairCache = null
+        seedCache = null
+    }
+
+    private val keypair: NoiseKeypairHex
+        get() = keypairCache ?: loadOrCreateKeypair().also { keypairCache = it }
+
+    private val seedHex: String
+        get() = seedCache ?: loadOrCreateSeed().also { seedCache = it }
+
     /** Noise static keypair (X25519), persisted or generated + saved once. */
-    private val keypair: NoiseKeypairHex by lazy {
+    private fun loadOrCreateKeypair(): NoiseKeypairHex = run {
         // BOTH halves live in the keystore. Splitting them (private in the
         // keystore, public in prefs) looked harmless because the public half is
         // in every announce anyway, but the two stores fail INDEPENDENTLY: with
@@ -64,17 +88,14 @@ object MeshIdentity {
         } else if (priv != null || pub != null) {
             // Half-readable means a transient keystore fault, not a first run.
             error("mesh identity is only half-readable; refusing to regenerate and rotate the mesh fingerprint")
-        } else if (!DesktopSecrets.absenceIsTrustworthy()) {
-            // Same rule as requireTrustworthyAbsence, kept explicit here because
-            // this branch also has to distinguish the half-readable case above.
+        } else {
             // BOTH halves unreadable is the COMMON keystore fault (locked
             // keyring, no D-Bus session), and it is indistinguishable from a
             // first run by the return value alone: `secret-tool lookup` exits 1
-            // either way. Generating here would rotate peerIdHex and drop every
-            // peer's verified fingerprint. Only mint when the keystore has been
-            // proven readable, so "absent" really means absent.
-            error("mesh identity is unreadable (keystore fault); refusing to regenerate and rotate the mesh fingerprint")
-        } else {
+            // either way. Same rule as the seed, through the same helper so the
+            // two cannot drift; the half-readable case above stays separate
+            // because only this property can have one half.
+            requireTrustworthyAbsence(priv, DesktopSecrets.absenceIsTrustworthy(), "mesh identity")
             noiseGenerateKeypair().also {
                 DesktopSecrets.put("mesh.noise.priv", it.privateHex)
                 DesktopSecrets.put("mesh.noise.pub", it.publicHex)
@@ -83,7 +104,7 @@ object MeshIdentity {
     }
 
     /** Ed25519 announce-signing seed (32 bytes hex), persisted or made once. */
-    private val seedHex: String by lazy {
+    private fun loadOrCreateSeed(): String = run {
         // Signs the 0x01 announce and the 0x53 Sonar Discovery packet, so a peer
         // that holds it can forge either. Same storage as the Noise key.
         val existing = DesktopSecrets.get("mesh.ed25519.seed")
