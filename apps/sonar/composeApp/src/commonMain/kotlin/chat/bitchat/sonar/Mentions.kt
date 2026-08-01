@@ -98,11 +98,26 @@ object Mentions {
         val needle = query.lowercase()
         return roster
             .filter { it.name.isNotBlank() && it.name.lowercase().startsWith(needle) }
-            // A name with no leading run of wire-legal characters ("🎉 bob")
-            // cannot be written as a mention at all, so it is not offered.
-            .filter { wireName(it.name).isNotEmpty() }
+            .filter { isMentionable(it, roster) }
             .sortedBy { it.name.lowercase() }
             .take(limit)
+    }
+
+    /**
+     * Whether a member can be written as a mention that will actually resolve.
+     *
+     * Two ways it cannot: the name has no leading run of wire-legal characters
+     * ("🎉 party"), so there is no token to build; or the name needs the `#abcd`
+     * key to identify its owner — it collides, or it had to be truncated — but
+     * the member has no usable key (an npub that would not parse). Offering
+     * either produces a mention that silently resolves to nobody, which reads to
+     * the sender as "I mentioned them" and to the recipient as nothing at all.
+     */
+    internal fun isMentionable(pick: MentionCandidate, roster: List<MentionCandidate>): Boolean {
+        val name = wireName(pick.name)
+        if (name.isEmpty()) return false
+        val needsKey = needsSuffix(pick, roster) || name != pick.name
+        return !needsKey || pick.suffixHex4 != null
     }
 
     /**

@@ -98,6 +98,24 @@ struct SonarMentionsTests {
         #expect(SNMentions.matches(draft: "@", roster: [emoji]).isEmpty)
     }
 
+    @Test("a member needing a key it does not have is not offered")
+    func memberNeedingAbsentKeyIsNotOffered() {
+        // Ambiguous with no usable key: any token we could build resolves to
+        // nobody, which looks to the sender like a mention that worked.
+        let noSuffix = SNMentionCandidate(npub: "npub1ddd", name: "vincenzo", suffixHex4: nil)
+        let roster = [noSuffix, vincenzoTwin]
+        #expect(!SNMentions.isMentionable(noSuffix, roster: roster))
+        #expect(!SNMentions.matches(draft: "@vin", roster: roster).contains { $0.npub == noSuffix.npub })
+        #expect(SNMentions.isMentionable(vincenzoTwin, roster: roster))
+    }
+
+    @Test("an unambiguous name without a key is still offered")
+    func unambiguousNameWithoutKeyIsOffered() {
+        let solo = SNMentionCandidate(npub: "npub1hhh", name: "solo", suffixHex4: nil)
+        #expect(SNMentions.isMentionable(solo, roster: [solo]))
+        #expect(SNMentions.token(solo, roster: [solo]) == "@solo")
+    }
+
     @Test("an unambiguous plain name still inserts bare")
     func unambiguousPlainNameStaysBare() {
         // The truncation rule must not drag every mention into the suffix form.

@@ -162,12 +162,25 @@ enum SNMentions {
         let needle = query.lowercased()
         return roster
             .filter { !$0.name.isEmpty && $0.name.lowercased().hasPrefix(needle) }
-            // A name with no leading run of wire-legal characters ("🎉 bob")
-            // cannot be written as a mention at all, so it is not offered.
-            .filter { !wireName($0.name).isEmpty }
+            .filter { isMentionable($0, roster: roster) }
             .sorted { $0.name.lowercased() < $1.name.lowercased() }
             .prefix(limit)
             .map { $0 }
+    }
+
+    /// Whether a member can be written as a mention that will actually resolve.
+    ///
+    /// Two ways it cannot: the name has no leading run of wire-legal characters
+    /// ("🎉 party"), so there is no token to build; or the name needs the `#abcd`
+    /// key to identify its owner — it collides, or it had to be truncated — but
+    /// the member has no usable key (an npub that would not parse). Offering
+    /// either produces a mention that silently resolves to nobody, which reads to
+    /// the sender as "I mentioned them" and to the recipient as nothing at all.
+    static func isMentionable(_ pick: SNMentionCandidate, roster: [SNMentionCandidate]) -> Bool {
+        let name = wireName(pick.name)
+        if name.isEmpty { return false }
+        let needsKey = needsSuffix(pick, roster: roster) || name != pick.name
+        return !needsKey || pick.suffixHex4 != nil
     }
 
     /// True when `pick` shares a display name with another roster member, so the

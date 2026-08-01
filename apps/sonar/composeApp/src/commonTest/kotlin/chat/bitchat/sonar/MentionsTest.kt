@@ -88,11 +88,30 @@ class MentionsTest {
     }
 
     @Test
-    fun memberWithoutASuffixStillInsertsBare() {
+    fun memberNeedingAKeyItDoesNotHaveIsNotOffered() {
+        // Ambiguous with no usable key: any token we could build resolves to
+        // nobody, which looks to the sender like a mention that worked. Better
+        // to not offer them than to emit a silent dead end.
         val noSuffix = MentionCandidate("npub1ddd", "vincenzo", suffixHex4 = null)
         val roster = listOf(noSuffix, vincenzoTwin)
-        // Ambiguous but undisambiguatable: better a bare mention than "@name#null".
-        assertEquals("@vincenzo", Mentions.token(noSuffix, roster))
+        assertFalse(Mentions.isMentionable(noSuffix, roster))
+        assertTrue(Mentions.matches("@vin", roster).none { it.npub == noSuffix.npub })
+        // The twin has a key, so it is still offerable.
+        assertTrue(Mentions.isMentionable(vincenzoTwin, roster))
+    }
+
+    @Test
+    fun truncatedNameWithoutAKeyIsNotOffered() {
+        val john = MentionCandidate("npub1ggg", "John Doe", suffixHex4 = null)
+        assertFalse(Mentions.isMentionable(john, listOf(john)))
+    }
+
+    @Test
+    fun unambiguousNameWithoutAKeyIsStillOffered() {
+        // No key needed, so a missing suffix costs nothing.
+        val solo = MentionCandidate("npub1hhh", "solo", suffixHex4 = null)
+        assertTrue(Mentions.isMentionable(solo, listOf(solo)))
+        assertEquals("@solo", Mentions.token(solo, listOf(solo)))
     }
 
     @Test
