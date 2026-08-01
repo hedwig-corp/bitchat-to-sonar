@@ -74,7 +74,7 @@ the #1 source of mesh-only bugs:
    (`mirrorToEphemeralIfNeeded` requires a `unifiedPeerService` entry). So an
    out-of-range peer's replies sit in a bucket the alias set never names.
 
-   That asymmetry is a shipped bug (`#537`): `dmRows` folds *every*
+   That asymmetry is a shipped bug (`#541`): `dmRows` folds *every*
    `privateChats` bucket through `canonicalPeerKey`, so the chat-list row
    showed those replies, while the transcript read alias keys only and stayed
    permanently behind its own home row. Read `privateChats` through
