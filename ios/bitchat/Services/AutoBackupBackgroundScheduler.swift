@@ -236,10 +236,21 @@ final class AutoBackupBackgroundScheduler {
     private func closeStoreIfStillBackgrounded(label: String) async {
         guard let store else { return }
         guard UIApplication.shared.applicationState == .background else {
+            // Since `reopenAfterSeal: false` a background backup no longer
+            // reopens the node, so "that path owns the node" stopped being
+            // true: a user who foregrounded mid-backup had their
+            // `refreshAfterForeground` time out against `busy` and nothing
+            // retries — a visible app with a closed store. Same detached,
+            // ungated reconnect as the close path below (it awaits the doomed
+            // `refreshTask` first, then re-kicks only if still disconnected;
+            // no-op when the node exists).
             SecureLogger.info(
-                "Auto-backup \(label): store left open — app is foreground, that path owns the node",
+                "Auto-backup \(label): app is foreground — kicking reconnect instead of closing",
                 category: .session
             )
+            Task.detached(priority: .utility) {
+                await store.marmot.reconnectIfForegroundAfterWakeClose()
+            }
             return
         }
         SecureLogger.info("Auto-backup \(label): closing the store before suspension", category: .session)
