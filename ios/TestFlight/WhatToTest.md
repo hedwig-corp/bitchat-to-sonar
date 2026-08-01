@@ -1,10 +1,12 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.7 (35)** · release tag **v0.1-alpha.12.2**
+Build: **Sonar 1.12.8 (37)** · release tag **v0.1-alpha.12.3**
 
-Cut after alpha.12.1 + Apple hotfixes through 1.12.6, then 0xdead10cc round 6
-(abort a Marmot connect that holds the store when iOS suspends; close a store a
-background auto-backup reopened), restored group-invite link handoff/approval,
+Cut over alpha.12.2 + 0xdead10cc round 7: the in-app 15-minute auto-backup timer
+no longer starts a backup (and reopens the Marmot store) while the app is
+backgrounded — the tick that survived rounds 1-6. iOS should now stay alive
+locked/backgrounded for several minutes without a RUNNINGBOARD 0xdead10cc kill.
+Everything from alpha.12.2 carries forward: group-invite link handoff/approval,
 backup stats carried into the live policy after a restore, short transcripts
 bottom-aligned and re-pinned on viewport shrink, and internet replies that only
 the chat list could see now surfaced in the transcript. Opening a chat should

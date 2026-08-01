@@ -15,7 +15,7 @@ repository: https://github.com/hedwig-corp/bitchat-to-sonar
 match: "sonar-.*-android\\.apk$"
 
 # Optional: local signed phone APK when not fetching from GitHub.
-# release_source: dist/sonar-0.1-alpha.12.2-android.apk
+# release_source: dist/sonar-0.1-alpha.12.3-android.apk
 
 name: Sonar
 summary: Private messenger — Bluetooth nearby, Nostr everywhere, Lightning in-chat
