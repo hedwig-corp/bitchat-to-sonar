@@ -183,8 +183,11 @@ seeded PRNG.
   every buffer here starts zero-filled, so discarding the `OSStatus` yields an
   all-zeros "random" value. Go through `SecureRandom.bytes(_:)` /
   `SecureRandom.optionalBytes(_:)` (`ios/bitchat/Utils/SecureRandom.swift`).
-- **Rust** — never `let _ = getrandom(..)`. Propagate with `?` or
-  `.expect("OS RNG available")`.
+- **Rust** — an unhandled `getrandom` leaves the array zeroed. Propagate with
+  `?` (prefer bare `?` — `Error::Rng` classifies it correctly; wrapping it in a
+  storage/IO error reports a dead CSPRNG as a disk fault) or
+  `.expect("OS RNG available")`. `let _ =`, `let _res =`, `.ok()`, and a `match`
+  that drops both arms are all the same swallow.
 - **Compose** — `kotlin.random.Random` is a clock-seeded XorWow, not a CSPRNG.
   Use `secureRandomBytes()` / `secureRandomHex()` (`SecureRandom.kt`), which is
   the Compose-side match for iOS's CSPRNG-backed `UUID()`.

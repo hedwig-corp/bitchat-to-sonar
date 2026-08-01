@@ -81,6 +81,11 @@ final class MockKeychain: KeychainManagerProtocol {
         serviceStorage[service]?[key]
     }
 
+    func loadWithResult(key: String, service: String) -> KeychainReadResult {
+        if let data = serviceStorage[service]?[key] { return .success(data) }
+        return .itemNotFound
+    }
+
     func delete(key: String, service: String) {
         serviceStorage[service]?.removeValue(forKey: key)
     }
@@ -192,6 +197,11 @@ final class TrackingMockKeychain: KeychainManagerProtocol {
 
     func load(key: String, service: String) -> Data? {
         serviceStorage[service]?[key]
+    }
+
+    func loadWithResult(key: String, service: String) -> KeychainReadResult {
+        if let data = serviceStorage[service]?[key] { return .success(data) }
+        return .itemNotFound
     }
 
     func delete(key: String, service: String) {

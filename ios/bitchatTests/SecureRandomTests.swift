@@ -13,12 +13,12 @@
 // failure branch. On a machine with a working CSPRNG the OLD code passes these
 // too — the old bug was invisible precisely because the happy path was fine.
 //
-// What they do pin is that the wiring is right and stays right: the nonce is
-// drawn fresh per message rather than derived, cached, or hoisted to a
-// constant, and the plumbing still decrypts. That catches the *other* way this
-// regresses — someone "optimising" a per-message draw into a stored value.
-// The failure branch itself is guarded mechanically, not here, by
-// scripts/check-rng-hygiene.sh.
+// What they do pin is that the wiring is right and stays right: the NIP-44
+// nonce, read straight out of the wire format, is drawn fresh per message
+// rather than derived, cached, or hoisted to a constant, and the plumbing
+// still decrypts. That catches the *other* way this regresses — someone
+// "optimising" a per-message draw into a stored value. The failure branch
+// itself is guarded mechanically, not here, by scripts/check-rng-hygiene.sh.
 //
 // This is free and unencumbered software released into the public domain.
 // For more information, see <https://unlicense.org>
@@ -61,33 +61,47 @@ struct SecureRandomTests {
         #expect(a != b)
     }
 
-    /// The NIP-44 site specifically: the conversation key is fixed per
-    /// (sender, recipient) pair, so a repeated nonce reuses the XChaCha20
-    /// keystream across every DM to that peer. Encrypting the *same* plaintext
-    /// to the *same* recipient twice must still produce different ciphertext,
-    /// which is only true if the 24-byte nonce is freshly random each time.
+    /// NIP-44 v2 wire format is `"v2:" + base64url(nonce24 ‖ ciphertext ‖ tag)`,
+    /// so the nonce can be read straight off the wire.
+    private func nip44Nonce(_ content: String) throws -> Data {
+        let body = try #require(content.split(separator: ":", maxSplits: 1).last.map(String.init))
+        var b64 = body.replacingOccurrences(of: "-", with: "+")
+                      .replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        let raw = try #require(Data(base64Encoded: b64))
+        #expect(raw.count > 24)
+        return raw.prefix(24)
+    }
+
+    /// Assert on the **nonce itself**, not on ciphertext inequality.
+    ///
+    /// Ciphertext inequality is not evidence here: `createPrivateMessage` mints
+    /// a fresh ephemeral key per message and `randomizedTimestamp()` perturbs
+    /// the plaintext, so `first.content != second.content` holds even with a
+    /// hardcoded constant nonce. Reading the 24 bytes out of the wire format is
+    /// what actually fails against a cached or constant nonce.
     @Test func nip44NonceIsFreshPerMessage() throws {
         let sender = try NostrIdentity.generate()
         let recipient = try NostrIdentity.generate()
         let plaintext = "same message, twice"
 
-        let first = try NostrProtocol.createPrivateMessage(
-            content: plaintext,
-            recipientPubkey: recipient.publicKeyHex,
-            senderIdentity: sender
-        )
-        let second = try NostrProtocol.createPrivateMessage(
-            content: plaintext,
-            recipientPubkey: recipient.publicKeyHex,
-            senderIdentity: sender
-        )
+        var nonces = Set<Data>()
+        var lastWrap: NostrEvent?
+        for _ in 0..<8 {
+            let wrap = try NostrProtocol.createPrivateMessage(
+                content: plaintext,
+                recipientPubkey: recipient.publicKeyHex,
+                senderIdentity: sender
+            )
+            nonces.insert(try nip44Nonce(wrap.content))
+            lastWrap = wrap
+        }
+        #expect(nonces.count == 8)
+        #expect(!nonces.contains(Data(repeating: 0, count: 24)))
 
-        #expect(first.content != second.content)
-        #expect(first.id != second.id)
-
-        // Both must still decrypt — freshness must not have broken correctness.
+        // Freshness must not have broken correctness.
         let (out, _, _) = try NostrProtocol.decryptPrivateMessage(
-            giftWrap: first,
+            giftWrap: try #require(lastWrap),
             recipientIdentity: recipient
         )
         #expect(out == plaintext)

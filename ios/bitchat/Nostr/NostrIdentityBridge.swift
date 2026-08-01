@@ -1,3 +1,4 @@
+import BitLogger
 import Foundation
 import CryptoKit
 
@@ -87,24 +88,74 @@ final class NostrIdentityBridge {
 
     /// Returns a stable device seed used to derive unlinkable per-geohash identities.
     /// Stored only on device keychain.
-    /// Throws rather than returning a zero seed: this seed keys the HMAC that
-    /// derives every per-geohash Nostr *private key*, and it is persisted on
-    /// first use. An unchecked `SecRandomCopyBytes` failure here would mint an
-    /// all-zeros seed, give every affected install the same geohash identities,
-    /// and then write that seed to the keychain permanently.
+    /// This seed keys the HMAC that derives every per-geohash Nostr *private
+    /// key*, and it is persisted on first use, so it throws rather than
+    /// returning anything it is not sure about. Three ways that could go wrong,
+    /// all of which permanently rotate every geohash identity:
+    ///   1. an unchecked `SecRandomCopyBytes` failure minting an all-zeros seed
+    ///      (same seed on every affected install), then persisting it;
+    ///   2. an unreadable keychain read up as "absent", minting a replacement
+    ///      that overwrites the real seed in place;
+    ///   3. a failed persist leaving the seed memory-only, so the next launch
+    ///      mints a different one.
     private func getOrCreateDeviceSeed() throws -> Data {
         if let cached = deviceSeedCache { return cached }
-        if let existing = keychain.load(key: deviceSeedKey, service: keychainService) {
+
+        // Classify the read. A bare `Data?` cannot tell "no seed yet" from
+        // "seed exists but is not readable right now", and this function
+        // responds to "absent" by minting a replacement and saving it — and
+        // `save` is update-then-add, so it overwrites in place. `deriveIdentity`
+        // runs off the foreground path via GeohashPresenceService, so a single
+        // locked-device or access-denied read would permanently rotate every
+        // per-geohash identity. Only `.itemNotFound` may create.
+        switch keychain.loadWithResult(key: deviceSeedKey, service: keychainService) {
+        case .success(let existing):
             // Migrate to AfterFirstUnlockThisDeviceOnly for stability during lock
             keychain.save(key: deviceSeedKey, data: existing, service: keychainService, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
             deviceSeedCache = existing
             return existing
+
+        case .accessDenied, .deviceLocked, .authenticationFailed, .otherError:
+            SecureLogger.warning(
+                "⚠️ geohash device seed not readable yet (device locked?) — deferring rather than rotating identities",
+                category: .keychain
+            )
+            throw DeviceSeedError.notReadable
+
+        case .itemNotFound:
+            break  // genuinely absent: safe to create
         }
+
         let seed = try SecureRandom.bytes(32)
         // Ensure availability after first unlock to prevent unintended rotation when locked
         keychain.save(key: deviceSeedKey, data: seed, service: keychainService, accessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly)
+        // Only cache after a readback confirms the seed actually persisted. A
+        // discarded save result would leave it memory-only, and the next launch
+        // would mint a different one — the same rotation by a slower route.
+        guard keychain.load(key: deviceSeedKey, service: keychainService) == seed else {
+            SecureLogger.error(
+                NSError(domain: "NostrIdentity", code: -2),
+                context: "geohash device seed failed to persist — refusing to use an ephemeral seed",
+                category: .keychain
+            )
+            throw DeviceSeedError.notPersisted
+        }
         deviceSeedCache = seed
         return seed
+    }
+
+    enum DeviceSeedError: Error, LocalizedError {
+        case notReadable
+        case notPersisted
+
+        var errorDescription: String? {
+            switch self {
+            case .notReadable:
+                return "device seed not readable yet (device locked?)"
+            case .notPersisted:
+                return "device seed could not be persisted"
+            }
+        }
     }
 
     /// Derive a deterministic, unlinkable Nostr identity for a given geohash.

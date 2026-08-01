@@ -2,7 +2,6 @@ import BitLogger
 import Foundation
 import CryptoKit
 import P256K
-import Security
 
 // Note: This file depends on Data extension from BinaryEncodingUtils.swift
 // Make sure BinaryEncodingUtils.swift is included in the target
@@ -289,10 +288,18 @@ struct NostrProtocol {
         // Derive NIP-44 v2 symmetric key (HKDF-SHA256 with label in info)
         let key = try deriveNIP44V2Key(from: sharedSecret)
         
-        // 24-byte random nonce for XChaCha20-Poly1305. The conversation key is
-        // fixed per (sender, recipient) pair, so a repeated nonce reuses the
-        // keystream across every DM to that peer and leaks the Poly1305 key.
-        // Never continue with an unchecked buffer here — fail the send instead.
+        // 24-byte random nonce for XChaCha20-Poly1305.
+        //
+        // Both callers (createSeal, createGiftWrap) pass a per-message
+        // *ephemeral* key, so the conversation key varies per message and a
+        // zero nonce would not by itself have caused cross-message keystream
+        // reuse here — the defence is depth, not a live hole being closed.
+        // It matters because the invariant is one refactor deep: NIP-17 as
+        // specified seals with the sender's LONG-TERM key, and the moment this
+        // path adopts that (or any caller passes a stable key), a fixed nonce
+        // becomes keystream reuse across every DM to that peer plus Poly1305
+        // key recovery. Fail the send rather than encrypt under an unchecked
+        // buffer.
         let nonce24 = try SecureRandom.bytes(24)
 
         let pt = Data(plaintext.utf8)

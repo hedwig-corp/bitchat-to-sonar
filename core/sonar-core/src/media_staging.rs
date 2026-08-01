@@ -573,8 +573,12 @@ pub(crate) fn new_media_staging_id() -> Result<String> {
     // send path that already surfaces failures to the user, so propagate rather
     // than panic — `MeshSigner::generate` returns a bare `Self` and has nowhere
     // to put the error, which is why it is the one place that expects.
-    getrandom::getrandom(&mut buf)
-        .map_err(|e| Error::Storage(format!("media staging id: {e}")))?;
+    //
+    // Bare `?` on purpose: `Error::Rng(#[from] getrandom::Error)` classifies
+    // this as an RNG failure. Wrapping it in `Error::Storage` would report a
+    // dead CSPRNG as a disk problem — the wrong triage signal in exactly the
+    // scenario this is meant to make diagnosable.
+    getrandom::getrandom(&mut buf)?;
     Ok(hex::encode(buf))
 }
 

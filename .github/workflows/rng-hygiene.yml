@@ -9,9 +9,14 @@ name: RNG hygiene
 # job in CI at all.
 #
 # No `paths:` filter on purpose. The script scans the whole tracked tree and
-# runs in under a second, and a path-filtered job can never be a required
-# status check — PRs that touch none of the filtered globs would report nothing
+# runs in under a second, and a path-filtered job cannot serve as a required
+# status check — PRs touching none of the filtered globs would report nothing
 # and block forever. Cheap enough to always run.
+#
+# NOTE: as of 2026-08-01 `main` has no branch protection, so nothing here is
+# actually a required check — this job reports, it does not gate. Keeping it
+# unfiltered is what makes it *eligible* to be marked required later; making it
+# so is a repo-admin decision. Until then, a red run has to be read by a human.
 
 on:
   push:
