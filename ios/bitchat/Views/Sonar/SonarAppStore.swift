@@ -2424,7 +2424,8 @@ final class SonarAppStore: ObservableObject {
         // Task was cancelled, or colliding with the result toast epoch.
         showStickyToast(String(localized: "Backing up chats…"))
         do {
-            try await marmot.backupAccount()
+            // Settings tap = foreground session: reopen so chats stay live.
+            try await marmot.backupAccount(reopenAfterSeal: true)
             showToast(String(localized: "Chat backup uploaded"))
             refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {

@@ -1247,7 +1247,10 @@ final class MarmotChatModel: ObservableObject {
     ///   to race. On 1.12.9 (38) that race was lost: the backup's reconnect
     ///   reopened SQLCipher ~200ms AFTER "store closed" was logged and
     ///   RunningBoard killed the suspending process 0xdead10cc (round 8).
-    func backupAccount(respectOptOut: Bool = false, reopenAfterSeal: Bool = true) async throws {
+    /// `reopenAfterSeal` is deliberately REQUIRED: a defaulted `true` here let
+    /// any future background caller silently inherit the reopen that round 8
+    /// exists to remove. Every call site must choose.
+    func backupAccount(respectOptOut: Bool = false, reopenAfterSeal: Bool) async throws {
         // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
             throw MarmotService.ServiceError.backupAlreadyInProgress
