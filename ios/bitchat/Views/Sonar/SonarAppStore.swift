@@ -3254,11 +3254,17 @@ final class SonarAppStore: ObservableObject {
                 // processIncomingTrillLines, same split as ⚡PAY on mesh.
                 guard classified != .call, classified != .trill else { continue }
                 // A plain message that names us is promoted so the banner reads
-                // "X mentioned you". Only plain messages are eligible — a
-                // payment keeps its own kind. Mute is enforced downstream in
-                // NotificationService, so a mention does NOT pierce it (R-022).
+                // "X mentioned you". Only plain messages in a MULTI-MEMBER group
+                // are eligible: a payment keeps its own kind, and in a 1:1 chat
+                // "X mentioned you" is both odd and inconsistent with the
+                // transcript, which renders no mention styling there. Mute is
+                // enforced downstream in NotificationService, so a mention does
+                // NOT pierce it (R-022).
+                let isGroupMessage = group.memberNpubs.count > 2
                 let kind: SonarLocalNotificationKind =
-                    (classified == .message && mentionsMe(message.content)) ? .mention : classified
+                    (classified == .message && isGroupMessage && mentionsMe(message.content))
+                        ? .mention
+                        : classified
                 let senderName = marmot.displayName(forNpub: message.senderNpub) ?? snShortNpubLabel(message.senderNpub)
                 sendSonarNotification(
                     kind: kind,

@@ -54,6 +54,17 @@ object Mentions {
     private fun isNameChar(c: Char): Boolean = c.isLetter() || c.isDigit() || c == '_'
 
     /**
+     * The part of a display name that can survive on the wire.
+     *
+     * A kind-0 name is free text — "John Doe", "alice (work)" — but the wire
+     * grammar stops at the first character outside the name class. Emitting
+     * `@John Doe` would put `@John` on the wire and resolve to nobody, so the
+     * token is built from this leading run instead, and a truncated name is
+     * forced to carry the `#abcd` suffix so it still resolves by key.
+     */
+    internal fun wireName(name: String): String = name.takeWhile { isNameChar(it) }
+
+    /**
      * The `@token` currently being typed at the end of [draft], without its
      * `@`, or null when the caret is not inside a mention.
      *
@@ -87,6 +98,9 @@ object Mentions {
         val needle = query.lowercase()
         return roster
             .filter { it.name.isNotBlank() && it.name.lowercase().startsWith(needle) }
+            // A name with no leading run of wire-legal characters ("🎉 bob")
+            // cannot be written as a mention at all, so it is not offered.
+            .filter { wireName(it.name).isNotEmpty() }
             .sortedBy { it.name.lowercase() }
             .take(limit)
     }
@@ -107,12 +121,13 @@ object Mentions {
      * the documented trade-off of keeping the wire plain text.
      */
     fun token(pick: MentionCandidate, roster: List<MentionCandidate>): String {
+        val name = wireName(pick.name)
         val suffix = pick.suffixHex4
-        return if (suffix != null && needsSuffix(pick, roster)) {
-            "@${pick.name}#$suffix"
-        } else {
-            "@${pick.name}"
-        }
+        // The suffix is required when the name alone cannot identify the member:
+        // either another member answers to it, or it had to be truncated to fit
+        // the wire grammar and so no longer equals the sender's display name.
+        val needsKey = needsSuffix(pick, roster) || name != pick.name
+        return if (suffix != null && needsKey) "@$name#$suffix" else "@$name"
     }
 
     /**

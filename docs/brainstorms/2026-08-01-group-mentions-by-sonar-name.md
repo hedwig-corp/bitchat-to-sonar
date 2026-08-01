@@ -58,8 +58,9 @@ mentioned person — on both `ios/` and `apps/sonar/`.
 
 - `@everyone` / `@here` broadcast mentions.
 - Mentioning someone who is **not** a member of the group (no invite-by-mention).
-- Mention-based notification settings beyond "a mention pierces mute" (no
-  per-group "mentions only" mode in v1).
+- Any change to mute behaviour. R-022 requires mute to suppress banner, sound,
+  and haptic on every delivery path, so a mention does **not** pierce mute (see
+  the resolved question below). No per-group "mentions only" mode in v1 either.
 - Rich NIP-27 interop with non-Sonar clients — explicitly deferred by the wire-format
   decision above.
 
@@ -72,8 +73,8 @@ mentioned person — on both `ios/` and `apps/sonar/`.
 3. The sent message renders with the mention highlighted on **both** the sender's and
    the recipients' transcripts, and tapping it opens that member's profile.
 4. The mentioned member gets a notification whose body is "X mentioned you"
-   (`NotificationKind::Mention` stops being dead), and that notification is delivered
-   even when the group is muted.
+   (`NotificationKind::Mention` stops being dead), subject to the existing mute
+   and privacy rules — a muted group stays silent (R-022).
 5. A client with no mention support renders the message as readable plain text.
 6. Mesh public/geohash chat mentions still behave exactly as before after the
    unification — pinned by a test, since this is a refactor of live behavior.
@@ -102,7 +103,9 @@ mentioned person — on both `ios/` and `apps/sonar/`.
 - **Sketch:** Put the tokenizer and roster resolution in `sonar-core`. Core already
   precomputes `MessageClassInfo` per message and already owns the notification
   taxonomy, so it is the natural home: given a group id and the plain-text content,
-  core returns resolved mention spans (byte range + npub + display name) and a
+  core returns resolved mention spans (UTF-16 code-unit range + npub + display
+  name — Kotlin and Swift both index in UTF-16, so Rust byte offsets would
+  misplace every span after a non-ASCII character) and a
   `mentions_me` flag, and classifies the resulting notification as
   `NotificationKind::Mention`. The wire stays plain `@name` text — core is only
   *parsing* it. Both apps then render prepared spans and build the composer picker
@@ -154,8 +157,11 @@ onto the same engine last with a test pinning existing mesh behavior.
   local drain, so the client can detect it — but it needs the local identity's own
   current profile name. Confirm core has that available at classification time before
   committing to core-side detection.
-- Does a mention pierce mute unconditionally, or only for non-muted groups (i.e. is
-  mute a hard "never notify")? Affects the notification router on both platforms.
+- ~~Does a mention pierce mute?~~ **Resolved: it does not.** R-022
+  () states mute suppresses banner, sound, and haptic on
+  every delivery path and has five guarding tests. Changing that is a deliberate
+  product decision, not a side effect of adding mentions; tracked as a follow-up
+  on #557.
 - Is there a local petname/alias store that should win over the kind-0 name in the
   picker? I did not find one — if it exists, the picker should prefer it.
 - Case sensitivity and non-Latin names: the mesh regex is `\p{L}`-based, so it already

@@ -120,6 +120,17 @@ enum SNMentions {
         c.isLetter || c.isNumber || c == "_"
     }
 
+    /// The part of a display name that can survive on the wire.
+    ///
+    /// A kind-0 name is free text — "John Doe", "alice (work)" — but the wire
+    /// grammar stops at the first character outside the name class. Emitting
+    /// `@John Doe` would put `@John` on the wire and resolve to nobody, so the
+    /// token is built from this leading run instead, and a truncated name is
+    /// forced to carry the `#abcd` suffix so it still resolves by key.
+    static func wireName(_ name: String) -> String {
+        String(name.prefix(while: isNameChar))
+    }
+
     /// The `@token` currently being typed at the end of `draft`, without its
     /// `@`, or nil when the caret is not inside a mention.
     ///
@@ -151,6 +162,9 @@ enum SNMentions {
         let needle = query.lowercased()
         return roster
             .filter { !$0.name.isEmpty && $0.name.lowercased().hasPrefix(needle) }
+            // A name with no leading run of wire-legal characters ("🎉 bob")
+            // cannot be written as a mention at all, so it is not offered.
+            .filter { !wireName($0.name).isEmpty }
             .sorted { $0.name.lowercased() < $1.name.lowercased() }
             .prefix(limit)
             .map { $0 }
@@ -169,10 +183,15 @@ enum SNMentions {
     /// cost is that a bare mention stops resolving if that member renames — the
     /// documented trade-off of keeping the wire plain text.
     static func token(_ pick: SNMentionCandidate, roster: [SNMentionCandidate]) -> String {
-        if let suffix = pick.suffixHex4, needsSuffix(pick, roster: roster) {
-            return "@\(pick.name)#\(suffix)"
+        let name = wireName(pick.name)
+        // The suffix is required when the name alone cannot identify the member:
+        // either another member answers to it, or it had to be truncated to fit
+        // the wire grammar and so no longer equals the sender's display name.
+        let needsKey = needsSuffix(pick, roster: roster) || name != pick.name
+        if let suffix = pick.suffixHex4, needsKey {
+            return "@\(name)#\(suffix)"
         }
-        return "@\(pick.name)"
+        return "@\(name)"
     }
 
     /// `draft` with the active `@token` replaced by `pick`'s mention plus a

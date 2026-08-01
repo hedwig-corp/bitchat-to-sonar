@@ -112,6 +112,38 @@ class MentionsTest {
     }
 
     @Test
+    fun aNameWithASpaceIsForcedToCarryItsKey() {
+        // Display names are free text. Emitting "@John Doe" would put "@John" on
+        // the wire — the scanner stops at the space — and resolve to nobody, so
+        // the token is truncated to the wire-legal run AND carries the suffix,
+        // which resolves by key regardless of the name.
+        val john = MentionCandidate("npub1ddd", "John Doe", "d0e5")
+        val roster = listOf(john, giulia)
+        assertEquals("@John#d0e5", Mentions.token(john, roster))
+        assertEquals("hey @John#d0e5 ", Mentions.applyPick("hey @Jo", john, roster))
+    }
+
+    @Test
+    fun aNameWithPunctuationIsTruncatedAtTheFirstIllegalCharacter() {
+        val alice = MentionCandidate("npub1eee", "alice(work)", "a11c")
+        assertEquals("@alice#a11c", Mentions.token(alice, listOf(alice)))
+    }
+
+    @Test
+    fun aNameWithNoWireLegalRunIsNotOffered() {
+        // "🎉 party" has no leading run the wire grammar accepts, so there is no
+        // token to build — better to not offer it than to emit "@#abcd".
+        val emoji = MentionCandidate("npub1fff", "🎉 party", "beef")
+        assertTrue(Mentions.matches("@", listOf(emoji)).isEmpty())
+    }
+
+    @Test
+    fun anUnambiguousPlainNameStillInsertsBare() {
+        // The truncation rule must not drag every mention into the suffix form.
+        assertEquals("@vincenzo", Mentions.token(vincenzo, uniqueRoster))
+    }
+
+    @Test
     fun nonLatinNamesMatch() {
         val viktor = MentionCandidate("npub1eee", "Виктор", "1234")
         assertEquals(listOf(viktor), Mentions.matches("ciao @Вик", listOf(viktor, giulia)))

@@ -43,8 +43,15 @@ final class MessageFormattingEngine {
             try! NSRegularExpression(pattern: "#([a-zA-Z0-9_]+)", options: [])
         }()
 
+        /// Mention styling for the mesh bubble.
+        ///
+        /// The leading `(?<=^|\s)` mirrors the core scanner's left boundary.
+        /// Without it this regex painted the `example` in `alice@example.com`
+        /// as a mention while `extractMentions` — which now runs through the
+        /// core — correctly reported none, so the same text was highlighted and
+        /// not-a-mention at the same time.
         static let mention: NSRegularExpression = {
-            try! NSRegularExpression(pattern: "@([\\p{L}0-9_]+(?:#[a-fA-F0-9]{4})?)", options: [])
+            try! NSRegularExpression(pattern: "(?<=^|\\s)@([\\p{L}0-9_]+(?:#[a-fA-F0-9]{4})?)", options: [])
         }()
 
         static let cashu: NSRegularExpression = {

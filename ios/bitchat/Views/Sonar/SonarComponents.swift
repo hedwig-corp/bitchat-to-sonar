@@ -591,6 +591,18 @@ struct SNMsgBubble: View {
         mentions.mentionsMe && !mine ? SonarTheme.accentDeep : bubbleText
     }
 
+    /// Mention spans are offsets into the FULL message text, decoded at row
+    /// build. A collapsed long message renders `preview.text`, which is not just
+    /// a prefix — it is also whitespace-trimmed at both ends, so a message
+    /// starting with whitespace shifts every offset and would style the wrong
+    /// characters. Re-deriving spans here would mean an FFI call per frame, so
+    /// the truncated preview simply goes unstyled until it is expanded.
+    private var renderableMentions: [SNResolvedMention] {
+        guard !mentions.isEmpty else { return [] }
+        guard visibleText == m.text else { return [] }
+        return mentions.mentions
+    }
+
     /// Message text with detected URLs turned into tappable, underlined links,
     /// and `@mentions` styled + linked to the member they name.
     private var linkified: AttributedString {
@@ -598,9 +610,9 @@ struct SNMsgBubble: View {
             visibleText,
             baseColor: bubbleText,
             linkColor: mine ? bubbleText : SonarTheme.accentDeep,
-            mentionFont: mentions.isEmpty ? nil : SonarTheme.uiFont(size: 16, weight: .semibold),
-            mentionColor: mentions.isEmpty ? nil : mentionColor,
-            mentions: mentions.isEmpty ? nil : mentions.mentions,
+            mentionFont: renderableMentions.isEmpty ? nil : SonarTheme.uiFont(size: 16, weight: .semibold),
+            mentionColor: renderableMentions.isEmpty ? nil : mentionColor,
+            mentions: renderableMentions.isEmpty ? nil : renderableMentions,
             detectBareDomains: true,
             excludeLinkBeforeTrailingEllipsis: preview.isTruncated && !isExpanded
         )

@@ -80,6 +80,30 @@ struct SonarMentionsTests {
         #expect(SNMentions.applyPick(draft: draft, pick: vincenzo, roster: uniqueRoster) == draft)
     }
 
+    @Test("a name with a space is forced to carry its key")
+    func nameWithSpaceCarriesKey() {
+        // Display names are free text. Emitting "@John Doe" would put "@John" on
+        // the wire — the scanner stops at the space — and resolve to nobody, so
+        // the token is truncated to the wire-legal run AND carries the suffix,
+        // which resolves by key regardless of the name.
+        let john = SNMentionCandidate(npub: "npub1ddd", name: "John Doe", suffixHex4: "d0e5")
+        let roster = [john, giulia]
+        #expect(SNMentions.token(john, roster: roster) == "@John#d0e5")
+        #expect(SNMentions.applyPick(draft: "hey @Jo", pick: john, roster: roster) == "hey @John#d0e5 ")
+    }
+
+    @Test("a name with no wire-legal run is not offered")
+    func nameWithoutWireLegalRunIsNotOffered() {
+        let emoji = SNMentionCandidate(npub: "npub1fff", name: "🎉 party", suffixHex4: "beef")
+        #expect(SNMentions.matches(draft: "@", roster: [emoji]).isEmpty)
+    }
+
+    @Test("an unambiguous plain name still inserts bare")
+    func unambiguousPlainNameStaysBare() {
+        // The truncation rule must not drag every mention into the suffix form.
+        #expect(SNMentions.token(vincenzo, roster: uniqueRoster) == "@vincenzo")
+    }
+
     @Test("the suffix form resolves regardless of the name")
     func suffixFormResolves() {
         let span = SNMentionSpan(start: 0, end: 14, name: "whoever", suffixHex4: "0011")

@@ -2676,9 +2676,16 @@ private fun MessageBubble(
     // A mention of you is called out in the accent; mentions of other people
     // stay in the link colour so they read as references, not alerts.
     val mentionColor = if (mentions.mentionsMe && !m.mine) s.accent else linkColor
-    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s, mentions, mentionColor) {
+    // Spans are offsets into the FULL message, decoded at row build. A collapsed
+    // long message renders a shortened string, so styling it would depend on the
+    // preview staying a pure prefix. Re-deriving per frame would mean an FFI call
+    // on the render path, so a truncated row goes unstyled until it is expanded —
+    // matching iOS, where the preview is trimmed at BOTH ends and the offsets
+    // genuinely do shift.
+    val renderableMentions = if (visibleText == m.content) mentions.mentions else emptyList()
+    val annotated = remember(visibleText, m.mine, mesh, timeLabel, s, renderableMentions, mentionColor) {
         buildAnnotatedString {
-            append(decorateMessage(visibleText, linkColor, mentions.mentions, mentionColor))
+            append(decorateMessage(visibleText, linkColor, renderableMentions, mentionColor))
             // bc-meta: 10.5px time + transport glyph riding the last line.
             withStyle(SpanStyle(fontSize = 10.5.sp, color = metaColor)) { append(" " + timeLabel) }
             appendInlineContent(BUBBLE_META_ICON, "·")

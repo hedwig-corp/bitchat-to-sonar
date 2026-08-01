@@ -5068,11 +5068,16 @@ class SonarAppState(private val scope: CoroutineScope) {
         val classified =
             forcedKind ?: SonarNotificationRouter.classifyContent(content, ::isCallNotificationContent)
         // A plain message that names us is promoted to Mention so the banner
-        // reads "X mentioned you". Only plain messages are eligible — a payment
-        // or call keeps its own kind. Note this runs AFTER the mute gate above:
-        // a mention does not pierce mute (R-022).
+        // reads "X mentioned you". Only plain messages in a MULTI-MEMBER group
+        // are eligible: a payment or call keeps its own kind, and in a 1:1 chat
+        // "X mentioned you" is both odd and inconsistent with the transcript,
+        // which renders no mention styling there. Note this runs AFTER the mute
+        // gate above: a mention does not pierce mute (R-022).
         val kind =
-            if (classified == SonarNotificationKind.Message && mentionsMe(content)) {
+            if (classified == SonarNotificationKind.Message &&
+                isMultiMemberChat(idKey) &&
+                mentionsMe(content)
+            ) {
                 SonarNotificationKind.Mention
             } else {
                 classified
