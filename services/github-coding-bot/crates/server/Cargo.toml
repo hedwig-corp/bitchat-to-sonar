@@ -1,0 +1,29 @@
+[package]
+name = "coding-bot-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hermes-github-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+coding-bot-config = { path = "../config" }
+coding-bot-domain = { path = "../domain" }
+coding-bot-github = { path = "../github" }
+coding-bot-store = { path = "../store" }
+coding-bot-worker = { path = "../worker" }
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

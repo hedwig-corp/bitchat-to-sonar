@@ -1,0 +1,15 @@
+[package]
+name = "coding-bot-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+coding-bot-domain = { path = "../domain" }
+secrecy.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

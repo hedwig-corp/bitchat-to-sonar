@@ -1,0 +1,60 @@
+name: Hermes GitHub MCP bot
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/github-coding-bot/**"
+      - ".github/workflows/github-coding-bot.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/github-coding-bot/**"
+      - ".github/workflows/github-coding-bot.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_DB: coding_bot_test
+          POSTGRES_USER: coding_bot
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U coding_bot -d coding_bot_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: services/github-coding-bot
+    env:
+      DATABASE_URL: postgres://coding_bot:test-only-password@127.0.0.1:5432/coding_bot_test
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust 1.92
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+          rustup component add clippy rustfmt
+      - name: Formatting
+        run: cargo fmt --all --check
+      - name: Compile
+        run: cargo check --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --workspace
+      - name: PostgreSQL state integration
+        run: cargo test -p coding-bot-store --test postgres_state -- --ignored
+      - name: Build MCP/controller image
+        run: docker build --file Dockerfile.mcp --tag hermes-github-mcp:test .
+      - name: Build sandbox image
+        run: docker build --file Dockerfile.worker --tag hermes-github-sandbox:test .

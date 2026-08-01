@@ -1,0 +1,22 @@
+[package]
+name = "coding-bot-github"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+jsonwebtoken.workspace = true
+octocrab.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+
+[lints]
+workspace = true
