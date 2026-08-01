@@ -1,0 +1,17 @@
+# CODEOWNERS — GitHub requests review from these owners on PRs that touch
+# the listed paths. See https://docs.github.com/repositories/managing-your-repositories-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Scope note: Kyle (@kwsantiago) owns the Compose Desktop (JVM) codebase.
+# The Android source sets and the shared build.gradle.kts are intentionally
+# NOT listed here.
+
+# Desktop JVM implementation + entry point (DesktopSecrets, MeshIdentity,
+# DesktopEnv, SonarCore.jvm, Main.kt, BLE bridge, etc.)
+/apps/sonar/composeApp/src/jvmMain/                                    @kwsantiago
+
+# Desktop JVM tests
+/apps/sonar/composeApp/src/jvmTest/                                    @kwsantiago
+
+# Desktop-only UI composables (physically in commonMain, composed only by
+# the desktop entry point — e.g. SonarDesktopRoot, SecretsAtRiskBanner)
+/apps/sonar/composeApp/src/commonMain/kotlin/chat/bitchat/sonar/desktop/ @kwsantiago
