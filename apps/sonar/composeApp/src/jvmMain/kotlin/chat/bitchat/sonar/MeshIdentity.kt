@@ -10,13 +10,33 @@ import java.security.SecureRandom
 
 /**
  * Desktop mesh identity — the Noise static keypair + Ed25519 announce-signing
- * seed that back this device's bitchat presence, persisted in [DesktopEnv] so the
+ * seed that back this device's bitchat presence, persisted via [DesktopSecrets] (OS keystore) so the
  * mesh peerID is STABLE across launches (the desktop twin of the Android
  * `MeshGatt` identity). Builds the signed ANNOUNCE packet via the SAME byte-exact
  * Rust core (`meshBuildAnnounce`) the Android/iOS apps use, so a phone that
  * receives it shows this desktop as a real named peer.
  */
 object MeshIdentity {
+
+    /**
+     * Refuse to mint a replacement secret when a null might mean "unreadable"
+     * rather than "absent".
+     *
+     * Extracted so both mint sites share one rule and can be tested without a
+     * keystore. `keypair` was guarded and `seedHex` was not, which mattered more
+     * than it looks: `seedHex` is the LEFTMOST argument at both
+     * `meshBuildAnnounce`/`meshBuildSignedPacket` call sites, so Kotlin's
+     * left-to-right evaluation forces it BEFORE `peerIdHex` forces `keypair`.
+     * On a locked keyring it therefore minted and persisted a new seed, and only
+     * then did `keypair` throw into a `runCatching` that swallowed it. The next
+     * healthy launch saw keystore and prefs disagree, treated prefs as newer (it
+     * normally is), and made the rotation permanent.
+     */
+    internal fun requireTrustworthyAbsence(existing: String?, trustworthy: Boolean, what: String) {
+        check(existing != null || trustworthy) {
+            "$what unreadable (keystore fault); refusing to regenerate and rotate the mesh identity"
+        }
+    }
     private const val DEFAULT_TTL: UByte = 7u
     private const val TYPE_SONAR: UByte = 0x53u
 
@@ -26,25 +46,76 @@ object MeshIdentity {
     private fun unhex(s: String): ByteArray =
         ByteArray(s.length / 2) { ((s[it * 2].digitToInt(16) shl 4) or s[it * 2 + 1].digitToInt(16)).toByte() }
 
+    /**
+     * Cached rather than `by lazy` so tests can exercise the REAL call sites.
+     *
+     * An object-scoped `by lazy` is resolved once per JVM, so a test that runs
+     * after anything else has touched the identity can never re-enter the mint
+     * branch, which left the call-site guards testable only through the helper
+     * they delegate to. The regression ledger is explicit that a helper-level
+     * test is not a substitute (R-001 regressed through a missing argument at a
+     * call site while every helper test stayed green).
+     */
+    @Volatile private var keypairCache: NoiseKeypairHex? = null
+    @Volatile private var seedCache: String? = null
+
+    internal fun resetCachesForTest() {
+        keypairCache = null
+        seedCache = null
+    }
+
+    private val keypair: NoiseKeypairHex
+        get() = keypairCache ?: loadOrCreateKeypair().also { keypairCache = it }
+
+    private val seedHex: String
+        get() = seedCache ?: loadOrCreateSeed().also { seedCache = it }
+
     /** Noise static keypair (X25519), persisted or generated + saved once. */
-    private val keypair: NoiseKeypairHex by lazy {
-        val priv = DesktopEnv.getString("mesh.noise.priv")
-        val pub = DesktopEnv.getString("mesh.noise.pub")
+    private fun loadOrCreateKeypair(): NoiseKeypairHex = run {
+        // BOTH halves live in the keystore. Splitting them (private in the
+        // keystore, public in prefs) looked harmless because the public half is
+        // in every announce anyway, but the two stores fail INDEPENDENTLY: with
+        // a locked keyring the private read returns null while the public value
+        // is still on disk, the else-branch regenerates, and the new public key
+        // overwrites prefs while the old private key survives in the keystore.
+        // The next healthy launch then pairs oldPriv with newPub and every Noise
+        // handshake fails permanently. Keeping them together means they are
+        // always present or absent as a unit.
+        val priv = DesktopSecrets.get("mesh.noise.priv")
+        val pub = DesktopSecrets.get("mesh.noise.pub")
         if (priv != null && pub != null) {
             NoiseKeypairHex(priv, pub)
+        } else if (priv != null || pub != null) {
+            // Half-readable means a transient keystore fault, not a first run.
+            error("mesh identity is only half-readable; refusing to regenerate and rotate the mesh fingerprint")
         } else {
+            // BOTH halves unreadable is the COMMON keystore fault (locked
+            // keyring, no D-Bus session), and it is indistinguishable from a
+            // first run by the return value alone: `secret-tool lookup` exits 1
+            // either way. Same rule as the seed, through the same helper so the
+            // two cannot drift; the half-readable case above stays separate
+            // because only this property can have one half.
+            requireTrustworthyAbsence(priv, DesktopSecrets.absenceIsTrustworthy(), "mesh identity")
             noiseGenerateKeypair().also {
-                DesktopEnv.putString("mesh.noise.priv", it.privateHex)
-                DesktopEnv.putString("mesh.noise.pub", it.publicHex)
+                DesktopSecrets.put("mesh.noise.priv", it.privateHex)
+                DesktopSecrets.put("mesh.noise.pub", it.publicHex)
             }
         }
     }
 
     /** Ed25519 announce-signing seed (32 bytes hex), persisted or made once. */
-    private val seedHex: String by lazy {
-        DesktopEnv.getString("mesh.ed25519.seed")
+    private fun loadOrCreateSeed(): String = run {
+        // Signs the 0x01 announce and the 0x53 Sonar Discovery packet, so a peer
+        // that holds it can forge either. Same storage as the Noise key.
+        val existing = DesktopSecrets.get("mesh.ed25519.seed")
+        requireTrustworthyAbsence(
+            existing,
+            DesktopSecrets.absenceIsTrustworthy(),
+            "mesh announce seed",
+        )
+        existing
             ?: hex(ByteArray(32).also { SecureRandom().nextBytes(it) })
-                .also { DesktopEnv.putString("mesh.ed25519.seed", it) }
+                .also { DesktopSecrets.put("mesh.ed25519.seed", it) }
     }
 
     /** bitchat peerID = SHA256(noise static pubkey)[:8], hex. */
