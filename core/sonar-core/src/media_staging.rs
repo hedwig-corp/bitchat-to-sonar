@@ -566,10 +566,20 @@ fn write_private_file(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn new_media_staging_id() -> String {
+pub(crate) fn new_media_staging_id() -> Result<String> {
     let mut buf = [0u8; 16];
-    let _ = getrandom::getrandom(&mut buf);
-    hex::encode(buf)
+    // Swallowing the error leaves `buf` zeroed, so every staged item would land
+    // on the same id and collide on disk. The only caller is inside a `Result`
+    // send path that already surfaces failures to the user, so propagate rather
+    // than panic — `MeshSigner::generate` returns a bare `Self` and has nowhere
+    // to put the error, which is why it is the one place that expects.
+    //
+    // Bare `?` on purpose: `Error::Rng(#[from] getrandom::Error)` classifies
+    // this as an RNG failure. Wrapping it in `Error::Storage` would report a
+    // dead CSPRNG as a disk problem — the wrong triage signal in exactly the
+    // scenario this is meant to make diagnosable.
+    getrandom::getrandom(&mut buf)?;
+    Ok(hex::encode(buf))
 }
 
 #[cfg(test)]

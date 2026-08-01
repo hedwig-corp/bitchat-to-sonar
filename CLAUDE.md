@@ -172,6 +172,45 @@ The value must never be empty, `https:`, `http:`, or anything without a host.
 If this check fails, fix the build setting before archiving; otherwise the app
 can launch successfully while silently disabling Breez offline payment wakeups.
 
+## Randomness Rule
+
+A degraded RNG path must never succeed quietly. Nonces, IVs, salts, challenges,
+key material, and any id that goes on the wire come from the OS CSPRNG, and a
+CSPRNG failure fails the operation — it never falls back to a zeroed buffer or a
+seeded PRNG.
+
+- **Swift** — `SecRandomCopyBytes` leaves its buffer untouched on failure, and
+  every buffer here starts zero-filled, so discarding the `OSStatus` yields an
+  all-zeros "random" value. Go through `SecureRandom.bytes(_:)` /
+  `SecureRandom.optionalBytes(_:)` (`ios/bitchat/Utils/SecureRandom.swift`).
+- **Rust** — an unhandled `getrandom` leaves the array zeroed. Propagate with
+  `?` (prefer bare `?` — `Error::Rng` classifies it correctly; wrapping it in a
+  storage/IO error reports a dead CSPRNG as a disk fault) or
+  `.expect("OS RNG available")`. `let _ =`, `let _res =`, `.ok()`, and a `match`
+  that drops both arms are all the same swallow.
+- **Compose** — `kotlin.random.Random` is a clock-seeded XorWow, not a CSPRNG.
+  Use `secureRandomBytes()` / `secureRandomHex()` (`SecureRandom.kt`), which is
+  the Compose-side match for iOS's CSPRNG-backed `UUID()`.
+
+The one exception is BIP-340 `aux_rand` (`NostrProtocol.swift`): an all-zero
+`aux_rand` is the spec's own "no auxiliary randomness" case and produces a sound
+signature, so that site degrades rather than failing event signing outright. It
+degrades *deliberately and logged*. Any other zeroed-buffer fallback is a bug.
+
+Deliberate non-crypto randomness (UI jitter, backoff, sampling) is fine with an
+inline `// rng-hygiene: ok — <reason>` marker on the same line or the line above.
+
+`scripts/check-rng-hygiene.sh` enforces all three in CI. Know what it does not
+cover: it is a grep, so it catches the shape, not the intent — it cannot tell
+whether a checked call feeds the right value. It scans **tracked** files only:
+all `*.swift`, all `*.rs` outside `vendor/` and `target/`, and all `*.kt`, minus
+test source sets. `secureRandomBytes()`/`secureRandomHex()` are `internal` to
+`composeApp`, so Kotlin under `packages/` is flagged but has no seam to use yet —
+add one there if that code ever needs randomness. Intent, and whether a value is
+used correctly once generated, stay review questions. The rule exists because
+this class of bug is silent by construction — see the script header for the
+COLDCARD firmware disclosure that motivated it.
+
 ## Regression Invariant Rule
 
 Some bugs in this repo have been fixed more than once. [`docs/REGRESSIONS.md`](docs/REGRESSIONS.md)

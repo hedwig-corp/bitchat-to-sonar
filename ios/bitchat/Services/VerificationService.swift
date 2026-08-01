@@ -81,8 +81,12 @@ final class VerificationService {
         let noiseKey = noise.getStaticPublicKeyData().hexEncodedString()
         let signKey = noise.getSigningPublicKeyData().hexEncodedString()
         let ts = Int64(Date().timeIntervalSince1970)
-        var nonce = Data(count: 16)
-        _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
+        // A zero nonce would make every QR payload replayable, so fail instead.
+        // Note the caller (VerificationViews) currently collapses nil to "" and
+        // renders an empty QR box with no message — a pre-existing gap on the
+        // `noise == nil` path that this shares. SecureRandom.bytes logs the
+        // cause; the missing error UI is tracked separately.
+        guard let nonce = SecureRandom.optionalBytes(16) else { return nil }
         let nonceB64 = nonce.base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
         let payload = VerificationQR(v: 1, noiseKeyHex: noiseKey, signKeyHex: signKey, npub: npub, nickname: nickname, ts: ts, nonceB64: nonceB64, sigHex: "")
         let msg = payload.canonicalBytes()

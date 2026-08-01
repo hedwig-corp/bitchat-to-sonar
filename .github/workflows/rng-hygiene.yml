@@ -1,0 +1,39 @@
+name: RNG hygiene
+
+# A degraded RNG path must not be able to succeed quietly. See
+# scripts/check-rng-hygiene.sh for the three shapes this checks and the
+# COLDCARD disclosure that motivated them.
+#
+# Deliberately separate from the platform build workflows: this is pure shell
+# (seconds, no JDK/Rust/Xcode). It also matters most for iOS, which has no test
+# job in CI at all.
+#
+# No `paths:` filter on purpose. The script scans the whole tracked tree and
+# runs in under a second, and a path-filtered job cannot serve as a required
+# status check — PRs touching none of the filtered globs would report nothing
+# and block forever. Cheap enough to always run.
+#
+# NOTE: as of 2026-08-01 `main` has no branch protection, so nothing here is
+# actually a required check — this job reports, it does not gate. Keeping it
+# unfiltered is what makes it *eligible* to be marked required later; making it
+# so is a repo-admin decision. Until then, a red run has to be read by a human.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check:
+    name: No predictable-RNG fallbacks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for silent RNG fallbacks
+        run: ./scripts/check-rng-hygiene.sh

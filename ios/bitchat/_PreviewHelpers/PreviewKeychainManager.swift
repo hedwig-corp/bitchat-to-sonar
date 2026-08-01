@@ -67,6 +67,11 @@ final class PreviewKeychainManager: KeychainManagerProtocol {
         serviceStorage[service]?[key]
     }
 
+    func loadWithResult(key: String, service: String) -> KeychainReadResult {
+        if let data = serviceStorage[service]?[key] { return .success(data) }
+        return .itemNotFound
+    }
+
     func delete(key: String, service: String) {
         serviceStorage[service]?.removeValue(forKey: key)
     }

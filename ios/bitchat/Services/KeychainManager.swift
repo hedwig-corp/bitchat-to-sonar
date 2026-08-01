@@ -73,6 +73,9 @@ protocol KeychainManagerProtocol {
     func save(key: String, data: Data, service: String, accessible: CFString?)
     /// Load data from a custom service
     func load(key: String, service: String) -> Data?
+    /// Load data from a custom service with the failure classified. Required
+    /// for any caller that would mint a replacement secret on a `nil` read.
+    func loadWithResult(key: String, service: String) -> KeychainReadResult
     /// Delete data from a custom service
     func delete(key: String, service: String)
 }
@@ -627,18 +630,33 @@ final class KeychainManager: KeychainManagerProtocol {
 
     /// Load data from a custom service
     func load(key: String, service customService: String) -> Data? {
+        if case .success(let data) = loadWithResult(key: key, service: customService) {
+            return data
+        }
+        return nil
+    }
+
+    /// `load(key:service:)` with the failure classified.
+    ///
+    /// The bare `Data?` cannot distinguish "no such item" from "exists but not
+    /// readable right now" (device locked, access denied). Callers that would
+    /// respond to `nil` by MINTING AND PERSISTING a replacement secret must use
+    /// this instead: treating a transient read failure as "absent" silently
+    /// overwrites the real key. Same discipline as
+    /// `getIdentityKeyWithResult` / `MarmotService.databaseConfig`, which is
+    /// what the Account Key Durability Rule requires (invariant 2).
+    func loadWithResult(key: String, service customService: String) -> KeychainReadResult {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: customService,
             kSecAttrAccount as String: key,
-            kSecReturnData as String: true
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
         ]
 
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-
-        guard status == errSecSuccess else { return nil }
-        return result as? Data
+        return classifyReadStatus(status, data: result as? Data)
     }
 
     /// Delete data from a custom service

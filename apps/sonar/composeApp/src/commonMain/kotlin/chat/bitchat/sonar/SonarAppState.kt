@@ -8020,7 +8020,9 @@ class SonarAppState(private val scope: CoroutineScope) {
     fun sendVoiceNote(chatId: String, bytes: ByteArray) {
         if (marmotAccountMutationSuspended) return
         if (isContactBlocked(chatId)) { toast = "Unblock this contact before sending."; return }
-        val filename = "vn-${(1000..99999).random()}.m4a"
+        // ~98k values out of a seeded PRNG collide by birthday after a few
+        // hundred sends, and this name travels with the attachment.
+        val filename = "vn-${secureRandomHex(6)}.m4a"
         val mime = "audio/mp4"
         if (isMeshChat(chatId) && liveMeshRoutePeerId(meshPeerId(chatId)) != null) {
             if (sendMeshMedia(meshPeerId(chatId), bytes, filename, mime)) return
@@ -10758,8 +10760,10 @@ class SonarAppState(private val scope: CoroutineScope) {
         return canonicalNpubHex(other)
     }
 
-    private fun randomMeshId(): String =
-        (0 until 16).joinToString("") { "0123456789abcdef"[kotlin.random.Random.nextInt(16)].toString() }
+    // CSPRNG, not kotlin.random: these ids travel on the mesh and key dedup, so
+    // a predictable one lets a peer pre-seed the dedup entry for a message you
+    // have not sent yet. iOS mints the same field from UUID(). See SecureRandom.kt.
+    private fun randomMeshId(): String = secureRandomHex(8)
 
     private fun ByteArray.toHexLower(): String =
         joinToString("") { (it.toInt() and 0xFF).toString(16).padStart(2, '0') }

@@ -38,8 +38,7 @@ data class TrillLine(val id: String) {
     }
 }
 
-internal fun randomTrillId(): String =
-    (0 until 16).map { "0123456789abcdef".random() }.joinToString("")
+internal fun randomTrillId(): String = secureRandomHex(8)
 
 /** MSN's own guard: the nudge action is disabled for 8 s per chat after sending. */
 internal const val TRILL_SEND_COOLDOWN_MS = 8_000L

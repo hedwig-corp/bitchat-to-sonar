@@ -3317,9 +3317,9 @@ final class ChatViewModel: ObservableObject, BitchatDelegate, CommandContextProv
         if pendingQRVerifications[peerID] != nil {
             return true
         }
-        // Generate nonceA
-        var nonce = Data(count: 16)
-        _ = nonce.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 16, $0.baseAddress!) }
+        // Generate nonceA. A predictable challenge defeats the whole point of
+        // the exchange, so abort rather than continue with a zero nonce.
+        guard let nonce = SecureRandom.optionalBytes(16) else { return false }
         var pending = PendingVerification(noiseKeyHex: qr.noiseKeyHex, signKeyHex: qr.signKeyHex, nonceA: nonce, startedAt: Date(), sent: false)
         pendingQRVerifications[peerID] = pending
         // If Noise session is established, send immediately; otherwise trigger handshake and send on auth
