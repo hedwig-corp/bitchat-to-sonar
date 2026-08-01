@@ -368,6 +368,13 @@ pub const KNOWN_SENDER_GROUP_CAP: usize = 3;
 /// every real conversation on both hosts. Counting only 2-member invites
 /// would leave a 3-member-group spammer an open door.
 pub const PENDING_INVITE_CAP: usize = 25;
+/// Ceiling on parked invites for a welcomer we already share an active group
+/// with. Higher than [`PENDING_INVITE_CAP`] so a stranger flood cannot lock a
+/// real contact out of inviting us, but STILL A CEILING: an attacker whose
+/// first welcome was auto-accepted is "known" from then on, so an unbounded
+/// exemption just moves the flood from silent groups into an unbounded invite
+/// list — the exact failure [`PENDING_INVITE_CAP`] exists to prevent.
+pub const KNOWN_SENDER_PENDING_INVITE_CAP: usize = 50;
 
 /// Sidecar suffix for the persisted auto-accept window (JSON `[u64]` of unix
 /// seconds). Shares fate with the DB in [`MarmotEngine::wipe`].
@@ -656,7 +663,7 @@ impl MarmotEngine {
                 consume_budget: true,
             };
         }
-        let shared = self.shared_active_groups_with(&welcome.welcomer);
+        let shared = self.shared_active_groups_with(&welcome.welcomer, KNOWN_SENDER_GROUP_CAP);
         if shared > 0 && shared < KNOWN_SENDER_GROUP_CAP {
             return DmWelcomeDecision::AutoAccept {
                 consume_budget: false,
@@ -669,23 +676,33 @@ impl MarmotEngine {
         self.park_or_drop_welcome(welcome)
     }
 
-    /// How many ACTIVE groups we already share with `welcomer`. Bounds the
-    /// known-sender bypass (see [`KNOWN_SENDER_GROUP_CAP`]) and lets the
-    /// parked-invite ceiling exempt someone we already talk to.
-    fn shared_active_groups_with(&self, welcomer: &PublicKey) -> usize {
-        self.groups()
-            .ok()
-            .map(|groups| {
-                groups
-                    .iter()
-                    .filter(|g| {
-                        self.members(&g.mls_group_id)
-                            .ok()
-                            .is_some_and(|members| members.contains(welcomer))
-                    })
-                    .count()
-            })
-            .unwrap_or(0)
+    /// How many ACTIVE groups we already share with `welcomer`, counting no
+    /// further than `limit`. Bounds the known-sender bypass (see
+    /// [`KNOWN_SENDER_GROUP_CAP`]) and the parked-invite exemption.
+    ///
+    /// `limit` is not a nicety. This runs inside `process_incoming`, which
+    /// holds the `mls_write` mutex that outgoing message creation also needs,
+    /// and every group costs a membership storage lookup — so an unbounded
+    /// scan lets relay welcome traffic block SENDING on an account with many
+    /// conversations, against the Signal-comparable performance rule. Every
+    /// caller compares against a small ceiling, so stopping there is exact,
+    /// not approximate: the count is only ever used as `> 0` or `< CAP`.
+    fn shared_active_groups_with(&self, welcomer: &PublicKey, limit: usize) -> usize {
+        let Ok(groups) = self.groups() else { return 0 };
+        let mut shared = 0usize;
+        for group in groups.iter() {
+            if shared >= limit {
+                break;
+            }
+            if self
+                .members(&group.mls_group_id)
+                .ok()
+                .is_some_and(|members| members.contains(welcomer))
+            {
+                shared += 1;
+            }
+        }
+        shared
     }
 
     /// Park as pending unless the parked-invite ceiling is already hit.
@@ -697,21 +714,29 @@ impl MarmotEngine {
     /// DM-only ceiling, and the invite list is a single list to the user
     /// either way.
     fn park_or_drop_welcome(&self, current: &welcome_types::Welcome) -> DmWelcomeDecision {
-        // Someone we already share an active group with is never dropped: the
-        // ceiling exists to bound a stranger flood, and without this exemption
-        // 25 parked spam invites turn into a permanent invite outage for real
-        // contacts too.
-        if self.shared_active_groups_with(&current.welcomer) > 0 {
-            return DmWelcomeDecision::Park;
-        }
+        // Someone we already share an active group with gets a HIGHER ceiling,
+        // never an unbounded one. The exemption is real — without it 25 parked
+        // spam invites become a permanent invite outage for real contacts —
+        // but returning Park unconditionally handed the attacker the flood back
+        // through the other door: their first welcome is auto-accepted, which
+        // makes them "known", and every later welcome then parked forever. The
+        // group cap stopped the silent groups while the invite list grew without
+        // limit, so the fix bounded one half and left the other open.
+        let known_sender = self.shared_active_groups_with(&current.welcomer, 1) > 0;
+        let cap = if known_sender {
+            KNOWN_SENDER_PENDING_INVITE_CAP
+        } else {
+            PENDING_INVITE_CAP
+        };
         let parked = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))
             .map(|ws| ws.iter().filter(|w| w.id != current.id).count())
             .unwrap_or(0);
-        if parked >= PENDING_INVITE_CAP {
+        if parked >= cap {
             tracing::warn!(
                 welcomer = %current.welcomer,
                 member_count = current.member_count,
-                cap = PENDING_INVITE_CAP,
+                cap,
+                known_sender,
                 "pending-invite ceiling hit; declining a welcome without surfacing it"
             );
             DmWelcomeDecision::Drop

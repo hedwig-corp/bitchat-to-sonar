@@ -7,7 +7,8 @@ use nostr::{EventBuilder, Kind, RelayUrl};
 use sonar_core::identity::Identity;
 use sonar_core::invite_link::{build_join_request_rumor, JOIN_REQUEST_RUMOR_KIND};
 use sonar_core::marmot::{
-    Incoming, MarmotEngine, PENDING_INVITE_CAP, UNKNOWN_DM_AUTOACCEPT_MAX,
+    Incoming, MarmotEngine, KNOWN_SENDER_PENDING_INVITE_CAP, PENDING_INVITE_CAP,
+    UNKNOWN_DM_AUTOACCEPT_MAX,
 };
 
 #[tokio::test]
@@ -798,5 +799,46 @@ async fn multi_member_invite_flood_is_capped_too() {
         PENDING_INVITE_CAP,
         "dropped welcomes must not leave stored group rows behind — the \
          database, not just the invite list, is what #419 bounds"
+    );
+}
+
+/// Review round: the known-sender exemption on the parked-invite ceiling was
+/// UNBOUNDED, and that gave the flood its door back. One attacker's first
+/// welcomes are auto-accepted on the budget, which makes that key "known" from
+/// then on; `park_or_drop_welcome` then returned `Park` unconditionally for it,
+/// so the group cap bounded the silent groups while the pending-invite list
+/// grew forever — the exact storage denial of service `PENDING_INVITE_CAP`
+/// exists to stop. A known sender must get a HIGHER ceiling, never no ceiling.
+#[tokio::test]
+async fn a_known_sender_cannot_park_unlimited_invites() {
+    let relay = RelayUrl::parse("wss://relay.example.com").expect("relay url");
+    let bob = MarmotEngine::in_memory(Identity::generate());
+    // ONE attacker identity for every welcome — that is what makes it "known".
+    let stranger = MarmotEngine::in_memory(Identity::generate());
+
+    let mut dropped = 0usize;
+    for _ in 0..(KNOWN_SENDER_PENDING_INVITE_CAP + 10) {
+        let bob_kp = bob.key_package_event(vec![relay.clone()]).expect("bob kp");
+        let creation = stranger
+            .create_group("spam", vec![bob_kp], vec![relay.clone()])
+            .expect("stranger creates 2-member group");
+        let (pk, welcome) = creation.welcomes[0].clone();
+        let wrapped = stranger
+            .gift_wrap_welcome(&pk, welcome)
+            .await
+            .expect("wrap welcome");
+        if let Incoming::None = bob.process_incoming(&wrapped).await.expect("process") {
+            dropped += 1;
+        }
+    }
+
+    assert!(
+        dropped > 0,
+        "a known sender past the ceiling must have welcomes declined, not parked forever"
+    );
+    let parked = bob.pending_group_invites().expect("invites").len();
+    assert!(
+        parked <= KNOWN_SENDER_PENDING_INVITE_CAP,
+        "parked invites from one known sender must stop at the ceiling, got {parked}"
     );
 }
