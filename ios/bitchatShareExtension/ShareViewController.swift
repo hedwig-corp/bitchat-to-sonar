@@ -361,6 +361,19 @@ final class ShareViewController: UIViewController {
             if scoped { source.stopAccessingSecurityScopedResource() }
         }
 
+        // Reject directories BEFORE the size check. A `public.file-url` provider
+        // (Files.app "Folders", any package/bundle) can hand us a directory, and
+        // every guard below waves it through: `attributesOfItem[.size]` reports
+        // the directory ENTRY (~96 bytes), so it passes `size > 0` AND the byte
+        // budget, and then `copyItem` copies the whole tree recursively — an
+        // unbounded copy into the extension's payload, recorded with a bogus
+        // 96-byte `byteCount`. A folder is not a shareable attachment; a file is.
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: source.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return .unreadable
+        }
         guard let size = (try? fileManager.attributesOfItem(atPath: source.path))?[.size] as? Int,
               size > 0
         else {
