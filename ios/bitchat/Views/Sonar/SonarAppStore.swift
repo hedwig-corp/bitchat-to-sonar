@@ -8814,7 +8814,15 @@ final class SonarAppStore: ObservableObject {
             return []
         }
         guard let group = marmot.groups.first(where: { $0.id == groupId }) else { return [] }
-        let mine = Self.canonicalCallKey(marmot.npub ?? "")
+        // No local identity yet (cold start, or a wake before the keychain
+        // read) means we cannot subtract OURSELVES from the roster. `?? ""`
+        // canonicalized to an empty key, which the filter below then kept
+        // every member against — so a 2-party DM reported BOTH sides as
+        // "other", the admission check saw a non-direct conversation, and it
+        // rejected a legitimate call control. Return no roster instead and let
+        // `structurallyDirect` judge it, exactly as a mesh DM already does.
+        guard let npub = marmot.npub, !npub.isEmpty else { return [] }
+        let mine = Self.canonicalCallKey(npub)
         return group.memberNpubs
             .map(Self.canonicalCallKey)
             .filter { !$0.isEmpty && $0 != mine }
