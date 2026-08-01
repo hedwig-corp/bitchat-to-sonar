@@ -1040,6 +1040,14 @@ final class MarmotChatModel: ObservableObject {
     ///    `AutoBackupBackgroundScheduler.closeStoreIfStillBackgrounded` — the
     ///    same one-directional `ran` gate, the same detached foreground-race
     ///    reconnect (see that method for why detached and ungated).
+    ///
+    /// Named residual: if a straddling run outlives the `beginBackgroundTask`
+    /// window (~30s; both field-measured backups took ~13s), iOS suspends us
+    /// after the expiry handler and the close below is never reached. Closing
+    /// FROM the expiry handler is the round-6 `Rejected` item — expiry can land
+    /// mid-seal, where `closeNode` clearing `nodeClosing` drops the fence the
+    /// seal still holds and can leave the store permanently closed. Accepted,
+    /// like the BGTask handler's cancel-only expiry, and for the same reason.
     private func runAutoBackupTimerTick() async {
         #if os(iOS)
         guard UIApplication.shared.applicationState != .background else {
