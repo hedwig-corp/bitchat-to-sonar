@@ -484,9 +484,27 @@ impl DmAutoacceptBudget {
     /// The property the old ordering protected — a welcome that fails MLS
     /// processing must not eat a real first contact's slot — is preserved by
     /// [`Self::release`] rather than by ordering.
+    /// The cap is re-checked HERE, not only in [`Self::has_room`]. Those are
+    /// two separate steps of `process_incoming`, and this one used to
+    /// `push_back` unconditionally — so anything `refresh_from_disk` unioned in
+    /// between (the iOS NSE runs its own engine against the same sidecar) was
+    /// added on top of a decision taken against a smaller window, and the
+    /// window could grow past the maximum. Failing here parks the welcome,
+    /// which is the same fail-closed path a failed persist already takes.
+    ///
+    /// Residual: two processes that both refresh before either persists can
+    /// still each admit one, so this bounds the overrun rather than making the
+    /// window strictly atomic. Closing that needs a lock around the sidecar
+    /// read-modify-write, the way `MarmotStoreLock` guards the store.
     fn reserve(&mut self, now_secs: u64) -> std::io::Result<()> {
         self.refresh_from_disk();
         self.prune(now_secs);
+        if self.admits.len() >= UNKNOWN_DM_AUTOACCEPT_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "dm auto-accept budget exhausted",
+            ));
+        }
         self.admits.push_back(now_secs);
         match self.persist() {
             Ok(()) => Ok(()),
@@ -2128,6 +2146,45 @@ mod dm_autoaccept_budget_tests {
         assert!(!b.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS - 1));
         // The first admit ages out; exactly one slot frees.
         assert!(b.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS));
+    }
+
+    /// `reserve` is the authority on the cap, not `has_room`.
+    ///
+    /// They are two separate steps of `process_incoming`, and the iOS NSE runs
+    /// its own engine against the same sidecar. A peer process filling the
+    /// window between our `has_room` and our `reserve` used to be added to
+    /// silently — `reserve` pushed unconditionally — so the window could grow
+    /// past the maximum and hand out extra silent groups. Now it fails, and the
+    /// caller parks the welcome on that error.
+    #[test]
+    fn reserve_refuses_once_another_process_filled_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let t0 = 3_000_000;
+
+        // We observe room...
+        let mut ours = DmAutoacceptBudget::load(&db_path);
+        assert!(ours.has_room(t0), "precondition: the window starts empty");
+
+        // ...and the "NSE" fills the window from its own process before we act.
+        let mut peer = DmAutoacceptBudget::load(&db_path);
+        for i in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+            peer.reserve(t0 + i as u64).expect("peer reserve persists");
+        }
+        drop(peer);
+
+        // Act AFTER the peer's admits: `prune` drops future-dated stamps, so
+        // reserving at t0 would legitimately see a window of one.
+        let now = t0 + UNKNOWN_DM_AUTOACCEPT_MAX as u64;
+        assert!(
+            ours.reserve(now).is_err(),
+            "reserve must refuse a slot the window can no longer afford"
+        );
+        let mut reloaded = DmAutoacceptBudget::load(&db_path);
+        assert!(
+            !reloaded.has_room(now),
+            "and it must not have grown the window past the maximum"
+        );
     }
 
     /// `has_room` must not consume — the slot is recorded only after a
