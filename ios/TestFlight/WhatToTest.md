@@ -1,16 +1,16 @@
 # TestFlight — What to Test
 
-Build: **Sonar 1.12.7 (35)** · release tag **v0.1-alpha.12.2**
+Build: **Sonar 1.12.9 (38)** · release tag **v0.1-alpha.12.4** · **last cut before alpha.13**
 
-Cut after alpha.12.1 + Apple hotfixes through 1.12.6, then 0xdead10cc round 6
-(abort a Marmot connect that holds the store when iOS suspends; close a store a
-background auto-backup reopened), restored group-invite link handoff/approval,
-backup stats carried into the live policy after a restore, short transcripts
-bottom-aligned and re-pinned on viewport shrink, and internet replies that only
-the chat list could see now surfaced in the transcript. Opening a chat should
-paint from local storage first; missed messages catch up in the background;
-payments and notifications should stay stable when the phone is locked or the
-app is killed.
+Security-driven release: RNG hardening (#554). Five iOS SecRandomCopyBytes call
+sites that discarded the OSStatus now fail loudly on error instead of producing
+all-zero nonces/seeds (NIP-44 nonce, geohash device seed, verification nonces,
+BIP-340 aux_rand). Compose now uses SecureRandom instead of clock-seeded
+kotlin.random for mesh/pay/trill ids. Rust media_staging no longer swallows
+getrandom errors. Everything from alpha.12.2–12.3 carries: 0xdead10cc round 7
+(auto-backup timer no longer reopens the store while backgrounded), group-invite
+links, backup stats, short-transcript bottom-align. Opening a chat should paint
+from local storage first; payments and notifications stay stable when locked.
 
 ## 1. Sync speed & catching up (headline)
 
