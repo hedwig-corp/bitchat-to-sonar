@@ -63,7 +63,7 @@ pub struct ImportedSignalSticker {
     pub sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SignalImportOptions {
     /// Accept invalid TLS certificates when fetching encrypted Signal CDN blobs.
     ///
@@ -71,6 +71,17 @@ pub struct SignalImportOptions {
     /// private CA. Sticker contents are still authenticated by Signal's
     /// pack-key HMAC before they are returned.
     pub accept_invalid_certs: bool,
+    /// Additional root certificates to trust when fetching Signal CDN blobs,
+    /// PEM encoded.
+    ///
+    /// `cdn.signal.org` is served under a chain rooted in Signal's own CA,
+    /// which no public trust store contains. A client built on the system
+    /// roots alone therefore cannot complete the handshake for *any* pack —
+    /// the failure looks like a bad link but is not one. Supplying Signal's
+    /// root here is the correct fix: unlike [`Self::accept_invalid_certs`] it
+    /// keeps full certificate verification on and widens trust to exactly one
+    /// known issuer. Signal's own clients bundle the same root.
+    pub root_certificates: Vec<Vec<u8>>,
     /// Continue importing when one sticker asset is missing or cannot be
     /// decrypted. Skipped ids are reported in [`ImportedSignalPack`].
     pub skip_failed_stickers: bool,
@@ -133,12 +144,12 @@ impl SignalPackLink {
 }
 
 pub async fn import_signal_pack(link: &str) -> Result<ImportedSignalPack> {
-    import_signal_pack_with_options(link, SignalImportOptions::default()).await
+    import_signal_pack_with_options(link, &SignalImportOptions::default()).await
 }
 
 pub async fn import_signal_pack_with_options(
     link: &str,
-    options: SignalImportOptions,
+    options: &SignalImportOptions,
 ) -> Result<ImportedSignalPack> {
     let link = SignalPackLink::parse(link)?;
     let keys = derive_keys(&link.pack_key_bytes()?)?;
@@ -319,17 +330,45 @@ fn decrypt_attachment(
         .map_err(|e| StickerError::Crypto(format!("AES-CBC decrypt failed: {e}")))
 }
 
+/// Build the HTTP client used for Signal CDN fetches.
+///
+/// Split out of [`fetch_limited`] so the trust configuration is testable
+/// without a network call or an async runtime.
+fn build_http_client(options: &SignalImportOptions) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .danger_accept_invalid_certs(options.accept_invalid_certs)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(60));
+    for pem in &options.root_certificates {
+        // `from_pem_bundle`, not `from_pem`: the latter accepts anything —
+        // empty input and plain garbage both parse "successfully" and are then
+        // silently dropped, leaving the client back on the system roots and
+        // failing the handshake the caller pinned a root to fix. The bundle
+        // form rejects malformed PEM outright and reports how many
+        // certificates it actually read, so an unusable root is an error here
+        // rather than a confusing TLS failure later.
+        let certs = reqwest::Certificate::from_pem_bundle(pem)
+            .map_err(|e| StickerError::Http(format!("invalid root certificate: {e}")))?;
+        if certs.is_empty() {
+            return Err(StickerError::Http(
+                "root certificate contained no PEM certificates".to_string(),
+            ));
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    builder
+        .build()
+        .map_err(|e| StickerError::Http(e.to_string()))
+}
+
 async fn fetch_limited(
     url: &str,
     max_bytes: usize,
-    options: SignalImportOptions,
+    options: &SignalImportOptions,
 ) -> Result<Vec<u8>> {
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(options.accept_invalid_certs)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .map_err(|e| StickerError::Http(e.to_string()))?;
+    let client = build_http_client(options)?;
     let resp = client
         .get(url)
         .send()
@@ -468,5 +507,52 @@ mod tests {
         mac.update(&out);
         out.extend_from_slice(&mac.finalize().into_bytes());
         out
+    }
+
+    /// A malformed root must surface as an error, not be silently skipped —
+    /// skipping it would fall back to the system roots and reproduce the exact
+    /// handshake failure the caller supplied a root to avoid.
+    #[test]
+    fn invalid_root_certificate_is_rejected() {
+        let options = SignalImportOptions {
+            root_certificates: vec![b"not a certificate".to_vec()],
+            ..SignalImportOptions::default()
+        };
+        let error = build_http_client(&options).expect_err("malformed root must not be ignored");
+        assert!(
+            matches!(&error, StickerError::Http(message) if message.contains("root certificate")),
+            "unexpected error: {error:?}"
+        );
+
+        // Bad base64 inside PEM markers fails parsing rather than yielding an
+        // empty set — a different path to the same guarantee.
+        let malformed = SignalImportOptions {
+            root_certificates: vec![
+                b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".to_vec(),
+            ],
+            ..SignalImportOptions::default()
+        };
+        assert!(build_http_client(&malformed).is_err());
+    }
+
+    /// The bundled root a caller would actually pin must parse.
+    #[test]
+    fn a_valid_root_certificate_is_accepted() {
+        let pem = include_bytes!("../tests/signal-root.pem");
+        let options = SignalImportOptions {
+            root_certificates: vec![pem.to_vec()],
+            ..SignalImportOptions::default()
+        };
+        assert!(build_http_client(&options).is_ok());
+    }
+
+    /// Default options trust only the platform roots, so existing callers keep
+    /// their current behaviour.
+    #[test]
+    fn default_options_pin_nothing() {
+        let options = SignalImportOptions::default();
+        assert!(options.root_certificates.is_empty());
+        assert!(!options.accept_invalid_certs);
+        assert!(build_http_client(&options).is_ok());
     }
 }
