@@ -76,4 +76,28 @@ struct RelayConnectionPolicyTests {
         #expect(RelayConnectionPolicy.shouldInvalidateOnPushWake(appVisible: true) == false)
         #expect(RelayConnectionPolicy.shouldInvalidateOnPushWake(appVisible: false))
     }
+
+    @Test("a backgrounded attach with no push-wake owner must be refused")
+    func backgroundedAttachWithoutOwnerRefused() {
+        // Consumed by `MarmotChatModel.connectRelaysIfNeeded`. Flipping this to
+        // true lets a straggler attach (e.g. a backup's post-seal reconnect)
+        // open/hold SQLCipher while backgrounded with nobody left to close it —
+        // on 1.12.9 (38) the store reopened ~200ms after the BGTask executor
+        // logged "store closed" and RunningBoard killed the suspension with
+        // 0xdead10cc (round 8).
+        #expect(RelayConnectionPolicy.mayAttachRelays(foreground: false, pushWakeOwned: false) == false)
+    }
+
+    @Test("the push wake may attach relays while backgrounded")
+    func pushWakeMayAttachRelaysBackgrounded() {
+        // The wake brackets its drain in `pushWakeOwnership` and closes after
+        // itself (`closeStoreWithDeadline`); refusing it would kill background
+        // message delivery entirely.
+        #expect(RelayConnectionPolicy.mayAttachRelays(foreground: false, pushWakeOwned: true))
+    }
+
+    @Test("a foreground attach is never gated")
+    func foregroundAttachNeverGated() {
+        #expect(RelayConnectionPolicy.mayAttachRelays(foreground: true, pushWakeOwned: false))
+    }
 }

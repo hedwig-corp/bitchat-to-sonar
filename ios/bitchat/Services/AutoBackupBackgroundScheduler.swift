@@ -161,7 +161,12 @@ final class AutoBackupBackgroundScheduler {
         }
         SecureLogger.info("Auto-backup \(label): running", category: .session)
         let work = Task { @MainActor in
-            await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
+            // `reopenStore: false`: the upload is node-free, so a background
+            // backup leaves the store CLOSED instead of reopening it for this
+            // handler's close to race. On 1.12.9 (38) the reopen's straggler
+            // relay attach re-opened SQLCipher after "store closed" and iOS
+            // killed the suspension 0xdead10cc (round 8).
+            await store.marmot.runAutoBackupIfDue(allowWhileActive: true, reopenStore: false)
         }
         // Deliberately still cancel-only. Closing the store from here as well
         // looks like the obvious completion of this fix and is a WORSE bug:
@@ -337,7 +342,9 @@ final class AutoBackupBackgroundScheduler {
             // here: this fires on EVERY backgrounding, so closing unconditionally
             // would race the store open for a push wake that arrived seconds after
             // the transition.
-            guard await store.marmot.runAutoBackupIfDue(allowWhileActive: true) else { return }
+            // `reopenStore: false` — same round-8 rule as the BGTask path: never
+            // reopen a store this executor would then have to close in a race.
+            guard await store.marmot.runAutoBackupIfDue(allowWhileActive: true, reopenStore: false) else { return }
             await self?.closeStoreIfStillBackgrounded(label: "opportunistic")
         }
     }
