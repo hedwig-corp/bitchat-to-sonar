@@ -411,6 +411,30 @@ pub fn record_backup_attempt(db_path: &Path) -> Result<()> {
     })
 }
 
+/// Fold another process's dirty bump into the cached policy before a cold RMW
+/// writes the sidecar back.
+///
+/// `POLICY_STATE` is per-process; the NSE (and share extension) mark dirty from
+/// their own processes by writing the sidecar directly. Since
+/// `backupAccount(reopenAfterSeal: false)` the store — and the App Group flock —
+/// is UNLOCKED during the Blossom upload, so an NSE wake can persist a message
+/// and bump `dirty_seq` on disk in exactly the window that ends with
+/// [`record_backup_success`] writing this process's cached copy back. Without
+/// this merge that write clobbers the newer mark and the NSE-delivered message
+/// silently misses the next opportunistic backup.
+fn merge_cross_process_dirty(policy: &mut BackupPolicy, db_path: &Path) {
+    let path = backup_policy_path_for_db(db_path);
+    let Ok(bytes) = fs::read(&path) else { return };
+    let Ok(disk) = serde_json::from_slice::<BackupPolicy>(&bytes) else {
+        return;
+    };
+    if disk.dirty_seq > policy.dirty_seq {
+        policy.dirty_seq = disk.dirty_seq;
+        policy.dirty = true;
+        policy.last_dirty_at = disk.last_dirty_at.or(policy.last_dirty_at);
+    }
+}
+
 pub fn record_backup_success(
     db_path: &Path,
     size_bytes: Option<u64>,
@@ -428,6 +452,9 @@ pub fn record_backup_success(
     with_policy_state(|map| {
         let now = now_unix_secs();
         let mut policy = cached_policy(map, db_path);
+        // A cross-process bump (NSE during the unlocked upload window) must be
+        // visible BEFORE the attempt compare, or it gets cleared and clobbered.
+        merge_cross_process_dirty(&mut policy, db_path);
         // Messages that arrived after seal started must keep dirty=true so the
         // next opportunistic backup still covers them.
         if policy.attempt_dirty_seq == Some(policy.dirty_seq) {
@@ -530,6 +557,9 @@ pub fn record_backup_failure(db_path: &Path, err: &str) -> Result<()> {
     with_policy_state(|map| {
         let now = now_unix_secs();
         let mut policy = cached_policy(map, db_path);
+        // Same cross-process window as success: do not write back a sidecar
+        // that erases an NSE's newer dirty bump.
+        merge_cross_process_dirty(&mut policy, db_path);
         policy.last_attempt_at = Some(now);
         let truncated: String = err.chars().take(MAX_POLICY_ERROR_CHARS).collect();
         policy.last_error = Some(truncated);
@@ -2012,6 +2042,35 @@ mod tests {
         // A success with no size reported leaves the previous one intact.
         record_backup_success(&db, None, None).unwrap();
         assert_eq!(load_backup_policy(&db).last_size_bytes, Some(282_748));
+    }
+
+    /// `reopenAfterSeal: false` leaves the store (and App Group flock) UNLOCKED
+    /// during the Blossom upload, so the NSE can persist a message and bump the
+    /// sidecar's `dirty_seq` from its own process while this one still holds a
+    /// pre-seal cached policy. Success must fold that bump in, not clobber it —
+    /// or the NSE-delivered message silently misses the next backup.
+    #[test]
+    fn success_keeps_dirty_bumped_by_another_process_during_upload() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("marmot.sqlite");
+        // App process: a message dirties the policy, then a backup attempt
+        // snapshots dirty_seq at seal time.
+        mark_backup_dirty(&db);
+        record_backup_attempt(&db).unwrap();
+        // "NSE": a different process writes the sidecar directly with a newer
+        // bump (fs write = exactly what crosses the process boundary).
+        let path = backup_policy_path_for_db(&db);
+        let mut disk: BackupPolicy =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        disk.dirty = true;
+        disk.dirty_seq += 1;
+        disk.last_dirty_at = Some(4242);
+        fs::write(&path, serde_json::to_vec_pretty(&disk).unwrap()).unwrap();
+        // App process: the upload finishes.
+        record_backup_success(&db, Some(1), None).unwrap();
+        let after = load_backup_policy(&db);
+        assert!(after.dirty, "cross-process dirty mark must survive success");
+        assert_eq!(after.dirty_seq, disk.dirty_seq, "newer seq must be adopted");
     }
 
     /// Storage counts the user's data and excludes logs — otherwise the number

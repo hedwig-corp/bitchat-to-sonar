@@ -56,6 +56,24 @@ enum RelayConnectionPolicy {
     /// read in the same direction so the mirror stays diffable.
     static func shouldAutoReconnect(foreground: Bool) -> Bool { foreground }
 
+    /// Whether a relay attach may proceed right now — the store-opening half of
+    /// the background rule `shouldAutoReconnect` applies to timers.
+    ///
+    /// `connectRelaysIfNeeded()` opens/holds the SQLCipher store for the whole
+    /// attach and ends by re-arming polling, so an attach that starts while the
+    /// app is BACKGROUNDED with nobody owning a close leaves the store open for
+    /// RunningBoard to kill at suspension (0xdead10cc, round 8: on 1.12.9 (38)
+    /// a background backup's post-seal attach straggler reopened the store
+    /// ~200ms after the executor logged "store closed"). The push wake is the
+    /// one legitimate background caller — it brackets its whole drain in
+    /// `pushWakeOwnership` and closes after itself (`closeStoreWithDeadline`).
+    ///
+    /// Compose has no RunningBoard file-lock kill, so `RelayConnectionPolicy.kt`
+    /// deliberately has no mirror of this rule (documented platform gap).
+    static func mayAttachRelays(foreground: Bool, pushWakeOwned: Bool) -> Bool {
+        foreground || pushWakeOwned
+    }
+
     /// Whether a push wake should drop the relay latch.
     ///
     /// Only a real background scene can have had its sockets suspended. `.inactive`

@@ -161,7 +161,12 @@ final class AutoBackupBackgroundScheduler {
         }
         SecureLogger.info("Auto-backup \(label): running", category: .session)
         let work = Task { @MainActor in
-            await store.marmot.runAutoBackupIfDue(allowWhileActive: true)
+            // `reopenStore: false`: the upload is node-free, so a background
+            // backup leaves the store CLOSED instead of reopening it for this
+            // handler's close to race. On 1.12.9 (38) the reopen's straggler
+            // relay attach re-opened SQLCipher after "store closed" and iOS
+            // killed the suspension 0xdead10cc (round 8).
+            await store.marmot.runAutoBackupIfDue(allowWhileActive: true, reopenStore: false)
         }
         // Deliberately still cancel-only. Closing the store from here as well
         // looks like the obvious completion of this fix and is a WORSE bug:
@@ -231,10 +236,21 @@ final class AutoBackupBackgroundScheduler {
     private func closeStoreIfStillBackgrounded(label: String) async {
         guard let store else { return }
         guard UIApplication.shared.applicationState == .background else {
+            // Since `reopenAfterSeal: false` a background backup no longer
+            // reopens the node, so "that path owns the node" stopped being
+            // true: a user who foregrounded mid-backup had their
+            // `refreshAfterForeground` time out against `busy` and nothing
+            // retries — a visible app with a closed store. Same detached,
+            // ungated reconnect as the close path below (it awaits the doomed
+            // `refreshTask` first, then re-kicks only if still disconnected;
+            // no-op when the node exists).
             SecureLogger.info(
-                "Auto-backup \(label): store left open — app is foreground, that path owns the node",
+                "Auto-backup \(label): app is foreground — kicking reconnect instead of closing",
                 category: .session
             )
+            Task.detached(priority: .utility) {
+                await store.marmot.reconnectIfForegroundAfterWakeClose()
+            }
             return
         }
         SecureLogger.info("Auto-backup \(label): closing the store before suspension", category: .session)
@@ -337,7 +353,9 @@ final class AutoBackupBackgroundScheduler {
             // here: this fires on EVERY backgrounding, so closing unconditionally
             // would race the store open for a push wake that arrived seconds after
             // the transition.
-            guard await store.marmot.runAutoBackupIfDue(allowWhileActive: true) else { return }
+            // `reopenStore: false` — same round-8 rule as the BGTask path: never
+            // reopen a store this executor would then have to close in a race.
+            guard await store.marmot.runAutoBackupIfDue(allowWhileActive: true, reopenStore: false) else { return }
             await self?.closeStoreIfStillBackgrounded(label: "opportunistic")
         }
     }

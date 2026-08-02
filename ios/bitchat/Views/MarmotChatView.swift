@@ -791,13 +791,26 @@ final class MarmotChatModel: ObservableObject {
         let box = SNBackgroundTaskBox()
         box.set(
             UIApplication.shared.beginBackgroundTask(withName: "sonar.marmot.storeSuspend") {
+                // Self-reporting (round 8): the 1.12.8 (37) 0xdead10cc kill —
+                // node alive 33s after backgrounding with zero FFI in flight —
+                // was undiagnosable because this path logged nothing. This line
+                // firing before "store closed" below means the close HUNG
+                // (leaked `nodeLifecycleGroup` lease / stuck queue); its absence
+                // means the close finished and some other strong `SonarNode`
+                // ref (or another SQLite handle) kept the file locked.
+                SecureLogger.warning(
+                    "⚠️ Suspend close: background window expired before the store close completed",
+                    category: .session
+                )
                 box.endOnce()
             }
         )
+        SecureLogger.info("Suspend close: closing the Marmot store for backgrounding", category: .session)
         // userInitiated: flock release must beat Transponder NSE acquire
         // (default Task priority often loses the race → storeBusy generic banner).
         Task(priority: .userInitiated) { [weak self] in
             await self?.service.closeNode()
+            SecureLogger.info("Suspend close: store closed", category: .session)
             box.endOnce()
         }
         #else
@@ -1226,7 +1239,18 @@ final class MarmotChatModel: ObservableObject {
     /// `connectRelaysIfNeeded`. Always reconnects after the seal attempt.
     /// Auto-backup passes `respectOptOut` so a mid-flight Settings disable
     /// aborts before upload.
-    func backupAccount(respectOptOut: Bool = false) async throws {
+    /// - Parameter reopenAfterSeal: pass `false` from BACKGROUND executors
+    ///   (BGTask / opportunistic). The upload below is node-free
+    ///   (`pushSealedAccountBackup` never touches the store), so skipping the
+    ///   post-seal `performConnect` + `connectRelaysIfNeeded` reopen leaves the
+    ///   store CLOSED — removing the reopen those executors' own close then has
+    ///   to race. On 1.12.9 (38) that race was lost: the backup's reconnect
+    ///   reopened SQLCipher ~200ms AFTER "store closed" was logged and
+    ///   RunningBoard killed the suspending process 0xdead10cc (round 8).
+    /// `reopenAfterSeal` is deliberately REQUIRED: a defaulted `true` here let
+    /// any future background caller silently inherit the reopen that round 8
+    /// exists to remove. Every call site must choose.
+    func backupAccount(respectOptOut: Bool = false, reopenAfterSeal: Bool) async throws {
         // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
             throw MarmotService.ServiceError.backupAlreadyInProgress
@@ -1262,18 +1286,27 @@ final class MarmotChatModel: ObservableObject {
             try? service.noteBackupFailure(error.localizedDescription)
         }
 
-        let reconnected = await performConnect(scheduleAutoBackup: false)
-        // Clear busy before relay attach / Blossom RTT.
-        busy = false
-        if reconnected {
-            connectRelaysIfNeeded()
+        let reconnected: Bool
+        if reopenAfterSeal {
+            reconnected = await performConnect(scheduleAutoBackup: false)
+            // Clear busy before relay attach / Blossom RTT.
+            busy = false
+            if reconnected {
+                connectRelaysIfNeeded()
+            }
+            if wasPolling { startPolling() }
+        } else {
+            // Background executor: leave the store closed. The seal already
+            // released its lock and cleared the fence; the upload needs no node.
+            // Foreground resume reconnects via refreshAfterForeground.
+            reconnected = false
+            busy = false
         }
-        if wasPolling { startPolling() }
 
         if let sealError {
             // Seal failures are local/crypto — always surface (do not reuse
             // upload-retry suppression, which would log "uploaded" falsely).
-            if !reconnected {
+            if reopenAfterSeal, !reconnected {
                 throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
             }
             throw sealError
@@ -1306,7 +1339,8 @@ final class MarmotChatModel: ObservableObject {
         }
         let outcome = MarmotAccountBackupFlow.outcome(
             uploadSucceeded: uploadError == nil,
-            reconnected: reconnected
+            reconnected: reconnected,
+            reconnectRequired: reopenAfterSeal
         )
         if outcome.shouldSurfaceUploadFailure, let uploadError {
             throw uploadError
@@ -1359,8 +1393,11 @@ final class MarmotChatModel: ObservableObject {
     ///   chat on a large account. Doing that 45s into a session the user is
     ///   sitting in reads as the app freezing, so the periodic in-app loop hands
     ///   the work to the background paths instead of doing it itself.
+    /// - Parameter reopenStore: background executors pass `false` so
+    ///   `backupAccount` never reopens the store they would then have to close
+    ///   before suspension (0xdead10cc round 8) — see `backupAccount`.
     @discardableResult
-    func runAutoBackupIfDue(allowWhileActive: Bool = false) async -> Bool {
+    func runAutoBackupIfDue(allowWhileActive: Bool = false, reopenStore: Bool = true) async -> Bool {
         // TRACKED GAP (macOS): this guard is iOS-only, so the macOS in-app loop
         // still seals while the app is active — the freeze this exists to
         // prevent. Deliberate: macOS has no BGTask/WorkManager equivalent and
@@ -1407,19 +1444,22 @@ final class MarmotChatModel: ObservableObject {
             return false
         }
         do {
-            try await backupAccount(respectOptOut: true)
+            try await backupAccount(respectOptOut: true, reopenAfterSeal: reopenStore)
             SecureLogger.info("Auto account backup uploaded", category: .session)
         } catch {
+            // Dump the typed error, not just localizedDescription: the 1.12.9
+            // (38) crash forensics stalled on an opaque "ServiceError error 1".
             SecureLogger.warning(
-                "⚠️ Auto account backup failed: \(error.localizedDescription)",
+                "⚠️ Auto account backup failed: \(String(describing: error))",
                 category: .session
             )
         }
-        // True on the throwing path too: `backupAccount()` reopens the node in
-        // its own middle (seal -> `performConnect` -> upload) and throws only
-        // after, so a failed upload leaves the store just as open as a good one.
-        // A failed reopen lands here as well, where the caller's close is a
-        // harmless no-op.
+        // True on the throwing path too: with `reopenStore` a `backupAccount()`
+        // reopens the node in its own middle (seal -> `performConnect` ->
+        // upload) and throws only after, so a failed upload leaves the store
+        // just as open as a good one. A failed reopen lands here as well, and
+        // so does a `reopenStore: false` run (store left closed) — for both,
+        // the caller's close is a harmless idempotent no-op.
         return true
     }
 
@@ -1609,6 +1649,25 @@ final class MarmotChatModel: ObservableObject {
         // Identity backup/restore holds `busy` with the node closed — do not
         // reopen the DB underneath a staged restore or in-flight upload.
         guard !busy, !relayBusy else { return }
+        #if os(iOS)
+        // Round-8 0xdead10cc gate: an attach that starts while backgrounded
+        // opens/holds SQLCipher with nobody scheduled to close it (the round-8
+        // straggler reopened the store 200ms AFTER the executor's "store
+        // closed"). Only the push wake may attach in background — it brackets
+        // its drain in `pushWakeOwnership` and closes after itself. Foreground
+        // resume re-attaches via `refreshAfterForeground`; a deliberate refusal
+        // here costs at most one deferred attach, never a missed wake.
+        guard RelayConnectionPolicy.mayAttachRelays(
+            foreground: UIApplication.shared.applicationState != .background,
+            pushWakeOwned: pushWakeOwnershipCount > 0
+        ) else {
+            SecureLogger.info(
+                "Relay attach refused: backgrounded with no push-wake owner (0xdead10cc r8 gate)",
+                category: .session
+            )
+            return
+        }
+        #endif
         relayConnectTask?.cancel()
         relayConnectTask = nil
         relayBusy = true
@@ -1616,6 +1675,26 @@ final class MarmotChatModel: ObservableObject {
             guard let self else { return }
             defer { self.relayBusy = false }
             guard !self.busy else { return }
+            #if os(iOS)
+            // Re-check at EXECUTION time, not only at call time. The guard above
+            // runs synchronously in the caller, but this task is unstructured
+            // and is deliberately NOT assigned to `relayConnectTask`, so
+            // `suspendStoreForBackground()` cannot cancel it. A scene that
+            // backgrounds between the two would otherwise let a
+            // foreground-authorized attach reach `service.connect()` after
+            // `closeNode()` cleared its fence and reopen the SQLCipher store
+            // post-close — the exact 0xdead10cc shape this gate exists to stop.
+            guard RelayConnectionPolicy.mayAttachRelays(
+                foreground: UIApplication.shared.applicationState != .background,
+                pushWakeOwned: self.pushWakeOwnershipCount > 0
+            ) else {
+                SecureLogger.info(
+                    "Relay attach abandoned at execution: backgrounded after the gate (0xdead10cc r8)",
+                    category: .session
+                )
+                return
+            }
+            #endif
             do {
                 self.relayConnected = false
                 #if DEBUG
