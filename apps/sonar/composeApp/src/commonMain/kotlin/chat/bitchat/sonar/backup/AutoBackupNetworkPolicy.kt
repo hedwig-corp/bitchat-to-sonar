@@ -24,6 +24,19 @@ package chat.bitchat.sonar.backup
 enum class AccountBackupOutcome {
     Uploaded,
     AlreadyUpToDate,
+
+    /**
+     * The seal finished but the node could not be reopened, so chat is down
+     * until restart.
+     *
+     * Distinct from [Failed] because the caller must NOT overwrite the precise
+     * "Could not reopen chats after backup" toast that
+     * `reopenMarmotAfterSealOrReport` already set — telling the user
+     * "Backup failed, try again when online" would describe the wrong problem,
+     * and "already up to date" would hide it entirely. Mirrors the Apple path,
+     * which surfaces the reconnect error rather than the backup one.
+     */
+    ReopenFailed,
     Failed,
 }
 

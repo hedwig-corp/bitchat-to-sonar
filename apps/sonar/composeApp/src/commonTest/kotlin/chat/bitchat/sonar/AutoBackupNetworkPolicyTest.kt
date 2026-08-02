@@ -72,4 +72,20 @@ class AutoBackupNetworkPolicyTest {
         assertNotEquals(AccountBackupOutcome.Failed, AccountBackupOutcome.AlreadyUpToDate)
         assertNotEquals(AccountBackupOutcome.Uploaded, AccountBackupOutcome.AlreadyUpToDate)
     }
+
+    /**
+     * A seal closes the node. If it will not reopen, chat is down until restart
+     * — and that outranks anything the seal itself reported. Reporting
+     * "already up to date" over a dead session is the worst of the three, so
+     * the reopen failure has to be its own outcome rather than collapsing into
+     * either neighbour.
+     */
+    @Test
+    fun reopenFailureIsDistinctFromBothSuccessAndPlainFailure() {
+        assertNotEquals(AccountBackupOutcome.AlreadyUpToDate, AccountBackupOutcome.ReopenFailed)
+        assertNotEquals(AccountBackupOutcome.Uploaded, AccountBackupOutcome.ReopenFailed)
+        // Also distinct from Failed: the caller keeps the precise
+        // "Could not reopen chats" toast instead of a generic backup error.
+        assertNotEquals(AccountBackupOutcome.Failed, AccountBackupOutcome.ReopenFailed)
+    }
 }

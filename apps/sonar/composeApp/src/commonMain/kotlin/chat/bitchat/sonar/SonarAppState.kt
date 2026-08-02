@@ -4173,12 +4173,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 backupMutex.unlock()
             }
             refreshBackupPolicy()
-            toast = when (outcome) {
-                AccountBackupOutcome.Uploaded -> getString(Res.string.chat_backup_uploaded)
+            when (outcome) {
+                AccountBackupOutcome.Uploaded ->
+                    toast = getString(Res.string.chat_backup_uploaded)
                 AccountBackupOutcome.AlreadyUpToDate ->
-                    getString(Res.string.chat_backup_is_already_up_to_date)
+                    toast = getString(Res.string.chat_backup_is_already_up_to_date)
+                // Leave the toast alone: `reopenMarmotAfterSealOrReport` already
+                // set "Could not reopen chats after backup", which names the
+                // problem the user actually has. Overwriting it with a backup
+                // message would describe the wrong failure.
+                AccountBackupOutcome.ReopenFailed -> Unit
                 AccountBackupOutcome.Failed ->
-                    getString(Res.string.backup_failed_try_again_when_online)
+                    toast = getString(Res.string.backup_failed_try_again_when_online)
             }
         }
     }
@@ -4199,11 +4205,17 @@ class SonarAppState(private val scope: CoroutineScope) {
         respectMeteredGate: Boolean = false,
     ): AccountBackupOutcome {
         var alreadyUpToDate = false
+        var reopenFailedAfterSeal = false
         val sealed = runCatching {
             cancelMarmotJobsForExclusiveBackup()
             SonarCore.sealAccountBackup()
         }.onFailure { err ->
-            reopenMarmotAfterSealOrReport()
+            // Keep the reopen result. The node was CLOSED to seal; if it will
+            // not come back, chat is down until restart and that outranks
+            // whatever the seal itself reported — including "unchanged", which
+            // would otherwise render as a reassuring "already up to date" over
+            // a dead session.
+            if (!reopenMarmotAfterSealOrReport()) reopenFailedAfterSeal = true
             // Core refuses to re-seal an account that is byte-identical to the
             // blob already on Blossom. That is a no-op, not a failure — writing
             // it to `last_error` would put a red row under an account that is
@@ -4218,16 +4230,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                 }
             }
         }.getOrNull()
-            ?: return if (alreadyUpToDate) {
-                AccountBackupOutcome.AlreadyUpToDate
-            } else {
-                AccountBackupOutcome.Failed
+            ?: return when {
+                // A dead node outranks everything else the seal could report.
+                reopenFailedAfterSeal -> AccountBackupOutcome.ReopenFailed
+                alreadyUpToDate -> AccountBackupOutcome.AlreadyUpToDate
+                else -> AccountBackupOutcome.Failed
             }
         if (!reopenMarmotAfterSealOrReport()) {
             runCatching {
                 SonarCore.recordBackupFailure("reconnect failed")
             }
-            return AccountBackupOutcome.Failed
+            return AccountBackupOutcome.ReopenFailed
         }
         // Upload boundary: the last point before bytes leave the device.
         if (respectMeteredGate && !autoBackupAllowedOnCurrentNetwork()) {
