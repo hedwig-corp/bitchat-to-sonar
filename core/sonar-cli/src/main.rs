@@ -276,11 +276,17 @@ enum Output {
         relays: Vec<String>,
     },
     Sent {
-        to: String,
+        /// Recipient npub for a 1:1 DM send; absent for `--group` sends,
+        /// which are addressed by `group_id` alone. Never a group id — an
+        /// npub-named field carrying raw group hex is this repo's recurring
+        /// identifier-confusion bug (#547 review).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
         group_id: String,
     },
     SentMedia {
-        to: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
         group_id: String,
         kind: String,
         mime: String,
@@ -289,7 +295,8 @@ enum Output {
         blossom_server: String,
     },
     SentAlbum {
-        to: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        to: Option<String>,
         group_id: String,
         /// Number of attachments packed into the single album message.
         count: usize,
@@ -456,7 +463,9 @@ async fn run(cli: Cli) -> Result<()> {
             // a 1:1 DM resolved from --to <npub> (creating a new DM if needed).
             let (group_id, to_npub) = if let Some(group_hex) = &args.group {
                 let gid = parse_group_id_hex(group_hex)?;
-                (gid, group_hex.clone())
+                // No `to`: the target is the group itself, and `group_id`
+                // already reports it canonically.
+                (gid, None)
             } else if let Some(to) = &args.to {
                 let peer = PublicKey::parse(to)
                     .map_err(|e| CliError::Message(format!("recipient pubkey: {e}")))?;
@@ -467,7 +476,7 @@ async fn run(cli: Cli) -> Result<()> {
                 let npub = peer
                     .to_bech32()
                     .expect("valid public key encodes as npub");
-                (gid, npub)
+                (gid, Some(npub))
             } else {
                 return Err(CliError::Message(
                     "provide either --to <npub> or --group <group_id>".to_owned(),
