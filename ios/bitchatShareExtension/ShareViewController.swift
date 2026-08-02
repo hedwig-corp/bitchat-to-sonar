@@ -36,13 +36,15 @@ final class ShareViewController: UIViewController {
 
     /// Type identifiers we ask an attachment for, most specific first. A
     /// provider usually conforms to several; the first match wins.
+    ///
+    /// `public.file-url` is deliberately absent: asking for it returns a temp
+    /// file containing the `file://` path, not the document. See
+    /// `snStagingTypeIdentifier`, which handles everything not listed here.
     private static let fileTypeIdentifiers = [
         UTType.image.identifier,
         UTType.movie.identifier,
         UTType.audio.identifier,
         UTType.pdf.identifier,
-        UTType.fileURL.identifier,
-        UTType.data.identifier,
     ]
 
     private let statusLabel: UILabel = {
@@ -251,28 +253,33 @@ final class ShareViewController: UIViewController {
         let group = DispatchGroup()
 
         for provider in fileProviders.prefix(SonarShareInbox.maxStagedItems) {
-            guard let typeID = Self.fileTypeIdentifiers.first(where: {
+            // A concrete media type first (it is also what names the fallback
+            // file), then whatever byte-bearing type the provider registered.
+            let typeID = Self.fileTypeIdentifiers.first {
                 provider.hasItemConformingToTypeIdentifier($0)
-            }) else { continue }
+            } ?? snStagingTypeIdentifier(
+                registeredTypeIdentifiers: provider.registeredTypeIdentifiers
+            )
 
             group.enter()
-            provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, _ in
+            let record: (URL?) -> Void = { url in
                 defer { group.leave() }
                 guard let url else {
-                    // No temp representation vended. Count it, or a multi-file
+                    // No representation vended. Count it, or a multi-file
                     // share silently omits this attachment and still reports
                     // complete success.
                     queue.sync { staged.unreadableCount += 1 }
                     return
                 }
-                // loadFileRepresentation's URL is valid only inside this
-                // callback, so copy synchronously before returning.
+                // The vended URL is valid only inside this callback, so copy
+                // synchronously before returning.
                 queue.sync {
                     switch self.copyIntoPayload(
                         source: url,
                         directory: directory,
                         index: staged.items.count,
                         typeID: typeID,
+                        suggestedName: provider.suggestedName,
                         maxBytes: remainingBytes
                     ) {
                     case .staged(let item):
@@ -285,11 +292,47 @@ final class ShareViewController: UIViewController {
                     }
                 }
             }
+
+            if let typeID {
+                provider.loadFileRepresentation(forTypeIdentifier: typeID) { url, _ in
+                    record(url)
+                }
+            } else {
+                // Nothing but URL identifiers registered. Resolve the file URL
+                // and copy the real file — asking `loadFileRepresentation` for
+                // `public.file-url` would stage the path string instead.
+                Self.loadFileURL(from: provider, completion: record)
+            }
         }
 
         group.notify(queue: .global(qos: .userInitiated)) {
             staged.unreadableCount += max(0, fileProviders.count - SonarShareInbox.maxStagedItems)
             completion(staged)
+        }
+    }
+
+    /// Resolve a provider that registered only URL identifiers to its file URL.
+    /// The URL is handed to the completion still inside the load callback, so
+    /// the caller's copy happens while the coordinated read is alive.
+    private static func loadFileURL(
+        from provider: NSItemProvider,
+        completion: @escaping (URL?) -> Void
+    ) {
+        let id = UTType.fileURL.identifier
+        guard provider.hasItemConformingToTypeIdentifier(id) else {
+            completion(nil)
+            return
+        }
+        provider.loadItem(forTypeIdentifier: id, options: nil) { item, _ in
+            if let url = item as? URL, url.isFileURL {
+                completion(url)
+            } else if let data = item as? Data,
+                      let string = String(data: data, encoding: .utf8),
+                      let url = URL(string: string), url.isFileURL {
+                completion(url)
+            } else {
+                completion(nil)
+            }
         }
     }
 
@@ -305,10 +348,32 @@ final class ShareViewController: UIViewController {
         source: URL,
         directory: URL,
         index: Int,
-        typeID: String,
+        typeID: String?,
+        suggestedName: String?,
         maxBytes: Int
     ) -> CopyOutcome {
         let fileManager = FileManager.default
+        // A provider that vended a URL outside our sandbox needs the scope held
+        // for the copy; a temp file we were handed does not, and simply reports
+        // false here.
+        let scoped = source.startAccessingSecurityScopedResource()
+        defer {
+            if scoped { source.stopAccessingSecurityScopedResource() }
+        }
+
+        // Reject directories BEFORE the size check. A `public.file-url` provider
+        // (Files.app "Folders", any package/bundle) can hand us a directory, and
+        // every guard below waves it through: `attributesOfItem[.size]` reports
+        // the directory ENTRY (~96 bytes), so it passes `size > 0` AND the byte
+        // budget, and then `copyItem` copies the whole tree recursively — an
+        // unbounded copy into the extension's payload, recorded with a bogus
+        // 96-byte `byteCount`. A folder is not a shareable attachment; a file is.
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: source.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return .unreadable
+        }
         guard let size = (try? fileManager.attributesOfItem(atPath: source.path))?[.size] as? Int,
               size > 0
         else {
@@ -316,16 +381,25 @@ final class ShareViewController: UIViewController {
         }
         guard size <= maxBytes else { return .tooLarge }
 
-        let name = snSafeSharedFilename(
-            source.lastPathComponent,
+        // The provider's own name wins: the temp file is named after the TYPE
+        // ("Zip archive.zip") whenever the bytes came from a data
+        // representation, which is most non-media documents.
+        let name = snStagedFilename(
+            suggestedName: suggestedName,
+            temporaryName: source.lastPathComponent,
             fallback: Self.defaultFilename(for: typeID, index: index)
         )
-        // Prefix with the index so two attachments named "IMG_0001.jpg" cannot
-        // overwrite each other inside the payload directory.
-        let relativePath = "\(index)-\(name)"
+        // One directory per index so two attachments named "IMG_0001.jpg"
+        // cannot overwrite each other — without an `index-` prefix leaking into
+        // the filename the recipient sees.
+        let relativePath = snStagedRelativePath(index: index, filename: name)
         let destination = directory.appendingPathComponent(relativePath)
 
         do {
+            try fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             if fileManager.fileExists(atPath: destination.path) {
                 try fileManager.removeItem(at: destination)
             }
@@ -342,32 +416,33 @@ final class ShareViewController: UIViewController {
             SonarSharedItem(
                 relativePath: relativePath,
                 filename: name,
-                mime: Self.mime(for: source, typeID: typeID),
+                mime: Self.mime(forFilename: name, typeID: typeID),
                 byteCount: size
             )
         )
     }
 
-    private static func defaultFilename(for typeID: String, index: Int) -> String {
-        let ext = UTType(typeID)?.preferredFilenameExtension
+    private static func defaultFilename(for typeID: String?, index: Int) -> String {
+        let ext = typeID.flatMap { UTType($0)?.preferredFilenameExtension }
         let stem: String
         switch typeID {
-        case UTType.image.identifier: stem = "photo"
-        case UTType.movie.identifier: stem = "video"
-        case UTType.audio.identifier: stem = "audio"
+        case .some(UTType.image.identifier): stem = "photo"
+        case .some(UTType.movie.identifier): stem = "video"
+        case .some(UTType.audio.identifier): stem = "audio"
         default: stem = "attachment"
         }
         let suffix = ext.map { ".\($0)" } ?? ""
         return index == 0 ? "\(stem)\(suffix)" : "\(stem)-\(index + 1)\(suffix)"
     }
 
-    private static func mime(for url: URL, typeID: String) -> String {
+    private static func mime(forFilename filename: String, typeID: String?) -> String {
         // The file extension is more specific than the requested conformance
         // (a provider asked for `public.image` may hand back a HEIC or a PNG).
-        if let fromExtension = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType {
+        let ext = (filename as NSString).pathExtension
+        if let fromExtension = UTType(filenameExtension: ext)?.preferredMIMEType {
             return fromExtension
         }
-        if let fromType = UTType(typeID)?.preferredMIMEType {
+        if let typeID, let fromType = UTType(typeID)?.preferredMIMEType {
             return fromType
         }
         return "application/octet-stream"

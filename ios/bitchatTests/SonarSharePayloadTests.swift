@@ -7,6 +7,7 @@
 
 import Testing
 import Foundation
+import UniformTypeIdentifiers
 @testable import Sonar
 
 /// Pins the staging contract between the share extension and the app.
@@ -203,5 +204,144 @@ struct SonarSharePayloadTests {
     func sharedFilenameIsBounded() {
         let long = String(repeating: "a", count: 500) + ".jpg"
         #expect(snSafeSharedFilename(long).count <= 120)
+    }
+
+    // MARK: - Which type identifier carries the bytes
+
+    /// THE regression: sharing any non-media document into Sonar delivered the
+    /// file's PATH instead of the file.
+    ///
+    /// `loadFileRepresentation(forTypeIdentifier: "public.file-url")` does not
+    /// vend the document — it vends a temp file named `file URL` whose contents
+    /// are the `file://` path string (measured: 111 bytes for a 11-byte
+    /// `notes.txt`). `public.file-url` sat ahead of `public.data` in the probe
+    /// order, so every csv/txt/json/zip/docx share hit it. Photos and PDFs
+    /// dodged it by matching a concrete type first, which is why the bug read as
+    /// "some files work".
+    @Test
+    func stagingNeverAsksAURLIdentifierForBytes() {
+        // Exactly what NSItemProvider(contentsOf:) registers for a document.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.comma-separated-values-text", "public.file-url", "public.url",
+        ]) == "public.comma-separated-values-text")
+
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.zip-archive", "public.file-url", "public.url",
+        ]) == "public.zip-archive")
+
+        // Order must not rescue us: a provider that lists the URL type first is
+        // still asked for its content type.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.file-url", "public.url", "public.plain-text",
+        ]) == "public.plain-text")
+
+        // Generic data is the floor, not a miss: a provider whose only
+        // byte-carrying type IS `public.data` must stage from it — every case
+        // above would also pass an implementation that only ranked CONCRETE
+        // types over `public.file-url` and skipped the generic one.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.file-url", "public.data", "public.url",
+        ]) == "public.data")
+    }
+
+    @Test
+    func urlOnlyProviderHasNoStagingTypeAndFallsBackToTheFileURL() {
+        // nil is the signal for "resolve the file URL and copy the real file"
+        // — never "ask public.file-url for bytes".
+        #expect(snStagingTypeIdentifier(
+            registeredTypeIdentifiers: ["public.file-url", "public.url"]
+        ) == nil)
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: []) == nil)
+    }
+
+    @Test
+    func dynamicUTIStillStages() {
+        // An unknown extension yields a `dyn.…` identifier. Dropping it would
+        // lose the file, so the non-URL fallback keeps it.
+        let dynamic = UTType(filenameExtension: "sonartestext")?.identifier ?? "dyn.test"
+        #expect(snStagingTypeIdentifier(
+            registeredTypeIdentifiers: [dynamic, "public.file-url"]
+        ) == dynamic)
+    }
+
+    @Test
+    func urlIdentifiersAreRecognised() {
+        #expect(snIsURLTypeIdentifier("public.file-url"))
+        #expect(snIsURLTypeIdentifier("public.url"))
+        #expect(!snIsURLTypeIdentifier("public.plain-text"))
+        #expect(!snIsURLTypeIdentifier("public.jpeg"))
+    }
+
+    // MARK: - Staged names
+
+    @Test
+    func stagedFilenamePrefersTheProviderName() {
+        // The temp file is named after the TYPE whenever the bytes came from a
+        // data representation, so `report.csv` would otherwise be delivered as
+        // "comma-separated values.csv".
+        #expect(snStagedFilename(
+            suggestedName: "report.csv",
+            temporaryName: "comma-separated values.csv",
+            fallback: "attachment"
+        ) == "report.csv")
+    }
+
+    @Test
+    func stagedFilenameBorrowsTheExtensionWhenTheProviderNameHasNone() {
+        #expect(snStagedFilename(
+            suggestedName: "report",
+            temporaryName: "comma-separated values.csv",
+            fallback: "attachment"
+        ) == "report.csv")
+    }
+
+    @Test
+    func stagedFilenameFallsBackWhenThereIsNoProviderName() {
+        #expect(snStagedFilename(
+            suggestedName: nil,
+            temporaryName: "IMG_0001.HEIC",
+            fallback: "photo.jpg"
+        ) == "IMG_0001.HEIC")
+        #expect(snStagedFilename(
+            suggestedName: "   ",
+            temporaryName: "",
+            fallback: "photo.jpg"
+        ) == "photo.jpg")
+    }
+
+    @Test
+    func stagedFilenameCannotEscapeThePayloadDirectory() {
+        // The suggested name comes from another app and is attacker-influenced,
+        // so it goes through the same single-component sanitiser as before.
+        // (`.bin` is then borrowed from the temp name, which has no extension of
+        // its own after sanitising — the point here is that no separator and no
+        // `..` survives.)
+        let name = snStagedFilename(
+            suggestedName: "../../../etc/passwd",
+            temporaryName: "data.bin",
+            fallback: "attachment"
+        )
+        #expect(name == "passwd.bin")
+        #expect(!name.contains("/"))
+        #expect(!name.contains(".."))
+
+        // And the relative path it feeds is still one directory + one name.
+        let path = snStagedRelativePath(index: 0, filename: name)
+        #expect(path == "0/passwd.bin")
+        #expect((path as NSString).pathComponents.count == 2)
+    }
+
+    /// The second half of "the path is broken": the app sends each staged file
+    /// under `url.lastPathComponent`, so the old `"\(index)-\(name)"` layout put
+    /// the index INTO the delivered filename — the recipient saw `0-report.csv`.
+    @Test
+    func stagedPathKeepsTheIndexOutOfTheFilename() {
+        let path = snStagedRelativePath(index: 0, filename: "report.csv")
+        #expect(path == "0/report.csv")
+        #expect((path as NSString).lastPathComponent == "report.csv")
+
+        // Still collision-proof: two identically named attachments stay apart.
+        #expect(snStagedRelativePath(index: 1, filename: "IMG_0001.jpg")
+            != snStagedRelativePath(index: 2, filename: "IMG_0001.jpg"))
     }
 }
