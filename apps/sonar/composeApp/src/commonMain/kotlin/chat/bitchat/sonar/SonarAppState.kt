@@ -3995,15 +3995,18 @@ class SonarAppState(private val scope: CoroutineScope) {
      * upload right below this row so a user who is never on Wi-Fi can see the
      * staleness and turn it on.
      */
-    /// Defensive read: this initialiser runs while `SonarAppState` is being
-    /// constructed, which can precede core init. A failure means "not opted
-    /// in" — the safe direction — and [refreshBackupPolicy] re-syncs the real
-    /// value once the core is up.
-    var backupOverCellular by mutableStateOf(
-        runCatching {
-            SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
-        }.getOrDefault(false)
-    )
+    /// UI mirror only, and deliberately NOT read from the core here.
+    ///
+    /// This is a property initialiser: it runs inside `SonarAppState`'s
+    /// constructor, and instrumented tests construct one directly on the main
+    /// thread before any core init. A JNI/disk read there is a main-thread
+    /// side effect on a path that must stay allocation-cheap — the same reason
+    /// the render path stays side-effect free.
+    ///
+    /// [refreshBackupPolicy] syncs the real value (the Backup screen calls it
+    /// on open), and the executor gate below reads the pref directly at
+    /// decision time rather than trusting this cache.
+    var backupOverCellular by mutableStateOf(false)
         private set
 
     fun updateBackupOverCellular(enabled: Boolean) {
@@ -4017,11 +4020,20 @@ class SonarAppState(private val scope: CoroutineScope) {
         chat.bitchat.sonar.backup.schedulePlatformAutoBackupWork()
     }
 
-    /** Whether an automatic (not user-initiated) backup may run right now. */
+    /**
+     * Whether an automatic (not user-initiated) backup may run right now.
+     *
+     * Reads the pref rather than [backupOverCellular]: this runs on the backup
+     * executors, off the render path, and the durable value is the one that
+     * must decide whether to spend the user's data — not a UI mirror that may
+     * never have been synced in a headless/background process.
+     */
     private fun autoBackupAllowedOnCurrentNetwork(): Boolean =
         AutoBackupNetworkPolicy.allowsUpload(
             metered = runCatching { isNetworkMetered() }.getOrDefault(true),
-            cellularOptIn = backupOverCellular,
+            cellularOptIn = runCatching {
+                SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
+            }.getOrDefault(false),
         )
 
     /** Whole policy snapshot for the redesigned backup screen (stats + cadence). */
