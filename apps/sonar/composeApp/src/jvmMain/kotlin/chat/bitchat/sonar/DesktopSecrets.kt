@@ -211,8 +211,8 @@ object DesktopSecrets {
     // Availability is a PATH scan, never a trial run — see [DesktopExec] for why
     // both of those matter. Cached: the answer cannot change mid-session in any way
     // we can act on, and the scan is not free.
-    private val macProbe: Boolean by lazy { DesktopExec.onPath("security") }
-    private val linuxProbe: Boolean by lazy { DesktopExec.onPath("secret-tool") }
+    private val macProbe: Boolean by lazy { DesktopExec.which("security") != null }
+    private val linuxProbe: Boolean by lazy { DesktopExec.which("secret-tool") != null }
 
     private fun keychainProbe(): Boolean = macProbe
     private fun secretToolProbe(): Boolean = linuxProbe
