@@ -90,6 +90,20 @@ class CallControlAdmissionTest {
     @Test
     fun answerFromAnotherConversationCannotSteerTheActiveCall() {
         // A callId learned elsewhere must not end/answer the live call.
+        // Answer is the security-load-bearing kind — core's `on_answer`
+        // overwrites the remote pin, so the last answerer wins (#420) — and an
+        // earlier draft of this test asserted only End/Cancel while its name
+        // claimed Answer coverage.
+        assertFalse(
+            CallControlAdmission.isAdmissible(
+                kind = Kind.Answer,
+                otherMemberKeys = listOf(peer),
+                structurallyDirect = false,
+                senderKey = peer,
+                activeCallConversationId = "marmot:dm",
+                conversationId = "marmot:other",
+            )
+        )
         assertFalse(
             CallControlAdmission.isAdmissible(
                 kind = Kind.End,

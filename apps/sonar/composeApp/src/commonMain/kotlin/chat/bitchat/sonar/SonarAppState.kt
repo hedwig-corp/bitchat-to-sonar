@@ -1716,8 +1716,19 @@ class SonarAppState(private val scope: CoroutineScope) {
         // A mesh/NIP-17 DM is keyed by the peer itself, so it is 2-party by
         // construction and carries no roster; a Marmot conversation must be
         // judged on its member list.
-        val structurallyDirect = isMeshChat(chatId) || isMeshChat(callChatId)
-        val roster = otherMemberKeys(chatId).ifEmpty { otherMemberKeys(callChatId) }
+        // Judged on the CARRIER conversation only, never on the folded
+        // `callChatId` (#420 review round 2). Deriving directness or a roster
+        // from the fold reopened the bypass through the fold cache: a group
+        // whose id was once a 2-party fold (`foldedGroupPeerIds` /
+        // `groupFoldMap` — the `group == null` arm skips revalidation while
+        // `chats` is still hydrating) folds to a mesh id, and a mesh id is
+        // structurally direct with an empty roster — so a member added to that
+        // group AFTER the fold could drive the victim's call state from a cold
+        // start. The carrier tells the truth: a mesh DM is 2-party by
+        // construction; a Marmot chat is judged on its own member list, and an
+        // unhydrated one retries below rather than borrowing the fold's shape.
+        val structurallyDirect = isMeshChat(chatId)
+        val roster = otherMemberKeys(chatId)
         // "Roster not loaded" is NOT "refused". The caller adds this message to
         // `scannedCall` BEFORE dispatch, so simply returning would drop a
         // legitimate call permanently — remove it so the next scan retries.
