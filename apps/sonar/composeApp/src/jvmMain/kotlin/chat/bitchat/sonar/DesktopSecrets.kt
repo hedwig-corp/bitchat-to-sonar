@@ -208,31 +208,11 @@ object DesktopSecrets {
     // ---- Availability probes (cached: the answer cannot change mid-session in
     //      any way we can act on, and these fork a process). ----
 
-    /**
-     * Whether the helper binary exists, resolved by scanning `PATH` rather than
-     * executing anything.
-     *
-     * Executing was wrong twice over. Exit status is meaningless here
-     * (`secret-tool --version` exits 2 even when working, which would report a
-     * healthy keystore as missing). And the first probe runs from composition on
-     * the AWT event thread, so a helper that hangs (wedged D-Bus, a PATH entry on
-     * a stalled network mount) would freeze the UI with no recovery. A lookup has
-     * no such failure mode and no side effects.
-     */
-    private fun onPath(binary: String): Boolean {
-        val path = System.getenv("PATH") ?: return false
-        // runCatching INSIDE the loop: one malformed entry (InvalidPathException)
-        // must skip that entry, not abort the scan and report the keystore
-        // missing on a machine where the helper is installed.
-        return path.split(java.io.File.pathSeparatorChar).any { dir ->
-            dir.isNotEmpty() && runCatching {
-                java.nio.file.Files.isExecutable(java.nio.file.Paths.get(dir).resolve(binary))
-            }.getOrDefault(false)
-        }
-    }
-
-    private val macProbe: Boolean by lazy { onPath("security") }
-    private val linuxProbe: Boolean by lazy { onPath("secret-tool") }
+    // Availability is a PATH scan, never a trial run — see [DesktopExec] for why
+    // both of those matter. Cached: the answer cannot change mid-session in any way
+    // we can act on, and the scan is not free.
+    private val macProbe: Boolean by lazy { DesktopExec.onPath("security") }
+    private val linuxProbe: Boolean by lazy { DesktopExec.onPath("secret-tool") }
 
     private fun keychainProbe(): Boolean = macProbe
     private fun secretToolProbe(): Boolean = linuxProbe
