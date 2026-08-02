@@ -404,17 +404,52 @@ impl DmAutoacceptBudget {
         }
     }
 
+    /// A missing sidecar is a fresh install: empty window. Any OTHER read or
+    /// parse failure fails CLOSED — an exhausted window — matching `reserve`'s
+    /// treatment of a failed persist (#498 review round 2). `unwrap_or_default`
+    /// here handed a truncated/unreadable sidecar a fresh set of silent
+    /// auto-accepts, the opposite of what the limiter exists for. The window
+    /// self-heals: the next successful persist rewrites the sidecar, and
+    /// `prune` ages the synthetic admits out after
+    /// [`UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS`] — meanwhile welcomes park for
+    /// manual accept rather than being dropped.
     fn load(db_path: &Path) -> Self {
         let sidecar = dm_autoaccept_sidecar(db_path);
-        let admits = std::fs::read(&sidecar)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Vec<u64>>(&bytes).ok())
-            .map(std::collections::VecDeque::from)
-            .unwrap_or_default();
+        let admits = match std::fs::read(&sidecar) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<u64>>(&bytes) {
+                Ok(entries) => std::collections::VecDeque::from(entries),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dm-autoaccept sidecar unparsable; treating the window as exhausted"
+                    );
+                    Self::exhausted_window()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::collections::VecDeque::new()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dm-autoaccept sidecar unreadable; treating the window as exhausted"
+                );
+                Self::exhausted_window()
+            }
+        };
         Self {
             admits,
             sidecar: Some(sidecar),
         }
+    }
+
+    /// A full window stamped `now`, so `prune` retires it naturally.
+    fn exhausted_window() -> std::collections::VecDeque<u64> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::collections::VecDeque::from(vec![now_secs; UNKNOWN_DM_AUTOACCEPT_MAX])
     }
 
     fn prune(&mut self, now_secs: u64) {
@@ -761,9 +796,21 @@ impl MarmotEngine {
         } else {
             PENDING_INVITE_CAP
         };
+        // A failed pending-list read parks (fails open on the ceiling) rather
+        // than declining: Drop destroys a possibly-real invite unrecoverably,
+        // while Park keeps it user-visible and costs one row — the wrong
+        // direction only if the storage error persists across a whole flood,
+        // by which point welcome processing itself is failing. Logged so a
+        // recurring read failure is visible (#498 review round 2).
         let parked = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))
             .map(|ws| ws.iter().filter(|w| w.id != current.id).count())
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "pending-welcome count unavailable; parking without the ceiling"
+                );
+                0
+            });
         if parked >= cap {
             tracing::warn!(
                 welcomer = %current.welcomer,

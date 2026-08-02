@@ -816,8 +816,9 @@ async fn a_known_sender_cannot_park_unlimited_invites() {
     // ONE attacker identity for every welcome — that is what makes it "known".
     let stranger = MarmotEngine::in_memory(Identity::generate());
 
+    let mut accepted = 0usize;
     let mut dropped = 0usize;
-    for _ in 0..(KNOWN_SENDER_PENDING_INVITE_CAP + 10) {
+    for _ in 0..(KNOWN_SENDER_PENDING_INVITE_CAP + UNKNOWN_DM_AUTOACCEPT_MAX + 10) {
         let bob_kp = bob.key_package_event(vec![relay.clone()]).expect("bob kp");
         let creation = stranger
             .create_group("spam", vec![bob_kp], vec![relay.clone()])
@@ -827,16 +828,32 @@ async fn a_known_sender_cannot_park_unlimited_invites() {
             .gift_wrap_welcome(&pk, welcome)
             .await
             .expect("wrap welcome");
-        if let Incoming::None = bob.process_incoming(&wrapped).await.expect("process") {
-            dropped += 1;
+        match bob.process_incoming(&wrapped).await.expect("process") {
+            Incoming::None => dropped += 1,
+            Incoming::GroupUpdated(_) => accepted += 1,
+            _ => {}
         }
     }
 
+    // The premise must hold or the assertions below test the WRONG limiter:
+    // the budgeted auto-accepts create active shared groups, which is what
+    // makes this key "known" for every later welcome (#498 review round 2 —
+    // an earlier draft only asserted `parked <= KNOWN_..._CAP`, which a
+    // regression to the unknown-sender path also satisfies).
+    assert!(
+        accepted > 0,
+        "the budget must auto-accept first welcomes — nothing made the sender known"
+    );
     assert!(
         dropped > 0,
         "a known sender past the ceiling must have welcomes declined, not parked forever"
     );
     let parked = bob.pending_group_invites().expect("invites").len();
+    assert!(
+        parked > PENDING_INVITE_CAP,
+        "the KNOWN-sender ceiling must be the operative one; stopping at the \
+         unknown-sender cap ({PENDING_INVITE_CAP}) means the exemption regressed, got {parked}"
+    );
     assert!(
         parked <= KNOWN_SENDER_PENDING_INVITE_CAP,
         "parked invites from one known sender must stop at the ceiling, got {parked}"
