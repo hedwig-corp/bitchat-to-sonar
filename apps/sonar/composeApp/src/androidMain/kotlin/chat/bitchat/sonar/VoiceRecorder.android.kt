@@ -12,6 +12,9 @@ actual object AudioNotePlayer {
     private var file: File? = null
     private var onDone: (() -> Unit)? = null
 
+    // MediaPlayer is part of the platform; there is nothing to be missing.
+    actual fun unavailableReason(): String? = null
+
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
         stop() // tears down + notifies any previous note before starting this one
         val f = File(AppContextHolder.ctx.cacheDir, "play-${System.currentTimeMillis()}.m4a")

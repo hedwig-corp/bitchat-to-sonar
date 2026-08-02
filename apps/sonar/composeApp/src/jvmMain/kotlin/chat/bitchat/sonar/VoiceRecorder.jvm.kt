@@ -69,10 +69,93 @@ actual object AudioNotePlayer {
         }
     }
 
+    /**
+     * External players that can decode AAC-in-MP4 and exit on their own at the end
+     * of the clip, most-preferred first.
+     *
+     * Every property in that sentence is load-bearing, and each one eliminated a
+     * candidate:
+     *
+     * - **The JDK cannot do it.** `javax.sound` ships no AAC decoder, and JavaFX
+     *   (which has one) is not in the runtime image the `linux { }` jpackage target
+     *   builds, so this has to shell out.
+     * - **Must decode AAC without a separately-packaged plugin.** `gst-play-1.0`
+     *   was here and was removed: on a stock desktop the AAC plugin lives in
+     *   `gstreamer1.0-plugins-bad`, and without it `gst-play-1.0` prints a plug-in
+     *   error and **still exits 0**, in ~50ms for a 2s clip. Being on `PATH` does
+     *   not imply being able to play, and its failure is indistinguishable from
+     *   success, which is exactly the silent no-op this whole change exists to kill.
+     *   Both entries below bundle their own decoder.
+     * - **Must exit at end of clip**, since that is what fires [onComplete] and
+     *   resets the bubble. `paplay`/`aplay` are excluded for being PCM-only, and
+     *   each flag list makes termination explicit rather than leaning on a default
+     *   a user config could flip.
+     *
+     * Both entries were run against a real 2s AAC `.m4a` before being added here:
+     * `ffplay` 2242ms/exit 0, `cvlc` 2132ms/exit 0. `mpv` is a reasonable third
+     * candidate and is deliberately NOT in the list, because it could not be
+     * installed on the machine this was developed on and an entry whose flags have
+     * never been executed is the same gamble `gst-play-1.0` just lost. Add it with
+     * a timing run, not from the man page.
+     */
+    private val LINUX_PLAYERS = listOf(
+        "ffplay" to listOf("-nodisp", "-autoexit", "-loglevel", "quiet"),
+        "cvlc" to listOf("--intf", "dummy", "--play-and-exit", "--quiet"),
+    )
+
+    private val osName = System.getProperty("os.name").lowercase()
+    private val isMac = osName.contains("mac")
+    private val isLinux = osName.contains("linux")
+
+    // Resolved `[binary] + flags` for this host, or null if nothing can play.
+    // A resettable cache rather than `by lazy`: an object-scoped lazy resolves once
+    // per JVM, so a test could never re-resolve after pointing PATH somewhere else,
+    // and would silently assert against whatever the first caller happened to see.
+    @Volatile private var commandCache: List<String>? = null
+    @Volatile private var commandResolved = false
+
+    internal fun resetPlayerCacheForTest() {
+        synchronized(lock) { commandCache = null; commandResolved = false }
+    }
+
+    private val playerCommand: List<String>?
+        get() = synchronized(lock) {
+            if (!commandResolved) {
+                commandCache = resolvePlayer()
+                commandResolved = true
+            }
+            commandCache
+        }
+
+    private fun resolvePlayer(): List<String>? = when {
+        isMac -> DesktopExec.which("afplay")?.let { listOf(it) }
+        isLinux -> LINUX_PLAYERS.firstNotNullOfOrNull { (bin, flags) ->
+            DesktopExec.which(bin)?.let { listOf(it) + flags }
+        }
+        else -> null
+    }
+
+    /**
+     * Null when voice notes are playable here, otherwise why they are not.
+     *
+     * Callers MUST check this and mark the note unplayable. What shipped instead
+     * was `if (!mac) { onComplete(); return }`, which on Linux rendered a working
+     * play button that completed instantly in silence, indistinguishable from a
+     * zero-length recording, so the sender looks broken rather than the player.
+     */
+    actual fun unavailableReason(): String? = when {
+        playerCommand != null -> null
+        isLinux -> "no audio player found; install ffmpeg or vlc"
+        isMac -> "afplay is missing from this macOS install"
+        else -> "voice-note playback is not supported on this platform yet"
+    }
+
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
-        val os = System.getProperty("os.name").lowercase()
-        if (!os.contains("mac")) {
-            // Linux/Windows desktop: no built-in AAC player yet (follow-up: ffplay/JavaFX).
+        val command = playerCommand
+        if (command == null) {
+            // No player: fire the completion so the bubble does not hang on Pause.
+            // The UI is expected to have disabled this path via unavailableReason();
+            // this is the belt-and-braces arm, not the way the user finds out.
             onComplete()
             return
         }
@@ -93,7 +176,7 @@ actual object AudioNotePlayer {
                 return@execute
             }
             val afplay = runCatching {
-                ProcessBuilder("/usr/bin/afplay", file.absolutePath)
+                ProcessBuilder(command + file.absolutePath)
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
                     .start()
@@ -111,7 +194,12 @@ actual object AudioNotePlayer {
             }
             Thread({
                 try {
-                    afplay.waitFor()
+                    val rc = afplay.waitFor()
+                    // A player can exit non-zero on a codec it cannot handle. There
+                    // is no per-note error channel in the bubble yet, so this at
+                    // least makes "pressed play, heard nothing" diagnosable instead
+                    // of leaving no trace at all.
+                    if (rc != 0) sonarLog("AudioNotePlayer", "${command.first()} exited $rc")
                 } catch (_: InterruptedException) {
                     runCatching { afplay.destroy() }
                 } finally {

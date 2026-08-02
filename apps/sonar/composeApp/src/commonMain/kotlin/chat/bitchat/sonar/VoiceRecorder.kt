@@ -26,4 +26,14 @@ expect class VoiceRecorder() {
 expect object AudioNotePlayer {
     fun play(bytes: ByteArray, onComplete: () -> Unit = {})
     fun stop()
+
+    /**
+     * Null when voice notes can be played on this host, otherwise a short reason to
+     * show the user. Non-null only on desktop, where playback shells out to an
+     * external decoder that may not be installed; Android always returns null.
+     *
+     * The UI must consult this rather than assuming [play] works. A silent no-op is
+     * indistinguishable from an empty recording and blames the sender.
+     */
+    fun unavailableReason(): String?
 }
