@@ -3887,6 +3887,12 @@ class SonarAppState(private val scope: CoroutineScope) {
                 profilesByNpub = emptyMap(); profileFetches.clear(); profileFetchedAt.clear(); profileMissedAt.clear(); persistProfileCacheNow()
                 socialState = SonarSocialState(); persistSocialState()
                 bip353 = ""; SonarCore.saveBlob("bip353", "")
+                // "Back up over cellular" is consent from ONE account to spend
+                // the user's data plan. The restored account never gave it, so
+                // it must not inherit the previous account's answer — the same
+                // rule the panic wipe already follows.
+                SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
+                backupOverCellular = false
                 coreClaimedHandle = null
                 handleClaimState = HandleClaimState.Idle
                 // Drop the previous account's nickname. The restored identity's
@@ -4401,6 +4407,18 @@ class SonarAppState(private val scope: CoroutineScope) {
                 runCatching {
                     SonarCore.recordBackupFailure("auto-backup aborted — user opted out")
                 }
+                refreshBackupPolicy()
+                return
+            }
+            // Re-check the route at the UPLOAD boundary, not just at this
+            // executor's entry: seal + reconnect take seconds on a large
+            // account, and a Wi-Fi→cellular handoff in that window would put
+            // the whole snapshot on the user's data plan despite the gate.
+            if (!autoBackupAllowedOnCurrentNetwork()) {
+                runCatching {
+                    SonarCore.recordBackupFailure("auto-backup aborted — metered link")
+                }
+                sonarLog("Backup", "executor: aborted after seal — route became metered before upload")
                 refreshBackupPolicy()
                 return
             }

@@ -946,8 +946,16 @@ actual object SonarCore {
                 runCatching { recordBackupSuccess(sealed.size.toLong()) }
                 status
             } catch (t: Throwable) {
-                sonarLog("Backup", "upload FAILED: ${t.message}")
-                runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                // An unchanged account is a no-op, not a failure. Recording it
+                // here would put a red `last_error` under a perfectly
+                // backed-up account before any caller could suppress it — this
+                // wrapper runs BEFORE AutoBackupWorker's catch.
+                if (chat.bitchat.sonar.backup.AutoBackupNetworkPolicy.isUnchangedAccount(t)) {
+                    sonarLog("Backup", "upload skipped: unchanged since the last successful upload")
+                } else {
+                    sonarLog("Backup", "upload FAILED: ${t.message}")
+                    runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                }
                 throw t
             }
         }

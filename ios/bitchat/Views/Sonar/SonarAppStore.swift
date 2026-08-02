@@ -2621,6 +2621,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func clearAccountBoundLocalStateForRestore() {
+        // "Back up over cellular" is consent from ONE account to spend the
+        // user's data plan. Restoring account B must not inherit account A's
+        // answer — B never gave it. Panic wipe clears this too; both paths
+        // replace the account, so both have to.
+        defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()

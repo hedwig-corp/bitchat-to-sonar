@@ -929,7 +929,12 @@ actual object SonarCore {
                 runCatching { recordBackupSuccess(sealed.size.toLong()) }
                 status
             } catch (t: Throwable) {
-                runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                // Mirrors the Android wrapper: an unchanged account is a no-op,
+                // and recording it would put a red `last_error` under an
+                // account that is perfectly backed up.
+                if (!chat.bitchat.sonar.backup.AutoBackupNetworkPolicy.isUnchangedAccount(t)) {
+                    runCatching { recordBackupFailure(t.message ?: "backup failed") }
+                }
                 throw t
             }
         }

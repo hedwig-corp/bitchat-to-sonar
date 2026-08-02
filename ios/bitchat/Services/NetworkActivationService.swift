@@ -32,6 +32,9 @@ final class NetworkActivationService: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var started = false
     private var pathMonitorStarted = false
+    /// Whether `NWPathMonitor` has delivered at least one update. Distinguishes
+    /// "no route" from "we do not know yet" — see `currentPathIsExpensive()`.
+    private var pathUpdateReceived = false
     private let pathMonitor = NWPathMonitor()
     private let pathQueue = DispatchQueue(label: "chat.bitchat.network-path")
     private let torPreferenceKey = "networkActivationService.userTorEnabled.v2"
@@ -57,6 +60,7 @@ final class NetworkActivationService: ObservableObject {
             let expensive = path.isExpensive || path.isConstrained
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.pathUpdateReceived = true
                 if self.pathIsExpensive != expensive {
                     self.pathIsExpensive = expensive
                     SecureLogger.info("NetworkActivationService: pathIsExpensive -> \(expensive)", category: .session)
@@ -69,19 +73,37 @@ final class NetworkActivationService: ObservableObject {
         pathMonitor.start(queue: pathQueue)
     }
 
-    /// Metered state resolved NOW, from the monitor's current path.
+    /// Metered state for a one-shot decision, awaiting the monitor's first
+    /// update rather than guessing.
     ///
-    /// The `@Published pathIsExpensive` above is pessimistic until the first
-    /// `NWPathMonitor` callback lands, which is correct for a UI binding and
-    /// wrong for a one-shot decision: a background launch that asks before that
-    /// first callback would read `true` and skip the backup, and a launch that
-    /// never ran `start()` would read `true` forever. A gate that silently
-    /// means "no backups, ever" is worse than the data it saves.
+    /// Three states have to stay distinct, and collapsing any two of them
+    /// re-opens a bug this change exists to close:
     ///
-    /// An unsatisfied path answers `false`: there is no route, so the upload
-    /// fails on its own terms rather than being suppressed as "too expensive".
-    func currentPathIsExpensive() -> Bool {
+    /// * **Unknown** (no update delivered yet) — a cold `BGProcessing` launch
+    ///   starts the monitor and `currentPath.status` is still `.unsatisfied`
+    ///   even on a device with perfectly good cellular. Reading that as
+    ///   "not expensive" would upload the full snapshot over cellular, which
+    ///   is the 66 GB bug. So we WAIT briefly for the real answer...
+    /// * ...but only briefly, and then fall back to **expensive**. Blocking
+    ///   forever, or defaulting to expensive without waiting, turns the gate
+    ///   into "no background backups, ever" — worse than the data it saves.
+    /// * **No route** (`.unsatisfied` after a real update) answers `false`:
+    ///   the upload will fail on its own terms; suppressing it as
+    ///   "too expensive" would just hide the real error.
+    func currentPathIsExpensive() async -> Bool {
         startPathMonitorIfNeeded()
+        // ~2s is generous for a local NWPathMonitor callback and short enough
+        // that a BGTask window is not meaningfully spent on it.
+        for _ in 0..<20 where !pathUpdateReceived {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        guard pathUpdateReceived else {
+            SecureLogger.info(
+                "NetworkActivationService: path still unknown — treating as metered",
+                category: .session
+            )
+            return true
+        }
         let path = pathMonitor.currentPath
         guard path.status == .satisfied else { return false }
         return path.isExpensive || path.isConstrained

@@ -1358,6 +1358,30 @@ final class MarmotChatModel: ObservableObject {
                 SecureLogger.info("Auto-backup aborted after seal — user opted out", category: .session)
                 return false
             }
+            // Re-check the route at the UPLOAD boundary, not just at the
+            // executor's entry. Everything between the two — relay drain,
+            // checkpoint, seal, reconnect — takes seconds on a large account,
+            // and a Wi-Fi→cellular handoff in that window would put the whole
+            // snapshot on the user's data plan despite the gate. Abort here
+            // instead: the seal is wasted, the bytes are not.
+            //
+            // `noteBackupFailure` mirrors the opt-out path above — it keeps
+            // `dirty` set so the next window retries, and clears the in-flight
+            // attempt so the message hot path stops re-persisting the policy.
+            let stillUnmetered = MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+                pathIsExpensive: await NetworkActivationService.shared.currentPathIsExpensive(),
+                cellularOptIn: UserDefaults.standard.bool(
+                    forKey: MarmotAccountBackupFlow.cellularOptInKey
+                )
+            )
+            guard stillUnmetered else {
+                try? service.noteBackupFailure("auto-backup aborted — metered link")
+                SecureLogger.info(
+                    "Auto-backup aborted after seal — route became metered before upload",
+                    category: .session
+                )
+                return false
+            }
         }
 
         var uploadError: Error?
@@ -1473,7 +1497,7 @@ final class MarmotChatModel: ObservableObject {
         // a process that never built the UI scene), and the cache is
         // pessimistic until then — which would silently skip every background
         // backup rather than saving data.
-        let pathIsExpensive = NetworkActivationService.shared.currentPathIsExpensive()
+        let pathIsExpensive = await NetworkActivationService.shared.currentPathIsExpensive()
         guard MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
             pathIsExpensive: pathIsExpensive,
             cellularOptIn: UserDefaults.standard.bool(
