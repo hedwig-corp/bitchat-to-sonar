@@ -234,6 +234,14 @@ struct SonarSharePayloadTests {
         #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
             "public.file-url", "public.url", "public.plain-text",
         ]) == "public.plain-text")
+
+        // Generic data is the floor, not a miss: a provider whose only
+        // byte-carrying type IS `public.data` must stage from it — every case
+        // above would also pass an implementation that only ranked CONCRETE
+        // types over `public.file-url` and skipped the generic one.
+        #expect(snStagingTypeIdentifier(registeredTypeIdentifiers: [
+            "public.file-url", "public.data", "public.url",
+        ]) == "public.data")
     }
 
     @Test
