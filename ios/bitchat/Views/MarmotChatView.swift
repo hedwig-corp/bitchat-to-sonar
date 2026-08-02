@@ -1675,6 +1675,26 @@ final class MarmotChatModel: ObservableObject {
             guard let self else { return }
             defer { self.relayBusy = false }
             guard !self.busy else { return }
+            #if os(iOS)
+            // Re-check at EXECUTION time, not only at call time. The guard above
+            // runs synchronously in the caller, but this task is unstructured
+            // and is deliberately NOT assigned to `relayConnectTask`, so
+            // `suspendStoreForBackground()` cannot cancel it. A scene that
+            // backgrounds between the two would otherwise let a
+            // foreground-authorized attach reach `service.connect()` after
+            // `closeNode()` cleared its fence and reopen the SQLCipher store
+            // post-close — the exact 0xdead10cc shape this gate exists to stop.
+            guard RelayConnectionPolicy.mayAttachRelays(
+                foreground: UIApplication.shared.applicationState != .background,
+                pushWakeOwned: self.pushWakeOwnershipCount > 0
+            ) else {
+                SecureLogger.info(
+                    "Relay attach abandoned at execution: backgrounded after the gate (0xdead10cc r8)",
+                    category: .session
+                )
+                return
+            }
+            #endif
             do {
                 self.relayConnected = false
                 #if DEBUG
