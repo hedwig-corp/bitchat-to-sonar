@@ -168,6 +168,18 @@ actual object AudioNotePlayer {
             val file = runCatching {
                 File.createTempFile(TMP_PREFIX, TMP_SUFFIX)
             }.getOrElse { onComplete(); return@execute }
+            // Tighten BEFORE the bytes land, never after. `File.createTempFile`
+            // honors the umask, so under a common 0002 it yields rw-rw-r-- and this
+            // note is decrypted end-to-end-encrypted audio sitting readable by every
+            // local user in a shared /tmp. Ordering matters as much as the mode: a
+            // chmod after the write leaves a window in which the plaintext is
+            // world-readable, so only the empty file is ever exposed.
+            if (!DesktopEnv.restrictToOwner(file)) {
+                // A filesystem that cannot express the mode (exFAT/SMB tmpdir).
+                // Playback continues rather than dying on an exotic mount, but it
+                // does not get to be silent about handing out plaintext.
+                sonarLog("AudioNotePlayer", "could not restrict $TMP_SUFFIX temp file to owner-only")
+            }
             try {
                 file.writeBytes(bytes)
             } catch (_: Exception) {

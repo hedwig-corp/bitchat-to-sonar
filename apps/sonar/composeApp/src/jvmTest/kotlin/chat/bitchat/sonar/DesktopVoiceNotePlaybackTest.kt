@@ -114,6 +114,40 @@ class DesktopVoiceNotePlaybackTest {
     }
 
     @Test
+    fun theDecryptedNoteIsNeverReadableByOtherLocalUsers() {
+        if (!linux) return
+        val dir = createTempDir("sonar-player-")
+        val perms = File(dir, "perms.log")
+        // This stub reports the mode of the note file it was handed, which is the
+        // only moment the decrypted plaintext exists on disk.
+        val f = File(dir, "ffplay")
+        f.writeText(
+            """
+            #!/bin/sh
+            for a in "$@"; do
+              case "${'$'}a" in *.m4a) stat -c '%a' "${'$'}a" >> "${perms.absolutePath}" ;; esac
+            done
+            exit 0
+            """.trimIndent()
+        )
+        f.setExecutable(true)
+        DesktopExec.pathOverride = dir.absolutePath
+        AudioNotePlayer.resetPlayerCacheForTest()
+
+        val done = CountDownLatch(1)
+        AudioNotePlayer.play(ByteArray(4096) { 0x41 }) { done.countDown() }
+        assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
+
+        // File.createTempFile honors the umask and yields rw-rw-r-- under a common
+        // 0002, which would leave decrypted E2EE audio in a shared /tmp readable by
+        // every local user for the length of the clip.
+        assertEquals(
+            "600", perms.readText().trim(),
+            "the decrypted voice note must be owner-only while it exists on disk",
+        )
+    }
+
+    @Test
     fun prefersFfplayWhenSeveralPlayersAreInstalled() {
         if (!linux) return
         val dir = createTempDir("sonar-player-")
