@@ -15,6 +15,15 @@ final class NetworkActivationService: ObservableObject {
     /// Current OS network reachability. Optimistic until NWPathMonitor delivers
     /// its first update; relay connection state still gates user-visible Online.
     @Published private(set) var internetPathSatisfied: Bool = true
+    /// True when the current route bills the user for bytes: cellular, a
+    /// personal hotspot, or a link the user put under Low Data Mode
+    /// (`isConstrained`). Only bulk transfers consult this — chat, relays and
+    /// media stay on whatever path exists.
+    ///
+    /// Pessimistic until the first `NWPathMonitor` update, which is the safe
+    /// direction: a cold launch that starts a multi-megabyte account upload
+    /// before the first path callback is exactly the 66 GB report.
+    @Published private(set) var pathIsExpensive: Bool = true
     // Sonar decision (2026-06-13): Tor is opt-in and OFF by default for now —
     // public channels / Nostr go direct. The v2 key ignores any previously
     // stored "true" from older builds where Tor defaulted on.
@@ -41,8 +50,17 @@ final class NetworkActivationService: ObservableObject {
 
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let satisfied = path.status == .satisfied
+            // `isConstrained` is Low Data Mode: the user asked the OS to hold
+            // back background transfers, and a full-account upload is the
+            // definition of one.
+            let expensive = path.isExpensive || path.isConstrained
             Task { @MainActor [weak self] in
-                guard let self, self.internetPathSatisfied != satisfied else { return }
+                guard let self else { return }
+                if self.pathIsExpensive != expensive {
+                    self.pathIsExpensive = expensive
+                    SecureLogger.info("NetworkActivationService: pathIsExpensive -> \(expensive)", category: .session)
+                }
+                guard self.internetPathSatisfied != satisfied else { return }
                 self.internetPathSatisfied = satisfied
                 SecureLogger.info("NetworkActivationService: internetPathSatisfied -> \(satisfied)", category: .session)
             }

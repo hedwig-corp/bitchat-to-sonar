@@ -2452,6 +2452,19 @@ final class SonarAppStore: ObservableObject {
     /// Account footprint for Settings → Storage; nil until measured.
     @Published private(set) var storageBytes: UInt64?
 
+    /// Whether AUTOMATIC backups may upload over a metered link.
+    ///
+    /// Off by default: one full-account snapshot per run, and the executors fire
+    /// on every backgrounding — a roaming user reported 66.3 GB in one billing
+    /// period before this gate existed. Manual "Back up now" ignores it.
+    var backupOverCellular: Bool {
+        get { defaults.bool(forKey: MarmotAccountBackupFlow.cellularOptInKey) }
+        set {
+            objectWillChange.send()
+            defaults.set(newValue, forKey: MarmotAccountBackupFlow.cellularOptInKey)
+        }
+    }
+
     /// Large media waits for Wi-Fi. Host preference, mirrored from Compose.
     var wifiOnly: Bool {
         get { UserDefaults.standard.object(forKey: "sonar.wifiOnly") as? Bool ?? true }

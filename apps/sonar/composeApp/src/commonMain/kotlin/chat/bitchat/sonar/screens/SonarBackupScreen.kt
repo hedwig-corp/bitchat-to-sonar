@@ -87,6 +87,16 @@ fun SonarBackupScreen(state: SonarAppState) {
                         icon = SNIconName.Data, label = "Frequency",
                         value = BackupFormat.frequencyLabel(policy?.frequency ?: "daily"),
                     ) { freqSheet = true }
+                    // A backup is a full-account snapshot, so the default waits
+                    // for Wi-Fi. Sits directly above "Last backup" on purpose: a
+                    // user who is never on Wi-Fi has to be able to SEE the
+                    // backup going stale and turn this on.
+                    SNSettingsRow(
+                        icon = SNIconName.Data, tone = SNTone.Cyan,
+                        label = "Back up over cellular",
+                        sub = "Off: full-account backups wait for Wi-Fi",
+                        toggle = state.backupOverCellular,
+                    ) { state.updateBackupOverCellular(!state.backupOverCellular) }
                     SNSettingsRow(
                         icon = SNIconName.Drive, label = "Last backup",
                         sub = "Restores automatically · tap for a dry run",

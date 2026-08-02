@@ -59,6 +59,18 @@ pub enum Error {
     #[error("no account backup found on Blossom for this key")]
     AccountBackupMissing,
 
+    /// Soft-fail path for auto-backup: the account is byte-identical to the last
+    /// successfully uploaded blob, so re-uploading it would spend bandwidth for
+    /// nothing. Hosts MUST treat this as a benign no-op — not a failure — and
+    /// must not surface it to the user or write it to `last_error`.
+    ///
+    /// This exists because the seal picks a fresh random AEAD nonce every run
+    /// (`seal_account_backup`), so an unchanged account still produces different
+    /// ciphertext and a different blob hash. Content-addressed dedup on the
+    /// Blossom side can never collapse those; only a pre-seal check can.
+    #[error("account backup unchanged since the last successful upload")]
+    AccountBackupUnchanged,
+
     #[error("http error: {0}")]
     Http(String),
 

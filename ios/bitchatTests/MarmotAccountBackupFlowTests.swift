@@ -78,4 +78,56 @@ struct MarmotAccountBackupFlowTests {
         )
         #expect(outcome.shouldSurfaceReconnectFailure)
     }
+
+    // MARK: - Metered-link gate (66.3 GB cellular report)
+
+    @Test
+    func automaticBackupIsBlockedOnAMeteredLinkByDefault() {
+        #expect(!MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+            pathIsExpensive: true,
+            cellularOptIn: false
+        ))
+    }
+
+    @Test
+    func optingInAllowsAutomaticBackupOnCellular() {
+        #expect(MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+            pathIsExpensive: true,
+            cellularOptIn: true
+        ))
+    }
+
+    @Test
+    func unmeteredLinksAreNeverGated() {
+        #expect(MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+            pathIsExpensive: false,
+            cellularOptIn: false
+        ))
+        #expect(MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+            pathIsExpensive: false,
+            cellularOptIn: true
+        ))
+    }
+
+    // MARK: - Unchanged-account no-op
+
+    @Test
+    func coreRefusalToReuploadAnUnchangedAccountIsNotAFailure() {
+        // Exactly what crosses UniFFI: SonarFfiError is a flat_error, so the
+        // core Display text is the whole contract.
+        let unchanged = MarmotService.ServiceError.core(
+            "account backup unchanged since the last successful upload"
+        )
+        #expect(MarmotAccountBackupFlow.isUnchangedAccount(unchanged))
+    }
+
+    @Test
+    func realBackupFailuresAreStillFailures() {
+        #expect(!MarmotAccountBackupFlow.isUnchangedAccount(
+            MarmotService.ServiceError.core("backup upload timed out")
+        ))
+        #expect(!MarmotAccountBackupFlow.isUnchangedAccount(
+            MarmotService.ServiceError.core("no account backup found on Blossom for this key")
+        ))
+    }
 }

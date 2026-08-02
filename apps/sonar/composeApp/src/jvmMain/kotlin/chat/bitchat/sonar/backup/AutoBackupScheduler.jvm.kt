@@ -13,3 +13,6 @@ actual fun enqueueOneShotPlatformAutoBackup() {
 
 actual fun currentUtcOffsetSecs(): Long =
     java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000L
+
+/** Desktop links are not billed per byte, and the JVM cannot see a tethered one. */
+actual fun isNetworkMetered(): Boolean = false

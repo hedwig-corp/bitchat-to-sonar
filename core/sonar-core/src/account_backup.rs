@@ -98,6 +98,38 @@ const BACKUP_POLICY_SUFFIX: &str = ".sonar-backup-policy.json";
 pub const DEFAULT_OPPORTUNISTIC_DEBOUNCE_SECS: u64 = 30 * 60;
 /// Default daily floor when the account is quiet (24 hours).
 pub const DEFAULT_DAILY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Ceiling on how long an unchanged account may go without re-uploading an
+/// identical blob. The effective window is the user's own cadence when that is
+/// shorter — see [`unchanged_refresh_window_secs`].
+///
+/// The seal picks a fresh random nonce every run, so an unchanged account still
+/// produces different ciphertext and a different Blossom hash — nothing on the
+/// server side can collapse those into one blob. Skipping the upload entirely is
+/// what makes an idle account cost zero bytes.
+///
+/// It is a refresh window rather than "never", because the blob lives on a host
+/// we do not control: retention policy, GC or an operator wipe can remove it,
+/// and a backup that exists only as an upload we declined to repeat is not a
+/// backup.
+pub const UNCHANGED_REFRESH_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long this policy may skip re-uploading identical bytes.
+///
+/// Bounded by the user's chosen cadence, not just the ceiling above. Two reasons
+/// to honour their setting even though the blob would be identical:
+///
+/// 1. Honesty. Settings shows the age of the last successful upload. A "Daily"
+///    user reading "Last backup: 6 days ago" concludes backup is broken, and
+///    they cannot see that the reason is "nothing changed".
+/// 2. Freshness. One upload per chosen interval is what they asked for, and it
+///    re-establishes the blob against host-side GC on their schedule.
+///
+/// The saving that matters was never this: it is killing the 30-minute
+/// opportunistic re-upload (up to 48/day → 1/day), plus the metered gate that
+/// keeps all of it off cellular.
+fn unchanged_refresh_window_secs(policy: &BackupPolicy) -> u64 {
+    policy.daily_interval_secs.min(UNCHANGED_REFRESH_SECS)
+}
 const MAX_POLICY_ERROR_CHARS: usize = 240;
 
 /// Core-owned auto-backup policy (Approach B). Hosts only execute when due.
@@ -132,6 +164,21 @@ pub struct BackupPolicy {
     /// success time rather than recounted later (the DB moves on).
     #[serde(default)]
     pub last_message_count: Option<u64>,
+    /// SHA-256 (hex) of the PLAINTEXT package behind the last successful upload.
+    ///
+    /// Plaintext, not sealed bytes: the seal randomises its nonce, so sealed
+    /// ciphertext never repeats even for a byte-identical account. This is the
+    /// only value that can answer "would this upload send anything new".
+    /// `None` on installs that predate the field — the first seal after upgrade
+    /// records one and uploads normally.
+    #[serde(default)]
+    pub last_plain_hash: Option<String>,
+    /// Fingerprint stamped by the in-flight seal, promoted to `last_plain_hash`
+    /// by [`record_backup_success`]. Split for the same reason as
+    /// `attempt_dirty_seq`: the host seals, reconnects, and only then uploads,
+    /// so success is recorded by a later call that no longer has the bytes.
+    #[serde(default)]
+    pub attempt_plain_hash: Option<String>,
 }
 
 /// The three cadences the Settings UI offers, mapped onto policy fields.
@@ -183,6 +230,8 @@ impl Default for BackupPolicy {
             daily_interval_secs: DEFAULT_DAILY_INTERVAL_SECS,
             last_size_bytes: None,
             last_message_count: None,
+            last_plain_hash: None,
+            attempt_plain_hash: None,
         }
     }
 }
@@ -464,6 +513,12 @@ pub fn record_backup_success(
         policy.last_attempt_at = Some(now);
         policy.last_error = None;
         policy.attempt_dirty_seq = None;
+        // Promote only what this attempt actually sealed. A success recorded
+        // without a seal fingerprint (older host path, or a caller that uploaded
+        // bytes we did not produce) CLEARS the marker rather than keeping a
+        // stale one: the failure mode of a wrong "unchanged" is a skipped
+        // backup, which is the one outcome this module must never risk.
+        policy.last_plain_hash = policy.attempt_plain_hash.take();
         if size_bytes.is_some() {
             policy.last_size_bytes = size_bytes;
         }
@@ -566,6 +621,11 @@ pub fn record_backup_failure(db_path: &Path, err: &str) -> Result<()> {
         // End in-flight window so the message hot path stops bumping dirty_seq.
         // Keep dirty so opportunistic retry remains due after debounce.
         policy.attempt_dirty_seq = None;
+        // Drop this attempt's fingerprint with it. Left behind, a later success
+        // recorded by a path that did not seal would promote the hash of bytes
+        // that were never uploaded — and every subsequent seal would then skip
+        // against a blob the server does not have.
+        policy.attempt_plain_hash = None;
         store_policy(map, db_path, &policy)
     })
 }
@@ -1668,12 +1728,70 @@ pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) 
     record_backup_attempt(db_path)?;
     let sealed = (|| {
         let package = read_account_backup_package(db_path, db_key_hex)?;
+        // Cheapest possible place for this check: the bytes are already read, so
+        // the fingerprint costs one hash pass and saves the seal, the reconnect
+        // and — the whole point — the upload.
+        let fingerprint = plaintext_fingerprint(&package);
+        if backup_upload_is_redundant(db_path, &fingerprint, now_unix_secs()) {
+            return Err(Error::AccountBackupUnchanged);
+        }
+        stamp_attempt_plain_hash(db_path, &fingerprint);
         seal_account_backup(&secret_bytes(keys), &package)
     })();
     if let Err(ref e) = sealed {
-        let _ = record_backup_failure(db_path, &e.to_string());
+        // `AccountBackupUnchanged` is a no-op, not a failure. Writing it to
+        // `last_error` would put "account backup unchanged" under a red
+        // Settings row for an account that is perfectly backed up.
+        if !matches!(e, Error::AccountBackupUnchanged) {
+            let _ = record_backup_failure(db_path, &e.to_string());
+        }
     }
     sealed
+}
+
+/// SHA-256 (hex) over the package's plaintext content: DB bytes, then index
+/// bytes, length-delimited so a byte moving across the boundary cannot collide.
+fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
+    let index = package.index_bytes.as_deref().unwrap_or(&[]);
+    let mut buf =
+        Vec::with_capacity(8 + package.db_bytes.len() + 8 + index.len() + package.db_key_hex.len());
+    buf.extend_from_slice(&(package.db_bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&package.db_bytes);
+    buf.extend_from_slice(&(index.len() as u64).to_le_bytes());
+    buf.extend_from_slice(index);
+    // The wrapped SQLCipher key is part of what a restore needs: if it ever
+    // changed without the DB changing, the old blob would no longer open.
+    buf.extend_from_slice(package.db_key_hex.as_bytes());
+    Sha256Hash::hash(&buf).to_string()
+}
+
+/// True when uploading `fingerprint` would re-send bytes Blossom already holds.
+///
+/// Pure over the policy so the window logic is testable at a fixed instant.
+fn upload_is_redundant(policy: &BackupPolicy, fingerprint: &str, now_secs: u64) -> bool {
+    // No recorded success ⇒ nothing is known to be on the server. Upload.
+    let Some(last_ok) = policy.last_success_at else {
+        return false;
+    };
+    if policy.last_plain_hash.as_deref() != Some(fingerprint) {
+        return false;
+    }
+    // Identical content, but refresh the remote copy on the user's cadence.
+    now_secs.saturating_sub(last_ok) < unchanged_refresh_window_secs(policy)
+}
+
+fn backup_upload_is_redundant(db_path: &Path, fingerprint: &str, now_secs: u64) -> bool {
+    with_policy_state(|map| upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs))
+}
+
+fn stamp_attempt_plain_hash(db_path: &Path, fingerprint: &str) {
+    with_policy_state(|map| {
+        let mut policy = cached_policy(map, db_path);
+        policy.attempt_plain_hash = Some(fingerprint.to_string());
+        if let Err(e) = store_policy(map, db_path, &policy) {
+            tracing::warn!(%e, "persist backup attempt fingerprint failed");
+        }
+    })
 }
 
 /// High-level convenience: seal then upload (holds exclusive DB access for the
@@ -3076,5 +3194,221 @@ mod tests {
         let opened = open_account_backup(&secret_bytes(&keys), &sealed).unwrap();
         assert_eq!(opened.db_key_hex, key_hex);
         assert!(!opened.db_bytes.is_empty());
+    }
+
+    // ── Skip-unchanged (cellular data fix) ──────────────────────────────
+
+    fn package_of(db: &[u8], index: Option<&[u8]>) -> AccountBackupPackage {
+        AccountBackupPackage {
+            db_key_hex: "55".repeat(32),
+            db_bytes: db.to_vec(),
+            index_bytes: index.map(|b| b.to_vec()),
+        }
+    }
+
+    /// Seed a keyed Marmot DB **and** its conversation index, the shape every
+    /// real install has. Without the index the first seal fingerprints an
+    /// account with no index file and the success path then creates one, so the
+    /// next seal legitimately sees different content — a fresh-dir artifact that
+    /// costs one extra upload in production and would otherwise make these
+    /// tests look like the skip is broken.
+    fn seed_account(db_path: &Path, key_hex: &str) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+            .unwrap();
+        conn.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (9);")
+            .unwrap();
+        drop(conn);
+        // Opening the index for the message count is what creates it.
+        count_indexed_messages(db_path, key_hex);
+        assert!(index_db_path_for_db(db_path).is_file(), "index must exist");
+    }
+
+    /// The property the whole fix rests on: identical accounts fingerprint the
+    /// same, and any moved byte does not.
+    #[test]
+    fn plaintext_fingerprint_tracks_content_not_nonce() {
+        let a = plaintext_fingerprint(&package_of(b"chats", Some(b"index")));
+        assert_eq!(
+            a,
+            plaintext_fingerprint(&package_of(b"chats", Some(b"index"))),
+            "same bytes must fingerprint the same — otherwise nothing is ever skipped"
+        );
+        assert_ne!(a, plaintext_fingerprint(&package_of(b"chatz", Some(b"index"))));
+        assert_ne!(a, plaintext_fingerprint(&package_of(b"chats", Some(b"indeX"))));
+        // Length-delimited: moving the boundary must not collide.
+        assert_ne!(
+            plaintext_fingerprint(&package_of(b"ab", Some(b"c"))),
+            plaintext_fingerprint(&package_of(b"a", Some(b"bc"))),
+        );
+        // A rotated SQLCipher key invalidates the old blob even if chats match.
+        let mut rekeyed = package_of(b"chats", Some(b"index"));
+        rekeyed.db_key_hex = "66".repeat(32);
+        assert_ne!(a, plaintext_fingerprint(&rekeyed));
+    }
+
+    #[test]
+    fn unchanged_account_inside_the_refresh_window_is_redundant() {
+        let now = 1_800_000_000u64;
+        let policy = BackupPolicy {
+            last_success_at: Some(now - 60),
+            last_plain_hash: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(
+            upload_is_redundant(&policy, "abc", now),
+            "re-uploading a byte-identical account is the 66 GB bug"
+        );
+    }
+
+    #[test]
+    fn changed_account_is_never_redundant() {
+        let now = 1_800_000_000u64;
+        let policy = BackupPolicy {
+            last_success_at: Some(now - 60),
+            last_plain_hash: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(!upload_is_redundant(&policy, "def", now));
+    }
+
+    /// The remote copy still gets refreshed: a blob the host may have GC'd must
+    /// not be the only backup forever.
+    #[test]
+    fn unchanged_account_past_the_refresh_window_uploads_again() {
+        let now = 1_800_000_000u64;
+        let policy = BackupPolicy {
+            last_success_at: Some(now - UNCHANGED_REFRESH_SECS - 1),
+            last_plain_hash: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(!upload_is_redundant(&policy, "abc", now));
+    }
+
+    /// The user's cadence wins when it is shorter than the ceiling. Without
+    /// this, Settings would tell a "Daily" user their last backup was six days
+    /// ago — indistinguishable, to them, from backup being broken.
+    #[test]
+    fn the_refresh_window_never_outlives_the_chosen_cadence() {
+        let now = 1_800_000_000u64;
+        let daily = BackupPolicy {
+            last_success_at: Some(now - DEFAULT_DAILY_INTERVAL_SECS - 1),
+            last_plain_hash: Some("abc".into()),
+            daily_interval_secs: DEFAULT_DAILY_INTERVAL_SECS,
+            ..Default::default()
+        };
+        assert!(
+            !upload_is_redundant(&daily, "abc", now),
+            "a daily account must still refresh daily, identical bytes or not"
+        );
+        assert_eq!(unchanged_refresh_window_secs(&daily), DEFAULT_DAILY_INTERVAL_SECS);
+
+        // Weekly sits exactly at the ceiling, so both agree.
+        let weekly = BackupPolicy {
+            daily_interval_secs: 7 * DEFAULT_DAILY_INTERVAL_SECS,
+            ..Default::default()
+        };
+        assert_eq!(unchanged_refresh_window_secs(&weekly), UNCHANGED_REFRESH_SECS);
+    }
+
+    /// Upgrade path and "nothing ever succeeded" path: with no recorded success
+    /// there is no blob to be redundant with, whatever the hash says.
+    #[test]
+    fn no_recorded_success_is_never_redundant() {
+        let now = 1_800_000_000u64;
+        let never = BackupPolicy {
+            last_success_at: None,
+            last_plain_hash: Some("abc".into()),
+            ..Default::default()
+        };
+        assert!(!upload_is_redundant(&never, "abc", now));
+        let upgraded = BackupPolicy {
+            last_success_at: Some(now - 60),
+            last_plain_hash: None,
+            ..Default::default()
+        };
+        assert!(!upload_is_redundant(&upgraded, "abc", now));
+    }
+
+    /// End-to-end over the real seal: second seal of an untouched account is
+    /// refused, and the refusal is NOT written to `last_error`.
+    #[test]
+    fn second_seal_of_an_untouched_account_is_refused() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let keys = Keys::generate();
+
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        // Only a recorded SUCCESS may enable a later skip — the upload is what
+        // puts the bytes on Blossom.
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+
+        let again = seal_account_backup_files(&keys, &db_path, &key_hex);
+        assert!(
+            matches!(again, Err(Error::AccountBackupUnchanged)),
+            "an unchanged account must not seal or upload again, got {again:?}"
+        );
+        let policy = load_backup_policy(&db_path);
+        assert!(
+            policy.last_error.is_none(),
+            "a redundant upload is a no-op, not a failure to show the user"
+        );
+        assert_eq!(policy.last_plain_hash.as_deref().map(str::len), Some(64));
+    }
+
+    /// ...and a real edit re-opens the path.
+    #[test]
+    fn seal_runs_again_once_the_account_changes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let open_keyed = || {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))
+                .unwrap();
+            conn
+        };
+        let keys = Keys::generate();
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+        assert!(seal_account_backup_files(&keys, &db_path, &key_hex).is_err());
+
+        {
+            let conn = open_keyed();
+            conn.execute_batch("INSERT INTO t VALUES (10);").unwrap();
+        }
+        assert!(
+            seal_account_backup_files(&keys, &db_path, &key_hex).is_ok(),
+            "a new message must still reach Blossom"
+        );
+    }
+
+    /// A failed upload must not leave a fingerprint that a later success could
+    /// promote — that would skip against a blob the server never received.
+    #[test]
+    fn a_failed_attempt_drops_its_fingerprint() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        save_backup_policy(
+            &db_path,
+            &BackupPolicy {
+                attempt_plain_hash: Some("sealed-but-never-uploaded".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        record_backup_failure(&db_path, "blossom upload timed out").unwrap();
+        assert_eq!(load_backup_policy(&db_path).attempt_plain_hash, None);
+
+        record_backup_success(&db_path, None, None).unwrap();
+        assert_eq!(
+            load_backup_policy(&db_path).last_plain_hash,
+            None,
+            "a success with no seal behind it must clear the marker, not inherit one"
+        );
     }
 }

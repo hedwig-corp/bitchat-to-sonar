@@ -80,6 +80,21 @@ class AutoBackupWorker(
         if (MarmotSessionGate.isLiveUiSession()) return Result.success()
         if (SonarCore.loadBlob(DISCLOSED_PREF) != "1") return Result.success()
         if (!SonarCore.onboardingComplete()) return Result.success()
+        // The route can change between dispatch and here, and a constraint that
+        // held when the job was enqueued does not bind the upload that starts
+        // now. Result.success(), not retry(): the periodic job and the next
+        // backgrounding both come back, and retrying would just burn slots
+        // while the user is still on cellular.
+        if (!AutoBackupNetworkPolicy.allowsUpload(
+                metered = isNetworkMetered(),
+                cellularOptIn = SonarCore.loadBlob(
+                    AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF
+                ) == "1",
+            )
+        ) {
+            android.util.Log.i("AutoBackupWorker", "skipped: metered link, cellular backup off")
+            return Result.success()
+        }
         if (!SonarCore.backupIsDue()) return Result.success()
         return try {
             // Final check is inside sealAccountBackup under the Marmot lock
@@ -106,9 +121,27 @@ class AutoBackupWorker(
         const val ONE_SHOT_NAME = "sonar-auto-backup-oneshot"
         const val DISCLOSED_PREF = "pref.auto_backup_disclosed"
 
+        /**
+         * `UNMETERED` unless the user opted into cellular backups.
+         *
+         * Belt and braces with the in-worker [isNetworkMetered] check below:
+         * the constraint keeps WorkManager from waking us at all on a metered
+         * link, and the runtime check catches the route changing between the
+         * job being dispatched and the upload starting.
+         */
+        private fun networkType(): NetworkType {
+            // Enqueue can run before the core is initialised (startup schedules
+            // the periodic job). A failed read means "not opted in", which is
+            // the safe direction: worst case a backup waits for Wi-Fi.
+            val optedIn = runCatching {
+                SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
+            }.getOrDefault(false)
+            return if (optedIn) NetworkType.CONNECTED else NetworkType.UNMETERED
+        }
+
         fun enqueue(context: Context) {
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(networkType())
                 .setRequiresBatteryNotLow(true)
                 .build()
             val request = PeriodicWorkRequestBuilder<AutoBackupWorker>(12, TimeUnit.HOURS)
@@ -132,7 +165,7 @@ class AutoBackupWorker(
          */
         fun enqueueOneShot(context: Context) {
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.CONNECTED)
+                .setRequiredNetworkType(networkType())
                 .build()
             val request = OneTimeWorkRequestBuilder<AutoBackupWorker>()
                 .setInitialDelay(3, TimeUnit.MINUTES)

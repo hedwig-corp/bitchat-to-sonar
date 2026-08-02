@@ -1250,7 +1250,16 @@ final class MarmotChatModel: ObservableObject {
     /// `reopenAfterSeal` is deliberately REQUIRED: a defaulted `true` here let
     /// any future background caller silently inherit the reopen that round 8
     /// exists to remove. Every call site must choose.
-    func backupAccount(respectOptOut: Bool = false, reopenAfterSeal: Bool) async throws {
+    /// - Returns: whether bytes actually went to Blossom. `false` means the
+    ///   account was byte-identical to the blob already there, so the upload was
+    ///   skipped — callers must not report that as "uploaded". Orthogonal to
+    ///   `reopenAfterSeal`: whether the store is left open is that parameter's
+    ///   business, and a skipped upload does not change it either way.
+    @discardableResult
+    func backupAccount(
+        respectOptOut: Bool = false,
+        reopenAfterSeal: Bool
+    ) async throws -> Bool {
         // `@MainActor` serializes check-then-set; Settings taps share this actor.
         guard !accountBackupInFlight else {
             throw MarmotService.ServiceError.backupAlreadyInProgress
@@ -1260,7 +1269,7 @@ final class MarmotChatModel: ObservableObject {
 
         if respectOptOut {
             let enabled = (try? service.loadBackupPolicy().enabled) ?? false
-            guard enabled else { return }
+            guard enabled else { return false }
         }
 
         let wasPolling = syncTask != nil
@@ -1277,8 +1286,19 @@ final class MarmotChatModel: ObservableObject {
 
         var sealedBundle: (nsec: String, dbPath: String, sealed: Data)?
         var sealError: Error?
+        var sealSkippedUnchanged = false
         do {
             sealedBundle = try await service.prepareSealedAccountBackup()
+        } catch let error where MarmotAccountBackupFlow.isUnchangedAccount(error) {
+            // Core refused to re-seal: this account is byte-identical to the
+            // blob already on Blossom, so uploading would spend bandwidth to
+            // replace a file with itself. Deliberately NOT noteBackupFailure —
+            // an up-to-date account is not a failed backup.
+            sealSkippedUnchanged = true
+            SecureLogger.info(
+                "Account backup skipped — unchanged since the last successful upload",
+                category: .session
+            )
         } catch {
             sealError = error
             // Keep `busy` through reconnect so `connectIfNeeded` cannot start a
@@ -1303,6 +1323,20 @@ final class MarmotChatModel: ObservableObject {
             busy = false
         }
 
+        // Nothing to upload. Clean return — but a reopen we ASKED for and did
+        // not get is still fatal, exactly as on the seal-error path below.
+        // The `reopenAfterSeal` guard is load-bearing: background executors run
+        // with `reopenAfterSeal: false`, where `reconnected == false` is the
+        // intended outcome (round 8 leaves the store closed on purpose), so
+        // testing `!reconnected` alone would throw "failed to reconnect" on
+        // every unchanged background backup.
+        if sealSkippedUnchanged {
+            if reopenAfterSeal, !reconnected {
+                throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
+            }
+            return false
+        }
+
         if let sealError {
             // Seal failures are local/crypto — always surface (do not reuse
             // upload-retry suppression, which would log "uploaded" falsely).
@@ -1322,7 +1356,7 @@ final class MarmotChatModel: ObservableObject {
                 // Clear in-flight attempt so dirty remake / debounce state stays sane.
                 try? service.noteBackupFailure("auto-backup aborted — user opted out")
                 SecureLogger.info("Auto-backup aborted after seal — user opted out", category: .session)
-                return
+                return false
             }
         }
 
@@ -1348,6 +1382,7 @@ final class MarmotChatModel: ObservableObject {
         if outcome.shouldSurfaceReconnectFailure {
             throw MarmotService.ServiceError.core(errorText ?? "failed to reconnect after backup")
         }
+        return true
     }
 
     /// Best-effort drain of an in-flight relay attach before `closeNode` +
@@ -1428,6 +1463,24 @@ final class MarmotChatModel: ObservableObject {
             SecureLogger.info("Auto-backup executor: skipped (not disclosed)", category: .session)
             return false
         }
+        // Metered-link gate. A backup is a full-account snapshot — tens of MB —
+        // and every executor above this line fires on backgrounding, so before
+        // this gate an active roaming account uploaded the whole database
+        // dozens of times a day over cellular. Manual "Back up now" bypasses
+        // this by never coming through here.
+        let pathIsExpensive = NetworkActivationService.shared.pathIsExpensive
+        guard MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
+            pathIsExpensive: pathIsExpensive,
+            cellularOptIn: UserDefaults.standard.bool(
+                forKey: MarmotAccountBackupFlow.cellularOptInKey
+            )
+        ) else {
+            SecureLogger.info(
+                "Auto-backup executor: skipped (metered link, cellular backup off)",
+                category: .session
+            )
+            return false
+        }
         #endif
         let due: Bool
         do {
@@ -1444,8 +1497,16 @@ final class MarmotChatModel: ObservableObject {
             return false
         }
         do {
-            try await backupAccount(respectOptOut: true, reopenAfterSeal: reopenStore)
-            SecureLogger.info("Auto account backup uploaded", category: .session)
+            let uploaded = try await backupAccount(
+                respectOptOut: true,
+                reopenAfterSeal: reopenStore
+            )
+            SecureLogger.info(
+                uploaded
+                    ? "Auto account backup uploaded"
+                    : "Auto account backup: nothing to upload (account already backed up)",
+                category: .session
+            )
         } catch {
             // Dump the typed error, not just localizedDescription: the 1.12.9
             // (38) crash forensics stalled on an opaque "ServiceError error 1".

@@ -7013,10 +7013,24 @@ impl SonarClient {
                 tracing::warn!(%e, "index upsert failed");
             }
         }
-        if let Some(ref db_path) = self.marmot_db_path {
-            // Auto-backup policy: local transcript change ⇒ opportunistic due later.
-            // mark_backup_dirty is cache-backed; disk I/O only on first dirty / remake.
-            crate::account_backup::mark_backup_dirty(db_path);
+        // Auto-backup policy: only OUR OWN messages make the account urgent.
+        //
+        // A received message is already durable somewhere else — the relay holds
+        // the kind-445 and a reinstall replays it — so paying for a full-account
+        // upload within 30 minutes of every inbound message buys nothing. What
+        // is irreplaceable is what this device produced: an outbound send exists
+        // nowhere until it is backed up. Received history still rides the daily
+        // floor, so the worst case is a backup up to a day behind on messages
+        // the relay can re-serve anyway.
+        //
+        // This is the cadence half of the 66 GB cellular fix: with inbound
+        // marking dirty, any account in one active group was dirty essentially
+        // always, so the 30-minute opportunistic path ran forever.
+        // `mark_backup_dirty` is cache-backed; disk I/O only on first dirty.
+        if message.mine {
+            if let Some(ref db_path) = self.marmot_db_path {
+                crate::account_backup::mark_backup_dirty(db_path);
+            }
         }
     }
 
@@ -8274,6 +8288,62 @@ mod tests {
                 .expect("summary exists")
                 .unread_count,
             2
+        );
+    }
+
+    /// R: a received message must NOT make the account "urgent" for auto-backup.
+    ///
+    /// Marking dirty on inbound kept any account in one active group dirty
+    /// essentially always, so the 30-minute opportunistic path re-uploaded the
+    /// WHOLE account forever — the 66 GB-per-period cellular report. Received
+    /// history is replayable from the relay; only our own sends are
+    /// irreplaceable, so only they may shorten the cadence.
+    ///
+    /// Pins the real index call site rather than `mark_backup_dirty` itself:
+    /// the helper was never wrong, the call site was.
+    #[tokio::test]
+    async fn only_our_own_messages_make_the_account_backup_urgent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+
+        let mut client = SonarClient::connect_in_memory(Identity::generate(), Vec::new())
+            .await
+            .expect("client connects");
+        client.conversation_index = Some(Arc::new(Mutex::new(
+            ConversationIndex::open_in_memory().expect("index opens"),
+        )));
+        client.marmot_db_path = Some(db_path.clone());
+        crate::account_backup::save_backup_policy(
+            &db_path,
+            &crate::account_backup::BackupPolicy::default(),
+        )
+        .expect("seed policy");
+
+        let group_id = GroupId::from_slice(&[9u8; 32]);
+        let peer = Keys::generate().public_key();
+        let msg = |seed: u8, secs: u64, mine: bool| ChatMessage {
+            id: test_event_id(seed),
+            group_id: group_id.clone(),
+            sender: peer,
+            content: "hey".to_owned(),
+            created_at: Timestamp::from_secs(secs),
+            mine,
+            delivery_state: crate::marmot::DeliveryState::Received,
+            media: vec![],
+            sticker_ref: None,
+            classification: crate::marmot::MessageClassification::of("hey"),
+        };
+
+        client.upsert_index_for_message(&msg(1, 100, false), Some("Chat"));
+        assert!(
+            !crate::account_backup::load_backup_policy(&db_path).dirty,
+            "an inbound message must not schedule a full-account upload"
+        );
+
+        client.upsert_index_for_message(&msg(2, 200, true), Some("Chat"));
+        assert!(
+            crate::account_backup::load_backup_policy(&db_path).dirty,
+            "our own send is the irreplaceable one — it must still mark dirty"
         );
     }
 
