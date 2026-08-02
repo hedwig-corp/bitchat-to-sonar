@@ -1700,6 +1700,55 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("SonarCall", "ignoring blocked call control chatId=$callChatId")
             return
         }
+        // #420: bind control to a 2-party conversation AND to its peer. A
+        // ☎CALL line is an ordinary group message, so without this any member
+        // of a group containing the victim could ring them with an OFFER
+        // carrying the attacker's own address, or answer someone else's call
+        // (core's on_answer overwrites the pin — the last answerer wins).
+        // Silent drop: replying decline into a group leaks presence to every
+        // member.
+        val kind = when (ctrl) {
+            is SonarCallControl.Offer -> CallControlAdmission.Kind.Offer
+            is SonarCallControl.Answer -> CallControlAdmission.Kind.Answer
+            is SonarCallControl.Cancel -> CallControlAdmission.Kind.Cancel
+            is SonarCallControl.End -> CallControlAdmission.Kind.End
+        }
+        // A mesh/NIP-17 DM is keyed by the peer itself, so it is 2-party by
+        // construction and carries no roster; a Marmot conversation must be
+        // judged on its member list.
+        // Judged on the CARRIER conversation only, never on the folded
+        // `callChatId` (#420 review round 2). Deriving directness or a roster
+        // from the fold reopened the bypass through the fold cache: a group
+        // whose id was once a 2-party fold (`foldedGroupPeerIds` /
+        // `groupFoldMap` — the `group == null` arm skips revalidation while
+        // `chats` is still hydrating) folds to a mesh id, and a mesh id is
+        // structurally direct with an empty roster — so a member added to that
+        // group AFTER the fold could drive the victim's call state from a cold
+        // start. The carrier tells the truth: a mesh DM is 2-party by
+        // construction; a Marmot chat is judged on its own member list, and an
+        // unhydrated one retries below rather than borrowing the fold's shape.
+        val structurallyDirect = isMeshChat(chatId)
+        val roster = otherMemberKeys(chatId)
+        // "Roster not loaded" is NOT "refused". The caller adds this message to
+        // `scannedCall` BEFORE dispatch, so simply returning would drop a
+        // legitimate call permanently — remove it so the next scan retries.
+        if (roster.isEmpty() && !structurallyDirect) {
+            scannedCall.remove(m.id)
+            sonarLog("SonarCall", "roster not loaded yet, retrying chatId=$chatId folded=$callChatId")
+            return
+        }
+        if (!CallControlAdmission.isAdmissible(
+                kind = kind,
+                otherMemberKeys = roster,
+                structurallyDirect = structurallyDirect,
+                senderKey = canonicalProfileKey(m.senderNpub),
+                activeCallConversationId = activeCall?.chatId,
+                conversationId = callChatId,
+            )
+        ) {
+            sonarLog("SonarCall", "dropping unbound call control chatId=$chatId folded=$callChatId")
+            return
+        }
         if (ctrl is SonarCallControl.Offer && !canCall(callChatId)) {
             if (shouldDeferOfferForSonarDescriptor(callChatId)) {
                 sonarLog("SonarCall", "deferring offer until Sonar descriptor lookup completes chatId=$chatId folded=$callChatId")
@@ -10750,14 +10799,44 @@ class SonarAppState(private val scope: CoroutineScope) {
         return if (peerId == null) marmotChatPeerNpubHex(chatId) else npubRawFor(peerId)?.toHexLower()
     }
 
+    /// The conversation's single other member, or null.
+    ///
+    /// `singleOrNull`, NOT `firstOrNull` (#420): with `firstOrNull` a
+    /// >2-member group resolved to whichever member happened to be first, so
+    /// `canCall(<group>)` returned true whenever THAT member's descriptor
+    /// supported calls — which is what put call buttons on group chats and let
+    /// any member's forged OFFER ring the victim under an innocent member's
+    /// name. A group has no unambiguous call peer; it must resolve to null,
+    /// matching iOS `snDirectMarmotPeerKey`.
     private fun marmotChatPeerNpubHex(chatId: String): String? {
         val mine = canonicalProfileKey(npub)
         val other = chats.firstOrNull { it.id == chatId }
             ?.members
             ?.map { canonicalProfileKey(it) }
-            ?.firstOrNull { it != mine && it.isNotBlank() }
+            ?.filter { it != mine && it.isNotBlank() }
+            ?.distinct()
+            ?.singleOrNull()
             ?: return null
         return canonicalNpubHex(other)
+    }
+
+    /// Members of `chatId` other than us, canonicalized — the input to the
+    /// call-control admission check (#420).
+    ///
+    /// `distinct()` matters as much as the filter: admission requires exactly
+    /// one other member, so a roster listing the same peer twice (mixed
+    /// encodings collapsing under `canonicalProfileKey`, a duplicated entry)
+    /// would read as a group and REJECT valid 2-party call controls. Mirrors
+    /// `marmotChatPeerNpubHex` above, which already deduped for the same
+    /// reason.
+    private fun otherMemberKeys(chatId: String): List<String> {
+        val mine = canonicalProfileKey(npub)
+        return chats.firstOrNull { it.id == chatId }
+            ?.members
+            ?.map { canonicalProfileKey(it) }
+            ?.filter { it != mine && it.isNotBlank() }
+            ?.distinct()
+            .orEmpty()
     }
 
     // CSPRNG, not kotlin.random: these ids travel on the mesh and key dedup, so
