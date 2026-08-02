@@ -40,3 +40,21 @@ expect fun currentUtcOffsetSecs(): Long
  * Desktop has no metered concept and answers `false`.
  */
 expect fun isNetworkMetered(): Boolean
+
+/**
+ * Whether this platform can actually tell a metered link from an unmetered one.
+ *
+ * `false` on Compose Desktop: the JVM has no portable metered-network API, so
+ * [isNetworkMetered] there is a hard-coded `false` and a "wait for Wi-Fi"
+ * preference would be unenforceable. The Backup screen hides the toggle rather
+ * than offering a data-saving control that silently does nothing — a UI that
+ * promises something it cannot deliver is the same class of defect as the
+ * "Backup failed" toast on a healthy account.
+ *
+ * TRACKED GAP (desktop): a laptop on a phone hotspot still auto-uploads full
+ * snapshots. Closing it needs per-OS native probing (Windows exposes a
+ * connection-cost API; macOS and Linux need separate paths), which is why it is
+ * not in this change. Follow-up: implement `isNetworkMetered()` per desktop OS,
+ * then flip this to `true` and the toggle reappears with no other edits.
+ */
+expect val meteredNetworkPolicySupported: Boolean

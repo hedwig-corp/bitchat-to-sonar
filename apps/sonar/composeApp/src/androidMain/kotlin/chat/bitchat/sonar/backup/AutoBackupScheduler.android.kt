@@ -19,6 +19,9 @@ actual fun enqueueOneShotPlatformAutoBackup() {
 actual fun currentUtcOffsetSecs(): Long =
     java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 1000L
 
+/** `ConnectivityManager.isActiveNetworkMetered` is authoritative on Android. */
+actual val meteredNetworkPolicySupported: Boolean = true
+
 actual fun isNetworkMetered(): Boolean {
     val ctx = try {
         chat.bitchat.sonar.AppContextHolder.ctx

@@ -2025,9 +2025,26 @@ executors pass through: the 15-minute in-app loop, the opportunistic
 background-transition run, `BGAppRefresh` and `BGProcessing`), and Compose
 `SonarAppState.runAutoBackupIfDue` + `runOpportunisticBackupOnBackground` plus
 `AutoBackupWorker`'s `NetworkType.UNMETERED` constraint **and** its run-time
-re-check (the route can change between dispatch and upload). macOS inherits the
-core half and shares `SonarBackupScreen`; `isNetworkMetered()` is `false` on the
-JVM target, which is correct — a desktop link is not billed per byte.
+re-check. macOS inherits the core half and shares `SonarBackupScreen`.
+
+**The gate is re-checked at the upload boundary, not just at executor entry.**
+Relay drain, checkpoint, seal and reconnect take seconds on a large account, so
+a Wi-Fi→cellular handoff between the entry check and the PUT would ship the
+whole snapshot anyway. Both surfaces re-check immediately before the upload and
+abort, recording a benign failure so `dirty` stays set for the next window.
+
+**TRACKED GAP (Compose Desktop).** The JVM has no portable metered-network API,
+so `isNetworkMetered()` is a hard-coded `false` there and the preference cannot
+be enforced. The Backup screen therefore HIDES the toggle on that target
+(`meteredNetworkPolicySupported`) rather than offering a data-saving control
+that silently does nothing — a UI promising something it cannot deliver is the
+same defect class as the "Backup failed" toast on a healthy account. A desktop
+on a phone hotspot still auto-uploads full snapshots. Follow-up: implement
+`isNetworkMetered()` per desktop OS (Windows exposes a connection-cost API;
+macOS and Linux need separate paths), then flip the flag and the toggle returns
+with no other edits. Deliberately not in this change: the reported incident is
+iOS cellular, and a half-working desktop probe would be worse than an admitted
+gap.
 
 **Why the refresh window tracks the user's cadence rather than a flat constant.**
 An unchanged account still re-uploads once per chosen interval (capped at
