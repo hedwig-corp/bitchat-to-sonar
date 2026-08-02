@@ -1,10 +1,10 @@
-MARKETING_VERSION = 1.12.7
+MARKETING_VERSION = 1.12.11
 // App Store Connect rejects a second upload of a (MARKETING_VERSION,
 // CURRENT_PROJECT_VERSION) pair it has already accepted — it fails the
 // whole submission with "the state of the relationship 'buildUpload'".
 // A re-archive of the same marketing version therefore needs a fresh build
-// number, even when no source changed. 35 was consumed on 2026-07-31.
-CURRENT_PROJECT_VERSION = 36
+// number, even when no source changed. 39 was consumed on 2026-08-02.
+CURRENT_PROJECT_VERSION = 40
 
 IPHONEOS_DEPLOYMENT_TARGET = 16.0
 MACOSX_DEPLOYMENT_TARGET = 15.0
