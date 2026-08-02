@@ -722,10 +722,65 @@ final class MarmotChatModel: ObservableObject {
     func connectIfNeeded(allowCreateIdentity: Bool = false) {
         if service.isConnected() { return }
         guard !busy else { return }
+        #if os(iOS)
+        // Round-9 0xdead10cc gate: this is the lazy open FUNNEL — every
+        // non-explicit open (`ensureConnected`, chat-open warmups, send
+        // fallbacks, view appear hooks) lands here. On 1.12.10 (39), a build
+        // carrying rounds 1-8, one of them fired during the background
+        // transition, queued behind the suspend close on the serial work
+        // queue, and reopened SQLCipher 150ms AFTER "store closed" — the
+        // attach gates never saw it because `performConnect` opens the store
+        // before any relay attach. Only the push wake (which brackets its
+        // drain in `pushWakeOwnership` and closes after itself) may open
+        // lazily while backgrounded. Explicit flows (restore, erase, backup
+        // executors, onboarding) call `performConnect` directly and stay
+        // ungated — see `RelayConnectionPolicy.mayOpenStore`.
+        guard RelayConnectionPolicy.mayOpenStore(
+            foreground: UIApplication.shared.applicationState != .background,
+            pushWakeOwned: pushWakeOwnershipCount > 0
+        ) else {
+            SecureLogger.info(
+                "Lazy store open refused: backgrounded with no push-wake owner (0xdead10cc r9 gate)",
+                category: .session
+            )
+            return
+        }
+        #endif
         busy = true
         Task {
             defer { busy = false }
+            #if os(iOS)
+            // Re-check at EXECUTION time, mirroring the round-8 attach gate:
+            // the guard above runs synchronously in the caller, but a scene
+            // that backgrounds between it and this task body would let a
+            // foreground-authorized open reach `connectLocal` after
+            // `closeNode()` cleared its fence.
+            guard RelayConnectionPolicy.mayOpenStore(
+                foreground: UIApplication.shared.applicationState != .background,
+                pushWakeOwned: pushWakeOwnershipCount > 0
+            ) else {
+                SecureLogger.info(
+                    "Lazy store open abandoned at execution: backgrounded after the gate (0xdead10cc r9)",
+                    category: .session
+                )
+                return
+            }
+            // The gate rides into performConnect and is rechecked AFTER the
+            // identity-load awaits, immediately before `connectLocal` opens
+            // SQLCipher: those awaits are exactly where the fatal open queued
+            // behind the suspend close, so a check here alone still races.
+            _ = await performConnect(
+                allowCreateIdentity: allowCreateIdentity,
+                lazyOpenGate: { [weak self] in
+                    RelayConnectionPolicy.mayOpenStore(
+                        foreground: UIApplication.shared.applicationState != .background,
+                        pushWakeOwned: (self?.pushWakeOwnershipCount ?? 0) > 0
+                    )
+                }
+            )
+            #else
             _ = await performConnect(allowCreateIdentity: allowCreateIdentity)
+            #endif
         }
     }
 
@@ -906,9 +961,17 @@ final class MarmotChatModel: ObservableObject {
     /// `connectIfNeeded()` and the erase-and-reconnect path —
     /// the latter must NOT be blocked by the `busy`/`npub` guard, which would
     /// silently leave the node disconnected ("not connected yet" until restart).
+    /// `lazyOpenGate` is supplied ONLY by `connectIfNeeded` (the lazy funnel):
+    /// it is rechecked after the identity-load awaits, immediately before
+    /// `connectLocal` opens SQLCipher — the awaits are where the round-9 fatal
+    /// open sat queued while the suspend close completed. Explicit callers
+    /// (restore, erase, backup, onboarding) pass nil and are never refused —
+    /// the r8 `Rejected` note (a refused connect during nsec restore rolls
+    /// back through `wipeDatabase()`) is why this is a parameter, not a check.
     private func performConnect(
         allowCreateIdentity: Bool = false,
-        scheduleAutoBackup: Bool = true
+        scheduleAutoBackup: Bool = true,
+        lazyOpenGate: (@MainActor () -> Bool)? = nil
     ) async -> Bool {
         // A keychain/DB failure must reveal the cached fallback instead of
         // leaving the app's launch surface visible forever.
@@ -983,6 +1046,17 @@ final class MarmotChatModel: ObservableObject {
         // 2) Open the encrypted DB with no relays first → load LOCAL chats right
         //    away → then attach real relays in the background. A relay publish
         //    failure must NOT hide already-persisted chats.
+        // Round-9 recheck at the last hop before the store opens: the identity
+        // awaits above are where the fatal lazy open queued behind the suspend
+        // close on the serial work queue, so the caller-side gates alone still
+        // race the transition. Nil for every explicit caller.
+        if let lazyOpenGate, !lazyOpenGate() {
+            SecureLogger.info(
+                "Lazy store open abandoned before local open: backgrounded during identity load (0xdead10cc r9)",
+                category: .session
+            )
+            return false
+        }
         do {
             _ = try await service.connectLocal(nsec: storedNsec)
             relayConnected = false

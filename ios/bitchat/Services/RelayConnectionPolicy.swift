@@ -74,6 +74,28 @@ enum RelayConnectionPolicy {
         foreground || pushWakeOwned
     }
 
+    /// Whether the LAZY store open (`connectIfNeeded`) may proceed right now —
+    /// the local-open sibling of `mayAttachRelays`.
+    ///
+    /// Every non-explicit open funnels through `connectIfNeeded`:
+    /// `ensureConnected`'s kick, chat-open warmups, send fallbacks, view appear
+    /// hooks. Backgrounded, any of them can land in the window right after
+    /// `suspendStoreForBackground()`'s close completes and `nodeClosing`
+    /// clears, reopening SQLCipher with nobody scheduled to close it — on
+    /// 1.12.10 (39), a build carrying rounds 1-8, one did exactly that 150ms
+    /// after the executor logged "store closed" and RunningBoard killed the
+    /// suspension (0xdead10cc round 9). The push wake opens lazily through this
+    /// same funnel and owns a bounded close afterwards, so ownership admits it.
+    ///
+    /// Explicit flows (onboarding, nsec restore, erase-and-reconnect, the
+    /// backup executors) call `performConnect` directly and are deliberately
+    /// NOT gated: a refused connect during an nsec restore rolls back through
+    /// `wipeDatabase()` (see `connectLocal`'s R-031 note), so the shared open
+    /// must stay callable and the gate sits on the lazy funnel only.
+    static func mayOpenStore(foreground: Bool, pushWakeOwned: Bool) -> Bool {
+        foreground || pushWakeOwned
+    }
+
     /// Whether a push wake should drop the relay latch.
     ///
     /// Only a real background scene can have had its sockets suspended. `.inactive`
