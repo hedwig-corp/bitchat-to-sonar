@@ -331,6 +331,16 @@ pub struct MarmotEngine {
     /// is never held across an await, so a concurrent send waits for at most
     /// one in-flight mutation, never for a relay fetch.
     write_lock: std::sync::Mutex<()>,
+    /// Sliding window of recent 2-member-welcome auto-accepts (#419). Anyone
+    /// holding our public KeyPackage can gift-wrap us a welcome, so
+    /// auto-accepts are rate limited; overflow routes to the pending
+    /// accept/decline UI (or is dropped past [`PENDING_INVITE_CAP`])
+    /// instead of silently writing MLS groups and chat rows without bound.
+    ///
+    /// Persisted to a sidecar next to the DB: the iOS NSE builds a fresh
+    /// engine per push wake, so an in-memory-only window would hand every
+    /// wake a fresh budget (5 × wake-rate, not 5 per window).
+    dm_autoaccept_budget: std::sync::Mutex<DmAutoacceptBudget>,
     /// Where to persist this install's KeyPackage slot id (the kind-30443 `d`
     /// tag). `None` for in-memory engines, which keep the slot in
     /// [`Self::key_package_slot_memo`] for the life of the process instead.
@@ -338,6 +348,250 @@ pub struct MarmotEngine {
     /// In-process cache of the slot id. Also the only storage for an in-memory
     /// engine, so tests that publish twice see one stable slot.
     key_package_slot_memo: std::sync::Mutex<Option<String>>,
+}
+
+/// Max 2-member welcomes auto-accepted per window before the known-sender
+/// check has to vouch for the welcomer; beyond both, they surface as pending
+/// invites (accept/decline UI).
+pub const UNKNOWN_DM_AUTOACCEPT_MAX: usize = 5;
+/// Window for [`UNKNOWN_DM_AUTOACCEPT_MAX`], in seconds.
+pub const UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS: u64 = 10 * 60;
+/// Max ACTIVE groups shared with the SAME welcomer whose further welcomes may
+/// bypass the budget. One admitted welcome must not buy an attacker unlimited
+/// silent groups: the bypass is self-bootstrapping, since landing a single
+/// welcome inside the window makes every later one from that key "known".
+/// Each extra group also adds an `#h` entry to every batched kind-445 fetch.
+pub const KNOWN_SENDER_GROUP_CAP: usize = 3;
+/// Hard ceiling on PARKED pending invites of ANY size. Past it, a new
+/// welcome is declined outright rather than parked: without this the flood
+/// just moves from silent groups into an unbounded invite list pinned above
+/// every real conversation on both hosts. Counting only 2-member invites
+/// would leave a 3-member-group spammer an open door.
+pub const PENDING_INVITE_CAP: usize = 25;
+/// Ceiling on parked invites for a welcomer we already share an active group
+/// with. Higher than [`PENDING_INVITE_CAP`] so a stranger flood cannot lock a
+/// real contact out of inviting us, but STILL A CEILING: an attacker whose
+/// first welcome was auto-accepted is "known" from then on, so an unbounded
+/// exemption just moves the flood from silent groups into an unbounded invite
+/// list — the exact failure [`PENDING_INVITE_CAP`] exists to prevent.
+pub const KNOWN_SENDER_PENDING_INVITE_CAP: usize = 50;
+/// Ceiling on groups INSPECTED by [`MarmotEngine::shared_active_groups_with`]
+/// (as opposed to matched — the `limit` parameter). The attacker/unknown case
+/// shares no group, so without this the scan pays one membership lookup per
+/// active group under `mls_write` on every flood welcome. A contact whose only
+/// shared group sits past the cap parks for manual accept instead — see the
+/// method doc for the trade.
+pub const SHARED_GROUP_SCAN_CAP: usize = 128;
+
+/// Sidecar suffix for the persisted auto-accept window (JSON `[u64]` of unix
+/// seconds). Shares fate with the DB in [`MarmotEngine::wipe`].
+const DM_AUTOACCEPT_FILE_SUFFIX: &str = ".dm-autoaccepts.json";
+/// The tmp file of the atomic write above — wiped with everything else.
+const DM_AUTOACCEPT_TMP_FILE_SUFFIX: &str = ".dm-autoaccepts.json.tmp";
+
+/// The sliding auto-accept window, shared by every process that opens the
+/// same DB path (app, NSE) via a best-effort JSON sidecar.
+struct DmAutoacceptBudget {
+    admits: std::collections::VecDeque<u64>,
+    sidecar: Option<std::path::PathBuf>,
+}
+
+impl DmAutoacceptBudget {
+    fn in_memory() -> Self {
+        Self {
+            admits: std::collections::VecDeque::new(),
+            sidecar: None,
+        }
+    }
+
+    /// A missing sidecar is a fresh install: empty window. Any OTHER read or
+    /// parse failure fails CLOSED — an exhausted window — matching `reserve`'s
+    /// treatment of a failed persist (#498 review round 2). `unwrap_or_default`
+    /// here handed a truncated/unreadable sidecar a fresh set of silent
+    /// auto-accepts, the opposite of what the limiter exists for. The window
+    /// self-heals: the next successful persist rewrites the sidecar, and
+    /// `prune` ages the synthetic admits out after
+    /// [`UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS`] — meanwhile welcomes park for
+    /// manual accept rather than being dropped.
+    fn load(db_path: &Path) -> Self {
+        let sidecar = dm_autoaccept_sidecar(db_path);
+        let admits = match std::fs::read(&sidecar) {
+            Ok(bytes) => match serde_json::from_slice::<Vec<u64>>(&bytes) {
+                Ok(entries) => std::collections::VecDeque::from(entries),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "dm-autoaccept sidecar unparsable; treating the window as exhausted"
+                    );
+                    Self::exhausted_window()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::collections::VecDeque::new()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "dm-autoaccept sidecar unreadable; treating the window as exhausted"
+                );
+                Self::exhausted_window()
+            }
+        };
+        Self {
+            admits,
+            sidecar: Some(sidecar),
+        }
+    }
+
+    /// A full window stamped `now`, so `prune` retires it naturally.
+    fn exhausted_window() -> std::collections::VecDeque<u64> {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::collections::VecDeque::from(vec![now_secs; UNKNOWN_DM_AUTOACCEPT_MAX])
+    }
+
+    fn prune(&mut self, now_secs: u64) {
+        // Future-dated admits are dropped too: `saturating_sub` returns 0 for
+        // them, so a device whose clock was ahead (dead battery, bad NTP)
+        // would otherwise pin the window exhausted until wall-clock caught up
+        // — and the persisted sidecar makes that survive reboots.
+        self.admits
+            .retain(|t| *t <= now_secs && now_secs - *t < UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS);
+    }
+
+    /// Whether the window has room, WITHOUT consuming a slot — the slot is
+    /// recorded only after `accept_welcome` succeeds, so a welcome that fails
+    /// MLS processing cannot eat the budget for real first contacts.
+    fn has_room(&mut self, now_secs: u64) -> bool {
+        self.refresh_from_disk();
+        self.prune(now_secs);
+        self.admits.len() < UNKNOWN_DM_AUTOACCEPT_MAX
+    }
+
+    /// Union the on-disk window into ours before every read or write.
+    ///
+    /// The app and the iOS NSE each hold their own engine, and a
+    /// whole-file write from a stale in-memory snapshot silently drops the
+    /// other process's admits — last-writer-wins only ever WIDENS the
+    /// budget, which is the defect persisting it was meant to close.
+    /// Caveat: two admits in the same wall-clock second across processes
+    /// dedup to one, a 1-slot loss versus today's whole-set loss.
+    fn refresh_from_disk(&mut self) {
+        let Some(sidecar) = &self.sidecar else { return };
+        let Some(disk) = std::fs::read(sidecar)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<u64>>(&bytes).ok())
+        else {
+            return;
+        };
+        if disk.is_empty() {
+            return;
+        }
+        // Disk is the AUTHORITY, not a set to union with. Every writer
+        // persists its whole window immediately after recording, so the file
+        // is a superset of what this process last wrote; adopting it wholesale
+        // picks up the other process's admits without the multiplicity problem
+        // a value-dedup creates — two admits in the same wall-clock second are
+        // distinct budget slots, and deduping collapses a burst into one.
+        let mut merged = disk;
+        merged.sort_unstable();
+        self.admits = merged.into();
+    }
+
+    /// Write the whole window through tmp+rename, like the sync/outbox
+    /// sidecars. A budget with no sidecar (memory storage, tests) persists
+    /// trivially.
+    fn persist(&self) -> std::io::Result<()> {
+        let Some(sidecar) = &self.sidecar else {
+            return Ok(());
+        };
+        let admits: Vec<u64> = self.admits.iter().copied().collect();
+        let bytes = serde_json::to_vec(&admits)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = sidecar.with_extension("json.tmp");
+        std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, sidecar))
+    }
+
+    /// Consume a slot and make it DURABLE before the caller acts on it.
+    ///
+    /// Ordering matters and used to be the other way round: recording after
+    /// `accept_welcome` meant a failed sidecar write returned success with the
+    /// budget unconsumed, so the next engine (the NSE opens its own) loaded a
+    /// stale window and granted another five automatic accepts. The limiter
+    /// disappeared exactly when the filesystem was under contention or the NSE
+    /// was killed mid-write. Reserving first fails CLOSED instead.
+    ///
+    /// The property the old ordering protected — a welcome that fails MLS
+    /// processing must not eat a real first contact's slot — is preserved by
+    /// [`Self::release`] rather than by ordering.
+    /// The cap is re-checked HERE, not only in [`Self::has_room`]. Those are
+    /// two separate steps of `process_incoming`, and this one used to
+    /// `push_back` unconditionally — so anything `refresh_from_disk` unioned in
+    /// between (the iOS NSE runs its own engine against the same sidecar) was
+    /// added on top of a decision taken against a smaller window, and the
+    /// window could grow past the maximum. Failing here parks the welcome,
+    /// which is the same fail-closed path a failed persist already takes.
+    ///
+    /// Residual: two processes that both refresh before either persists can
+    /// still each admit one, so this bounds the overrun rather than making the
+    /// window strictly atomic. Closing that needs a lock around the sidecar
+    /// read-modify-write, the way `MarmotStoreLock` guards the store.
+    fn reserve(&mut self, now_secs: u64) -> std::io::Result<()> {
+        self.refresh_from_disk();
+        self.prune(now_secs);
+        if self.admits.len() >= UNKNOWN_DM_AUTOACCEPT_MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "dm auto-accept budget exhausted",
+            ));
+        }
+        self.admits.push_back(now_secs);
+        match self.persist() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.drop_one(now_secs);
+                Err(e)
+            }
+        }
+    }
+
+    /// Give a reserved slot back after the action it was reserved for failed.
+    /// Best-effort by nature: if this write fails the window stays consumed,
+    /// which errs toward rate-limiting a real contact rather than toward
+    /// handing an attacker a free accept.
+    fn release(&mut self, now_secs: u64) {
+        self.drop_one(now_secs);
+        if let Err(e) = self.persist() {
+            tracing::warn!(
+                error = %e,
+                "dm-autoaccept rollback write failed; the slot stays consumed"
+            );
+        }
+    }
+
+    /// Remove one admit stamped `now_secs` (the most recent such entry).
+    fn drop_one(&mut self, now_secs: u64) {
+        if let Some(pos) = self.admits.iter().rposition(|&t| t == now_secs) {
+            self.admits.remove(pos);
+        }
+    }
+}
+
+fn dm_autoaccept_sidecar(db_path: &Path) -> std::path::PathBuf {
+    let name = db_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    db_path.with_file_name(format!("{name}{DM_AUTOACCEPT_FILE_SUFFIX}"))
+}
+
+/// Outcome of the 2-member-welcome gate (#419).
+enum DmWelcomeDecision {
+    AutoAccept { consume_budget: bool },
+    Park,
+    Drop,
 }
 
 impl MarmotEngine {
@@ -348,6 +602,7 @@ impl MarmotEngine {
             storage: Storage::Memory(Box::new(MDK::new(MdkMemoryStorage::default()))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::in_memory()),
             db_path: None,
             key_package_slot_memo: std::sync::Mutex::new(None),
         }
@@ -398,6 +653,10 @@ impl MarmotEngine {
             storage: Storage::Sqlite(Box::new(MDK::new(storage))),
             identity,
             write_lock: std::sync::Mutex::new(()),
+            // Persistent engine ⇒ persisted window. The iOS NSE builds a
+            // fresh engine per push wake, so an in-memory budget here would
+            // hand every wake a full budget (5 × wake-rate, not 5 per window).
+            dm_autoaccept_budget: std::sync::Mutex::new(DmAutoacceptBudget::load(path)),
             db_path: Some(path.to_path_buf()),
             key_package_slot_memo: std::sync::Mutex::new(None),
         })
@@ -414,6 +673,219 @@ impl MarmotEngine {
         self.write_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Decide what to do with a 2-member welcome (#419).
+    ///
+    /// Auto-accept is a spam/storage-DoS surface: our KeyPackage (kind 30443)
+    /// is public, so anyone can mint a 2-member MLS group and gift-wrap us a
+    /// welcome. Order of checks, cheapest first:
+    ///
+    /// 1. The authenticated seal author must BE the welcomer. NIP-59 already
+    ///    rejects a third-party seal (`SenderMismatch`) before we get here and
+    ///    MDK derives `welcomer` from the rumor author, so today this cannot
+    ///    fire — it is a cheap, MDK-version-independent backstop, not a live
+    ///    defense, and no test can reach it from the wire.
+    /// 2. The sliding budget window (persisted sidecar). Checked FIRST so the
+    ///    common under-budget path does zero storage IO — the known-sender
+    ///    scan below deserializes full MLS group state per group while the
+    ///    engine write lock is held, which is exactly the
+    ///    long-work-under-a-lock shape the 0xdead10cc history warns about.
+    ///    The slot is consumed only after `accept_welcome` succeeds.
+    /// 3. Budget exhausted: a welcomer we already share an active group with
+    ///    is vouched for (re-invites, key rotation, second device) — accept
+    ///    without consuming budget.
+    /// 4. Otherwise park as a pending invite — but only up to
+    ///    [`PENDING_INVITE_CAP`] parked invites; past the cap the
+    ///    welcome is declined outright, or the flood just moves into an
+    ///    unbounded invite list on both hosts.
+    fn dm_welcome_decision(
+        &self,
+        seal_sender: &PublicKey,
+        welcome: &welcome_types::Welcome,
+        now_secs: u64,
+    ) -> DmWelcomeDecision {
+        if *seal_sender != welcome.welcomer {
+            tracing::warn!(
+                "welcome seal author {} != welcomer {}; parking instead of auto-accepting",
+                seal_sender,
+                welcome.welcomer
+            );
+            return self.park_or_drop_welcome(welcome);
+        }
+        let has_room = self
+            .dm_autoaccept_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .has_room(now_secs);
+        if has_room {
+            return DmWelcomeDecision::AutoAccept {
+                consume_budget: true,
+            };
+        }
+        let shared = self.shared_active_groups_with(&welcome.welcomer, KNOWN_SENDER_GROUP_CAP);
+        if shared > 0 && shared < KNOWN_SENDER_GROUP_CAP {
+            return DmWelcomeDecision::AutoAccept {
+                consume_budget: false,
+            };
+        }
+        tracing::info!(
+            "unknown-sender DM welcome from {} not auto-accepted (budget exhausted)",
+            welcome.welcomer
+        );
+        self.park_or_drop_welcome(welcome)
+    }
+
+    /// How many ACTIVE groups we already share with `welcomer`, counting no
+    /// further than `limit`. Bounds the known-sender bypass (see
+    /// [`KNOWN_SENDER_GROUP_CAP`]) and the parked-invite exemption.
+    ///
+    /// `limit` is not a nicety. This runs inside `process_incoming`, which
+    /// holds the `mls_write` mutex that outgoing message creation also needs,
+    /// and every group costs a membership storage lookup — so an unbounded
+    /// scan lets relay welcome traffic block SENDING on an account with many
+    /// conversations, against the Signal-comparable performance rule. Every
+    /// caller compares against a small ceiling, so stopping there is exact,
+    /// not approximate: the count is only ever used as `> 0` or `< CAP`.
+    ///
+    /// The match cap alone is not enough (#498 review round 2): the normal
+    /// attacker case shares NO group, so `shared` never reaches `limit` and
+    /// the loop would still pay one `members()` lookup per active group under
+    /// `mls_write`. [`SHARED_GROUP_SCAN_CAP`] bounds the groups INSPECTED. The
+    /// trade is explicit: a genuine contact whose only shared group sits past
+    /// the cap reads as unknown and the welcome parks for manual accept —
+    /// fail-toward-parking, never toward auto-accepting or dropping.
+    fn shared_active_groups_with(&self, welcomer: &PublicKey, limit: usize) -> usize {
+        let Ok(groups) = self.groups() else { return 0 };
+        let mut shared = 0usize;
+        for group in groups.iter().take(SHARED_GROUP_SCAN_CAP) {
+            if shared >= limit {
+                break;
+            }
+            if self
+                .members(&group.mls_group_id)
+                .ok()
+                .is_some_and(|members| members.contains(welcomer))
+            {
+                shared += 1;
+            }
+        }
+        shared
+    }
+
+    /// Park as pending unless the parked-invite ceiling is already hit.
+    /// `process_welcome` has already stored the CURRENT welcome as pending,
+    /// so it is excluded from the count — the cap bounds the OTHERS.
+    ///
+    /// Counts EVERY pending welcome, not just 2-member ones: a spammer who
+    /// mints 3-member groups instead would otherwise walk straight around a
+    /// DM-only ceiling, and the invite list is a single list to the user
+    /// either way.
+    fn park_or_drop_welcome(&self, current: &welcome_types::Welcome) -> DmWelcomeDecision {
+        // Someone we already share an active group with gets a HIGHER ceiling,
+        // never an unbounded one. The exemption is real — without it 25 parked
+        // spam invites become a permanent invite outage for real contacts —
+        // but returning Park unconditionally handed the attacker the flood back
+        // through the other door: their first welcome is auto-accepted, which
+        // makes them "known", and every later welcome then parked forever. The
+        // group cap stopped the silent groups while the invite list grew without
+        // limit, so the fix bounded one half and left the other open.
+        let known_sender = self.shared_active_groups_with(&current.welcomer, 1) > 0;
+        let cap = if known_sender {
+            KNOWN_SENDER_PENDING_INVITE_CAP
+        } else {
+            PENDING_INVITE_CAP
+        };
+        // A failed pending-list read parks (fails open on the ceiling) rather
+        // than declining: Drop destroys a possibly-real invite unrecoverably,
+        // while Park keeps it user-visible and costs one row — the wrong
+        // direction only if the storage error persists across a whole flood,
+        // by which point welcome processing itself is failing. Logged so a
+        // recurring read failure is visible (#498 review round 2).
+        let parked = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))
+            .map(|ws| ws.iter().filter(|w| w.id != current.id).count())
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "pending-welcome count unavailable; parking without the ceiling"
+                );
+                0
+            });
+        if parked >= cap {
+            tracing::warn!(
+                welcomer = %current.welcomer,
+                member_count = current.member_count,
+                cap,
+                known_sender,
+                "pending-invite ceiling hit; declining a welcome without surfacing it"
+            );
+            DmWelcomeDecision::Drop
+        } else {
+            DmWelcomeDecision::Park
+        }
+    }
+
+    fn reserve_dm_autoaccept(&self, now_secs: u64) -> std::io::Result<()> {
+        self.dm_autoaccept_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reserve(now_secs)
+    }
+
+    fn release_dm_autoaccept(&self, now_secs: u64) {
+        self.dm_autoaccept_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release(now_secs);
+    }
+
+    /// Decline a flood welcome AND reclaim the rows it created.
+    ///
+    /// `process_welcome` has already persisted the welcome and a group row by
+    /// the time we decide to drop it, and `decline_welcome` only marks them
+    /// Declined/Inactive — so a ceiling that stops at declining still lets an
+    /// attacker grow the database ~5KB per event, which is the storage DoS
+    /// #419 is about. `delete_group` removes the group, its `welcomes` rows and
+    /// its `processed_welcomes` rows (mdk-sqlite-storage does this explicitly,
+    /// marmot-protocol/mdk#293), so the flood costs the victim nothing durable.
+    ///
+    /// Guarded, because deleting the wrong group destroys a real conversation:
+    /// only a group that is NOT Active is ever deleted. A replayed wrapper for
+    /// a live chat therefore cannot be turned into a deletion — the failure
+    /// mode this PR already had to fix once (`stop replay deleting a live DM`).
+    ///
+    /// Dropping `processed_welcomes` does mean an identical replayed wrapper is
+    /// processed again rather than deduped. That is the right trade: each replay
+    /// is re-declined and re-deleted, so it costs CPU, not unbounded storage.
+    fn decline_and_purge_welcome(&self, welcome: &welcome_types::Welcome) -> Result<()> {
+        dispatch!(&self.storage, |mdk| mdk.decline_welcome(welcome))?;
+        self.purge_declined_welcome_group(welcome)
+    }
+
+    /// The purge half of [`Self::decline_and_purge_welcome`], callable on its
+    /// own for a RE-DELIVERED already-Declined welcome: a kill between
+    /// `decline_welcome` and `delete_group` (or a transient delete error)
+    /// leaves the decline committed with the flood group's rows still on disk,
+    /// and the sync cursor advances past the wrapper — so re-delivery is the
+    /// only retry that ever comes (#498 review round 2). Same Active guard:
+    /// a manually declined welcome whose group is somehow live is never
+    /// deleted.
+    fn purge_declined_welcome_group(&self, welcome: &welcome_types::Welcome) -> Result<()> {
+        let group_id = &welcome.mls_group_id;
+        let state = dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?.map(|g| g.state);
+        match state {
+            Some(group_types::GroupState::Active) => {
+                tracing::warn!(
+                    welcomer = %welcome.welcomer,
+                    "declined welcome maps to an ACTIVE group; not deleting it"
+                );
+            }
+            Some(_) => {
+                dispatch!(&self.storage, |mdk| mdk.delete_group(group_id))?;
+            }
+            None => {}
+        }
+        Ok(())
     }
 
     /// Erase the on-disk SQLCipher database at `db_path` and its sidecar files.
@@ -932,12 +1404,100 @@ impl MarmotEngine {
                 let _mls = self.mls_write();
                 let welcome = dispatch!(&self.storage, |mdk| mdk
                     .process_welcome(&event.id, &unwrapped.rumor))?;
+                // A re-delivered wrapper returns the STORED welcome, which may
+                // already be Accepted or Declined — `process_welcome` is
+                // idempotent. Gating one of those can `decline_welcome` an
+                // ACCEPTED welcome, which flips its group Inactive and makes a
+                // live conversation vanish. Only a genuinely pending welcome
+                // may be gated.
+                if welcome.state != welcome_types::WelcomeState::Pending {
+                    return match welcome.state {
+                        welcome_types::WelcomeState::Accepted => {
+                            Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                        }
+                        welcome_types::WelcomeState::Declined => {
+                            // Re-delivery is the only retry a half-finished
+                            // `decline_and_purge_welcome` ever gets: the
+                            // decline committed, the kill (or a transient
+                            // delete error) left the flood group's rows on
+                            // disk, and the sync cursor advanced past the
+                            // wrapper. Best-effort — the Active guard inside
+                            // keeps a live group undeletable.
+                            if let Err(e) = self.purge_declined_welcome_group(&welcome) {
+                                tracing::warn!(
+                                    error = %e,
+                                    welcomer = %welcome.welcomer,
+                                    "retry purge of a declined welcome's group failed"
+                                );
+                            }
+                            Ok(Incoming::None)
+                        }
+                        _ => Ok(Incoming::None),
+                    };
+                }
                 if welcome.member_count <= 2 {
-                    dispatch!(&self.storage, |mdk| mdk.accept_welcome(&welcome))?;
-                    return Ok(Incoming::GroupUpdated(welcome.mls_group_id));
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    match self.dm_welcome_decision(&unwrapped.sender, &welcome, now_secs) {
+                        DmWelcomeDecision::AutoAccept { consume_budget } => {
+                            // Reserve the slot durably BEFORE accepting. If we
+                            // cannot, fail closed: fall through to the parked
+                            // path so the user still sees the invite, rather
+                            // than granting an accept we cannot account for.
+                            let reserved = !consume_budget
+                                || match self.reserve_dm_autoaccept(now_secs) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            welcomer = %welcome.welcomer,
+                                            "cannot persist the DM auto-accept budget; \
+                                             parking this welcome instead of auto-accepting"
+                                        );
+                                        false
+                                    }
+                                };
+                            if reserved {
+                                match dispatch!(&self.storage, |mdk| mdk
+                                    .accept_welcome(&welcome))
+                                {
+                                    Ok(()) => {
+                                        return Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                                    }
+                                    Err(e) => {
+                                        // Give the slot back: a welcome that
+                                        // fails MLS processing must not eat a
+                                        // real first contact's budget.
+                                        if consume_budget {
+                                            self.release_dm_autoaccept(now_secs);
+                                        }
+                                        return Err(e.into());
+                                    }
+                                }
+                            }
+                        }
+                        DmWelcomeDecision::Park => {}
+                        DmWelcomeDecision::Drop => {
+                            // Flood ceiling: decline locally so it neither
+                            // surfaces nor stays pending, then reclaim the rows
+                            // it created so the flood costs no durable storage.
+                            // The sender learns nothing (no network here).
+                            self.decline_and_purge_welcome(&welcome)?;
+                            return Ok(Incoming::None);
+                        }
+                    }
                 }
                 match welcome.state {
                     welcome_types::WelcomeState::Pending => {
+                        // The parked-invite ceiling applies to every size, or
+                        // a spammer just mints 3-member groups instead (#419
+                        // review round 2).
+                        if matches!(self.park_or_drop_welcome(&welcome), DmWelcomeDecision::Drop) {
+                            self.decline_and_purge_welcome(&welcome)?;
+                            return Ok(Incoming::None);
+                        }
                         Ok(Incoming::GroupInvitePending(welcome.mls_group_id))
                     }
                     welcome_types::WelcomeState::Accepted => {
@@ -990,6 +1550,15 @@ impl MarmotEngine {
 
     /// All active groups this identity belongs to. Pending group invites are
     /// surfaced separately via [`Self::pending_group_invites`].
+    /// Count of stored group rows in EVERY state, not just Active.
+    ///
+    /// Diagnostics and the #419 storage-DoS tests: `groups()` filters to
+    /// Active, so it cannot see the Declined/Inactive rows a welcome flood
+    /// leaves behind — which is exactly the growth that has to be bounded.
+    pub fn stored_group_count(&self) -> Result<usize> {
+        Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?.len())
+    }
+
     pub fn groups(&self) -> Result<Vec<group_types::Group>> {
         Ok(dispatch!(&self.storage, |mdk| mdk.get_groups())?
             .into_iter()
@@ -1000,11 +1569,18 @@ impl MarmotEngine {
     /// Pending multi-member welcomes waiting for user acceptance.
     pub fn pending_group_invites(&self) -> Result<Vec<GroupInvite>> {
         let welcomes = dispatch!(&self.storage, |mdk| mdk.get_pending_welcomes(None))?;
-        Ok(welcomes
-            .into_iter()
-            .filter(|w| w.member_count > 2)
-            .map(Self::to_group_invite)
-            .collect())
+        // No member-count filter: 2-member welcomes normally auto-accept, but
+        // an unknown-sender welcome past the rate limit (#419) parks here and
+        // must stay visible for explicit accept/decline.
+        //
+        // INVARIANT (do not widen the kind-445 fetch to pending groups): the
+        // 445 subscription/fetch filters are built from ACTIVE groups only, so
+        // a pending group's messages are never handed to MDK — which is what
+        // keeps them retrievable. MDK records a terminal Failed for a message
+        // it cannot process; if pending groups' 445s were fetched before
+        // accept, the opening message of every parked first contact would be
+        // permanently undecryptable. Accept runs a full backfill instead.
+        Ok(welcomes.into_iter().map(Self::to_group_invite).collect())
     }
 
     /// Accept a pending group invite by its kind-444 welcome event id.
@@ -1626,6 +2202,8 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
         "-journal",
         SYNC_STATE_FILE_SUFFIX,
         OUTBOX_STATE_FILE_SUFFIX,
+        DM_AUTOACCEPT_FILE_SUFFIX,
+        DM_AUTOACCEPT_TMP_FILE_SUFFIX,
         KEY_PACKAGE_SLOT_FILE_SUFFIX,
     ]
     .iter()
@@ -1635,6 +2213,149 @@ fn sidecar_paths(base: &Path) -> Vec<std::path::PathBuf> {
     paths.push(base.with_file_name(format!("{name}{OUTBOX_STATE_FILE_SUFFIX}.tmp")));
     paths.push(base.with_file_name(format!("{name}{KEY_PACKAGE_SLOT_FILE_SUFFIX}.tmp")));
     paths
+}
+
+#[cfg(test)]
+mod dm_autoaccept_budget_tests {
+    use super::{
+        dm_autoaccept_sidecar, DmAutoacceptBudget, UNKNOWN_DM_AUTOACCEPT_MAX,
+        UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS,
+    };
+
+    /// The sliding window actually slides: admits older than the window are
+    /// evicted, so the budget recovers without a restart.
+    #[test]
+    fn window_slides() {
+        let mut b = DmAutoacceptBudget::in_memory();
+        let t0 = 1_000_000;
+        for i in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+            assert!(b.has_room(t0 + i as u64));
+            b.reserve(t0 + i as u64).expect("reserve must persist");
+        }
+        assert!(!b.has_room(t0 + 10), "budget exhausted inside the window");
+        // One second before the first admit expires: still exhausted.
+        assert!(!b.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS - 1));
+        // The first admit ages out; exactly one slot frees.
+        assert!(b.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS));
+    }
+
+    /// `reserve` is the authority on the cap, not `has_room`.
+    ///
+    /// They are two separate steps of `process_incoming`, and the iOS NSE runs
+    /// its own engine against the same sidecar. A peer process filling the
+    /// window between our `has_room` and our `reserve` used to be added to
+    /// silently — `reserve` pushed unconditionally — so the window could grow
+    /// past the maximum and hand out extra silent groups. Now it fails, and the
+    /// caller parks the welcome on that error.
+    #[test]
+    fn reserve_refuses_once_another_process_filled_the_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let t0 = 3_000_000;
+
+        // We observe room...
+        let mut ours = DmAutoacceptBudget::load(&db_path);
+        assert!(ours.has_room(t0), "precondition: the window starts empty");
+
+        // ...and the "NSE" fills the window from its own process before we act.
+        let mut peer = DmAutoacceptBudget::load(&db_path);
+        for i in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+            peer.reserve(t0 + i as u64).expect("peer reserve persists");
+        }
+        drop(peer);
+
+        // Act AFTER the peer's admits: `prune` drops future-dated stamps, so
+        // reserving at t0 would legitimately see a window of one.
+        let now = t0 + UNKNOWN_DM_AUTOACCEPT_MAX as u64;
+        assert!(
+            ours.reserve(now).is_err(),
+            "reserve must refuse a slot the window can no longer afford"
+        );
+        let mut reloaded = DmAutoacceptBudget::load(&db_path);
+        assert!(
+            !reloaded.has_room(now),
+            "and it must not have grown the window past the maximum"
+        );
+    }
+
+    /// `has_room` must not consume — the slot is recorded only after a
+    /// successful accept, so failed accepts cannot eat the budget.
+    #[test]
+    fn has_room_does_not_consume() {
+        let mut b = DmAutoacceptBudget::in_memory();
+        for _ in 0..100 {
+            assert!(b.has_room(5));
+        }
+    }
+
+    /// The window survives process death via the sidecar — the iOS NSE mints
+    /// a fresh engine per push wake, so an in-memory-only window would grant
+    /// every wake a fresh budget.
+    #[test]
+    fn budget_persists_across_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let mut b = DmAutoacceptBudget::load(&db_path);
+        let t0 = 2_000_000;
+        for i in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+            b.reserve(t0 + i as u64).expect("reserve must persist");
+        }
+        assert!(!b.has_room(t0 + 10));
+        drop(b);
+
+        let mut reloaded = DmAutoacceptBudget::load(&db_path);
+        assert!(
+            !reloaded.has_room(t0 + 10),
+            "a fresh process must inherit the exhausted window"
+        );
+        assert!(reloaded.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS));
+        // The sidecar sits next to the DB and is listed for wipe().
+        assert!(dm_autoaccept_sidecar(&db_path)
+            .to_string_lossy()
+            .ends_with(".dm-autoaccepts.json"));
+    }
+
+    /// Two engines on the same DB path (the app and the iOS NSE) must not
+    /// clobber each other's admits. A whole-file write from a stale in-memory
+    /// snapshot only ever WIDENS the budget, which is the defect persisting it
+    /// was meant to close.
+    #[test]
+    fn a_second_process_sees_the_first_ones_admits() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        let t0 = 3_000_000;
+
+        // The "NSE" records admits while the "app" handle sits idle, holding a
+        // stale (empty) window.
+        let mut app = DmAutoacceptBudget::load(&db_path);
+        let mut nse = DmAutoacceptBudget::load(&db_path);
+        for i in 0..UNKNOWN_DM_AUTOACCEPT_MAX {
+            assert!(nse.has_room(t0 + i as u64));
+            nse.reserve(t0 + i as u64).expect("reserve must persist");
+        }
+
+        // The app must observe them rather than overwrite them.
+        assert!(
+            !app.has_room(t0 + 10),
+            "a second process must inherit the first's exhausted window"
+        );
+        // And once the window slides, both recover.
+        assert!(app.has_room(t0 + UNKNOWN_DM_AUTOACCEPT_WINDOW_SECS));
+    }
+
+    /// A corrupt sidecar fails open to an empty window (never blocks welcome
+    /// processing), and the next record rewrites it.
+    #[test]
+    fn corrupt_sidecar_fails_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("marmot.sqlite");
+        std::fs::write(dm_autoaccept_sidecar(&db_path), b"not json").unwrap();
+        let mut b = DmAutoacceptBudget::load(&db_path);
+        assert!(b.has_room(1));
+        b.reserve(1).expect("reserve must persist");
+        let reloaded = DmAutoacceptBudget::load(&db_path);
+        assert_eq!(reloaded.admits.len(), 1);
+    }
 }
 
 #[cfg(test)]

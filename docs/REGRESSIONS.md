@@ -1938,6 +1938,17 @@ reached) -> build 31 crash (round 6: nothing to close *yet*) -> this fix.
 
 ## Unguarded
 
+- **A 2-member pending welcome must remain visible in both hosts' invite UI.**
+  #498 made core stop filtering `member_count <= 2` out of
+  `pending_group_invites` so a rate-limited first-contact DM parks visibly
+  (`core/sonar-core/src/marmot.rs::pending_group_invites`); both hosts render
+  the list unfiltered today (Compose `App.kt` invite section, iOS
+  `SonarHomeScreen`), but no test stops either host from filtering it back
+  out — the classic mirror-pair failure. Related invariant, also unpinned: the
+  kind-445 fetch filters must stay ACTIVE-groups-only or a parked contact's
+  opening message becomes permanently undecryptable (comment at the call
+  site).
+
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
 entry once a test exists. Listing a gap is the point — an entry that overclaims
 its coverage is worse than an honest hole, because it stops people looking.
