@@ -306,6 +306,13 @@ fn load_backup_policy_from_disk(db_path: &Path) -> BackupPolicy {
             // Stale in-flight marker from a crashed process — clear so the
             // hot path does not fsync on every message after restart.
             p.attempt_dirty_seq = None;
+            // Same class, same reason: a seal that stamped its fingerprint and
+            // then died (this app is killed in the background routinely — see
+            // the 0xdead10cc rounds) must not leave one behind for a later
+            // `record_backup_success` to promote. That would mark bytes as
+            // uploaded which never reached Blossom, and every subsequent seal
+            // would skip against a blob the server does not have.
+            p.attempt_plain_hash = None;
             p
         }
         Err(e) => {
@@ -1733,6 +1740,13 @@ pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) 
         // and — the whole point — the upload.
         let fingerprint = plaintext_fingerprint(&package);
         if backup_upload_is_redundant(db_path, &fingerprint, now_unix_secs()) {
+            // End the in-flight window `record_backup_attempt` opened above.
+            // While `attempt_dirty_seq` is set, `mark_backup_dirty` re-persists
+            // the policy on the MESSAGE HOT PATH instead of taking its cached
+            // early-out — so returning without clearing it would leave a
+            // per-message disk write armed until the next attempt. Success and
+            // failure both clear it; a skip has to as well.
+            end_backup_attempt_window(db_path);
             return Err(Error::AccountBackupUnchanged);
         }
         stamp_attempt_plain_hash(db_path, &fingerprint);
@@ -1751,18 +1765,24 @@ pub fn seal_account_backup_files(keys: &Keys, db_path: &Path, db_key_hex: &str) 
 
 /// SHA-256 (hex) over the package's plaintext content: DB bytes, then index
 /// bytes, length-delimited so a byte moving across the boundary cannot collide.
+///
+/// Fed to the hasher incrementally rather than assembled into one buffer. An
+/// account snapshot is tens of MB (the reported account was ~46 MB sealed, and
+/// the cap is 200 MiB); a concatenated copy would double that at the exact
+/// moment the sealed ciphertext is about to be allocated too — inside a BGTask
+/// with a memory ceiling.
 fn plaintext_fingerprint(package: &AccountBackupPackage) -> String {
+    use sha2::Digest as _;
     let index = package.index_bytes.as_deref().unwrap_or(&[]);
-    let mut buf =
-        Vec::with_capacity(8 + package.db_bytes.len() + 8 + index.len() + package.db_key_hex.len());
-    buf.extend_from_slice(&(package.db_bytes.len() as u64).to_le_bytes());
-    buf.extend_from_slice(&package.db_bytes);
-    buf.extend_from_slice(&(index.len() as u64).to_le_bytes());
-    buf.extend_from_slice(index);
+    let mut hasher = Sha256::new();
+    hasher.update((package.db_bytes.len() as u64).to_le_bytes());
+    hasher.update(&package.db_bytes);
+    hasher.update((index.len() as u64).to_le_bytes());
+    hasher.update(index);
     // The wrapped SQLCipher key is part of what a restore needs: if it ever
     // changed without the DB changing, the old blob would no longer open.
-    buf.extend_from_slice(package.db_key_hex.as_bytes());
-    Sha256Hash::hash(&buf).to_string()
+    hasher.update(package.db_key_hex.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// True when uploading `fingerprint` would re-send bytes Blossom already holds.
@@ -1782,6 +1802,20 @@ fn upload_is_redundant(policy: &BackupPolicy, fingerprint: &str, now_secs: u64) 
 
 fn backup_upload_is_redundant(db_path: &Path, fingerprint: &str, now_secs: u64) -> bool {
     with_policy_state(|map| upload_is_redundant(&cached_policy(map, db_path), fingerprint, now_secs))
+}
+
+/// Close the in-flight window opened by [`record_backup_attempt`] without
+/// recording either a success or a failure. `last_attempt_at` deliberately
+/// stays put, so the skip still debounces the next opportunistic pass.
+fn end_backup_attempt_window(db_path: &Path) {
+    with_policy_state(|map| {
+        let mut policy = cached_policy(map, db_path);
+        policy.attempt_dirty_seq = None;
+        policy.attempt_plain_hash = None;
+        if let Err(e) = store_policy(map, db_path, &policy) {
+            tracing::warn!(%e, "ending backup attempt window failed");
+        }
+    })
 }
 
 fn stamp_attempt_plain_hash(db_path: &Path, fingerprint: &str) {
@@ -3384,6 +3418,61 @@ mod tests {
             seal_account_backup_files(&keys, &db_path, &key_hex).is_ok(),
             "a new message must still reach Blossom"
         );
+    }
+
+    /// A skip must close the in-flight window it opened. While
+    /// `attempt_dirty_seq` is set, `mark_backup_dirty` re-persists the policy on
+    /// the message hot path instead of taking its cached early-out.
+    #[test]
+    fn a_redundant_seal_closes_the_attempt_window_it_opened() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        let key_hex = "55".repeat(32);
+        seed_account(&db_path, &key_hex);
+        let keys = Keys::generate();
+
+        let sealed = seal_account_backup_files(&keys, &db_path, &key_hex).unwrap();
+        record_backup_success(&db_path, Some(sealed.len() as u64), Some(&key_hex)).unwrap();
+
+        assert!(matches!(
+            seal_account_backup_files(&keys, &db_path, &key_hex),
+            Err(Error::AccountBackupUnchanged)
+        ));
+        let policy = load_backup_policy(&db_path);
+        assert_eq!(
+            policy.attempt_dirty_seq, None,
+            "a skip must not leave a per-message disk write armed"
+        );
+        assert_eq!(policy.attempt_plain_hash, None);
+        assert!(
+            policy.last_attempt_at.is_some(),
+            "but the attempt still debounces the next opportunistic pass"
+        );
+    }
+
+    /// A seal that stamped its fingerprint and then died must not leave one on
+    /// disk: a later success would promote bytes that never reached Blossom,
+    /// and every seal after that would skip against a blob the server lacks.
+    #[test]
+    fn a_crashed_seals_fingerprint_does_not_survive_reload() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("marmot.sqlite");
+        save_backup_policy(
+            &db_path,
+            &BackupPolicy {
+                attempt_plain_hash: Some("sealed-then-killed".into()),
+                attempt_dirty_seq: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Drop the in-process cache so the next read comes off disk, which is
+        // what a fresh process after a background kill actually does.
+        with_policy_state(|map| map.clear());
+
+        let reloaded = load_backup_policy(&db_path);
+        assert_eq!(reloaded.attempt_plain_hash, None);
+        assert_eq!(reloaded.attempt_dirty_seq, None);
     }
 
     /// A failed upload must not leave a fingerprint that a later success could

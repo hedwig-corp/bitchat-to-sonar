@@ -86,10 +86,10 @@ class AutoBackupWorker(
         // backgrounding both come back, and retrying would just burn slots
         // while the user is still on cellular.
         if (!AutoBackupNetworkPolicy.allowsUpload(
-                metered = isNetworkMetered(),
-                cellularOptIn = SonarCore.loadBlob(
-                    AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF
-                ) == "1",
+                metered = runCatching { isNetworkMetered() }.getOrDefault(true),
+                cellularOptIn = runCatching {
+                    SonarCore.loadBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
+                }.getOrDefault(false),
             )
         ) {
             android.util.Log.i("AutoBackupWorker", "skipped: metered link, cellular backup off")
@@ -107,6 +107,15 @@ class AutoBackupWorker(
             // Structured concurrency cancel must not become Result.retry().
             throw e
         } catch (e: Exception) {
+            if (AutoBackupNetworkPolicy.isUnchangedAccount(e)) {
+                // Core refused to re-seal a byte-identical account. Nothing to
+                // upload and nothing wrong — `backupAccountToBlossom` surfaces
+                // the refusal as a thrown error, so without this the worker
+                // would burn its backoff slots re-discovering the same no-op
+                // and log a scary warning for a healthy account.
+                android.util.Log.i("AutoBackupWorker", "skipped: unchanged since the last upload")
+                return Result.success()
+            }
             // Do not swallow Error (OOM / LinkageError) as retry. Log before
             // retrying: a silent retry made the on-device worker test
             // undiagnosable — the job "ran" and nothing said why nothing

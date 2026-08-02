@@ -22,6 +22,10 @@ schedule** — and the codebase has exactly one of those.
 
 ## Root cause (confirmed in code): auto-backup re-uploads the entire account on a ~30-minute cadence, with no metered-network gate, on both platforms
 
+> The mechanics below are written in the present tense as they were **before**
+> the fix, because they are the diagnosis. All four are addressed on this
+> branch; R-032 is the record of what the behaviour is now.
+
 Every element verified, not inferred:
 
 1. **On by default.** `BackupPolicy::default()` sets `enabled: true`
@@ -152,12 +156,18 @@ comes back tiny, escalate the relay-rewind path (check for
      the gate can never silently mean *no backups* (Account Key Durability
      Rule: the user must be able to see backup staleness).
 2. **Skip unchanged accounts, core-side.** Before sealing, hash the plaintext
-   inputs (db bytes + index bytes — or cheaper: `(mtime, size)` of both files
-   after checkpoint, upgraded to SHA-256 of the files). Store
-   `last_plain_hash` in the policy sidecar; if unchanged since the last
-   *successful* upload and the daily floor hasn't passed, record a no-op
-   attempt and skip seal + upload entirely. This fixes the random-nonce
-   problem at its root: dedup must happen before encryption.
+   inputs (db bytes + index bytes). Store `last_plain_hash` in the policy
+   sidecar; if unchanged since the last *successful* upload and the refresh
+   window hasn't passed, record a no-op attempt and skip seal + upload
+   entirely. This fixes the random-nonce problem at its root: dedup must
+   happen before encryption.
+
+   > **Do not use `(mtime, size)` as the token** — an earlier draft of this
+   > plan suggested it as a cheap first step. SQLite in WAL mode leaves the
+   > main DB file's mtime untouched while new commits sit in `-wal`, so the
+   > token can report "unchanged" for an account that changed. A false
+   > *unchanged* is the one failure direction this must never risk, and the
+   > content hash is free anyway because the seal has already read the bytes.
 3. **Fix the dirty definition.** `mark_backup_dirty` currently treats *incoming*
    messages as urgent. Received history is recoverable from relays; what is
    irreplaceable is local-only state. Keep the 30-min debounce for genuinely

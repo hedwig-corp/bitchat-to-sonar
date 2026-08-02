@@ -1,8 +1,10 @@
 package chat.bitchat.sonar
 
+import chat.bitchat.sonar.backup.AccountBackupOutcome
 import chat.bitchat.sonar.backup.AutoBackupNetworkPolicy
 import kotlin.test.Test
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -57,5 +59,17 @@ class AutoBackupNetworkPolicyTest {
                 IllegalStateException("no account backup found on Blossom for this key"),
             ),
         )
+    }
+
+    /**
+     * "Nothing to upload" and "the backup broke" are different outcomes. A
+     * boolean conflated them, so a manual tap on an already-current account
+     * toasted "Backup failed — try again when online" — the exact false alarm
+     * this change set exists to remove.
+     */
+    @Test
+    fun alreadyUpToDateIsNotAFailure() {
+        assertNotEquals(AccountBackupOutcome.Failed, AccountBackupOutcome.AlreadyUpToDate)
+        assertNotEquals(AccountBackupOutcome.Uploaded, AccountBackupOutcome.AlreadyUpToDate)
     }
 }

@@ -2425,8 +2425,13 @@ final class SonarAppStore: ObservableObject {
         showStickyToast(String(localized: "Backing up chats…"))
         do {
             // Settings tap = foreground session: reopen so chats stay live.
-            try await marmot.backupAccount(reopenAfterSeal: true)
-            showToast(String(localized: "Chat backup uploaded"))
+            let uploaded = try await marmot.backupAccount(reopenAfterSeal: true)
+            // "Uploaded" would be a small lie for an account that was already
+            // current; "failed" (the Compose bug this mirrors) would be a big
+            // one. Say what happened.
+            showToast(uploaded
+                ? String(localized: "Chat backup uploaded")
+                : String(localized: "Chat backup is already up to date"))
             refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {
             // In-flight backup owns sticky/result toasts; do not clobber with failure.
@@ -9676,6 +9681,9 @@ final class SonarAppStore: ObservableObject {
         // Panic wipe must not leave auto-backup disclosure / BG tasks armed for
         // the next account (or race a due seal against wipeDatabase).
         defaults.removeObject(forKey: Self.autoBackupDisclosedKey)
+        // Same rule for the cellular opt-in: it is a per-account consent to
+        // spend the user's data plan, and the next account never gave it.
+        defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         #if os(iOS)
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: AutoBackupBackgroundScheduler.taskIdentifier)
         #endif

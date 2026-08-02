@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import chat.bitchat.sonar.backup.AccountBackupOutcome
 import chat.bitchat.sonar.backup.AutoBackupNetworkPolicy
 import chat.bitchat.sonar.backup.isNetworkMetered
 import chat.bitchat.sonar.crypto.Bech32
@@ -51,6 +52,7 @@ import chat.bitchat.sonar.resources.account_restored_chats_recovered_from
 import chat.bitchat.sonar.resources.account_restored_chats_start_empty
 import chat.bitchat.sonar.resources.backup_failed_try_again_when_online
 import chat.bitchat.sonar.resources.chat_backup_is_on_encrypted_backups
+import chat.bitchat.sonar.resources.chat_backup_is_already_up_to_date
 import chat.bitchat.sonar.resources.chat_backup_uploaded
 import chat.bitchat.sonar.resources.could_not_reopen_chats_after_backup
 import org.jetbrains.compose.resources.getString
@@ -999,6 +1001,10 @@ class SonarAppState(private val scope: CoroutineScope) {
             chat.bitchat.sonar.backup.cancelPlatformAutoBackupWork()
             // Panic wipe must not leave disclosure armed for the next account.
             SonarCore.saveBlob("pref.$AUTO_BACKUP_DISCLOSED_PREF", "0")
+            // Same rule for the cellular opt-in: it is a per-account consent to
+            // spend the user's data plan, and the next account never gave it.
+            SonarCore.saveBlob(AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF, "0")
+            backupOverCellular = false
             MeshRadio.stop()
             MeshRadio.setMeshNickname("")
             MeshRadio.discardPendingDeliverySignals()
@@ -4154,17 +4160,19 @@ class SonarAppState(private val scope: CoroutineScope) {
                 return@launch
             }
             backupInProgress = true
-            val ok = try {
+            val outcome = try {
                 performAccountBackupSealReconnectUpload()
             } finally {
                 backupInProgress = false
                 backupMutex.unlock()
             }
             refreshBackupPolicy()
-            toast = if (ok) {
-                getString(Res.string.chat_backup_uploaded)
-            } else {
-                getString(Res.string.backup_failed_try_again_when_online)
+            toast = when (outcome) {
+                AccountBackupOutcome.Uploaded -> getString(Res.string.chat_backup_uploaded)
+                AccountBackupOutcome.AlreadyUpToDate ->
+                    getString(Res.string.chat_backup_is_already_up_to_date)
+                AccountBackupOutcome.Failed ->
+                    getString(Res.string.backup_failed_try_again_when_online)
             }
         }
     }
@@ -4174,7 +4182,8 @@ class SonarAppState(private val scope: CoroutineScope) {
      * [ensureMarmotAfterExclusiveSeal] (avoids cold-boot UI flash after a good reopen).
      * @return true when Blossom upload + policy success recorded.
      */
-    private suspend fun performAccountBackupSealReconnectUpload(): Boolean {
+    private suspend fun performAccountBackupSealReconnectUpload(): AccountBackupOutcome {
+        var alreadyUpToDate = false
         val sealed = runCatching {
             cancelMarmotJobsForExclusiveBackup()
             SonarCore.sealAccountBackup()
@@ -4183,20 +4192,27 @@ class SonarAppState(private val scope: CoroutineScope) {
             // Core refuses to re-seal an account that is byte-identical to the
             // blob already on Blossom. That is a no-op, not a failure — writing
             // it to `last_error` would put a red row under an account that is
-            // perfectly backed up.
+            // perfectly backed up, and reporting it as failure would tell the
+            // user their backup broke when it is current.
             if (AutoBackupNetworkPolicy.isUnchangedAccount(err)) {
+                alreadyUpToDate = true
                 sonarLog("Backup", "skipped — unchanged since the last successful upload")
             } else {
                 runCatching {
                     SonarCore.recordBackupFailure(err.message ?: "backup failed")
                 }
             }
-        }.getOrNull() ?: return false
+        }.getOrNull()
+            ?: return if (alreadyUpToDate) {
+                AccountBackupOutcome.AlreadyUpToDate
+            } else {
+                AccountBackupOutcome.Failed
+            }
         if (!reopenMarmotAfterSealOrReport()) {
             runCatching {
                 SonarCore.recordBackupFailure("reconnect failed")
             }
-            return false
+            return AccountBackupOutcome.Failed
         }
         return runCatching {
             SonarCore.uploadSealedAccountBackup(sealed)
@@ -4205,7 +4221,7 @@ class SonarAppState(private val scope: CoroutineScope) {
             runCatching {
                 SonarCore.recordBackupFailure(err.message ?: "backup failed")
             }
-        }.isSuccess
+        }.let { if (it.isSuccess) AccountBackupOutcome.Uploaded else AccountBackupOutcome.Failed }
     }
 
     private suspend fun cancelMarmotJobsForExclusiveBackup() {
@@ -4704,15 +4720,23 @@ class SonarAppState(private val scope: CoroutineScope) {
             sonarLog("Backup", "opportunistic: skipped (disclosed=${isAutoBackupDisclosed()} enabled=$autoBackupEnabled)")
             return
         }
-        // This fires on EVERY backgrounding, so it is the single hottest upload
-        // trigger in the app — gate it before either half runs. The one-shot
-        // worker carries its own UNMETERED constraint and re-checks at run time,
-        // but enqueueing it here at all would just park a job that cannot run.
+        // Enqueue the one-shot FIRST, and unconditionally. It carries an
+        // UNMETERED constraint, so on cellular WorkManager parks it and runs it
+        // the moment the device reaches Wi-Fi — which is exactly the behaviour
+        // that keeps "wait for Wi-Fi" from degrading into "never back up".
+        // Skipping the enqueue on a metered link (as this did) threw that away
+        // and left the user on the 12-hour periodic job instead.
+        chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()
+        // The IN-PROCESS attempt below is the one that must respect the gate:
+        // it uploads right now, on whatever link is currently attached.
         if (!autoBackupAllowedOnCurrentNetwork()) {
-            sonarLog("Backup", "opportunistic: skipped (metered link, cellular backup off)")
+            sonarLog(
+                "Backup",
+                "opportunistic: in-process upload skipped (metered link, cellular backup off) " +
+                    "— one-shot worker parked until unmetered",
+            )
             return
         }
-        chat.bitchat.sonar.backup.enqueueOneShotPlatformAutoBackup()
         scope.launch {
             val due = runCatching {
                 withContext(Dispatchers.Default) { SonarCore.backupIsDue() }
@@ -4724,14 +4748,16 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!due) return@launch
             if (!backupMutex.tryLock()) return@launch
             backupInProgress = true
-            val ok = try {
+            val outcome = try {
                 performAccountBackupSealReconnectUpload()
             } finally {
                 backupInProgress = false
                 backupMutex.unlock()
             }
             refreshBackupPolicy()
-            if (ok) sonarLog("Backup", "opportunistic background backup uploaded")
+            if (outcome == AccountBackupOutcome.Uploaded) {
+                sonarLog("Backup", "opportunistic background backup uploaded")
+            }
         }
     }
 

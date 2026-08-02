@@ -79,8 +79,14 @@ enum MarmotAccountBackupFlow {
     /// user-visible failure.
     private static let unchangedAccountMarker = "account backup unchanged"
 
-    /// True when core refused to re-seal because the account is byte-identical
-    /// to the blob already on Blossom.
+    /// True when core refused to re-seal because the account's plaintext
+    /// fingerprint still matches the one recorded for the last **successful**
+    /// upload, inside the refresh window.
+    ///
+    /// Stated precisely on purpose: this is a local check against
+    /// `last_plain_hash`/`last_success_at`, not a confirmation that the blob is
+    /// still present on Blossom. If the host GC'd it, the refresh window (the
+    /// user's cadence, capped at a week) is what re-establishes it.
     ///
     /// This is a **no-op, not a failure**: nothing needs uploading. Callers must
     /// not write it to `last_error` (it would put a red row under a perfectly

@@ -1468,7 +1468,12 @@ final class MarmotChatModel: ObservableObject {
         // this gate an active roaming account uploaded the whole database
         // dozens of times a day over cellular. Manual "Back up now" bypasses
         // this by never coming through here.
-        let pathIsExpensive = NetworkActivationService.shared.pathIsExpensive
+        // Resolved at call time, not read from the @Published cache: a BGTask
+        // launch can reach here before the first NWPathMonitor callback (or in
+        // a process that never built the UI scene), and the cache is
+        // pessimistic until then — which would silently skip every background
+        // backup rather than saving data.
+        let pathIsExpensive = NetworkActivationService.shared.currentPathIsExpensive()
         guard MarmotAccountBackupFlow.autoBackupAllowedOnCurrentPath(
             pathIsExpensive: pathIsExpensive,
             cellularOptIn: UserDefaults.standard.bool(
