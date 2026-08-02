@@ -4188,7 +4188,16 @@ class SonarAppState(private val scope: CoroutineScope) {
      * [ensureMarmotAfterExclusiveSeal] (avoids cold-boot UI flash after a good reopen).
      * @return true when Blossom upload + policy success recorded.
      */
-    private suspend fun performAccountBackupSealReconnectUpload(): AccountBackupOutcome {
+    /**
+     * @param respectMeteredGate re-check the route between the seal and the
+     *   upload. AUTOMATIC callers pass `true`: seal + reconnect take seconds on
+     *   a large account, so a Wi-Fi→cellular handoff in that window would put
+     *   the whole snapshot on the data plan even though the entry gate passed.
+     *   Manual "Back up now" passes `false` — the user asked for it.
+     */
+    private suspend fun performAccountBackupSealReconnectUpload(
+        respectMeteredGate: Boolean = false,
+    ): AccountBackupOutcome {
         var alreadyUpToDate = false
         val sealed = runCatching {
             cancelMarmotJobsForExclusiveBackup()
@@ -4218,6 +4227,14 @@ class SonarAppState(private val scope: CoroutineScope) {
             runCatching {
                 SonarCore.recordBackupFailure("reconnect failed")
             }
+            return AccountBackupOutcome.Failed
+        }
+        // Upload boundary: the last point before bytes leave the device.
+        if (respectMeteredGate && !autoBackupAllowedOnCurrentNetwork()) {
+            runCatching {
+                SonarCore.recordBackupFailure("auto-backup aborted — metered link")
+            }
+            sonarLog("Backup", "aborted after seal — route became metered before upload")
             return AccountBackupOutcome.Failed
         }
         return runCatching {
@@ -4767,7 +4784,8 @@ class SonarAppState(private val scope: CoroutineScope) {
             if (!backupMutex.tryLock()) return@launch
             backupInProgress = true
             val outcome = try {
-                performAccountBackupSealReconnectUpload()
+                // Automatic path: re-check the route at the upload boundary.
+                performAccountBackupSealReconnectUpload(respectMeteredGate = true)
             } finally {
                 backupInProgress = false
                 backupMutex.unlock()

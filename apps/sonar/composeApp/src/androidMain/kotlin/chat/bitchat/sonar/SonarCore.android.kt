@@ -942,6 +942,28 @@ actual object SonarCore {
             sonarLog("Backup", "upload: sealing and uploading account backup")
             try {
                 val sealed = sealAccountBackup(requireNoLiveUiSession)
+                // Upload boundary. The seal above takes seconds on a large
+                // account, and this wrapper is the HEADLESS (WorkManager) path:
+                // its caller checked the route before dispatch, which does not
+                // bind the upload starting now. Without this, a Wi-Fi→cellular
+                // handoff during the seal put the whole snapshot on the data
+                // plan with the opt-in off.
+                val optedIn = runCatching {
+                    loadBlob(chat.bitchat.sonar.backup.AutoBackupNetworkPolicy.CELLULAR_OPT_IN_PREF) == "1"
+                }.getOrDefault(false)
+                if (!chat.bitchat.sonar.backup.AutoBackupNetworkPolicy.allowsUpload(
+                        metered = runCatching {
+                            chat.bitchat.sonar.backup.isNetworkMetered()
+                        }.getOrDefault(true),
+                        cellularOptIn = optedIn,
+                    )
+                ) {
+                    sonarLog("Backup", "upload aborted after seal — route became metered")
+                    // Benign: keeps `dirty` set for the next window and clears
+                    // the in-flight attempt, same as the opt-out abort.
+                    runCatching { recordBackupFailure("auto-backup aborted — metered link") }
+                    return@withContext "skipped: metered link"
+                }
                 val status = uploadSealedAccountBackup(sealed)
                 runCatching { recordBackupSuccess(sealed.size.toLong()) }
                 status
