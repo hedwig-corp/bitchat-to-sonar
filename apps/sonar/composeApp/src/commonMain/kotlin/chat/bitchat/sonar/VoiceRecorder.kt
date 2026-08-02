@@ -37,3 +37,30 @@ expect object AudioNotePlayer {
      */
     fun unavailableReason(): String?
 }
+
+/** What tapping the button on a voice-note bubble should do. */
+internal enum class AudioAction { Download, CancelDownload, Play, Stop, Nothing }
+
+/**
+ * The voice-note button's decision, extracted from the bubble so it can be pinned.
+ *
+ * It lived inline in a private composable, where deleting the [unavailable] check
+ * restored the silent-playback bug with the whole suite still green. That is the
+ * shape `docs/REGRESSIONS.md` calls out: the helper was covered, the call site was
+ * not.
+ */
+internal fun audioClickAction(
+    phase: MediaTransferPhase,
+    unavailable: String?,
+    hasBytes: Boolean,
+    playing: Boolean,
+): AudioAction = when (phase) {
+    MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed -> AudioAction.Download
+    MediaTransferPhase.Downloading -> AudioAction.CancelDownload
+    MediaTransferPhase.Available -> when {
+        unavailable != null -> AudioAction.Nothing
+        playing -> AudioAction.Stop
+        hasBytes -> AudioAction.Play
+        else -> AudioAction.Nothing
+    }
+}

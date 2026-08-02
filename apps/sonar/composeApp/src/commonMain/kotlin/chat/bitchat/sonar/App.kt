@@ -4142,18 +4142,19 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
                 .then(
                     if (isSending) Modifier else Modifier.clickable {
-                        when (transfer.phase) {
-                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                                state.requestMediaDownload(chatId, media)
-                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> {
-                                if (unplayable != null) return@clickable
-                                val b = bytes ?: return@clickable
-                                // onComplete resets `playing` when the note ends, is stopped, or
-                                // another note steals the shared player.
-                                if (playing) AudioNotePlayer.stop()
-                                else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                        // The decision itself lives in audioClickAction so it can be
+                        // tested; this only carries it out.
+                        when (audioClickAction(transfer.phase, unplayable, bytes != null, playing)) {
+                            AudioAction.Download -> state.requestMediaDownload(chatId, media)
+                            AudioAction.CancelDownload -> state.cancelMediaDownload(media)
+                            // onComplete resets `playing` when the note ends, is stopped, or
+                            // another note steals the shared player.
+                            AudioAction.Play -> {
+                                playing = true
+                                AudioNotePlayer.play(bytes!!) { playing = false }
                             }
+                            AudioAction.Stop -> AudioNotePlayer.stop()
+                            AudioAction.Nothing -> Unit
                         }
                     }
                 ),
