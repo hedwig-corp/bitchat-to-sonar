@@ -375,6 +375,13 @@ pub const PENDING_INVITE_CAP: usize = 25;
 /// exemption just moves the flood from silent groups into an unbounded invite
 /// list — the exact failure [`PENDING_INVITE_CAP`] exists to prevent.
 pub const KNOWN_SENDER_PENDING_INVITE_CAP: usize = 50;
+/// Ceiling on groups INSPECTED by [`MarmotEngine::shared_active_groups_with`]
+/// (as opposed to matched — the `limit` parameter). The attacker/unknown case
+/// shares no group, so without this the scan pays one membership lookup per
+/// active group under `mls_write` on every flood welcome. A contact whose only
+/// shared group sits past the cap parks for manual accept instead — see the
+/// method doc for the trade.
+pub const SHARED_GROUP_SCAN_CAP: usize = 128;
 
 /// Sidecar suffix for the persisted auto-accept window (JSON `[u64]` of unix
 /// seconds). Shares fate with the DB in [`MarmotEngine::wipe`].
@@ -705,10 +712,18 @@ impl MarmotEngine {
     /// conversations, against the Signal-comparable performance rule. Every
     /// caller compares against a small ceiling, so stopping there is exact,
     /// not approximate: the count is only ever used as `> 0` or `< CAP`.
+    ///
+    /// The match cap alone is not enough (#498 review round 2): the normal
+    /// attacker case shares NO group, so `shared` never reaches `limit` and
+    /// the loop would still pay one `members()` lookup per active group under
+    /// `mls_write`. [`SHARED_GROUP_SCAN_CAP`] bounds the groups INSPECTED. The
+    /// trade is explicit: a genuine contact whose only shared group sits past
+    /// the cap reads as unknown and the welcome parks for manual accept —
+    /// fail-toward-parking, never toward auto-accepting or dropping.
     fn shared_active_groups_with(&self, welcomer: &PublicKey, limit: usize) -> usize {
         let Ok(groups) = self.groups() else { return 0 };
         let mut shared = 0usize;
-        for group in groups.iter() {
+        for group in groups.iter().take(SHARED_GROUP_SCAN_CAP) {
             if shared >= limit {
                 break;
             }
@@ -797,6 +812,18 @@ impl MarmotEngine {
     /// is re-declined and re-deleted, so it costs CPU, not unbounded storage.
     fn decline_and_purge_welcome(&self, welcome: &welcome_types::Welcome) -> Result<()> {
         dispatch!(&self.storage, |mdk| mdk.decline_welcome(welcome))?;
+        self.purge_declined_welcome_group(welcome)
+    }
+
+    /// The purge half of [`Self::decline_and_purge_welcome`], callable on its
+    /// own for a RE-DELIVERED already-Declined welcome: a kill between
+    /// `decline_welcome` and `delete_group` (or a transient delete error)
+    /// leaves the decline committed with the flood group's rows still on disk,
+    /// and the sync cursor advances past the wrapper — so re-delivery is the
+    /// only retry that ever comes (#498 review round 2). Same Active guard:
+    /// a manually declined welcome whose group is somehow live is never
+    /// deleted.
+    fn purge_declined_welcome_group(&self, welcome: &welcome_types::Welcome) -> Result<()> {
         let group_id = &welcome.mls_group_id;
         let state = dispatch!(&self.storage, |mdk| mdk.get_group(group_id))?.map(|g| g.state);
         match state {
@@ -1340,6 +1367,23 @@ impl MarmotEngine {
                     return match welcome.state {
                         welcome_types::WelcomeState::Accepted => {
                             Ok(Incoming::GroupUpdated(welcome.mls_group_id))
+                        }
+                        welcome_types::WelcomeState::Declined => {
+                            // Re-delivery is the only retry a half-finished
+                            // `decline_and_purge_welcome` ever gets: the
+                            // decline committed, the kill (or a transient
+                            // delete error) left the flood group's rows on
+                            // disk, and the sync cursor advanced past the
+                            // wrapper. Best-effort — the Active guard inside
+                            // keeps a live group undeletable.
+                            if let Err(e) = self.purge_declined_welcome_group(&welcome) {
+                                tracing::warn!(
+                                    error = %e,
+                                    welcomer = %welcome.welcomer,
+                                    "retry purge of a declined welcome's group failed"
+                                );
+                            }
+                            Ok(Incoming::None)
                         }
                         _ => Ok(Incoming::None),
                     };
