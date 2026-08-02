@@ -163,8 +163,17 @@ pub fn is_valid_local_part(s: &str) -> bool {
 /// Rejecting is the safe direction for the cases where the URL parser would
 /// *fail* instead of normalising (`1.0x7f000001` overflows its 2-part slot):
 /// such a host can never be fetched anyway.
+///
+/// Both `0x` and `0X` are matched. The uppercase form cannot reach here through
+/// `parse_handle_input` (it lowercases) and would be caught downstream anyway by
+/// `is_valid_domain`'s lowercase-only charset check — but this predicate answers
+/// "is this label an IPv4 octet", and that answer must not depend on a check
+/// that runs after it.
 fn label_is_ipv4_number(label: &str) -> bool {
-    match label.strip_prefix("0x") {
+    let hex_body = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"));
+    match hex_body {
         Some(hex) => hex.bytes().all(|b| b.is_ascii_hexdigit()),
         None => label.bytes().all(|b| b.is_ascii_digit()),
     }
@@ -443,6 +452,18 @@ mod tests {
                 "expected rejection of non-decimal IPv4 literal: {bad}"
             );
         }
+        // Uppercase hex is double-gated: `parse_handle_input` lowercases, and
+        // the charset check below accepts `is_ascii_lowercase` only. Pinned
+        // here so `label_is_ipv4_number` staying case-insensitive is a tested
+        // property, not an accident of call order.
+        for upper in ["0X7F.0X0.0X0.0X1", "0x7F.0x0.0x0.0x1", "0X7f.0X1"] {
+            assert!(
+                !is_valid_domain(upper),
+                "expected rejection of uppercase-hex IPv4 literal: {upper}"
+            );
+            assert!(label_is_ipv4_number(upper.rsplit('.').next().unwrap()));
+        }
+
         // A hex-looking label is only an IPv4 octet when the host *ends* in a
         // number. These are ordinary names and must still resolve.
         for good in ["0x7f.example.com", "0xdeadbeef.org", "1password.com"] {
