@@ -100,4 +100,32 @@ struct RelayConnectionPolicyTests {
     func foregroundAttachNeverGated() {
         #expect(RelayConnectionPolicy.mayAttachRelays(foreground: true, pushWakeOwned: false))
     }
+
+    @Test("a backgrounded lazy store open with no push-wake owner must be refused")
+    func backgroundedLazyStoreOpenWithoutOwnerRefused() {
+        // Consumed by `MarmotChatModel.connectIfNeeded` — the funnel every
+        // non-explicit open goes through. Flipping this to true lets any
+        // stray `ensureConnected`/warmup/send-fallback caller reopen SQLCipher
+        // right after `suspendStoreForBackground()`'s close clears the fence —
+        // on 1.12.10 (39), a build carrying rounds 1-8, one did exactly that
+        // 150ms after "store closed" and RunningBoard killed the suspension
+        // with 0xdead10cc (round 9). The relay-attach gates never see these
+        // opens because `performConnect` opens the store before any attach.
+        #expect(RelayConnectionPolicy.mayOpenStore(foreground: false, pushWakeOwned: false) == false)
+    }
+
+    @Test("the push wake may open the store lazily while backgrounded")
+    func pushWakeMayOpenStoreBackgrounded() {
+        // `SonarPushProcessor` holds `pushWakeOwnership` across its whole pass
+        // and reaches the store through `ensureConnected` → `connectIfNeeded`;
+        // refusing it would kill background message delivery entirely.
+        #expect(RelayConnectionPolicy.mayOpenStore(foreground: false, pushWakeOwned: true))
+    }
+
+    @Test("a foreground lazy store open is never gated")
+    func foregroundLazyStoreOpenNeverGated() {
+        // The foreground resume (`refreshAfterForeground` → `ensureConnected`)
+        // is the primary reopen path after every background close.
+        #expect(RelayConnectionPolicy.mayOpenStore(foreground: true, pushWakeOwned: false))
+    }
 }

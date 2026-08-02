@@ -722,9 +722,50 @@ final class MarmotChatModel: ObservableObject {
     func connectIfNeeded(allowCreateIdentity: Bool = false) {
         if service.isConnected() { return }
         guard !busy else { return }
+        #if os(iOS)
+        // Round-9 0xdead10cc gate: this is the lazy open FUNNEL — every
+        // non-explicit open (`ensureConnected`, chat-open warmups, send
+        // fallbacks, view appear hooks) lands here. On 1.12.10 (39), a build
+        // carrying rounds 1-8, one of them fired during the background
+        // transition, queued behind the suspend close on the serial work
+        // queue, and reopened SQLCipher 150ms AFTER "store closed" — the
+        // attach gates never saw it because `performConnect` opens the store
+        // before any relay attach. Only the push wake (which brackets its
+        // drain in `pushWakeOwnership` and closes after itself) may open
+        // lazily while backgrounded. Explicit flows (restore, erase, backup
+        // executors, onboarding) call `performConnect` directly and stay
+        // ungated — see `RelayConnectionPolicy.mayOpenStore`.
+        guard RelayConnectionPolicy.mayOpenStore(
+            foreground: UIApplication.shared.applicationState != .background,
+            pushWakeOwned: pushWakeOwnershipCount > 0
+        ) else {
+            SecureLogger.info(
+                "Lazy store open refused: backgrounded with no push-wake owner (0xdead10cc r9 gate)",
+                category: .session
+            )
+            return
+        }
+        #endif
         busy = true
         Task {
             defer { busy = false }
+            #if os(iOS)
+            // Re-check at EXECUTION time, mirroring the round-8 attach gate:
+            // the guard above runs synchronously in the caller, but a scene
+            // that backgrounds between it and this task body would let a
+            // foreground-authorized open reach `connectLocal` after
+            // `closeNode()` cleared its fence.
+            guard RelayConnectionPolicy.mayOpenStore(
+                foreground: UIApplication.shared.applicationState != .background,
+                pushWakeOwned: pushWakeOwnershipCount > 0
+            ) else {
+                SecureLogger.info(
+                    "Lazy store open abandoned at execution: backgrounded after the gate (0xdead10cc r9)",
+                    category: .session
+                )
+                return
+            }
+            #endif
             _ = await performConnect(allowCreateIdentity: allowCreateIdentity)
         }
     }
