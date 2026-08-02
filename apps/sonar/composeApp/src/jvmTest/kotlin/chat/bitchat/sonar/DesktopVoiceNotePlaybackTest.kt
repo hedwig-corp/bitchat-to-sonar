@@ -32,8 +32,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @AfterTest
     fun restore() {
-        DesktopExec.pathOverride = null
-        AudioNotePlayer.resetPlayerCacheForTest()
+        AudioNotePlayer.searchPath = null
     }
 
     /** A fake player that logs its argv, lingers [holdMs], then exits cleanly. */
@@ -62,8 +61,7 @@ class DesktopVoiceNotePlaybackTest {
         val dir = createTempDir("sonar-player-")
         val log = File(dir, "argv.log")
         stubPlayer(dir, "ffplay", log)
-        DesktopExec.pathOverride = dir.absolutePath
-        AudioNotePlayer.resetPlayerCacheForTest()
+        AudioNotePlayer.searchPath = dir.absolutePath
 
         assertNull(
             AudioNotePlayer.unavailableReason(),
@@ -72,7 +70,7 @@ class DesktopVoiceNotePlaybackTest {
 
         val done = CountDownLatch(1)
         val started = System.nanoTime()
-        AudioNotePlayer.play(ByteArray(2048) { it.toByte() }) { done.countDown() }
+        AudioNotePlayer.play(fakeM4a(2048)) { done.countDown() }
         assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
         val elapsedMs = (System.nanoTime() - started) / 1_000_000
 
@@ -95,17 +93,20 @@ class DesktopVoiceNotePlaybackTest {
     fun playbackLeavesNoDecryptedAudioBehind() {
         if (!linux) return
         val dir = createTempDir("sonar-player-")
-        stubPlayer(dir, "ffplay", File(dir, "argv.log"), holdMs = 50)
-        DesktopExec.pathOverride = dir.absolutePath
-        AudioNotePlayer.resetPlayerCacheForTest()
+        val log = File(dir, "argv.log")
+        stubPlayer(dir, "ffplay", log, holdMs = 50)
+        AudioNotePlayer.searchPath = dir.absolutePath
 
         // Snapshot first: a temp file stranded by an earlier run of the real app
         // would otherwise fail this for something this playback did not do.
         val before = tempNotes()
         val done = CountDownLatch(1)
-        AudioNotePlayer.play(ByteArray(1024)) { done.countDown() }
+        AudioNotePlayer.play(fakeM4a(1024)) { done.countDown() }
         assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
 
+        // Without this the test passes vacuously: if nothing is ever spawned, no
+        // temp file is created and "nothing left behind" is trivially true.
+        assertTrue(log.readText().contains("NOTE_PRESENT"), "no player was spawned at all")
         // The note is E2EE on the wire; the temp copy handed to the player is not.
         assertEquals(
             emptyList(), (tempNotes() - before).toList(),
@@ -131,11 +132,10 @@ class DesktopVoiceNotePlaybackTest {
             """.trimIndent()
         )
         f.setExecutable(true)
-        DesktopExec.pathOverride = dir.absolutePath
-        AudioNotePlayer.resetPlayerCacheForTest()
+        AudioNotePlayer.searchPath = dir.absolutePath
 
         val done = CountDownLatch(1)
-        AudioNotePlayer.play(ByteArray(4096) { 0x41 }) { done.countDown() }
+        AudioNotePlayer.play(fakeM4a(4096)) { done.countDown() }
         assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
 
         // File.createTempFile honors the umask and yields rw-rw-r-- under a common
@@ -154,11 +154,10 @@ class DesktopVoiceNotePlaybackTest {
         val log = File(dir, "argv.log")
         stubPlayer(dir, "cvlc", log, holdMs = 50)
         stubPlayer(dir, "ffplay", log, holdMs = 50)
-        DesktopExec.pathOverride = dir.absolutePath
-        AudioNotePlayer.resetPlayerCacheForTest()
+        AudioNotePlayer.searchPath = dir.absolutePath
 
         val done = CountDownLatch(1)
-        AudioNotePlayer.play(ByteArray(512)) { done.countDown() }
+        AudioNotePlayer.play(fakeM4a(512)) { done.countDown() }
         assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
 
         val argv = log.readText()
@@ -172,8 +171,7 @@ class DesktopVoiceNotePlaybackTest {
     @Test
     fun notesAreMarkedUnplayableWhenNoPlayerIsInstalled() {
         if (!linux) return
-        DesktopExec.pathOverride = createTempDir("sonar-empty-").absolutePath
-        AudioNotePlayer.resetPlayerCacheForTest()
+        AudioNotePlayer.searchPath = createTempDir("sonar-empty-").absolutePath
 
         val reason = AudioNotePlayer.unavailableReason()
         assertNotNull(reason, "with nothing on PATH the UI must be told notes cannot play")
@@ -183,6 +181,113 @@ class DesktopVoiceNotePlaybackTest {
             reason.contains("ffmpeg") || reason.contains("mpv") || reason.contains("vlc"),
             "the reason must name a package that fixes it: $reason",
         )
+    }
+
+    @Test
+    fun aPlaylistDisguisedAsAVoiceNoteIsNeverHandedToAPlayer() {
+        if (!linux) return
+        val dir = createTempDir("sonar-player-")
+        val log = File(dir, "argv.log")
+        stubPlayer(dir, "ffplay", log, holdMs = 50)
+        AudioNotePlayer.searchPath = dir.absolutePath
+
+        // VLC content-sniffs and ignores the .m4a suffix, so these bytes made cvlc
+        // fetch the URL and exit 0 while the app reported a normal play: an IP
+        // disclosure and SSRF probe driven by whoever sent the message.
+        val playlist = "#EXTM3U\nhttp://127.0.0.1:1/beacon\n".toByteArray()
+        val done = CountDownLatch(1)
+        AudioNotePlayer.play(playlist) { done.countDown() }
+        assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
+
+        assertEquals(
+            "", log.let { if (it.exists()) it.readText() else "" },
+            "a non-MP4 payload must never reach an external media stack",
+        )
+    }
+
+    @Test
+    fun aDirectoryNamedLikeAPlayerIsNotMistakenForOne() {
+        if (!linux) return
+        val dir = createTempDir("sonar-player-")
+        // Files.isExecutable is access(2) X_OK, which is true for any searchable
+        // directory. This one used to win resolution, so the app claimed it could
+        // play, the spawn failed with EACCES, and the note completed in silence.
+        File(dir, "ffplay").mkdirs()
+        AudioNotePlayer.searchPath = dir.absolutePath
+
+        assertNotNull(
+            AudioNotePlayer.unavailableReason(),
+            "a directory is not a player; the UI must be told notes cannot play",
+        )
+    }
+
+    @Test
+    fun switchingNotesTearsDownTheFirstPlayerAndItsPlaintext() {
+        if (!linux) return
+        val dir = createTempDir("sonar-player-")
+        val log = File(dir, "argv.log")
+        // Long enough that the first player is still running when the second starts.
+        stubPlayer(dir, "ffplay", log, holdMs = 5000)
+        AudioNotePlayer.searchPath = dir.absolutePath
+
+        val before = tempNotes()
+        val firstDone = CountDownLatch(1)
+        AudioNotePlayer.play(fakeM4a(2048)) { firstDone.countDown() }
+        Thread.sleep(300)
+        val secondDone = CountDownLatch(1)
+        AudioNotePlayer.play(fakeM4a(2048)) { secondDone.countDown() }
+
+        // Removing the teardown() call in play() leaves both players running and
+        // the first bubble stuck on Pause forever, with its decrypted note on disk.
+        assertTrue(
+            firstDone.await(15, TimeUnit.SECONDS),
+            "starting a second note must complete the first, not orphan it",
+        )
+        AudioNotePlayer.stop()
+        assertTrue(secondDone.await(15, TimeUnit.SECONDS), "stop() must complete the second")
+        assertEquals(
+            emptyList(), (tempNotes() - before).toList(),
+            "neither note may leave decrypted audio behind",
+        )
+    }
+
+    @Test
+    fun aPlayerThatIgnoresSigtermDoesNotWedgePlaybackForever() {
+        if (!linux) return
+        val dir = createTempDir("sonar-player-")
+        val f = File(dir, "ffplay")
+        // Ignores SIGTERM. teardown() used to waitFor() this with no timeout on the
+        // single control thread, so every later play()/stop() queued behind it for
+        // the rest of the session.
+        f.writeText(
+            """
+            #!/bin/sh
+            trap "" TERM
+            sleep 3600
+            """.trimIndent()
+        )
+        f.setExecutable(true)
+        AudioNotePlayer.searchPath = dir.absolutePath
+
+        val stubborn = CountDownLatch(1)
+        AudioNotePlayer.play(fakeM4a(1024)) { stubborn.countDown() }
+        Thread.sleep(300)
+        AudioNotePlayer.stop()
+        assertTrue(
+            stubborn.await(20, TimeUnit.SECONDS),
+            "stop() must escalate to SIGKILL rather than wait forever",
+        )
+
+        // And the player must still work afterwards.
+        stubPlayer(dir, "ffplay", File(dir, "argv2.log"), holdMs = 50)
+        val after = CountDownLatch(1)
+        AudioNotePlayer.play(fakeM4a(1024)) { after.countDown() }
+        assertTrue(after.await(20, TimeUnit.SECONDS), "the control thread is wedged")
+    }
+
+    /** Minimal bytes that pass the MP4 container check: `....ftyp`. */
+    private fun fakeM4a(size: Int): ByteArray = ByteArray(maxOf(size, 12)).also {
+        "ftyp".forEachIndexed { i, c -> it[4 + i] = c.code.toByte() }
     }
 
     private fun tempNotes(): Set<String> =
