@@ -20,7 +20,7 @@ export const BLOG_EVENT_KIND = 30023;
  * equal the pubkey the posts are signed with (scripts/blog/publish.sh), or the
  * reader will filter the posts out.
  */
-export const BLOG_PUBKEY_HEX = '1745b4c2aab2851f2d2511f25da0e78a6eda475b72d45d7de727a4f5f316152e';
+export const BLOG_PUBKEY_HEX = '7215b2db8754494fd3452b7f2d28b56e23863b95446bf68d79f980a7ad5ec7cd';
 
 /** Relays queried for the blog feed. Same public set the status feed uses. */
 export const BLOG_FEED_RELAYS = [
