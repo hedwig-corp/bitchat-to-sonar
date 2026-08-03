@@ -30,6 +30,39 @@ class DesktopVoiceNotePlaybackTest {
 
     private val linux = System.getProperty("os.name").lowercase().contains("linux")
 
+    /**
+     * These drive Linux player resolution, so they cannot assert anything elsewhere.
+     * Reported rather than silently returning: nine green tests that executed nothing
+     * is the same "success that is really a no-op" this file exists to prevent.
+     */
+    private fun skipOffLinux(): Boolean {
+        if (!linux) println("SKIPPED (not Linux): desktop player tests assert nothing here")
+        return !linux
+    }
+
+    private fun box(type: String, payload: ByteArray): ByteArray {
+        val size = 8 + payload.size
+        return byteArrayOf(
+            (size ushr 24).toByte(), (size ushr 16).toByte(),
+            (size ushr 8).toByte(), size.toByte(),
+        ) + type.toByteArray() + payload
+    }
+
+    /** A valid MP4 whose `moov/rmra` names a URL instead of holding audio. */
+    private fun referenceMovie(): ByteArray {
+        val url = "http://127.0.0.1:1/beacon ".toByteArray()
+        val rdrf = box(
+            "rdrf",
+            byteArrayOf(0, 0, 0, 0) + "url ".toByteArray() +
+                byteArrayOf(
+                    (url.size ushr 24).toByte(), (url.size ushr 16).toByte(),
+                    (url.size ushr 8).toByte(), url.size.toByte(),
+                ) + url,
+        )
+        return box("ftyp", "qt  ".toByteArray() + ByteArray(8)) +
+            box("moov", box("mvhd", ByteArray(100)) + box("rmra", box("rmda", rdrf)))
+    }
+
     @AfterTest
     fun restore() {
         AudioNotePlayer.searchPath = null
@@ -57,7 +90,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun playSpawnsTheResolvedPlayerWithTheNoteAndWaitsForItToFinish() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val log = File(dir, "argv.log")
         stubPlayer(dir, "ffplay", log)
@@ -76,6 +109,11 @@ class DesktopVoiceNotePlaybackTest {
 
         val argv = log.readText()
         assertTrue(argv.contains("-autoexit"), "ffplay must get its exit-at-EOF flag: $argv")
+        // The one flag standing between a remote peer and an outbound request.
+        assertTrue(
+            argv.contains("-protocol_whitelist") && argv.contains("file"),
+            "ffplay must be told which protocols it may use, not left on a build default: $argv",
+        )
         assertTrue(argv.contains("-nodisp"), "ffplay must not open a video window: $argv")
         assertTrue(argv.contains(".m4a"), "the note file must be passed to the player: $argv")
         assertTrue(argv.contains("NOTE_PRESENT"), "the note bytes must be written before spawn: $argv")
@@ -91,7 +129,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun playbackLeavesNoDecryptedAudioBehind() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val log = File(dir, "argv.log")
         stubPlayer(dir, "ffplay", log, holdMs = 50)
@@ -116,7 +154,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun theDecryptedNoteIsNeverReadableByOtherLocalUsers() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val perms = File(dir, "perms.log")
         // This stub reports the mode of the note file it was handed, which is the
@@ -148,29 +186,8 @@ class DesktopVoiceNotePlaybackTest {
     }
 
     @Test
-    fun prefersFfplayWhenSeveralPlayersAreInstalled() {
-        if (!linux) return
-        val dir = createTempDir("sonar-player-")
-        val log = File(dir, "argv.log")
-        stubPlayer(dir, "cvlc", log, holdMs = 50)
-        stubPlayer(dir, "ffplay", log, holdMs = 50)
-        AudioNotePlayer.searchPath = dir.absolutePath
-
-        val done = CountDownLatch(1)
-        AudioNotePlayer.play(fakeM4a(512)) { done.countDown() }
-        assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
-
-        val argv = log.readText()
-        assertTrue(argv.contains("-autoexit"), "expected ffplay to win the preference order: $argv")
-        assertTrue(
-            !argv.contains("--play-and-exit"),
-            "only one player may be spawned per note: $argv",
-        )
-    }
-
-    @Test
     fun notesAreMarkedUnplayableWhenNoPlayerIsInstalled() {
-        if (!linux) return
+        if (skipOffLinux()) return
         AudioNotePlayer.searchPath = createTempDir("sonar-empty-").absolutePath
 
         val reason = AudioNotePlayer.unavailableReason()
@@ -185,7 +202,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun aPlaylistDisguisedAsAVoiceNoteIsNeverHandedToAPlayer() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val log = File(dir, "argv.log")
         stubPlayer(dir, "ffplay", log, holdMs = 50)
@@ -194,20 +211,48 @@ class DesktopVoiceNotePlaybackTest {
         // VLC content-sniffs and ignores the .m4a suffix, so these bytes made cvlc
         // fetch the URL and exit 0 while the app reported a normal play: an IP
         // disclosure and SSRF probe driven by whoever sent the message.
-        val playlist = "#EXTM3U\nhttp://127.0.0.1:1/beacon\n".toByteArray()
-        val done = CountDownLatch(1)
-        AudioNotePlayer.play(playlist) { done.countDown() }
-        assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
+        for ((name, payload) in listOf(
+            "m3u playlist" to "#EXTM3U\nhttp://127.0.0.1:1/beacon\n".toByteArray(),
+            // Structurally a valid MP4, so it passed the original ftyp-only gate and
+            // cvlc fetched its URL twice while exiting 0.
+            "QuickTime reference movie" to referenceMovie(),
+        )) {
+            val done = CountDownLatch(1)
+            AudioNotePlayer.play(payload) { done.countDown() }
+            assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired for $name")
+            assertEquals(
+                "", log.let { if (it.exists()) it.readText() else "" },
+                "$name must never reach an external media stack",
+            )
+        }
+    }
 
-        assertEquals(
-            "", log.let { if (it.exists()) it.readText() else "" },
-            "a non-MP4 payload must never reach an external media stack",
+    @Test
+    fun ordinaryMp3AudioStillReachesThePlayer() {
+        if (skipOffLinux()) return
+        val dir = createTempDir("sonar-player-")
+        val log = File(dir, "argv.log")
+        stubPlayer(dir, "ffplay", log, holdMs = 50)
+        AudioNotePlayer.searchPath = dir.absolutePath
+
+        // Every audio/* attachment routes here, and drag-and-drop accepts mpeg, wav,
+        // ogg, flac and aac. An MP4-only gate turned all of them into silent no-ops,
+        // including on macOS where they played before this branch existed.
+        val mp3 = ByteArray(512).also {
+            it[0] = 0x49; it[1] = 0x44; it[2] = 0x33; it[3] = 0x04
+        }
+        val done = CountDownLatch(1)
+        AudioNotePlayer.play(mp3) { done.countDown() }
+        assertTrue(done.await(15, TimeUnit.SECONDS), "onComplete never fired")
+        assertTrue(
+            log.readText().contains("NOTE_PRESENT"),
+            "an mp3 is legitimate audio and must reach the player: ${log.readText()}",
         )
     }
 
     @Test
     fun aDirectoryNamedLikeAPlayerIsNotMistakenForOne() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         // Files.isExecutable is access(2) X_OK, which is true for any searchable
         // directory. This one used to win resolution, so the app claimed it could
@@ -223,7 +268,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun switchingNotesTearsDownTheFirstPlayerAndItsPlaintext() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val log = File(dir, "argv.log")
         // Long enough that the first player is still running when the second starts.
@@ -253,7 +298,7 @@ class DesktopVoiceNotePlaybackTest {
 
     @Test
     fun aPlayerThatIgnoresSigtermDoesNotWedgePlaybackForever() {
-        if (!linux) return
+        if (skipOffLinux()) return
         val dir = createTempDir("sonar-player-")
         val f = File(dir, "ffplay")
         // Ignores SIGTERM. teardown() used to waitFor() this with no timeout on the

