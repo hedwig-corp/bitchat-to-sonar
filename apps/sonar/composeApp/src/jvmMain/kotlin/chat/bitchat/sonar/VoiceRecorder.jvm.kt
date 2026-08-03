@@ -152,15 +152,23 @@ actual object AudioNotePlayer {
             onComplete()
             return
         }
-        val command = playerCommand
-        if (command == null) {
-            // No player: fire the completion so the bubble does not hang on Pause.
-            // The UI is expected to have disabled this path via unavailableReason();
-            // this is the belt-and-braces arm, not the way the user finds out.
-            onComplete()
-            return
-        }
         control.execute {
+            // Resolved HERE, not on the caller's thread. This is a PATH scan, and a
+            // stat on an entry backed by a stalled network mount blocks exactly like
+            // the exec probe DesktopExec refuses to do for that reason. Moving the
+            // render-path read off the Compose thread was not enough: the click path
+            // ran it too, so a tap froze the UI with no recovery.
+            val command = playerCommand
+            if (command == null) {
+                // No player: fire the completion so the bubble does not hang on
+                // Pause. The UI is expected to have disabled this via
+                // unavailableReason(); this is belt and braces, not how the user
+                // finds out. Deliberately before teardown(), so pressing play on an
+                // unplayable note does not stop a note that IS playing.
+                sonarLog("AudioNotePlayer", "no usable audio player found")
+                onComplete()
+                return@execute
+            }
             // Tear down any in-flight playback first (fires its completion, resets the
             // previous bubble) before adopting the new note.
             teardown()

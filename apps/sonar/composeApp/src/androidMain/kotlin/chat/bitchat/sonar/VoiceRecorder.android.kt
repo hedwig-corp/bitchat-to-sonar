@@ -16,6 +16,16 @@ actual object AudioNotePlayer {
     actual fun unavailableReason(): String? = null
 
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
+        audioPayloadRejection(bytes)?.let { why ->
+            // The gate lives in commonMain and every platform calls it. Leaving
+            // Android out while the shared KDoc claimed coverage is the
+            // docs/REGRESSIONS.md rule-2 shape: the helper moved, the call site
+            // did not. MediaPlayer will not chase a URL out of a local file, so
+            // this is consistency and defence in depth, not a fix for a known bug.
+            sonarLog("AudioNotePlayer", "refusing to play: $why")
+            onComplete()
+            return
+        }
         stop() // tears down + notifies any previous note before starting this one
         val f = File(AppContextHolder.ctx.cacheDir, "play-${System.currentTimeMillis()}.m4a")
         runCatching {

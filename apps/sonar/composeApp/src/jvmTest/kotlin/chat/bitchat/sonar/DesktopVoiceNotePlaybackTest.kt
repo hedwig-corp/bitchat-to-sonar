@@ -109,10 +109,15 @@ class DesktopVoiceNotePlaybackTest {
 
         val argv = log.readText()
         assertTrue(argv.contains("-autoexit"), "ffplay must get its exit-at-EOF flag: $argv")
-        // The one flag standing between a remote peer and an outbound request.
-        assertTrue(
-            argv.contains("-protocol_whitelist") && argv.contains("file"),
-            "ffplay must be told which protocols it may use, not left on a build default: $argv",
+        // The one flag standing between a remote peer and an outbound request, so
+        // pin its VALUE. Asserting the flag merely appears kept this green for
+        // `-protocol_whitelist file,http,https`, which reopens the hole entirely.
+        val args = log.readLines()
+        val flagAt = args.indexOf("-protocol_whitelist")
+        assertTrue(flagAt >= 0, "ffplay must be told which protocols it may use: $argv")
+        assertEquals(
+            "file", args.getOrNull(flagAt + 1),
+            "only the local file protocol may be permitted: $argv",
         )
         assertTrue(argv.contains("-nodisp"), "ffplay must not open a video window: $argv")
         assertTrue(argv.contains(".m4a"), "the note file must be passed to the player: $argv")
@@ -195,8 +200,8 @@ class DesktopVoiceNotePlaybackTest {
         // The reason is shown verbatim in the bubble, so it has to say what to do
         // about it, not just that something is wrong.
         assertTrue(
-            reason.contains("ffmpeg") || reason.contains("mpv") || reason.contains("vlc"),
-            "the reason must name a package that fixes it: $reason",
+            reason.contains("ffmpeg"),
+            "the reason must name the package that actually fixes it: $reason",
         )
     }
 

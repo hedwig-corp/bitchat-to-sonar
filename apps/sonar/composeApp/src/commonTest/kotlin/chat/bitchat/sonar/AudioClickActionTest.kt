@@ -19,7 +19,7 @@ class AudioClickActionTest {
             AudioAction.Nothing,
             audioClickAction(
                 MediaTransferPhase.Available,
-                unavailable = "no audio player found; install ffmpeg or vlc",
+                unavailable = "no audio player found; install ffmpeg",
                 hasBytes = true,
                 playing = false,
             ),
