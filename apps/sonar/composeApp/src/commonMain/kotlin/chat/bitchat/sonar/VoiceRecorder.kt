@@ -78,13 +78,16 @@ internal fun audioClickAction(
  * What this does buy: a playlist or arbitrary junk never reaches a decoder at all,
  * and the rejection is shared by every platform rather than living beside one player.
  */
-internal fun audioPayloadRejection(bytes: ByteArray): String? = when {
-    sniffAudioContainer(bytes) == null -> "unrecognized audio container"
+internal fun audioPayloadRejection(bytes: ByteArray): String? = when (sniffAudioContainer(bytes)) {
+    null -> "unrecognized audio container"
     // Defense in depth for the one platform that cannot be constrained the way
     // ffplay is: macOS spawns the system `afplay`, which takes no protocol
     // whitelist. Whether afplay resolves reference movies at all is UNVERIFIED (no
     // mac to test on), so this refuses the known redirect rather than assuming.
-    hasReferenceMovie(bytes) -> "MP4 reference movie (names an external URL)"
+    // Only MP4 gets the box walk. It fails closed on a structure it cannot parse,
+    // and mp3/wav/ogg/flac bytes are not boxes, so running it on them would reject
+    // every non-MP4 format -- the exact regression this rejection was widened to fix.
+    "mp4" -> if (hasReferenceMovie(bytes)) "MP4 reference movie (names an external URL)" else null
     else -> null
 }
 
@@ -115,36 +118,68 @@ internal fun sniffAudioContainer(b: ByteArray): String? {
 }
 
 /**
- * True when this MP4 carries a `moov/rmra` reference-movie box, i.e. it points at
- * something else instead of containing audio.
+ * True when this MP4 carries a `moov/rmra` reference-movie box, i.e. it names
+ * something else instead of holding audio, OR when its box structure cannot be
+ * walked well enough to rule that out.
  *
- * Walks the box tree rather than scanning for the tag, so audio payload bytes that
- * happen to spell `rmra` cannot trip it.
+ * Fails CLOSED, and the first version did not. It gave up on any box whose size
+ * field it did not understand and answered "no reference movie", so putting one
+ * 64-bit-sized box (`size == 1`, real length in the following 8 bytes) in front of
+ * `moov` hid the redirect completely:
+ *
+ *     240 bytes; hasReferenceMovie() -> False   (rmra IS present)
+ *     cvlc -> BEACON HIT x2, rc=0
+ *
+ * "I could not parse this" is not evidence of safety, so an unwalkable structure is
+ * refused. Real files are unaffected: 64-bit sizes and the `size == 0` (runs to end
+ * of file) form are both handled, and a well-formed MP4 walks cleanly.
+ *
+ * It walks the box tree rather than scanning for the tag, so audio payload bytes
+ * that happen to spell `rmra` do not trip it.
  */
 internal fun hasReferenceMovie(b: ByteArray): Boolean {
     fun u32(i: Int): Long =
         ((b[i].toLong() and 0xFF) shl 24) or ((b[i + 1].toLong() and 0xFF) shl 16) or
             ((b[i + 2].toLong() and 0xFF) shl 8) or (b[i + 3].toLong() and 0xFF)
+    fun u64(i: Int): Long {
+        var v = 0L
+        for (k in 0 until 8) v = (v shl 8) or (b[i + k].toLong() and 0xFF)
+        return v
+    }
     fun tag(i: Int, t: String) = t.indices.all { i + it < b.size && b[i + it] == t[it].code.toByte() }
+
+    // Box end offset, or null when the header cannot be trusted.
+    fun endOf(off: Int, limit: Int): Int? {
+        if (off + 8 > limit) return null
+        val declared = u32(off)
+        val size = when {
+            // 1 => the real size is the 64-bit value following the type.
+            declared == 1L -> {
+                if (off + 16 > limit) return null
+                u64(off + 8)
+            }
+            // 0 => this box runs to the end of the file.
+            declared == 0L -> (limit - off).toLong()
+            else -> declared
+        }
+        if (size < 8 || off + size > limit) return null
+        return (off + size).toInt()
+    }
+
+    fun contentStart(off: Int): Int = if (u32(off) == 1L) off + 16 else off + 8
 
     var off = 0
     while (off + 8 <= b.size) {
-        val size = u32(off)
-        // 0 means "to end of file"; 1 means a 64-bit size follows. Neither can be
-        // walked past safely here, so stop rather than guess.
-        if (size < 8 || off + size > b.size) return false
+        val end = endOf(off, b.size) ?: return true
         if (tag(off + 4, "moov")) {
-            var child = off + 8
-            val end = (off + size).toInt()
+            var child = contentStart(off)
             while (child + 8 <= end) {
-                val cs = u32(child)
-                if (cs < 8 || child + cs > end) return false
                 if (tag(child + 4, "rmra")) return true
-                child += cs.toInt()
+                child = endOf(child, end) ?: return true
             }
             return false
         }
-        off += size.toInt()
+        off = end
     }
     return false
 }
