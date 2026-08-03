@@ -5,8 +5,8 @@ import java.util.Properties
 
 // Single source of truth for the shipped version. The Android block and the
 // desktop native packagers both read it, so a .deb can be traced to a release.
-val SONAR_VERSION_CODE = 14
-val SONAR_VERSION_NAME = "0.1-alpha.12.2"
+val SONAR_VERSION_CODE = 19
+val SONAR_VERSION_NAME = "0.1-alpha.13"
 
 plugins {
     alias(libs.plugins.multiplatform)
