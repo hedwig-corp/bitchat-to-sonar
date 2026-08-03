@@ -4116,9 +4116,16 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
         media.durationMs?.let { fmtDur((it / 1000).toInt()) } ?: ""
     }
     // Non-null only where nothing on the host can decode the note (desktop without
-    // ffmpeg/mpv/vlc). Say so rather than offering a play button that completes in
-    // silence: the note downloaded fine, so a silent no-op reads as a bad recording.
-    val unplayable = remember { AudioNotePlayer.unavailableReason() }
+    // ffmpeg). Say so rather than offering a play button that completes in silence:
+    // the note downloaded fine, so a silent no-op reads as a bad recording.
+    //
+    // Resolved off the Compose thread. It is a PATH scan, and `stat` on an entry
+    // that lives on a stalled network mount blocks exactly like the exec probe
+    // DesktopExec refuses to do for that reason. Null until it resolves, which only
+    // means the button is briefly live; play() re-checks and no-ops safely.
+    val unplayable by androidx.compose.runtime.produceState<String?>(null) {
+        value = withContext(Dispatchers.IO) { AudioNotePlayer.unavailableReason() }
+    }
     val tail = 5.dp
     // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs
     // the surface bubble; radius 18 with the tail corner; padding 11/15/11/11.
@@ -4179,11 +4186,12 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
             }
         }
         Spacer(Modifier.width(11.dp))
-        if (unplayable != null) {
+        val unplayableReason = unplayable
+        if (unplayableReason != null) {
             // Replaces the waveform rather than sitting beside it: a waveform next to
             // a dead button still reads as playable.
             Text(
-                unplayable,
+                unplayableReason,
                 style = SonarType.mono(11.5, FontWeight.SemiBold),
                 color = if (m.mine) onTint.copy(alpha = 0.8f) else s.text2.copy(alpha = 0.8f),
                 modifier = Modifier.widthIn(max = 200.dp),

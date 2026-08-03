@@ -35,6 +35,10 @@ internal object DesktopExec {
      * test could cache "no keystore" and reach the account-key durability surface.
      */
     fun which(binary: String, path: String? = System.getenv("PATH")): String? {
+        // POSIX only: the absolute-entry rule below rejects `C:\\Windows\\System32`
+        // and nothing here appends `.exe`. Every current caller is macOS/Linux
+        // (`build.gradle.kts` ships only `linux { }` and `macOS { }`), so this is a
+        // documented limit rather than a Windows bug waiting to be found.
         if (path == null) return null
         for (dir in path.split(File.pathSeparatorChar)) {
             // Empty AND relative entries are skipped. A relative entry ("." or
