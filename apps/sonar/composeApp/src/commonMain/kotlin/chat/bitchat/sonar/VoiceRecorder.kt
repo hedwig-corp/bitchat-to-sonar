@@ -162,24 +162,43 @@ internal fun hasReferenceMovie(b: ByteArray): Boolean {
             declared == 0L -> (limit - off).toLong()
             else -> declared
         }
-        if (size < 8 || off + size > limit) return null
+        // `size > limit - off`, NOT `off + size > limit`. The latter is Long
+        // arithmetic that WRAPS: a 64-bit largesize near Long.MAX_VALUE makes the
+        // sum negative, so the guard passes, and `.toInt()` then truncates to the
+        // low 32 bits and yields an offset BEHIND `off`. Measured on a 64-byte
+        // payload: the walk stepped 0 -> 24 -> 8, backwards, and with the right two
+        // boxes that is a cycle the loop never leaves. `limit - off` is a
+        // non-negative Int here, cannot wrap, and guarantees the walk advances.
+        if (size < 8 || size > limit - off) return null
         return (off + size).toInt()
     }
 
     fun contentStart(off: Int): Int = if (u32(off) == 1L) off + 16 else off + 8
 
-    var off = 0
-    while (off + 8 <= b.size) {
-        val end = endOf(off, b.size) ?: return true
-        if (tag(off + 4, "moov")) {
-            var child = contentStart(off)
-            while (child + 8 <= end) {
-                if (tag(child + 4, "rmra")) return true
-                child = endOf(child, end) ?: return true
+    // Recurses, and keeps going after the first `moov`. Matching only a direct child
+    // of the first `moov` missed an `rmra` nested under `moov/udta`, and missed one
+    // in a SECOND `moov` hidden behind a clean first. Standard reference movies use
+    // neither shape, but "the malformed variant is probably not resolved either" is
+    // an assumption, and this check exists precisely for the player whose behaviour
+    // could not be verified.
+    fun scan(start: Int, limit: Int, depth: Int): Boolean {
+        if (depth > 8) return true // pathological nesting: refuse rather than recurse
+        var off = start
+        while (off + 8 <= limit) {
+            if (tag(off + 4, "rmra")) return true
+            val end = endOf(off, limit) ?: return true
+            // Only descend into containers; a leaf's payload is not boxes.
+            if (CONTAINER_BOXES.any { tag(off + 4, it) } &&
+                scan(contentStart(off), end, depth + 1)
+            ) {
+                return true
             }
-            return false
+            off = end
         }
-        off = end
+        return false
     }
-    return false
+    return scan(0, b.size, 0)
 }
+
+/** Box types whose payload is more boxes, so the walk may descend into them. */
+private val CONTAINER_BOXES = listOf("moov", "udta", "trak", "mdia", "minf", "dinf", "rmra", "rmda")

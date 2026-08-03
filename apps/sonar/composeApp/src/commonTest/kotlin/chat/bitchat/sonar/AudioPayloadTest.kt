@@ -109,6 +109,42 @@ class AudioPayloadTest {
     }
 
     @Test
+    fun aBoxSizeThatOverflowsIsRefusedInsteadOfWalkingBackwards() {
+        // A 64-bit largesize near Long.MAX_VALUE. `off + size` wraps negative, so a
+        // `off + size > limit` guard passes it, and the truncated result points
+        // BEHIND the current offset: the walk stepped 0 -> 24 -> 8. Two boxes
+        // arranged that way is a cycle, on a payload a peer chooses, evaluated on
+        // the click path.
+        fun b32(v: Int) = byteArrayOf(
+            (v ushr 24).toByte(), (v ushr 16).toByte(), (v ushr 8).toByte(), v.toByte(),
+        )
+        val hostile = b32(24) + "ftyp".encodeToByteArray() + ByteArray(16) +
+            b32(1) + "free".encodeToByteArray() +
+            byteArrayOf(0x7F, -1, -1, -1, -1, -1, -1, -0x10) + ByteArray(16)
+        assertNotNull(
+            audioPayloadRejection(hostile),
+            "an overflowing box size must fail closed, not send the walk backwards",
+        )
+    }
+
+    @Test
+    fun aReferenceMovieIsFoundWhereverItHides() {
+        val rmra = box("rmra", box("rmda", ByteArray(8)))
+        val cases = mapOf(
+            // Not a direct child of moov.
+            "nested under moov/udta" to box("ftyp", "qt  ".encodeToByteArray() + ByteArray(8)) +
+                box("moov", box("mvhd", ByteArray(100)) + box("udta", rmra)),
+            // Behind a clean first moov, which the walk used to stop at.
+            "in a second moov" to box("ftyp", "qt  ".encodeToByteArray() + ByteArray(8)) +
+                box("moov", box("mvhd", ByteArray(100))) +
+                box("moov", box("mvhd", ByteArray(100)) + rmra),
+        )
+        for ((where, payload) in cases) {
+            assertNotNull(audioPayloadRejection(payload), "a reference movie $where must be found")
+        }
+    }
+
+    @Test
     fun junkIsRejected() {
         assertNotNull(audioPayloadRejection("not audio at all, just text".encodeToByteArray()))
         assertNotNull(audioPayloadRejection(ByteArray(4)), "too short to identify")
