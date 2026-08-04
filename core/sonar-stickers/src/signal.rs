@@ -74,7 +74,8 @@ pub struct SignalImportOptions<'a> {
     /// Additional root certificates to trust when fetching Signal CDN blobs,
     /// PEM encoded.
     ///
-    /// This is needed for urls like `cdn.signal.org` which are served under a chain rooted in Signal's own CA,
+    /// This is needed for urls like `cdn.signal.org` which are served under a
+    /// chain rooted in Signal's own CA,
     pub root_certificates: Option<&'a [&'a [u8]]>,
     /// Continue importing when one sticker asset is missing or cannot be
     /// decrypted. Skipped ids are reported in [`ImportedSignalPack`].
@@ -354,7 +355,7 @@ fn build_http_client(options: SignalImportOptions) -> Result<reqwest::Client> {
             }
         }
     }
-    
+
     builder
         .build()
         .map_err(|e| StickerError::Http(e.to_string()))
@@ -512,10 +513,10 @@ mod tests {
     #[test]
     fn invalid_root_certificate_is_rejected() {
         let options = SignalImportOptions {
-            root_certificates: vec![b"not a certificate".to_vec()],
+            root_certificates: Some(&[b"not a certificate".as_ref()]),
             ..SignalImportOptions::default()
         };
-        let error = build_http_client(&options).expect_err("malformed root must not be ignored");
+        let error = build_http_client(options).expect_err("malformed root must not be ignored");
         assert!(
             matches!(&error, StickerError::Http(message) if message.contains("root certificate")),
             "unexpected error: {error:?}"
@@ -524,12 +525,11 @@ mod tests {
         // Bad base64 inside PEM markers fails parsing rather than yielding an
         // empty set — a different path to the same guarantee.
         let malformed = SignalImportOptions {
-            root_certificates: vec![
-                b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".to_vec(),
-            ],
+            root_certificates: Some(&[b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".as_ref()])
+            ,
             ..SignalImportOptions::default()
         };
-        assert!(build_http_client(&malformed).is_err());
+        assert!(build_http_client(malformed).is_err());
     }
 
     /// The bundled root a caller would actually pin must parse.
@@ -537,10 +537,10 @@ mod tests {
     fn a_valid_root_certificate_is_accepted() {
         let pem = include_bytes!("../tests/signal-root.pem");
         let options = SignalImportOptions {
-            root_certificates: vec![pem.to_vec()],
+            root_certificates: Some(&[pem]),
             ..SignalImportOptions::default()
         };
-        assert!(build_http_client(&options).is_ok());
+        assert!(build_http_client(options).is_ok());
     }
 
     /// Default options trust only the platform roots, so existing callers keep
@@ -548,8 +548,8 @@ mod tests {
     #[test]
     fn default_options_pin_nothing() {
         let options = SignalImportOptions::default();
-        assert!(options.root_certificates.is_empty());
+        assert!(options.root_certificates.is_none());
         assert!(!options.accept_invalid_certs);
-        assert!(build_http_client(&options).is_ok());
+        assert!(build_http_client(options).is_ok());
     }
 }
