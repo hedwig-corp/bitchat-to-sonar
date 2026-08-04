@@ -67,7 +67,7 @@ pub struct BreezWallet {
     /// Two workers is enough for the blocking bridge: every public method
     /// issues one `block_on` and waits, and breez spawns its own background
     /// tasks onto this runtime.
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     state: Mutex<Lifecycle>,
     listeners: Arc<ListenerRegistry>,
     events_tx: mpsc::Sender<WalletEvent>,
@@ -81,10 +81,21 @@ pub struct BreezWallet {
     quote_seq: AtomicU64,
 }
 
-/// Cap on parked quotes. A caller that prepares and never sends leaks one entry
-/// each time; this bounds the damage without needing expiry timestamps (which
-/// the crate has no clock for — `Date::now` equivalents are avoided here).
+/// Cap on parked quotes. A caller that prepares and never sends (an abandoned
+/// confirmation sheet) leaves one entry behind; at the cap the oldest is
+/// evicted, which bounds memory without an expiry clock and without ever
+/// refusing a new preparation.
 const MAX_LIVE_QUOTES: usize = 64;
+
+/// Recover the monotonic sequence from a quote token (`{destination}#{seq}`),
+/// so eviction can pick the oldest. An unparseable token sorts oldest, which is
+/// the safe direction — it gets evicted first.
+fn quote_seq_of(token: &str) -> u64 {
+    token
+        .rsplit_once('#')
+        .and_then(|(_, seq)| seq.parse().ok())
+        .unwrap_or(0)
+}
 
 /// Amount the backend itself quoted, when the caller supplied none and the
 /// destination carried none.
@@ -127,7 +138,7 @@ impl BreezWallet {
 
         Ok(Self {
             config,
-            runtime,
+            runtime: Some(runtime),
             state: Mutex::new(Lifecycle::default()),
             listeners,
             events_tx,
@@ -138,6 +149,14 @@ impl BreezWallet {
 
     fn state(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The owned runtime. `Option` only so `Drop` can move it out and shut it
+    /// down without blocking; it is `Some` for the whole normal lifetime.
+    fn rt(&self) -> &tokio::runtime::Runtime {
+        self.runtime
+            .as_ref()
+            .expect("runtime is only taken during drop")
     }
 
     fn sdk(&self) -> Result<Arc<LiquidSdk>> {
@@ -166,6 +185,29 @@ impl BreezWallet {
         Ok(config)
     }
 
+    /// Is `sdk` still the published handle? Identity, not equality — two
+    /// `LiquidSdk`s over the same working dir are different nodes.
+    fn is_same_published_sdk(&self, sdk: &Arc<LiquidSdk>) -> bool {
+        self.state()
+            .sdk
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, sdk))
+    }
+
+    /// Clear the published handle only if it is still `sdk`. Returns whether it
+    /// was cleared, so callers can tell "I tore down the live node" from
+    /// "someone else's node is live now, leave it alone".
+    fn clear_sdk_if_same(&self, sdk: &Arc<LiquidSdk>) -> bool {
+        let mut state = self.state();
+        match state.sdk.as_ref() {
+            Some(published) if Arc::ptr_eq(published, sdk) => {
+                state.sdk = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Re-parse a destination through the connected SDK when it carries no
     /// amount, so an offline-classified invoice regains the amount encoded in
     /// it. Falls back to the caller's destination if the parse fails or adds
@@ -174,7 +216,7 @@ impl BreezWallet {
         if destination.amount_sats.is_some() {
             return destination.clone();
         }
-        match self.runtime.block_on(sdk.parse(destination.raw.trim())) {
+        match self.rt().block_on(sdk.parse(destination.raw.trim())) {
             Ok(input_type) => {
                 let refined = map_input_type(&destination.raw, input_type);
                 if refined.amount_sats.is_some() {
@@ -191,7 +233,7 @@ impl BreezWallet {
     /// `disconnect` and to discard a connect that a concurrent disconnect
     /// abandoned.
     fn shutdown(&self, sdk: Arc<LiquidSdk>) -> Result<()> {
-        self.runtime
+        self.rt()
             .block_on(sdk.disconnect())
             .map_err(|e| WalletError::Backend(e.to_string()))
     }
@@ -203,21 +245,32 @@ impl Drop for BreezWallet {
         // which can hang the dropping thread (a main-thread `deinit` on iOS).
         // Close the node first so there is nothing left to wait for.
         //
-        // `block_on` panics if we are already inside a runtime, and so does
-        // dropping the owned runtime — a panic in `drop` aborts. Hosts should
-        // call `disconnect()` and drop from a blocking context; if they drop us
-        // from async instead, leak the close rather than take the process down.
-        if tokio::runtime::Handle::try_current().is_ok() {
-            return;
-        }
+        // `block_on` panics if we are already inside a runtime — and so does
+        // *dropping* the multi-threaded runtime, which happens automatically
+        // when our fields drop. Returning early is therefore not enough: the
+        // runtime must be moved out and shut down without blocking, or the
+        // panic lands anyway and a panic in `drop` aborts the process.
+        let runtime = self.runtime.take();
         let sdk = self
             .state
             .get_mut()
             .unwrap_or_else(|e| e.into_inner())
             .sdk
             .take();
+        let Some(runtime) = runtime else { return };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            // Dropped from async context. `shutdown_background` returns
+            // immediately and is the one teardown safe to call from here; the
+            // node close is abandoned rather than taking the process down.
+            // Hosts should `disconnect()` and drop from a blocking context.
+            runtime.shutdown_background();
+            return;
+        }
+        // Blocking context: close the node first so dropping the runtime has
+        // nothing left to wait on.
         if let Some(sdk) = sdk {
-            let _ = self.runtime.block_on(sdk.disconnect());
+            let _ = runtime.block_on(sdk.disconnect());
         }
     }
 }
@@ -242,7 +295,7 @@ impl WalletBackend for BreezWallet {
 
     fn sync_wallet(&self) -> Result<()> {
         let sdk = self.sdk()?;
-        self.runtime
+        self.rt()
             .block_on(sdk.sync(false))
             .map_err(|e| WalletError::Backend(e.to_string()))
     }
@@ -271,7 +324,7 @@ impl WalletBackend for BreezWallet {
                 passphrase: None,
                 seed: Some(self.config.seed.to_vec()),
             };
-            self.runtime
+            self.rt()
                 .block_on(LiquidSdk::connect(req))
                 .map_err(|e| WalletError::Backend(e.to_string()))
         })();
@@ -305,14 +358,21 @@ impl WalletBackend for BreezWallet {
         let forwarder = Box::new(ForwardingListener {
             events: self.events_tx.clone(),
         });
-        if let Err(e) = self.runtime.block_on(sdk.add_event_listener(forwarder)) {
+        if let Err(e) = self.rt().block_on(sdk.add_event_listener(forwarder)) {
             // Roll the connection back. Leaving it published would mean
             // `connect()` returns Err while `is_connected()` is true, and the
             // retry takes the already-connected fast path — a live wallet that
-            // silently delivers no events, forever.
-            self.state().sdk = None;
+            // silently delivers no events, forever. Clear by identity so a
+            // concurrent reconnect's handle is not collaterally dropped.
+            self.clear_sdk_if_same(&sdk);
             let _ = self.shutdown(sdk);
             return Err(WalletError::Backend(e.to_string()));
+        }
+        // A disconnect can have landed while we were registering the listener.
+        // Announcing `Connected` after it would leave lifecycle-driven hosts
+        // in the ready state over a wallet that is already closed.
+        if !self.is_same_published_sdk(&sdk) {
+            return Ok(());
         }
         self.emit(WalletEvent::Connected);
         Ok(())
@@ -338,8 +398,17 @@ impl WalletBackend for BreezWallet {
                 None => return Ok(()),
             }
         };
-        self.shutdown(sdk)?;
-        self.state().sdk = None;
+        self.shutdown(sdk.clone())?;
+        // Clear by identity: two concurrent disconnects can hold the same
+        // handle, and if a reconnect published a NEW node between the first
+        // finishing and the second landing, an unconditional clear would
+        // orphan that live node — `is_connected()` false while it still holds
+        // the working-dir SQLite lock.
+        if !self.clear_sdk_if_same(&sdk) {
+            // A different node is published now; it and its quotes are not ours
+            // to tear down.
+            return Ok(());
+        }
         // Quotes were priced against the session that just ended; executing one
         // after reconnect would pay a stale route/fee.
         self.quotes
@@ -357,7 +426,7 @@ impl WalletBackend for BreezWallet {
     fn balance(&self) -> Result<Balance> {
         let sdk = self.sdk()?;
         let info = self
-            .runtime
+            .rt()
             .block_on(sdk.get_info())
             .map_err(|e| WalletError::Backend(e.to_string()))?;
         Ok(Balance {
@@ -386,7 +455,7 @@ impl WalletBackend for BreezWallet {
             .description
             .clone()
             .unwrap_or_else(|| RECEIVE_DESCRIPTION.to_string());
-        self.runtime.block_on(async {
+        self.rt().block_on(async {
             let prepare_response = sdk
                 .prepare_receive_payment(&PrepareReceiveRequest {
                     payment_method,
@@ -420,10 +489,28 @@ impl WalletBackend for BreezWallet {
                 Ok(fallback)
             };
         };
-        match self.runtime.block_on(sdk.parse(input.trim())) {
+        match self.rt().block_on(sdk.parse(input.trim())) {
             Ok(input_type) => Ok(map_input_type(input, input_type)),
             Err(e) => {
-                if fallback.kind == DestinationKind::Unknown {
+                // Connected, and the real parser said no. For destinations that
+                // are fully self-describing — BOLT11, BOLT12, LNURL all carry
+                // their own checksum — that verdict is authoritative and must
+                // propagate: the prefix classifier does no checksum check, so
+                // returning it as success lets a host advance to the amount or
+                // confirmation screen for a corrupt invoice and only fail later
+                // in `prepare_send`.
+                //
+                // Lightning addresses are the exception: resolving one needs
+                // DNS/HTTP, so a failure here can be transient network trouble
+                // rather than a bad address, and the classification is still
+                // the most useful answer we have.
+                let self_describing = matches!(
+                    fallback.kind,
+                    DestinationKind::Bolt11
+                        | DestinationKind::Bolt12Offer
+                        | DestinationKind::LnurlPay
+                );
+                if fallback.kind == DestinationKind::Unknown || self_describing {
                     Err(WalletError::InvalidDestination(e.to_string()))
                 } else {
                     Ok(fallback)
@@ -457,7 +544,7 @@ impl WalletBackend for BreezWallet {
         // amountless destination.
         let amount = resolve_send_amount(amount_sats, destination.amount_sats)?;
         let prepared = self
-            .runtime
+            .rt()
             .block_on(sdk.prepare_send_payment(&PrepareSendRequest {
                 destination: destination.raw.clone(),
                 amount: amount.map(|receiver_amount_sat| PayAmount::Bitcoin {
@@ -484,10 +571,19 @@ impl WalletBackend for BreezWallet {
         );
         {
             let mut quotes = self.quotes.lock().unwrap_or_else(|e| e.into_inner());
-            if quotes.len() >= MAX_LIVE_QUOTES {
-                return Err(WalletError::Busy(format!(
-                    "{MAX_LIVE_QUOTES} prepared sends are already outstanding; send or drop them first"
-                )));
+            // Evict oldest rather than refusing: a user who abandons a
+            // confirmation sheet never tells us, and `PreparedSend` has no drop
+            // hook, so refusing at the cap would brick preparation for the rest
+            // of the process after N cancellations. An evicted quote is
+            // single-use and stale anyway, and `send` reports it as expired.
+            while quotes.len() >= MAX_LIVE_QUOTES {
+                let oldest = quotes.keys().min_by_key(|k| quote_seq_of(k)).cloned();
+                match oldest {
+                    Some(key) => {
+                        quotes.remove(&key);
+                    }
+                    None => break,
+                }
             }
             quotes.insert(token.clone(), prepared);
         }
@@ -517,7 +613,7 @@ impl WalletBackend for BreezWallet {
                 WalletError::InvalidInput("prepared send is expired or already used".into())
             })?;
         let response = self
-            .runtime
+            .rt()
             .block_on(sdk.send_payment(&SendPaymentRequest {
                 prepare_response: quote,
                 use_asset_fees: None,
@@ -534,7 +630,7 @@ impl WalletBackend for BreezWallet {
     fn list_recent_payments(&self, limit: u32) -> Result<Vec<sonar_wallet::Payment>> {
         let sdk = self.sdk()?;
         let payments = self
-            .runtime
+            .rt()
             .block_on(sdk.list_payments(&ListPaymentsRequest {
                 filters: None,
                 states: None,
@@ -552,7 +648,7 @@ impl WalletBackend for BreezWallet {
     fn fetch_fiat_rates(&self) -> Result<Vec<ExchangeRate>> {
         let sdk = self.sdk()?;
         let rates = self
-            .runtime
+            .rt()
             .block_on(sdk.fetch_fiat_rates())
             .map_err(|e| WalletError::Network(e.to_string()))?;
         Ok(rates
@@ -570,14 +666,14 @@ impl WalletBackend for BreezWallet {
 
     fn register_webhook(&self, url: &str) -> Result<()> {
         let sdk = self.sdk()?;
-        self.runtime
+        self.rt()
             .block_on(sdk.register_webhook(url.to_string()))
             .map_err(|e| WalletError::Backend(e.to_string()))
     }
 
     fn unregister_webhook(&self) -> Result<()> {
         let sdk = self.sdk()?;
-        self.runtime
+        self.rt()
             .block_on(sdk.unregister_webhook())
             .map_err(|e| WalletError::Backend(e.to_string()))
     }
@@ -1278,6 +1374,22 @@ mod tests {
         // And the wallet is still honestly reporting itself disconnected.
         assert!(!wallet.is_connected());
         assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+    }
+
+    #[test]
+    fn quote_eviction_picks_the_oldest_and_never_refuses() {
+        // The cap must not turn "user abandoned a confirmation sheet" into a
+        // wallet that can never prepare another payment.
+        assert_eq!(quote_seq_of("lno1abc#7"), 7);
+        assert_eq!(quote_seq_of("lno1abc#0"), 0);
+        // A destination containing '#' must not confuse the split.
+        assert_eq!(quote_seq_of("weird#dest#42"), 42);
+        // Unparseable sorts oldest, so it is evicted first rather than pinned.
+        assert_eq!(quote_seq_of("no-separator"), 0);
+
+        let keys = ["d#5", "d#2", "d#9"];
+        let oldest = keys.iter().min_by_key(|k| quote_seq_of(k)).unwrap();
+        assert_eq!(*oldest, "d#2");
     }
 
     #[test]
