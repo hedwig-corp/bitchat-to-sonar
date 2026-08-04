@@ -598,6 +598,7 @@ async fn post_sticker_pack(loaded: &LoadedConfig, args: PostArgs) -> Result<Outp
         SignalImportOptions {
             accept_invalid_certs: args.accept_invalid_signal_certs,
             skip_failed_stickers: args.skip_missing_signal_stickers,
+            ..Default::default()
         },
     )
     .await?;
