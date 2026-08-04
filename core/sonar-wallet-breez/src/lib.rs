@@ -43,35 +43,48 @@ use sonar_wallet::{
 /// integration (`SonarWallet.createOffer`).
 const RECEIVE_DESCRIPTION: &str = "Sonar";
 
+/// Connection state. Kept in ONE mutex so a `disconnect` racing a `connect`
+/// always observes either "the SDK is published" or "the connect has not
+/// committed yet and will abandon" — never a torn state where it sees neither
+/// and returns success over a node that is about to go live.
+///
+/// The lock is only ever held for short critical sections; the network work in
+/// `LiquidSdk::connect` happens with the lock released, so `disconnect` can
+/// never be parked behind it.
+#[derive(Default)]
+struct Lifecycle {
+    sdk: Option<Arc<LiquidSdk>>,
+    /// A connect is between "claimed the slot" and "committed or abandoned".
+    connecting: bool,
+    /// Bumped by every `disconnect`. A connect that was in flight compares the
+    /// generation it started with, under the same lock it publishes with, so a
+    /// disconnect racing a slow connect is honoured rather than silently undone.
+    generation: u64,
+}
+
 pub struct BreezWallet {
     config: WalletConfig,
     /// Two workers is enough for the blocking bridge: every public method
     /// issues one `block_on` and waits, and breez spawns its own background
     /// tasks onto this runtime.
     runtime: tokio::runtime::Runtime,
-    sdk: Mutex<Option<Arc<LiquidSdk>>>,
-    /// Bumped by every `disconnect`. A `connect` that was in flight compares
-    /// the generation it started with against this before publishing its SDK,
-    /// so a disconnect racing a slow connect is honoured instead of being
-    /// silently undone.
-    generation: AtomicU64,
-    /// Held only for short critical sections, never across network work, so
-    /// `disconnect` cannot be parked behind a slow `connect`.
-    connecting: Mutex<bool>,
+    state: Mutex<Lifecycle>,
     listeners: Arc<ListenerRegistry>,
     events_tx: mpsc::Sender<WalletEvent>,
-    /// Live quotes from `prepare_send`, keyed by the token handed to the
+    /// Live quotes from `prepare_send`, keyed by the opaque token handed to the
     /// caller. Breez's `PrepareSendResponse` is not `Clone`, so it is parked
     /// here rather than serialized into the token.
     quotes: Mutex<HashMap<String, breez_sdk_liquid::model::PrepareSendResponse>>,
+    /// Makes each quote token unique. Two concurrent prepares for the same
+    /// destination and amount must not collide: whoever sent first would
+    /// otherwise execute the other's quote, at a fee they never saw.
+    quote_seq: AtomicU64,
 }
 
-/// Identifies one quote. Not a security boundary — quotes never leave the
-/// process — just a stable handle that ties a `PreparedSend` to the exact
-/// `PrepareSendResponse` that priced it.
-fn quote_key(destination: &Destination, amount_sats: u64) -> String {
-    format!("{}|{}", destination.raw, amount_sats)
-}
+/// Cap on parked quotes. A caller that prepares and never sends leaks one entry
+/// each time; this bounds the damage without needing expiry timestamps (which
+/// the crate has no clock for — `Date::now` equivalents are avoided here).
+const MAX_LIVE_QUOTES: usize = 64;
 
 /// Amount the backend itself quoted, when the caller supplied none and the
 /// destination carried none.
@@ -115,13 +128,16 @@ impl BreezWallet {
         Ok(Self {
             config,
             runtime,
-            sdk: Mutex::new(None),
-            generation: AtomicU64::new(0),
-            connecting: Mutex::new(false),
+            state: Mutex::new(Lifecycle::default()),
             listeners,
             events_tx,
             quotes: Mutex::new(HashMap::new()),
+            quote_seq: AtomicU64::new(0),
         })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn sdk(&self) -> Result<Arc<LiquidSdk>> {
@@ -129,11 +145,7 @@ impl BreezWallet {
     }
 
     fn sdk_if_any(&self) -> Option<Arc<LiquidSdk>> {
-        self.sdk
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .cloned()
+        self.state().sdk.clone()
     }
 
     fn emit(&self, event: WalletEvent) {
@@ -154,6 +166,27 @@ impl BreezWallet {
         Ok(config)
     }
 
+    /// Re-parse a destination through the connected SDK when it carries no
+    /// amount, so an offline-classified invoice regains the amount encoded in
+    /// it. Falls back to the caller's destination if the parse fails or adds
+    /// nothing — this is an enrichment step, never a new failure mode.
+    fn refine_destination(&self, sdk: &Arc<LiquidSdk>, destination: &Destination) -> Destination {
+        if destination.amount_sats.is_some() {
+            return destination.clone();
+        }
+        match self.runtime.block_on(sdk.parse(destination.raw.trim())) {
+            Ok(input_type) => {
+                let refined = map_input_type(&destination.raw, input_type);
+                if refined.amount_sats.is_some() {
+                    refined
+                } else {
+                    destination.clone()
+                }
+            }
+            Err(_) => destination.clone(),
+        }
+    }
+
     /// Shut an SDK handle down without touching wallet state. Used both by
     /// `disconnect` and to discard a connect that a concurrent disconnect
     /// abandoned.
@@ -169,7 +202,21 @@ impl Drop for BreezWallet {
         // Dropping the runtime blocks until breez's background tasks finish,
         // which can hang the dropping thread (a main-thread `deinit` on iOS).
         // Close the node first so there is nothing left to wait for.
-        if let Some(sdk) = self.sdk.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+        //
+        // `block_on` panics if we are already inside a runtime, and so does
+        // dropping the owned runtime — a panic in `drop` aborts. Hosts should
+        // call `disconnect()` and drop from a blocking context; if they drop us
+        // from async instead, leak the close rather than take the process down.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return;
+        }
+        let sdk = self
+            .state
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .sdk
+            .take();
+        if let Some(sdk) = sdk {
             let _ = self.runtime.block_on(sdk.disconnect());
         }
     }
@@ -201,16 +248,23 @@ impl WalletBackend for BreezWallet {
     }
 
     fn connect(&self) -> Result<()> {
-        {
-            let mut connecting = self.connecting.lock().unwrap_or_else(|e| e.into_inner());
-            if self.sdk_if_any().is_some() || *connecting {
-                // Already connected, or another thread is doing it.
+        let started_at = {
+            let mut state = self.state();
+            if state.sdk.is_some() {
                 return Ok(());
             }
-            *connecting = true;
-        }
-        let started_at = self.generation.load(Ordering::Acquire);
-        let result = (|| {
+            if state.connecting {
+                // Do NOT report someone else's in-flight attempt as success:
+                // the caller would proceed straight to `balance()` and get
+                // `NotConnected` after a "successful" connect.
+                return Err(WalletError::Busy("a connect is already in progress".into()));
+            }
+            state.connecting = true;
+            state.generation
+        };
+
+        // Network work with the lock released, so `disconnect` never parks.
+        let opened = (|| {
             let req = ConnectRequest {
                 config: self.breez_config()?,
                 mnemonic: None,
@@ -221,22 +275,43 @@ impl WalletBackend for BreezWallet {
                 .block_on(LiquidSdk::connect(req))
                 .map_err(|e| WalletError::Backend(e.to_string()))
         })();
-        *self.connecting.lock().unwrap_or_else(|e| e.into_inner()) = false;
 
-        let sdk = result?;
-        // A disconnect that landed while we were connecting wins: throw the
-        // fresh handle away instead of publishing a node nobody asked for.
-        if self.generation.load(Ordering::Acquire) != started_at {
-            let _ = self.shutdown(sdk);
-            return Ok(());
+        let sdk = match opened {
+            Ok(sdk) => sdk,
+            Err(e) => {
+                self.state().connecting = false;
+                return Err(e);
+            }
+        };
+
+        // Commit: clearing `connecting` and publishing happen in ONE critical
+        // section together with the generation check, so a concurrent
+        // disconnect cannot slip between them and report success over a node
+        // that is about to go live.
+        {
+            let mut state = self.state();
+            state.connecting = false;
+            if state.generation != started_at {
+                // A disconnect landed while we were connecting; it wins.
+                drop(state);
+                let _ = self.shutdown(sdk);
+                return Ok(());
+            }
+            // Publish before registering the forwarder so an event can never
+            // reach a host while `is_connected()` still reports false.
+            state.sdk = Some(sdk.clone());
         }
-        // Publish before registering the forwarder, so an event cannot reach a
-        // host while `is_connected()` still reports false.
-        *self.sdk.lock().unwrap_or_else(|e| e.into_inner()) = Some(sdk.clone());
+
         let forwarder = Box::new(ForwardingListener {
             events: self.events_tx.clone(),
         });
         if let Err(e) = self.runtime.block_on(sdk.add_event_listener(forwarder)) {
+            // Roll the connection back. Leaving it published would mean
+            // `connect()` returns Err while `is_connected()` is true, and the
+            // retry takes the already-connected fast path — a live wallet that
+            // silently delivers no events, forever.
+            self.state().sdk = None;
+            let _ = self.shutdown(sdk);
             return Err(WalletError::Backend(e.to_string()));
         }
         self.emit(WalletEvent::Connected);
@@ -244,20 +319,33 @@ impl WalletBackend for BreezWallet {
     }
 
     fn disconnect(&self) -> Result<()> {
-        // Never blocks on an in-flight connect; the generation bump tells it
-        // to discard whatever it produces.
-        self.generation.fetch_add(1, Ordering::AcqRel);
-        // Clone rather than take: if teardown fails we must keep the only
-        // handle able to retry it. Dropping it would leave a live node
-        // holding the working-dir SQLite lock while `is_connected()` reports
-        // false — the next connect would open a second node over the same
-        // database and `wipe_local_storage` would sail past its guard. This
-        // mirrors the invariant `SonarWallet.stopNode()` documents on iOS.
-        let Some(sdk) = self.sdk_if_any() else {
-            return Ok(());
+        // Bumping the generation under the same lock `connect` commits with is
+        // what makes this safe against an in-flight connect: either we see its
+        // published SDK below, or it sees our bump and abandons its handle.
+        // Never blocks on the connect itself.
+        let sdk = {
+            let mut state = self.state();
+            state.generation = state.generation.wrapping_add(1);
+            // Clone rather than take: if teardown fails we must keep the only
+            // handle able to retry it. Dropping it would leave a live node
+            // holding the working-dir SQLite lock while `is_connected()`
+            // reports false — the next connect would open a second node over
+            // the same database and `wipe_local_storage` would sail past its
+            // guard. This mirrors the invariant `SonarWallet.stopNode()`
+            // documents on iOS.
+            match state.sdk.clone() {
+                Some(sdk) => sdk,
+                None => return Ok(()),
+            }
         };
         self.shutdown(sdk)?;
-        *self.sdk.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.state().sdk = None;
+        // Quotes were priced against the session that just ended; executing one
+        // after reconnect would pay a stale route/fee.
+        self.quotes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.emit(WalletEvent::Disconnected);
         Ok(())
     }
@@ -356,6 +444,14 @@ impl WalletBackend for BreezWallet {
             )));
         }
         let sdk = self.sdk()?;
+        // A destination classified offline (the documented pre-connect
+        // validation path) carries `amount_sats: None` even for an
+        // amount-bearing BOLT11 invoice, because the pure classifier does not
+        // decode amounts. Re-parse through the connected SDK before deciding
+        // there is no amount anywhere — otherwise a perfectly payable invoice
+        // is rejected, and the "never pay one of two disagreeing figures"
+        // guarantee has nothing to compare against.
+        let destination = &self.refine_destination(&sdk, destination);
         // Breez rejects an explicit amount on a destination that already
         // carries one, so only forward an amount when we must settle an
         // amountless destination.
@@ -378,15 +474,28 @@ impl WalletBackend for BreezWallet {
             .or_else(|| prepared_amount_sats(&prepared))
             .ok_or_else(|| WalletError::InvalidDestination("backend quoted no amount".into()))?;
         let fees_sats = prepared.fees_sat;
-        self.quotes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(quote_key(destination, quoted_amount), prepared);
+        // Unique per preparation: two overlapping confirmation flows for the
+        // same destination and amount must not share a slot, or the first
+        // sender executes the second quote at a fee it never displayed.
+        let token = format!(
+            "{}#{}",
+            destination.raw,
+            self.quote_seq.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut quotes = self.quotes.lock().unwrap_or_else(|e| e.into_inner());
+            if quotes.len() >= MAX_LIVE_QUOTES {
+                return Err(WalletError::Busy(format!(
+                    "{MAX_LIVE_QUOTES} prepared sends are already outstanding; send or drop them first"
+                )));
+            }
+            quotes.insert(token.clone(), prepared);
+        }
         Ok(PreparedSend {
             destination: destination.clone(),
             amount_sats: quoted_amount,
             fees_sats,
-            token: PreparedSendToken::Opaque(quote_key(destination, quoted_amount)),
+            token: PreparedSendToken::Opaque(token),
         })
     }
 
@@ -482,33 +591,44 @@ impl WalletBackend for BreezWallet {
     }
 
     fn wipe_local_storage(&self) -> Result<()> {
-        if self.is_connected() {
+        // Hold the lifecycle lock across the check AND the delete: otherwise a
+        // concurrent `connect` can publish a node midway through
+        // `remove_dir_all` and have its database pulled out from under it.
+        let state = self.state();
+        if state.sdk.is_some() || state.connecting {
             return Err(WalletError::Backend(
                 "disconnect before wiping local storage".into(),
             ));
         }
-        let dir = &self.config.working_dir;
         // Recursive delete driven by caller-supplied config: refuse targets
         // that cannot plausibly be one wallet's directory. `WalletConfig`
-        // documents that working_dir must be dedicated to this wallet.
-        guard_wipe_path(dir)?;
-        if dir.exists() {
-            std::fs::remove_dir_all(dir)
-                .map_err(|e| WalletError::Backend(format!("wipe {}: {e}", dir.display())))?;
+        // documents that working_dir must be dedicated to this wallet. The
+        // guard returns the RESOLVED path, and that is what we delete — never
+        // the raw config value, which may traverse.
+        let target = guard_wipe_path(&self.config.working_dir)?;
+        if target.exists() {
+            std::fs::remove_dir_all(&target)
+                .map_err(|e| WalletError::Backend(format!("wipe {}: {e}", target.display())))?;
         }
         Ok(())
     }
 }
 
-/// Gate on the recursive delete in `wipe_local_storage`.
+/// Gate on the recursive delete in `wipe_local_storage`. Returns the resolved
+/// path that is safe to delete.
 ///
-/// Rejecting the filesystem root and `$HOME` is not enough on its own: a host
-/// bug that drops one path component hands us something like
-/// `~/Library/Application Support`, which is absolute, has a parent, and is
-/// not `$HOME`. So the directory must additionally *look like* a wallet
-/// working dir — either empty/absent (nothing to lose) or containing breez's
-/// own artifacts. Anything else is somebody else's data.
-fn guard_wipe_path(dir: &std::path::Path) -> Result<()> {
+/// Lexical checks alone are not enough, in two distinct ways:
+///
+/// 1. **Traversal.** `/tmp/..` is absolute, has a parent, and is not lexically
+///    `$HOME` — but `remove_dir_all` resolves it to `/`. Every check therefore
+///    runs against the *canonicalized* path, and the canonical path is what the
+///    caller deletes.
+/// 2. **Over-broad but honest paths.** A host bug that drops one component
+///    hands us `~/Library/Application Support`, which survives every rule
+///    above. So the directory must additionally *look like* a wallet working
+///    dir — empty/absent (nothing to lose) or containing only breez's own
+///    artifacts. Anything else is somebody else's data.
+fn guard_wipe_path(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let refuse = |why: &str| {
         Err(WalletError::Backend(format!(
             "refusing to wipe {}: {why}",
@@ -518,26 +638,50 @@ fn guard_wipe_path(dir: &std::path::Path) -> Result<()> {
     if !dir.is_absolute() {
         return refuse("working_dir must be an absolute path");
     }
-    if dir.parent().is_none() {
-        return refuse("path is the filesystem root");
+
+    // Resolve symlinks and `..` before judging anything. A non-existent path
+    // cannot traverse into something that exists, but it can still contain
+    // `..`, so reject those rather than guessing at their intent.
+    let resolved = match dir.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            if dir
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+            {
+                return refuse("path contains `..` and cannot be resolved");
+            }
+            // Absent path with no traversal: nothing to delete, nothing to risk.
+            return Ok(dir.to_path_buf());
+        }
+    };
+
+    if resolved.parent().is_none() {
+        return refuse("path resolves to the filesystem root");
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() && dir == std::path::Path::new(&home) {
-            return refuse("path is the home directory");
+    for var in ["HOME", "TMPDIR"] {
+        if let Some(value) = std::env::var_os(var) {
+            if value.is_empty() {
+                continue;
+            }
+            // Compare canonically: `/tmp` vs `/private/tmp` on macOS.
+            let known = std::path::Path::new(&value)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(&value));
+            if resolved == known {
+                return refuse(&format!("path resolves to ${var}"));
+            }
         }
     }
-    if !dir.exists() {
-        return Ok(());
-    }
-    if !dir.is_dir() {
+    if !resolved.is_dir() {
         return refuse("path is not a directory");
     }
-    let entries: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| WalletError::Backend(format!("read {}: {e}", dir.display())))?
+    let entries: Vec<_> = std::fs::read_dir(&resolved)
+        .map_err(|e| WalletError::Backend(format!("read {}: {e}", resolved.display())))?
         .flatten()
         .collect();
     if entries.is_empty() {
-        return Ok(());
+        return Ok(resolved);
     }
     // Breez nests per-network then per-fingerprint directories under the
     // working dir, and keeps its sqlite store inside.
@@ -552,7 +696,7 @@ fn guard_wipe_path(dir: &std::path::Path) -> Result<()> {
     if !looks_like_wallet_dir {
         return refuse("directory does not look like a wallet working dir");
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// Bridges breez's async event listener onto the wallet's own dispatch thread.
@@ -577,8 +721,20 @@ impl EventListener for ForwardingListener {
                 Some(payment) => WalletEvent::PaymentFailed { payment },
                 None => return,
             },
-            SdkEvent::Synced => WalletEvent::Synced,
-            _ => return,
+            // Every remaining balance-affecting transition maps to `Synced`,
+            // whose contract is "re-query state". Dropping these left a
+            // pending send or a completed refund invisible until some
+            // unrelated later event happened to arrive — the existing Android
+            // and JVM bridges refresh the balance on exactly these variants.
+            SdkEvent::Synced
+            | SdkEvent::DataSynced { .. }
+            | SdkEvent::PaymentPending { .. }
+            | SdkEvent::PaymentRefunded { .. }
+            | SdkEvent::PaymentWaitingConfirmation { .. }
+            | SdkEvent::PaymentWaitingFeeAcceptance { .. } => WalletEvent::Synced,
+            // A sync failure changes no balance and has no interface event; the
+            // next successful sync will emit one.
+            SdkEvent::SyncFailed { .. } => return,
         };
         let _ = self.events.send(event);
     }
@@ -641,9 +797,14 @@ fn non_empty(s: Option<String>) -> Option<String> {
 /// pending and a fee-exclusive receiver amount once it settles, so without
 /// this the figure shown to the user changes between "Sending" and "Sent".
 fn net_amount_sats(p: &Payment) -> u64 {
-    let pending_send = p.payment_type == PaymentType::Send
-        && !matches!(p.status, PaymentState::Complete | PaymentState::Failed);
-    if pending_send {
+    // Only a *completed* send reports the fee-exclusive receiver amount. Every
+    // other send state — pending, timed out, refundable, and failed alike —
+    // still carries the fee-inclusive payer amount, so excluding `Failed` here
+    // made a failed row overstate by the fee while a timed-out row beside it
+    // did not.
+    let unsettled_send =
+        p.payment_type == PaymentType::Send && !matches!(p.status, PaymentState::Complete);
+    if unsettled_send {
         p.amount_sat.saturating_sub(p.fees_sat)
     } else {
         p.amount_sat
@@ -995,6 +1156,54 @@ mod tests {
     }
 
     #[test]
+    fn wipe_refuses_paths_that_traverse_to_the_root() {
+        // Each of these is absolute, has a parent, and is not lexically $HOME —
+        // every lexical rule passes — yet each resolves somewhere catastrophic.
+        // Which rule catches it is platform-dependent (on macOS `/tmp` is a
+        // symlink to `/private/tmp`, so `/tmp/..` lands on `/private`, refused
+        // as "not a wallet dir" rather than as the root); what must hold on
+        // every platform is that none of them is ever deleted.
+        for traversal in ["/tmp/..", "/tmp/../..", "/usr/local/../..", "/etc/.."] {
+            assert!(
+                guard_wipe_path(std::path::Path::new(traversal)).is_err(),
+                "traversal must be refused: {traversal}"
+            );
+        }
+        // A path that unambiguously resolves to `/` is caught by name.
+        let err = guard_wipe_path(std::path::Path::new("/../../..")).unwrap_err();
+        assert!(
+            matches!(err, WalletError::Backend(ref m) if m.contains("filesystem root")),
+            "unexpected error: {err}"
+        );
+        // Traversal in a path that does not exist is refused rather than
+        // silently treated as "absent, nothing to lose".
+        assert!(guard_wipe_path(std::path::Path::new("/nonexistent-xyz/../..")).is_err());
+        // And traversal into $HOME, however it is spelled.
+        if std::env::var_os("HOME").is_some() {
+            let via_traversal = std::path::Path::new("/tmp/../..").join(
+                std::path::Path::new(&std::env::var("HOME").unwrap())
+                    .strip_prefix("/")
+                    .unwrap(),
+            );
+            assert!(guard_wipe_path(&via_traversal).is_err());
+        }
+    }
+
+    #[test]
+    fn wipe_returns_the_resolved_path_not_the_raw_one() {
+        // The caller must delete what the guard approved, not the raw config
+        // value — otherwise the resolution work is decorative.
+        let base = std::env::temp_dir().join("sonar-wallet-resolve-test");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("wallet").join("mainnet")).unwrap();
+        let indirect = base.join("wallet").join("mainnet").join("..");
+        let resolved = guard_wipe_path(&indirect).expect("resolvable wallet dir");
+        assert!(!resolved.to_string_lossy().contains(".."));
+        assert_eq!(resolved, base.join("wallet").canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn wipe_refuses_a_directory_full_of_someone_elses_data() {
         let base = std::env::temp_dir().join("sonar-wallet-guard-test");
         let _ = std::fs::remove_dir_all(&base);
@@ -1021,6 +1230,65 @@ mod tests {
         assert!(guard_wipe_path(&empty).is_ok());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn every_unsettled_send_state_reports_the_same_net_amount() {
+        // Only a completed send carries the fee-exclusive receiver amount.
+        // Pending, timed-out, refundable and failed all carry the payer amount,
+        // so they must all subtract the fee to agree with the settled row.
+        for state in [
+            PaymentState::Created,
+            PaymentState::Pending,
+            PaymentState::Failed,
+            PaymentState::TimedOut,
+            PaymentState::Refundable,
+            PaymentState::RefundPending,
+            PaymentState::WaitingFeeAcceptance,
+        ] {
+            let p = payment(
+                PaymentType::Send,
+                state,
+                1_100,
+                100,
+                lightning_details(Some("hash-1")),
+            );
+            assert_eq!(net_amount_sats(&p), 1_000, "state {state:?} disagrees");
+        }
+        let settled = payment(
+            PaymentType::Send,
+            PaymentState::Complete,
+            1_000,
+            100,
+            lightning_details(Some("hash-1")),
+        );
+        assert_eq!(net_amount_sats(&settled), 1_000);
+    }
+
+    #[test]
+    fn concurrent_connect_is_refused_rather_than_falsely_succeeding() {
+        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        // Simulate an in-flight attempt without doing real network work.
+        wallet.state().connecting = true;
+        let err = wallet.connect().unwrap_err();
+        assert!(
+            matches!(err, WalletError::Busy(_)),
+            "a second connect must not report success while one is in flight: {err}"
+        );
+        // And the wallet is still honestly reporting itself disconnected.
+        assert!(!wallet.is_connected());
+        assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+    }
+
+    #[test]
+    fn wipe_is_refused_while_a_connect_is_in_flight() {
+        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        wallet.state().connecting = true;
+        let err = wallet.wipe_local_storage().unwrap_err();
+        assert!(
+            matches!(err, WalletError::Backend(ref m) if m.contains("disconnect before")),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

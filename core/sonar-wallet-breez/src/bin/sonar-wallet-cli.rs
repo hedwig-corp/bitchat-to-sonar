@@ -123,12 +123,16 @@ fn payment_json(p: &Payment) -> serde_json::Value {
 }
 
 fn expand_home(path: &str) -> PathBuf {
-    match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => PathBuf::from(home).join(rest),
-            None => PathBuf::from(path),
+    let home = std::env::var_os("HOME");
+    match (path, home) {
+        // Bare `~` too, not just `~/x` — otherwise `--dir ~` creates a literal
+        // `./~` directory, which the wipe guard then refuses as relative.
+        ("~", Some(home)) => PathBuf::from(home),
+        (p, Some(home)) => match p.strip_prefix("~/") {
+            Some(rest) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(p),
         },
-        None => PathBuf::from(path),
+        (p, None) => PathBuf::from(p),
     }
 }
 
@@ -291,9 +295,20 @@ fn run(wallet: &BreezWallet, command: &Command) -> Result<(), WalletError> {
             // the process before the caller's `disconnect()` runs and leave the
             // wallet database locked, which is a poor look for the binary whose
             // job is to prove the lifecycle.
-            tracing::info!("listening for wallet events; press Enter to stop");
+            //
+            // A closed/redirected stdin returns Ok(0) immediately, which would
+            // turn `listen … &` or `listen < /dev/null` into a silent no-op
+            // that exits 0. Park instead, and let the operator stop it with a
+            // signal — the DB lock is released by the OS either way, and this
+            // is the only shape that actually listens.
+            tracing::info!("listening for wallet events; press Enter (or send a signal) to stop");
             let mut line = String::new();
-            let _ = std::io::stdin().read_line(&mut line);
+            if let Ok(0) = std::io::stdin().read_line(&mut line) {
+                tracing::info!("stdin is not interactive; parking until signalled");
+                loop {
+                    std::thread::park();
+                }
+            }
         }
     }
     Ok(())
