@@ -90,6 +90,10 @@ enum Command {
     Messages(MessagesArgs),
     /// Create a multi-member Marmot group.
     Group(GroupArgs),
+    /// Add members to an existing Marmot group.
+    GroupAdd(GroupMembershipArgs),
+    /// Remove members from an existing Marmot group.
+    GroupRemove(GroupMembershipArgs),
 }
 
 #[derive(Args, Debug)]
@@ -249,6 +253,16 @@ struct GroupArgs {
     members: Vec<String>,
 }
 
+#[derive(Args, Debug)]
+struct GroupMembershipArgs {
+    /// Existing group id hex.
+    #[arg(long)]
+    group: String,
+    /// Member npub1... or 64-char hex public key. Repeat --members for each.
+    #[arg(long = "members", num_args = 1.., required = true)]
+    members: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct AgentConfig {
     version: u32,
@@ -329,6 +343,14 @@ enum Output {
     GroupCreated {
         id: String,
         name: String,
+    },
+    GroupMembersAdded {
+        group_id: String,
+        added: Vec<String>,
+    },
+    GroupMembersRemoved {
+        group_id: String,
+        removed: Vec<String>,
     },
     Message {
         group_id: String,
@@ -647,6 +669,46 @@ async fn run(cli: Cli) -> Result<()> {
             print_json(&Output::GroupCreated {
                 id: hex::encode(group_id.as_slice()),
                 name: args.name.clone(),
+            })?;
+            Ok(())
+        }
+        Command::GroupAdd(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = parse_group_id_hex(&args.group)?;
+            let mut members = Vec::new();
+            let mut added = Vec::new();
+            for npub in &args.members {
+                let pk = PublicKey::parse(npub)
+                    .map_err(|e| CliError::Message(format!("member pubkey: {e}")))?;
+                members.push(pk);
+                added.push(npub.clone());
+            }
+            client.add_group_members(&group_id, members).await?;
+            print_json(&Output::GroupMembersAdded {
+                group_id: args.group.clone(),
+                added,
+            })?;
+            Ok(())
+        }
+        Command::GroupRemove(args) => {
+            let loaded = LoadedConfig::load(home, cli.relays)?;
+            let client = loaded.connect().await?;
+            client.sync().await?;
+            let group_id = parse_group_id_hex(&args.group)?;
+            let mut members = Vec::new();
+            let mut removed = Vec::new();
+            for npub in &args.members {
+                let pk = PublicKey::parse(npub)
+                    .map_err(|e| CliError::Message(format!("member pubkey: {e}")))?;
+                members.push(pk);
+                removed.push(npub.clone());
+            }
+            client.remove_group_members(&group_id, members).await?;
+            print_json(&Output::GroupMembersRemoved {
+                group_id: args.group.clone(),
+                removed,
             })?;
             Ok(())
         }
