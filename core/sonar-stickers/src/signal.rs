@@ -525,8 +525,9 @@ mod tests {
         // Bad base64 inside PEM markers fails parsing rather than yielding an
         // empty set — a different path to the same guarantee.
         let malformed = SignalImportOptions {
-            root_certificates: Some(&[b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".as_ref()])
-            ,
+            root_certificates: Some(&[
+                b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n".as_ref(),
+            ]),
             ..SignalImportOptions::default()
         };
         assert!(build_http_client(malformed).is_err());
