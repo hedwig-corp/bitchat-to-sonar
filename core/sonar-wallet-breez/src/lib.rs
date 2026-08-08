@@ -74,6 +74,20 @@ struct Lifecycle {
     defunct: bool,
 }
 
+impl Lifecycle {
+    /// The established session, if any — fully set up (listener installed),
+    /// not mid-teardown, not retained after a failed close. This is the ONE
+    /// predicate operational code may use; earlier revisions duplicated these
+    /// conditions at call sites and they drifted, which is how a defunct
+    /// handle stayed quotable after it was already quarantined elsewhere.
+    fn established(&self) -> Option<(Arc<LiquidSdk>, u64)> {
+        if self.connecting || self.disconnecting || self.defunct {
+            return None;
+        }
+        self.sdk.clone().map(|sdk| (sdk, self.generation))
+    }
+}
+
 pub struct BreezWallet {
     config: WalletConfig,
     /// Two workers is enough for the blocking bridge: every public method
@@ -127,6 +141,24 @@ fn prepared_amount_sats(p: &breez_sdk_liquid::model::PrepareSendResponse) -> Opt
 }
 
 impl BreezWallet {
+    /// This backend's capabilities are static metadata — they depend on what
+    /// the code routes to, not on any wallet state — so tooling can discover
+    /// them without constructing a wallet (i.e. without holding a seed).
+    pub const CAPABILITIES: WalletCapabilities = WalletCapabilities {
+        node_lifecycle: true,
+        webhook: true,
+        fiat_rates: true,
+        // LNURL-pay and Lightning addresses need breez's separate `lnurl_pay`
+        // API, which this wrapper does not route to yet; `send` refuses them
+        // explicitly rather than letting `prepare_send_payment` fail with an
+        // opaque parse error.
+        lnurl_send: false,
+        bolt11_send: true,
+        bolt12_send: true,
+        bolt12_receive: true,
+        bolt11_receive: true,
+    };
+
     pub fn new(config: WalletConfig) -> Result<Self> {
         if config.seed.len() < 32 {
             return Err(WalletError::InvalidInput(
@@ -191,16 +223,11 @@ impl BreezWallet {
     /// the handle regardless (disconnect, wipe, drop) read `state.sdk`
     /// directly.
     fn sdk_if_any(&self) -> Option<Arc<LiquidSdk>> {
-        let state = self.state();
-        // Neither a setup-phase handle nor a retained-after-failed-teardown
-        // one is an established session: the first can still roll back, the
-        // second has no event forwarder — payments through it would settle
-        // with no notification ever delivered. Both stay reachable for
-        // lifecycle paths, which read the slot directly.
-        if state.connecting || state.defunct {
-            return None;
-        }
-        state.sdk.clone()
+        // Established sessions only — see `Lifecycle::established` for why a
+        // setup-phase, mid-teardown, or retained-after-failed-close handle is
+        // excluded. All three stay reachable for lifecycle paths, which read
+        // the slot directly.
+        self.state().established().map(|(sdk, _)| sdk)
     }
 
     fn emit(&self, event: WalletEvent) {
@@ -290,20 +317,7 @@ impl Drop for BreezWallet {
 
 impl WalletBackend for BreezWallet {
     fn capabilities(&self) -> WalletCapabilities {
-        WalletCapabilities {
-            node_lifecycle: true,
-            webhook: true,
-            fiat_rates: true,
-            // LNURL-pay and Lightning addresses need breez's separate
-            // `lnurl_pay` API, which this wrapper does not route to yet;
-            // `send` refuses them explicitly rather than letting
-            // `prepare_send_payment` fail with an opaque parse error.
-            lnurl_send: false,
-            bolt11_send: true,
-            bolt12_send: true,
-            bolt12_receive: true,
-            bolt11_receive: true,
-        }
+        BreezWallet::CAPABILITIES
     }
 
     fn sync_wallet(&self) -> Result<()> {
@@ -648,18 +662,10 @@ impl WalletBackend for BreezWallet {
         // against, so the insertion below can refuse a quote that straddled a
         // disconnect — the purge in `disconnect` only invalidates quotes that
         // are already in the map.
-        let (sdk, session_gen) = {
-            let state = self.state();
-            // Same rule as `sdk_if_any`: never quote against a setup-phase
-            // session — its setup can still fail and roll back.
-            if state.connecting {
-                return Err(WalletError::NotConnected);
-            }
-            match state.sdk.clone() {
-                Some(sdk) => (sdk, state.generation),
-                None => return Err(WalletError::NotConnected),
-            }
-        };
+        let (sdk, session_gen) = self
+            .state()
+            .established()
+            .ok_or(WalletError::NotConnected)?;
         // A destination classified offline (the documented pre-connect
         // validation path) carries `amount_sats: None` even for an
         // amount-bearing BOLT11 invoice, because the pure classifier does not
@@ -1562,24 +1568,31 @@ mod tests {
     }
 
     #[test]
-    fn setup_phase_handle_is_not_operational() {
-        // While `connecting` is set, a published-but-listener-pending handle
-        // must not be reachable through operational accessors: a quote taken
-        // through it could outlive a failed setup.
-        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
-        wallet.state().connecting = true;
-        assert!(!wallet.is_connected());
-        assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+    fn non_established_lifecycle_states_are_not_operational() {
+        // Setup-phase, mid-teardown, and retained-after-failed-close handles
+        // must all be invisible to operational accessors — every one of these
+        // states has produced its own review finding, so they are pinned as a
+        // set: `Lifecycle::established` is the single predicate.
         let dest = Destination {
             raw: "lno1qcp4256ypq".into(),
             kind: DestinationKind::Bolt12Offer,
             amount_sats: None,
             note: None,
         };
-        assert!(matches!(
-            wallet.prepare_send(&dest, Some(100)),
-            Err(WalletError::NotConnected)
-        ));
+        for set_state in [
+            (|s: &mut Lifecycle| s.connecting = true) as fn(&mut Lifecycle),
+            |s: &mut Lifecycle| s.disconnecting = true,
+            |s: &mut Lifecycle| s.defunct = true,
+        ] {
+            let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+            set_state(&mut wallet.state());
+            assert!(!wallet.is_connected());
+            assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+            assert!(matches!(
+                wallet.prepare_send(&dest, Some(100)),
+                Err(WalletError::NotConnected)
+            ));
+        }
     }
 
     #[test]

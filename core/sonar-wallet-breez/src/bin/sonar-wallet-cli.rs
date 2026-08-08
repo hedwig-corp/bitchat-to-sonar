@@ -146,6 +146,27 @@ fn main() -> Result<(), WalletError> {
         .init();
 
     let cli = Cli::parse();
+
+    // Capabilities are static backend metadata: discovery must not require a
+    // funds-controlling secret, so answer before any secret is loaded.
+    if let Command::Capabilities = cli.command {
+        let c = BreezWallet::CAPABILITIES;
+        println!(
+            "{}",
+            json!({
+                "node_lifecycle": c.node_lifecycle,
+                "webhook": c.webhook,
+                "fiat_rates": c.fiat_rates,
+                "lnurl_send": c.lnurl_send,
+                "bolt11_send": c.bolt11_send,
+                "bolt12_send": c.bolt12_send,
+                "bolt12_receive": c.bolt12_receive,
+                "bolt11_receive": c.bolt11_receive,
+            })
+        );
+        return Ok(());
+    }
+
     // Secrets come from the environment only. Never accept them as arguments:
     // argv is visible to every local user via `ps` and lands in shell history
     // and CI logs.
@@ -185,24 +206,6 @@ fn main() -> Result<(), WalletError> {
         api_key,
         working_dir,
     })?;
-
-    if let Command::Capabilities = cli.command {
-        let c = wallet.capabilities();
-        println!(
-            "{}",
-            json!({
-                "node_lifecycle": c.node_lifecycle,
-                "webhook": c.webhook,
-                "fiat_rates": c.fiat_rates,
-                "lnurl_send": c.lnurl_send,
-                "bolt11_send": c.bolt11_send,
-                "bolt12_send": c.bolt12_send,
-                "bolt12_receive": c.bolt12_receive,
-                "bolt11_receive": c.bolt11_receive,
-            })
-        );
-        return Ok(());
-    }
 
     wallet.connect()?;
     let result = run(&wallet, &cli.command);
