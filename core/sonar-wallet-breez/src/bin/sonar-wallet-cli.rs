@@ -194,9 +194,11 @@ fn main() -> Result<(), WalletError> {
                 "node_lifecycle": c.node_lifecycle,
                 "webhook": c.webhook,
                 "fiat_rates": c.fiat_rates,
+                "lnurl_send": c.lnurl_send,
                 "bolt11_send": c.bolt11_send,
                 "bolt12_send": c.bolt12_send,
                 "bolt12_receive": c.bolt12_receive,
+                "bolt11_receive": c.bolt11_receive,
             })
         );
         return Ok(());

@@ -182,8 +182,20 @@ impl BreezWallet {
         self.sdk_if_any().ok_or(WalletError::NotConnected)
     }
 
+    /// The established session's handle — the one operational methods may use.
+    ///
+    /// A setup-phase handle (published, listener registration pending) is
+    /// deliberately NOT exposed: setup can still fail and roll back, and a
+    /// quote prepared through it in that window would survive as executable
+    /// against a session that no longer exists. Lifecycle paths that must see
+    /// the handle regardless (disconnect, wipe, drop) read `state.sdk`
+    /// directly.
     fn sdk_if_any(&self) -> Option<Arc<LiquidSdk>> {
-        self.state().sdk.clone()
+        let state = self.state();
+        if state.connecting {
+            return None;
+        }
+        state.sdk.clone()
     }
 
     fn emit(&self, event: WalletEvent) {
@@ -628,6 +640,11 @@ impl WalletBackend for BreezWallet {
         // are already in the map.
         let (sdk, session_gen) = {
             let state = self.state();
+            // Same rule as `sdk_if_any`: never quote against a setup-phase
+            // session — its setup can still fail and roll back.
+            if state.connecting {
+                return Err(WalletError::NotConnected);
+            }
             match state.sdk.clone() {
                 Some(sdk) => (sdk, state.generation),
                 None => return Err(WalletError::NotConnected),
@@ -891,6 +908,14 @@ fn guard_wipe_path(dir: &std::path::Path) -> Result<std::path::PathBuf> {
                 return refuse(&format!("path resolves to ${var}"));
             }
         }
+    }
+    // $TMPDIR alone is not enough: when it is unset the platform still has an
+    // effective temp root (`/tmp` on Linux), and deleting the SHARED system
+    // temp directory must be refused no matter how it was reached.
+    let system_tmp = std::env::temp_dir();
+    let system_tmp = system_tmp.canonicalize().unwrap_or(system_tmp);
+    if resolved == system_tmp {
+        return refuse("path resolves to the system temp directory");
     }
     if !resolved.is_dir() {
         return refuse("path is not a directory");
@@ -1514,6 +1539,35 @@ mod tests {
         // Eviction ordering still reads the trailing sequence.
         assert_eq!(quote_seq_of(&token_a), 0);
         assert_eq!(quote_seq_of(&format!("{}#{}#{}", a.instance, "d", 7)), 7);
+    }
+
+    #[test]
+    fn setup_phase_handle_is_not_operational() {
+        // While `connecting` is set, a published-but-listener-pending handle
+        // must not be reachable through operational accessors: a quote taken
+        // through it could outlive a failed setup.
+        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        wallet.state().connecting = true;
+        assert!(!wallet.is_connected());
+        assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+        let dest = Destination {
+            raw: "lno1qcp4256ypq".into(),
+            kind: DestinationKind::Bolt12Offer,
+            amount_sats: None,
+            note: None,
+        };
+        assert!(matches!(
+            wallet.prepare_send(&dest, Some(100)),
+            Err(WalletError::NotConnected)
+        ));
+    }
+
+    #[test]
+    fn wipe_refuses_the_system_temp_directory() {
+        // With $TMPDIR unset the platform still has an effective temp root;
+        // the guard must refuse it by name, not only via the env var.
+        let tmp = std::env::temp_dir();
+        assert!(guard_wipe_path(&tmp).is_err());
     }
 
     #[test]
