@@ -85,7 +85,13 @@ pub struct BreezWallet {
     /// destination and amount must not collide: whoever sent first would
     /// otherwise execute the other's quote, at a fee they never saw.
     quote_seq: AtomicU64,
+    /// Process-unique id for this wallet object; see the token construction in
+    /// `prepare_send`.
+    instance: u64,
 }
+
+/// Allocator for [`BreezWallet::instance`].
+static NEXT_WALLET_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
 /// Cap on parked quotes. A caller that prepares and never sends (an abandoned
 /// confirmation sheet) leaves one entry behind; at the cap the oldest is
@@ -150,6 +156,7 @@ impl BreezWallet {
             events_tx,
             quotes: Mutex::new(HashMap::new()),
             quote_seq: AtomicU64::new(0),
+            instance: NEXT_WALLET_INSTANCE.fetch_add(1, Ordering::Relaxed),
         })
     }
 
@@ -189,29 +196,6 @@ impl BreezWallet {
             .map_err(|e| WalletError::Backend(e.to_string()))?;
         config.working_dir = self.config.working_dir.to_string_lossy().into_owned();
         Ok(config)
-    }
-
-    /// Is `sdk` still the published handle? Identity, not equality — two
-    /// `LiquidSdk`s over the same working dir are different nodes.
-    fn is_same_published_sdk(&self, sdk: &Arc<LiquidSdk>) -> bool {
-        self.state()
-            .sdk
-            .as_ref()
-            .is_some_and(|published| Arc::ptr_eq(published, sdk))
-    }
-
-    /// Clear the published handle only if it is still `sdk`. Returns whether it
-    /// was cleared, so callers can tell "I tore down the live node" from
-    /// "someone else's node is live now, leave it alone".
-    fn clear_sdk_if_same(&self, sdk: &Arc<LiquidSdk>) -> bool {
-        let mut state = self.state();
-        match state.sdk.as_ref() {
-            Some(published) if Arc::ptr_eq(published, sdk) => {
-                state.sdk = None;
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Re-parse a destination through the connected SDK when it carries no
@@ -375,19 +359,46 @@ impl WalletBackend for BreezWallet {
             // Roll the connection back. Leaving it published would mean
             // `connect()` returns Err while `is_connected()` is true, and the
             // retry takes the already-connected fast path — a live wallet that
-            // silently delivers no events, forever. Clear by identity so a
-            // concurrent reconnect's handle is not collaterally dropped.
-            self.clear_sdk_if_same(&sdk);
-            let _ = self.shutdown(sdk);
+            // silently delivers no events, forever.
+            //
+            // Unless a `disconnect` already owns the teardown: then the slot
+            // and the close are its to handle — clearing here would break the
+            // "`disconnecting` implies published" invariant, and shutting down
+            // would double-close the same node concurrently.
+            let ours = {
+                let mut state = self.state();
+                if state.disconnecting {
+                    false
+                } else {
+                    match state.sdk.as_ref() {
+                        Some(published) if Arc::ptr_eq(published, &sdk) => {
+                            state.sdk = None;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            };
+            if ours {
+                let _ = self.shutdown(sdk);
+            }
             return Err(WalletError::Backend(e.to_string()));
         }
         // A disconnect can have landed while we were registering the listener.
-        // Announcing `Connected` after it would leave lifecycle-driven hosts
-        // in the ready state over a wallet that is already closed.
-        if !self.is_same_published_sdk(&sdk) {
-            return Ok(());
+        // Announcing `Connected` after it would leave lifecycle-driven hosts in
+        // the ready state over a closed wallet — and the check must share the
+        // critical section with the emit, or a disconnect slipping between
+        // them delivers `Disconnected` then `Connected` in that order.
+        {
+            let state = self.state();
+            let still_ours = state
+                .sdk
+                .as_ref()
+                .is_some_and(|published| Arc::ptr_eq(published, &sdk));
+            if still_ours {
+                self.emit(WalletEvent::Connected);
+            }
         }
-        self.emit(WalletEvent::Connected);
         Ok(())
     }
 
@@ -423,40 +434,36 @@ impl WalletBackend for BreezWallet {
         let teardown = self.shutdown(sdk.clone());
         // Whatever happened, release the teardown claim and (on success) the
         // slot in ONE critical section, so `disconnecting == true` always
-        // implies the SDK is still published.
-        let cleared = {
+        // implies the SDK is still published. The quote purge and the
+        // `Disconnected` emit stay inside the same section: emitting after
+        // releasing the lock lets a racing connect interleave its `Connected`
+        // the wrong way around.
+        {
             let mut state = self.state();
             state.disconnecting = false;
-            match &teardown {
-                // Clear by identity: if a reconnect published a NEW node while
-                // we were tearing down (not possible today — connect refuses
-                // while `disconnecting` — but cheap to keep honest), an
-                // unconditional clear would orphan that live node.
-                Ok(()) => match state.sdk.as_ref() {
-                    Some(published) if Arc::ptr_eq(published, &sdk) => {
-                        state.sdk = None;
-                        true
-                    }
-                    _ => false,
-                },
-                // Teardown failed: keep the handle so the caller can retry.
-                Err(_) => false,
+            // On teardown failure, keep the handle so the caller can retry.
+            // On success, clear by identity: if a rollback already released the
+            // slot (or a reconnect published a NEW node — not possible today,
+            // since connect refuses while `disconnecting`, but cheap to keep
+            // honest), it is not ours to clear or announce.
+            if teardown.is_ok()
+                && state
+                    .sdk
+                    .as_ref()
+                    .is_some_and(|published| Arc::ptr_eq(published, &sdk))
+            {
+                state.sdk = None;
+                // Quotes were priced against the session that just ended;
+                // executing one after reconnect would pay a stale route/fee.
+                // (Lock order is state → quotes, everywhere.)
+                self.quotes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                self.emit(WalletEvent::Disconnected);
             }
-        };
-        teardown?;
-        if !cleared {
-            // A different node is published now; it and its quotes are not ours
-            // to tear down.
-            return Ok(());
         }
-        // Quotes were priced against the session that just ended; executing one
-        // after reconnect would pay a stale route/fee.
-        self.quotes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.emit(WalletEvent::Disconnected);
-        Ok(())
+        teardown
     }
 
     fn is_connected(&self) -> bool {
@@ -604,8 +611,14 @@ impl WalletBackend for BreezWallet {
         // Unique per preparation: two overlapping confirmation flows for the
         // same destination and amount must not share a slot, or the first
         // sender executes the second quote at a fee it never displayed.
+        // The instance component keeps a stale `PreparedSend` from an earlier
+        // wallet object (a host that rebuilt the wallet under a still-open
+        // confirmation sheet) from colliding with this instance's tokens:
+        // per-instance sequences both start at zero, so `dest#0` alone could
+        // resolve to a quote the user never saw.
         let token = format!(
-            "{}#{}",
+            "{}#{}#{}",
+            self.instance,
             destination.raw,
             self.quote_seq.fetch_add(1, Ordering::Relaxed)
         );
@@ -731,7 +744,7 @@ impl WalletBackend for BreezWallet {
         // concurrent `connect` can publish a node midway through
         // `remove_dir_all` and have its database pulled out from under it.
         let state = self.state();
-        if state.sdk.is_some() || state.connecting {
+        if state.sdk.is_some() || state.connecting || state.disconnecting {
             return Err(WalletError::Backend(
                 "disconnect before wiping local storage".into(),
             ));
@@ -1414,6 +1427,34 @@ mod tests {
         // And the wallet is still honestly reporting itself disconnected.
         assert!(!wallet.is_connected());
         assert!(matches!(wallet.balance(), Err(WalletError::NotConnected)));
+    }
+
+    #[test]
+    fn quote_tokens_differ_across_wallet_instances() {
+        // A host that rebuilds the wallet under a still-open confirmation
+        // sheet must not have the stale PreparedSend resolve against the new
+        // instance's quotes: both sequences start at zero, so without the
+        // instance component `dest#0` would collide.
+        let a = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        let b = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        assert_ne!(a.instance, b.instance);
+        let token_a = format!("{}#{}#{}", a.instance, "lno1dest", 0);
+        let token_b = format!("{}#{}#{}", b.instance, "lno1dest", 0);
+        assert_ne!(token_a, token_b);
+        // Eviction ordering still reads the trailing sequence.
+        assert_eq!(quote_seq_of(&token_a), 0);
+        assert_eq!(quote_seq_of(&format!("{}#{}#{}", a.instance, "d", 7)), 7);
+    }
+
+    #[test]
+    fn wipe_is_refused_while_a_disconnect_is_in_flight() {
+        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        wallet.state().disconnecting = true;
+        let err = wallet.wipe_local_storage().unwrap_err();
+        assert!(
+            matches!(err, WalletError::Backend(ref m) if m.contains("disconnect before")),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
