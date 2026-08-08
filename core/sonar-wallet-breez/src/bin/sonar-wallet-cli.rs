@@ -280,6 +280,24 @@ fn run(wallet: &BreezWallet, command: &Command) -> Result<(), WalletError> {
         Command::Quote(args) => {
             let destination = wallet.parse_destination(&args.destination)?;
             let prepared = wallet.prepare_send(&destination, args.amount_sats)?;
+            // Same fail-closed cap semantics as `send`: automation uses this
+            // as a preflight, and a success exit with a fee above (or absent
+            // from) the requested ceiling would be a false green light.
+            if let Some(max) = args.max_fee_sats {
+                match prepared.fees_sats {
+                    Some(fees) if fees <= max => {}
+                    Some(fees) => {
+                        return Err(WalletError::Backend(format!(
+                            "quoted fee {fees} sats exceeds --max-fee-sats {max}"
+                        )));
+                    }
+                    None => {
+                        return Err(WalletError::Backend(format!(
+                            "backend quoted no fee, cannot honour --max-fee-sats {max}"
+                        )));
+                    }
+                }
+            }
             println!(
                 "{}",
                 json!({

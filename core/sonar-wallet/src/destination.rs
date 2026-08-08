@@ -37,10 +37,16 @@ pub fn resolve_send_amount(requested: Option<u64>, encoded: Option<u64>) -> Resu
 /// [`crate::WalletBackend::parse_destination`].
 pub fn classify_destination(input: &str) -> Destination {
     let trimmed = input.trim();
-    let stripped = trimmed
-        .strip_prefix("lightning:")
-        .or_else(|| trimmed.strip_prefix("LIGHTNING:"))
-        .unwrap_or(trimmed);
+    // URI schemes are case-insensitive (RFC 3986 §3.1): `Lightning:` from a
+    // QR encoder or a copy-pasted deep link must strip the same as
+    // `lightning:`.
+    const SCHEME: &str = "lightning:";
+    let stripped =
+        if trimmed.len() >= SCHEME.len() && trimmed[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
+            &trimmed[SCHEME.len()..]
+        } else {
+            trimmed
+        };
     let lower = stripped.to_ascii_lowercase();
     let kind = if lower.starts_with("lno") {
         DestinationKind::Bolt12Offer
@@ -84,9 +90,18 @@ mod tests {
 
     #[test]
     fn strips_lightning_uri_prefix_and_whitespace() {
-        let d = classify_destination("  lightning:lno1abcdef  ");
-        assert_eq!(d.kind, DestinationKind::Bolt12Offer);
-        assert_eq!(d.raw, "lno1abcdef");
+        // Schemes are case-insensitive (RFC 3986 §3.1) — QR encoders and deep
+        // links produce every casing.
+        for input in [
+            "  lightning:lno1abcdef  ",
+            "LIGHTNING:lno1abcdef",
+            "Lightning:lno1abcdef",
+            "LiGhTnInG:lno1abcdef",
+        ] {
+            let d = classify_destination(input);
+            assert_eq!(d.kind, DestinationKind::Bolt12Offer, "input: {input}");
+            assert_eq!(d.raw, "lno1abcdef", "input: {input}");
+        }
     }
 
     #[test]

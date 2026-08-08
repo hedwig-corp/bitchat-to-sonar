@@ -38,6 +38,13 @@ pub trait WalletEventListener: Send + Sync {
 /// - a failed `disconnect` must leave the backend able to retry teardown; it
 ///   must never drop its only handle to a node that is still running, or the
 ///   next `connect` opens a second node over the same database.
+/// - `disconnect` does NOT wait for in-flight operations. An operation that
+///   straddles a teardown may fail with a backend error, and a send in that
+///   window is settled by the payment protocol itself — its true outcome is
+///   reconciled from the backend's persistent payment store on the next
+///   connect (this is why payment ids must be stable). Deferring teardown
+///   behind a slow send is the exact background-kill shape the fast-close
+///   rule above exists to prevent.
 ///
 /// Capability-gated methods default to [`WalletError::Unsupported`] so
 /// backends implement only what they have; callers gate on
