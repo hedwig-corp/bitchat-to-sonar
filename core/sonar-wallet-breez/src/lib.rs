@@ -192,7 +192,12 @@ impl BreezWallet {
     /// directly.
     fn sdk_if_any(&self) -> Option<Arc<LiquidSdk>> {
         let state = self.state();
-        if state.connecting {
+        // Neither a setup-phase handle nor a retained-after-failed-teardown
+        // one is an established session: the first can still roll back, the
+        // second has no event forwarder — payments through it would settle
+        // with no notification ever delivered. Both stay reachable for
+        // lifecycle paths, which read the slot directly.
+        if state.connecting || state.defunct {
             return None;
         }
         state.sdk.clone()
@@ -384,13 +389,18 @@ impl WalletBackend for BreezWallet {
                 let closed = self.shutdown(sdk.clone());
                 let mut state = self.state();
                 state.disconnecting = false;
-                if closed.is_err() {
-                    // Retain the only handle to a still-running node: publish
-                    // it, so `is_connected()` tells the truth and a later
-                    // disconnect can retry the close. Marked defunct — it has
-                    // no event forwarder and must not pass the fast path.
+                if let Err(close_err) = closed {
+                    // Retain the only handle to a still-running node — marked
+                    // defunct (no event forwarder) so neither the fast path
+                    // nor operational accessors treat it as a session; only a
+                    // disconnect() retry can recover it. And tell the caller:
+                    // the disconnect that cancelled us has already returned,
+                    // so this error is the one signal that recovery is needed.
                     state.sdk = Some(sdk);
                     state.defunct = true;
+                    return Err(WalletError::Backend(format!(
+                        "connect was cancelled and the abandoned node failed to close: {close_err}"
+                    )));
                 }
                 return Ok(());
             }
@@ -880,7 +890,11 @@ fn guard_wipe_path(dir: &std::path::Path) -> Result<std::path::PathBuf> {
     // `..`, so reject those rather than guessing at their intent.
     let resolved = match dir.canonicalize() {
         Ok(resolved) => resolved,
-        Err(_) => {
+        // Only a confirmed ABSENT path is harmless. Any other resolution
+        // failure (permissions, I/O) must fail the destructive operation
+        // closed: `exists()` returns false under the same access error, so
+        // the wipe would otherwise report success while the state remains.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             if dir
                 .components()
                 .any(|c| c == std::path::Component::ParentDir)
@@ -889,6 +903,12 @@ fn guard_wipe_path(dir: &std::path::Path) -> Result<std::path::PathBuf> {
             }
             // Absent path with no traversal: nothing to delete, nothing to risk.
             return Ok(dir.to_path_buf());
+        }
+        Err(e) => {
+            return Err(WalletError::Backend(format!(
+                "cannot resolve {}: {e}",
+                dir.display()
+            )))
         }
     };
 
