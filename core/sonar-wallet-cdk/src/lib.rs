@@ -58,6 +58,19 @@ const RESTORED_MARKER_PREFIX: &str = "cashu.restored";
 /// expose no push channel over plain HTTP.
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Exactly our artifacts, nothing prefix-shaped: `cashu.redb-backup` or
+/// `cashu.restored-notes` in an over-broad `working_dir` are somebody's data,
+/// and a loose `starts_with` would have handed them to `remove_dir_all` —
+/// defeating the foreign-content protection the wipe guard exists for.
+fn is_our_artifact(name: &str) -> bool {
+    if name == DB_FILE {
+        return true;
+    }
+    name.strip_prefix(RESTORED_MARKER_PREFIX)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|suffix| suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 /// Connection state; one mutex, same discipline as the Breez backend.
 #[derive(Default)]
 struct Lifecycle {
@@ -290,6 +303,26 @@ impl CdkWallet {
             .finalize_pending_melts()
             .await
             .map_err(|e| WalletError::Backend(format!("finalize pending melts: {e}")))?;
+        // Event consumers dedupe ledger rows by payment id; a terminal event
+        // that drops the note would overwrite the row the initial send wrote.
+        // The persisted transaction still carries it — join by quote id.
+        let notes: HashMap<String, String> = if finalized.is_empty() {
+            HashMap::new()
+        } else {
+            wallet
+                .list_transactions(None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|tx| {
+                    let note = tx
+                        .memo
+                        .clone()
+                        .or_else(|| tx.metadata.get("memo").cloned())?;
+                    Some((tx.quote_id?, note))
+                })
+                .collect()
+        };
         let mut settled = 0;
         for melt in &finalized {
             let status = match melt.state() {
@@ -307,7 +340,7 @@ impl CdkWallet {
                 timestamp_secs: now_secs(),
                 status,
                 preimage: melt.payment_proof().map(str::to_string),
-                note: None,
+                note: notes.get(melt.quote_id()).cloned(),
             };
             let _ = events.send(if status == PaymentStatus::Failed {
                 WalletEvent::PaymentFailed { payment }
@@ -800,9 +833,7 @@ impl WalletBackend for CdkWallet {
                 "disconnect before wiping local storage".into(),
             ));
         }
-        let target = guard_wipe_path(&self.config.working_dir, |name| {
-            name == DB_FILE || name.starts_with(DB_FILE) || name.starts_with(RESTORED_MARKER_PREFIX)
-        })?;
+        let target = guard_wipe_path(&self.config.working_dir, is_our_artifact)?;
         if target.exists() {
             std::fs::remove_dir_all(&target)
                 .map_err(|e| WalletError::Backend(format!("wipe {}: {e}", target.display())))?;
@@ -909,6 +940,22 @@ mod tests {
             note: None,
         };
         assert_eq!(refine_bolt11_amount(garbage.clone()), garbage);
+    }
+
+    #[test]
+    fn wipe_predicate_matches_exact_artifacts_only() {
+        assert!(is_our_artifact("cashu.redb"));
+        assert!(is_our_artifact("cashu.restored.00c0ffee"));
+        for foreign in [
+            "cashu.redb-backup",
+            "cashu.restored-notes",
+            "cashu.restored.",
+            "cashu.restored.xyz",
+            "cashu.restored.00c0ffee.old",
+            "notes.txt",
+        ] {
+            assert!(!is_our_artifact(foreign), "must reject {foreign}");
+        }
     }
 
     #[test]
