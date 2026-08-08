@@ -205,6 +205,26 @@ impl CdkWallet {
         let path = self.config.working_dir.join(ACCOUNT_MARKER);
         let ours = self.account_fingerprint();
 
+        // An existing proof database with no marker is NOT ours to claim: a
+        // database-only backup restore (or a lost sidecar) would otherwise be
+        // adopted by whichever seed opened it first, handing one account's
+        // bearer proofs to another. Only a genuinely new store self-claims;
+        // adopting an existing one is an explicit, deliberate act.
+        if !path.exists() && self.config.working_dir.join(DB_FILE).exists() {
+            if std::env::var("SONAR_CASHU_ADOPT_UNBOUND_STORE").as_deref() != Ok("1") {
+                return Err(WalletError::InvalidInput(format!(
+                    "{} holds a wallet database with no account marker; refusing to adopt \
+                     proofs that may belong to another account. If this store is yours, set \
+                     SONAR_CASHU_ADOPT_UNBOUND_STORE=1 once to bind it to seed {ours}",
+                    self.config.working_dir.display()
+                )));
+            }
+            tracing::warn!(
+                "adopting unbound store at {} for account {ours} (SONAR_CASHU_ADOPT_UNBOUND_STORE=1)",
+                self.config.working_dir.display()
+            );
+        }
+
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -920,11 +940,38 @@ impl WalletBackend for CdkWallet {
                 .list_transactions(None)
                 .await
                 .map_err(|e| WalletError::Backend(e.to_string()))?;
+            // Outgoing rows must not all claim Complete: a melt still active
+            // or pending is unresolved, and reporting it as paid after a
+            // restart is the worst direction to be wrong in. Anything the
+            // wallet no longer tracks has settled.
+            let mut melt_states: HashMap<String, MeltQuoteState> = HashMap::new();
+            for quote in wallet
+                .get_active_melt_quotes()
+                .await
+                .map_err(|e| WalletError::Backend(e.to_string()))?
+                .into_iter()
+                .chain(
+                    wallet
+                        .get_pending_melt_quotes()
+                        .await
+                        .map_err(|e| WalletError::Backend(e.to_string()))?,
+                )
+            {
+                melt_states.insert(quote.id.clone(), quote.state);
+            }
             let mut payments: Vec<Payment> = transactions
                 .into_iter()
                 .map(|tx| {
                     let incoming =
                         tx.direction == cdk::wallet::types::TransactionDirection::Incoming;
+                    let status = match tx.quote_id.as_ref().and_then(|q| melt_states.get(q)) {
+                        Some(MeltQuoteState::Paid) => PaymentStatus::Complete,
+                        Some(MeltQuoteState::Failed) => PaymentStatus::Failed,
+                        Some(_) => PaymentStatus::Pending,
+                        // Untracked: settled (incoming rows only exist once
+                        // their proofs are minted).
+                        None => PaymentStatus::Complete,
+                    };
                     Payment {
                         // Live returns and events identify a payment by its
                         // mint/melt QUOTE id; reconstructing history with
@@ -935,7 +982,7 @@ impl WalletBackend for CdkWallet {
                         fees_sats: Some(u64::from(tx.fee)),
                         incoming,
                         timestamp_secs: tx.timestamp,
-                        status: PaymentStatus::Complete,
+                        status,
                         preimage: None,
                         note: tx_note(tx.memo.as_ref(), &tx.metadata).filter(|n| !n.is_empty()),
                     }
@@ -1115,6 +1162,42 @@ mod tests {
             "a losing seed must never rewrite the marker"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_existing_unbound_database_is_not_adopted() {
+        // Restoring a database-only backup must not hand its bearer proofs to
+        // whichever seed opens it first.
+        let dir = std::env::temp_dir().join("sonar-cdk-unbound-store-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(DB_FILE), b"pretend-proofs").unwrap();
+
+        let mut cfg = config();
+        cfg.working_dir = dir.clone();
+        let w = CdkWallet::new(cfg, "https://mint.example.com").unwrap();
+        let err = w.check_account_binding().unwrap_err();
+        assert!(
+            matches!(err, WalletError::InvalidInput(ref m) if m.contains("no account marker")),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dir.join(ACCOUNT_MARKER).exists(),
+            "a refused adoption must not leave a claim behind"
+        );
+
+        // A genuinely new store (no database) still self-claims.
+        let fresh = std::env::temp_dir().join("sonar-cdk-fresh-store-test");
+        let _ = std::fs::remove_dir_all(&fresh);
+        std::fs::create_dir_all(&fresh).unwrap();
+        let mut cfg2 = config();
+        cfg2.working_dir = fresh.clone();
+        let w2 = CdkWallet::new(cfg2, "https://mint.example.com").unwrap();
+        w2.check_account_binding().expect("fresh store self-claims");
+        assert!(fresh.join(ACCOUNT_MARKER).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh);
     }
 
     #[test]
