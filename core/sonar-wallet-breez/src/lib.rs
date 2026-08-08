@@ -56,6 +56,12 @@ struct Lifecycle {
     sdk: Option<Arc<LiquidSdk>>,
     /// A connect is between "claimed the slot" and "committed or abandoned".
     connecting: bool,
+    /// A disconnect is between "claimed the teardown" and "slot cleared".
+    /// While it is set the SDK is still published (the slot clears in the same
+    /// critical section that clears this flag), so without it a concurrent
+    /// `connect` would early-return Ok over a node that is mid-teardown —
+    /// the mirror image of the connect-in-flight race.
+    disconnecting: bool,
     /// Bumped by every `disconnect`. A connect that was in flight compares the
     /// generation it started with, under the same lock it publishes with, so a
     /// disconnect racing a slow connect is honoured rather than silently undone.
@@ -303,6 +309,13 @@ impl WalletBackend for BreezWallet {
     fn connect(&self) -> Result<()> {
         let started_at = {
             let mut state = self.state();
+            if state.disconnecting {
+                // The SDK is still published while its teardown runs, so the
+                // is-some fast path below would report Ok over a node that is
+                // mid-shutdown. Refuse instead; the caller retries after the
+                // teardown lands.
+                return Err(WalletError::Busy("a disconnect is in progress".into()));
+            }
             if state.sdk.is_some() {
                 return Ok(());
             }
@@ -386,6 +399,12 @@ impl WalletBackend for BreezWallet {
         let sdk = {
             let mut state = self.state();
             state.generation = state.generation.wrapping_add(1);
+            if state.disconnecting {
+                // Another teardown owns the close; idempotent contract says
+                // report success rather than double-closing the same node
+                // concurrently.
+                return Ok(());
+            }
             // Clone rather than take: if teardown fails we must keep the only
             // handle able to retry it. Dropping it would leave a live node
             // holding the working-dir SQLite lock while `is_connected()`
@@ -394,17 +413,38 @@ impl WalletBackend for BreezWallet {
             // guard. This mirrors the invariant `SonarWallet.stopNode()`
             // documents on iOS.
             match state.sdk.clone() {
-                Some(sdk) => sdk,
+                Some(sdk) => {
+                    state.disconnecting = true;
+                    sdk
+                }
                 None => return Ok(()),
             }
         };
-        self.shutdown(sdk.clone())?;
-        // Clear by identity: two concurrent disconnects can hold the same
-        // handle, and if a reconnect published a NEW node between the first
-        // finishing and the second landing, an unconditional clear would
-        // orphan that live node — `is_connected()` false while it still holds
-        // the working-dir SQLite lock.
-        if !self.clear_sdk_if_same(&sdk) {
+        let teardown = self.shutdown(sdk.clone());
+        // Whatever happened, release the teardown claim and (on success) the
+        // slot in ONE critical section, so `disconnecting == true` always
+        // implies the SDK is still published.
+        let cleared = {
+            let mut state = self.state();
+            state.disconnecting = false;
+            match &teardown {
+                // Clear by identity: if a reconnect published a NEW node while
+                // we were tearing down (not possible today — connect refuses
+                // while `disconnecting` — but cheap to keep honest), an
+                // unconditional clear would orphan that live node.
+                Ok(()) => match state.sdk.as_ref() {
+                    Some(published) if Arc::ptr_eq(published, &sdk) => {
+                        state.sdk = None;
+                        true
+                    }
+                    _ => false,
+                },
+                // Teardown failed: keep the handle so the caller can retry.
+                Err(_) => false,
+            }
+        };
+        teardown?;
+        if !cleared {
             // A different node is published now; it and its quotes are not ours
             // to tear down.
             return Ok(());
@@ -1390,6 +1430,22 @@ mod tests {
         let keys = ["d#5", "d#2", "d#9"];
         let oldest = keys.iter().min_by_key(|k| quote_seq_of(k)).unwrap();
         assert_eq!(*oldest, "d#2");
+    }
+
+    #[test]
+    fn connect_is_refused_while_a_disconnect_is_in_flight() {
+        // The SDK stays published during teardown, so without the flag the
+        // is-some fast path would report Ok over a node mid-shutdown.
+        let wallet = BreezWallet::new(config(Network::Mainnet)).unwrap();
+        wallet.state().disconnecting = true;
+        let err = wallet.connect().unwrap_err();
+        assert!(
+            matches!(err, WalletError::Busy(ref m) if m.contains("disconnect")),
+            "unexpected error: {err}"
+        );
+        // A second disconnect during the same window is idempotent success,
+        // not a concurrent double-close of the same node.
+        assert!(wallet.disconnect().is_ok());
     }
 
     #[test]
