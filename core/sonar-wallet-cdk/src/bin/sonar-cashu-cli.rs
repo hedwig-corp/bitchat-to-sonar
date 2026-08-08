@@ -25,9 +25,12 @@ struct Cli {
     /// commands; capabilities and derive answer without it.
     #[arg(long, global = true)]
     mint: Option<String>,
-    /// Working directory for the wallet database.
-    #[arg(long, global = true, default_value = "~/.sonar-cashu")]
-    dir: String,
+    /// Working directory for the wallet database. The default is scoped per
+    /// account (`~/.sonar-cashu/<fingerprint>`) so changing $SONAR_NSEC never
+    /// opens the previous account's bearer proofs; an explicit --dir is taken
+    /// literally and still guarded by the store's account binding.
+    #[arg(long, global = true)]
+    dir: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -182,6 +185,20 @@ fn main() -> Result<(), WalletError> {
         return Ok(());
     }
 
+    // Per-account default: the fingerprint is derived from the same seed the
+    // store binds itself to, so each account gets its own directory.
+    let working_dir = match cli.dir.as_deref() {
+        Some(dir) => expand_home(dir),
+        None => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"sonar-cashu-account-fingerprint-v1");
+            hasher.update(&seed[..]);
+            let fingerprint = hex::encode(&hasher.finalize()[..8]);
+            expand_home("~/.sonar-cashu").join(fingerprint)
+        }
+    };
+
     let mint = cli.mint.clone().ok_or_else(|| {
         WalletError::InvalidInput("--mint <url> is required for wallet commands".into())
     })?;
@@ -190,7 +207,7 @@ fn main() -> Result<(), WalletError> {
             seed,
             network: Network::Mainnet,
             api_key: None,
-            working_dir: expand_home(&cli.dir),
+            working_dir,
         },
         &mint,
     )?;

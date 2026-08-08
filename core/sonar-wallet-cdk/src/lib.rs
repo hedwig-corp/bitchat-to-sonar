@@ -53,6 +53,13 @@ const DB_FILE: &str = "cashu.redb";
 /// mint ⇒ restore runs (idempotent) until it succeeds once.
 const RESTORED_MARKER_PREFIX: &str = "cashu.restored";
 
+/// Fingerprint of the seed that owns this store. Cashu proofs are BEARER
+/// data: opening one account's store with another account's seed would let
+/// the second see (and spend) the first's funds, and would suppress its own
+/// NUT-13 restore because the markers look satisfied. The store is therefore
+/// bound to its seed on creation and validated on every open.
+const ACCOUNT_MARKER: &str = "cashu.account";
+
 /// How often the watcher polls pending mint quotes. Mint quotes are the only
 /// state that changes without us acting (a payer pays the invoice), and mints
 /// expose no push channel over plain HTTP.
@@ -63,7 +70,7 @@ const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 /// and a loose `starts_with` would have handed them to `remove_dir_all` —
 /// defeating the foreign-content protection the wipe guard exists for.
 fn is_our_artifact(name: &str) -> bool {
-    if name == DB_FILE {
+    if name == DB_FILE || name == ACCOUNT_MARKER {
         return true;
     }
     name.strip_prefix(RESTORED_MARKER_PREFIX)
@@ -174,6 +181,35 @@ impl CdkWallet {
         format!("{RESTORED_MARKER_PREFIX}.{}", hex::encode(&digest[..4]))
     }
 
+    /// Non-secret fingerprint of the account seed (domain-separated, so the
+    /// marker never narrows a search for the seed itself).
+    fn account_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"sonar-cashu-account-fingerprint-v1");
+        hasher.update(&self.config.seed[..]);
+        hex::encode(&hasher.finalize()[..8])
+    }
+
+    /// Bind a fresh store to this seed, or refuse to open one belonging to a
+    /// different account.
+    fn check_account_binding(&self) -> Result<()> {
+        let path = self.config.working_dir.join(ACCOUNT_MARKER);
+        let ours = self.account_fingerprint();
+        match std::fs::read_to_string(&path) {
+            Ok(existing) if existing.trim() == ours => Ok(()),
+            Ok(existing) => Err(WalletError::InvalidInput(format!(
+                "{} belongs to a different account (store {}, seed {}); use a per-account working_dir",
+                self.config.working_dir.display(),
+                existing.trim(),
+                ours
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(&path, &ours)
+                .map_err(|e| WalletError::Backend(format!("write account marker: {e}"))),
+            Err(e) => Err(WalletError::Backend(format!("read {}: {e}", path.display()))),
+        }
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -217,6 +253,8 @@ impl CdkWallet {
             .map_err(|e| WalletError::InvalidInput(format!("mint url: {e}")))?;
         std::fs::create_dir_all(&self.config.working_dir)
             .map_err(|e| WalletError::Backend(format!("create working dir: {e}")))?;
+        // Before touching the store: never open another account's proofs.
+        self.check_account_binding()?;
         let db_path = self.config.working_dir.join(DB_FILE);
         let fresh = !self
             .config
@@ -296,12 +334,17 @@ impl CdkWallet {
             .get_active_mint_quotes()
             .await
             .map_err(|e| WalletError::Network(format!("list mint quotes: {e}")))?;
+        // Per-quote errors are isolated: one stale or pruned quote must not
+        // stop every later quote from minting, now or on any future pass.
+        let mut errors: Vec<String> = Vec::new();
         for quote in quotes {
-            let state = wallet
-                .check_mint_quote_status(&quote.id)
-                .await
-                .map_err(|e| WalletError::Network(format!("quote {}: {e}", quote.id)))?
-                .state;
+            let state = match wallet.check_mint_quote_status(&quote.id).await {
+                Ok(updated) => updated.state,
+                Err(e) => {
+                    errors.push(format!("quote {}: {e}", quote.id));
+                    continue;
+                }
+            };
             if state != MintQuoteState::Paid {
                 continue;
             }
@@ -323,14 +366,20 @@ impl CdkWallet {
                     });
                 }
                 Err(e) => {
-                    return Err(WalletError::Backend(format!(
-                        "minting paid quote {}: {e}",
-                        quote.id
-                    )));
+                    errors.push(format!("minting paid quote {}: {e}", quote.id));
                 }
             }
         }
-        Ok(minted)
+        if errors.is_empty() {
+            Ok(minted)
+        } else if minted > 0 {
+            Err(WalletError::Network(format!(
+                "minted {minted}, but: {}",
+                errors.join("; ")
+            )))
+        } else {
+            Err(WalletError::Network(errors.join("; ")))
+        }
     }
 
     /// Outgoing side: a melt that confirmed as Pending (delayed Lightning
@@ -839,7 +888,11 @@ impl WalletBackend for CdkWallet {
                     let incoming =
                         tx.direction == cdk::wallet::types::TransactionDirection::Incoming;
                     Payment {
-                        id: tx.id().to_string(),
+                        // Live returns and events identify a payment by its
+                        // mint/melt QUOTE id; reconstructing history with
+                        // CDK's transaction id would make hosts insert a
+                        // duplicate row instead of updating the existing one.
+                        id: tx.quote_id.clone().unwrap_or_else(|| tx.id().to_string()),
                         amount_sats: u64::from(tx.amount),
                         fees_sats: Some(u64::from(tx.fee)),
                         incoming,
@@ -986,8 +1039,36 @@ mod tests {
     }
 
     #[test]
+    fn a_store_refuses_a_different_account_seed() {
+        // Cashu proofs are bearer data — the worst outcome here is one
+        // account spending another's funds through a shared default dir.
+        let dir = std::env::temp_dir().join("sonar-cdk-account-binding-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut first = config();
+        first.working_dir = dir.clone();
+        let a = CdkWallet::new(first, "https://mint.example.com").unwrap();
+        a.check_account_binding().expect("fresh store binds");
+        a.check_account_binding().expect("same seed reopens");
+
+        let mut second = config();
+        second.working_dir = dir.clone();
+        second.seed = Zeroizing::new(vec![9u8; 64]);
+        let b = CdkWallet::new(second, "https://mint.example.com").unwrap();
+        let err = b.check_account_binding().unwrap_err();
+        assert!(
+            matches!(err, WalletError::InvalidInput(ref m) if m.contains("different account")),
+            "unexpected error: {err}"
+        );
+        assert_ne!(a.account_fingerprint(), b.account_fingerprint());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn wipe_predicate_matches_exact_artifacts_only() {
         assert!(is_our_artifact("cashu.redb"));
+        assert!(is_our_artifact("cashu.account"));
         assert!(is_our_artifact("cashu.restored.00c0ffee"));
         for foreign in [
             "cashu.redb-backup",
