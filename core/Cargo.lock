@@ -5411,6 +5411,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sonar-wallet"
+version = "0.1.0"
+dependencies = [
+ "bech32",
+ "hex",
+ "hkdf",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "sorted-index-buffer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
