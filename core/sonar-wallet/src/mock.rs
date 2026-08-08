@@ -92,6 +92,7 @@ impl WalletBackend for MockWallet {
         WalletCapabilities {
             fiat_rates: true,
             lnurl_send: true,
+            lightning_address_send: true,
             bolt11_send: true,
             bolt12_send: true,
             bolt12_receive: true,
@@ -400,6 +401,7 @@ mod tests {
             fn capabilities(&self) -> WalletCapabilities {
                 WalletCapabilities {
                     lnurl_send: false,
+                    lightning_address_send: false,
                     ..self.0.capabilities()
                 }
             }

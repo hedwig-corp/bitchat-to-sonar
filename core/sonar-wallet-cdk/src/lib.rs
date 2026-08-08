@@ -92,7 +92,9 @@ impl CdkWallet {
         node_lifecycle: false,
         webhook: false,
         fiat_rates: false,
-        lnurl_send: true,
+        // Raw LNURL is NOT routed (no CDK path for it); addresses are.
+        lnurl_send: false,
+        lightning_address_send: true,
         bolt11_send: true,
         bolt12_send: true,
         bolt12_receive: true,
@@ -171,7 +173,11 @@ impl CdkWallet {
         out
     }
 
-    fn build_wallet(&self) -> Result<Wallet> {
+    /// Build the CDK wallet; `fresh` reports whether the store file was just
+    /// created (first run, post-wipe, or a new device) — the caller must then
+    /// run a NUT-13 restore scan, or the trait's "fully recoverable with the
+    /// seed" guarantee is a lie: for ecash the local store IS the funds.
+    fn build_wallet(&self) -> Result<(Wallet, bool)> {
         let mint_url: cdk::mint_url::MintUrl = self
             .mint_url
             .parse()
@@ -179,15 +185,17 @@ impl CdkWallet {
         std::fs::create_dir_all(&self.config.working_dir)
             .map_err(|e| WalletError::Backend(format!("create working dir: {e}")))?;
         let db_path = self.config.working_dir.join(DB_FILE);
+        let fresh = !db_path.exists();
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
-        WalletBuilder::new()
+        let wallet = WalletBuilder::new()
             .mint_url(mint_url)
             .unit(CurrencyUnit::Sat)
             .localstore(Arc::new(localstore))
             .seed(self.seed64())
             .build()
-            .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))
+            .map_err(|e| WalletError::Backend(format!("build wallet: {e}")))?;
+        Ok((wallet, fresh))
     }
 
     /// One pass of the pending-mint-quote watcher; also the body of
@@ -307,13 +315,28 @@ impl WalletBackend for CdkWallet {
 
         // Store open + mint probe with the lock released.
         let opened = (|| {
-            let wallet = self.build_wallet()?;
+            let (wallet, fresh) = self.build_wallet()?;
             // One round-trip proves the mint is reachable and caches its
             // info/keysets; without this, "connected" would be a lie the
             // first send exposes.
             self.rt()
                 .block_on(wallet.load_mint_info())
                 .map_err(|e| WalletError::Network(format!("mint unreachable: {e}")))?;
+            if fresh {
+                // Fresh store, existing seed: scan the mint for proofs the
+                // seed already owns (NUT-13). This is what makes wipe →
+                // reconnect (and new-device setup) actually recover funds
+                // instead of presenting an empty balance over live money.
+                let restored = self
+                    .rt()
+                    .block_on(wallet.restore())
+                    .map_err(|e| WalletError::Backend(format!("NUT-13 restore: {e}")))?;
+                tracing::info!(
+                    "fresh store: NUT-13 restore recovered {} sats unspent ({} pending)",
+                    u64::from(restored.unspent),
+                    u64::from(restored.pending),
+                );
+            }
             Ok(Arc::new(wallet))
         })();
 
@@ -342,7 +365,12 @@ impl WalletBackend for CdkWallet {
         let events = self.events_tx.clone();
         let watch_wallet = wallet.clone();
         let handle = self.rt().spawn(async move {
-            let mut tick = tokio::time::interval(WATCH_INTERVAL);
+            // First tick DELAYED, not immediate: a disconnect racing the
+            // install below aborts this task at its first await, and an
+            // immediate tick would let it poll — and mint, and emit — before
+            // the identity check ever runs.
+            let start = tokio::time::Instant::now() + WATCH_INTERVAL;
+            let mut tick = tokio::time::interval_at(start, WATCH_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
@@ -497,7 +525,17 @@ impl WalletBackend for CdkWallet {
         // Decode locally — same crate CDK itself uses — before resolving.
         let destination = &refine_bolt11_amount(destination.clone());
         // Trait contract: never silently pay one of two disagreeing figures.
-        let requested = resolve_send_amount(amount_sats, destination.amount_sats)?;
+        // BOLT12 offers are the one kind where "no amount anywhere" is not
+        // ours to reject: the offer itself may fix the amount, we carry no
+        // offer decoder, and the mint reads it during the quote — the
+        // post-quote equality check below still catches any disagreement.
+        let requested = if destination.kind == DestinationKind::Bolt12Offer
+            && destination.amount_sats.is_none()
+        {
+            amount_sats
+        } else {
+            resolve_send_amount(amount_sats, destination.amount_sats)?
+        };
 
         let quote = self.rt().block_on(async {
             match destination.kind {

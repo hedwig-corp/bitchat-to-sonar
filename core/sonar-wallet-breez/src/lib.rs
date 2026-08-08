@@ -153,6 +153,7 @@ impl BreezWallet {
         // explicitly rather than letting `prepare_send_payment` fail with an
         // opaque parse error.
         lnurl_send: false,
+        lightning_address_send: false,
         bolt11_send: true,
         bolt12_send: true,
         bolt12_receive: true,
