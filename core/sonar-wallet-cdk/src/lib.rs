@@ -256,6 +256,41 @@ impl CdkWallet {
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
     ) -> Result<usize> {
+        // The incoming (mint) and outgoing (melt) sides are reconciled
+        // INDEPENDENTLY and their errors aggregated afterwards: a single
+        // stale mint quote must not block finalizing an otherwise healthy
+        // delayed melt on every pass, or its reserved proofs stay reserved
+        // for as long as the bad quote exists.
+        let mut errors: Vec<String> = Vec::new();
+        let minted = match Self::reconcile_mint_quotes(wallet, events).await {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(e.to_string());
+                0
+            }
+        };
+        let settled = match Self::reconcile_pending_melts(wallet, events).await {
+            Ok(n) => n,
+            Err(e) => {
+                errors.push(e.to_string());
+                0
+            }
+        };
+        if minted > 0 || settled > 0 {
+            let _ = events.send(WalletEvent::Synced);
+        }
+        if errors.is_empty() {
+            Ok(minted + settled)
+        } else {
+            Err(WalletError::Network(errors.join("; ")))
+        }
+    }
+
+    /// Incoming side: mint proofs for paid quotes.
+    async fn reconcile_mint_quotes(
+        wallet: &Wallet,
+        events: &mpsc::Sender<WalletEvent>,
+    ) -> Result<usize> {
         let mut minted = 0;
         let quotes = wallet
             .get_active_mint_quotes()
@@ -295,10 +330,17 @@ impl CdkWallet {
                 }
             }
         }
-        // Outgoing side: a melt that confirmed as Pending (delayed Lightning
-        // payment, or a restart mid-send) is finalized here — otherwise the
-        // backend never learns its outcome and reserved proofs stay reserved
-        // indefinitely.
+        Ok(minted)
+    }
+
+    /// Outgoing side: a melt that confirmed as Pending (delayed Lightning
+    /// payment, or a restart mid-send) is finalized here — otherwise the
+    /// backend never learns its outcome and reserved proofs stay reserved
+    /// indefinitely.
+    async fn reconcile_pending_melts(
+        wallet: &Wallet,
+        events: &mpsc::Sender<WalletEvent>,
+    ) -> Result<usize> {
         let finalized = wallet
             .finalize_pending_melts()
             .await
@@ -315,10 +357,7 @@ impl CdkWallet {
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|tx| {
-                    let note = tx
-                        .memo
-                        .clone()
-                        .or_else(|| tx.metadata.get("memo").cloned())?;
+                    let note = tx_note(tx.memo.as_ref(), &tx.metadata)?;
                     Some((tx.quote_id?, note))
                 })
                 .collect()
@@ -348,10 +387,7 @@ impl CdkWallet {
                 WalletEvent::PaymentSent { payment }
             });
         }
-        if minted > 0 || settled > 0 {
-            let _ = events.send(WalletEvent::Synced);
-        }
-        Ok(minted + settled)
+        Ok(settled)
     }
 }
 
@@ -373,6 +409,14 @@ fn refine_bolt11_amount(destination: Destination) -> Destination {
         },
         Err(_) => destination,
     }
+}
+
+/// The caller's note, wherever CDK persisted it: `send()` writes it into
+/// `prepare_melt` metadata under "memo", while some paths surface it as the
+/// transaction memo — history and delayed finalization must read both or a
+/// restart erases notes.
+fn tx_note(memo: Option<&String>, metadata: &HashMap<String, String>) -> Option<String> {
+    memo.cloned().or_else(|| metadata.get("memo").cloned())
 }
 
 fn now_secs() -> u64 {
@@ -802,8 +846,7 @@ impl WalletBackend for CdkWallet {
                         timestamp_secs: tx.timestamp,
                         status: PaymentStatus::Complete,
                         preimage: None,
-                        note: (!tx.memo.clone().unwrap_or_default().is_empty())
-                            .then(|| tx.memo.clone().unwrap_or_default()),
+                        note: tx_note(tx.memo.as_ref(), &tx.metadata).filter(|n| !n.is_empty()),
                     }
                 })
                 .collect();

@@ -6,7 +6,12 @@
 > `core/sonar-wallet-breez`. The per-platform Breez integrations described
 > below are what ships today; they are scheduled for replacement by that
 > interface over a staged PR train (desktop → Android → iOS app → iOS
-> notification extension). Background and the decisions behind it:
+> notification extension). The Cashu backend (`core/sonar-wallet-cdk`, PR
+> #582) is core-only for now on BOTH app surfaces — an explicit tracked gap
+> per the Cross-Platform Feature Rule: apps reach wallet backends through the
+> sonar-ffi surface, which lands with the platform cutovers; the follow-up
+> path is the guided Breez→Cashu migration flow (PR3 of the train) plus the
+> per-platform cutover PRs. Background and the decisions behind it:
 > [`docs/brainstorms/2026-07-26-wallet-interface-bolt12.md`](brainstorms/2026-07-26-wallet-interface-bolt12.md).
 >
 > Two constraints that will not go away, and that any wallet work must respect:
