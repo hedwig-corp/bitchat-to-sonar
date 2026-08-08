@@ -23,7 +23,11 @@ pub trait WalletEventListener: Send + Sync {
 ///
 /// Sync and object-safe by design (repo convention: traits are sync, the FFI
 /// layer is blocking); async backends own their runtime internally, like
-/// `SonarNode` in sonar-ffi does. All methods may be called from any thread.
+/// `SonarNode` in sonar-ffi does. Methods may be called from any OS thread,
+/// but they BLOCK — never call them from inside an async executor (a tokio
+/// task, a Swift/Kotlin coroutine bridged onto one): a blocking bridge nested
+/// in a runtime panics or starves it, same as any blocking I/O would. The
+/// intended callers are the FFI hosts, which invoke from plain threads.
 ///
 /// Lifecycle rules (0xdead10cc lineage — hosts call these from app-lifecycle
 /// hooks):

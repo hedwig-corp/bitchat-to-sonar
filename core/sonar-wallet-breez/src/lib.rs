@@ -66,6 +66,12 @@ struct Lifecycle {
     /// generation it started with, under the same lock it publishes with, so a
     /// disconnect racing a slow connect is honoured rather than silently undone.
     generation: u64,
+    /// The published handle is a RETAINED one: its teardown failed and it was
+    /// kept only so a later `disconnect` can retry the close. It has no event
+    /// forwarder, so it must never satisfy the connected fast path — a wallet
+    /// that reports Ok and then delivers no events, forever, is the failure
+    /// every rollback in this file exists to prevent.
+    defunct: bool,
 }
 
 pub struct BreezWallet {
@@ -311,6 +317,15 @@ impl WalletBackend for BreezWallet {
                 return Err(WalletError::Busy("a connect is already in progress".into()));
             }
             if state.sdk.is_some() {
+                if state.defunct {
+                    // Live node, failed close, no event forwarder. Not an
+                    // established connection: recovery is a disconnect() retry
+                    // (which owns the retained handle), then a fresh connect.
+                    return Err(WalletError::Backend(
+                        "previous wallet session failed to close; call disconnect() to retry"
+                            .into(),
+                    ));
+                }
                 return Ok(());
             }
             state.connecting = true;
@@ -360,8 +375,10 @@ impl WalletBackend for BreezWallet {
                 if closed.is_err() {
                     // Retain the only handle to a still-running node: publish
                     // it, so `is_connected()` tells the truth and a later
-                    // disconnect can retry the close.
+                    // disconnect can retry the close. Marked defunct — it has
+                    // no event forwarder and must not pass the fast path.
                     state.sdk = Some(sdk);
+                    state.defunct = true;
                 }
                 return Ok(());
             }
@@ -415,6 +432,13 @@ impl WalletBackend for BreezWallet {
                                 state.sdk = None;
                             }
                         }
+                    } else if state
+                        .sdk
+                        .as_ref()
+                        .is_some_and(|published| Arc::ptr_eq(published, &sdk))
+                    {
+                        // Close failed: the retained handle has no forwarder.
+                        state.defunct = true;
                     }
                 }
                 Err(WalletError::Backend(e.to_string()))
@@ -473,6 +497,7 @@ impl WalletBackend for BreezWallet {
                     .is_some_and(|published| Arc::ptr_eq(published, &sdk))
             {
                 state.sdk = None;
+                state.defunct = false;
                 // Quotes were priced against the session that just ended;
                 // executing one after reconnect would pay a stale route/fee.
                 // (Lock order is state → quotes, everywhere.)

@@ -251,11 +251,22 @@ fn run(wallet: &BreezWallet, command: &Command) -> Result<(), WalletError> {
                     }
                 })
             );
-            if let (Some(max), Some(fees)) = (args.max_fee_sats, prepared.fees_sats) {
-                if fees > max {
-                    return Err(WalletError::Backend(format!(
-                        "quoted fee {fees} sats exceeds --max-fee-sats {max}"
-                    )));
+            if let Some(max) = args.max_fee_sats {
+                match prepared.fees_sats {
+                    Some(fees) if fees <= max => {}
+                    Some(fees) => {
+                        return Err(WalletError::Backend(format!(
+                            "quoted fee {fees} sats exceeds --max-fee-sats {max}"
+                        )));
+                    }
+                    // The user asked for a hard ceiling; a quote with no fee
+                    // figure cannot honour it, so fail closed rather than pay
+                    // an unbounded, undisclosed fee.
+                    None => {
+                        return Err(WalletError::Backend(format!(
+                            "backend quoted no fee, cannot honour --max-fee-sats {max}"
+                        )));
+                    }
                 }
             }
             let payment = wallet.send(&prepared, &args.note)?;
