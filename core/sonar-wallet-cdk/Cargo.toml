@@ -17,8 +17,14 @@ path = "src/bin/sonar-cashu-cli.rs"
 
 [dependencies]
 sonar-wallet = { path = "../sonar-wallet" }
-cdk = "0.17.3"
+# Wallet side only: the default feature set includes `mint` (the mint SERVER)
+# whose cdk-signatory build.rs needs protoc — a toolchain requirement the
+# workspace CI job rightly does not have, for server code a client never runs.
+cdk = { version = "0.17.3", default-features = false, features = ["wallet", "bip353"] }
 cdk-redb = "0.17.3"
+# Same version cdk itself uses; decodes BOLT11 invoices so an amount-bearing
+# invoice satisfies resolve_send_amount without the host re-supplying it.
+lightning-invoice = "0.34"
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hex.workspace = true
 serde_json.workspace = true

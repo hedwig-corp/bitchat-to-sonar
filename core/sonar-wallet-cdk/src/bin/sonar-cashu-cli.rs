@@ -133,10 +133,6 @@ fn enforce_fee_cap(max: Option<u64>, quoted: Option<u64>) -> Result<(), WalletEr
 fn main() -> Result<(), WalletError> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
         .init();
     let cli = Cli::parse();
 

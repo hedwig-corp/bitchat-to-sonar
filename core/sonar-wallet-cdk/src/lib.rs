@@ -235,6 +235,26 @@ impl CdkWallet {
     }
 }
 
+/// Fill in the amount a BOLT11 invoice itself encodes, when classification
+/// left it empty. Round sub-sat amounts UP: the figure is shown to the user
+/// and must never understate what will be paid. Leaves every other kind (and
+/// undecodable input — the mint gives the authoritative verdict) untouched.
+fn refine_bolt11_amount(destination: Destination) -> Destination {
+    if destination.kind != DestinationKind::Bolt11 || destination.amount_sats.is_some() {
+        return destination;
+    }
+    use std::str::FromStr;
+    match lightning_invoice::Bolt11Invoice::from_str(&destination.raw) {
+        Ok(invoice) => Destination {
+            amount_sats: invoice
+                .amount_milli_satoshis()
+                .map(|msat| msat.div_ceil(1_000)),
+            ..destination
+        },
+        Err(_) => destination,
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -329,13 +349,26 @@ impl WalletBackend for CdkWallet {
                 CdkWallet::poll_mint_quotes(&watch_wallet, &events).await;
             }
         });
-        if let Some(old) = self
-            .watcher
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(handle)
         {
-            old.abort();
+            // Install only while OUR wallet is still the published one — a
+            // disconnect that landed between publish and here found no watcher
+            // to abort, so installing unconditionally would leave an orphan
+            // task polling the mint (and minting!) after `Disconnected`.
+            // Lock order: state → watcher, everywhere.
+            let state = self.state();
+            let still_ours = state
+                .wallet
+                .as_ref()
+                .is_some_and(|published| Arc::ptr_eq(published, &wallet));
+            let mut watcher = self.watcher.lock().unwrap_or_else(|e| e.into_inner());
+            if still_ours {
+                if let Some(old) = watcher.replace(handle) {
+                    old.abort();
+                }
+            } else {
+                handle.abort();
+                return Ok(());
+            }
         }
 
         // Identity re-check and emit share the critical section, so hosts
@@ -457,6 +490,12 @@ impl WalletBackend for CdkWallet {
             )));
         }
         let wallet = self.wallet()?;
+        // An offline-classified destination carries no amount even for an
+        // amount-bearing BOLT11 invoice (the pure classifier decodes nothing),
+        // and rejecting `prepare_send(invoice, None)` for it would make the
+        // advertised BOLT11 path unable to pay a normal fixed-amount invoice.
+        // Decode locally — same crate CDK itself uses — before resolving.
+        let destination = &refine_bolt11_amount(destination.clone());
         // Trait contract: never silently pay one of two disagreeing figures.
         let requested = resolve_send_amount(amount_sats, destination.amount_sats)?;
 
@@ -552,9 +591,17 @@ impl WalletBackend for CdkWallet {
                 note: None,
             })
         })?;
-        self.emit(WalletEvent::PaymentSent {
-            payment: payment.clone(),
-        });
+        // A finalized-but-failed melt must not be announced as sent; hosts
+        // render the two very differently.
+        if payment.status == PaymentStatus::Failed {
+            self.emit(WalletEvent::PaymentFailed {
+                payment: payment.clone(),
+            });
+        } else {
+            self.emit(WalletEvent::PaymentSent {
+                payment: payment.clone(),
+            });
+        }
         Ok(payment)
     }
 
@@ -696,6 +743,28 @@ mod tests {
             w.prepare_send(&unknown, Some(10)),
             Err(WalletError::NotConnected)
         ));
+    }
+
+    #[test]
+    fn bolt11_amount_is_decoded_before_resolution() {
+        // lightning-invoice's own 10-msat (100p) test vector: sub-sat rounds
+        // UP so the shown figure never understates what will be paid.
+        let invoice = "lnbc100p1psj9jhxdqud3jxktt5w46x7unfv9kz6mn0v3jsnp4q0d3p2sfluzdx45tqcsh2pu5qc7lgq0xs578ngs6s0s68ua4h7cvspp5q6rmq35js88zp5dvwrv9m459tnk2zunwj5jalqtyxqulh0l5gflssp5nf55ny5gcrfl30xuhzj3nphgj27rstekmr9fw3ny5989s300gyus9qyysgqcqpcrzjqw2sxwe993h5pcm4dxzpvttgza8zhkqxpgffcrf5v25nwpr3cmfg7z54kuqq8rgqqqqqqqq2qqqqq9qq9qrzjqd0ylaqclj9424x9m8h2vcukcgnm6s56xfgu3j78zyqzhgs4hlpzvznlugqq9vsqqqqqqqlgqqqqqeqq9qrzjqwldmj9dha74df76zhx6l9we0vjdquygcdt3kssupehe64g6yyp5yz5rhuqqwccqqyqqqqlgqqqqjcqq9qrzjqf9e58aguqr0rcun0ajlvmzq3ek63cw2w282gv3z5uupmuwvgjtq2z55qsqqg6qqqyqqqrtnqqqzq3cqygrzjqvphmsywntrrhqjcraumvc4y6r8v4z5v593trte429v4hredj7ms5z52usqq9ngqqqqqqqlgqqqqqqgq9qrzjq2v0vp62g49p7569ev48cmulecsxe59lvaw3wlxm7r982zxa9zzj7z5l0cqqxusqqyqqqqlgqqqqqzsqygarl9fh38s0gyuxjjgux34w75dnc6xp2l35j7es3jd4ugt3lu0xzre26yg5m7ke54n2d5sym4xcmxtl8238xxvw5h5h5j5r6drg6k6zcqj0fcwg";
+        let classified = classify_destination(invoice);
+        assert_eq!(classified.kind, DestinationKind::Bolt11);
+        assert_eq!(classified.amount_sats, None, "classifier decodes nothing");
+        let refined = refine_bolt11_amount(classified);
+        assert_eq!(refined.amount_sats, Some(1), "10 msat rounds up to 1 sat");
+        // Non-bolt11 and undecodable inputs pass through untouched.
+        let offer = classify_destination("lno1qcp4256ypq");
+        assert_eq!(refine_bolt11_amount(offer.clone()), offer);
+        let garbage = Destination {
+            raw: "lnbc-not-a-real-invoice".into(),
+            kind: DestinationKind::Bolt11,
+            amount_sats: None,
+            note: None,
+        };
+        assert_eq!(refine_bolt11_amount(garbage.clone()), garbage);
     }
 
     #[test]

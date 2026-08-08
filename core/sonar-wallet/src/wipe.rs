@@ -85,10 +85,13 @@ pub fn guard_wipe_path(dir: &Path, looks_like_ours: impl Fn(&str) -> bool) -> Re
     if !resolved.is_dir() {
         return refuse("path is not a directory");
     }
+    // Entry errors fail the wipe closed: an entry the iterator could not read
+    // is an entry this guard could not judge, and `.flatten()` would silently
+    // let `remove_dir_all` delete it anyway.
     let entries: Vec<_> = std::fs::read_dir(&resolved)
         .map_err(|e| WalletError::Backend(format!("read {}: {e}", resolved.display())))?
-        .flatten()
-        .collect();
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| WalletError::Backend(format!("read entry in {}: {e}", resolved.display())))?;
     if entries.is_empty() {
         return Ok(resolved);
     }
