@@ -44,13 +44,14 @@ use sonar_wallet::{
 /// notion of "our artifact".
 const DB_FILE: &str = "cashu.redb";
 
-/// Marker written ONLY after a NUT-13 restore scan completes. Freshness must
-/// not be judged by the store file existing: a first connect can create the
-/// file and then fail `load_mint_info`/`restore` transiently, and keying on
-/// the file would skip restoration forever — an empty balance over
-/// recoverable funds. Absent marker ⇒ restore runs (idempotent) until it
-/// succeeds once.
-const RESTORED_MARKER: &str = "cashu.restored";
+/// Prefix of the per-mint restore markers, written ONLY after a NUT-13
+/// restore scan completes against that mint. Freshness must not be judged by
+/// the store file existing (a first connect can create the file and then fail
+/// transiently — keying on it would skip restoration forever), and must not
+/// be directory-global either: the same seeded store reused against a second
+/// mint still owes that mint its own scan. Absent marker for the configured
+/// mint ⇒ restore runs (idempotent) until it succeeds once.
+const RESTORED_MARKER_PREFIX: &str = "cashu.restored";
 
 /// How often the watcher polls pending mint quotes. Mint quotes are the only
 /// state that changes without us acting (a payer pays the invoice), and mints
@@ -110,12 +111,14 @@ impl CdkWallet {
     };
 
     pub fn new(config: WalletConfig, mint_url: &str) -> Result<Self> {
-        if config.seed.len() < 64 {
-            // The CDK builder takes exactly 64 bytes and NUT-13 derives proof
-            // secrets from them; a 32-byte Breez-style seed here would slice
-            // out of bounds below — refuse loudly instead.
+        if config.seed.len() != 64 {
+            // Exactly 64: the CDK builder takes [u8; 64] and NUT-13 derives
+            // proof secrets from them. Shorter would slice out of bounds;
+            // LONGER would silently truncate, making distinct seeds that share
+            // a 64-byte prefix open the same funds wallet.
             return Err(WalletError::InvalidInput(
-                "cashu wallet seed must be 64 bytes (use sonar_wallet::cashu_wallet_seed)".into(),
+                "cashu wallet seed must be exactly 64 bytes (use sonar_wallet::cashu_wallet_seed)"
+                    .into(),
             ));
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -147,6 +150,15 @@ impl CdkWallet {
             events_tx,
             watcher: Mutex::new(None),
         })
+    }
+
+    /// Restore-completion marker for THIS mint (`cashu.restored.<hash8>`),
+    /// so a shared store connecting to a second mint still runs that mint's
+    /// NUT-13 scan.
+    fn restore_marker_name(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(self.mint_url.as_bytes());
+        format!("{RESTORED_MARKER_PREFIX}.{}", hex::encode(&digest[..4]))
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
@@ -193,7 +205,11 @@ impl CdkWallet {
         std::fs::create_dir_all(&self.config.working_dir)
             .map_err(|e| WalletError::Backend(format!("create working dir: {e}")))?;
         let db_path = self.config.working_dir.join(DB_FILE);
-        let fresh = !self.config.working_dir.join(RESTORED_MARKER).exists();
+        let fresh = !self
+            .config
+            .working_dir
+            .join(self.restore_marker_name())
+            .exists();
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
         let wallet = WalletBuilder::new()
@@ -266,10 +282,43 @@ impl CdkWallet {
                 }
             }
         }
-        if minted > 0 {
+        // Outgoing side: a melt that confirmed as Pending (delayed Lightning
+        // payment, or a restart mid-send) is finalized here — otherwise the
+        // backend never learns its outcome and reserved proofs stay reserved
+        // indefinitely.
+        let finalized = wallet
+            .finalize_pending_melts()
+            .await
+            .map_err(|e| WalletError::Backend(format!("finalize pending melts: {e}")))?;
+        let mut settled = 0;
+        for melt in &finalized {
+            let status = match melt.state() {
+                MeltQuoteState::Paid => PaymentStatus::Complete,
+                MeltQuoteState::Failed => PaymentStatus::Failed,
+                // Still in flight; a later pass finalizes it.
+                _ => continue,
+            };
+            settled += 1;
+            let payment = Payment {
+                id: melt.quote_id().to_string(),
+                amount_sats: u64::from(melt.amount()),
+                fees_sats: Some(u64::from(melt.fee_paid())),
+                incoming: false,
+                timestamp_secs: now_secs(),
+                status,
+                preimage: melt.payment_proof().map(str::to_string),
+                note: None,
+            };
+            let _ = events.send(if status == PaymentStatus::Failed {
+                WalletEvent::PaymentFailed { payment }
+            } else {
+                WalletEvent::PaymentSent { payment }
+            });
+        }
+        if minted > 0 || settled > 0 {
             let _ = events.send(WalletEvent::Synced);
         }
-        Ok(minted)
+        Ok(minted + settled)
     }
 }
 
@@ -369,8 +418,11 @@ impl WalletBackend for CdkWallet {
                     u64::from(restored.unspent),
                     u64::from(restored.pending),
                 );
-                std::fs::write(self.config.working_dir.join(RESTORED_MARKER), b"1")
-                    .map_err(|e| WalletError::Backend(format!("write restore marker: {e}")))?;
+                std::fs::write(
+                    self.config.working_dir.join(self.restore_marker_name()),
+                    b"1",
+                )
+                .map_err(|e| WalletError::Backend(format!("write restore marker: {e}")))?;
             }
             Ok(Arc::new(wallet))
         })();
@@ -621,13 +673,14 @@ impl WalletBackend for CdkWallet {
         })?;
 
         let quoted_amount = u64::from(quote.amount);
-        // A destination-carried amount the caller disagreed with was already
-        // rejected by resolve_send_amount; still verify the mint's quote
-        // against whichever figure the caller confirmed.
-        if let Some(requested) = amount_sats {
-            if quoted_amount != requested {
+        // No-disagreement contract, applied to the MINT as well: verify its
+        // quote against whichever figure we hold — the caller's argument or
+        // the amount decoded from the destination itself. A buggy or
+        // dishonest mint must not be able to re-price a fixed invoice.
+        if let Some(confirmed) = amount_sats.or(destination.amount_sats) {
+            if quoted_amount != confirmed {
                 return Err(WalletError::InvalidDestination(format!(
-                    "mint quoted {quoted_amount} sats but {requested} sats was requested"
+                    "mint quoted {quoted_amount} sats but the confirmed amount is {confirmed} sats"
                 )));
             }
         }
@@ -748,7 +801,7 @@ impl WalletBackend for CdkWallet {
             ));
         }
         let target = guard_wipe_path(&self.config.working_dir, |name| {
-            name == DB_FILE || name.starts_with(DB_FILE) || name == RESTORED_MARKER
+            name == DB_FILE || name.starts_with(DB_FILE) || name.starts_with(RESTORED_MARKER_PREFIX)
         })?;
         if target.exists() {
             std::fs::remove_dir_all(&target)

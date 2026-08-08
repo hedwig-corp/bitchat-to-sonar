@@ -6223,6 +6223,7 @@ dependencies = [
  "hex",
  "lightning-invoice",
  "serde_json",
+ "sha2 0.10.9",
  "sonar-wallet",
  "tokio",
  "tracing",

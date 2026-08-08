@@ -27,6 +27,7 @@ cdk-redb = "0.17.3"
 lightning-invoice = "0.34"
 clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 hex.workspace = true
+sha2 = "0.10"
 serde_json.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tracing.workspace = true
