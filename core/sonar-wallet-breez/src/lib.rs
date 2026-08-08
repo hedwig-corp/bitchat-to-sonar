@@ -300,14 +300,18 @@ impl WalletBackend for BreezWallet {
                 // teardown lands.
                 return Err(WalletError::Busy("a disconnect is in progress".into()));
             }
-            if state.sdk.is_some() {
-                return Ok(());
-            }
+            // Checked BEFORE the is-some fast path: during listener setup the
+            // SDK is already published but the connection is not established,
+            // and reporting Ok there hands the caller a wallet whose setup can
+            // still fail and roll back underneath them.
             if state.connecting {
                 // Do NOT report someone else's in-flight attempt as success:
                 // the caller would proceed straight to `balance()` and get
                 // `NotConnected` after a "successful" connect.
                 return Err(WalletError::Busy("a connect is already in progress".into()));
+            }
+            if state.sdk.is_some() {
+                return Ok(());
             }
             state.connecting = true;
             state.generation
@@ -334,72 +338,88 @@ impl WalletBackend for BreezWallet {
             }
         };
 
-        // Commit: clearing `connecting` and publishing happen in ONE critical
-        // section together with the generation check, so a concurrent
-        // disconnect cannot slip between them and report success over a node
-        // that is about to go live.
+        // Commit, or abandon if a disconnect won. `connecting` stays set until
+        // listener setup finishes: the SDK is published (so events can never
+        // reach hosts while `is_connected()` is false) but the connection is
+        // NOT yet established — a concurrent `connect` must see Busy, not Ok,
+        // or it proceeds into a wallet whose setup may still fail.
         {
             let mut state = self.state();
-            state.connecting = false;
             if state.generation != started_at {
-                // A disconnect landed while we were connecting; it wins.
+                // A disconnect landed while we were connecting; it wins, and
+                // WE own the abandoned node's close. Claim the teardown so no
+                // third caller can observe an idle lifecycle and open a second
+                // node over the same working dir while this one is shutting
+                // down.
+                state.connecting = false;
+                state.disconnecting = true;
                 drop(state);
-                let _ = self.shutdown(sdk);
+                let closed = self.shutdown(sdk.clone());
+                let mut state = self.state();
+                state.disconnecting = false;
+                if closed.is_err() {
+                    // Retain the only handle to a still-running node: publish
+                    // it, so `is_connected()` tells the truth and a later
+                    // disconnect can retry the close.
+                    state.sdk = Some(sdk);
+                }
                 return Ok(());
             }
-            // Publish before registering the forwarder so an event can never
-            // reach a host while `is_connected()` still reports false.
             state.sdk = Some(sdk.clone());
         }
 
         let forwarder = Box::new(ForwardingListener {
             events: self.events_tx.clone(),
         });
-        if let Err(e) = self.rt().block_on(sdk.add_event_listener(forwarder)) {
-            // Roll the connection back. Leaving it published would mean
-            // `connect()` returns Err while `is_connected()` is true, and the
-            // retry takes the already-connected fast path — a live wallet that
-            // silently delivers no events, forever.
-            //
-            // Unless a `disconnect` already owns the teardown: then the slot
-            // and the close are its to handle — clearing here would break the
-            // "`disconnecting` implies published" invariant, and shutting down
-            // would double-close the same node concurrently.
-            let ours = {
-                let mut state = self.state();
-                if state.disconnecting {
-                    false
-                } else {
-                    match state.sdk.as_ref() {
-                        Some(published) if Arc::ptr_eq(published, &sdk) => {
-                            state.sdk = None;
-                            true
+        let registered = self.rt().block_on(sdk.add_event_listener(forwarder));
+
+        let mut state = self.state();
+        state.connecting = false;
+        match registered {
+            Ok(_) => {
+                // A disconnect can have landed while we were registering. The
+                // identity check and the emit share this critical section, so
+                // the only orderings hosts can observe are ones that happened.
+                let still_ours = state
+                    .sdk
+                    .as_ref()
+                    .is_some_and(|published| Arc::ptr_eq(published, &sdk));
+                if still_ours {
+                    self.emit(WalletEvent::Connected);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // Roll the connection back — a published wallet that delivers
+                // no events, forever, is the alternative. Unless a disconnect
+                // already owns the teardown: then slot and close are its.
+                let ours = !state.disconnecting
+                    && state
+                        .sdk
+                        .as_ref()
+                        .is_some_and(|published| Arc::ptr_eq(published, &sdk));
+                if ours {
+                    // Claim the teardown, keep the SDK published while it
+                    // runs, and retain it if the close fails — same
+                    // discipline as every other shutdown path, so no window
+                    // exists where a retry opens a second node over a
+                    // database the first still holds.
+                    state.disconnecting = true;
+                    drop(state);
+                    let closed = self.shutdown(sdk.clone());
+                    let mut state = self.state();
+                    state.disconnecting = false;
+                    if closed.is_ok() {
+                        if let Some(published) = state.sdk.as_ref() {
+                            if Arc::ptr_eq(published, &sdk) {
+                                state.sdk = None;
+                            }
                         }
-                        _ => false,
                     }
                 }
-            };
-            if ours {
-                let _ = self.shutdown(sdk);
-            }
-            return Err(WalletError::Backend(e.to_string()));
-        }
-        // A disconnect can have landed while we were registering the listener.
-        // Announcing `Connected` after it would leave lifecycle-driven hosts in
-        // the ready state over a closed wallet — and the check must share the
-        // critical section with the emit, or a disconnect slipping between
-        // them delivers `Disconnected` then `Connected` in that order.
-        {
-            let state = self.state();
-            let still_ours = state
-                .sdk
-                .as_ref()
-                .is_some_and(|published| Arc::ptr_eq(published, &sdk));
-            if still_ours {
-                self.emit(WalletEvent::Connected);
+                Err(WalletError::Backend(e.to_string()))
             }
         }
-        Ok(())
     }
 
     fn disconnect(&self) -> Result<()> {
@@ -577,7 +597,17 @@ impl WalletBackend for BreezWallet {
                 destination.kind.label()
             )));
         }
-        let sdk = self.sdk()?;
+        // Capture the session (handle + generation) the quote will be priced
+        // against, so the insertion below can refuse a quote that straddled a
+        // disconnect — the purge in `disconnect` only invalidates quotes that
+        // are already in the map.
+        let (sdk, session_gen) = {
+            let state = self.state();
+            match state.sdk.clone() {
+                Some(sdk) => (sdk, state.generation),
+                None => return Err(WalletError::NotConnected),
+            }
+        };
         // A destination classified offline (the documented pre-connect
         // validation path) carries `amount_sats: None` even for an
         // amount-bearing BOLT11 invoice, because the pure classifier does not
@@ -623,6 +653,21 @@ impl WalletBackend for BreezWallet {
             self.quote_seq.fetch_add(1, Ordering::Relaxed)
         );
         {
+            // The session check and the insertion share one critical section
+            // (lock order state → quotes, everywhere): a disconnect that
+            // completed while the quote was being priced has already purged
+            // the map, and inserting after it would resurrect a quote priced
+            // against a session that no longer exists — exactly what the purge
+            // is for. Reject instead; the caller reconnects and re-prepares.
+            let state = self.state();
+            let session_alive = state.generation == session_gen
+                && state
+                    .sdk
+                    .as_ref()
+                    .is_some_and(|published| Arc::ptr_eq(published, &sdk));
+            if !session_alive {
+                return Err(WalletError::NotConnected);
+            }
             let mut quotes = self.quotes.lock().unwrap_or_else(|e| e.into_inner());
             // Evict oldest rather than refusing: a user who abandons a
             // confirmation sheet never tells us, and `PreparedSend` has no drop
