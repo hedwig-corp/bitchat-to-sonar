@@ -193,20 +193,58 @@ impl CdkWallet {
 
     /// Bind a fresh store to this seed, or refuse to open one belonging to a
     /// different account.
+    ///
+    /// The initial claim is ATOMIC (`create_new` ⇒ `O_EXCL`): two processes
+    /// with different seeds opening the same fresh dir would otherwise both
+    /// see the marker missing and both write, letting the loser overwrite the
+    /// winner's fingerprint — and once the winner's funds land, the loser's
+    /// seed would pass this check and open somebody else's bearer proofs.
+    /// Whoever loses the create race falls through to the compare path.
     fn check_account_binding(&self) -> Result<()> {
+        use std::io::Write;
         let path = self.config.working_dir.join(ACCOUNT_MARKER);
         let ours = self.account_fingerprint();
-        match std::fs::read_to_string(&path) {
-            Ok(existing) if existing.trim() == ours => Ok(()),
-            Ok(existing) => Err(WalletError::InvalidInput(format!(
+
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                // A partial claim (crash/ENOSPC mid-write) would leave a
+                // marker nobody matches, bricking the directory — remove it so
+                // the next attempt can claim cleanly.
+                if let Err(e) = file
+                    .write_all(ours.as_bytes())
+                    .and_then(|_| file.sync_all())
+                {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(WalletError::Backend(format!("write account marker: {e}")));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(WalletError::Backend(format!(
+                    "claim {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+
+        // Read back unconditionally: this is both the compare path for an
+        // existing store and the confirmation that our own claim is the one
+        // on disk.
+        let existing = std::fs::read_to_string(&path)
+            .map_err(|e| WalletError::Backend(format!("read {}: {e}", path.display())))?;
+        if existing.trim() == ours {
+            Ok(())
+        } else {
+            Err(WalletError::InvalidInput(format!(
                 "{} belongs to a different account (store {}, seed {}); use a per-account working_dir",
                 self.config.working_dir.display(),
                 existing.trim(),
                 ours
-            ))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::write(&path, &ours)
-                .map_err(|e| WalletError::Backend(format!("write account marker: {e}"))),
-            Err(e) => Err(WalletError::Backend(format!("read {}: {e}", path.display()))),
+            )))
         }
     }
 
@@ -390,27 +428,27 @@ impl CdkWallet {
         wallet: &Wallet,
         events: &mpsc::Sender<WalletEvent>,
     ) -> Result<usize> {
+        // Notes are read BEFORE finalizing, and a lookup failure aborts the
+        // pass. Order matters: `finalize_pending_melts` makes a melt terminal,
+        // so a later pass may never return it again — swallowing the error
+        // here (it was `unwrap_or_default`) would emit a note-less terminal
+        // event under the same payment id, permanently overwriting the row the
+        // initial send wrote, while still reporting the sync as successful.
+        // Failing first keeps the whole thing retryable.
+        let notes: HashMap<String, String> = wallet
+            .list_transactions(None)
+            .await
+            .map_err(|e| WalletError::Backend(format!("list transactions: {e}")))?
+            .into_iter()
+            .filter_map(|tx| {
+                let note = tx_note(tx.memo.as_ref(), &tx.metadata)?;
+                Some((tx.quote_id?, note))
+            })
+            .collect();
         let finalized = wallet
             .finalize_pending_melts()
             .await
             .map_err(|e| WalletError::Backend(format!("finalize pending melts: {e}")))?;
-        // Event consumers dedupe ledger rows by payment id; a terminal event
-        // that drops the note would overwrite the row the initial send wrote.
-        // The persisted transaction still carries it — join by quote id.
-        let notes: HashMap<String, String> = if finalized.is_empty() {
-            HashMap::new()
-        } else {
-            wallet
-                .list_transactions(None)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|tx| {
-                    let note = tx_note(tx.memo.as_ref(), &tx.metadata)?;
-                    Some((tx.quote_id?, note))
-                })
-                .collect()
-        };
         let mut settled = 0;
         for melt in &finalized {
             let status = match melt.state() {
@@ -1062,6 +1100,20 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_ne!(a.account_fingerprint(), b.account_fingerprint());
+
+        // The claim is atomic, so the loser of a create race must not be able
+        // to overwrite the winner's fingerprint: repeated binding attempts by
+        // the second seed leave the marker untouched.
+        let marker = dir.join(ACCOUNT_MARKER);
+        let after_first = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(after_first.trim(), a.account_fingerprint());
+        let _ = b.check_account_binding();
+        let _ = b.check_account_binding();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap().trim(),
+            a.account_fingerprint(),
+            "a losing seed must never rewrite the marker"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
