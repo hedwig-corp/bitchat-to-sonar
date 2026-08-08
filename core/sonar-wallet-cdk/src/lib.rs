@@ -44,6 +44,14 @@ use sonar_wallet::{
 /// notion of "our artifact".
 const DB_FILE: &str = "cashu.redb";
 
+/// Marker written ONLY after a NUT-13 restore scan completes. Freshness must
+/// not be judged by the store file existing: a first connect can create the
+/// file and then fail `load_mint_info`/`restore` transiently, and keying on
+/// the file would skip restoration forever — an empty balance over
+/// recoverable funds. Absent marker ⇒ restore runs (idempotent) until it
+/// succeeds once.
+const RESTORED_MARKER: &str = "cashu.restored";
+
 /// How often the watcher polls pending mint quotes. Mint quotes are the only
 /// state that changes without us acting (a payer pays the invoice), and mints
 /// expose no push channel over plain HTTP.
@@ -185,7 +193,7 @@ impl CdkWallet {
         std::fs::create_dir_all(&self.config.working_dir)
             .map_err(|e| WalletError::Backend(format!("create working dir: {e}")))?;
         let db_path = self.config.working_dir.join(DB_FILE);
-        let fresh = !db_path.exists();
+        let fresh = !self.config.working_dir.join(RESTORED_MARKER).exists();
         let localstore = cdk_redb::WalletRedbDatabase::new(&db_path)
             .map_err(|e| WalletError::Backend(format!("open {}: {e}", db_path.display())))?;
         let wallet = WalletBuilder::new()
@@ -198,19 +206,38 @@ impl CdkWallet {
         Ok((wallet, fresh))
     }
 
-    /// One pass of the pending-mint-quote watcher; also the body of
-    /// `sync_wallet`. Returns how many quotes were minted.
+    /// One pass of the pending-mint-quote watcher (best-effort: errors are
+    /// logged and retried next tick, since the watcher must outlive transient
+    /// mint hiccups).
     async fn poll_mint_quotes(wallet: &Wallet, events: &mpsc::Sender<WalletEvent>) -> usize {
+        match Self::poll_mint_quotes_strict(wallet, events).await {
+            Ok(minted) => minted,
+            Err(e) => {
+                tracing::warn!("mint-quote poll failed: {e}");
+                0
+            }
+        }
+    }
+
+    /// Strict variant for explicit `sync_wallet`: the push-wake contract is
+    /// "reconcile NOW or say you could not" — returning Ok over a failed poll
+    /// would tell a host no retry is needed while an incoming payment sits
+    /// unreconciled.
+    async fn poll_mint_quotes_strict(
+        wallet: &Wallet,
+        events: &mpsc::Sender<WalletEvent>,
+    ) -> Result<usize> {
         let mut minted = 0;
-        let quotes = match wallet.get_active_mint_quotes().await {
-            Ok(quotes) => quotes,
-            Err(_) => return 0,
-        };
+        let quotes = wallet
+            .get_active_mint_quotes()
+            .await
+            .map_err(|e| WalletError::Network(format!("list mint quotes: {e}")))?;
         for quote in quotes {
-            let state = match wallet.check_mint_quote_status(&quote.id).await {
-                Ok(updated) => updated.state,
-                Err(_) => continue,
-            };
+            let state = wallet
+                .check_mint_quote_status(&quote.id)
+                .await
+                .map_err(|e| WalletError::Network(format!("quote {}: {e}", quote.id)))?
+                .state;
             if state != MintQuoteState::Paid {
                 continue;
             }
@@ -232,14 +259,17 @@ impl CdkWallet {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("minting paid quote {} failed: {e}", quote.id);
+                    return Err(WalletError::Backend(format!(
+                        "minting paid quote {}: {e}",
+                        quote.id
+                    )));
                 }
             }
         }
         if minted > 0 {
             let _ = events.send(WalletEvent::Synced);
         }
-        minted
+        Ok(minted)
     }
 }
 
@@ -323,10 +353,13 @@ impl WalletBackend for CdkWallet {
                 .block_on(wallet.load_mint_info())
                 .map_err(|e| WalletError::Network(format!("mint unreachable: {e}")))?;
             if fresh {
-                // Fresh store, existing seed: scan the mint for proofs the
-                // seed already owns (NUT-13). This is what makes wipe →
-                // reconnect (and new-device setup) actually recover funds
-                // instead of presenting an empty balance over live money.
+                // No restore marker yet: scan the mint for proofs the seed
+                // already owns (NUT-13). This is what makes wipe → reconnect
+                // (and new-device setup) actually recover funds instead of
+                // presenting an empty balance over live money. The marker is
+                // written only on success, so a transient failure here leaves
+                // restoration pending for the next connect rather than
+                // permanently skipped.
                 let restored = self
                     .rt()
                     .block_on(wallet.restore())
@@ -336,6 +369,8 @@ impl WalletBackend for CdkWallet {
                     u64::from(restored.unspent),
                     u64::from(restored.pending),
                 );
+                std::fs::write(self.config.working_dir.join(RESTORED_MARKER), b"1")
+                    .map_err(|e| WalletError::Backend(format!("write restore marker: {e}")))?;
             }
             Ok(Arc::new(wallet))
         })();
@@ -455,9 +490,20 @@ impl WalletBackend for CdkWallet {
                 .total_reserved_balance()
                 .await
                 .map_err(|e| WalletError::Backend(e.to_string()))?;
+            // The Balance contract names Cashu unminted quotes as pending
+            // receives; CDK's pending-proof balance does not see a quote that
+            // has no proofs yet, so sum active quote amounts in as well.
+            let quoted: u64 = wallet
+                .get_active_mint_quotes()
+                .await
+                .map_err(|e| WalletError::Backend(e.to_string()))?
+                .iter()
+                .filter_map(|q| q.amount)
+                .map(u64::from)
+                .sum();
             Ok(Balance {
                 confirmed_sats: u64::from(confirmed),
-                pending_receive_sats: u64::from(pending),
+                pending_receive_sats: u64::from(pending) + quoted,
                 pending_send_sats: u64::from(reserved),
             })
         })
@@ -467,7 +513,7 @@ impl WalletBackend for CdkWallet {
         let wallet = self.wallet()?;
         let events = self.events_tx.clone();
         self.rt()
-            .block_on(async { CdkWallet::poll_mint_quotes(&wallet, &events).await });
+            .block_on(async { CdkWallet::poll_mint_quotes_strict(&wallet, &events).await })?;
         Ok(())
     }
 
@@ -595,16 +641,23 @@ impl WalletBackend for CdkWallet {
         })
     }
 
-    fn send(&self, prepared: &PreparedSend, _note: &str) -> Result<Payment> {
+    fn send(&self, prepared: &PreparedSend, note: &str) -> Result<Payment> {
         let wallet = self.wallet()?;
         let PreparedSendToken::Opaque(quote_id) = &prepared.token else {
             return Err(WalletError::InvalidInput(
                 "this prepared send did not come from the CDK backend".into(),
             ));
         };
+        let note_meta = (!note.is_empty()).then(|| {
+            let mut m = HashMap::new();
+            // CDK surfaces transaction metadata; the "memo" key keeps
+            // list_recent_payments consistent with what we return here.
+            m.insert("memo".to_string(), note.to_string());
+            m
+        });
         let payment = self.rt().block_on(async {
             let prepared_melt = wallet
-                .prepare_melt(quote_id, HashMap::new())
+                .prepare_melt(quote_id, note_meta.clone().unwrap_or_default())
                 .await
                 .map_err(|e| WalletError::Backend(e.to_string()))?;
             let finalized = prepared_melt
@@ -626,7 +679,7 @@ impl WalletBackend for CdkWallet {
                 timestamp_secs: now_secs(),
                 status,
                 preimage: finalized.payment_proof().map(str::to_string),
-                note: None,
+                note: (!note.is_empty()).then(|| note.to_string()),
             })
         })?;
         // A finalized-but-failed melt must not be announced as sent; hosts
@@ -695,7 +748,7 @@ impl WalletBackend for CdkWallet {
             ));
         }
         let target = guard_wipe_path(&self.config.working_dir, |name| {
-            name == DB_FILE || name.starts_with(DB_FILE)
+            name == DB_FILE || name.starts_with(DB_FILE) || name == RESTORED_MARKER
         })?;
         if target.exists() {
             std::fs::remove_dir_all(&target)
