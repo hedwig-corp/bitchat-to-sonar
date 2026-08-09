@@ -1,0 +1,18 @@
+[package]
+name = "sonar-wallet-migrate"
+description = "Backend-agnostic wallet-to-wallet migration engine for Sonar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# Depends ONLY on the interface crate: the engine drives two `dyn
+# WalletBackend`s and never names a concrete backend, so it can be unit-tested
+# over MockWallet pairs, linked next to the real Breez+CDK pair in the island
+# CLI, and later exported through sonar-ffi with the source side injected as a
+# host-implemented foreign trait.
+
+[dependencies]
+sonar-wallet = { path = "../sonar-wallet" }
+thiserror.workspace = true
+tracing.workspace = true
