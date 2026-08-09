@@ -2681,6 +2681,57 @@ impl SonarClient {
         metadata
     }
 
+    /// Decide what (if anything) a profile publish should send.
+    ///
+    /// `fetched` is the current relay kind-0, `cached` the last own profile
+    /// this device fetched or published (the sidecar). Two guards on top of
+    /// the plain merge:
+    ///
+    /// - **Wipe hole**: a fetch that comes back empty is ambiguous — a fresh
+    ///   key and a flaky network that missed the relay holding the profile
+    ///   look identical. Merging over the cache instead of nothing means the
+    ///   republished event can never carry fewer fields than the richest
+    ///   profile this device has seen. When `fetched` is present it stays
+    ///   authoritative, so a field deleted through another client is not
+    ///   resurrected.
+    /// - **Churn**: kind-0 republishes on every relay connect; when the merge
+    ///   result equals the relay copy there is nothing to say. Skipping keeps
+    ///   `created_at` stable and — because each publish is another chance to
+    ///   hit the wipe hole on a bad network — shrinks that surface too.
+    ///
+    /// Returns `None` when the publish should be skipped.
+    fn resolve_profile_publish(
+        fetched: Option<&Metadata>,
+        cached: Option<&Metadata>,
+        name: &str,
+        about: Option<&str>,
+        picture: Option<&str>,
+        claimed_handle: Option<String>,
+    ) -> Option<Metadata> {
+        let current = fetched.or(cached);
+        let merged = Self::merge_profile_metadata(current, name, about, picture, claimed_handle);
+        if fetched.is_some_and(|cur| *cur == merged) {
+            return None;
+        }
+        Some(merged)
+    }
+
+    /// The own-profile cache sidecar path (None for in-memory sessions).
+    fn own_profile_cache_path(&self) -> Option<PathBuf> {
+        self.marmot_db_path
+            .as_deref()
+            .map(crate::own_profile::own_profile_path_for_db)
+    }
+
+    /// Best-effort cache refresh — the cache is a merge floor, never a
+    /// publish precondition, so a failed write logs and moves on.
+    fn persist_own_profile_cache(path: Option<&Path>, metadata: &Metadata) {
+        let Some(path) = path else { return };
+        if let Err(err) = crate::own_profile::store_own_profile(path, metadata) {
+            tracing::warn!(%err, "own profile cache write failed");
+        }
+    }
+
     pub async fn publish_profile(
         &self,
         name: &str,
@@ -2693,14 +2744,27 @@ impl SonarClient {
         // not read.
         let me = self.engine.identity().keys().public_key();
         let current = self.nostr.fetch_metadata(me, FETCH_TIMEOUT).await?;
-        let metadata = Self::merge_profile_metadata(
+        let cache_path = self.own_profile_cache_path();
+        let cached = cache_path
+            .as_deref()
+            .and_then(crate::own_profile::load_own_profile);
+        let Some(metadata) = Self::resolve_profile_publish(
             current.as_ref(),
+            cached.as_ref(),
             name,
             about,
             picture,
             self.claimed_handle.lock().unwrap().clone(),
-        );
+        ) else {
+            // Unchanged — but the relay copy may still be newer than the
+            // cache (e.g. a picture set through another client).
+            if let Some(current) = current.as_ref() {
+                Self::persist_own_profile_cache(cache_path.as_deref(), current);
+            }
+            return Ok(());
+        };
         self.nostr.set_metadata(&metadata).await?;
+        Self::persist_own_profile_cache(cache_path.as_deref(), &metadata);
         Ok(())
     }
 
@@ -2717,6 +2781,7 @@ impl SonarClient {
         let nostr = self.nostr.clone();
         let claimed = self.claimed_handle.lock().unwrap().clone();
         let me = self.engine.identity().keys().public_key();
+        let cache_path = self.own_profile_cache_path();
         let name = name.to_string();
         let about = about.map(str::to_string);
         let picture = picture.map(str::to_string);
@@ -2730,16 +2795,27 @@ impl SonarClient {
                     return;
                 }
             };
-            let metadata = Self::merge_profile_metadata(
+            let cached = cache_path
+                .as_deref()
+                .and_then(crate::own_profile::load_own_profile);
+            let Some(metadata) = Self::resolve_profile_publish(
                 current.as_ref(),
+                cached.as_ref(),
                 &name,
                 about.as_deref(),
                 picture.as_deref(),
                 claimed,
-            );
+            ) else {
+                if let Some(current) = current.as_ref() {
+                    Self::persist_own_profile_cache(cache_path.as_deref(), current);
+                }
+                return;
+            };
             if let Err(err) = nostr.set_metadata(&metadata).await {
                 tracing::warn!(%err, "background profile publish failed");
+                return;
             }
+            Self::persist_own_profile_cache(cache_path.as_deref(), &metadata);
         });
     }
 
@@ -7422,6 +7498,7 @@ impl SonarClient {
         let push_result = wipe_push_token_cache_for_db(db_path);
         let sticker_result = wipe_sticker_cache_for_db(db_path);
         let handle_result = crate::handles::wipe_handle_state_for_db(db_path);
+        let own_profile_result = crate::own_profile::wipe_own_profile_for_db(db_path);
         let media_staging_result = wipe_media_staging_for_db(db_path);
         crate::account_backup::wipe_backup_policy_for_db(db_path);
         crate::account_backup::wipe_index_key_sidecar_for_db(db_path);
@@ -7430,6 +7507,7 @@ impl SonarClient {
         push_result?;
         sticker_result?;
         handle_result?;
+        own_profile_result?;
         media_staging_result
     }
 
@@ -10105,5 +10183,66 @@ mod profile_merge_tests {
         let m = SonarClient::merge_profile_metadata(Some(&r), "n", Some(""), Some("not a url"), None);
         assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
         assert_eq!(m.picture, r.picture);
+    }
+
+    #[test]
+    fn empty_fetch_falls_back_to_cached_profile() {
+        // Wipe hole: the publish-time fetch missed the relay holding the
+        // profile. The cache is the merge floor — picture/about/banner/lud16
+        // must survive the republish.
+        let cached = rich_remote();
+        let m = SonarClient::resolve_profile_publish(None, Some(&cached), "new-name", None, None, None)
+            .expect("must publish");
+        assert_eq!(m.name.as_deref(), Some("new-name"));
+        assert_eq!(m.picture, cached.picture);
+        assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
+        assert_eq!(m.banner, cached.banner);
+        assert_eq!(m.lud16.as_deref(), Some("vin@walletofsatoshi.com"));
+    }
+
+    #[test]
+    fn unchanged_profile_skips_republish() {
+        // Churn: kind-0 republishes on every relay connect. When the merge
+        // result equals the relay copy, nothing is sent.
+        let published =
+            SonarClient::merge_profile_metadata(Some(&rich_remote()), "vincenzo", None, None, None);
+        let skip = SonarClient::resolve_profile_publish(
+            Some(&published),
+            None,
+            "vincenzo",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn cache_never_resurrects_fields_deleted_remotely() {
+        // The user deleted their picture through another client: the relay
+        // copy is authoritative over the (stale, richer) cache, and since
+        // nothing changes the republish is skipped entirely.
+        let remote = Metadata::new()
+            .name("vincenzo")
+            .display_name("vincenzo")
+            .about("bitcoin dev");
+        let stale_cache = rich_remote();
+        let skip = SonarClient::resolve_profile_publish(
+            Some(&remote),
+            Some(&stale_cache),
+            "vincenzo",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn fresh_key_with_no_cache_publishes() {
+        let m = SonarClient::resolve_profile_publish(None, None, "alice", Some("hi"), None, None)
+            .expect("must publish");
+        assert_eq!(m.name.as_deref(), Some("alice"));
+        assert_eq!(m.about.as_deref(), Some("hi"));
     }
 }
