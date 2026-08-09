@@ -2806,7 +2806,12 @@ impl SonarClient {
         picture: Option<&str>,
     ) {
         let nostr = self.nostr.clone();
-        let claimed = self.claimed_handle.lock().unwrap().clone();
+        // `name`/`about`/`picture` are the caller's intent at spawn time by
+        // design — the host owns them and core cannot re-read them. The
+        // claimed handle IS core state, so its Arc travels into the task and
+        // is read only after the lock: a task queued behind a `claim_handle`
+        // + republish must attach the fresh nip05, not a pre-lock snapshot.
+        let claimed_handle = self.claimed_handle.clone();
         let me = self.engine.identity().keys().public_key();
         let cache_path = self.own_profile_cache_path();
         let publish_lock = self.profile_publish_lock.clone();
@@ -2816,6 +2821,7 @@ impl SonarClient {
         tokio::spawn(async move {
             // Same read-modify-write serialization as the foreground path.
             let _publishing = publish_lock.lock_owned().await;
+            let claimed = claimed_handle.lock().unwrap().clone();
             // Skip (do not publish blind) when the current kind-0 cannot be
             // fetched — the next relay connect retries.
             let current = match nostr.fetch_metadata(me, FETCH_TIMEOUT).await {
