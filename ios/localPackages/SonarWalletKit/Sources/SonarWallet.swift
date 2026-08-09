@@ -44,6 +44,16 @@ public final class SonarWallet {
 
     // MARK: - Public model types (callers must not import BreezSDKLiquid)
 
+    /// A priced, not-yet-paid send. `id` is an opaque handle back into this
+    /// wallet's pending-quote table — hand it to `sendPrepared`. Single-use.
+    public struct PreparedSend: Sendable, Equatable {
+        public let id: String
+        /// Net amount that reaches the payee.
+        public let amountSats: Int64
+        /// Fee this wallet pays, when Breez can quote one up front.
+        public let feesSats: Int64?
+    }
+
     public struct Payment: Sendable, Equatable {
         public let id: String
         public let amountSats: Int64
@@ -102,6 +112,11 @@ public final class SonarWallet {
     private let storage = KeychainWalletStorage()
     private let queue = DispatchQueue(label: "chat.bitchat.sonar.wallet.sdk")
     private var sdk: BindingLiquidSdk?
+    /// Live quotes from `prepareSend`, consumed by `sendPrepared`.
+    private var pendingQuotes: [String: BreezSDKLiquid.PrepareSendResponse] = [:]
+    private var pendingQuoteOrder: [String] = []
+    private let pendingQuotesLock = NSLock()
+    private static let maxPendingQuotes = 16
     private var apiKey: String = ""
     private var mainnet = true
     private var workingDir = ""
@@ -343,12 +358,72 @@ public final class SonarWallet {
         AsyncStream { _ in }
     }
 
+    /// One-shot confirmed balance. `balanceStream` polls this; migration needs
+    /// a single read without subscribing.
+    public func balanceSnapshot() async throws -> Int64 {
+        try await balanceSats()
+    }
+
     private func balanceSats() async throws -> Int64 {
         guard let node = sdk else { throw WalletError.notConfigured }
         return try await run { Int64(try node.getInfo().walletInfo.balanceSat) }
     }
 
     // MARK: - Payments
+
+    /// Price a send WITHOUT paying it, so callers can show the fee and take
+    /// consent first. The prepared response is parked here (it is not
+    /// `Sendable` across the FFI boundary) and consumed by `sendPrepared`.
+    ///
+    /// Needed by the Breez→Cashu migration, whose contract is quote → consent
+    /// → pay; the plain `send` path prepares and pays in one step and cannot
+    /// surface a fee for confirmation.
+    public func prepareSend(destination: String, amountSats: Int64) async throws -> PreparedSend {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        let prepared: BreezSDKLiquid.PrepareSendResponse = try await run {
+            let amount: PayAmount? = amountSats > 0 ? .bitcoin(receiverAmountSat: UInt64(amountSats)) : nil
+            return try node.prepareSendPayment(req: PrepareSendRequest(destination: destination, amount: amount))
+        }
+        let quoted: Int64
+        if case let .bitcoin(receiverAmountSat) = prepared.amount {
+            quoted = Int64(receiverAmountSat)
+        } else {
+            quoted = amountSats
+        }
+        let id = UUID().uuidString
+        pendingQuotesLock.lock()
+        // Bounded: an abandoned confirmation sheet leaves an entry behind and
+        // there is no drop hook, so evict the oldest rather than growing or
+        // refusing.
+        if pendingQuoteOrder.count >= Self.maxPendingQuotes, let oldest = pendingQuoteOrder.first {
+            pendingQuoteOrder.removeFirst()
+            pendingQuotes.removeValue(forKey: oldest)
+        }
+        pendingQuotes[id] = prepared
+        pendingQuoteOrder.append(id)
+        pendingQuotesLock.unlock()
+        return PreparedSend(id: id, amountSats: quoted, feesSats: prepared.feesSat.map(Int64.init))
+    }
+
+    /// Pay a quote from `prepareSend`. Single-use: the quote is consumed, so a
+    /// double-tapped confirm cannot pay twice.
+    @discardableResult
+    public func sendPrepared(id: String, note: String = "") async throws -> Payment {
+        guard let node = sdk else { throw WalletError.notConfigured }
+        pendingQuotesLock.lock()
+        let prepared = pendingQuotes.removeValue(forKey: id)
+        pendingQuoteOrder.removeAll { $0 == id }
+        pendingQuotesLock.unlock()
+        guard let prepared else {
+            throw WalletError.core("prepared send is expired or already used")
+        }
+        return try await run {
+            let response = try node.sendPayment(
+                req: SendPaymentRequest(prepareResponse: prepared, useAssetFees: nil, payerNote: note.isEmpty ? nil : note)
+            )
+            return Self.map(response.payment)
+        }
+    }
 
     @discardableResult
     public func send(destination: String, amountSats: Int64 = 0, note: String = "") async throws -> Payment {

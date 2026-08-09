@@ -1,0 +1,425 @@
+//! Wallet FFI: the Cashu (CDK) wallet and the Breez→Cashu migration engine.
+//!
+//! Why the asymmetry — Cashu is a real Rust object here, Breez is a foreign
+//! trait the hosts implement: `breez-sdk-liquid` ships a forked
+//! `libsqlite3-sys` that links plain sqlite3, which cannot coexist in one
+//! binary with sonar-core's SQLCipher. So Breez can never enter this crate.
+//! Both apps already integrate Breez natively (SonarWalletKit on Apple,
+//! `WalletBridge` on Compose); they implement [`HostMigrationSource`] over
+//! that existing integration and the Rust engine drives it.
+//!
+//! Call shape for hosts:
+//!
+//! ```text
+//! let wallet = SonarCashuWallet::open(nsec, mint_url, dir)   // NUT-13 restore on fresh store
+//! let engine = SonarMigration::new(source, wallet, limits)
+//! let plan   = engine.plan(...)      // no funds move; fee is visible here
+//!   ...show custody consent + fee, get the user's explicit yes...
+//! let paid   = engine.execute(plan)  // the ONE spending call
+//! let done   = engine.settle(...)    // safe to re-run after a crash
+//! ```
+
+use std::sync::Arc;
+
+use sonar_wallet::{
+    cashu_wallet_seed, nsec_to_secret, Balance, Destination, Payment, PreparedSend,
+    PreparedSendToken, ReceiveMethod, ReceiveRequest, Result as WalletResult, WalletBackend,
+    WalletCapabilities, WalletError, WalletEventListener, Zeroizing,
+};
+use sonar_wallet_cdk::CdkWallet;
+use sonar_wallet_migrate::{MigrationEngine, MigrationLimits, Settlement};
+
+use crate::{FfiResult, SonarFfiError};
+
+impl From<WalletError> for SonarFfiError {
+    fn from(e: WalletError) -> Self {
+        SonarFfiError::Core(e.to_string())
+    }
+}
+
+impl From<sonar_wallet_migrate::MigrateError> for SonarFfiError {
+    fn from(e: sonar_wallet_migrate::MigrateError) -> Self {
+        SonarFfiError::Core(e.to_string())
+    }
+}
+
+/// Balance snapshot, sats.
+#[derive(uniffi::Record)]
+pub struct WalletBalance {
+    pub confirmed_sats: u64,
+    pub pending_receive_sats: u64,
+    pub pending_send_sats: u64,
+}
+
+impl From<Balance> for WalletBalance {
+    fn from(b: Balance) -> Self {
+        Self {
+            confirmed_sats: b.confirmed_sats,
+            pending_receive_sats: b.pending_receive_sats,
+            pending_send_sats: b.pending_send_sats,
+        }
+    }
+}
+
+/// A priced send from the host's wallet: what the engine asked for, and what
+/// the host's backend quoted. `token` is opaque — the host hands it back to
+/// its own `send`, so it can be a quote id, a serialized prepare-response, or
+/// anything else the host needs to execute exactly this quote.
+#[derive(uniffi::Record)]
+pub struct HostSendQuote {
+    pub amount_sats: u64,
+    pub fees_sats: Option<u64>,
+    pub token: String,
+}
+
+/// A payment the host's wallet made.
+#[derive(uniffi::Record)]
+pub struct HostPayment {
+    pub id: String,
+    pub amount_sats: u64,
+    pub fees_sats: Option<u64>,
+    /// True only when the host's backend reports the payment as settled.
+    pub complete: bool,
+}
+
+/// The migration SOURCE, implemented by the host over its existing native
+/// Breez integration. Deliberately minimal — the engine needs exactly these
+/// three operations, so hosts do not have to mirror the whole `WalletBackend`
+/// trait over the FFI boundary.
+///
+/// Implementations are called from a Rust thread and MUST block until done.
+/// Failures are reported by throwing [`SonarFfiError`] — the same error type
+/// the rest of this FFI surface uses, so hosts have one error to handle.
+/// (A bare `String` error is NOT exportable by UniFFI for callback
+/// interfaces; the binding generator rejects it outright.)
+#[uniffi::export(with_foreign)]
+pub trait HostMigrationSource: Send + Sync {
+    /// Confirmed spendable balance, sats.
+    fn balance_sats(&self) -> Result<u64, SonarFfiError>;
+    /// Price paying `invoice` for `amount_sats` WITHOUT paying it.
+    fn prepare(&self, invoice: String, amount_sats: u64) -> Result<HostSendQuote, SonarFfiError>;
+    /// Pay a previously prepared quote. Called at most once per token.
+    fn send(&self, token: String, note: String) -> Result<HostPayment, SonarFfiError>;
+}
+
+/// Adapts the host's minimal source to the full `WalletBackend` the engine
+/// consumes. Everything the engine does not call is `Unsupported` — the
+/// engine only ever touches balance / parse / prepare_send / send.
+struct HostSourceBackend {
+    host: Arc<dyn HostMigrationSource>,
+}
+
+impl WalletBackend for HostSourceBackend {
+    fn capabilities(&self) -> WalletCapabilities {
+        WalletCapabilities {
+            bolt11_send: true,
+            ..Default::default()
+        }
+    }
+
+    fn connect(&self) -> WalletResult<()> {
+        // The host owns its wallet's lifecycle; by the time it hands us a
+        // source it is already connected.
+        Ok(())
+    }
+
+    fn disconnect(&self) -> WalletResult<()> {
+        Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        true
+    }
+
+    fn balance(&self) -> WalletResult<Balance> {
+        let confirmed = self
+            .host
+            .balance_sats()
+            .map_err(|e| WalletError::Backend(format!("host source balance: {e}")))?;
+        Ok(Balance {
+            confirmed_sats: confirmed,
+            ..Balance::default()
+        })
+    }
+
+    fn receive(&self, _request: &ReceiveRequest) -> WalletResult<String> {
+        Err(WalletError::Unsupported(
+            "the migration source is send-only".into(),
+        ))
+    }
+
+    fn parse_destination(&self, input: &str) -> WalletResult<Destination> {
+        // The engine only ever feeds this a BOLT11 invoice minted by the
+        // destination moments earlier; classify locally rather than making the
+        // host round-trip its parser.
+        Ok(sonar_wallet::classify_destination(input))
+    }
+
+    fn prepare_send(
+        &self,
+        destination: &Destination,
+        amount_sats: Option<u64>,
+    ) -> WalletResult<PreparedSend> {
+        let amount = amount_sats.ok_or_else(|| {
+            WalletError::InvalidDestination("migration always supplies an amount".into())
+        })?;
+        let quote = self
+            .host
+            .prepare(destination.raw.clone(), amount)
+            .map_err(|e| WalletError::Backend(format!("host source prepare: {e}")))?;
+        Ok(PreparedSend {
+            destination: destination.clone(),
+            amount_sats: quote.amount_sats,
+            fees_sats: quote.fees_sats,
+            token: PreparedSendToken::Opaque(quote.token),
+        })
+    }
+
+    fn send(&self, prepared: &PreparedSend, note: &str) -> WalletResult<Payment> {
+        let PreparedSendToken::Opaque(token) = &prepared.token else {
+            return Err(WalletError::InvalidInput(
+                "this prepared send did not come from the host source".into(),
+            ));
+        };
+        let paid = self
+            .host
+            .send(token.clone(), note.to_string())
+            .map_err(|e| WalletError::Backend(format!("host source send: {e}")))?;
+        Ok(Payment {
+            id: paid.id,
+            amount_sats: paid.amount_sats,
+            fees_sats: paid.fees_sats,
+            incoming: false,
+            timestamp_secs: 0,
+            status: if paid.complete {
+                sonar_wallet::PaymentStatus::Complete
+            } else {
+                sonar_wallet::PaymentStatus::Pending
+            },
+            preimage: None,
+            note: (!note.is_empty()).then(|| note.to_string()),
+        })
+    }
+
+    fn list_recent_payments(&self, _limit: u32) -> WalletResult<Vec<Payment>> {
+        Ok(Vec::new())
+    }
+
+    fn add_event_listener(&self, _listener: Arc<dyn WalletEventListener>) -> u64 {
+        0
+    }
+
+    fn remove_event_listener(&self, _id: u64) {}
+
+    fn wipe_local_storage(&self) -> WalletResult<()> {
+        Err(WalletError::Unsupported(
+            "the host owns its own wallet storage".into(),
+        ))
+    }
+}
+
+/// The Cashu wallet, backed by `sonar-wallet-cdk`. Seeded from the account
+/// nsec via the `sonar-cashu-v1` HKDF domain — a different domain from the
+/// Breez seed, so the two funds domains share no key material while both stay
+/// restorable from the account key alone.
+#[derive(uniffi::Object)]
+pub struct SonarCashuWallet {
+    inner: CdkWallet,
+}
+
+#[uniffi::export]
+impl SonarCashuWallet {
+    /// Open (or create) the Cashu wallet and connect to the mint. On a store
+    /// that has never completed a NUT-13 restore against this mint, the
+    /// restore scan runs here — that is what makes a reinstall or a wiped
+    /// store recover funds instead of showing an empty balance.
+    #[uniffi::constructor]
+    pub fn open(nsec: String, mint_url: String, working_dir: String) -> FfiResult<Arc<Self>> {
+        let secret = Zeroizing::new(nsec_to_secret(&nsec)?);
+        let inner = CdkWallet::new(
+            sonar_wallet::WalletConfig {
+                seed: Zeroizing::new(cashu_wallet_seed(&secret).to_vec()),
+                network: sonar_wallet::Network::Mainnet,
+                api_key: None,
+                working_dir: std::path::PathBuf::from(working_dir),
+            },
+            &mint_url,
+        )?;
+        inner.connect()?;
+        Ok(Arc::new(Self { inner }))
+    }
+
+    pub fn balance(&self) -> FfiResult<WalletBalance> {
+        Ok(self.inner.balance()?.into())
+    }
+
+    /// Reconcile with the mint now (mints paid quotes, finalizes melts).
+    pub fn sync(&self) -> FfiResult<()> {
+        Ok(self.inner.sync_wallet()?)
+    }
+
+    /// A reusable BOLT12 offer for this wallet.
+    pub fn receive_offer(&self) -> FfiResult<String> {
+        Ok(self.inner.receive_offer()?)
+    }
+
+    /// A BOLT11 invoice for an exact amount.
+    pub fn receive_invoice(&self, amount_sats: u64) -> FfiResult<String> {
+        Ok(self.inner.receive(&ReceiveRequest {
+            method: ReceiveMethod::Bolt11Invoice,
+            amount_sats: Some(amount_sats),
+            description: None,
+        })?)
+    }
+
+    pub fn disconnect(&self) -> FfiResult<()> {
+        Ok(self.inner.disconnect()?)
+    }
+}
+
+/// What the user must see before consenting. Amounts in sats.
+#[derive(uniffi::Record)]
+pub struct MigrationQuote {
+    /// Net amount that will arrive in the Cashu wallet.
+    pub amount_sats: u64,
+    /// Fee the source wallet will pay on top, when it can quote one.
+    pub source_fee_sats: Option<u64>,
+    /// Destination balance before the migration — hand this back to `settle`
+    /// so a resumed watch knows what "arrived" means.
+    pub destination_baseline_sats: u64,
+    /// Opaque handle for `execute`; single-use.
+    pub plan_id: String,
+}
+
+#[derive(uniffi::Enum)]
+pub enum MigrationOutcome {
+    /// Funds are in the Cashu wallet.
+    Settled { cashu_confirmed_sats: u64 },
+    /// Paid, not yet visible. NOT a failure — the wallet keeps reconciling;
+    /// call `settle` again (the same call is the crash-resume path).
+    Pending { cashu_confirmed_sats: u64 },
+}
+
+impl From<Settlement> for MigrationOutcome {
+    fn from(s: Settlement) -> Self {
+        match s {
+            Settlement::Settled {
+                destination_confirmed_sats,
+            } => MigrationOutcome::Settled {
+                cashu_confirmed_sats: destination_confirmed_sats,
+            },
+            Settlement::Pending {
+                destination_confirmed_sats,
+            } => MigrationOutcome::Pending {
+                cashu_confirmed_sats: destination_confirmed_sats,
+            },
+        }
+    }
+}
+
+/// Drives one migration. Held by the host across the consent step: `plan` →
+/// (consent UI) → `execute` → `settle`.
+#[derive(uniffi::Object)]
+pub struct SonarMigration {
+    source: HostSourceBackend,
+    dest: Arc<SonarCashuWallet>,
+    limits: MigrationLimits,
+    /// The single live plan, keyed by the id handed to the host. Cleared by
+    /// `execute` so one plan can never be paid twice.
+    plan: std::sync::Mutex<Option<(String, sonar_wallet_migrate::MigrationPlan, u64)>>,
+}
+
+#[uniffi::export]
+impl SonarMigration {
+    /// `dest_max_sats` is the mint's per-quote ceiling (mint.hedwig.sh: 500000)
+    /// and `fee_cap_sats` is a fail-closed cap on the source fee — a quote
+    /// above it, or a source that cannot quote a fee at all, refuses to plan.
+    #[uniffi::constructor]
+    pub fn new(
+        source: Arc<dyn HostMigrationSource>,
+        destination: Arc<SonarCashuWallet>,
+        dest_max_sats: Option<u64>,
+        fee_cap_sats: Option<u64>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            source: HostSourceBackend { host: source },
+            dest: destination,
+            limits: MigrationLimits {
+                dest_max_sats,
+                fee_cap_sats,
+            },
+            plan: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Price the migration. Nothing is paid. `amount_sats = None` plans a
+    /// whole-balance drain.
+    pub fn plan(&self, amount_sats: Option<u64>) -> FfiResult<MigrationQuote> {
+        let engine = MigrationEngine::new(&self.source, self.dest.inner_ref(), self.limits.clone());
+        let baseline = engine.balances()?.1.confirmed_sats;
+        let plan = match amount_sats {
+            Some(a) => engine.plan_amount(a),
+            None => engine.plan_drain(),
+        }?;
+        let quote = MigrationQuote {
+            amount_sats: plan.amount_sats,
+            source_fee_sats: plan.source_fee_sats,
+            destination_baseline_sats: baseline,
+            plan_id: plan.invoice.clone(),
+        };
+        *self.plan.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((quote.plan_id.clone(), plan, baseline));
+        Ok(quote)
+    }
+
+    /// Pay the planned migration. THE spending call — hosts must not reach it
+    /// without explicit user consent to the custody change. Single-use: the
+    /// plan is consumed, so a double-tap cannot pay twice.
+    pub fn execute(&self, plan_id: String) -> FfiResult<HostPayment> {
+        let taken = {
+            let mut slot = self.plan.lock().unwrap_or_else(|e| e.into_inner());
+            match slot.take() {
+                Some((id, plan, baseline)) if id == plan_id => Some((plan, baseline)),
+                // Put a non-matching plan back; the caller passed a stale id.
+                Some(other) => {
+                    *slot = Some(other);
+                    None
+                }
+                None => None,
+            }
+        };
+        let (plan, _baseline) = taken.ok_or_else(|| {
+            SonarFfiError::InvalidInput(
+                "no such migration plan (expired or already executed)".into(),
+            )
+        })?;
+        let engine = MigrationEngine::new(&self.source, self.dest.inner_ref(), self.limits.clone());
+        let payment = engine.execute(&plan)?;
+        Ok(HostPayment {
+            id: payment.id,
+            amount_sats: payment.amount_sats,
+            fees_sats: payment.fees_sats,
+            complete: payment.status == sonar_wallet::PaymentStatus::Complete,
+        })
+    }
+
+    /// Watch the Cashu wallet until the funds land. Blocking; each poll is a
+    /// mint sync. Safe to call any number of times, including after a crash
+    /// between `execute` and settlement — the wallet's own reconciliation is
+    /// what finishes the job, this only observes it.
+    pub fn settle(
+        &self,
+        baseline_sats: u64,
+        expected_sats: u64,
+        polls: u32,
+    ) -> FfiResult<MigrationOutcome> {
+        let engine = MigrationEngine::new(&self.source, self.dest.inner_ref(), self.limits.clone());
+        Ok(engine.settle(baseline_sats, expected_sats, polls)?.into())
+    }
+}
+
+impl SonarCashuWallet {
+    fn inner_ref(&self) -> &CdkWallet {
+        &self.inner
+    }
+}

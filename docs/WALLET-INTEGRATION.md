@@ -6,6 +6,18 @@
 > `core/sonar-wallet-breez`. The per-platform Breez integrations described
 > below are what ships today; they are scheduled for replacement by that
 > interface over a staged PR train (desktop → Android → iOS app → iOS
+> **Migration surface (PR3).** `SonarCashuWallet` and `SonarMigration` are
+> exported from sonar-ffi; the Breez side of a migration is the foreign trait
+> `HostMigrationSource`, implemented per app over the EXISTING native Breez
+> integrations (`SonarWallet` on Apple, `WalletBridge` on Compose) — Breez-rust
+> can never enter sonar-ffi because its forked libsqlite3-sys links plain
+> sqlite3 and would collide with sonar-core's SQLCipher. **Tracked platform
+> gap:** the migration source ships on iOS and Android only. Compose *desktop*
+> (jvmMain) has no UniFFI bindings generated for it today, so it cannot host
+> the engine; desktop users keep the Breez wallet until that binding path
+> exists. Follow-up: generate the Kotlin bindings for the desktop target in
+> `build-desktop.sh` and add a jvm `BreezMigrationSource`.
+>
 > notification extension). The Cashu backend (`core/sonar-wallet-cdk`, PR
 > #582) is core-only for now on BOTH app surfaces — an explicit tracked gap
 > per the Cross-Platform Feature Rule: apps reach wallet backends through the

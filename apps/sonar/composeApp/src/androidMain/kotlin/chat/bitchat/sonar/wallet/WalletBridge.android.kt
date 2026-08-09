@@ -442,6 +442,60 @@ actual object WalletBridge {
         }
     }
 
+    /** Live quotes from [prepareSend], consumed by [sendPrepared]. Bounded:
+     *  an abandoned confirmation sheet leaves an entry and there is no drop
+     *  hook, so the oldest is evicted rather than growing or refusing. */
+    private val pendingQuotes = LinkedHashMap<String, PrepareSendResponse>()
+    private const val MAX_PENDING_QUOTES = 16
+
+    actual suspend fun prepareSend(destination: String, amountSats: Long): PreparedSendQuote? =
+        withContext(Dispatchers.IO) {
+            val node = lock.withLock { sdk } ?: return@withContext null
+            if (amountSats < 0) return@withContext null
+            try {
+                val amount: PayAmount? =
+                    if (amountSats > 0) PayAmount.Bitcoin(amountSats.toULong()) else null
+                val prepared = node.prepareSendPayment(PrepareSendRequest(destination.trim(), amount))
+                val quoted = (prepared.amount as? PayAmount.Bitcoin)
+                    ?.receiverAmountSat?.toLong() ?: amountSats
+                val id = java.util.UUID.randomUUID().toString()
+                synchronized(pendingQuotes) {
+                    if (pendingQuotes.size >= MAX_PENDING_QUOTES) {
+                        pendingQuotes.keys.firstOrNull()?.let { pendingQuotes.remove(it) }
+                    }
+                    pendingQuotes[id] = prepared
+                }
+                PreparedSendQuote(id = id, amountSats = quoted, feesSats = prepared.feesSat?.toLong())
+            } catch (t: Throwable) {
+                null
+            }
+        }
+
+    actual suspend fun sendPrepared(id: String, note: String): SendResult =
+        withContext(Dispatchers.IO) {
+            val node = lock.withLock { sdk } ?: return@withContext SendResult(false)
+            val prepared = synchronized(pendingQuotes) { pendingQuotes.remove(id) }
+                ?: return@withContext SendResult(
+                    ok = false,
+                    error = "prepared send is expired or already used",
+                )
+            try {
+                val resp = node.sendPayment(SendPaymentRequest(prepared, null, note.ifBlank { null }))
+                val payment = resp.payment
+                val lightning = payment.details as? PaymentDetails.Lightning
+                refreshBalance()
+                SendResult(
+                    ok = true,
+                    preimage = lightning?.preimage,
+                    paymentId = payment.txId ?: lightning?.paymentHash ?: payment.destination,
+                    feesSats = payment.feesSat.toLong(),
+                    settledAtSecs = payment.timestamp.toLong(),
+                )
+            } catch (t: Throwable) {
+                SendResult(false)
+            }
+        }
+
     actual suspend fun send(destination: String, amountSats: Long, note: String): SendResult =
         withContext(Dispatchers.IO) {
             // Capture the handle under [lock] so a concurrent Breez wake cannot
