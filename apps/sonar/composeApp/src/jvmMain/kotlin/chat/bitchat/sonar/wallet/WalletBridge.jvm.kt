@@ -10,6 +10,7 @@ import breez_sdk_liquid.PaymentMethod
 import breez_sdk_liquid.PaymentType
 import breez_sdk_liquid.PrepareReceiveRequest
 import breez_sdk_liquid.PrepareSendRequest
+import breez_sdk_liquid.PrepareSendResponse
 import breez_sdk_liquid.ReceivePaymentRequest
 import breez_sdk_liquid.PaymentDetails
 import breez_sdk_liquid.SdkEvent
