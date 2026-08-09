@@ -907,3 +907,78 @@ async fn fetch_key_package_picks_the_newest_across_relays() {
     let newest = all.iter().max_by_key(|e| e.created_at).expect("nonempty");
     assert_eq!(picked.id, newest.id, "must resolve to the newest candidate");
 }
+
+/// The empty-fetch wipe guard must be WIRED, not just decided (R-032).
+///
+/// Unit tests pin the pure `resolve_profile_publish`; this pins the call site:
+/// `publish_profile` must persist the own-profile sidecar after publishing,
+/// load it on a later publish whose relay fetch comes back empty, use it as
+/// the merge floor, and ship the merged event. A refactor that drops the
+/// sidecar argument at the call site keeps every unit test green — this one
+/// goes red.
+#[tokio::test]
+async fn profile_republish_against_empty_relay_keeps_sidecar_fields() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("marmot.sqlite");
+    let identity = Identity::generate();
+    let pubkey = identity.public_key();
+
+    // Session 1: publish a rich profile through relay A; the sidecar records it.
+    let relay_a = MockRelay::run().await.expect("mock relay A starts");
+    {
+        let client = SonarClient::connect(
+            identity.clone(),
+            vec![relay_a.url().await],
+            &db_path,
+            [0x24; 32],
+        )
+        .await
+        .expect("session 1 connects");
+        client
+            .publish_profile(
+                "vincenzo",
+                Some("bitcoin dev"),
+                Some("https://example.com/pic.png"),
+            )
+            .await
+            .expect("rich profile publishes");
+    }
+    let sidecar = db_path.with_file_name("marmot.sqlite.sonar-profile.json");
+    assert!(
+        sidecar.exists(),
+        "publish must write the own-profile sidecar"
+    );
+
+    // Session 2: same account, but the only reachable relay is EMPTY — the
+    // flaky-network shape of the wipe. A rename must carry the sidecar
+    // fields, not strip the profile back to name-only.
+    let relay_b = MockRelay::run().await.expect("mock relay B starts");
+    let url_b = relay_b.url().await;
+    let client = SonarClient::connect(identity, vec![url_b.clone()], &db_path, [0x24; 32])
+        .await
+        .expect("session 2 connects");
+    client
+        .publish_profile("new-name", None, None)
+        .await
+        .expect("republish against empty relay");
+
+    let viewer = SonarClient::connect_in_memory(Identity::generate(), vec![url_b])
+        .await
+        .expect("viewer connects");
+    let profile = timeout(Duration::from_secs(10), viewer.fetch_profile(pubkey))
+        .await
+        .expect("fetch did not time out")
+        .expect("fetch ok")
+        .expect("profile present on relay B");
+    assert_eq!(profile.name.as_deref(), Some("new-name"));
+    assert_eq!(
+        profile.about.as_deref(),
+        Some("bitcoin dev"),
+        "sidecar floor must survive an empty-fetch republish"
+    );
+    assert_eq!(
+        profile.picture.as_deref(),
+        Some("https://example.com/pic.png"),
+        "picture must survive an empty-fetch republish"
+    );
+}

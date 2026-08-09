@@ -1894,6 +1894,11 @@ pub struct SonarClient {
     claimed_handle: Arc<Mutex<Option<String>>>,
     /// Durable path for the claimed handle (None for in-memory sessions).
     handle_state_path: Option<PathBuf>,
+    /// Serializes kind-0 publishes (foreground and background): each publish
+    /// is a fetch/load/merge/set/cache read-modify-write over relay + sidecar
+    /// state, so two interleaved publishes could decide from state the other
+    /// is mid-way through changing.
+    profile_publish_lock: Arc<tokio::sync::Mutex<()>>,
     /// Persistent Marmot DB path for auto-backup dirty marks (None in-memory).
     marmot_db_path: Option<PathBuf>,
     /// Atomic throttle + single-flight gate for the per-group catch-up pass;
@@ -2413,6 +2418,7 @@ impl SonarClient {
             pending_sync_notifications: Arc::new(Mutex::new(Vec::new())),
             claimed_handle: Arc::new(Mutex::new(None)),
             handle_state_path: None,
+            profile_publish_lock: Arc::new(tokio::sync::Mutex::new(())),
             marmot_db_path: None,
             group_catchup_gate: Arc::new(Mutex::new(GroupCatchupGate::default())),
         };
@@ -2683,17 +2689,21 @@ impl SonarClient {
 
     /// Decide what (if anything) a profile publish should send.
     ///
-    /// `fetched` is the current relay kind-0, `cached` the last own profile
-    /// this device fetched or published (the sidecar). Two guards on top of
+    /// `fetched` is the current relay kind-0, `cached` the sidecar read of the
+    /// last own profile this device fetched or published. Guards on top of
     /// the plain merge:
     ///
     /// - **Wipe hole**: a fetch that comes back empty is ambiguous — a fresh
     ///   key and a flaky network that missed the relay holding the profile
-    ///   look identical. Merging over the cache instead of nothing means the
-    ///   republished event can never carry fewer fields than the richest
-    ///   profile this device has seen. When `fetched` is present it stays
+    ///   look identical. Merging over the cache instead of nothing means an
+    ///   empty fetch can never produce an event with fewer fields than the
+    ///   last profile this device saw. When `fetched` is present it stays
     ///   authoritative, so a field deleted through another client is not
     ///   resurrected.
+    /// - **Unreadable cache**: an empty fetch plus an *unreadable* (not
+    ///   missing) sidecar proves a profile existed but gives no floor to
+    ///   merge over — publishing from scratch there is the wipe again, so
+    ///   the publish is skipped; the next fetch that succeeds retries.
     /// - **Churn**: kind-0 republishes on every relay connect; when the merge
     ///   result equals the relay copy there is nothing to say. Skipping keeps
     ///   `created_at` stable and — because each publish is another chance to
@@ -2702,13 +2712,24 @@ impl SonarClient {
     /// Returns `None` when the publish should be skipped.
     fn resolve_profile_publish(
         fetched: Option<&Metadata>,
-        cached: Option<&Metadata>,
+        cached: &crate::own_profile::CacheRead,
         name: &str,
         about: Option<&str>,
         picture: Option<&str>,
         claimed_handle: Option<String>,
     ) -> Option<Metadata> {
-        let current = fetched.or(cached);
+        use crate::own_profile::CacheRead;
+        let current = match (fetched, cached) {
+            (Some(cur), _) => Some(cur),
+            (None, CacheRead::Cached(floor)) => Some(floor.as_ref()),
+            (None, CacheRead::Missing) => None,
+            (None, CacheRead::Unreadable) => {
+                tracing::warn!(
+                    "skipping kind-0 republish: empty relay fetch and unreadable profile cache"
+                );
+                return None;
+            }
+        };
         let merged = Self::merge_profile_metadata(current, name, about, picture, claimed_handle);
         if fetched.is_some_and(|cur| *cur == merged) {
             return None;
@@ -2738,6 +2759,11 @@ impl SonarClient {
         about: Option<&str>,
         picture: Option<&str>,
     ) -> Result<()> {
+        // Serialized with the background path: fetch/load/merge/set/cache is
+        // a read-modify-write of relay + sidecar state, and two interleaved
+        // publishes could decide from what the other is mid-way through
+        // changing (and race the shared sidecar temp file).
+        let _publishing = self.profile_publish_lock.clone().lock_owned().await;
         // Fetch-and-merge: kind-0 is replaceable, so a blind publish would
         // wipe every field Sonar does not manage. Propagate the fetch error
         // instead of publishing blind — never destroy a profile we could
@@ -2747,10 +2773,11 @@ impl SonarClient {
         let cache_path = self.own_profile_cache_path();
         let cached = cache_path
             .as_deref()
-            .and_then(crate::own_profile::load_own_profile);
+            .map(crate::own_profile::load_own_profile)
+            .unwrap_or(crate::own_profile::CacheRead::Missing);
         let Some(metadata) = Self::resolve_profile_publish(
             current.as_ref(),
-            cached.as_ref(),
+            &cached,
             name,
             about,
             picture,
@@ -2782,10 +2809,13 @@ impl SonarClient {
         let claimed = self.claimed_handle.lock().unwrap().clone();
         let me = self.engine.identity().keys().public_key();
         let cache_path = self.own_profile_cache_path();
+        let publish_lock = self.profile_publish_lock.clone();
         let name = name.to_string();
         let about = about.map(str::to_string);
         let picture = picture.map(str::to_string);
         tokio::spawn(async move {
+            // Same read-modify-write serialization as the foreground path.
+            let _publishing = publish_lock.lock_owned().await;
             // Skip (do not publish blind) when the current kind-0 cannot be
             // fetched — the next relay connect retries.
             let current = match nostr.fetch_metadata(me, FETCH_TIMEOUT).await {
@@ -2797,10 +2827,11 @@ impl SonarClient {
             };
             let cached = cache_path
                 .as_deref()
-                .and_then(crate::own_profile::load_own_profile);
+                .map(crate::own_profile::load_own_profile)
+                .unwrap_or(crate::own_profile::CacheRead::Missing);
             let Some(metadata) = Self::resolve_profile_publish(
                 current.as_ref(),
-                cached.as_ref(),
+                &cached,
                 &name,
                 about.as_deref(),
                 picture.as_deref(),
@@ -10185,14 +10216,23 @@ mod profile_merge_tests {
         assert_eq!(m.picture, r.picture);
     }
 
+    use crate::own_profile::CacheRead;
+
     #[test]
     fn empty_fetch_falls_back_to_cached_profile() {
         // Wipe hole: the publish-time fetch missed the relay holding the
         // profile. The cache is the merge floor — picture/about/banner/lud16
         // must survive the republish.
         let cached = rich_remote();
-        let m = SonarClient::resolve_profile_publish(None, Some(&cached), "new-name", None, None, None)
-            .expect("must publish");
+        let m = SonarClient::resolve_profile_publish(
+            None,
+            &CacheRead::Cached(Box::new(cached.clone())),
+            "new-name",
+            None,
+            None,
+            None,
+        )
+        .expect("must publish");
         assert_eq!(m.name.as_deref(), Some("new-name"));
         assert_eq!(m.picture, cached.picture);
         assert_eq!(m.about.as_deref(), Some("bitcoin dev"));
@@ -10208,7 +10248,7 @@ mod profile_merge_tests {
             SonarClient::merge_profile_metadata(Some(&rich_remote()), "vincenzo", None, None, None);
         let skip = SonarClient::resolve_profile_publish(
             Some(&published),
-            None,
+            &CacheRead::Missing,
             "vincenzo",
             None,
             None,
@@ -10229,7 +10269,7 @@ mod profile_merge_tests {
         let stale_cache = rich_remote();
         let skip = SonarClient::resolve_profile_publish(
             Some(&remote),
-            Some(&stale_cache),
+            &CacheRead::Cached(Box::new(stale_cache)),
             "vincenzo",
             None,
             None,
@@ -10240,9 +10280,50 @@ mod profile_merge_tests {
 
     #[test]
     fn fresh_key_with_no_cache_publishes() {
-        let m = SonarClient::resolve_profile_publish(None, None, "alice", Some("hi"), None, None)
-            .expect("must publish");
+        let m = SonarClient::resolve_profile_publish(
+            None,
+            &CacheRead::Missing,
+            "alice",
+            Some("hi"),
+            None,
+            None,
+        )
+        .expect("must publish");
         assert_eq!(m.name.as_deref(), Some("alice"));
         assert_eq!(m.about.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn empty_fetch_with_unreadable_cache_skips_publish() {
+        // An unreadable sidecar proves a profile existed but gives no merge
+        // floor. Publishing from scratch there is the wipe again — skip, and
+        // let the next successful fetch retry.
+        let skip = SonarClient::resolve_profile_publish(
+            None,
+            &CacheRead::Unreadable,
+            "vincenzo",
+            None,
+            None,
+            None,
+        );
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn unreadable_cache_with_present_remote_still_publishes() {
+        // A broken cache must not block a legitimate rename when the relay
+        // copy is available — the fetch, not the cache, is the primary guard.
+        let remote = rich_remote();
+        let m = SonarClient::resolve_profile_publish(
+            Some(&remote),
+            &CacheRead::Unreadable,
+            "new-name",
+            None,
+            None,
+            None,
+        )
+        .expect("must publish");
+        assert_eq!(m.name.as_deref(), Some("new-name"));
+        assert_eq!(m.picture, remote.picture);
     }
 }
