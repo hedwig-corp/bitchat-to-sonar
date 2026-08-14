@@ -1936,6 +1936,74 @@ reached) -> build 31 crash (round 6: nothing to close *yet*) -> this fix.
   open store between "started" and "installed", and every host would need
   rewriting for a crash that only one host can suffer.
 
+## R-032 — An empty profile fetch must never license a from-scratch kind-0 republish
+
+**Invariant:** kind-0 is replaceable: whoever publishes last owns the whole
+event. Sonar manages only `name`/`display_name` (plus `nip05` for a claimed
+handle), so every publish merges over the current relay profile, which stays
+authoritative whenever present. When the publish-time fetch comes back empty,
+the persisted own-profile cache is the merge floor; when the fetch is empty
+and the cache exists but is *unreadable*, the publish is skipped outright —
+only a fetch-empty + cache-*missing* combination (a genuinely fresh device)
+licenses publishing from scratch. A merge result identical to the relay copy
+is not sent at all, and publishes are serialized so no two interleave their
+fetch/merge/store steps.
+
+**Breaks as:** the user sets a picture/bio in Damus/Primal/Amethyst; some time
+later their profile is bare again everywhere — name and Sonar handle only.
+No error anywhere: the app that did it was "successfully publishing its
+profile".
+
+**Why (twice):** the first wipe was the blind publish fixed by fetch-and-merge
+in #390. The second is the hole #390 left: `fetch_metadata` returning no event
+is ambiguous — a genuinely fresh key and a flaky network that missed the relay
+holding the profile look identical — and the merge treated both as "publish
+from scratch". The odds looked small per publish, but the connect path
+republished kind-0 on every relay attach (~26 identical events observed in one
+day from one device), so the bad roll was a matter of time; once one bare event
+lands with the newest `created_at`, it propagates to every relay and all later
+merges faithfully preserve the bare state. The fix adds the
+`sonar.db.sonar-profile.json` sidecar as a merge floor for the empty-fetch
+case, and skips the send entirely when the merge equals the relay copy (which
+also removes the churn that multiplied the exposure).
+
+**Who hits it:** anyone using the same nsec in Sonar and any other Nostr
+client, on any platform — the publish path lives in `sonar-core`, so Android,
+iOS, and desktop all had it.
+
+**Call sites:** one shared implementation:
+`core/sonar-core/src/client.rs` `publish_profile` /
+`publish_profile_background` (`resolve_profile_publish` is the decision).
+Compose reaches it via `SonarCore.publishProfile` (connect-path
+`completeRelayStartup`, `updateNickname`, `claimHandle` in `SonarAppState.kt`);
+Apple via `publishProfile`/`publishProfileBackground`
+(`SonarAppStore.swift`, `MarmotChatView.swift`). No per-platform variant
+exists, deliberately.
+
+**Guarded by:** `client.rs::empty_fetch_falls_back_to_cached_profile`, `client.rs::unchanged_profile_skips_republish`, `client.rs::cache_never_resurrects_fields_deleted_remotely`, `client.rs::fresh_key_with_no_cache_publishes`, `client.rs::empty_fetch_with_unreadable_cache_skips_publish`, `client.rs::unreadable_cache_with_present_remote_still_publishes`, `own_profile.rs::sidecar_round_trip_and_wipe`, `own_profile.rs::corrupt_sidecar_reads_as_unreadable_not_missing`, `e2e.rs::profile_republish_against_empty_relay_keeps_sidecar_fields`
+
+**Coverage (honest):** the unit tests pin the pure decision
+(`resolve_profile_publish`) and the sidecar round-trip; the e2e test pins the
+foreground wiring against a real relay — publish rich, reopen the same DB
+against an *empty* relay, rename, and assert the republished event still
+carries picture/about (this is the R-001 call-site shape the unit tests
+cannot see). Still unasserted: the background path's wiring (same code shape,
+no test drives `publish_profile_background` through the sidecar),
+`created_at` stability on skip, and the publish lock's serialization (the
+lock is trivially correct by construction, but nothing would fail if it were
+removed).
+
+**Rejected:**
+- *Always merging the cache over the fetched profile.* Resurrects fields the
+  user deliberately deleted through another client. The cache is a floor only
+  when the fetch saw nothing; a present relay copy stays authoritative.
+- *Treating an empty fetch as an error and never publishing.* Bricks
+  first-publish for genuinely fresh keys, and blocks the self-heal republish
+  when relays really did lose the event. The cache distinguishes the two.
+- *Fixing only the churn (skip-if-unchanged) without the cache.* Shrinks the
+  exposure but the wipe stays one bad fetch away; the first empty fetch after
+  a nickname edit still strips the profile.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
