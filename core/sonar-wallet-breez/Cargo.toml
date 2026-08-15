@@ -47,3 +47,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # it here to keep swap behavior identical to upstream binary releases.
 [patch.crates-io]
 secp256k1-zkp = { git = "https://github.com/breez/rust-secp256k1-zkp.git", rev = "eac2e479255a6e32b5588bc25ee53c642fdd8395" }
+
+# github.com/breez/breez-sdk started returning 404 on 2026-08-15 — deleted or
+# made private upstream. breez-sdk-liquid (every rev, including main) still
+# pulls sdk-common/sdk-macros from that URL, and neither crate was published to
+# crates.io, so without this patch the island cannot build from a cold cargo
+# cache. The two crates are vendored from a local clone taken while the repo
+# was still up, verified against the pinned SHA. Full story, provenance, and
+# removal criteria: core/vendor/breez-sdk/VENDORED.md
+[patch."https://github.com/breez/breez-sdk"]
+sdk-common = { path = "../vendor/breez-sdk/libs/sdk-common" }
+sdk-macros = { path = "../vendor/breez-sdk/libs/sdk-macros" }
