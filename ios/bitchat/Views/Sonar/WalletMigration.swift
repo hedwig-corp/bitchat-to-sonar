@@ -1,6 +1,9 @@
+#if os(iOS) || os(macOS)
+
 import Foundation
+import SonarCore
 import SwiftUI
-import SonarWalletKit
+import WalletKit
 
 /// Breez→Cashu migration on Apple.
 ///
@@ -357,3 +360,5 @@ struct SonarWalletMigrationScreen: View {
         .buttonStyle(.borderedProminent)
     }
 }
+
+#endif
