@@ -673,17 +673,38 @@ fn canary_payload() -> Vec<u8> {
     data
 }
 
+/// Cap a status-page `desc` at 120 bytes without ever splitting a UTF-8
+/// character.
+///
+/// This used to be `&s[..117]`, a raw byte index into a `String`: it panics
+/// with "byte index 117 is not a char boundary" whenever byte 117 lands inside
+/// a multi-byte character. Nothing routed through here carries non-ASCII today
+/// — the only externally-influenced field is a Blossom server's `X-Reason`
+/// header, and `HeaderValue::to_str` rejects any byte outside visible ASCII, so
+/// a hostile header degrades to "Unknown reason" long before it reaches this
+/// string — but a byte index is wrong by construction, and this runs inside a
+/// long-lived publisher where a panic costs the status page until restart.
+/// `str::floor_char_boundary` is still unstable, hence the walk.
+fn truncate_desc(s: &str) -> String {
+    const MAX_BYTES: usize = 120;
+    const CUT: usize = 117;
+    if s.len() <= MAX_BYTES {
+        return s.to_owned();
+    }
+    let mut end = CUT;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 fn summarize_blossom_err(err: &nostr_blossom::error::Error) -> String {
     let s = err.to_string();
     // Keep the status page desc short; full text stays in probe JSON.
     if let Some(rest) = s.strip_prefix("Failed to upload blob: ") {
         return rest.to_owned();
     }
-    if s.len() > 120 {
-        format!("{}…", &s[..117])
-    } else {
-        s
-    }
+    truncate_desc(&s)
 }
 
 #[cfg(test)]
@@ -694,6 +715,33 @@ mod tests {
     #[test]
     fn primary_matches_app_default_blossom() {
         assert_eq!(DEFAULT_BLOSSOM_SERVER, "https://push.sonar.hedwig.sh");
+    }
+
+    /// Regression: the truncation was a raw byte slice `&s[..117]`, so any
+    /// error string over 120 bytes whose 117th byte fell inside a multi-byte
+    /// character panicked the publisher instead of shortening the desc.
+    #[test]
+    fn truncate_desc_never_splits_a_char() {
+        // Byte 117 lands mid-character: 116 ASCII bytes, then a 2-byte U+00BD.
+        let mid = format!("{}\u{00bd}{}", "a".repeat(116), "b".repeat(40));
+        assert!(mid.len() > 120 && !mid.is_char_boundary(117));
+        let out = truncate_desc(&mid);
+        assert_eq!(out, format!("{}…", "a".repeat(116)));
+
+        // Also exercise a wider char and a fully multi-byte string.
+        for s in [
+            format!("{}\u{1f600}{}", "a".repeat(115), "b".repeat(40)),
+            "\u{4e2d}".repeat(80),
+        ] {
+            let out = truncate_desc(&s);
+            assert!(out.ends_with('…'), "expected ellipsis for {} bytes", s.len());
+            assert!(out.len() <= 117 + '…'.len_utf8());
+        }
+
+        // Short strings pass through untouched, ellipsis-free.
+        assert_eq!(truncate_desc("boom"), "boom");
+        let exactly_120 = "c".repeat(120);
+        assert_eq!(truncate_desc(&exactly_120), exactly_120);
     }
 
     #[test]

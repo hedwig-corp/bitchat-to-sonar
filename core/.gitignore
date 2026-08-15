@@ -1,3 +1,5 @@
 /target/
 # sonar-ble is a detached workspace with its own target dir.
 /sonar-ble/target/
+# sonar-wallet-breez is likewise a detached workspace (see core/Cargo.toml).
+/sonar-wallet-breez/target/

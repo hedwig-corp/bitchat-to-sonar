@@ -20,6 +20,7 @@ pub mod mesh_engine;
 pub mod noise;
 pub mod notification;
 pub mod outbox;
+pub mod own_profile;
 pub mod push;
 pub mod relay_directory;
 pub mod sonar_descriptor;

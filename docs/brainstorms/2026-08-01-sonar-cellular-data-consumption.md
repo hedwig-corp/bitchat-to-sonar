@@ -1,8 +1,8 @@
 # Sonar cellular data consumption (66.3 GB / period, iOS)
 
-> **Status: P0 shipped.** See `docs/REGRESSIONS.md` R-032 for the landed
+> **Status: P0 shipped.** See `docs/REGRESSIONS.md` R-033 for the landed
 > invariant, its tests, and both platform call sites. Two things changed versus
-> the plan below while implementing, both recorded in R-032's `Rejected`:
+> the plan below while implementing, both recorded in R-033's `Rejected`:
 > the fingerprint must be taken over the **plaintext** (the seal's nonce is
 > fresh per run, so sealed bytes never repeat and no server-side dedup can
 > help), and the unchanged-refresh window tracks the user's chosen cadence
@@ -24,7 +24,7 @@ schedule** — and the codebase has exactly one of those.
 
 > The mechanics below are written in the present tense as they were **before**
 > the fix, because they are the diagnosis. All four are addressed on this
-> branch; R-032 is the record of what the behaviour is now.
+> branch; R-033 is the record of what the behaviour is now.
 
 Every element verified, not inferred:
 

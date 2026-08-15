@@ -29,6 +29,17 @@ function safeHref(href) {
     : '#';
 }
 
+// Image sources are a narrower allow-list than hrefs: absolute http(s) or
+// site-relative only. `data:` is excluded on purpose — an SVG data URI is a
+// script execution vector — and there is no `#`/`mailto:` case, since a `#`
+// fallback as an img src re-requests the current page. Returns null for
+// anything else so the caller drops the image instead of emitting a broken tag.
+/** @param {string} src @returns {string | null} */
+function safeSrc(src) {
+  const v = src.trim();
+  return /^\/(?!\/)/.test(v) || /^https?:\/\//i.test(v) ? v : null;
+}
+
 /**
  * @param {string} s
  * @param {(href: string) => string} resolve maps a relative markdown link to a real href
@@ -38,6 +49,18 @@ function inline(s, resolve) {
     .replace(/`([^`]+)`/g, (/** @type {string} */ m, /** @type {string} */ c) => '<code>' + c + '</code>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    // Images MUST run before the link rule below: `![alt](src)` also matches
+    // the link pattern, which would leave a stray "!" and turn a screenshot
+    // into a hyperlink. An unusable src drops the whole image rather than
+    // emitting a tag that 404s or re-requests the page.
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (/** @type {string} */ m, /** @type {string} */ alt, /** @type {string} */ s) => {
+      const src = safeSrc(s);
+      if (!src) return '';
+      return (
+        '<img src="' + escQuotes(src) + '" alt="' + escQuotes(alt) + '"' +
+        ' loading="lazy" decoding="async">'
+      );
+    })
     .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (/** @type {string} */ m, /** @type {string} */ t, /** @type {string} */ h) => {
       let href = h;
       let cls = '';
