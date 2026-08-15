@@ -57,16 +57,16 @@ Tear down with `docker rm -f sim-mint-src sim-mint-dst`.
 | Destination max | `--amount-sats 2000 --dest-max-sats 100` refuses |
 | melt→mint hand-off | payment reports `Complete`, settlement watch reports `settled` |
 | `settle` resume | re-running `settle` after a migration re-reports the right balance |
+| Crash resume, for real | destination mint frozen (`docker pause`) after the melt, process killed mid-watch, then `settle` recovered the funds — source down exactly 1003, destination up exactly 1000 |
 | NUT-13 restore | deleting the whole destination wallet directory and reopening with only the account key recovers the full balance |
 
-The restore check is the one that matters most for a migration: it is what makes
-moving funds into ecash survivable across a reinstall.
+Two of those matter more than the rest. **NUT-13 restore** is what makes moving
+funds into ecash survivable across a reinstall. **Crash resume** is the safety
+net for the live run: it was tested by genuinely interrupting a migration after
+the money had left the source, not by simulating the state.
 
-Two things that claim is careful *not* to cover. `settle` was exercised on an
-already-settled migration, so it proves the command reads state correctly — a
-genuine mid-flight `Pending` was never induced, and the crash-resume path
-proper is still untested. And every figure above comes from a fake backend; see
-the next section for what that means.
+Every figure above still comes from a fake backend; see below for what that
+means.
 
 **Not proven.** The two mints have *independent* fake backends, so the source
 only pretends to pay and the destination independently believes its own invoice
@@ -86,6 +86,34 @@ Two consequences worth knowing before reading simulation output:
   `input_fee_ppk = 100`, moving 2000 sats debits 2003 (2000 + 2 routing + 1
   input fee) while `fees_sats` reports only the routing fee. Do not read that
   1-sat gap as a Breez-side discrepancy.
+
+## Known gap: the settlement watch has no timeout
+
+Freeze the destination mint after the melt (`docker pause sim-mint-dst` two
+seconds into a `migrate`) and the command prints
+
+```
+{"plan":{"amount_sats":1000,"destination_baseline_sats":0,"source_fee_sats":10}}
+{"paid":{"amount_sats":1000,"fees_sats":2,"id":"01a005c8-…","status":"Complete"}}
+```
+
+and then **hangs indefinitely** — observed past ten minutes with
+`--settle-polls 4`. The poll count cannot bound it: one poll blocks forever on a
+mint that accepts the connection and never answers, which is what a hung server
+looks like (a *refused* connection fails fast instead).
+
+The state is recoverable — unfreezing and running `settle` found the funds, with
+the balances conserved exactly — but the hang lands at the worst moment in the
+whole flow: after the money has left the source, and on a branch that never
+prints the resume instruction, because that text only exists on the `Pending`
+path. An operator who did not already know to interrupt and run `settle` would
+be staring at a dead terminal holding a paid migration. In the app the same
+shape is a spinner that never resolves.
+
+Fixes worth considering: a per-request timeout on the destination sync so a
+poll can fail into `Pending` instead of blocking, and printing the resume
+instruction as soon as the payment succeeds rather than only when settlement
+gives up.
 
 ## Known gap this harness found: `prepare_send` does not check affordability
 
