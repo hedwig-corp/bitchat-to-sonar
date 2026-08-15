@@ -114,6 +114,19 @@ struct SonarBackupScreen: View {
                 ) {
                     freqSheet = true
                 }
+                // A backup is a full-account snapshot, so the default is Wi-Fi
+                // only. The "Last backup" row directly below is deliberate: a
+                // user who is never on Wi-Fi must be able to SEE the backup
+                // going stale and turn this on, rather than silently never
+                // being backed up.
+                SNSettingsRow(
+                    icon: .data, tone: .cyan,
+                    label: String(localized: "Back up over cellular"),
+                    sub: String(localized: "Off: full-account backups wait for Wi-Fi"),
+                    trail: .toggle(store.backupOverCellular)
+                ) {
+                    store.backupOverCellular.toggle()
+                }
                 SNSettingsRow(
                     icon: .drive,
                     label: String(localized: "Last backup"),

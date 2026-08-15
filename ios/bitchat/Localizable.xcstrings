@@ -19,6 +19,9 @@
     "Chat backup uploaded" : {
 
     },
+    "Chat backup is already up to date" : {
+
+    },
     "Backup failed — try again when online" : {
 
     },

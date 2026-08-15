@@ -2425,8 +2425,26 @@ final class SonarAppStore: ObservableObject {
         showStickyToast(String(localized: "Backing up chats…"))
         do {
             // Settings tap = foreground session: reopen so chats stay live.
-            try await marmot.backupAccount(reopenAfterSeal: true)
-            showToast(String(localized: "Chat backup uploaded"))
+            let outcome = try await marmot.backupAccount(reopenAfterSeal: true)
+            // "Uploaded" would be a small lie for an account that was already
+            // current; "failed" (the Compose bug this mirrors) would be a big
+            // one. Say what happened.
+            switch outcome {
+            case .uploaded:
+                showToast(String(localized: "Chat backup uploaded"))
+            case .alreadyUpToDate:
+                showToast(String(localized: "Chat backup is already up to date"))
+            case .skippedOptOut, .abortedMeteredLink:
+                // Unreachable from the manual path: it never passes
+                // `respectOptOut`, and manual backups are deliberately never
+                // metered-gated. If a refactor ever makes this reachable, the
+                // truthful summary is that the upload the user asked for did
+                // not happen — the failure toast, never "up to date"
+                // (assertionFailure is a no-op in Release, so the toast is
+                // what a user would actually see).
+                assertionFailure("manual backup returned an auto-only outcome")
+                showToast(String(localized: "Backup failed — try again when online"))
+            }
             refreshBackupPolicy()
         } catch MarmotService.ServiceError.backupAlreadyInProgress {
             // In-flight backup owns sticky/result toasts; do not clobber with failure.
@@ -2451,6 +2469,19 @@ final class SonarAppStore: ObservableObject {
     @Published private(set) var backupFrequency: String = "daily"
     /// Account footprint for Settings → Storage; nil until measured.
     @Published private(set) var storageBytes: UInt64?
+
+    /// Whether AUTOMATIC backups may upload over a metered link.
+    ///
+    /// Off by default: one full-account snapshot per run, and the executors fire
+    /// on every backgrounding — a roaming user reported 66.3 GB in one billing
+    /// period before this gate existed. Manual "Back up now" ignores it.
+    var backupOverCellular: Bool {
+        get { defaults.bool(forKey: MarmotAccountBackupFlow.cellularOptInKey) }
+        set {
+            objectWillChange.send()
+            defaults.set(newValue, forKey: MarmotAccountBackupFlow.cellularOptInKey)
+        }
+    }
 
     /// Large media waits for Wi-Fi. Host preference, mirrored from Compose.
     var wifiOnly: Bool {
@@ -2603,6 +2634,11 @@ final class SonarAppStore: ObservableObject {
     }
 
     private func clearAccountBoundLocalStateForRestore() {
+        // "Back up over cellular" is consent from ONE account to spend the
+        // user's data plan. Restoring account B must not inherit account A's
+        // answer — B never gave it. Panic wipe clears this too; both paths
+        // replace the account, so both have to.
+        defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         path = []
         unreadCountAtOpenByDM.removeAll()
         jumpMessageIdAtOpenByDM.removeAll()
@@ -9663,6 +9699,9 @@ final class SonarAppStore: ObservableObject {
         // Panic wipe must not leave auto-backup disclosure / BG tasks armed for
         // the next account (or race a due seal against wipeDatabase).
         defaults.removeObject(forKey: Self.autoBackupDisclosedKey)
+        // Same rule for the cellular opt-in: it is a per-account consent to
+        // spend the user's data plan, and the next account never gave it.
+        defaults.removeObject(forKey: MarmotAccountBackupFlow.cellularOptInKey)
         #if os(iOS)
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: AutoBackupBackgroundScheduler.taskIdentifier)
         #endif

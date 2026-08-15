@@ -24,6 +24,7 @@
   "Bluetooth finds people around you, even offline.": "bluetooth_finds_people_around_you_even",
   "Cancel": "cancel",
   "Chat backup": "chat_backup",
+  "Chat backup is already up to date": "chat_backup_is_already_up_to_date",
   "Chat backup is on — encrypted backups upload automatically. Manage in Settings.": "chat_backup_is_on_encrypted_backups",
   "Chat backup uploaded": "chat_backup_uploaded",
   "Choose an image": "choose_an_image",

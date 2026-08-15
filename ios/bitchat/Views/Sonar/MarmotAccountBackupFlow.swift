@@ -46,4 +46,80 @@ enum MarmotAccountBackupFlow {
             reconnectRequired: reconnectRequired
         )
     }
+
+    /// What a `backupAccount()` run that did not throw actually did. Mirrors
+    /// Compose's `AccountBackupOutcome` minus the failure legs, which throw on
+    /// iOS.
+    ///
+    /// A `Bool` here conflated three different "no upload" exits, and the
+    /// auto-executor's summary line then logged an opt-out or metered abort as
+    /// "account already backed up" — a lie in exactly the log stream R-033
+    /// names as the real verification channel for this feature.
+    enum RunOutcome {
+        /// Bytes went to Blossom and the success was recorded.
+        case uploaded
+        /// Core skip: byte-identical to the last successful upload. A no-op,
+        /// never a failure.
+        case alreadyUpToDate
+        /// `respectOptOut` was set and the policy is disabled. Nothing sealed.
+        case skippedOptOut
+        /// The route became metered between the executor's entry gate and the
+        /// upload boundary; the seal was discarded, the bytes were not sent.
+        case abortedMeteredLink
+    }
+
+    /// `UserDefaults` key for "back up over cellular". Off by default: an
+    /// account backup is a multi-megabyte full-snapshot upload, and shipping it
+    /// over a metered link by default cost one roaming user 66.3 GB in a single
+    /// billing period.
+    static let cellularOptInKey = "sonar.auto_backup_cellular"
+
+    /// Whether an AUTOMATIC backup may run on the current route.
+    ///
+    /// Manual "Back up now" deliberately does not consult this — the user asked
+    /// for it and can see the result.
+    ///
+    /// Never let this become "no backups at all": the Backup screen shows the
+    /// age of the last successful upload next to the toggle, so a user who is
+    /// permanently on cellular can see the staleness and opt in. Silent
+    /// indefinite skipping would be an Account Key Durability problem, not a
+    /// data saving.
+    static func autoBackupAllowedOnCurrentPath(
+        pathIsExpensive: Bool,
+        cellularOptIn: Bool
+    ) -> Bool {
+        !pathIsExpensive || cellularOptIn
+    }
+
+    /// Stable Display text of `sonar_core::Error::AccountBackupUnchanged`.
+    ///
+    /// Errors cross UniFFI as rendered strings (`SonarFfiError` is a
+    /// `flat_error`), so matching the message is the contract here — the same
+    /// one `AccountBackupMissing` already relies on. Kept to the distinctive
+    /// stem so a reworded tail cannot silently turn a no-op back into a
+    /// user-visible failure.
+    private static let unchangedAccountMarker = "account backup unchanged"
+
+    /// True when core refused to re-seal because the account's plaintext
+    /// fingerprint still matches the one recorded for the last **successful**
+    /// upload, inside the refresh window.
+    ///
+    /// Stated precisely on purpose: this is a local check against
+    /// `last_plain_hash`/`last_success_at`, not a confirmation that the blob is
+    /// still present on Blossom. If the host GC'd it, the refresh window (the
+    /// user's cadence, capped at a week) is what re-establishes it.
+    ///
+    /// This is a **no-op, not a failure**: nothing needs uploading. Callers must
+    /// not write it to `last_error` (it would put a red row under a perfectly
+    /// backed-up account) and must not surface it as a failed backup.
+    static func isUnchangedAccount(_ error: Error) -> Bool {
+        let text = (error as? LocalizedError)?.errorDescription
+            ?? String(describing: error)
+        if text.localizedCaseInsensitiveContains(unchangedAccountMarker) {
+            return true
+        }
+        // `String(describing:)` on some bridged error shapes hides the message;
+        // `localizedDescription` is the other rendering hosts see.
+        return error.localizedDescription.localizedCaseInsensitiveContains(unchangedAccountMarker)
+    }
 }

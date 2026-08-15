@@ -2004,6 +2004,200 @@ removed).
   exposure but the wipe stays one bad fetch away; the first empty fetch after
   a nickname edit still strips the profile.
 
+## R-033 — Auto-backup spends the user's data plan only for bytes that changed
+
+**Invariant:** an automatic account backup may not run on a metered link unless
+the user opted in, and may not re-upload an account whose plaintext fingerprint
+still matches the last successful upload *within the refresh window* (the user's
+own cadence, capped at a week — it deliberately does re-upload identical bytes
+at that boundary). Only messages **this device produced** may shorten the backup
+cadence; received history rides the daily floor. Skipping is never a failure,
+and "wait for Wi-Fi" is never allowed to become "never back up".
+
+**Breaks as:** iOS Settings → Mobile Data showing **Sonar 66.3 GB** in one
+billing period — 20× the next-heaviest app on the same phone (Instagram, 3.35
+GB), with 81.9 of the device's 82.4 GB roaming. That works out to ~2.2 GB/day
+sustained, which no amount of chat text explains; it is a large payload on a
+schedule.
+
+**Why:** four mechanisms multiplied.
+
+1. *Every upload is a full snapshot.* `seal_account_backup_files` reads the
+   whole SQLCipher DB **plus** the conversation index and PUTs the sealed blob
+   (cap 200 MiB). There is no delta format.
+2. *Nothing on the server can dedupe it.* `seal_account_backup` draws a fresh
+   random nonce per run, so an unchanged account produces different ciphertext
+   and a different sha256 every time. Blossom is content-addressed and still
+   sees a brand-new blob. **Dedup has to happen before encryption or not at
+   all** — this is the part that makes the naive "the server will collapse
+   them" intuition wrong.
+3. *The real cadence was 30 minutes, not daily.* `backup_is_due` fires as soon
+   as the policy is `dirty` and `opportunistic_debounce_secs` has passed, and
+   `mark_backup_dirty` ran on **every incoming message** as well as every send.
+   An account in one active group was therefore dirty essentially always; the
+   24 h `daily_interval_secs` only ever throttled a *quiet* account.
+4. *No code anywhere distinguished Wi-Fi from cellular.* iOS never read
+   `NWPath.isExpensive`; `BGProcessingTaskRequest` asked only
+   `requiresNetworkConnectivity`; Android asked `NetworkType.CONNECTED`, not
+   `UNMETERED`. Meanwhile the executors are the hottest triggers in the app —
+   iOS runs one on **every** transition to background plus a `BGAppRefresh`
+   re-armed 3 minutes later (the scheduler's own doc comment measures 18 runs
+   in a 53-hour device log), and Compose mirrors both.
+
+48 uploads/day × a ~46 MB sealed account reproduces 2.2 GB/day exactly. Roaming
+is what removed the last accidental brake: the design leaned on "it will mostly
+happen on Wi-Fi", and for this user no upload ever was.
+
+**A skip is not a failure, and must not read as one.** Three places conflated
+them, all found by review rather than by the tests above: Compose returned a
+bare `Boolean` so a manual tap on an already-current account toasted
+"Backup failed — try again when online"; `AutoBackupWorker` mapped the refusal
+to `Result.retry()` and burned its backoff slots re-discovering the same no-op;
+and iOS logged "Auto account backup uploaded" when nothing was uploaded. The
+outcome is now tri-state (`AccountBackupOutcome`) on Compose and a returned
+`Bool` on iOS. A false "backup broken" alarm on a healthy account is the same
+class of bug as the "Last backup: 6 days ago" one this entry already avoids.
+
+**A skip must also close the window it opened.** `seal_account_backup_files`
+stamps `record_backup_attempt` *before* the redundancy check. While
+`attempt_dirty_seq` is set, `mark_backup_dirty` re-persists the policy on the
+MESSAGE HOT PATH instead of taking its cached early-out — so returning early
+without clearing it left a per-message disk write armed until the next attempt.
+Success and failure both clear it; so must a skip. `attempt_plain_hash` is
+cleared on load from disk for the same reason `attempt_dirty_seq` already was:
+a seal that stamped and then died (this app is killed in the background
+routinely) must not leave a fingerprint for a later success to promote, or every
+seal after that would skip against a blob Blossom never received.
+
+**A skip is also evidence, and must act on it.** The redundancy check proves
+the bytes read under this attempt match the last successful upload, so the skip
+clears two things (multi-model review found both): stale `dirty` — a send
+landing mid-attempt but before the DB read is *in* the sealed bytes yet keeps
+`dirty=true` at success, and left set with nothing new to upload it re-seals
+and re-hashes the whole account every opportunistic pass, forever — and stale
+`last_error`, which would otherwise keep a red Settings row under a provably
+backed-up account. The `dirty` clear uses the same `attempt_dirty_seq` guard as
+`record_backup_success` — a bump *after* the attempt snapshot keeps `dirty`,
+because that send is not proven covered; the `last_error` clear is
+unconditional, matching how success clears it.
+
+**Guarded by:** `client.rs::only_our_own_messages_make_the_account_backup_urgent`
+(pins the real index call site — inbound must not dirty, outbound must)
+
+Every citation below is deliberately on ONE line per `Guarded by:` prefix.
+`check-regression-ledger.sh` greps for lines *starting* with the prefix, so a
+citation wrapped onto a continuation line is silently never verified — the
+first draft of this entry had eight of those. If you reflow this block, keep
+each prefix's citations on its own single line or they stop being checked.
+
+**Also guarded by:** `account_backup.rs::second_seal_of_an_untouched_account_is_refused`, `account_backup.rs::seal_runs_again_once_the_account_changes`, `account_backup.rs::plaintext_fingerprint_tracks_content_not_nonce`, `account_backup.rs::unchanged_account_inside_the_refresh_window_is_redundant`, `account_backup.rs::the_refresh_window_never_outlives_the_chosen_cadence`, `account_backup.rs::a_failed_attempt_drops_its_fingerprint`, `account_backup.rs::a_redundant_seal_closes_the_attempt_window_it_opened`, `account_backup.rs::a_crashed_seals_fingerprint_does_not_survive_reload`, `account_backup.rs::no_recorded_success_is_never_redundant`, `account_backup.rs::changed_account_is_never_redundant`, `account_backup.rs::unchanged_account_past_the_refresh_window_uploads_again`, `account_backup.rs::a_redundant_skip_clears_stale_dirty`, `account_backup.rs::a_send_during_the_skips_own_window_keeps_dirty`, `account_backup.rs::a_redundant_skip_clears_a_stale_error`
+
+**Also guarded by:** `AutoBackupNetworkPolicyTest.meteredLinkBlocksAutomaticBackupByDefault`, `AutoBackupNetworkPolicyTest.coreRefusalToReuploadAnUnchangedAccountIsNotAFailure`, `AutoBackupNetworkPolicyTest.alreadyUpToDateIsNotAFailure`, `AutoBackupNetworkPolicyTest.optingInAllowsAutomaticBackupOnCellular`, `AutoBackupNetworkPolicyTest.realBackupFailuresAreStillFailures`
+
+**Also guarded by:** `MarmotAccountBackupFlowTests.automaticBackupIsBlockedOnAMeteredLinkByDefault`, `MarmotAccountBackupFlowTests.optingInAllowsAutomaticBackupOnCellular`, `MarmotAccountBackupFlowTests.unmeteredLinksAreNeverGated`, `MarmotAccountBackupFlowTests.coreRefusalToReuploadAnUnchangedAccountIsNotAFailure`, `MarmotAccountBackupFlowTests.realBackupFailuresAreStillFailures`
+
+**Both platform call sites.** Core is shared: `upsert_index_for_message`
+(`client.rs`) and the fingerprint check in `seal_account_backup_files`
+(`account_backup.rs`) fix the cadence and the redundant-upload halves for every
+host at once. The metered gate is per-host and had to land twice —
+iOS `MarmotChatModel.runAutoBackupIfDue` (the single funnel all four iOS
+executors pass through: the 15-minute in-app loop, the opportunistic
+background-transition run, `BGAppRefresh` and `BGProcessing`), and Compose
+`SonarAppState.runAutoBackupIfDue` + `runOpportunisticBackupOnBackground` plus
+`AutoBackupWorker`'s `NetworkType.UNMETERED` constraint **and** its run-time
+re-check. macOS inherits the core half and shares `SonarBackupScreen`.
+
+**The gate is re-checked at the upload boundary, not just at executor entry.**
+Relay drain, checkpoint, seal and reconnect take seconds on a large account, so
+a Wi-Fi→cellular handoff between the entry check and the PUT would ship the
+whole snapshot anyway. Both surfaces re-check immediately before the upload and
+abort, recording a benign failure so `dirty` stays set for the next window.
+
+**TRACKED GAP (Compose Desktop).** The JVM has no portable metered-network API,
+so `isNetworkMetered()` is a hard-coded `false` there and the preference cannot
+be enforced. The Backup screen therefore HIDES the toggle on that target
+(`meteredNetworkPolicySupported`) rather than offering a data-saving control
+that silently does nothing — a UI promising something it cannot deliver is the
+same defect class as the "Backup failed" toast on a healthy account. A desktop
+on a phone hotspot still auto-uploads full snapshots. Follow-up: implement
+`isNetworkMetered()` per desktop OS (Windows exposes a connection-cost API;
+macOS and Linux need separate paths), then flip the flag and the toggle returns
+with no other edits. Deliberately not in this change: the reported incident is
+iOS cellular, and a half-working desktop probe would be worse than an admitted
+gap.
+
+**Why the refresh window tracks the user's cadence rather than a flat constant.**
+An unchanged account still re-uploads once per chosen interval (capped at
+`UNCHANGED_REFRESH_SECS`). Two reasons, and the first is the one that would have
+generated a bug report: Settings shows the age of the last successful upload, so
+a "Daily" user reading *"Last backup: 6 days ago"* concludes backup is broken
+and cannot see that the reason is "nothing changed". Second, the blob lives on a
+host we do not control, and re-establishing it on their schedule bounds
+retention/GC exposure. The saving that matters was never this — it is killing
+the 30-minute opportunistic re-upload and keeping all of it off cellular.
+
+**Two ways this gate could have meant "no backups", both closed.** (1) The
+Compose opportunistic path returned *before* enqueueing the one-shot worker, so
+a user on cellular got nothing scheduled at all and fell back to the 12-hour
+periodic. The one-shot carries an `UNMETERED` constraint precisely so
+WorkManager can **park** it and run it the moment Wi-Fi arrives; it is now
+enqueued unconditionally and only the in-process upload consults the gate.
+(2) iOS read `NetworkActivationService.pathIsExpensive`, which is pessimistic
+until the first `NWPathMonitor` callback — and `start()` is only ever called
+from the UI scene, so a `BGProcessing`/`BGAppRefresh` launch could evaluate the
+gate against a default that never updates and silently skip every background
+backup. The gate now calls `currentPathIsExpensive()`, which starts the monitor
+on demand and reads `currentPath`, answering `false` when there is no route at
+all (let the upload fail on its own terms rather than be suppressed as
+"expensive").
+
+**Not guarded.** The *Swift* half, again, for the reason
+[[ios-not-built-in-ci]] records: the gate lives in `MarmotChatModel`, which no
+iOS test constructs, and iOS tests do not run in CI regardless. What is pinned
+is the pure predicate (`autoBackupAllowedOnCurrentPath`,
+`isUnchangedAccount`); delete the **call** in `runAutoBackupIfDue` and every
+test stays green. That is the R-001 shape and it is admitted as one. Also
+unpinned: `NetworkActivationService.currentPathIsExpensive()` and its
+start-on-demand behaviour, Android's `isNetworkMetered()` actual (needs a
+`ConnectivityManager`), the `NetworkType` mapping in
+`AutoBackupWorker.networkType()`, and the unconditional one-shot enqueue.
+`only_our_own_messages_make_the_account_backup_urgent` pins the index call site
+but not `spawn_send_bookkeeping`, which is the other site that marks dirty on a
+real local send. Real verification is Settings → Mobile Data on a device left on
+cellular for a day, cross-checked against `SecureLogger` `.session` lines
+(`Auto-backup executor: skipped (metered link, cellular backup off)` /
+`Account backup skipped — unchanged since the last successful upload`).
+
+**Rejected:**
+- *Letting the daily floor re-upload identical bytes anyway.* It is a full
+  snapshot; "identical" means the existing blob already satisfies it. The
+  cadence-bounded refresh window above is the compromise that keeps the UI
+  honest without paying 1440 uploads/month.
+- *Hashing the sealed ciphertext instead of the plaintext.* Cannot work — the
+  nonce is fresh per seal, so sealed bytes never repeat. This is the trap that
+  makes the bug counter-intuitive and it is why the fingerprint is taken over
+  the package's plaintext (DB ‖ index ‖ db_key, length-delimited).
+- *A `(mtime, size)` change token instead of a content hash.* Nearly free, but
+  wrong here: SQLite in WAL mode leaves the main file's mtime untouched while
+  the `-wal` holds new commits, so it can report "unchanged" for an account
+  that changed. A false *unchanged* is the one failure direction this module
+  must never risk. The hash costs nothing extra because the seal has already
+  read the bytes.
+- *Adding a `skip_if_unchanged` parameter so manual "Back up now" can force an
+  upload.* It would change two `#[uniffi::export]` signatures, and the
+  committed Swift/Kotlin bindings are generated — a checksum move no CI job
+  watches ([[uniffi-doc-comment-is-an-abi-change]]). The error crosses as a
+  rendered string instead (`SonarFfiError` is a `flat_error`), the same
+  contract `AccountBackupMissing` already relies on. Manual backup of an
+  unchanged account is a no-op that returns cleanly rather than an error.
+- *Bumping `last_success_at` on a redundant skip so the UI reads "just now".*
+  It would make the refresh window unreachable — `now - last_ok` could never
+  grow — leaving a GC'd blob as the only backup, forever.
+- *Gating media downloads and relay sync on the same flag.* Measured first:
+  media is view-driven and durably cached under Application Support (no refetch
+  loop), and relay sync is watermark-scoped and event-driven. Neither is a
+  GB/day source, and gating chat traffic on Wi-Fi would break the product.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
