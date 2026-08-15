@@ -1733,6 +1733,17 @@ class SonarAppState(private val scope: CoroutineScope) {
                     return
                 }
                 runCatching { SonarCore.callIncomingOffer(ctrl.callId, ctrl.addrB64, ctrl.video) }
+                // A build without a call engine records the missed call and stops.
+                // Ringing on a screen whose Accept can only fail is the same dead
+                // affordance as the outgoing buttons, one step further along: the
+                // user answers, and nothing happens.
+                if (!SonarCore.callsSupported) {
+                    runCatching { SonarCore.callHangup(ctrl.callId) }
+                    callLogs.getOrPut(callChatId) { mutableListOf() }
+                        .add(CallRecord(id = ctrl.callId, video = ctrl.video, mine = false, durSecs = 0, tsSecs = SonarClock.nowSecs()))
+                    callVersion++
+                    return
+                }
                 // A stale offer (peer rang while we were offline) is a missed call.
                 if (SonarClock.nowSecs() - ctrl.unixSecs > 60) {
                     runCatching { SonarCore.callHangup(ctrl.callId) }
@@ -10867,6 +10878,11 @@ class SonarAppState(private val scope: CoroutineScope) {
      *  (CAP_CALLS from 0x53) and require either live BLE or the npub needed to
      *  create/reuse White Noise signaling for that same discovered peer. */
     fun canCall(chatId: String): Boolean {
+        // Platform capability first, so every entry point agrees. Three of the four
+        // call buttons already asked canCall(); the desktop detail rail did not and
+        // offered a dead affordance on every install. Answering here fixes the
+        // ungated one at the source rather than per-button.
+        if (!SonarCore.callsSupported) return false
         val peerId = if (isMeshChat(chatId)) meshPeerId(chatId) else peerIdForMarmotGroup(chatId)
         if (peerId == null) return marmotChatCallCapable(chatId)
         return callCapablePeer(peerId) &&

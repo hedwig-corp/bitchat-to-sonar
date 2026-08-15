@@ -607,12 +607,18 @@ private fun DmDetailRail(state: SonarAppState, scr: Screen.Chat) {
         }
 
         Spacer(Modifier.weight(1f))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
-            SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2) {
-                state.placeCall(scr.id, scr.name, video = false)
-            }
-            SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2) {
-                state.placeCall(scr.id, scr.name, video = true)
+        // Gated like every other call button in the app. Rendering these
+        // unconditionally was the one ungated site, and since the desktop core has
+        // no call engine they were dead on every install: tapping pushed the ringing
+        // screen, failed, toasted and popped.
+        if (state.canCall(scr.id)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)) {
+                SNIconButton(SNIconName.Phone, size = 18.dp, tint = s.text2) {
+                    state.placeCall(scr.id, scr.name, video = false)
+                }
+                SNIconButton(SNIconName.Videocam, size = 18.dp, tint = s.text2) {
+                    state.placeCall(scr.id, scr.name, video = true)
+                }
             }
         }
     }
