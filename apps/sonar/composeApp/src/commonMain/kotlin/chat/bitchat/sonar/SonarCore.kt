@@ -1058,12 +1058,11 @@ expect object SonarCore {
     /**
      * Whether this build can actually place or take a call.
      *
-     * False on desktop: the iroh call engine (`calls-audio`: iroh + opus + cpal) is
-     * not compiled into the desktop `sonar_ffi` dylib. The desktop core said so in a
-     * comment claiming "the call UI is never offered", but nothing enforced it, so
-     * the detail rail rendered Phone and Videocam buttons on every install and an
-     * incoming offer raised a ringing screen that could never be answered. A comment
-     * is not a guarantee; this is the value the UI can ask.
+     * True on Android, whose AAR is built with `calls-audio`. False on desktop,
+     * where the iroh call engine is not compiled into the `sonar_ffi` dylib.
+     *
+     * Gates the call buttons, the incoming-offer path, and what this node
+     * advertises to peers.
      */
     val callsSupported: Boolean
 
