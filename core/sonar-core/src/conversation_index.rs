@@ -77,6 +77,7 @@ fn sqlite_file_set(path: PathBuf) -> Vec<PathBuf> {
 
 impl ConversationIndex {
     pub fn open(path: &Path, key: [u8; 32]) -> Result<Self> {
+        crate::sqlcipher_runtime::ensure_no_checkpoint_on_close()?;
         let db = Connection::open(path)
             .map_err(|e| crate::Error::Storage(format!("index db open: {e}")))?;
         let hex_key = hex::encode(key);

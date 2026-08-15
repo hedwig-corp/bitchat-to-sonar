@@ -365,6 +365,10 @@ impl MarmotEngine {
         db_path: impl AsRef<Path>,
         key: [u8; 32],
     ) -> Result<Self> {
+        // Before MDK's Connection::open: skip WAL checkpoint on sqlite3_close so
+        // a suspend drop cannot hold file locks past iOS's ~30s grace
+        // (0xdead10cc round 10). See sqlcipher_runtime.
+        crate::sqlcipher_runtime::ensure_no_checkpoint_on_close()?;
         let path = db_path.as_ref();
         let storage = match MdkSqliteStorage::new_with_key(path, EncryptionConfig::new(key)) {
             Ok(storage) => storage,

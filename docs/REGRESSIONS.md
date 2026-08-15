@@ -2198,6 +2198,69 @@ cellular for a day, cross-checked against `SecureLogger` `.session` lines
   loop), and relay sync is watermark-scoped and event-driven. Neither is a
   GB/day source, and gating chat traffic on Wi-Fi would break the product.
 
+## R-034 — Dropping the Marmot store must not WAL-checkpoint on close
+
+**Invariant:** every SQLCipher connection opened by sonar-core (MDK store,
+conversation index, backup helper) has `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`.
+`sqlite3_close` during `SonarNode` drop must not run a WAL checkpoint.
+
+**Breaks as:** `RUNNINGBOARD 0xdead10cc`, round 10 — TestFlight **1.12.8 (37)**,
+user comment "I just closed the app and the app just crashed." Distinguishing
+feature versus rounds 1–9: Thread 0 is idle in the run loop (`Role: unknown`);
+the only thread touching the store is inside `rusqlite::InnerConnection::close`
+→ `sqlite3_close` → `sqlite3_backup_finish` → `pread`, reached from
+`Arc<Mutex<Connection>>::drop_slow` in `sonar_core` as `SonarNode` is freed.
+The close *started*. The WAL checkpoint did not finish before iOS's ~30s
+background grace, so RunningBoard killed the process for holding a file lock.
+
+Three other TestFlight reports in the same batch were **1.12.6 (34)** with the
+already-fixed shapes: `SonarNode::connect` parked in a bare `block_on` (R-031)
+and `wait_for_marmot_event` / `call_wait_event` with the store still open
+(rounds 6–9). They are not this entry.
+
+**Why:** SQLite's default in WAL mode is a FULL checkpoint on `sqlite3_close`.
+MDK's `MdkSqliteStorage` holds `Arc<Mutex<Connection>>` behind `pub(crate)`,
+so the host cannot set per-connection flags on the MLS store. `closeNode()`
+sets `node = nil`, UniFFI drops `SonarNode`, rusqlite closes, and a large
+Marmot WAL checkpoints with `pread` while the process is already suspending.
+Rounds 1–9 asked which *entry point* left the store open; this round is the
+close itself taking too long.
+
+**Call sites:** core `sqlcipher_runtime::ensure_no_checkpoint_on_close` (the
+`sqlite3_auto_extension` hook), invoked from `MarmotEngine::persistent`,
+`ConversationIndex::open`, and `checkpoint_sqlcipher_file` *before*
+`Connection::open`. The backup path still runs an explicit
+`PRAGMA wal_checkpoint(TRUNCATE)` before sealing — that pragma is independent
+of close-time checkpoint. **Not applicable to Compose** for the crash (no
+RunningBoard file-lock kill); the Rust hook still runs there and only makes
+teardown cheaper.
+
+**Guarded by:** `sqlcipher_runtime.rs::new_sqlcipher_connections_skip_checkpoint_on_close`, `sqlcipher_runtime.rs::file_backed_wal_connection_also_skips_checkpoint_on_close`
+
+**Coverage (honest):** the tests pin that a connection opened *after* the hook
+has `NO_CKPT_ON_CLOSE` and that a WAL file still reopens with committed rows.
+They do not pin that `MarmotService.closeNode` is the drop that used to
+checkpoint — that is UniFFI `SonarNode` deinit, and no iOS test constructs
+`MarmotService`. Deleting the three `ensure_no_checkpoint_on_close()` call
+sites while leaving the tests would keep them green if some other test had
+already installed the process-wide hook; the tests themselves call `ensure`
+first, so they fail if the auto-extension is removed.
+
+**History:** #446 (round 1) -> #448 (round 2) -> #449 / R-016 (round 3) ->
+R-020 (round 4) -> #538 / R-028 (round 5) -> #544/#545 / R-031 (round 6) ->
+#556 (round 7) -> #565 (round 8) -> #571 (round 9) -> this fix (round 10:
+close-time WAL checkpoint).
+
+**Rejected:**
+- *Patching MDK to set the flag in `open_connection`.* Needs an MDK rev bump,
+  which the Group-Scale Sim rule treats as a wire-format event. The
+  auto-extension reaches the same connection without forking MDK.
+- *`PRAGMA wal_checkpoint(PASSIVE)` from Swift before `node = nil`.* We have
+  no SQL handle on the Swift side, and PASSIVE then close still FULL-checkpoints
+  unless `NO_CKPT_ON_CLOSE` is set on that connection.
+- *Leaving checkpoint-on-close and extending `beginBackgroundTask`.* iOS can
+  expire the task; a large WAL still loses the race. The close must be cheap.
+
 ## Unguarded
 
 Gaps we know about. Each line is a concrete backlog item; fold it into its `R-`
