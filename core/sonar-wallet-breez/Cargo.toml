@@ -18,8 +18,18 @@ publish = false
 name = "sonar-wallet-cli"
 path = "src/bin/sonar-wallet-cli.rs"
 
+[[bin]]
+name = "sonar-migrate-cli"
+path = "src/bin/sonar-migrate-cli.rs"
+
 [dependencies]
 sonar-wallet = { path = "../sonar-wallet" }
+# The migration CLI links BOTH real backends in this one process — verified:
+# cdk (wallet-only) brings no libsqlite3-sys, so it coexists with breez's fork
+# here, which no other binary in the repo can offer. This island is therefore
+# where the Breez→Cashu migration engine gets its headless, real-backend proof.
+sonar-wallet-cdk = { path = "../sonar-wallet-cdk" }
+sonar-wallet-migrate = { path = "../sonar-wallet-migrate" }
 # Pinned by rev, not tag: this crate signs payments, and a git tag can be
 # moved upstream. `e11d88c` is what tag 0.12.4 pointed at when this landed.
 breez-sdk-liquid = { git = "https://github.com/breez/breez-sdk-liquid", rev = "e11d88c73abf1bf00b3c909e0a238c0abebb5d6a" }
