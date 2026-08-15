@@ -116,7 +116,8 @@ impl DestinationKind {
         match self {
             DestinationKind::Bolt11 => caps.bolt11_send,
             DestinationKind::Bolt12Offer => caps.bolt12_send,
-            DestinationKind::LightningAddress | DestinationKind::LnurlPay => caps.lnurl_send,
+            DestinationKind::LightningAddress => caps.lightning_address_send,
+            DestinationKind::LnurlPay => caps.lnurl_send,
             // Unclassified input is the backend's call, not ours.
             DestinationKind::Unknown => true,
         }
@@ -244,11 +245,14 @@ pub enum PreparedSendToken {
 /// backends unable to declare capabilities at all.)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WalletCapabilities {
-    /// Can pay LNURL-pay endpoints and Lightning addresses. Distinct from
-    /// `bolt11_send`/`bolt12_send`: on Breez these go through a separate API,
-    /// so a backend can support invoices and offers while not supporting
-    /// these.
+    /// Can pay RAW LNURL-pay destinations (`lnurl1…` bech32 / lud-17 URLs).
+    /// Deliberately separate from `lightning_address_send`: CDK routes
+    /// addresses but not raw LNURL, Breez currently routes neither — a single
+    /// flag either hides working support or advertises a deterministic
+    /// failure to hosts gating their payment UI.
     pub lnurl_send: bool,
+    /// Can pay Lightning addresses (user@domain, LUD-16/BIP-353).
+    pub lightning_address_send: bool,
     /// connect/disconnect map to a real node/session start-stop that hosts
     /// must drive from app lifecycle (foreground gating, background close).
     pub node_lifecycle: bool,
