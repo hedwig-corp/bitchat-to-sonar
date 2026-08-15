@@ -348,6 +348,11 @@ compose.desktop {
         }
     }
 }
+                // Second one now: `ffplay` (Debian/Ubuntu package `ffmpeg`) for
+                // voice-note playback. Unlike libsecret its absence has no global
+                // status surface, only the per-bubble "install ffmpeg" string, so
+                // the release job's control-file patch must cover both.
+
 
 // The jvm resources must carry the generated key file before packaging.
 tasks.named("jvmProcessResources") { dependsOn(generateBreezKeyResource) }

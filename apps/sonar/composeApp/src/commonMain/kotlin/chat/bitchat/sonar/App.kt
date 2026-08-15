@@ -4115,6 +4115,17 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
     val durText = remember(media.durationMs) {
         media.durationMs?.let { fmtDur((it / 1000).toInt()) } ?: ""
     }
+    // Non-null only where nothing on the host can decode the note (desktop without
+    // ffmpeg). Say so rather than offering a play button that completes in silence:
+    // the note downloaded fine, so a silent no-op reads as a bad recording.
+    //
+    // Resolved off the Compose thread. It is a PATH scan, and `stat` on an entry
+    // that lives on a stalled network mount blocks exactly like the exec probe
+    // DesktopExec refuses to do for that reason. Null until it resolves, which only
+    // means the button is briefly live; play() re-checks and no-ops safely.
+    val unplayable by androidx.compose.runtime.produceState<String?>(null) {
+        value = withContext(Dispatchers.IO) { AudioNotePlayer.unavailableReason() }
+    }
     val tail = 5.dp
     // .media-audio: own notes ride the FULL transport fill (cyan/indigo), theirs
     // the surface bubble; radius 18 with the tail corner; padding 11/15/11/11.
@@ -4138,17 +4149,19 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 .background(if (m.mine) Color.White.copy(alpha = 0.24f) else s.accentSoft)
                 .then(
                     if (isSending) Modifier else Modifier.clickable {
-                        when (transfer.phase) {
-                            MediaTransferPhase.NotDownloaded, MediaTransferPhase.Failed ->
-                                state.requestMediaDownload(chatId, media)
-                            MediaTransferPhase.Downloading -> state.cancelMediaDownload(media)
-                            MediaTransferPhase.Available -> {
-                                val b = bytes ?: return@clickable
-                                // onComplete resets `playing` when the note ends, is stopped, or
-                                // another note steals the shared player.
-                                if (playing) AudioNotePlayer.stop()
-                                else { playing = true; AudioNotePlayer.play(b) { playing = false } }
+                        // The decision itself lives in audioClickAction so it can be
+                        // tested; this only carries it out.
+                        when (audioClickAction(transfer.phase, unplayable, bytes != null, playing)) {
+                            AudioAction.Download -> state.requestMediaDownload(chatId, media)
+                            AudioAction.CancelDownload -> state.cancelMediaDownload(media)
+                            // onComplete resets `playing` when the note ends, is stopped, or
+                            // another note steals the shared player.
+                            AudioAction.Play -> {
+                                playing = true
+                                AudioNotePlayer.play(bytes!!) { playing = false }
                             }
+                            AudioAction.Stop -> AudioNotePlayer.stop()
+                            AudioAction.Nothing -> Unit
                         }
                     }
                 ),
@@ -4166,13 +4179,24 @@ private fun AudioBubble(m: SonarMsg, state: SonarAppState, chatId: String, media
                 MediaTransferPhase.Failed -> Text("↻", color = if (m.mine) Color.White else s.accentDeep, fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 MediaTransferPhase.Available -> SNIcon(
                     if (playing) SNIconName.Pause else SNIconName.Play, 14.dp,
-                    if (m.mine) Color.White else s.accentDeep,
+                    (if (m.mine) Color.White else s.accentDeep)
+                        .copy(alpha = if (unplayable != null) 0.35f else 1f),
                     weight = 2.2f
                 )
             }
         }
         Spacer(Modifier.width(11.dp))
-        MediaWaveStatic(
+        val unplayableReason = unplayable
+        if (unplayableReason != null) {
+            // Replaces the waveform rather than sitting beside it: a waveform next to
+            // a dead button still reads as playable.
+            Text(
+                unplayableReason,
+                style = SonarType.mono(11.5, FontWeight.SemiBold),
+                color = if (m.mine) onTint.copy(alpha = 0.8f) else s.text2.copy(alpha = 0.8f),
+                modifier = Modifier.widthIn(max = 200.dp),
+            )
+        } else MediaWaveStatic(
             media.filename,
             color = if (m.mine) Color.White.copy(alpha = 0.6f) else s.accent.copy(alpha = 0.55f),
             modifier = Modifier.width(124.dp).height(26.dp)

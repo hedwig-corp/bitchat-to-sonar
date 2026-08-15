@@ -3,12 +3,13 @@ package chat.bitchat.sonar
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Desktop (JVM) `actual`: recording is not wired yet (no JVM AAC encoder).
- * Playback: macOS uses `afplay` on a temp `.m4a` so received voice notes (including
- * Hermes/agent AAC) are audible in Compose Desktop / Sonar.app.
+ * Playback shells out to an installed decoder over a temp `.m4a`; see
+ * [AudioNotePlayer.LINUX_PLAYERS] for which ones and why.
  */
 actual class VoiceRecorder {
     actual suspend fun start(): Boolean = false
@@ -69,14 +70,105 @@ actual object AudioNotePlayer {
         }
     }
 
+    /**
+     * External players that can decode AAC-in-MP4 and exit on their own at the end
+     * of the clip, most-preferred first.
+     *
+     * Only `ffplay` is here, and the flags are the security boundary, not a
+     * convenience.
+     *
+     * `-protocol_whitelist file` is the load-bearing one. The payload is chosen by
+     * whoever sent the message, and a media container can name a URL: a QuickTime
+     * reference movie (`moov/rmra`) is a structurally valid MP4 that points
+     * somewhere else. Fed one of those, `cvlc` fetched the attacker's URL twice and
+     * exited 0, so the app reported a normal play; on a relay-mediated transport
+     * where the sender otherwise never learns the recipient's IP, one tap yields the
+     * IP, an exact read-receipt oracle, and a blind SSRF probe into the LAN.
+     * Reproduced against a local listener, and the same payload passes any
+     * magic-byte check because it really is an MP4. That is why the player is
+     * constrained instead of the bytes being trusted.
+     *
+     * `cvlc` was here and is gone: it follows both the m3u and the reference-movie
+     * redirect, and no invocation was found that provably stops it (`--demux=mp4
+     * --no-playlist-autostart` suppressed the fetch but then hung on the same
+     * input). A player that cannot be constrained is not a fallback worth having.
+     *
+     * ffplay refuses both payloads even without the flag, because libavformat's
+     * file-protocol default whitelist is `file,crypto,data`. It is passed
+     * explicitly anyway: a build-time default is not a guarantee, and this is the
+     * one line standing between a remote peer and an outbound request.
+     *
+     * Verified against real clips with these exact flags: m4a 2215ms, mp3 1194ms,
+     * wav 1191ms, ogg 1174ms, flac 1152ms, raw AAC 1234ms, all exit 0; and against
+     * both attack payloads, no request reached the listener.
+     *
+     * The other requirement is that it exits at end of clip, since that is what
+     * fires [onComplete] and resets the bubble. `gst-play-1.0` was rejected for
+     * failing that honestly: without `gstreamer1.0-plugins-bad` it prints a plug-in
+     * error and still exits 0, in ~50ms for a 2s clip. `paplay`/`aplay` are PCM-only.
+     */
+    private val LINUX_PLAYERS = listOf(
+        "ffplay" to listOf("-protocol_whitelist", "file", "-nodisp", "-autoexit", "-loglevel", "quiet"),
+    )
+
+    private val osName = System.getProperty("os.name").lowercase()
+    private val isMac = osName.contains("mac")
+    private val isLinux = osName.contains("linux")
+
+    /** `PATH` for player lookup. Tests point this at a directory of stubs. */
+    @Volatile
+    internal var searchPath: String? = null
+
+    // Deliberately NOT cached. The scan is ~10 stat calls with no fork, and caching
+    // it cost more than it saved: it needed a reset hatch purely so tests could
+    // re-resolve, it put that scan on the Compose thread under the playback lock,
+    // and it meant a user who followed the "install ffmpeg" message kept seeing that
+    // message until they restarted the app. Re-probing makes the fix take effect.
+    private val playerCommand: List<String>?
+        get() = when {
+            // macOS keeps the absolute path first. `afplay` ships with the OS at a
+            // SIP-protected location and does not move, so resolving it through
+            // `PATH` would only add a way for an earlier entry to win.
+            isMac -> listOf("/usr/bin/afplay").takeIf { File(it[0]).canExecute() }
+                ?: DesktopExec.which("afplay", pathOrDefault())?.let { listOf(it) }
+            isLinux -> LINUX_PLAYERS.firstNotNullOfOrNull { (bin, flags) ->
+                DesktopExec.which(bin, pathOrDefault())?.let { listOf(it) + flags }
+            }
+            else -> null
+        }
+
+    private fun pathOrDefault(): String? = searchPath ?: System.getenv("PATH")
+
+    actual fun unavailableReason(): String? = when {
+        playerCommand != null -> null
+        isLinux -> "no audio player found; install ffmpeg"
+        isMac -> "afplay is missing from this macOS install"
+        else -> "voice-note playback is not supported on this platform yet"
+    }
+
     actual fun play(bytes: ByteArray, onComplete: () -> Unit) {
-        val os = System.getProperty("os.name").lowercase()
-        if (!os.contains("mac")) {
-            // Linux/Windows desktop: no built-in AAC player yet (follow-up: ffplay/JavaFX).
+        audioPayloadRejection(bytes)?.let { why ->
+            sonarLog("AudioNotePlayer", "refusing to play: $why")
             onComplete()
             return
         }
         control.execute {
+            // Resolved HERE, not on the caller's thread. This is a PATH scan, and a
+            // stat on an entry backed by a stalled network mount blocks exactly like
+            // the exec probe DesktopExec refuses to do for that reason. Moving the
+            // render-path read off the Compose thread was not enough: the click path
+            // ran it too, so a tap froze the UI with no recovery.
+            val command = playerCommand
+            if (command == null) {
+                // No player: fire the completion so the bubble does not hang on
+                // Pause. The UI is expected to have disabled this via
+                // unavailableReason(); this is belt and braces, not how the user
+                // finds out. Deliberately before teardown(), so pressing play on an
+                // unplayable note does not stop a note that IS playing.
+                sonarLog("AudioNotePlayer", "no usable audio player found")
+                onComplete()
+                return@execute
+            }
             // Tear down any in-flight playback first (fires its completion, resets the
             // previous bubble) before adopting the new note.
             teardown()
@@ -84,20 +176,40 @@ actual object AudioNotePlayer {
             // startup sweep — so an interrupted play cannot leave decrypted E2EE audio.
             val file = runCatching {
                 File.createTempFile(TMP_PREFIX, TMP_SUFFIX)
-            }.getOrElse { onComplete(); return@execute }
+            }.getOrElse {
+                sonarLog("AudioNotePlayer", "could not create the temp note file")
+                onComplete()
+                return@execute
+            }
+            // Tighten BEFORE the bytes land, never after. `File.createTempFile`
+            // honors the umask, so under a common 0002 it yields rw-rw-r-- and this
+            // note is decrypted end-to-end-encrypted audio sitting readable by every
+            // local user in a shared /tmp. Ordering matters as much as the mode: a
+            // chmod after the write leaves a window in which the plaintext is
+            // world-readable, so only the empty file is ever exposed.
+            if (!DesktopEnv.restrictToOwner(file)) {
+                // A filesystem that cannot express the mode (exFAT/SMB tmpdir).
+                // Playback continues rather than dying on an exotic mount, but it
+                // does not get to be silent about handing out plaintext.
+                sonarLog("AudioNotePlayer", "could not restrict $TMP_SUFFIX temp file to owner-only")
+            }
             try {
                 file.writeBytes(bytes)
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                sonarLog("AudioNotePlayer", "could not write the temp note file: $e")
                 file.delete()
                 onComplete()
                 return@execute
             }
             val afplay = runCatching {
-                ProcessBuilder("/usr/bin/afplay", file.absolutePath)
+                ProcessBuilder(command + file.absolutePath)
                     .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                     .redirectError(ProcessBuilder.Redirect.DISCARD)
                     .start()
             }.getOrElse {
+                // Resolution and spawn are not atomic: a package upgrade between
+                // them, or a PATH entry that is not actually runnable, lands here.
+                sonarLog("AudioNotePlayer", "could not spawn ${command.first()}: $it")
                 file.delete()
                 onComplete()
                 return@execute
@@ -111,7 +223,12 @@ actual object AudioNotePlayer {
             }
             Thread({
                 try {
-                    afplay.waitFor()
+                    val rc = afplay.waitFor()
+                    // A player can exit non-zero on a codec it cannot handle. There
+                    // is no per-note error channel in the bubble yet, so this at
+                    // least makes "pressed play, heard nothing" diagnosable instead
+                    // of leaving no trace at all.
+                    if (rc != 0) sonarLog("AudioNotePlayer", "${command.first()} exited $rc")
                 } catch (_: InterruptedException) {
                     runCatching { afplay.destroy() }
                 } finally {
@@ -147,8 +264,18 @@ actual object AudioNotePlayer {
         }
         if (p != null) {
             runCatching { p.destroy() }
-            runCatching { p.waitFor() }
+            // Bounded, then SIGKILL. `waitFor()` with no timeout ran on the single
+            // control thread, so a child that ignores SIGTERM wedged it forever: the
+            // decrypted note below was never deleted, the bubble stayed on Pause,
+            // and every later play()/stop() queued behind it for the rest of the
+            // session. A player fed an endless attacker-controlled stream is exactly
+            // such a child.
+            runCatching {
+                if (!p.waitFor(2, TimeUnit.SECONDS)) p.destroyForcibly()
+            }.onFailure { runCatching { p.destroyForcibly() } }
         }
+        // Outside the `p != null` branch and after the kill: dropping the plaintext
+        // must not be reachable only on paths where the child cooperated.
         f?.let { runCatching { it.delete() } }
         cb?.invoke()
     }
